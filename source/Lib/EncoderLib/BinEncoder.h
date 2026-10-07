@@ -295,7 +295,7 @@ public:
 #if JVET_AM0056_PRED_TRANSFORM_COEFF_CODING
   uint16_t getProb( unsigned ctxId)
   {
-    return m_ctx[ctxId].state();
+    return static_cast<const CtxStore<BinProbModel>&>( m_ctx )[ctxId].state();   // read only: no dirty mark
   }
 #endif
   

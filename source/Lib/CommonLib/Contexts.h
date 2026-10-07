@@ -41,7 +41,12 @@
 #include "CommonDef.h"
 #include "Slice.h"
 
+#include <algorithm>
+#include <cstring>
 #include <vector>
+#if defined( _MSC_VER )
+#include <intrin.h>
+#endif
 
 static constexpr int     PROB_BITS   = 15;   // Nominal number of bits to represent probabilities
 #if EC_HIGH_PRECISION
@@ -905,6 +910,26 @@ public:
 
 
 
+// perf (bit-exact): the RD search copies whole context stores very often (snapshot / restore of ~1700 contexts, about
+// 20 KB) while only a few context sets change in between. The contexts are grouped into blocks of CTX_BLOCK_SIZE, and
+// every block has a version stamp that names its content: a write access only marks its block dirty, dirty blocks get
+// a fresh stamp (unique: store id + per-store counter) before the store is copied from, a copied block takes over the
+// stamp of its source, and copies skip the blocks whose stamps are equal in both stores.
+static constexpr int CTX_BLOCK_LOG2 = 5;
+static constexpr int CTX_BLOCK_SIZE = 1 << CTX_BLOCK_LOG2;
+static constexpr int CTX_MAX_BLOCKS = 64;
+
+static inline int ctxBlockCtz( uint64_t x )
+{
+#if defined( _MSC_VER )
+  unsigned long idx;
+  _BitScanForward64( &idx, x );
+  return (int) idx;
+#else
+  return __builtin_ctzll( x );
+#endif
+}
+
 template <class BinProbModel>
 class CtxStore : public FracBitsAccess
 {
@@ -912,18 +937,41 @@ public:
   CtxStore();
   CtxStore( bool dummy );
   CtxStore( const CtxStore<BinProbModel>& ctxStore );
+  CtxStore& operator=( const CtxStore<BinProbModel>& ctxStore ) { copyFrom( ctxStore ); return *this; }
 public:
   void copyFrom(const CtxStore<BinProbModel>& src)
   {
     checkInit();
-    std::copy_n(reinterpret_cast<const char*>(src.m_ctx), sizeof(BinProbModel) * ContextSetCfg::NumberOfContexts,
-      reinterpret_cast<char*>(m_ctx));
+    src.syncVersions();
+    uint64_t diff = takeDirtyMask();
+    for( int b = 0; b < CTX_MAX_BLOCKS; b++ )
+    {
+      diff |= uint64_t( m_ver[b] != src.m_ver[b] ) << b;
+    }
+    const size_t numCtx = m_ctxBuffer.size();
+    while( diff )
+    {
+      // copy runs of consecutive differing blocks
+      const int      first = ctxBlockCtz( diff );
+      const uint64_t rest  = ~( diff >> first );
+      const int      run   = rest ? ctxBlockCtz( rest ) : CTX_MAX_BLOCKS - first;
+      const size_t   begin = size_t( first ) << CTX_BLOCK_LOG2;
+      const size_t   end   = std::min( numCtx, size_t( first + run ) << CTX_BLOCK_LOG2 );
+      std::copy_n( reinterpret_cast<const char*>( src.m_ctx + begin ), sizeof( BinProbModel ) * ( end - begin ),
+                   reinterpret_cast<char*>( m_ctx + begin ) );
+      std::copy_n( src.m_ver + first, run, m_ver + first );
+      diff = first + run >= CTX_MAX_BLOCKS ? 0 : diff & ( ~uint64_t( 0 ) << ( first + run ) );
+    }
   }
   void copyFrom(const CtxStore<BinProbModel>& src, const CtxSet& ctxSet)
   {
     checkInit();
     std::copy_n(reinterpret_cast<const char*>(src.m_ctx + ctxSet.Offset), sizeof(BinProbModel) * ctxSet.Size,
       reinterpret_cast<char*>(m_ctx + ctxSet.Offset));
+    if( ctxSet.Size )
+    {
+      markDirty( ctxSet.Offset, ctxSet.Offset + ctxSet.Size );
+    }
   }
   void init(int qp, int initId);
 #if JVET_Z0135_TEMP_CABAC_WIN_WEIGHT
@@ -957,22 +1005,70 @@ public:
       {
         m_ctxBuffer[ store.ctxId ].updateShortWin( store.bin(i) );
       }
+      if( store.count )
+      {
+        markDirty( store.ctxId, store.ctxId + 1 );
+      }
     }
   }
 #endif
 
   const BinProbModel& operator[]      ( unsigned  ctxId  )  const { return m_ctx[ctxId]; }
-  BinProbModel&       operator[]      ( unsigned  ctxId  )        { return m_ctx[ctxId]; }
+  BinProbModel&       operator[]      ( unsigned  ctxId  )        { m_dirty[ctxId >> CTX_BLOCK_LOG2] = 1; return m_ctx[ctxId]; }
   uint32_t            estFracBits     ( unsigned  bin,
                                         unsigned  ctxId  )  const { return m_ctx[ctxId].estFracBits(bin); }
 
   BinFracBits         getFracBitsArray( unsigned  ctxId  )  const { return m_ctx[ctxId].getFracBitsArray(); }
 
 private:
-  inline void checkInit() { if( m_ctx ) return; m_ctxBuffer.resize( ContextSetCfg::NumberOfContexts ); m_ctx = m_ctxBuffer.data(); }
+  inline void checkInit()
+  {
+    if( m_ctx ) return;
+    m_ctxBuffer.resize( ContextSetCfg::NumberOfContexts );
+    m_ctx = m_ctxBuffer.data();
+    markAllDirty();
+  }
+  void initVersions();   // new store id, all blocks dirty
+  void markAllDirty()
+  {
+    CHECK( m_ctxBuffer.size() > size_t( CTX_MAX_BLOCKS ) << CTX_BLOCK_LOG2, "too many contexts for the block versions" );
+    if( !m_ctxBuffer.empty() )
+    {
+      markDirty( 0, (unsigned) m_ctxBuffer.size() );
+    }
+  }
+  void markDirty( unsigned begin, unsigned end ) const   // contexts [begin, end), end > begin
+  {
+    std::fill( m_dirty + ( begin >> CTX_BLOCK_LOG2 ), m_dirty + ( ( end - 1 ) >> CTX_BLOCK_LOG2 ) + 1, uint8_t( 1 ) );
+  }
+  // mask of dirty blocks; clears the dirty flags
+  uint64_t takeDirtyMask() const
+  {
+    uint64_t mask = 0;
+    for( int w = 0; w < CTX_MAX_BLOCKS / 8; w++ )
+    {
+      uint64_t v;
+      memcpy( &v, m_dirty + 8 * w, 8 );
+      // eight 0/1 bytes -> eight bits (no carries: every product term lands on its own bit)
+      mask |= ( ( v * 0x0102040810204080ull ) >> 56 ) << ( 8 * w );
+    }
+    memset( m_dirty, 0, sizeof( m_dirty ) );
+    return mask;
+  }
+  // gives the dirty blocks fresh version stamps
+  void syncVersions() const
+  {
+    for( uint64_t d = takeDirtyMask(); d; d &= d - 1 )
+    {
+      m_ver[ctxBlockCtz( d )] = ++m_verCounter;
+    }
+  }
 private:
   std::vector<BinProbModel> m_ctxBuffer;
   BinProbModel*             m_ctx;
+  mutable uint64_t          m_verCounter;
+  mutable uint64_t          m_ver[CTX_MAX_BLOCKS];
+  mutable uint8_t           m_dirty[CTX_MAX_BLOCKS];
 };
 
 

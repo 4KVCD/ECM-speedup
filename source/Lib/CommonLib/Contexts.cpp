@@ -38,6 +38,7 @@
 #include "Contexts.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <limits>
 
@@ -762,23 +763,41 @@ const CtxSet ContextSetCfg::Split = { ContextSetCfg::SplitFlag, ContextSetCfg::S
 const CtxSet ContextSetCfg::Split = { ContextSetCfg::SplitFlag, ContextSetCfg::SplitQtFlag, ContextSetCfg::SplitHvFlag, ContextSetCfg::Split12Flag, ContextSetCfg::ModeConsFlag };
 #endif
 
+static std::atomic<uint64_t> s_numCtxStores( 0 );
+
+template <class BinProbModel>
+void CtxStore<BinProbModel>::initVersions()
+{
+  // stamps are unique across stores: store number in the upper bits, per-store counter in the lower 40 bits
+  m_verCounter = ( ++s_numCtxStores ) << 40;
+  std::fill_n( m_ver, CTX_MAX_BLOCKS, uint64_t( 0 ) );
+  std::fill_n( m_dirty, CTX_MAX_BLOCKS, uint8_t( 0 ) );
+  markAllDirty();
+}
+
 template <class BinProbModel>
 CtxStore<BinProbModel>::CtxStore()
   : m_ctxBuffer ()
   , m_ctx       ( nullptr )
-{}
+{
+  initVersions();
+}
 
 template <class BinProbModel>
 CtxStore<BinProbModel>::CtxStore( bool dummy )
   : m_ctxBuffer ( ContextSetCfg::NumberOfContexts )
   , m_ctx       ( m_ctxBuffer.data() )
-{}
+{
+  initVersions();
+}
 
 template <class BinProbModel>
 CtxStore<BinProbModel>::CtxStore( const CtxStore<BinProbModel>& ctxStore )
   : m_ctxBuffer ( ctxStore.m_ctxBuffer )
-  , m_ctx       ( m_ctxBuffer.data() )
-{}
+  , m_ctx       ( m_ctxBuffer.empty() ? nullptr : m_ctxBuffer.data() )
+{
+  initVersions();
+}
 
 template <class BinProbModel>
 void CtxStore<BinProbModel>::init( int qp, int initId )
@@ -840,6 +859,7 @@ void CtxStore<BinProbModel>::init( int qp, int initId )
     }
 #endif
   }
+  markAllDirty();
 }
 
 #if JVET_Z0135_TEMP_CABAC_WIN_WEIGHT
@@ -871,6 +891,7 @@ void CtxStore<BinProbModel>::loadRateOffsets( const std::vector<uint8_t>& rateOf
     m_ctxBuffer[k].setAdaptRateOffset( rateOffset0[k], 0 );
     m_ctxBuffer[k].setAdaptRateOffset( rateOffset1[k], 1 );
   }
+  markAllDirty();
 }
 #endif
 
@@ -894,6 +915,7 @@ void CtxStore<BinProbModel>::loadWinSizes( const std::vector<uint8_t>& windows )
   {
     m_ctxBuffer[k].setWinSizes( windows[k] );
   }
+  markAllDirty();
 }
 
 template <class BinProbModel>
@@ -905,6 +927,7 @@ void CtxStore<BinProbModel>::loadWeights( const std::vector<uint8_t>& weights )
   {
     m_ctxBuffer[k].setAdaptRateWeight( weights[k] );
   }
+  markAllDirty();
 }
 
 template <class BinProbModel>
@@ -934,6 +957,7 @@ void CtxStore<BinProbModel>::loadPStates( const std::vector<std::pair<uint16_t, 
     }
 #endif
   }
+  markAllDirty();
 }
 
 template <class BinProbModel>
@@ -956,6 +980,7 @@ void CtxStore<BinProbModel>::loadPStates( const std::vector<uint16_t>& probState
   {
     m_ctxBuffer[k].setState( probStates[k] );
   }
+  markAllDirty();
 }
 
 template <class BinProbModel>

@@ -399,7 +399,7 @@ void TBinEncoder<BinProbModel>::encodeBin( unsigned bin, unsigned ctxId )
 template <class BinProbModel>
 uint16_t TBinEncoder<BinProbModel>::getProb( unsigned ctxId )
 {
-  return m_ctx[ctxId].state();
+  return static_cast<const CtxStore<BinProbModel>&>( m_ctx )[ctxId].state();   // read only: no dirty mark
 }
 #endif
 
