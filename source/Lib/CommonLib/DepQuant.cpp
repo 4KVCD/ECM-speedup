@@ -37,6 +37,9 @@
 #include "UnitTools.h"
 
 #include <bitset>
+#if defined(__SSE4_1__)
+#include <smmintrin.h>
+#endif
 
 namespace DQIntern
 {
@@ -99,6 +102,11 @@ namespace DQIntern
     unsigned    gtxCtxOffsetNext;
     int         nextInsidePos;
     NbInfoSbb   nextNbInfoSbb;
+#if JVET_AE0102_LFNST_CTX
+    uint8_t     nextNbShuffle[2][16];   // nextNbInfoSbb.inPos[ctxType][0..num-1] as byte-shuffle indices, 0x80 = unused
+#else
+    uint8_t     nextNbShuffle[1][16];
+#endif
     int         nextSbbRight;
     int         nextSbbBelow;
     int         posX;
@@ -571,6 +579,7 @@ namespace DQIntern
       scanInfo.spt = SCAN_EOCSBB;
     scanInfo.posX = m_scanId2BlkPos[scanIdx].x;
     scanInfo.posY = m_scanId2BlkPos[scanIdx].y;
+    ::memset(scanInfo.nextNbShuffle, 0x80, sizeof(scanInfo.nextNbShuffle));
     if (scanIdx)
     {
       const int nextScanIdx = scanIdx - 1;
@@ -597,6 +606,20 @@ namespace DQIntern
       }
       scanInfo.nextInsidePos = nextScanIdx & m_sbbMask;
       scanInfo.nextNbInfoSbb = m_scanId2NbInfoSbb[nextScanIdx];
+#if JVET_AE0102_LFNST_CTX
+      for (int ctxType = 0; ctxType < 2; ctxType++)
+      {
+        for (int k = 0; k < std::min<int>(5, scanInfo.nextNbInfoSbb.num[ctxType]); k++)
+        {
+          scanInfo.nextNbShuffle[ctxType][k] = scanInfo.nextNbInfoSbb.inPos[ctxType][k];
+        }
+      }
+#else
+      for (int k = 0; k < std::min<int>(5, scanInfo.nextNbInfoSbb.num); k++)
+      {
+        scanInfo.nextNbShuffle[0][k] = scanInfo.nextNbInfoSbb.inPos[k];
+      }
+#endif
       if (scanInfo.eosbb)
       {
         const int nextSbbPos  = m_scanSbbId2SbbPos[nextScanIdx >> m_log2SbbSize].idx;
@@ -1313,16 +1336,24 @@ const CtxSet &ctxSetGt4 = isLfnst ? Ctx::GtxFlagL[6 + chType] : Ctx::GtxFlag[6 +
     uint8_t *levels;
   };
 
+  // index of the all-zero template init (paths that started inside the current sub-block)
+  static const int CTX_INIT_ZERO = 8;
+
   class CommonCtx
   {
   public:
 #if TCQ_8STATES
-    CommonCtx() : m_currSbbCtx(m_allSbbCtx), m_prevSbbCtx(m_currSbbCtx + 8) {}
+    CommonCtx() : m_currSbbCtx(m_allSbbCtx), m_prevSbbCtx(m_currSbbCtx + 8) { ::memset(m_ctxInit, 0, sizeof(m_ctxInit)); }
 #else
-    CommonCtx() : m_currSbbCtx(m_allSbbCtx), m_prevSbbCtx(m_currSbbCtx + 4) {}
+    CommonCtx() : m_currSbbCtx(m_allSbbCtx), m_prevSbbCtx(m_currSbbCtx + 4) { ::memset(m_ctxInit, 0, sizeof(m_ctxInit)); }
 #endif
 
     inline void swap() { std::swap(m_currSbbCtx, m_prevSbbCtx); }
+
+    // template sums contributed by the neighbours outside the current sub-block, for each position inside it
+    // (sumNum + (sumAbs1 << 3) + (sumAbs << 8)); computed per state at the end of the previous sub-block and shared by
+    // all states that descend from it (a state only keeps the index, instead of a copy per state and scan position)
+    inline const uint16_t *ctxInit(int idx) const { return m_ctxInit[idx]; }
 
     inline void reset(const TUParameters &tuPars, const RateEstimator &rateEst)
     {
@@ -1350,6 +1381,7 @@ const CtxSet &ctxSetGt4 = isLfnst ? Ctx::GtxFlagL[6 + chType] : Ctx::GtxFlag[6 +
   private:
     const NbInfoOut *m_nbInfo;
     BinFracBits      m_sbbFlagBits[2];
+    alignas(16) uint16_t m_ctxInit[CTX_INIT_ZERO + 1][16];
 #if TCQ_8STATES
     SbbCtx m_allSbbCtx[16];
 #else
@@ -1380,6 +1412,55 @@ const CtxSet &ctxSetGt4 = isLfnst ? Ctx::GtxFlagL[6 + chType] : Ctx::GtxFlag[6 +
       196608, 196608, 229376, 229376, 229376, 229376, 229376, 229376, 229376, 229376 }
   };
 
+#if JVET_AG0100_TRANSFORM_COEFFICIENT_CODING
+  static const int TPL_LEVEL_CLIP = GTN_LEVEL;   // a template neighbour adds min(TPL_LEVEL_CLIP + (t & 1), t) to sumAbs1
+#else
+  static const int TPL_LEVEL_CLIP = 4;
+#endif
+  alignas(16) static const uint8_t g_zeroAbsLevels[16] = { 0 };
+
+  // dst = src with dst[insidePos] = val (16 levels of a sub-block; written as one vector, so the next stage's load of
+  // the whole vector is forwarded from the store instead of waiting for a byte store to retire)
+  static inline void setAbsLevels(uint8_t *dst, const uint8_t *src, const int insidePos, const uint8_t val)
+  {
+#if defined(__SSE4_1__)
+    const __m128i lv  = _mm_load_si128((const __m128i *) src);
+    const __m128i msk = _mm_cmpeq_epi8(_mm_set1_epi8((char) insidePos),
+                                       _mm_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15));
+    _mm_store_si128((__m128i *) dst, _mm_blendv_epi8(lv, _mm_set1_epi8((char) val), msk));
+#else
+    ::memcpy(dst, src, 16);
+    dst[insidePos] = val;
+#endif
+  }
+
+  // template sums over the neighbours inside the sub-block: levels[shuffle[k]] for the leading shuffle entries < 16
+  static inline void tplSumsInside(const uint8_t *levels, const uint8_t *shuffle, int &sumAbs1, int &sumNum,
+                                   int &sumAbs)
+  {
+#if defined(__SSE4_1__)
+    const __m128i zero = _mm_setzero_si128();
+    const __m128i one  = _mm_set1_epi8(1);
+    const __m128i nb   = _mm_shuffle_epi8(_mm_load_si128((const __m128i *) levels),
+                                          _mm_loadu_si128((const __m128i *) shuffle));   // unused lanes are 0
+    const __m128i abs1 = _mm_min_epu8(nb, _mm_add_epi8(_mm_and_si128(nb, one), _mm_set1_epi8(TPL_LEVEL_CLIP)));
+    const __m128i num  = _mm_min_epu8(nb, one);
+    const __m128i s12  = _mm_sad_epu8(_mm_unpacklo_epi64(abs1, num), zero);
+    sumAbs1            = _mm_cvtsi128_si32(s12);
+    sumNum             = _mm_extract_epi16(s12, 4);
+    sumAbs             = _mm_cvtsi128_si32(_mm_sad_epu8(nb, zero));
+#else
+    sumAbs1 = sumNum = sumAbs = 0;
+    for (int k = 0; k < 5 && shuffle[k] < 16; k++)
+    {
+      const int t = levels[shuffle[k]];
+      sumAbs += t;
+      sumAbs1 += std::min(TPL_LEVEL_CLIP + (t & 1), t);
+      sumNum += !!t;
+    }
+#endif
+  }
+
   class State
   {
     friend class CommonCtx;
@@ -1387,7 +1468,6 @@ const CtxSet &ctxSetGt4 = isLfnst ? Ctx::GtxFlagL[6 + chType] : Ctx::GtxFlag[6 +
   public:
     State(const RateEstimator &rateEst, CommonCtx &commonCtx, const int stateId);
 
-    template<uint8_t numIPos>
 #if JVET_AE0102_LFNST_CTX
     inline void updateState(const ScanInfo &scanInfo, const State *prevStates, const Decision &decision, int lfnstIdx);
 #else
@@ -1413,7 +1493,8 @@ const CtxSet &ctxSetGt4 = isLfnst ? Ctx::GtxFlagL[6 + chType] : Ctx::GtxFlag[6 +
     inline void init()
 #endif
     {
-      ::memset(m_absLevelsAndCtxInit, 0, sizeof(m_absLevelsAndCtxInit));
+      ::memset(m_absLevels, 0, sizeof(m_absLevels));
+      m_ctxInitIdx    = CTX_INIT_ZERO;
       m_rdCost        = std::numeric_limits<int64_t>::max() >> 1;
       m_numSigSbb     = 0;
       m_remRegBins    = 4;   // just large enough for last scan pos
@@ -1613,7 +1694,8 @@ const CtxSet &ctxSetGt4 = isLfnst ? Ctx::GtxFlagL[6 + chType] : Ctx::GtxFlag[6 +
 
   private:
     int64_t                    m_rdCost;
-    uint16_t                   m_absLevelsAndCtxInit[24];   // 16x8bit for abs levels + 16x16bit for ctx init id
+    alignas(16) uint8_t        m_absLevels[16];   // levels of the current sub-block by position inside it (max 255)
+    uint8_t                    m_ctxInitIdx;      // template sums from outside the sub-block: m_commonCtx.ctxInit(idx)
     int8_t                     m_numSigSbb;
     int                        m_remRegBins;
     int8_t                     m_refSbbCtxId;
@@ -1643,7 +1725,6 @@ const CtxSet &ctxSetGt4 = isLfnst ? Ctx::GtxFlagL[6 + chType] : Ctx::GtxFlag[6 +
   {
   }
 
-  template<uint8_t numIPos>
 #if JVET_AE0102_LFNST_CTX
   inline void State::updateState(const ScanInfo &scanInfo, const State *prevStates, const Decision &decision,
                                  int lfnstIdx)
@@ -1654,6 +1735,7 @@ const CtxSet &ctxSetGt4 = isLfnst ? Ctx::GtxFlagL[6 + chType] : Ctx::GtxFlag[6 +
     m_rdCost = decision.rdCost;
     if (decision.prevId > -2)
     {
+      const uint8_t *prvLevels;
       if (decision.prevId >= 0)
       {
         const State *prvState = prevStates + decision.prevId;
@@ -1674,7 +1756,8 @@ const CtxSet &ctxSetGt4 = isLfnst ? Ctx::GtxFlagL[6 + chType] : Ctx::GtxFlag[6 +
           m_remRegBins -= (decision.absLevel < 2 ? decision.absLevel : 3);
 #endif
         }
-        ::memcpy(m_absLevelsAndCtxInit, prvState->m_absLevelsAndCtxInit, 48 * sizeof(uint8_t));
+        m_ctxInitIdx = prvState->m_ctxInitIdx;
+        prvLevels    = prvState->m_absLevels;
       }
       else
       {
@@ -1692,191 +1775,49 @@ const CtxSet &ctxSetGt4 = isLfnst ? Ctx::GtxFlagL[6 + chType] : Ctx::GtxFlag[6 +
         m_remRegBins =
           (effWidth * effHeight * ctxBinSampleRatio) / 16 - (decision.absLevel < 2 ? decision.absLevel : 3);
 #endif
-        ::memset(m_absLevelsAndCtxInit, 0, 48 * sizeof(uint8_t));
+        m_ctxInitIdx = CTX_INIT_ZERO;
+        prvLevels    = g_zeroAbsLevels;
       }
 
-      uint8_t *levels            = reinterpret_cast<uint8_t *>(m_absLevelsAndCtxInit);
-      levels[scanInfo.insidePos] = (uint8_t) std::min<TCoeff>(255, decision.absLevel);
+      setAbsLevels(m_absLevels, prvLevels, scanInfo.insidePos, (uint8_t) std::min<TCoeff>(255, decision.absLevel));
+
+      // template of the next scan position: neighbours outside (ctx init) and inside the sub-block
+      const int tinit = m_commonCtx.ctxInit(m_ctxInitIdx)[scanInfo.nextInsidePos];
+#if JVET_AE0102_LFNST_CTX
+      const uint8_t *nbShuffle = scanInfo.nextNbShuffle[lfnstIdx > 0 ? 1 : 0];
+#else
+      const uint8_t *nbShuffle = scanInfo.nextNbShuffle[0];
+#endif
+      int sumAbs1In, sumNumIn, sumAbsIn;
+      tplSumsInside(m_absLevels, nbShuffle, sumAbs1In, sumNumIn, sumAbsIn);
 
       if (m_remRegBins >= 4)
       {
-        TCoeff tinit   = m_absLevelsAndCtxInit[8 + scanInfo.nextInsidePos];
-        TCoeff sumAbs1 = (tinit >> 3) & 31;
-        TCoeff sumNum  = tinit & 7;
-
-#if JVET_AE0102_LFNST_CTX
-        int ctxType = 0;
-        ctxType     = lfnstIdx > 0 ? 1 : 0;
-#endif
-#if JVET_AE0102_LFNST_CTX
+        const int sumAbs1 = ((tinit >> 3) & 31) + sumAbs1In;
+        const int sumNum  = (tinit & 7) + sumNumIn;
+        const int sumGt1  = sumAbs1 - sumNum;
 #if JVET_AG0100_TRANSFORM_COEFFICIENT_CODING
-#define UPDATE(k) {TCoeff t=levels[scanInfo.nextNbInfoSbb.inPos[ctxType][k]]; sumAbs1+=std::min<TCoeff>(GTN_LEVEL+(t&1),t); sumNum+=!!t; }
+        m_sigFracBits   = m_sigFracBitsArray + (scanInfo.sigCtxOffsetNext + std::min((sumAbs1 + 1) >> 1, NSIGCTX - 1));
+        m_coeffFracBits = m_gtxFracBitsArray + (scanInfo.gtxCtxOffsetNext + std::min(sumGt1, NGTXCTX - 1));
 #else
-#define UPDATE(k) {TCoeff t=levels[scanInfo.nextNbInfoSbb.inPos[ctxType][k]]; sumAbs1+=std::min<TCoeff>(4+(t&1),t); sumNum+=!!t; }
-#endif
-#else
-#define UPDATE(k)                                                                                                      \
-  {                                                                                                                    \
-    TCoeff t = levels[scanInfo.nextNbInfoSbb.inPos[k]];                                                                \
-    sumAbs1 += std::min<TCoeff>(4 + (t & 1), t);                                                                       \
-    sumNum += !!t;                                                                                                     \
-  }
-#endif
-        if (numIPos == 1)
-        {
-          UPDATE(0);
-        }
-        else if (numIPos == 2)
-        {
-          UPDATE(0);
-          UPDATE(1);
-        }
-        else if (numIPos == 3)
-        {
-          UPDATE(0);
-          UPDATE(1);
-          UPDATE(2);
-        }
-        else if (numIPos == 4)
-        {
-          UPDATE(0);
-          UPDATE(1);
-          UPDATE(2);
-          UPDATE(3);
-        }
-        else if (numIPos == 5)
-        {
-          UPDATE(0);
-          UPDATE(1);
-          UPDATE(2);
-          UPDATE(3);
-          UPDATE(4);
-        }
-#undef UPDATE
-        TCoeff sumGt1 = sumAbs1 - sumNum;
-#if JVET_R0351_HIGH_BIT_DEPTH_SUPPORT
-#if JVET_AG0100_TRANSFORM_COEFFICIENT_CODING
-        m_sigFracBits = m_sigFracBitsArray + (scanInfo.sigCtxOffsetNext + std::min<TCoeff>((sumAbs1 + 1) >> 1, NSIGCTX-1));
-#else
-        m_sigFracBits = m_sigFracBitsArray + (scanInfo.sigCtxOffsetNext + std::min<TCoeff>( (sumAbs1+1)>>1, 3 ));
-#endif
-#else
-        m_sigFracBits = m_sigFracBitsArray + (scanInfo.sigCtxOffsetNext + std::min((sumAbs1 + 1) >> 1, 3));
-#endif
-#if JVET_AG0100_TRANSFORM_COEFFICIENT_CODING
-        m_coeffFracBits = m_gtxFracBitsArray + (scanInfo.gtxCtxOffsetNext + (sumGt1 < (NGTXCTX-1) ? sumGt1 : (NGTXCTX - 1)));
-#else
-        m_coeffFracBits = m_gtxFracBitsArray + (scanInfo.gtxCtxOffsetNext + (sumGt1 < 4 ? sumGt1 : 4));
+        m_sigFracBits   = m_sigFracBitsArray + (scanInfo.sigCtxOffsetNext + std::min((sumAbs1 + 1) >> 1, 3));
+        m_coeffFracBits = m_gtxFracBitsArray + (scanInfo.gtxCtxOffsetNext + std::min(sumGt1, 4));
 #endif
 
-        TCoeff sumAbs = m_absLevelsAndCtxInit[8 + scanInfo.nextInsidePos] >> 8;
-#if JVET_AE0102_LFNST_CTX
-        ctxType = 0;
-        ctxType = lfnstIdx > 0 ? 1 : 0;
-
-#define UPDATE(k)                                                                                                      \
-  {                                                                                                                    \
-    TCoeff t = levels[scanInfo.nextNbInfoSbb.inPos[ctxType][k]];                                                       \
-    sumAbs += t;                                                                                                       \
-  }
-#else
-#define UPDATE(k)                                                                                                      \
-  {                                                                                                                    \
-    TCoeff t = levels[scanInfo.nextNbInfoSbb.inPos[k]];                                                                \
-    sumAbs += t;                                                                                                       \
-  }
-#endif
-        if (numIPos == 1)
-        {
-          UPDATE(0);
-        }
-        else if (numIPos == 2)
-        {
-          UPDATE(0);
-          UPDATE(1);
-        }
-        else if (numIPos == 3)
-        {
-          UPDATE(0);
-          UPDATE(1);
-          UPDATE(2);
-        }
-        else if (numIPos == 4)
-        {
-          UPDATE(0);
-          UPDATE(1);
-          UPDATE(2);
-          UPDATE(3);
-        }
-        else if (numIPos == 5)
-        {
-          UPDATE(0);
-          UPDATE(1);
-          UPDATE(2);
-          UPDATE(3);
-          UPDATE(4);
-        }
-#undef UPDATE
+        const int sumAbs = (tinit >> 8) + sumAbsIn;
 #if !JVET_AG0100_TRANSFORM_COEFFICIENT_CODING
-        int sumAll = std::max(std::min(31, (int)sumAbs - 4 * 5), 0);
+        int sumAll = std::max(std::min(31, sumAbs - 4 * 5), 0);
         m_goRicePar = g_auiGoRiceParsCoeff[sumAll];
 #else
-        int sumAll = std::max(std::min(GTN_MAXSUM - 1, (int)sumAbs - sumNum), 0);
+        int sumAll = std::max(std::min(GTN_MAXSUM - 1, sumAbs - sumNum), 0);
         m_goRicePar = g_auiGoRiceParsCoeffGTN[sumAll];
 #endif
       }
       else
       {
-        TCoeff sumAbs = m_absLevelsAndCtxInit[8 + scanInfo.nextInsidePos] >> 8;
-#if JVET_AE0102_LFNST_CTX
-        int ctxType = 0;
-        ctxType     = lfnstIdx > 0 ? 1 : 0;
-#define UPDATE(k)                                                                                                      \
-  {                                                                                                                    \
-    TCoeff t = levels[scanInfo.nextNbInfoSbb.inPos[ctxType][k]];                                                       \
-    sumAbs += t;                                                                                                       \
-  }
-#else
-#define UPDATE(k)                                                                                                      \
-  {                                                                                                                    \
-    TCoeff t = levels[scanInfo.nextNbInfoSbb.inPos[k]];                                                                \
-    sumAbs += t;                                                                                                       \
-  }
-#endif
-        if (numIPos == 1)
-        {
-          UPDATE(0);
-        }
-        else if (numIPos == 2)
-        {
-          UPDATE(0);
-          UPDATE(1);
-        }
-        else if (numIPos == 3)
-        {
-          UPDATE(0);
-          UPDATE(1);
-          UPDATE(2);
-        }
-        else if (numIPos == 4)
-        {
-          UPDATE(0);
-          UPDATE(1);
-          UPDATE(2);
-          UPDATE(3);
-        }
-        else if (numIPos == 5)
-        {
-          UPDATE(0);
-          UPDATE(1);
-          UPDATE(2);
-          UPDATE(3);
-          UPDATE(4);
-        }
-#undef UPDATE
-        sumAbs       = std::min<TCoeff>(31, sumAbs);
-        m_goRicePar  = g_auiGoRiceParsCoeff[sumAbs];
-        m_goRiceZero = g_auiGoRicePosCoeff0(m_stateId, m_goRicePar);
+        const int sumAbs = std::min(31, (tinit >> 8) + sumAbsIn);
+        m_goRicePar      = g_auiGoRiceParsCoeff[sumAbs];
+        m_goRiceZero     = g_auiGoRicePosCoeff0(m_stateId, m_goRicePar);
       }
     }
   }
@@ -1897,7 +1838,8 @@ const CtxSet &ctxSetGt4 = isLfnst ? Ctx::GtxFlagL[6 + chType] : Ctx::GtxFlag[6 +
     m_rdCost = decision.rdCost;
     if (decision.prevId > -2)
     {
-      const State *prvState = 0;
+      const State   *prvState  = 0;
+      const uint8_t *prvLevels = g_zeroAbsLevels;
 #if TCQ_8STATES
       if (decision.prevId >= skipOffset)
 #else
@@ -1911,28 +1853,25 @@ const CtxSet &ctxSetGt4 = isLfnst ? Ctx::GtxFlagL[6 + chType] : Ctx::GtxFlag[6 +
         prvState = skipStates + (decision.prevId - 4);
 #endif
         m_numSigSbb = 0;
-        ::memset(m_absLevelsAndCtxInit, 0, 16 * sizeof(uint8_t));
       }
       else if (decision.prevId >= 0)
       {
         prvState    = prevStates + decision.prevId;
         m_numSigSbb = prvState->m_numSigSbb + !!decision.absLevel;
-        ::memcpy(m_absLevelsAndCtxInit, prvState->m_absLevelsAndCtxInit, 16 * sizeof(uint8_t));
+        prvLevels   = prvState->m_absLevels;
       }
       else
       {
         m_numSigSbb = 1;
-        ::memset(m_absLevelsAndCtxInit, 0, 16 * sizeof(uint8_t));
       }
-      reinterpret_cast<uint8_t *>(m_absLevelsAndCtxInit)[scanInfo.insidePos] =
-        (uint8_t) std::min<TCoeff>(255, decision.absLevel);
+      setAbsLevels(m_absLevels, prvLevels, scanInfo.insidePos, (uint8_t) std::min<TCoeff>(255, decision.absLevel));
 #if JVET_AE0102_LFNST_CTX
       m_commonCtx.update(scanInfo, prvState, *this, bLfnst);
 #else
       m_commonCtx.update(scanInfo, prvState, *this);
 #endif
 
-      TCoeff  tinit   = m_absLevelsAndCtxInit[ 8 + scanInfo.nextInsidePos ];
+      TCoeff  tinit   = m_commonCtx.ctxInit(m_ctxInitIdx)[scanInfo.nextInsidePos];
       TCoeff  sumNum  =   tinit        & 7;
       TCoeff  sumAbs1 = ( tinit >> 3 ) & 31;
       TCoeff  sumGt1  = sumAbs1        - sumNum;
@@ -1978,7 +1917,7 @@ const CtxSet &ctxSetGt4 = isLfnst ? Ctx::GtxFlagL[6 + chType] : Ctx::GtxFlag[6 +
       ::memset(levels + scanInfo.scanIdx, 0, setCpSize);
     }
     sbbFlags[scanInfo.sbbPos] = !!currState.m_numSigSbb;
-    ::memcpy(levels + scanInfo.scanIdx, currState.m_absLevelsAndCtxInit, scanInfo.sbbSize * sizeof(uint8_t));
+    ::memcpy(levels + scanInfo.scanIdx, currState.m_absLevels, scanInfo.sbbSize * sizeof(uint8_t));
 
     const int sigNSbb     = ((scanInfo.nextSbbRight ? sbbFlags[scanInfo.nextSbbRight] : false)
                              || (scanInfo.nextSbbBelow ? sbbFlags[scanInfo.nextSbbBelow] : false)
@@ -1999,7 +1938,7 @@ const CtxSet &ctxSetGt4 = isLfnst ? Ctx::GtxFlagL[6 + chType] : Ctx::GtxFlag[6 +
     currState.m_refSbbCtxId = currState.m_stateId;
     currState.m_sbbFracBits = m_sbbFlagBits[sigNSbb];
 
-    uint16_t         templateCtxInit[16];
+    uint16_t        *templateCtxInit = m_ctxInit[currState.m_stateId];
     const int        scanBeg   = scanInfo.scanIdx - scanInfo.sbbSize;
     const NbInfoOut *nbOut     = m_nbInfo + scanBeg;
     const uint8_t *  absLevels = levels + scanBeg;
@@ -2073,9 +2012,9 @@ const CtxSet &ctxSetGt4 = isLfnst ? Ctx::GtxFlagL[6 + chType] : Ctx::GtxFlag[6 +
         templateCtxInit[id] = 0;
       }
     }
-    ::memset(currState.m_absLevelsAndCtxInit, 0, 16 * sizeof(uint8_t));
-    ::memcpy(currState.m_absLevelsAndCtxInit + 8, templateCtxInit, scanInfo.sbbSize * sizeof(uint16_t));
-    ::memset(currState.m_absLevelsAndCtxInit + 8 + scanInfo.sbbSize, 0, (16 - scanInfo.sbbSize) * sizeof(uint16_t));
+    ::memset(templateCtxInit + scanInfo.sbbSize, 0, (16 - scanInfo.sbbSize) * sizeof(uint16_t));
+    ::memset(currState.m_absLevels, 0, sizeof(currState.m_absLevels));
+    currState.m_ctxInitIdx = currState.m_stateId;
   }
 
   /*================================================================================*/
@@ -2426,227 +2365,17 @@ const CtxSet &ctxSetGt4 = isLfnst ? Ctx::GtxFlagL[6 + chType] : Ctx::GtxFlag[6 +
 #endif
       {
 #if TCQ_8STATES
+        for (int k = 0; k < numStates; k++)
+#else
+        for (int k = 0; k < 4; k++)
+#endif
+        {
 #if JVET_AE0102_LFNST_CTX
-        int ctxType = 0;
-        ctxType     = lfnstIdx > 0 ? 1 : 0;
-#if JVET_AE0102_LFNST_CTX
-        switch (scanInfo.nextNbInfoSbb.num[ctxType])
+          m_currStates[k].updateState(scanInfo, m_prevStates, decisions[k], lfnstIdx > 0 ? 1 : 0);
 #else
-        switch (scanInfo.nextNbInfoSbb.num)
+          m_currStates[k].updateState(scanInfo, m_prevStates, decisions[k]);
 #endif
-        {
-        case 0:
-          m_currStates[0].updateState<0>(scanInfo, m_prevStates, decisions[0], ctxType);
-          m_currStates[1].updateState<0>(scanInfo, m_prevStates, decisions[1], ctxType);
-          m_currStates[2].updateState<0>(scanInfo, m_prevStates, decisions[2], ctxType);
-          m_currStates[3].updateState<0>(scanInfo, m_prevStates, decisions[3], ctxType);
-
-          if (numStates > 4)
-          {
-            m_currStates[4].updateState<0>(scanInfo, m_prevStates, decisions[4], ctxType);
-            m_currStates[5].updateState<0>(scanInfo, m_prevStates, decisions[5], ctxType);
-            m_currStates[6].updateState<0>(scanInfo, m_prevStates, decisions[6], ctxType);
-            m_currStates[7].updateState<0>(scanInfo, m_prevStates, decisions[7], ctxType);
-          }
-          break;
-        case 1:
-          m_currStates[0].updateState<1>(scanInfo, m_prevStates, decisions[0], ctxType);
-          m_currStates[1].updateState<1>(scanInfo, m_prevStates, decisions[1], ctxType);
-          m_currStates[2].updateState<1>(scanInfo, m_prevStates, decisions[2], ctxType);
-          m_currStates[3].updateState<1>(scanInfo, m_prevStates, decisions[3], ctxType);
-
-          if (numStates > 4)
-          {
-            m_currStates[4].updateState<1>(scanInfo, m_prevStates, decisions[4], ctxType);
-            m_currStates[5].updateState<1>(scanInfo, m_prevStates, decisions[5], ctxType);
-            m_currStates[6].updateState<1>(scanInfo, m_prevStates, decisions[6], ctxType);
-            m_currStates[7].updateState<1>(scanInfo, m_prevStates, decisions[7], ctxType);
-          }
-          break;
-        case 2:
-          m_currStates[0].updateState<2>(scanInfo, m_prevStates, decisions[0], ctxType);
-          m_currStates[1].updateState<2>(scanInfo, m_prevStates, decisions[1], ctxType);
-          m_currStates[2].updateState<2>(scanInfo, m_prevStates, decisions[2], ctxType);
-          m_currStates[3].updateState<2>(scanInfo, m_prevStates, decisions[3], ctxType);
-
-          if (numStates > 4)
-          {
-            m_currStates[4].updateState<2>(scanInfo, m_prevStates, decisions[4], ctxType);
-            m_currStates[5].updateState<2>(scanInfo, m_prevStates, decisions[5], ctxType);
-            m_currStates[6].updateState<2>(scanInfo, m_prevStates, decisions[6], ctxType);
-            m_currStates[7].updateState<2>(scanInfo, m_prevStates, decisions[7], ctxType);
-          }
-          break;
-        case 3:
-          m_currStates[0].updateState<3>(scanInfo, m_prevStates, decisions[0], ctxType);
-          m_currStates[1].updateState<3>(scanInfo, m_prevStates, decisions[1], ctxType);
-          m_currStates[2].updateState<3>(scanInfo, m_prevStates, decisions[2], ctxType);
-          m_currStates[3].updateState<3>(scanInfo, m_prevStates, decisions[3], ctxType);
-
-          if (numStates > 4)
-          {
-            m_currStates[4].updateState<3>(scanInfo, m_prevStates, decisions[4], ctxType);
-            m_currStates[5].updateState<3>(scanInfo, m_prevStates, decisions[5], ctxType);
-            m_currStates[6].updateState<3>(scanInfo, m_prevStates, decisions[6], ctxType);
-            m_currStates[7].updateState<3>(scanInfo, m_prevStates, decisions[7], ctxType);
-          }
-          break;
-        case 4:
-          m_currStates[0].updateState<4>(scanInfo, m_prevStates, decisions[0], ctxType);
-          m_currStates[1].updateState<4>(scanInfo, m_prevStates, decisions[1], ctxType);
-          m_currStates[2].updateState<4>(scanInfo, m_prevStates, decisions[2], ctxType);
-          m_currStates[3].updateState<4>(scanInfo, m_prevStates, decisions[3], ctxType);
-
-          if (numStates > 4)
-          {
-            m_currStates[4].updateState<4>(scanInfo, m_prevStates, decisions[4], ctxType);
-            m_currStates[5].updateState<4>(scanInfo, m_prevStates, decisions[5], ctxType);
-            m_currStates[6].updateState<4>(scanInfo, m_prevStates, decisions[6], ctxType);
-            m_currStates[7].updateState<4>(scanInfo, m_prevStates, decisions[7], ctxType);
-          }
-          break;
-        default:
-          m_currStates[0].updateState<5>(scanInfo, m_prevStates, decisions[0], ctxType);
-          m_currStates[1].updateState<5>(scanInfo, m_prevStates, decisions[1], ctxType);
-          m_currStates[2].updateState<5>(scanInfo, m_prevStates, decisions[2], ctxType);
-          m_currStates[3].updateState<5>(scanInfo, m_prevStates, decisions[3], ctxType);
-
-          if (numStates > 4)
-          {
-            m_currStates[4].updateState<5>(scanInfo, m_prevStates, decisions[4], ctxType);
-            m_currStates[5].updateState<5>(scanInfo, m_prevStates, decisions[5], ctxType);
-            m_currStates[6].updateState<5>(scanInfo, m_prevStates, decisions[6], ctxType);
-            m_currStates[7].updateState<5>(scanInfo, m_prevStates, decisions[7], ctxType);
-          }
         }
-#else
-        switch (scanInfo.nextNbInfoSbb.num)
-        {
-        case 0:
-          m_currStates[0].updateState<0>(scanInfo, m_prevStates, decisions[0]);
-          m_currStates[1].updateState<0>(scanInfo, m_prevStates, decisions[1]);
-          m_currStates[2].updateState<0>(scanInfo, m_prevStates, decisions[2]);
-          m_currStates[3].updateState<0>(scanInfo, m_prevStates, decisions[3]);
-
-          if (numStates > 4)
-          {
-            m_currStates[4].updateState<0>(scanInfo, m_prevStates, decisions[4]);
-            m_currStates[5].updateState<0>(scanInfo, m_prevStates, decisions[5]);
-            m_currStates[6].updateState<0>(scanInfo, m_prevStates, decisions[6]);
-            m_currStates[7].updateState<0>(scanInfo, m_prevStates, decisions[7]);
-          }
-          break;
-        case 1:
-          m_currStates[0].updateState<1>(scanInfo, m_prevStates, decisions[0]);
-          m_currStates[1].updateState<1>(scanInfo, m_prevStates, decisions[1]);
-          m_currStates[2].updateState<1>(scanInfo, m_prevStates, decisions[2]);
-          m_currStates[3].updateState<1>(scanInfo, m_prevStates, decisions[3]);
-
-          if (numStates > 4)
-          {
-            m_currStates[4].updateState<1>(scanInfo, m_prevStates, decisions[4]);
-            m_currStates[5].updateState<1>(scanInfo, m_prevStates, decisions[5]);
-            m_currStates[6].updateState<1>(scanInfo, m_prevStates, decisions[6]);
-            m_currStates[7].updateState<1>(scanInfo, m_prevStates, decisions[7]);
-          }
-          break;
-        case 2:
-          m_currStates[0].updateState<2>(scanInfo, m_prevStates, decisions[0]);
-          m_currStates[1].updateState<2>(scanInfo, m_prevStates, decisions[1]);
-          m_currStates[2].updateState<2>(scanInfo, m_prevStates, decisions[2]);
-          m_currStates[3].updateState<2>(scanInfo, m_prevStates, decisions[3]);
-
-          if (numStates > 4)
-          {
-            m_currStates[4].updateState<2>(scanInfo, m_prevStates, decisions[4]);
-            m_currStates[5].updateState<2>(scanInfo, m_prevStates, decisions[5]);
-            m_currStates[6].updateState<2>(scanInfo, m_prevStates, decisions[6]);
-            m_currStates[7].updateState<2>(scanInfo, m_prevStates, decisions[7]);
-          }
-          break;
-        case 3:
-          m_currStates[0].updateState<3>(scanInfo, m_prevStates, decisions[0]);
-          m_currStates[1].updateState<3>(scanInfo, m_prevStates, decisions[1]);
-          m_currStates[2].updateState<3>(scanInfo, m_prevStates, decisions[2]);
-          m_currStates[3].updateState<3>(scanInfo, m_prevStates, decisions[3]);
-
-          if (numStates > 4)
-          {
-            m_currStates[4].updateState<3>(scanInfo, m_prevStates, decisions[4]);
-            m_currStates[5].updateState<3>(scanInfo, m_prevStates, decisions[5]);
-            m_currStates[6].updateState<3>(scanInfo, m_prevStates, decisions[6]);
-            m_currStates[7].updateState<3>(scanInfo, m_prevStates, decisions[7]);
-          }
-          break;
-        case 4:
-          m_currStates[0].updateState<4>(scanInfo, m_prevStates, decisions[0]);
-          m_currStates[1].updateState<4>(scanInfo, m_prevStates, decisions[1]);
-          m_currStates[2].updateState<4>(scanInfo, m_prevStates, decisions[2]);
-          m_currStates[3].updateState<4>(scanInfo, m_prevStates, decisions[3]);
-
-          if (numStates > 4)
-          {
-            m_currStates[4].updateState<4>(scanInfo, m_prevStates, decisions[4]);
-            m_currStates[5].updateState<4>(scanInfo, m_prevStates, decisions[5]);
-            m_currStates[6].updateState<4>(scanInfo, m_prevStates, decisions[6]);
-            m_currStates[7].updateState<4>(scanInfo, m_prevStates, decisions[7]);
-          }
-          break;
-        default:
-          m_currStates[0].updateState<5>(scanInfo, m_prevStates, decisions[0]);
-          m_currStates[1].updateState<5>(scanInfo, m_prevStates, decisions[1]);
-          m_currStates[2].updateState<5>(scanInfo, m_prevStates, decisions[2]);
-          m_currStates[3].updateState<5>(scanInfo, m_prevStates, decisions[3]);
-
-          if (numStates > 4)
-          {
-            m_currStates[4].updateState<5>(scanInfo, m_prevStates, decisions[4]);
-            m_currStates[5].updateState<5>(scanInfo, m_prevStates, decisions[5]);
-            m_currStates[6].updateState<5>(scanInfo, m_prevStates, decisions[6]);
-            m_currStates[7].updateState<5>(scanInfo, m_prevStates, decisions[7]);
-          }
-        }
-#endif
-#else
-        switch (scanInfo.nextNbInfoSbb.num)
-        {
-        case 0:
-          m_currStates[0].updateState<0>(scanInfo, m_prevStates, decisions[0]);
-          m_currStates[1].updateState<0>(scanInfo, m_prevStates, decisions[1]);
-          m_currStates[2].updateState<0>(scanInfo, m_prevStates, decisions[2]);
-          m_currStates[3].updateState<0>(scanInfo, m_prevStates, decisions[3]);
-          break;
-        case 1:
-          m_currStates[0].updateState<1>(scanInfo, m_prevStates, decisions[0]);
-          m_currStates[1].updateState<1>(scanInfo, m_prevStates, decisions[1]);
-          m_currStates[2].updateState<1>(scanInfo, m_prevStates, decisions[2]);
-          m_currStates[3].updateState<1>(scanInfo, m_prevStates, decisions[3]);
-          break;
-        case 2:
-          m_currStates[0].updateState<2>(scanInfo, m_prevStates, decisions[0]);
-          m_currStates[1].updateState<2>(scanInfo, m_prevStates, decisions[1]);
-          m_currStates[2].updateState<2>(scanInfo, m_prevStates, decisions[2]);
-          m_currStates[3].updateState<2>(scanInfo, m_prevStates, decisions[3]);
-          break;
-        case 3:
-          m_currStates[0].updateState<3>(scanInfo, m_prevStates, decisions[0]);
-          m_currStates[1].updateState<3>(scanInfo, m_prevStates, decisions[1]);
-          m_currStates[2].updateState<3>(scanInfo, m_prevStates, decisions[2]);
-          m_currStates[3].updateState<3>(scanInfo, m_prevStates, decisions[3]);
-          break;
-        case 4:
-          m_currStates[0].updateState<4>(scanInfo, m_prevStates, decisions[0]);
-          m_currStates[1].updateState<4>(scanInfo, m_prevStates, decisions[1]);
-          m_currStates[2].updateState<4>(scanInfo, m_prevStates, decisions[2]);
-          m_currStates[3].updateState<4>(scanInfo, m_prevStates, decisions[3]);
-          break;
-        default:
-          m_currStates[0].updateState<5>(scanInfo, m_prevStates, decisions[0]);
-          m_currStates[1].updateState<5>(scanInfo, m_prevStates, decisions[1]);
-          m_currStates[2].updateState<5>(scanInfo, m_prevStates, decisions[2]);
-          m_currStates[3].updateState<5>(scanInfo, m_prevStates, decisions[3]);
-        }
-#endif
       }
 
       if (scanInfo.spt == SCAN_SOCSBB)
