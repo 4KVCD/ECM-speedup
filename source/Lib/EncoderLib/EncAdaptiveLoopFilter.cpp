@@ -747,6 +747,91 @@ double AlfCovariance::calcErrorForCoeffs( const int *clip, const int *coeff, con
   return error / factor;
 }
 
+#if ALF_CLIP_COV
+// perf: the covariance elements E(clip[i], clip[j], i, j) and y(clip[i], i) of one clipping, gathered once for the
+// many error evaluations of the coefficient quantization searches; the functions below are calcErrorForCoeffs,
+// calcInitErrorForCoeffs, updateErrorForCoeffsDelta and calcErrorForCoeffsDelta with the same arithmetic (operations,
+// types and order) on these elements.
+struct AlfClipCov
+{
+  int   n;
+  float e[MAX_NUM_ALF_LUMA_COEFF][MAX_NUM_ALF_LUMA_COEFF];
+  float y[MAX_NUM_ALF_LUMA_COEFF];
+
+  AlfClipCov( const AlfCovariance& cov, const int* clip, const int numCoeff ) : n( numCoeff )
+  {
+    for( int i = 0; i < n; i++ )
+    {
+      for( int j = 0; j < n; j++ )
+      {
+        e[i][j] = cov.E( clip[i], clip[j], i, j );
+      }
+      y[i] = cov.y( clip[i], i );
+    }
+  }
+
+  double calcErrorForCoeffs( const int* coeff, const int bitDepth, const int scaleIdx ) const
+  {
+    const double factor = (double) ( 1 << ( bitDepth - 1 + AdaptiveLoopFilter::m_SCALE_SHIFT ) );
+    double       error  = 0;
+    for( int i = 0; i < n; i++ )
+    {
+      double sum = 0;
+      for( int j = 0; j < i; j++ )
+      {
+        sum += e[i][j] * coeff[j];
+      }
+      error += ( ( e[i][i] * coeff[i] + sum * 2 ) * AdaptiveLoopFilter::m_SCALE_FACTOR[scaleIdx] / factor - 2 * y[i] ) * coeff[i] * AdaptiveLoopFilter::m_SCALE_FACTOR[scaleIdx];
+    }
+    return error / factor;
+  }
+
+  void calcInitErrorForCoeffs( double* cAc, double* cA, double* bc, const int* coeff, const int bitDepth, const int scaleIdx ) const
+  {
+    const double factor = (double) ( 1 << ( bitDepth - 1 + AdaptiveLoopFilter::m_SCALE_SHIFT ) );
+    *cAc                = 0;
+    *bc                 = 0;
+    for( int i = 0; i < n; i++ )
+    {
+      double sum = 0;
+      for( int j = 0; j < n; j++ )
+      {
+        sum += e[i][j] * coeff[j] * AdaptiveLoopFilter::m_SCALE_FACTOR[scaleIdx];
+      }
+      ( *cAc ) += sum * coeff[i] * AdaptiveLoopFilter::m_SCALE_FACTOR[scaleIdx];
+      cA[i] = 2 * sum;
+      *bc += 2 * coeff[i] * AdaptiveLoopFilter::m_SCALE_FACTOR[scaleIdx] * y[i];
+    }
+    *cAc /= factor * factor;
+    for( int i = 0; i < n; i++ )
+    {
+      cA[i] /= factor;
+    }
+    *bc /= factor;
+  }
+
+  void updateErrorForCoeffsDelta( double* cAc, double* cA, double* bc, const double cDelta, const int modInd ) const
+  {
+    *cAc = ( *cAc ) + cDelta * cA[modInd] + cDelta * cDelta * e[modInd][modInd];
+    for( int i = 0; i < n; i++ )
+    {
+      cA[i] += 2 * cDelta * e[modInd][i];
+    }
+    ( *bc ) = ( *bc ) + 2 * y[modInd] * cDelta;
+  }
+
+  double calcErrorForCoeffsDelta( const double cAc, const double* cA, const double bc, const double cDelta, const int modInd ) const
+  {
+    double error;
+    error = cAc - bc;
+    error += cDelta * cA[modInd];
+    error += cDelta * cDelta * e[modInd][modInd];
+    error -= 2 * y[modInd] * cDelta;
+    return error;
+  }
+};
+#endif
+
 double AlfCovariance::calcErrorForCcAlfCoeffs(const int16_t *coeff, const int numCoeff, const int bitDepth) const
 {
   double factor = 1 << (bitDepth - 1);
@@ -4441,6 +4526,9 @@ void EncAdaptiveLoopFilter::deriveCoeffQuantMultipleBitDepths(int *filterClipp, 
   cov.optimizeFilter( shape, filterClipp, filterCoeff, optimizeClip );
 #endif
 
+#if ALF_CLIP_COV
+  const AlfClipCov clipCov( cov, filterClipp, numCoeff );
+#endif
   int minBits = 8;
   int numBitCand = 1;
 #if JVET_AG0158_ALF_LUMA_COEFF_PRECISION
@@ -4533,8 +4621,8 @@ void EncAdaptiveLoopFilter::deriveCoeffQuantMultipleBitDepths(int *filterClipp, 
         m_filterCoeffSet[filtIdxStore][numCoeff - 1] = 0;
 
         int modified=1;
-        double errRef = cov.calcErrorForCoeffs(filterClipp, m_filterCoeffSet[filtIdxStore], numCoeff, bitDepth, scaleIdx);
-        cov.calcInitErrorForCoeffs(&cAc, cA, &bc, filterClipp, m_filterCoeffSet[filtIdxStore], numCoeff, bitDepth, scaleIdx);
+        double errRef = clipCov.calcErrorForCoeffs( m_filterCoeffSet[filtIdxStore], bitDepth, scaleIdx );
+        clipCov.calcInitErrorForCoeffs( &cAc, cA, &bc, m_filterCoeffSet[filtIdxStore], bitDepth, scaleIdx );
 
         while( modified )
         {
@@ -4567,7 +4655,7 @@ void EncAdaptiveLoopFilter::deriveCoeffQuantMultipleBitDepths(int *filterClipp, 
               }
               m_filterCoeffSet[filtIdxStore][k] -= sign;
 #endif
-              double error = cov.calcErrorForCoeffsDelta(cAc, cA, bc, filterClipp, m_filterCoeffSet[filtIdxStore], numCoeff, bitDepth, coeffDelta, k);
+              double error = clipCov.calcErrorForCoeffsDelta( cAc, cA, bc, coeffDelta, k );
               if( error < errMin )
               {
                 errMin = error;
@@ -4590,12 +4678,12 @@ void EncAdaptiveLoopFilter::deriveCoeffQuantMultipleBitDepths(int *filterClipp, 
 #endif
               modified++;
               errRef = errMin;
-              cov.updateErrorForCoeffsDelta(&cAc, cA, &bc, filterClipp, m_filterCoeffSet[filtIdxStore], numCoeff, bitDepth, coeffDelta, minInd);
+              clipCov.updateErrorForCoeffsDelta( &cAc, cA, &bc, coeffDelta, minInd );
             }
           }
         }
 #if ALF_RD_COST_BUG_FIX
-        errRef = cov.calcErrorForCoeffs(filterClipp, m_filterCoeffSet[filtIdxStore], numCoeff, bitDepth, scaleIdx); // recalculate for computational stability
+        errRef = clipCov.calcErrorForCoeffs( m_filterCoeffSet[filtIdxStore], bitDepth, scaleIdx ); // recalculate for computational stability
 #endif
 #if JVET_AK0123_ALF_COEFF_RESTRICTION
         int bits = lengthFilterCoeffsOneFilter(shape, m_filterCoeffSet[filtIdxStore], true, bitDepth, mantissa);
@@ -5221,6 +5309,9 @@ double EncAdaptiveLoopFilter::deriveCoeffQuant(int* filterClipp, int* filterCoef
   cov.optimizeFilter( shape, filterClipp, filterCoeff, optimizeClip );
 #endif
 
+#if ALF_CLIP_COV
+  const AlfClipCov clipCov( cov, filterClipp, numCoeff );
+#endif
 #if JVET_AK0123_ALF_COEFF_RESTRICTION
   char scaleIdxFrom = 0, scaleIdxTo = 1;
   if (tryImproveScale)
@@ -5265,9 +5356,9 @@ double EncAdaptiveLoopFilter::deriveCoeffQuant(int* filterClipp, int* filterCoef
 
     int modified=1;
 
-    double errRef=cov.calcErrorForCoeffs( filterClipp, filterCoeffQuant, numCoeff, bitDepth, scaleIdxRef);
+    double errRef=clipCov.calcErrorForCoeffs( filterCoeffQuant, bitDepth, scaleIdxRef );
 #if ALF_PRECISION_VARIETY
-    cov.calcInitErrorForCoeffs(&cAc, cA, &bc, filterClipp, filterCoeffQuant, numCoeff, bitDepth, scaleIdxRef);
+    clipCov.calcInitErrorForCoeffs( &cAc, cA, &bc, filterCoeffQuant, bitDepth, scaleIdxRef );
 #endif
     while( modified )
     {
@@ -5302,7 +5393,7 @@ double EncAdaptiveLoopFilter::deriveCoeffQuant(int* filterClipp, int* filterCoef
           filterCoeffQuant[k] -= sign;
 #endif
 #if ALF_PRECISION_VARIETY
-          double error = cov.calcErrorForCoeffsDelta(cAc, cA, bc, filterClipp, filterCoeffQuant, numCoeff, bitDepth, coeffDelta, k);
+          double error = clipCov.calcErrorForCoeffsDelta( cAc, cA, bc, coeffDelta, k );
 #else
           double error = cov.calcErrorForCoeffs( filterClipp, filterCoeffQuant, numCoeff, bitDepth, scaleIdxRef );
 #endif
@@ -5329,14 +5420,14 @@ double EncAdaptiveLoopFilter::deriveCoeffQuant(int* filterClipp, int* filterCoef
           modified++;
           errRef = errMin;
 #if ALF_PRECISION_VARIETY
-          cov.updateErrorForCoeffsDelta(&cAc, cA, &bc, filterClipp, filterCoeffQuant, numCoeff, bitDepth, coeffDelta, minInd);
+          clipCov.updateErrorForCoeffsDelta( &cAc, cA, &bc, coeffDelta, minInd );
 #endif
         }
       }
     }
 #if ALF_RD_COST_BUG_FIX
 #if ALF_PRECISION_VARIETY
-    errRef = cov.calcErrorForCoeffs(filterClipp, filterCoeffQuant, numCoeff, bitDepth, scaleIdxRef); // recalculate for computational stability
+    errRef = clipCov.calcErrorForCoeffs( filterCoeffQuant, bitDepth, scaleIdxRef ); // recalculate for computational stability
 #endif
 #endif
 #if JVET_AK0123_ALF_COEFF_RESTRICTION
@@ -5466,7 +5557,10 @@ void EncAdaptiveLoopFilter::roundFiltCoeff( int *filterCoeffQuant, double *filte
 double EncAdaptiveLoopFilter::tryImproveCoeffQuant(int* filterClipp, int* filterCoeffQuant, const AlfCovariance& cov, const AlfFilterShape& shape, const int bitDepth, const bool optimizeClip, const bool isLuma, const int mantissa, double lambda, char& scaleIdxRef)
 {
   const int numCoeff = shape.numCoeff;
-  double errRef = cov.calcErrorForCoeffs(filterClipp, filterCoeffQuant, numCoeff, bitDepth, scaleIdxRef);
+#if ALF_CLIP_COV
+  const AlfClipCov clipCov( cov, filterClipp, numCoeff );
+#endif
+  double errRef = clipCov.calcErrorForCoeffs( filterCoeffQuant, bitDepth, scaleIdxRef );
   int bitsRef = lengthFilterCoeffsOneFilter(shape, filterCoeffQuant, isLuma, bitDepth, mantissa);
   double costRef = errRef + lambda * bitsRef;
 
@@ -5501,8 +5595,8 @@ double EncAdaptiveLoopFilter::tryImproveCoeffQuant(int* filterClipp, int* filter
     sp.scaleIdx = curScaleIdx;
 
     double scaleFactor = (double)AdaptiveLoopFilter::m_SCALE_FACTOR[(int)curScaleIdx] / (1 << AdaptiveLoopFilter::m_SCALE_SHIFT);
-    sp.error = cov.calcErrorForCoeffs(filterClipp, sp.coeff.data(), numCoeff, bitDepth, curScaleIdx);
-    cov.calcInitErrorForCoeffs(&cAc, cA, &bc, filterClipp, sp.coeff.data(), numCoeff, bitDepth, curScaleIdx);
+    sp.error = clipCov.calcErrorForCoeffs( sp.coeff.data(), bitDepth, curScaleIdx );
+    clipCov.calcInitErrorForCoeffs( &cAc, cA, &bc, sp.coeff.data(), bitDepth, curScaleIdx );
     bool modified = true;
     while (modified)
     {
@@ -5522,7 +5616,7 @@ double EncAdaptiveLoopFilter::tryImproveCoeffQuant(int* filterClipp, int* filter
           }
           sp.coeff[k] = coeffRestriction.getParam().idxToCoeff[newIdx];
           coeffDelta = (double)(sp.coeff[k] - oldVal) / (double)factor * scaleFactor;
-          double error = cov.calcErrorForCoeffsDelta(cAc, cA, bc, filterClipp, sp.coeff.data(), numCoeff, bitDepth, coeffDelta, k);
+          double error = clipCov.calcErrorForCoeffsDelta( cAc, cA, bc, coeffDelta, k );
           if (error < errMin)
           {
             errMin = error;
@@ -5537,11 +5631,11 @@ double EncAdaptiveLoopFilter::tryImproveCoeffQuant(int* filterClipp, int* filter
           coeffDelta = (double)(sp.coeff[minInd] - oldVal) / (double)factor * scaleFactor;
           modified = true;
           sp.error = errMin;
-          cov.updateErrorForCoeffsDelta(&cAc, cA, &bc, filterClipp, sp.coeff.data(), numCoeff, bitDepth, coeffDelta, minInd);
+          clipCov.updateErrorForCoeffsDelta( &cAc, cA, &bc, coeffDelta, minInd );
         }
       }
     }
-    sp.error = cov.calcErrorForCoeffs(filterClipp, sp.coeff.data(), numCoeff, bitDepth, sp.scaleIdx);
+    sp.error = clipCov.calcErrorForCoeffs( sp.coeff.data(), bitDepth, sp.scaleIdx );
     sp.bits = lambda > 0 ? lengthFilterCoeffsOneFilter(shape, sp.coeff.data(), isLuma, bitDepth, mantissa) : 0;
     sp.rdCost = sp.error + lambda * sp.bits;
   }
@@ -5580,7 +5674,7 @@ double EncAdaptiveLoopFilter::tryImproveCoeffQuant(int* filterClipp, int* filter
     double curError = startQueue.back().error;
     int curBits = startQueue.back().bits;
     startQueue.pop_back();
-    cov.calcInitErrorForCoeffs(&cAc, cA, &bc, filterClipp, curFilterCoef, numCoeff, bitDepth, curScaleIdx);
+    clipCov.calcInitErrorForCoeffs( &cAc, cA, &bc, curFilterCoef, bitDepth, curScaleIdx );
     int iteration = 0, nonImprovingIterationNum = 0;
     while (nonImprovingIterationNum < numCoeff * ALF_SA_NON_IMPROVES_PER_PARAMETER_TO_STOP)
     {
@@ -5604,8 +5698,8 @@ double EncAdaptiveLoopFilter::tryImproveCoeffQuant(int* filterClipp, int* filter
         {
           posChanged++;
           coeffDelta = (double)(tmpFilterCoef[i] - curFilterCoef[i]) / (double)factor * scaleFactor;
-          error = cov.calcErrorForCoeffsDelta(cAc, cA, bc, filterClipp, tmpFilterCoef, numCoeff, bitDepth, coeffDelta, i);
-          cov.updateErrorForCoeffsDelta(&cAc, cA, &bc, filterClipp, tmpFilterCoef, numCoeff, bitDepth, coeffDelta, i);
+          error = clipCov.calcErrorForCoeffsDelta( cAc, cA, bc, coeffDelta, i );
+          clipCov.updateErrorForCoeffsDelta( &cAc, cA, &bc, coeffDelta, i );
         }
       }
       if (posChanged == 0)
@@ -5649,7 +5743,7 @@ double EncAdaptiveLoopFilter::tryImproveCoeffQuant(int* filterClipp, int* filter
           {
             coeffDelta = (double)(-tmpFilterCoef[i] + curFilterCoef[i]) / (double)factor * scaleFactor;
             tmpFilterCoef[i] = curFilterCoef[i];
-            cov.updateErrorForCoeffsDelta(&cAc, cA, &bc, filterClipp, tmpFilterCoef, numCoeff, bitDepth, coeffDelta, i);
+            clipCov.updateErrorForCoeffsDelta( &cAc, cA, &bc, coeffDelta, i );
           }
         }
       }
@@ -5657,7 +5751,7 @@ double EncAdaptiveLoopFilter::tryImproveCoeffQuant(int* filterClipp, int* filter
       nonImprovingIterationNum++;
     }
 
-    curError = cov.calcErrorForCoeffs(filterClipp, tmpFilterCoef, numCoeff, bitDepth, curScaleIdx); // recalculate for computational stability
+    curError = clipCov.calcErrorForCoeffs( tmpFilterCoef, bitDepth, curScaleIdx ); // recalculate for computational stability
 
     double curCost = curError + lambda * curBits;
     bool isNew = true;
