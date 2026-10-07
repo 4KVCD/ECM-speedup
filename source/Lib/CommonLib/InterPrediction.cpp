@@ -27836,25 +27836,6 @@ void InterPrediction::xGetPredBlkTpl(const CodingUnit& cu, const ComponentID com
   const bool use4TapTM = (isLuma(compID) && nFilterIdx == 1) ? true : false;
 #endif
 
-  // perf: the same template interpolations repeat often; share the MC result cache (see McCache.h). The flags
-  // match what xPredInterBlk would use for the same filter calls (not bilinear, no alternative half-pel filter,
-  // no bi filter, rounded output)
-  McCacheKey mcKey;
-  if( m_useMcCache )
-  {
-    m_mcCache.setPicture( cu.cs->picture, cu.slice->getPOC() );
-    uint8_t flags = 16;
-#if JVET_AL0161_4TAP_TM
-    flags |= use4TapTM ? 8 : 0;
-#endif
-    mcKey = { ref, (int) refStride, (int16_t) bw, (int16_t) bh, (int16_t) xFrac, (int16_t) yFrac, (int8_t) compID,
-              (int8_t) nFilterIdx, (int8_t) cu.chromaFormat, flags, cu.slice->clpRng( compID ) };
-    if( m_mcCache.lookup( mcKey, dst, dstStride ) )
-    {
-      return;
-    }
-  }
-
   if ( yFrac == 0 )
   {
 #if JVET_AL0161_4TAP_TM
@@ -27910,10 +27891,6 @@ void InterPrediction::xGetPredBlkTpl(const CodingUnit& cu, const ComponentID com
     m_if.filterVer(compID, tmpBuf.buf + ((vFilterSize >> 1) - 1)*tmpBuf.stride, tmpBuf.stride, dst, dstStride, bw, bh, yFrac, false, true, cu.chromaFormat, cu.slice->clpRng(compID), nFilterIdx, false, useAltHpelIf);
 #endif
     JVET_AM0295_POP_CACHE_ENABLE();
-  }
-  if( m_useMcCache )
-  {
-    m_mcCache.store( mcKey, dst, dstStride );
   }
 }
 #endif // INTER_LIC
