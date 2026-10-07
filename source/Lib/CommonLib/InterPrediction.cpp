@@ -30335,16 +30335,37 @@ bool InterPrediction::readTplAmvpBuffer(AMVPInfo& dst, const CodingUnit& cu, Ref
 #if JVET_AJ0126_INTER_AMVP_ENHANCEMENT
 void InterPrediction::clearAffineAmvpBuffer()
 {
-  for (int affinetype = 0; affinetype < AFFINE_MODEL_NUM; ++affinetype)
+  if( m_affineAmvpAllWritten )
   {
-    for (int imv = 0; imv < NUM_IMV_MODES; ++imv)
+    for (int affinetype = 0; affinetype < AFFINE_MODEL_NUM; ++affinetype)
     {
-      for (int refIdx = 0; refIdx < MAX_NUM_REF; ++refIdx)
+      for (int imv = 0; imv < NUM_IMV_MODES; ++imv)
       {
-        m_affineAmvpInfo   [affinetype][imv][0][refIdx] = AffineAMVPInfo();
-        m_affineAmvpInfo   [affinetype][imv][1][refIdx] = AffineAMVPInfo();
+        for (int refIdx = 0; refIdx < MAX_NUM_REF; ++refIdx)
+        {
+          m_affineAmvpInfo   [affinetype][imv][0][refIdx] = AffineAMVPInfo();
+          m_affineAmvpInfo   [affinetype][imv][1][refIdx] = AffineAMVPInfo();
+        }
       }
     }
+    m_affineAmvpAllWritten = false;
+    std::fill_n( m_affineAmvpWritten, sizeof( m_affineAmvpWritten ) / sizeof( m_affineAmvpWritten[0] ), uint64_t( 0 ) );
+    return;
+  }
+  // perf: only the entries written since the last clear can differ from the cleared state
+  AffineAMVPInfo* info = &m_affineAmvpInfo[0][0][0][0];
+  for( int w = 0; w < (int) ( sizeof( m_affineAmvpWritten ) / sizeof( m_affineAmvpWritten[0] ) ); w++ )
+  {
+    for( uint64_t bits = m_affineAmvpWritten[w]; bits; bits &= bits - 1 )
+    {
+      int b = 0;
+      while( !( ( bits >> b ) & 1 ) )
+      {
+        b++;
+      }
+      info[w * 64 + b] = AffineAMVPInfo();
+    }
+    m_affineAmvpWritten[w] = 0;
   }
 }
 
@@ -30352,6 +30373,8 @@ void InterPrediction::writeAffineAmvpBuffer(const AffineAMVPInfo& src, const Cod
 {
   AffineAMVPInfo& dst = m_affineAmvpInfo[cu.affineType][cu.imv][eRefList][refIdx];
   dst = src;
+  const ptrdiff_t idx = &dst - &m_affineAmvpInfo[0][0][0][0];
+  m_affineAmvpWritten[idx >> 6] |= uint64_t( 1 ) << ( idx & 63 );
 }
 
 bool InterPrediction::readAffineAmvpBuffer(AffineAMVPInfo& dst, const CodingUnit& cu, RefPicList eRefList, int refIdx)

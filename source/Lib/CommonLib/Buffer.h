@@ -487,12 +487,30 @@ void AreaBuf<T>::copyFrom( const AreaBuf<const T> &other )
     const T* src         = other.buf;
     const unsigned srcStride = other.stride;
 
-    for( unsigned y = 0; y < height; y++ )
+    // perf: small rows of samples are copied inline (a library call per 8-64 byte row costs more than the copy)
+    auto copyRows = [&]( auto rowBytes ) {
+      for( unsigned y = 0; y < height; y++ )
+      {
+        memcpy( (void*) dst, (const void*) src, decltype( rowBytes )::value );
+        dst += stride;
+        src += srcStride;
+      }
+    };
+    switch( sizeof( T ) <= 4 ? width * sizeof( T ) : 0 )
     {
-      memcpy( dst, src, width * sizeof( T ) );
+    case 8:  copyRows( std::integral_constant<size_t, 8>() );  break;
+    case 16: copyRows( std::integral_constant<size_t, 16>() ); break;
+    case 32: copyRows( std::integral_constant<size_t, 32>() ); break;
+    case 64: copyRows( std::integral_constant<size_t, 64>() ); break;
+    default:
+      for( unsigned y = 0; y < height; y++ )
+      {
+        memcpy( dst, src, width * sizeof( T ) );
 
-      dst += stride;
-      src += srcStride;
+        dst += stride;
+        src += srcStride;
+      }
+      break;
     }
   }
 }

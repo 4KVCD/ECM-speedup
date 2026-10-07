@@ -191,6 +191,12 @@ public:
 #if JVET_AJ0126_INTER_AMVP_ENHANCEMENT
 public:
   AffineAMVPInfo m_affineAmvpInfo[AFFINE_MODEL_NUM][NUM_IMV_MODES][NUM_REF_PIC_LIST_01][MAX_NUM_REF];
+private:
+  // perf: entries written since the last clearAffineAmvpBuffer(), which only resets those (it runs for every CU)
+  static constexpr int AFFINE_AMVP_BUF_SIZE = AFFINE_MODEL_NUM * NUM_IMV_MODES * NUM_REF_PIC_LIST_01 * MAX_NUM_REF;
+  uint64_t       m_affineAmvpWritten[( AFFINE_AMVP_BUF_SIZE + 63 ) / 64] = {};
+  bool           m_affineAmvpAllWritten = true;   // initial contents are undefined
+public:
 #endif
 #if JVET_AK0212_GPM_OBMC_MODIFICATION
   bool              m_geoOBMC;
