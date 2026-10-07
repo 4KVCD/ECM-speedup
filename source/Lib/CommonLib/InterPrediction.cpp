@@ -56,6 +56,66 @@
 #include "CommonDefX86.h"
 #endif
 
+#if JVET_AL0079_AFFINE_MC
+#if defined( __SSE2__ )
+#include <emmintrin.h>
+#endif
+// perf: 12-tap 2-D luma interpolation of a block at most 2 samples wide (pixel / 2-sample affine sub-blocks) in one
+// call. Same arithmetic as m_filterHor[0][1][false] (first pass) followed by m_filterVer[0][0][isLast] (second pass),
+// i.e. simdFilter with 12 taps: per sample the 32-bit sum of the 12 products, (sum + offset) >> shift converted to
+// Pel; the second pass clips after that conversion when isLast. Every row reads exactly its 12 taps.
+// (Before, every sample went through two indirect filter calls with their per-call setup.)
+static inline int xDot12Taps( const Pel* s, const TFilterCoeff* c )
+{
+#if defined( __SSE2__ )
+  __m128i v = _mm_add_epi32( _mm_madd_epi16( _mm_loadu_si128( ( const __m128i* ) s ), _mm_loadu_si128( ( const __m128i* ) c ) ),
+                             _mm_madd_epi16( _mm_loadl_epi64( ( const __m128i* ) ( s + 8 ) ), _mm_loadl_epi64( ( const __m128i* ) ( c + 8 ) ) ) );
+  v = _mm_add_epi32( v, _mm_shuffle_epi32( v, 0x4e ) );
+  v = _mm_add_epi32( v, _mm_shuffle_epi32( v, 0xb1 ) );
+  return _mm_cvtsi128_si32( v );
+#else
+  int sum = 0;
+  for( int k = 0; k < 12; k++ )
+  {
+    sum += s[k] * c[k];
+  }
+  return sum;
+#endif
+}
+
+static void xFilter12Tap2DNarrow( const ClpRng& clpRng, const Pel* ref, const int refStride, Pel* dst, const int dstStride,
+                                  const int bw, const int bh, const TFilterCoeff* coeffH, const TFilterCoeff* coeffV,
+                                  const bool isLast )
+{
+  const int headRoom = IF_INTERNAL_FRAC_BITS( clpRng.bd );
+  const int shiftH   = IF_FILTER_PREC - headRoom;
+  const int offsetH  = -IF_INTERNAL_OFFS << shiftH;
+  const int shiftV   = isLast ? IF_FILTER_PREC + headRoom : IF_FILTER_PREC;
+  const int offsetV  = isLast ? ( 1 << ( shiftV - 1 ) ) + ( IF_INTERNAL_OFFS << IF_FILTER_PREC ) : 0;
+  CHECKD( shiftH < 0 || bh + 11 > MAX_CU_SIZE + 16, "unsupported filter parameters" );
+
+  Pel tmp[MAX_CU_SIZE + 16];
+  for( int x = 0; x < bw; x++ )
+  {
+    const Pel* s = ref + x - 5 - 5 * refStride;
+    for( int y = 0; y < bh + 11; y++, s += refStride )
+    {
+      tmp[y] = Pel( ( xDot12Taps( s, coeffH ) + offsetH ) >> shiftH );
+    }
+    Pel* d = dst + x;
+    for( int y = 0; y < bh; y++, d += dstStride )
+    {
+      Pel val = Pel( ( xDot12Taps( tmp + y, coeffV ) + offsetV ) >> shiftV );
+      if( isLast )
+      {
+        val = ClipPel( val, clpRng );
+      }
+      *d = val;
+    }
+  }
+}
+#endif
+
 //! \ingroup CommonLib
 //! \{
 
@@ -6304,6 +6364,23 @@ void InterPrediction::xPredAffineBlk(const ComponentID &compID, const Prediction
           else if (xFrac == 0)
           {
             m_if.m_filterVer[0][1][isLast](clpRng, ref, refStride, dst, dstStride, bw, bh, InterpolationFilter::m_lumaFilter64[yFrac], false);
+          }
+          else if (bw <= 2)
+          {
+            xFilter12Tap2DNarrow(clpRng, ref, refStride, dst, dstStride, bw, bh, InterpolationFilter::m_lumaFilter64[xFrac],
+                                 InterpolationFilter::m_lumaFilter64[yFrac], isLast);
+#ifdef AFFINE_NARROW_CHECK
+            Pel chk[MAX_CU_SIZE * 2];
+            m_if.m_filterHor[0][1][false](clpRng, ref - refIfOfst, refStride, tmpBuf.buf, tmpBuf.stride, bw, blkH4HorInterP, InterpolationFilter::m_lumaFilter64[xFrac], false);
+            m_if.m_filterVer[0][0][isLast](clpRng, tmpBuf.buf + tmpBufIfOfst, tmpBuf.stride, chk, bw, bw, bh, InterpolationFilter::m_lumaFilter64[yFrac], false);
+            for (int y = 0; y < bh; y++)
+            {
+              for (int x = 0; x < bw; x++)
+              {
+                CHECK(chk[y * bw + x] != dst[y * dstStride + x], "xFilter12Tap2DNarrow differs from the two-pass filter");
+              }
+            }
+#endif
           }
           else
           {
