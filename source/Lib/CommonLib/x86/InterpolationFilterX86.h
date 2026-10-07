@@ -3336,9 +3336,183 @@ static void simdInterpolateN2_10BIT_M4(const int16_t* src, int srcStride, int16_
   }
 }
 
+#if ECM_IF_STATS
+#include <cstdio>
+#include <map>
+#include <mutex>
+#include <tuple>
+struct IfStats
+{
+  std::map<std::tuple<int, int, int, int, int, int, int, int>, long long> m;
+  std::mutex mu;
+  ~IfStats()
+  {
+    FILE* f = fopen( "ifstats.txt", "w" );
+    for( auto& kv : m )
+    {
+      auto& k = kv.first;
+      fprintf( f, "%s N=%2d w=%3d h=%3d ver=%d first=%d last=%d bi=%d : %lld\n", std::get<0>( k ) ? "SCALAR" : "all   ", std::get<1>( k ),
+               std::get<2>( k ), std::get<3>( k ), std::get<4>( k ), std::get<5>( k ), std::get<6>( k ), std::get<7>( k ), kv.second );
+    }
+    fclose( f );
+  }
+};
+static inline IfStats& ifStats() { static IfStats s; return s; }
+static inline void ifStatsCount( int scalar, int N, int w, int h, int ver, int first, int last, int bi )
+{
+  std::lock_guard<std::mutex> l( ifStats().mu );
+  ifStats().m[std::make_tuple( scalar, N, w, h, ver, first, last, bi )]++;
+}
+#endif
+
+// perf: 1- and 2-sample wide blocks (template rows/columns of the sub-block and template-matching tools, chroma of
+// small blocks) were filtered by the scalar loop below; tens of millions of calls per frame. Each output sample is a
+// dot product of N taps; with the taps contiguous in memory it maps onto pmaddwd. Loads cover exactly the taps (no
+// over-read) and the sums are the same int32 arithmetic as the scalar loop, so results are identical.
+
+// sum_k p[k] * c[k], k < N (cv: coefficients 0..7 and 8..15, zero padded)
+template<int N>
+static inline int simdDotTapsContig( const Pel* p, const __m128i* cv )
+{
+  __m128i acc;
+  if( N == 2 )
+  {
+    int32_t t;
+    memcpy( &t, p, sizeof( t ) );
+    acc = _mm_madd_epi16( _mm_cvtsi32_si128( t ), cv[0] );
+  }
+  else if( N == 4 )
+  {
+    acc = _mm_madd_epi16( _mm_loadl_epi64( ( const __m128i* ) p ), cv[0] );
+  }
+  else if( N == 6 )
+  {
+    int32_t t;
+    memcpy( &t, p + 4, sizeof( t ) );
+    acc = _mm_madd_epi16( _mm_unpacklo_epi64( _mm_loadl_epi64( ( const __m128i* ) p ), _mm_cvtsi32_si128( t ) ), cv[0] );
+  }
+  else
+  {
+    acc = _mm_madd_epi16( _mm_loadu_si128( ( const __m128i* ) p ), cv[0] );
+    if( N == 12 )
+    {
+      acc = _mm_add_epi32( acc, _mm_madd_epi16( _mm_loadl_epi64( ( const __m128i* )( p + 8 ) ), cv[1] ) );
+    }
+    else
+    {
+      CHECKD( N != 8, "unsupported filter length" );
+    }
+  }
+  acc = _mm_add_epi32( acc, _mm_shuffle_epi32( acc, 0x4e ) );
+  acc = _mm_add_epi32( acc, _mm_shuffle_epi32( acc, 0xb1 ) );
+  return _mm_cvtsi128_si32( acc );
+}
+
+// p[0 .. 2N-1] holds N rows of a 2-sample wide block: s0 = sum_k p[2k] * c[k], s1 = sum_k p[2k+1] * c[k]
+// (ce/co: coefficients at the even/odd 16-bit lanes)
+template<int N>
+static inline void simdDotTapsInterleaved2( const Pel* p, const __m128i* ce, const __m128i* co, int& s0, int& s1 )
+{
+  __m128i a0, a1;
+  if( N == 2 )
+  {
+    const __m128i v = _mm_loadl_epi64( ( const __m128i* ) p );
+    a0              = _mm_madd_epi16( v, ce[0] );
+    a1              = _mm_madd_epi16( v, co[0] );
+  }
+  else
+  {
+    __m128i v = _mm_loadu_si128( ( const __m128i* ) p );
+    a0        = _mm_madd_epi16( v, ce[0] );
+    a1        = _mm_madd_epi16( v, co[0] );
+    if( N >= 6 )
+    {
+      v  = N == 6 ? _mm_loadl_epi64( ( const __m128i* )( p + 8 ) ) : _mm_loadu_si128( ( const __m128i* )( p + 8 ) );
+      a0 = _mm_add_epi32( a0, _mm_madd_epi16( v, ce[1] ) );
+      a1 = _mm_add_epi32( a1, _mm_madd_epi16( v, co[1] ) );
+    }
+    if( N == 12 )
+    {
+      v  = _mm_loadu_si128( ( const __m128i* )( p + 16 ) );
+      a0 = _mm_add_epi32( a0, _mm_madd_epi16( v, ce[2] ) );
+      a1 = _mm_add_epi32( a1, _mm_madd_epi16( v, co[2] ) );
+    }
+  }
+  a0 = _mm_add_epi32( a0, _mm_shuffle_epi32( a0, 0x4e ) );
+  a1 = _mm_add_epi32( a1, _mm_shuffle_epi32( a1, 0x4e ) );
+  a0 = _mm_add_epi32( a0, _mm_shuffle_epi32( a0, 0xb1 ) );
+  a1 = _mm_add_epi32( a1, _mm_shuffle_epi32( a1, 0xb1 ) );
+  s0 = _mm_cvtsi128_si32( a0 );
+  s1 = _mm_cvtsi128_si32( a1 );
+}
+
+// width <= 2; horizontal, or vertical on a packed buffer (srcStride == width). src points at the first tap.
+template<int N, bool isVertical, bool isLast>
+static void simdFilterNarrow( const ClpRng& clpRng, const Pel* src, int srcStride, Pel* dst, int dstStride, int width,
+                              int height, int shift, int offset, const TFilterCoeff* coeff )
+{
+  if( !isVertical || width == 1 )
+  {
+    // taps are contiguous (horizontal filtering, or a vertical 1-sample column with stride 1)
+    int16_t cc[16] = { 0 };
+    for( int k = 0; k < N; k++ )
+    {
+      cc[k] = coeff[k];
+    }
+    const __m128i cv[2] = { _mm_loadu_si128( ( const __m128i* ) cc ), _mm_loadu_si128( ( const __m128i* )( cc + 8 ) ) };
+    for( int row = 0; row < height; row++ )
+    {
+      for( int col = 0; col < width; col++ )
+      {
+        Pel val = ( simdDotTapsContig<N>( src + col, cv ) + offset ) >> shift;
+        if( isLast )
+        {
+          val = ClipPel( val, clpRng );
+        }
+        dst[col] = val;
+      }
+      src += srcStride;
+      dst += dstStride;
+    }
+  }
+  else
+  {
+    // vertical, 2 samples wide, rows packed: the taps of the two columns interleave
+    int16_t ce[24] = { 0 }, co[24] = { 0 };
+    for( int k = 0; k < N; k++ )
+    {
+      ce[2 * k]     = coeff[k];
+      co[2 * k + 1] = coeff[k];
+    }
+    const __m128i cev[3] = { _mm_loadu_si128( ( const __m128i* ) ce ), _mm_loadu_si128( ( const __m128i* )( ce + 8 ) ),
+                             _mm_loadu_si128( ( const __m128i* )( ce + 16 ) ) };
+    const __m128i cov[3] = { _mm_loadu_si128( ( const __m128i* ) co ), _mm_loadu_si128( ( const __m128i* )( co + 8 ) ),
+                             _mm_loadu_si128( ( const __m128i* )( co + 16 ) ) };
+    for( int row = 0; row < height; row++ )
+    {
+      int s[2];
+      simdDotTapsInterleaved2<N>( src, cev, cov, s[0], s[1] );
+      for( int col = 0; col < 2; col++ )
+      {
+        Pel val = ( s[col] + offset ) >> shift;
+        if( isLast )
+        {
+          val = ClipPel( val, clpRng );
+        }
+        dst[col] = val;
+      }
+      src += srcStride;
+      dst += dstStride;
+    }
+  }
+}
+
 template<X86_VEXT vext, int N, bool isVertical, bool isFirst, bool isLast>
 static void simdFilter( const ClpRng& clpRng, Pel const *src, int srcStride, Pel *dst, int dstStride, int width, int height, TFilterCoeff const *coeff, bool biMCForDMVR)
 {
+#if ECM_IF_STATS
+  ifStatsCount( 0, N, width, height, isVertical, isFirst, isLast, biMCForDMVR );
+#endif
   int row, col;
 #if JVET_Z0117_CHROMA_IF
   bool issym = false;
@@ -3431,6 +3605,42 @@ static void simdFilter( const ClpRng& clpRng, Pel const *src, int srcStride, Pel
       offset = 1 << (shift - 1);
     }
   }
+  if( width <= 2 && ( !isVertical || srcStride == width ) )
+  {
+    simdFilterNarrow<N, isVertical, isLast>( clpRng, src, srcStride, dst, dstStride, width, height, shift, offset, coeff );
+    return;
+  }
+#if MCIF_SIMD_NEW
+  if( N == 4 && vext >= AVX2 && width > 16 && !( ( width - 1 ) & 15 ) )
+  {
+    // perf: 16n+1 wide 4-tap blocks: SIMD for the first 16n columns, scalar for the last one (as done for 6/8 taps)
+    if( isVertical )
+    {
+      simdInterpolateVerM16_AVX2<vext, 4, isLast>( src, srcStride, dst, dstStride, width - 1, height, shift, offset, clpRng, c );
+    }
+    else
+    {
+      simdInterpolateHorM16_AVX2<vext, 4, isLast>( src, srcStride, dst, dstStride, width - 1, height, shift, offset, clpRng, c );
+    }
+    for( row = 0; row < height; row++ )
+    {
+      const int lastCol = width - 1;
+      int       sum     = src[lastCol] * c[0];
+      sum += src[lastCol + 1 * cStride] * c[1];
+      sum += src[lastCol + 2 * cStride] * c[2];
+      sum += src[lastCol + 3 * cStride] * c[3];
+      Pel val = ( sum + offset ) >> shift;
+      if( isLast )
+      {
+        val = ClipPel( val, clpRng );
+      }
+      dst[lastCol] = val;
+      src += srcStride;
+      dst += dstStride;
+    }
+    return;
+  }
+#endif
   {
 #if IF_12TAP_SIMD
     if (N == 12 && !(width & 0x03))

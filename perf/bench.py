@@ -28,6 +28,13 @@ TESTS = {
     "ra_parkjoy":   ("encoder_randomaccess_ecm.cfg", "ParkJoy_256x256.yuv", 256, 256, 50, 5, 37, []),
     "ld_foreman":   ("encoder_lowdelay_ecm.cfg",     "foreman_176x144.yuv", 176, 144, 30, 5, 32, []),
 }
+DEFAULT_TESTS = list(TESTS)
+
+# long sequences for segment-parallel (wall-clock) measurements; select with --tests
+TESTS.update({
+    "ra_long":      ("encoder_randomaccess_ecm.cfg", "foreman_128x128_257.yuv", 128, 128, 30, 257, 32, []),
+    "ai_long":      ("encoder_intra_ecm.cfg",        "foreman_128x128_257.yuv", 128, 128, 30, 65, 32, []),
+})
 
 
 def md5(path):
@@ -52,8 +59,9 @@ def process_cpu_seconds(proc):
     return val(ft[2]) + val(ft[3])
 
 
-def run_test(exe, outdir, name):
+def run_test(exe, outdir, name, more_args=()):
     cfg, yuv, w, h, fps, frames, qp, extra = TESTS[name]
+    extra = list(extra) + list(more_args)
     bs = os.path.join(outdir, name + ".bin")
     log = os.path.join(outdir, name + ".log")
     cmd = [exe, "-c", f"{CFG}/{cfg}", "-i", f"{SEQ}/{yuv}", "-wdt", str(w), "-hgt", str(h), "-fr", str(fps),
@@ -71,13 +79,14 @@ def run_test(exe, outdir, name):
 
 def cmd_run(args):
     exe = args.exe or f"{ROOT}/bin/{args.name}/EncoderApp.exe"
-    names = args.tests.split(",") if args.tests else list(TESTS)
+    names = args.tests.split(",") if args.tests else DEFAULT_TESTS
     outdir = os.path.join(ROOT, "runs", args.name)
     os.makedirs(outdir, exist_ok=True)
     os.makedirs(RESULTS, exist_ok=True)
     res = {}
+    more = args.extra.split() if args.extra else []
     with cf.ThreadPoolExecutor(args.jobs) as ex:
-        futs = [ex.submit(run_test, exe, outdir, n) for n in names]
+        futs = [ex.submit(run_test, exe, outdir, n, more) for n in names]
         for fu in cf.as_completed(futs):
             n, r = fu.result()
             res[n] = r
@@ -95,15 +104,25 @@ def cmd_run(args):
 def compare(a, b, an, bn):
     ok = True
     ta = tb = 0.0
-    print(f"\n{'test':14s} {an:>10s} {bn:>10s} {'speedup':>8s}  bit-exact")
+    ca = cb = 0.0
+    have_cpu = True
+    print(f"\n{'test':14s} {an + ' wall':>12s} {bn + ' wall':>12s} {'speedup':>8s}  {'cpu speedup':>11s}  bit-exact")
     for n in sorted(set(a) & set(b)):
         same = a[n]["md5"] is not None and a[n]["md5"] == b[n]["md5"]
         ok &= same
         ta += a[n]["time"]
         tb += b[n]["time"]
-        print(f"{n:14s} {a[n]['time']:10.1f} {b[n]['time']:10.1f} {a[n]['time'] / b[n]['time']:7.2f}x  "
+        cpu = ""
+        if a[n].get("cpu") and b[n].get("cpu"):
+            ca += a[n]["cpu"]
+            cb += b[n]["cpu"]
+            cpu = f"{a[n]['cpu'] / b[n]['cpu']:10.2f}x"
+        else:
+            have_cpu = False
+        print(f"{n:14s} {a[n]['time']:12.1f} {b[n]['time']:12.1f} {a[n]['time'] / b[n]['time']:7.2f}x  {cpu:>11s}  "
               f"{'YES' if same else '*** NO ***'}")
-    print(f"{'TOTAL':14s} {ta:10.1f} {tb:10.1f} {ta / tb:7.2f}x  {'ALL MATCH' if ok else '*** MISMATCH ***'}")
+    cpu = f"{ca / cb:10.2f}x" if have_cpu and cb else ""
+    print(f"{'TOTAL':14s} {ta:12.1f} {tb:12.1f} {ta / tb:7.2f}x  {cpu:>11s}  {'ALL MATCH' if ok else '*** MISMATCH ***'}")
     return 0 if ok else 1
 
 
@@ -115,6 +134,7 @@ def main():
     r.add_argument("--exe")
     r.add_argument("--jobs", type=int, default=5)
     r.add_argument("--tests")
+    r.add_argument("--extra", help="extra encoder arguments, e.g. \"--ParallelSegments=8\"")
     c = sub.add_parser("cmp")
     c.add_argument("base")
     c.add_argument("new")
