@@ -1426,6 +1426,78 @@ static void simdInterpolateHorM4_12tap(const int16_t* src, int srcStride, int16_
     dst += dstStride;
   }
 }
+// perf: AVX2 version of simdInterpolateHorM4_12tap for widths that are a multiple of 8: each 128-bit lane runs the
+// exact instruction sequence of the SSE kernel, lane 0 for columns col..col+3 and lane 1 for col+4..col+7, so the
+// results are identical. Reads the same source span as the SSE kernel. coeff: the 16 entries prepared by simdFilter.
+template<X86_VEXT vext, bool shiftBack>
+static void simdInterpolateHorM8_12tap_AVX2( const int16_t* src, int srcStride, int16_t* dst, int dstStride, int width, int height,
+                                             int shift, int offset, const ClpRng& clpRng, int16_t const* coeff )
+{
+#ifdef USE_AVX2
+  const __m256i voffset  = _mm256_set1_epi32( offset );
+  const __m256i vibdimin = _mm256_set1_epi16( clpRng.min );
+  const __m256i vibdimax = _mm256_set1_epi16( clpRng.max );
+  const __m128i ch       = _mm_lddqu_si128( ( __m128i const* ) coeff );
+  const __m128i cl       = _mm_lddqu_si128( ( __m128i const* )( coeff + 8 ) );
+  const __m256i vcoeffh  = _mm256_inserti128_si256( _mm256_castsi128_si256( ch ), ch, 1 );
+  const __m256i vcoeffl  = _mm256_inserti128_si256( _mm256_castsi128_si256( cl ), cl, 1 );
+  const __m256i vshuf0   = _mm256_set_epi8( 9, 8, 7, 6, 5, 4, 3, 2, 7, 6, 5, 4, 3, 2, 1, 0, 9, 8, 7, 6, 5, 4, 3, 2, 7, 6, 5, 4, 3, 2, 1, 0 );
+  const __m256i vshuf1   = _mm256_set_epi8( 13, 12, 11, 10, 9, 8, 7, 6, 11, 10, 9, 8, 7, 6, 5, 4, 13, 12, 11, 10, 9, 8, 7, 6, 11, 10, 9, 8, 7, 6, 5, 4 );
+  const __m256i vzero    = _mm256_setzero_si256();
+
+  for( int row = 0; row < height; row++ )
+  {
+    for( int col = 0; col < width; col += 8 )
+    {
+      __m256i vsrc0 = _mm256_inserti128_si256( _mm256_castsi128_si256( _mm_lddqu_si128( ( __m128i const* ) &src[col] ) ),
+                                               _mm_lddqu_si128( ( __m128i const* ) &src[col + 4] ), 1 );
+      const __m256i vsrc4 = _mm256_inserti128_si256( _mm256_castsi128_si256( _mm_lddqu_si128( ( __m128i const* ) &src[col + 8] ) ),
+                                                     _mm_lddqu_si128( ( __m128i const* ) &src[col + 12] ), 1 );
+
+      __m256i vtmp0 = _mm256_shuffle_epi8( vsrc4, vshuf0 );
+      __m256i vtmp1 = _mm256_shuffle_epi8( vsrc4, vshuf1 );
+
+      __m256i vsrc1 = _mm256_alignr_epi8( vsrc4, vsrc0, 2 );
+      __m256i vsrc2 = _mm256_alignr_epi8( vsrc4, vsrc0, 4 );
+      __m256i vsrc3 = _mm256_alignr_epi8( vsrc4, vsrc0, 6 );
+
+      vsrc0 = _mm256_madd_epi16( vsrc0, vcoeffh );
+      vsrc1 = _mm256_madd_epi16( vsrc1, vcoeffh );
+      vsrc2 = _mm256_madd_epi16( vsrc2, vcoeffh );
+      vsrc3 = _mm256_madd_epi16( vsrc3, vcoeffh );
+
+      vtmp0 = _mm256_madd_epi16( vtmp0, vcoeffl );
+      vtmp1 = _mm256_madd_epi16( vtmp1, vcoeffl );
+
+      __m256i vtmp2 = _mm256_unpacklo_epi64( vsrc0, vsrc1 );
+      vsrc0         = _mm256_unpackhi_epi64( vsrc0, vsrc1 );
+      __m256i vtmp3 = _mm256_unpacklo_epi64( vsrc2, vsrc3 );
+      vsrc2         = _mm256_unpackhi_epi64( vsrc2, vsrc3 );
+
+      vsrc0 = _mm256_add_epi32( vsrc0, vtmp2 );
+      vsrc2 = _mm256_add_epi32( vsrc2, vtmp3 );
+      vsrc0 = _mm256_add_epi32( vsrc0, vtmp0 );
+      vsrc2 = _mm256_add_epi32( vsrc2, vtmp1 );
+
+      __m256i vsum = _mm256_hadd_epi32( vsrc0, vsrc2 );
+      vsum         = _mm256_add_epi32( vsum, voffset );
+      vsum         = _mm256_srai_epi32( vsum, shift );
+      vsum         = _mm256_packs_epi32( vsum, vzero );
+      if( shiftBack )
+      {
+        vsum = _mm256_min_epi16( vibdimax, _mm256_max_epi16( vibdimin, vsum ) );
+      }
+      // lane 0 low 64 bits: columns 0..3, lane 1 low 64 bits: columns 4..7
+      vsum = _mm256_permute4x64_epi64( vsum, 0x08 );
+      _mm_storeu_si128( ( __m128i* ) &dst[col], _mm256_castsi256_si128( vsum ) );
+    }
+    src += srcStride;
+    dst += dstStride;
+  }
+  _mm256_zeroupper();
+#endif
+}
+
 #if MCIF_SIMD_NEW
 // SIMD interpolation horizontal, block not modulo of 4
 template<X86_VEXT vext, int N, bool shiftBack>
@@ -3613,12 +3685,29 @@ static void simdFilter( const ClpRng& clpRng, Pel const *src, int srcStride, Pel
 #if IF_12TAP_SIMD
     if (N == 12 && !(width & 0x03))
     {
+      // perf: AVX2 kernels with the same arithmetic as the 4-wide SSE ones for wider blocks (luma MC always uses 12 taps)
       if (!isVertical)
       {
-        simdInterpolateHorM4_12tap<vext, 12, isLast>(src, srcStride, dst, dstStride, width, height, shift, offset, clpRng, c);
+        if( vext >= AVX2 && !( width & 7 ) )
+        {
+          simdInterpolateHorM8_12tap_AVX2<vext, isLast>( src, srcStride, dst, dstStride, width, height, shift, offset, clpRng, c );
+        }
+        else
+        {
+          simdInterpolateHorM4_12tap<vext, 12, isLast>(src, srcStride, dst, dstStride, width, height, shift, offset, clpRng, c);
+        }
       }
       else
-        simdInterpolateVerM4_12tap<vext, 12, isLast>(src, srcStride, dst, dstStride, width, height, shift, offset, clpRng, c);
+      {
+        if( vext >= AVX2 && !( width & 15 ) )
+        {
+          simdInterpolateVerM16_AVX2<vext, 12, isLast>( src, srcStride, dst, dstStride, width, height, shift, offset, clpRng, c );
+        }
+        else
+        {
+          simdInterpolateVerM4_12tap<vext, 12, isLast>(src, srcStride, dst, dstStride, width, height, shift, offset, clpRng, c);
+        }
+      }
       return;
     }
 #if MCIF_SIMD_NEW
