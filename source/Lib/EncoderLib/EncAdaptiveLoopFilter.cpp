@@ -11138,6 +11138,40 @@ void EncAdaptiveLoopFilter::deriveCcAlfFilterCoeff( ComponentID compID, const Pe
     }
   }
 
+#if ALF_CCALF_DERIVE_CACHE
+  // perf: the derivation below only depends on kE (upper triangle), ky, size, the precision and the residual check
+  // flag; within the training of a component most derivations repeat an earlier one (same frame statistics)
+  CHECK( size + 1 > MAX_NUM_CC_ALF_CHROMA_COEFF, "Too many CC-ALF coefficients" );
+  float     ccKey[MAX_NUM_CC_ALF_CHROMA_COEFF * ( MAX_NUM_CC_ALF_CHROMA_COEFF + 3 ) / 2];
+  int       ccKeyLen = 0;
+  for( int k = 0; k < size; k++ )
+  {
+    for( int l = k; l < size; l++ )
+    {
+      ccKey[ccKeyLen++] = kE[k][l];
+    }
+    ccKey[ccKeyLen++] = ky[k];
+  }
+#if JVET_AH0057_CCALF_COEFF_PRECISION
+  const int ccPrec = coeffPrec;
+#else
+  const int ccPrec = m_scaleBits;
+#endif
+  const bool     ccResidualCheck = m_encCfg->getAlfResidualCheckEnabled();
+  const uint32_t ccHeader[3]     = { (uint32_t) ccPrec, (uint32_t) size, ccResidualCheck ? 1u : 0u };
+  const uint64_t ccHash          = alfHashWords( ccHeader, 3, alfHashWords( reinterpret_cast<const uint32_t*>( ccKey ), ccKeyLen, 0x2545F4914F6CDD1Dull ) );
+  for( size_t i = 0; i < m_ccAlfDeriveCacheSize; i++ )
+  {
+    const CcAlfDeriveCacheEntry& e = m_ccAlfDeriveCache[i];
+    if( e.hash == ccHash && e.prec == ccPrec && e.size == size && e.residualCheck == ccResidualCheck
+        && std::memcmp( e.key.data(), ccKey, sizeof( float ) * ccKeyLen ) == 0 )
+    {
+      std::copy_n( e.coeff, size + 1, filterCoeff[filterIdx] );
+      return;
+    }
+  }
+#endif
+
   m_alfCovarianceFrameCcAlf[0].gnsSolveByChol(kE, ky, filterCoeffDbl, size
 #if JVET_AN0086_RESIDUAL_CHECK
   , m_encCfg->getAlfResidualCheckEnabled()
@@ -11218,6 +11252,22 @@ void EncAdaptiveLoopFilter::deriveCcAlfFilterCoeff( ComponentID compID, const Pe
     CHECK((filterCoeffInt[k] < -(1 << CCALF_DYNAMIC_RANGE)) || (filterCoeffInt[k] > (1 << CCALF_DYNAMIC_RANGE)), "Exceeded valid range for CC ALF coefficient");
     filterCoeff[filterIdx][k] = filterCoeffInt[k];
   }
+#if ALF_CCALF_DERIVE_CACHE
+  if( m_ccAlfDeriveCacheSize < 1024 )
+  {
+    if( m_ccAlfDeriveCache.size() <= m_ccAlfDeriveCacheSize )
+    {
+      m_ccAlfDeriveCache.resize( m_ccAlfDeriveCacheSize + 1 );
+    }
+    CcAlfDeriveCacheEntry& e = m_ccAlfDeriveCache[m_ccAlfDeriveCacheSize++];
+    e.hash                   = ccHash;
+    e.prec                   = ccPrec;
+    e.size                   = size;
+    e.residualCheck          = ccResidualCheck;
+    e.key.assign( ccKey, ccKey + ccKeyLen );
+    std::copy_n( filterCoeff[filterIdx], size + 1, e.coeff );
+  }
+#endif
 }
 
 void EncAdaptiveLoopFilter::determineControlIdcValues(CodingStructure &cs, const ComponentID compID, const PelBuf *buf,
@@ -11463,6 +11513,10 @@ void EncAdaptiveLoopFilter::deriveCcAlfFilter( CodingStructure& cs, ComponentID 
     deriveStatsForCcAlfFiltering<false>(orgYuv, tempDecYuvBuf, compID, cs);
   }
   initDistortionCcalf(compID);
+#if ALF_CCALF_DERIVE_CACHE
+  m_ccAlfDeriveCacheSize = 0;
+  std::fill_n( m_ccTrainDistValid, MAX_NUM_CC_ALF_FILTERS, false );   // new CTU statistics
+#endif
 #if JVET_AF0197_LUMA_RESIDUAL_TAP_IN_CCALF
   double chromaFactor = ( m_isLowDelayConfig && m_isLumaSignalNewAps && (getAvailableCcAlfApsIds(cs, compID).size() < 4)) ? m_chromaFactor : 1.00 ;
 #endif
@@ -11638,6 +11692,23 @@ void EncAdaptiveLoopFilter::deriveCcAlfFilter( CodingStructure& cs, ComponentID 
             const int numCoeff  = m_filterShapesCcAlf[0].numCoeff - 1;
             int log2BlockWidth  = cs.pcv->maxCUWidthLog2 - scaleX;
             int log2BlockHeight = cs.pcv->maxCUHeightLog2 - scaleY;
+#if ALF_CCALF_DERIVE_CACHE
+            // perf: the distortions of filter filterIdx only depend on its coefficients and precision (the CTU
+            // statistics are fixed during the training of a component): skip if they are those of the last update
+#if JVET_AH0057_CCALF_COEFF_PRECISION
+            const int curPrec = coeffPrec;
+#else
+            const int curPrec = m_scaleBits;
+#endif
+            if( m_ccTrainDistValid[filterIdx] && m_ccTrainDistPrec[filterIdx] == curPrec
+                && std::equal( ccAlfFilterCoeff[filterIdx], ccAlfFilterCoeff[filterIdx] + numCoeff, m_ccTrainDistCoeff[filterIdx] ) )
+            {
+              continue;
+            }
+            m_ccTrainDistValid[filterIdx] = true;
+            m_ccTrainDistPrec[filterIdx]  = curPrec;
+            std::copy_n( ccAlfFilterCoeff[filterIdx], numCoeff, m_ccTrainDistCoeff[filterIdx] );
+#endif
             for (int y = 0; y < m_buf->height; y += (1 << log2BlockHeight))
             {
               for (int x = 0; x < m_buf->width; x += (1 << log2BlockWidth))

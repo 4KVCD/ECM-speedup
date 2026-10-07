@@ -68,6 +68,7 @@ struct CandTALF
 #define ALF_OPT_FILTER_CACHE                              (JVET_AF0177_ALF_COV_FLOAT && JVET_AD0222_ALF_RESI_CLASS && JVET_AN0086_RESIDUAL_CHECK)
 #define ALF_BATCHED_SOLVES                                (JVET_AF0177_ALF_COV_FLOAT && JVET_AD0222_ALF_RESI_CLASS && JVET_AN0086_RESIDUAL_CHECK && ENABLE_SIMD_OPT_ALF_CHOLESKY)
 #define ALF_BATCHED_MERGE                                 (ALF_BATCHED_SOLVES && ALF_IMPROVEMENT && JVET_X0071_ALF_BAND_CLASSIFIER)
+#define ALF_CCALF_DERIVE_CACHE                            (ALF_OPT_FILTER_CACHE && JVET_AN0086_RESIDUAL_CHECK)
 
 struct AlfCovariance
 {
@@ -540,6 +541,23 @@ private:
   std::vector<OptimizeFilterCacheEntry> m_optFilterCache;       // entries [0, m_optFilterCacheSize) are valid
   size_t                                m_optFilterCacheSize = 0;
   double optimizeFilterCached( const AlfCovariance& cov, const AlfFilterShape& shape, int* clip, AlfCovariance::Ty f, bool optimizeClip );
+#endif
+#if ALF_CCALF_DERIVE_CACHE
+  // perf: CC-ALF training of one component: results of deriveCcAlfFilterCoeff for bit-identical inputs, and the
+  // coefficients for which m_trainingDistortion[filterIdx] was last computed
+  struct CcAlfDeriveCacheEntry
+  {
+    uint64_t           hash;
+    int                prec, size;
+    bool               residualCheck;
+    std::vector<float> key;   // kE (upper triangle) and ky
+    short              coeff[MAX_NUM_CC_ALF_CHROMA_COEFF];
+  };
+  std::vector<CcAlfDeriveCacheEntry> m_ccAlfDeriveCache;
+  size_t                             m_ccAlfDeriveCacheSize = 0;
+  bool                               m_ccTrainDistValid[MAX_NUM_CC_ALF_FILTERS] = { false };
+  int                                m_ccTrainDistPrec[MAX_NUM_CC_ALF_FILTERS];
+  short                              m_ccTrainDistCoeff[MAX_NUM_CC_ALF_FILTERS][MAX_NUM_CC_ALF_CHROMA_COEFF];
 #endif
 
 public:
