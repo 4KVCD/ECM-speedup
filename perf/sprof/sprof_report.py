@@ -27,7 +27,17 @@ def load_symbols(exe):
 
 
 def short(name, width=120):
-    n = re.sub(r"\(.*\)( const)?$", "", name)  # drop argument lists
+    # drop the trailing argument list (matching parentheses from the end, so that template arguments such as
+    # "(X86_VEXT)4" survive) and a " [clone ...]" suffix
+    n = re.sub(r" \[clone [^\]]*\]$", "", name)
+    n = re.sub(r" const$", "", n)
+    if n.endswith(")"):
+        depth = 0
+        for i in range(len(n) - 1, -1, -1):
+            depth += {")": 1, "(": -1}.get(n[i], 0)
+            if depth == 0:
+                n = n[:i]
+                break
     return n if len(n) <= width else n[: width - 3] + "..."
 
 
