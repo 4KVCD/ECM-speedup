@@ -202,12 +202,12 @@ int main(int argc, char* argv[])
       spc.intraPeriod       = pcEncApp[0]->getIntraPeriod();
       spc.framesToBeEncoded = pcEncApp[0]->getFramesToBeEncoded();
       spc.frameSkip         = pcEncApp[0]->getFrameSkip();
+      spc.temporalSubsampleRatio = pcEncApp[0]->getTemporalSubsampleRatio();
       spc.frameRate         = pcEncApp[0]->getFrameRate();
       spc.bitstreamFile     = pcEncApp[0]->getBitstreamFileName();
       spc.reconFile         = pcEncApp[0]->getReconFileName();
       std::string reason;
-      if( segmentParallelSupported( spc, pcEncApp[0]->getDecodingRefreshType(), pcEncApp[0]->getTemporalSubsampleRatio(),
-                                    pcEncApp[0]->getMaxLayers(), reason ) )
+      if( segmentParallelSupported( spc, pcEncApp[0]->getDecodingRefreshType(), pcEncApp[0]->getMaxLayers(), reason ) )
       {
         const int ret = runSegmentParallel( argc, argv, spc );
         // no delete: ~EncApp() -> ~EncGOP() dereferences state that only createLib() initializes

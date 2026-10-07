@@ -54,16 +54,16 @@ struct SegmentParallelCfg
   int         numWorkers        = 1;    // concurrent child encoders
   int         segmentLength     = 0;    // frames per chunk (multiple of the intra period); 0: automatic
   int         intraPeriod       = -1;
-  int         framesToBeEncoded = 0;
-  int         frameSkip         = 0;
-  double      frameRate         = 0;
+  int         framesToBeEncoded = 0;   // coded frames (after temporal subsampling)
+  int         frameSkip         = 0;   // input frames
+  int         temporalSubsampleRatio = 1;
+  double      frameRate         = 0;   // input frame rate
   std::string bitstreamFile;
   std::string reconFile;
 };
 
 // returns true if the configuration can be split into independently coded chunks; reason gets why not
-bool segmentParallelSupported( const SegmentParallelCfg& cfg, int decodingRefreshType, int temporalSubsampleRatio,
-                               int maxLayers, std::string& reason );
+bool segmentParallelSupported( const SegmentParallelCfg& cfg, int decodingRefreshType, int maxLayers, std::string& reason );
 
 // runs the whole encode; returns the process exit code
 int  runSegmentParallel( int argc, char* argv[], const SegmentParallelCfg& cfg );

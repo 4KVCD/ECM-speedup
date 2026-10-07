@@ -511,8 +511,7 @@ std::string rebasePocLine( const std::string& line, int base, int& poc, bool& ok
 
 // ---------------------------------------------------------------------------------------------------------------------
 
-bool segmentParallelSupported( const SegmentParallelCfg& cfg, int decodingRefreshType, int temporalSubsampleRatio,
-                               int maxLayers, std::string& reason )
+bool segmentParallelSupported( const SegmentParallelCfg& cfg, int decodingRefreshType, int maxLayers, std::string& reason )
 {
   if( cfg.intraPeriod <= 0 )
   {
@@ -521,10 +520,6 @@ bool segmentParallelSupported( const SegmentParallelCfg& cfg, int decodingRefres
   else if( decodingRefreshType != 1 )
   {
     reason = "needs CRA random access points (DecodingRefreshType = 1)";
-  }
-  else if( temporalSubsampleRatio != 1 )
-  {
-    reason = "TemporalSubsampleRatio must be 1";
   }
   else if( maxLayers != 1 )
   {
@@ -585,9 +580,11 @@ int runSegmentParallel( int argc, char* argv[], const SegmentParallelCfg& cfg )
       Segment&                 seg = segs[k];
       std::vector<std::string> args( argv, argv + argc );
       args[0] = exe;
+      // coded frame i is input frame FrameSkip + i * TemporalSubsampleRatio; FramesToBeEncoded counts input frames
+      const int tsr = cfg.temporalSubsampleRatio;
       args.push_back( "--ParallelSegments=1" );
-      args.push_back( "--FrameSkip=" + std::to_string( cfg.frameSkip + seg.start ) );
-      args.push_back( "--FramesToBeEncoded=" + std::to_string( seg.frames ) );
+      args.push_back( "--FrameSkip=" + std::to_string( cfg.frameSkip + seg.start * tsr ) );
+      args.push_back( "--FramesToBeEncoded=" + std::to_string( seg.frames * tsr ) );
       args.push_back( "--BitstreamFile=" + seg.bitstream );
       args.push_back( "--ReconFile=" + seg.recon );
       seg.exitCode = runProcess( args, seg.log );
@@ -688,7 +685,8 @@ int runSegmentParallel( int argc, char* argv[], const SegmentParallelCfg& cfg )
   if( stats.frames )
   {
     printf( "\n\tTotal Frames |  Bitrate      Y-PSNR   U-PSNR   V-PSNR\n" );
-    printf( "\t%-12d a %10.4f  %8.4f %8.4f %8.4f\n", stats.frames, stats.bits * cfg.frameRate / stats.frames / 1000.0,
+    printf( "\t%-12d a %10.4f  %8.4f %8.4f %8.4f\n", stats.frames,
+            stats.bits * cfg.frameRate / cfg.temporalSubsampleRatio / stats.frames / 1000.0,
             stats.psnr[0] / stats.frames, stats.psnr[1] / stats.frames, stats.psnr[2] / stats.frames );
   }
   printf( "\nBitstream: %s (%zu bytes)\n", cfg.bitstreamFile.c_str(), joined.size() );

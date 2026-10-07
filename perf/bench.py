@@ -33,7 +33,8 @@ DEFAULT_TESTS = list(TESTS)
 # long sequences for segment-parallel (wall-clock) measurements; select with --tests
 TESTS.update({
     "ra_long":      ("encoder_randomaccess_ecm.cfg", "foreman_128x128_257.yuv", 128, 128, 30, 257, 32, []),
-    "ai_long":      ("encoder_intra_ecm.cfg",        "foreman_128x128_257.yuv", 128, 128, 30, 65, 32, []),
+    # AI CTC uses TemporalSubsampleRatio 8: 257 input frames -> 33 coded frames
+    "ai_long":      ("encoder_intra_ecm.cfg",        "foreman_128x128_257.yuv", 128, 128, 30, 257, 32, []),
 })
 
 
