@@ -206,6 +206,7 @@ int main(int argc, char* argv[])
       spc.frameRate         = pcEncApp[0]->getFrameRate();
       spc.bitstreamFile     = pcEncApp[0]->getBitstreamFileName();
       spc.reconFile         = pcEncApp[0]->getReconFileName();
+      spc.pocOffsetChunks   = pcEncApp[0]->getPocOffsetChunksSupported();
       std::string reason;
       if( segmentParallelSupported( spc, pcEncApp[0]->getDecodingRefreshType(), pcEncApp[0]->getMaxLayers(), reason ) )
       {

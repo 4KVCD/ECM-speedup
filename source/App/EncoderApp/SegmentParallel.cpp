@@ -529,7 +529,7 @@ bool segmentParallelSupported( const SegmentParallelCfg& cfg, int decodingRefres
   {
     reason = "needs a bitstream file";
   }
-  else if( cfg.framesToBeEncoded <= cfg.intraPeriod + 1 && cfg.segmentLength == 0 )
+  else if( cfg.framesToBeEncoded <= ( cfg.pocOffsetChunks ? 1 : cfg.intraPeriod + 1 ) && cfg.segmentLength == 0 )
   {
     reason = "sequence has only one intra period";
   }
@@ -545,21 +545,30 @@ int runSegmentParallel( int argc, char* argv[], const SegmentParallelCfg& cfg )
   const auto t0 = std::chrono::steady_clock::now();
   const int  P  = cfg.intraPeriod;
   const int  F  = cfg.framesToBeEncoded;
+  // disjoint chunks starting at their own POC (all-intra), or chunks that overlap by one intra frame
+  const bool concat  = cfg.pocOffsetChunks;
+  const int  overlap = concat ? 0 : 1;
 
   int L = cfg.segmentLength;
-  if( L <= 0 )
+  if( L <= 0 && concat )
   {
-    const int numPeriods = ( F - 1 + P - 1 ) / P;
+    // one picture per chunk: the workers pick the next picture when done, which balances unequal picture
+    // complexities; the cost is a process start-up per picture (~0.5 s against ~16 s for a 128x128 picture)
+    L = 1;
+  }
+  else if( L <= 0 )
+  {
+    const int numPeriods = ( F - overlap + P - 1 ) / P;
     L                    = P * std::max( 1, ( numPeriods + cfg.numWorkers - 1 ) / cfg.numWorkers );
   }
   CHECK( L % P != 0, "SegmentLength must be a multiple of the intra period" );
 
   std::vector<Segment> segs;
-  for( int s = 0; s < F - 1 || ( s == 0 && F == 1 ); s += L )
+  for( int s = 0; s < F - overlap || ( s == 0 && F == 1 ); s += L )
   {
     Segment seg;
     seg.start     = s;
-    seg.frames    = std::min( L + 1, F - s );
+    seg.frames    = std::min( L + overlap, F - s );
     const std::string tag = cfg.bitstreamFile + ".seg" + std::to_string( segs.size() );
     seg.bitstream = tag + ".bin";
     seg.log       = tag + ".log";
@@ -567,8 +576,8 @@ int runSegmentParallel( int argc, char* argv[], const SegmentParallelCfg& cfg )
     segs.push_back( seg );
   }
 
-  printf( "\nSegment-parallel encoding: %d frames, intra period %d, %d chunks of up to %d frames, %d workers\n", F, P,
-          (int) segs.size(), L + 1, cfg.numWorkers );
+  printf( "\nSegment-parallel encoding: %d frames, intra period %d, %d %s chunks of up to %d frames, %d workers\n", F, P,
+          (int) segs.size(), concat ? "disjoint" : "overlapping", L + overlap, cfg.numWorkers );
   fflush( stdout );
 
   const std::string exe = selfExecutable( argv[0] );
@@ -587,6 +596,10 @@ int runSegmentParallel( int argc, char* argv[], const SegmentParallelCfg& cfg )
       args.push_back( "--FramesToBeEncoded=" + std::to_string( seg.frames * tsr ) );
       args.push_back( "--BitstreamFile=" + seg.bitstream );
       args.push_back( "--ReconFile=" + seg.recon );
+      if( concat )
+      {
+        args.push_back( "--SegmentPOCOffset=" + std::to_string( seg.start ) );
+      }
       seg.exitCode = runProcess( args, seg.log );
       std::lock_guard<std::mutex> lock( ioMutex );
       printf( "  chunk %2d: frames %4d..%4d  %s\n", k, seg.start, seg.start + seg.frames - 1,
@@ -618,7 +631,16 @@ int runSegmentParallel( int argc, char* argv[], const SegmentParallelCfg& cfg )
   {
     std::vector<uint8_t> data;
     std::string          err;
-    if( !readFile( segs[k].bitstream, data ) || !appendSegment( data, (int) k, segs[k].start, joined, err ) )
+    if( !readFile( segs[k].bitstream, data ) )
+    {
+      fprintf( stderr, "joining chunk %d failed: cannot read bitstream\n", (int) k );
+      return 1;
+    }
+    if( concat )
+    {
+      joined.insert( joined.end(), data.begin(), data.end() );
+    }
+    else if( !appendSegment( data, (int) k, segs[k].start, joined, err ) )
     {
       fprintf( stderr, "joining chunk %d failed: %s\n", (int) k, err.empty() ? "cannot read bitstream" : err.c_str() );
       return 1;
@@ -634,7 +656,7 @@ int runSegmentParallel( int argc, char* argv[], const SegmentParallelCfg& cfg )
     }
   }
 
-  // join reconstructions (every chunk after the first repeats the previous chunk's last frame)
+  // join reconstructions (overlapping chunks after the first repeat the previous chunk's last frame)
   if( !cfg.reconFile.empty() )
   {
     std::ofstream f( cfg.reconFile, std::ios::binary );
@@ -643,7 +665,7 @@ int runSegmentParallel( int argc, char* argv[], const SegmentParallelCfg& cfg )
       std::vector<uint8_t> data;
       readFile( segs[k].recon, data );
       const size_t frameBytes = data.size() / segs[k].frames;
-      const size_t skip       = k ? frameBytes : 0;
+      const size_t skip       = k ? frameBytes * overlap : 0;
       f.write( reinterpret_cast<const char*>( data.data() ) + skip, data.size() - skip );
     }
   }
@@ -661,12 +683,12 @@ int runSegmentParallel( int argc, char* argv[], const SegmentParallelCfg& cfg )
       int    poc;
       bool   ok;
       double bits, psnr[3] = { 0, 0, 0 };
-      std::string l = rebasePocLine( line, segs[k].start, poc, ok, bits, psnr );
+      std::string l = rebasePocLine( line, concat ? 0 : segs[k].start, poc, ok, bits, psnr );
       if( !ok )
       {
         continue;
       }
-      if( k > 0 && first )   // the duplicated leading IRAP
+      if( k > 0 && first && overlap )   // the duplicated leading IRAP
       {
         first = false;
         continue;

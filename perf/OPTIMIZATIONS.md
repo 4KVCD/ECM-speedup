@@ -39,6 +39,8 @@ Benchmark suite (`perf/bench.py`)
 | 9-11 | MC / template interpolation result cache (54-56 % of calls repeat identical inputs) - three variants, **reverted**: the repeated calls are the cheap ones, lookup + arena traffic cost as much as recomputing | yes | ~0 % | |
 | 12 | copy only the used entries of the HMVP/CCP/EIP history tables (15+5.6+3.2 KB per coding-structure init) | yes | +0.5 % | |
 | - | clang 23 + ThinLTO instead of GCC: AI +1.5 %, but inter coding crashes (UB-sensitive) - dropped | - | - | |
+| 13 | AVX2 paths for 12-tap luma interpolation (horizontal 8 columns per iteration, vertical 16) - same arithmetic as the 4-wide SSE kernels | yes | +0.8 % (RA +1.0-1.3 %) | |
+| 14 | 8-wide 12-tap vertical interpolation via the generic AVX2 M8 kernel | yes | +0.5 % (CPU 1.00x: noise level) | |
 
 Paired totals (both builds run each test at the same time):
 - code steps 4-12 on top of PGO: `pgo` -> `best`: **+5.8 %** (every test 1.05-1.07x)
@@ -46,14 +48,21 @@ Paired totals (both builds run each test at the same time):
 
 ## Segment-parallel encoding (`--ParallelSegments=N`)
 
-Chunks of whole intra periods are encoded by concurrent child processes and joined (leading IDR access unit of
-each later chunk dropped, POC LSBs rebased at RBSP level). Verified byte-identical to the sequential encode:
-RA 65 frames (2 chunks), AI 9 frames (4 chunks) incl. reconstruction.
+- Random access: chunks of whole intra periods are encoded by concurrent child processes and joined (leading IDR
+  access unit of each later chunk dropped, POC LSBs rebased at RBSP level).
+- All intra (every picture a CRA, parameter sets repeated): a worker starts directly at its chunk's POC
+  (`--SegmentPOCOffset`, with the RAS-init state the full encode has at that CRA), so chunks are disjoint and the
+  bitstreams are simply concatenated. By default every picture is its own chunk and each worker takes the next
+  picture when it is done (process start-up ~0.5 s vs ~16 s per 128x128 picture).
+- Verified byte-identical to the sequential encode (bitstream and reconstruction): RA 65 frames (2 chunks),
+  AI 10 frames (1-3 picture chunks; overlapping mode with `ReWriteParamSets=0`), ra_long, ai_long.
 
-| test | coded frames | stock serial | best, 8 segments | wall-clock speedup | bit-exact |
+| test | coded frames | stock serial | parallel | wall-clock speedup | bit-exact |
 |---|---|---|---|---|---|
-| ra_long (foreman 128x128 crop, RA, QP 32, intra period 32) | 257 | 6011 s (5929 s CPU) | 1090.6 s (8 chunks) | **5.51x** | yes |
-| ai_long (foreman 128x128 crop, AI, QP 32, 257 input frames, TemporalSubsampleRatio 8) | 33 | 579.2 s | pending | | |
+| ra_long (foreman 128x128 crop, RA, QP 32, intra period 32) | 257 | 6011 s (5929 s CPU) | 1090.6 s (best, 8 chunks) | **5.51x** | yes |
+| ai_long (foreman 128x128 crop, AI, QP 32, 257 input frames, TemporalSubsampleRatio 8), first version: overlapping chunks, 8 workers | 33 | 579.2 s | 152.2 s (best2) | 3.80x | yes |
+| ai_long, disjoint chunks, 8 workers | 33 | 579.2 s | 133.2 s (dev = LTO, no PGO) | 4.35x | yes |
+| ai_long, 1-picture chunks, 16 workers (hyperthreads) | 33 | 579.2 s | 87.0 s (dev) | **6.66x** | yes |
 
 RA parallel efficiency is ~60 % (1.15x single-thread x 8 workers would be 9.2x): shared L3/DRAM bandwidth,
 lower all-core turbo, one duplicated intra frame per chunk, unequal chunk complexity. With intra period 32 a

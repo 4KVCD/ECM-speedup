@@ -239,6 +239,11 @@ void EncGOP::init ( EncLib* pcEncLib )
   ::memset(m_lastBPSEI, 0, sizeof(m_lastBPSEI));
   ::memset(m_totalCoded, 0, sizeof(m_totalCoded));
   m_HRD                = pcEncLib->getHRD();
+  if( m_pcCfg->getSegmentPocOffset() > 0 )
+  {
+    // chunk of an all-intra sequence: the first picture is a CRA following the IRAP at the previous POC
+    m_lastRasPoc = m_pcCfg->getSegmentPocOffset() - 1;
+  }
 
   m_AUWriterIf = pcEncLib->getAUWriterIf();
 #if NN_LF_UNIFIED
@@ -918,7 +923,7 @@ void EncGOP::xCreatePictureTimingSEI  (int IRAPGOPid, SEIMessages& seiMessages, 
     {
       int indexWithinGOP = (m_totalCoded[maxNumSubLayers - 1] - m_lastBPSEI[maxNumSubLayers - 1]) % m_pcCfg->getGOPSize();
       pictureTimingSEI->m_ptSubLayerDelaysPresentFlag[i] = true;
-      if( ((m_rapWithLeading == true) && (indexWithinGOP == 0)) || (m_totalCoded[maxNumSubLayers - 1] == 0) || m_bufferingPeriodSEIPresentInAU || (slice->getPOC() + m_pcCfg->getGOPSize()) > m_pcCfg->getFramesToBeEncoded() )
+      if( ((m_rapWithLeading == true) && (indexWithinGOP == 0)) || (m_totalCoded[maxNumSubLayers - 1] == 0) || m_bufferingPeriodSEIPresentInAU || (slice->getPOC() - m_pcCfg->getSegmentPocOffset() + m_pcCfg->getGOPSize()) > m_pcCfg->getFramesToBeEncoded() )
       {
         pictureTimingSEI->m_cpbRemovalDelayDeltaEnabledFlag[i] = false;
       }
@@ -2131,7 +2136,7 @@ void EncGOP::compressGOP(int iPOCLast, int iNumPicRcvd, PicList &rcListPic, std:
       pocCurr++;
       iTimeOffset--;
     }
-    if (pocCurr / multipleFactor >= m_pcCfg->getFramesToBeEncoded())
+    if ((pocCurr - m_pcCfg->getSegmentPocOffset()) / multipleFactor >= m_pcCfg->getFramesToBeEncoded())
     {
       if (m_pcCfg->getEfficientFieldIRAPEnabled())
       {

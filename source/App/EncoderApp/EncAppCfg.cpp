@@ -2081,6 +2081,7 @@ bool EncAppCfg::parseCfg( int argc, char* argv[] )
     ("LastValidFrame",                                m_lastValidFrame,                                  MAX_INT, "Last valid frame")
     ("ParallelSegments",                              m_parallelSegments,                                      1, "Encode intra-period chunks in this many concurrent processes and join them (bit-exact with a sequential encode; RA/AI with CRA refresh)")
     ("SegmentLength",                                 m_segmentLength,                                         0, "Frames per chunk for ParallelSegments, a multiple of IntraPeriod (0: automatic)")
+    ("SegmentPOCOffset",                              m_segmentPocOffset,                                      0, "Internal (ParallelSegments workers): POC of the first picture of an all-intra chunk")
 #if JVET_AJ0249_NEURAL_NETWORK_BASED
     ("IntraNN",                                       m_intraNN,                                            true, "Neural Network Intra Prediction: 1 activated, 0 deactivated")
 #endif
@@ -3129,21 +3130,22 @@ bool EncAppCfg::parseCfg( int argc, char* argv[] )
   }
 #endif
   // allocate slice-based dQP values
-  m_aidQP = new int[ m_framesToBeEncoded + m_iGOPSize + 1 ];
-  ::memset( m_aidQP, 0, sizeof(int)*( m_framesToBeEncoded + m_iGOPSize + 1 ) );
+  // indexed by POC; an all-intra chunk worker (SegmentPOCOffset) codes POCs offset .. offset + frames - 1
+  m_aidQP = new int[ m_segmentPocOffset + m_framesToBeEncoded + m_iGOPSize + 1 ];
+  ::memset( m_aidQP, 0, sizeof(int)*( m_segmentPocOffset + m_framesToBeEncoded + m_iGOPSize + 1 ) );
 
 #if QP_SWITCHING_FOR_PARALLEL
   if (m_qpIncrementAtSourceFrame.bPresent)
   {
-    uint32_t switchingPOC = 0;
+    uint32_t switchingPOC = m_segmentPocOffset;
     if (m_qpIncrementAtSourceFrame.value > m_FrameSkip)
     {
       // if switch source frame (ssf) = 10, and frame skip (fs)=2 and temporal subsample ratio (tsr) =1, then
       //    for this simulation switch at POC 8 (=10-2).
       // if ssf=10, fs=2, tsr=2, then for this simulation, switch at POC 4 (=(10-2)/2): POC0=Src2, POC1=Src4, POC2=Src6, POC3=Src8, POC4=Src10
-      switchingPOC = (m_qpIncrementAtSourceFrame.value - m_FrameSkip) / m_temporalSubsampleRatio;
+      switchingPOC += (m_qpIncrementAtSourceFrame.value - m_FrameSkip) / m_temporalSubsampleRatio;
     }
-    for (uint32_t i = switchingPOC; i<(m_framesToBeEncoded + m_iGOPSize + 1); i++)
+    for (uint32_t i = switchingPOC; i<(m_segmentPocOffset + m_framesToBeEncoded + m_iGOPSize + 1); i++)
     {
       m_aidQP[i] = 1;
     }
@@ -5573,6 +5575,17 @@ bool EncAppCfg::xCheckParameter()
       "Either TemporalFilterPastRefs or TemporalFilterFutureRefs must be larger than 0 when Block Importance Mapping is enabled" );
   }
 #endif
+  if( m_segmentPocOffset != 0 )
+  {
+    xConfirmPara( m_segmentPocOffset < 0, "SegmentPOCOffset must not be negative" );
+    xConfirmPara( m_iIntraPeriod != 1 || m_iDecodingRefreshType != 1 || !m_rewriteParamSets,
+                  "SegmentPOCOffset needs IntraPeriod 1, DecodingRefreshType 1 and ReWriteParamSets" );
+    xConfirmPara( m_gopBasedTemporalFilterEnabled || m_compositeRefEnabled || m_isField,
+                  "SegmentPOCOffset does not support the temporal filter, composite reference or field coding" );
+#if JVET_Y0240_BIM
+    xConfirmPara( m_bimEnabled, "SegmentPOCOffset does not support BIM" );
+#endif
+  }
 #if EXTENSION_360_VIDEO
   check_failed |= m_ext360.verifyParameters();
 #endif

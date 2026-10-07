@@ -122,6 +122,7 @@ protected:
   int       m_lastValidFrame;
   int       m_parallelSegments;                               ///< number of intra-period chunks encoded concurrently (1: off)
   int       m_segmentLength;                                  ///< frames per chunk, a multiple of the intra period (0: automatic)
+  int       m_segmentPocOffset;                               ///< POC of the first picture (all-intra chunk worker)
   int       m_framesToBeEncoded;                              ///< number of encoded frames
 #if JVET_AA0146_WRAP_AROUND_FIX
   int       m_sourcePadding[2];                               ///< number of padded pixels for width and height
@@ -1319,6 +1320,16 @@ public:
   // segment-parallel encoding (see SegmentParallel.h)
   int                getParallelSegments()      const { return m_parallelSegments; }
   int                getSegmentLength()         const { return m_segmentLength; }
+  // all-intra chunks can start at their own POC (SegmentPOCOffset) and be joined by plain concatenation
+  bool               getPocOffsetChunksSupported() const
+  {
+    return m_iIntraPeriod == 1 && m_iDecodingRefreshType == 1 && m_rewriteParamSets && !m_gopBasedTemporalFilterEnabled
+           && !m_compositeRefEnabled && !m_isField
+#if JVET_Y0240_BIM
+           && !m_bimEnabled
+#endif
+      ;
+  }
   int                getIntraPeriod()           const { return m_iIntraPeriod; }
   int                getDecodingRefreshType()   const { return m_iDecodingRefreshType; }
   int                getFramesToBeEncoded()     const { return m_framesToBeEncoded; }

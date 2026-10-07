@@ -49,6 +49,9 @@
 // chunks as concurrent child processes of the same executable and joins them in-process: the
 // leading IDR access unit of every chunk after the first is dropped (it duplicates the CRA that
 // ends the previous chunk) and picture order count LSBs are rebased.
+// All-intra sequences (every picture a CRA, parameter sets repeated) are split into disjoint chunks
+// instead: each worker starts at the chunk's own POC (SegmentPOCOffset) with the state the full encode
+// has at that CRA, so the chunk bitstreams are simply concatenated.
 struct SegmentParallelCfg
 {
   int         numWorkers        = 1;    // concurrent child encoders
@@ -58,6 +61,7 @@ struct SegmentParallelCfg
   int         frameSkip         = 0;   // input frames
   int         temporalSubsampleRatio = 1;
   double      frameRate         = 0;   // input frame rate
+  bool        pocOffsetChunks   = false;   // disjoint chunks started at their own POC, joined by concatenation
   std::string bitstreamFile;
   std::string reconFile;
 };

@@ -281,7 +281,8 @@ void EncApp::xInitLibCfg()
   m_cEncLib.setUpscaleFilerForDisplay                            (m_upscaleFilterForDisplay);
 #endif
   m_cEncLib.setFramesToBeEncoded                                 ( m_framesToBeEncoded );
-  m_cEncLib.setValidFrames                                       ( m_firstValidFrame, m_lastValidFrame );
+  m_cEncLib.setSegmentPocOffset                                  ( m_segmentPocOffset );
+  m_cEncLib.setValidFrames                                      ( m_firstValidFrame, m_lastValidFrame );
   m_cEncLib.setAvoidIntraInDepLayer                              ( m_avoidIntraInDepLayer );
 
   //====== SPS constraint flags =======

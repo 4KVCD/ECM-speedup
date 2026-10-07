@@ -179,6 +179,7 @@ protected:
   int       m_sourcePadding[2];
 #endif
   int       m_framesToBeEncoded;
+  int       m_segmentPocOffset = 0;
   int       m_firstValidFrame;
   int       m_lastValidFrame;
 
@@ -1514,6 +1515,10 @@ public:
   void      setConformanceWindow (int confLeft, int confRight, int confTop, int confBottom ) { m_conformanceWindow.setWindow (confLeft, confRight, confTop, confBottom); }
 
   void      setFramesToBeEncoded            ( int   i )      { m_framesToBeEncoded = i; }
+  // segment-parallel encoding of all-intra chunks (EncoderApp --ParallelSegments): the chunk's first picture gets
+  // this POC and is coded as the IRAP it would be in the full sequence
+  void      setSegmentPocOffset             ( int   i )      { m_segmentPocOffset = i; }
+  int       getSegmentPocOffset             () const         { return m_segmentPocOffset; }
 
   void setValidFrames( const int first, const int last )
   {

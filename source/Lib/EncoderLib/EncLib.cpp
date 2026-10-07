@@ -105,7 +105,7 @@ EncLib::~EncLib()
 void EncLib::create( const int layerId )
 {
   m_layerId = layerId;
-  m_iPOCLast = m_compositeRefEnabled ? -2 : -1;
+  m_iPOCLast = ( m_compositeRefEnabled ? -2 : -1 ) + m_segmentPocOffset;
   // create processing unit classes
   m_cGOPEncoder.        create( );
 #if JVET_AJ0237_INTERNAL_12BIT
