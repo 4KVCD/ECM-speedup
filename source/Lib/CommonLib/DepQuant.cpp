@@ -39,7 +39,16 @@
 #include <bitset>
 #if defined(__SSE4_1__)
 #include <smmintrin.h>
+#define DQ_SSE41 1
+#else
+#define DQ_SSE41 0
 #endif
+
+// Trellis of the active configuration: per-TU loop templated on the number of states, states as a structure of arrays
+// updated with SSE4.1 (StateArr). Other configurations keep the State based implementation.
+#define DQ_TRELLIS_LOOP_TEMPLATE                                                                                       \
+  (TCQ_8STATES && TU_256 && !EXTENDED_LFNST && JVET_R0351_HIGH_BIT_DEPTH_SUPPORT_VS && JVET_AE0102_LFNST_CTX           \
+   && JVET_AG0100_TRANSFORM_COEFFICIENT_CODING && DQ_SSE41)
 
 namespace DQIntern
 {
@@ -103,11 +112,15 @@ namespace DQIntern
     int         nextInsidePos;
     NbInfoSbb   nextNbInfoSbb;
 #if JVET_AE0102_LFNST_CTX
-    uint8_t     nextNbShuffle[2][16];   // nextNbInfoSbb.inPos[ctxType][0..num-1] as byte-shuffle indices, 0x80 = unused
     uint8_t     nextNbRows[2][5];       // nextNbInfoSbb.inPos[ctxType][0..num-1], 16 (an all-zero level row) = unused
+#if !DQ_TRELLIS_LOOP_TEMPLATE
+    uint8_t     nextNbShuffle[2][16];   // nextNbInfoSbb.inPos[ctxType][0..num-1] as byte-shuffle indices, 0x80 = unused
+#endif
 #else
-    uint8_t     nextNbShuffle[1][16];
     uint8_t     nextNbRows[1][5];
+#if !DQ_TRELLIS_LOOP_TEMPLATE
+    uint8_t     nextNbShuffle[1][16];
+#endif
 #endif
     int         nextSbbRight;
     int         nextSbbBelow;
@@ -581,7 +594,9 @@ namespace DQIntern
       scanInfo.spt = SCAN_EOCSBB;
     scanInfo.posX = m_scanId2BlkPos[scanIdx].x;
     scanInfo.posY = m_scanId2BlkPos[scanIdx].y;
+#if !DQ_TRELLIS_LOOP_TEMPLATE
     ::memset(scanInfo.nextNbShuffle, 0x80, sizeof(scanInfo.nextNbShuffle));
+#endif
     ::memset(scanInfo.nextNbRows, 16, sizeof(scanInfo.nextNbRows));
     if (scanIdx)
     {
@@ -614,15 +629,19 @@ namespace DQIntern
       {
         for (int k = 0; k < std::min<int>(5, scanInfo.nextNbInfoSbb.num[ctxType]); k++)
         {
+          scanInfo.nextNbRows[ctxType][k] = scanInfo.nextNbInfoSbb.inPos[ctxType][k];
+#if !DQ_TRELLIS_LOOP_TEMPLATE
           scanInfo.nextNbShuffle[ctxType][k] = scanInfo.nextNbInfoSbb.inPos[ctxType][k];
-          scanInfo.nextNbRows[ctxType][k]    = scanInfo.nextNbInfoSbb.inPos[ctxType][k];
+#endif
         }
       }
 #else
       for (int k = 0; k < std::min<int>(5, scanInfo.nextNbInfoSbb.num); k++)
       {
+        scanInfo.nextNbRows[0][k] = scanInfo.nextNbInfoSbb.inPos[k];
+#if !DQ_TRELLIS_LOOP_TEMPLATE
         scanInfo.nextNbShuffle[0][k] = scanInfo.nextNbInfoSbb.inPos[k];
-        scanInfo.nextNbRows[0][k]    = scanInfo.nextNbInfoSbb.inPos[k];
+#endif
       }
 #endif
       if (scanInfo.eosbb)
@@ -642,6 +661,9 @@ namespace DQIntern
     const CtxStore<BinProbModel_Std> &ctxStore;
     BinFracBits getFracBitsArray(unsigned ctxId) const { return ctxStore[ctxId].getFracBitsArray(); }
   };
+
+  // reuse of the sig / gtx / sub-block flag rate tables while their context models are unchanged
+#define DQ_RATE_TAB_CACHE (JVET_AG0143_INTER_INTRA && JVET_AE0102_LFNST_CTX && JVET_AG0100_TRANSFORM_COEFFICIENT_CODING)
 
   class RateEstimator
   {
@@ -705,6 +727,18 @@ namespace DQIntern
     bool      m_condition = false;
     SliceType m_sliceType = NUMBER_OF_SLICE_TYPES;
 #endif
+#if DQ_RATE_TAB_CACHE
+    bool xTabsUpToDate(const StdFracBitsAccess &fracBitsAccess, const ChannelType chType, const bool isLfnst);
+    template<class FracBitsAccessT>
+    bool xTabsUpToDate(const FracBitsAccessT &, const ChannelType, const bool)
+    {
+      m_tabKey = -1;
+      return false;
+    }
+    int     m_tabKey = -1;   // channel type, LFNST and inter/intra switch of the current tables
+    uint8_t m_tabModels[(sm_maxNumSigSbbCtx + sm_numCtxSetsSig * sm_maxNumSigCtx + 4 * sm_maxNumGtxCtx)
+                        * sizeof(BinProbModel_Std)];   // the context models they were computed from (raw bytes)
+#endif
   private:
     const ScanElement *m_scanId2Pos;
     int32_t            m_lastBitsX[MAX_TB_SIZEY];
@@ -713,6 +747,58 @@ namespace DQIntern
     BinFracBits        m_sigFracBits[sm_numCtxSetsSig][sm_maxNumSigCtx];
     CoeffFracBits      m_gtxFracBits[sm_maxNumGtxCtx];
   };
+
+#if DQ_RATE_TAB_CACHE
+  // The sig flag, gtx flag and sub-block flag tables only depend on the channel type, LFNST, the inter/intra switch and
+  // the context models they are read from. Consecutive TUs often see the same models (e.g. the modes of a block tested
+  // from one CABAC state), so the models the current tables were computed from are kept and the setup is skipped
+  // while they are unchanged.
+  bool RateEstimator::xTabsUpToDate(const StdFracBitsAccess &fracBitsAccess, const ChannelType chType,
+                                    const bool isLfnst)
+  {
+    const int      key    = int(chType) + 2 * int(isLfnst) + 4 * int(m_condition);
+    const unsigned numSig = (chType == CHANNEL_TYPE_LUMA ? NSIGCTX * 3 : NSIGCTX * 2);
+    const unsigned numGtx = (chType == CHANNEL_TYPE_LUMA ? 1 + NGTXCTX * 4 : 1 + NGTXCTX * 2);
+    // context sets read by xSetSigSbbFracBits, xSetSigFlagBits and xSetGtxFlagBits (same selection)
+    const CtxSet *sets[8];
+    unsigned      sizes[8];
+    sets[0]  = &(m_condition ? Ctx::SigCoeffGroupCtxSetSwitch[chType] : Ctx::SigCoeffGroup[chType]);
+    sizes[0] = sm_maxNumSigSbbCtx;
+    for (int k = 0; k < 3; k++)
+    {
+      sets[1 + k]  = &(isLfnst       ? Ctx::SigFlagL[chType + 2 * k]
+                       : m_condition ? Ctx::SigFlagCtxSetSwitch[chType + 2 * k]
+                                     : Ctx::SigFlag[chType + 2 * k]);
+      sizes[1 + k] = numSig;
+    }
+    static const int gtxSet[4] = { 2, 4, 0, 6 };   // gt1, gt2, gt3, gtN
+    for (int k = 0; k < 4; k++)
+    {
+      sets[4 + k]  = &(isLfnst       ? Ctx::GtxFlagL[gtxSet[k] + chType]
+                       : m_condition ? Ctx::GtxFlagCtxSetSwitch[gtxSet[k] + chType]
+                                     : Ctx::GtxFlag[gtxSet[k] + chType]);
+      sizes[4 + k] = numGtx;
+    }
+    bool     same  = (key == m_tabKey);
+    uint8_t *saved = m_tabModels;
+    for (int i = 0; i < 8; i++)
+    {
+      const void * models = &fracBitsAccess.ctxStore[sets[i]->Offset];
+      const size_t bytes  = sizes[i] * sizeof(BinProbModel_Std);
+      if (same && ::memcmp(saved, models, bytes))
+      {
+        same = false;
+      }
+      if (!same)
+      {
+        ::memcpy(saved, models, bytes);
+      }
+      saved += bytes;
+    }
+    m_tabKey = key;
+    return same;
+  }
+#endif
 
   template<class FracBitsAccessT>
   void RateEstimator::initCtx(const TUParameters &tuPars, const TransformUnit &tu, const ComponentID compID,
@@ -729,14 +815,19 @@ namespace DQIntern
     m_sliceType = tu.cu->slice->getSliceType();
 #endif
     m_scanId2Pos = tuPars.m_scanId2BlkPos;
-    xSetSigSbbFracBits(fracBitsAccess, tuPars.m_chType);
-#if JVET_AE0102_LFNST_CTX
-    xSetSigFlagBits(fracBitsAccess, tuPars.m_chType, lfnstIdx > 0);
-    xSetGtxFlagBits(fracBitsAccess, tuPars.m_chType, lfnstIdx > 0);
-#else
-    xSetSigFlagBits(fracBitsAccess, tuPars.m_chType);
-    xSetGtxFlagBits(fracBitsAccess, tuPars.m_chType);
+#if DQ_RATE_TAB_CACHE
+    if (!xTabsUpToDate(fracBitsAccess, tuPars.m_chType, lfnstIdx > 0))
 #endif
+    {
+      xSetSigSbbFracBits(fracBitsAccess, tuPars.m_chType);
+#if JVET_AE0102_LFNST_CTX
+      xSetSigFlagBits(fracBitsAccess, tuPars.m_chType, lfnstIdx > 0);
+      xSetGtxFlagBits(fracBitsAccess, tuPars.m_chType, lfnstIdx > 0);
+#else
+      xSetSigFlagBits(fracBitsAccess, tuPars.m_chType);
+      xSetGtxFlagBits(fracBitsAccess, tuPars.m_chType);
+#endif
+    }
     xSetLastCoeffOffset(fracBitsAccess, tuPars, tu, compID);
   }
 
@@ -1380,10 +1471,12 @@ const CtxSet &ctxSetGt4 = isLfnst ? Ctx::GtxFlagL[6 + chType] : Ctx::GtxFlag[6 +
         m_allSbbCtx[k].levels   = nextMem + numSbb;
       }
     }
+#if !DQ_TRELLIS_LOOP_TEMPLATE
 #if JVET_AE0102_LFNST_CTX
     inline void update(const ScanInfo &scanInfo, const State *prevState, State &currState, bool lfnstidx);
 #else
     inline void update(const ScanInfo &scanInfo, const State *prevState, State &currState);
+#endif
 #endif
     // end of a sub-block for state stateId (sub-block context of its predecessor: prevRefSbbCtxId, -1 = none):
     // sub-block flags and levels memory of the state, template init of the next sub-block (ctxInit(stateId, .));
@@ -1448,16 +1541,6 @@ const CtxSet &ctxSetGt4 = isLfnst ? Ctx::GtxFlagL[6 + chType] : Ctx::GtxFlag[6 +
 #else
 #define DQ_UNROLL_STATES
 #endif
-#if defined(__SSE4_1__)
-#define DQ_SSE41 1
-#else
-#define DQ_SSE41 0
-#endif
-// trellis of the active configuration: per-TU loop templated on the number of states, states as a structure of
-// arrays updated with SSE4.1 (other configurations keep the State based implementation)
-#define DQ_TRELLIS_LOOP_TEMPLATE                                                                                       \
-  (TCQ_8STATES && TU_256 && !EXTENDED_LFNST && JVET_R0351_HIGH_BIT_DEPTH_SUPPORT_VS && JVET_AE0102_LFNST_CTX           \
-   && JVET_AG0100_TRANSFORM_COEFFICIENT_CODING && DQ_SSE41)
 
 #if JVET_AG0100_TRANSFORM_COEFFICIENT_CODING
   static const int TPL_LEVEL_CLIP = GTN_LEVEL;   // a template neighbour adds min(TPL_LEVEL_CLIP + (t & 1), t) to sumAbs1
@@ -1481,6 +1564,7 @@ const CtxSet &ctxSetGt4 = isLfnst ? Ctx::GtxFlagL[6 + chType] : Ctx::GtxFlag[6 +
 #endif
   }
 
+#if !DQ_TRELLIS_LOOP_TEMPLATE   // State based trellis (other configurations)
   // template sums over the neighbours inside the sub-block: levels[shuffle[k]] for the leading shuffle entries < 16
   static inline void tplSumsInside(const uint8_t *levels, const uint8_t *shuffle, int &sumAbs1, int &sumNum,
                                    int &sumAbs)
@@ -1960,6 +2044,8 @@ const CtxSet &ctxSetGt4 = isLfnst ? Ctx::GtxFlagL[6 + chType] : Ctx::GtxFlag[6 +
 
     }
   }
+#endif
+
   inline int CommonCtx::updateSbb(const ScanInfo &scanInfo, const int prevRefSbbCtxId, const int stateId,
                                   const bool sigSbb, const uint8_t *absLevels16, const bool lfnstidx)
   {
@@ -2068,6 +2154,7 @@ const CtxSet &ctxSetGt4 = isLfnst ? Ctx::GtxFlagL[6 + chType] : Ctx::GtxFlag[6 +
     return sigNSbb;
   }
 
+#if !DQ_TRELLIS_LOOP_TEMPLATE
 #if JVET_AE0102_LFNST_CTX
   inline void CommonCtx::update(const ScanInfo &scanInfo, const State *prevState, State &currState, bool lfnstidx)
 #else
@@ -2096,6 +2183,8 @@ const CtxSet &ctxSetGt4 = isLfnst ? Ctx::GtxFlagL[6 + chType] : Ctx::GtxFlag[6 +
     ::memset(currState.m_absLevels, 0, sizeof(currState.m_absLevels));
     currState.m_ctxInitIdx = currState.m_stateId;
   }
+
+#endif
 
 #if DQ_TRELLIS_LOOP_TEMPLATE
   // The states of one trellis stage as a structure of arrays (lane = state id; 4 or 8 states), so that the state
@@ -2222,6 +2311,7 @@ const CtxSet &ctxSetGt4 = isLfnst ? Ctx::GtxFlagL[6 + chType] : Ctx::GtxFlag[6 +
     int16_t            m_riceThrGtn[3];     // g_auiGoRiceParsCoeffGTN[x] = number of thresholds <= x
     int16_t            m_riceThrCoeff[3];   // g_auiGoRiceParsCoeff[x]    = number of thresholds <= x
 #endif
+#if !DQ_TRELLIS_LOOP_TEMPLATE
 #if TU_256 && !EXTENDED_LFNST
 #if TCQ_8STATES
     template<int numStates>
@@ -2265,9 +2355,11 @@ const CtxSet &ctxSetGt4 = isLfnst ? Ctx::GtxFlagL[6 + chType] : Ctx::GtxFlag[6 +
                  int quantCoeff);
 #endif
 #endif
+#endif
 
   private:
     CommonCtx m_commonCtx;
+#if !DQ_TRELLIS_LOOP_TEMPLATE
 #if TCQ_8STATES
     State m_allStates[24];
 #else
@@ -2277,6 +2369,7 @@ const CtxSet &ctxSetGt4 = isLfnst ? Ctx::GtxFlagL[6 + chType] : Ctx::GtxFlag[6 +
     State *   m_prevStates;
     State *   m_skipStates;
     State     m_startState;
+#endif
     Quantizer m_quant;
 #if TCQ_8STATES
     Decision m_trellis[MAX_TB_SIZEY * MAX_TB_SIZEY * 8];
@@ -2289,6 +2382,7 @@ const CtxSet &ctxSetGt4 = isLfnst ? Ctx::GtxFlagL[6 + chType] : Ctx::GtxFlag[6 +
   DepQuant::DepQuant()
     : RateEstimator()
     , m_commonCtx()
+#if !DQ_TRELLIS_LOOP_TEMPLATE
 #if TCQ_8STATES
     , m_allStates
   {
@@ -2313,6 +2407,7 @@ const CtxSet &ctxSetGt4 = isLfnst ? Ctx::GtxFlagL[6 + chType] : Ctx::GtxFlag[6 +
 #endif
                                       ,
     m_startState TINIT(0)
+#endif
   {
 #if DQ_TRELLIS_LOOP_TEMPLATE
     ::memset(m_stateArr, 0, sizeof(m_stateArr));
@@ -2378,6 +2473,7 @@ const CtxSet &ctxSetGt4 = isLfnst ? Ctx::GtxFlagL[6 + chType] : Ctx::GtxFlag[6 +
 #endif
 #undef DINIT
 
+#if !DQ_TRELLIS_LOOP_TEMPLATE   // State based trellis (other configurations)
 #if TCQ_8STATES
   template<int numStates> ALWAYS_INLINE
 #endif
@@ -2625,6 +2721,7 @@ const CtxSet &ctxSetGt4 = isLfnst ? Ctx::GtxFlagL[6 + chType] : Ctx::GtxFlag[6 +
       }
     }
   }
+#endif
 
 #if DQ_TRELLIS_LOOP_TEMPLATE
   void DepQuant::xInitStates(const unsigned effWidth, const unsigned effHeight, const ChannelType chType)
