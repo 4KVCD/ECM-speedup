@@ -786,19 +786,15 @@ void  Slice::sortPicList        (PicList& rcListPic)
 
 Picture* Slice::xGetRefPic( PicList& rcListPic, int poc, const int layerId )
 {
-  PicList::iterator  iterPic = rcListPic.begin();
-  Picture*           pcPic   = *(iterPic);
-
-  while ( iterPic != rcListPic.end() )
+  // return a nullptr, if picture is not found (VTM commit 76b70fb45f; this loop dereferenced the list end before)
+  for( Picture* pcPic : rcListPic )
   {
     if( pcPic->getPOC() == poc && pcPic->layerId == layerId )
     {
-      break;
+      return pcPic;
     }
-    iterPic++;
-    pcPic = *(iterPic);
   }
-  return  pcPic;
+  return nullptr;
 }
 
 Picture* Slice::xGetLongTermRefPic( PicList& rcListPic, int poc, bool pocHasMsb, const int layerId )
@@ -1664,6 +1660,10 @@ void Slice::checkRPL(const ReferencePictureList* pRPL0, const ReferencePictureLi
         }
         pcRefPic = xGetLongTermRefPic( rcListPic, ltrpPoc, rpl[refPicList]->getDeltaPocMSBPresentFlag( i ), m_pcPic->layerId );
         refPicPOC = pcRefPic->getPOC();
+      }
+      if( !pcRefPic )
+      {
+        continue;   // the checks are for all entries, but an inactive reference picture may be missing when decoding started at a CRA (VTM commit 76b70fb45f)
       }
       refPicDecodingOrderNumber = pcRefPic->getDecodingOrderNumber();
 
@@ -2657,6 +2657,10 @@ void Slice::checkSubpicTypeConstraints(PicList& rcListPic, const ReferencePictur
       refPicPOC = pcRefPic->getPOC();
     }
 
+    if (!pcRefPic)
+    {
+      continue;   // the checks are for all entries, but an inactive reference picture may be missing when decoding started at a CRA (VTM commit 76b70fb45f)
+    }
     refPicDecodingOrderNumber = pcRefPic->getDecodingOrderNumber();
 
     if (nalUnitType == NAL_UNIT_CODED_SLICE_CRA || nalUnitType == NAL_UNIT_CODED_SLICE_IDR_W_RADL || nalUnitType == NAL_UNIT_CODED_SLICE_IDR_N_LP)
@@ -2733,6 +2737,10 @@ void Slice::checkSubpicTypeConstraints(PicList& rcListPic, const ReferencePictur
       }
       pcRefPic = xGetLongTermRefPic(rcListPic, ltrpPoc, pRPL1->getDeltaPocMSBPresentFlag(i), m_pcPic->layerId);
       refPicPOC = pcRefPic->getPOC();
+    }
+    if (!pcRefPic)
+    {
+      continue;   // the checks are for all entries, but an inactive reference picture may be missing when decoding started at a CRA (VTM commit 76b70fb45f)
     }
     refPicDecodingOrderNumber = pcRefPic->getDecodingOrderNumber();
 
