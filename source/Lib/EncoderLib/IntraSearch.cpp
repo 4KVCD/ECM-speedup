@@ -5508,7 +5508,7 @@ bool IntraSearch::estIntraPredLumaQT(CodingUnit &cu, Partitioner &partitioner, c
               {
                 modeInfoWithDCT2Cost[i] = { m_savedRdModeList[0][i], m_modeCostStore[0][i] };
               }
-              std::stable_sort(modeInfoWithDCT2Cost.begin(), modeInfoWithDCT2Cost.end(), [](const std::pair<ModeInfo, double> & l, const std::pair<ModeInfo, double> & r) {return l.second < r.second; });
+              stableSortSmall(modeInfoWithDCT2Cost.begin(), modeInfoWithDCT2Cost.end(), [](const std::pair<ModeInfo, double> & l, const std::pair<ModeInfo, double> & r) {return l.second < r.second; });
 
               // **Reorder the modes** and skip checking the modes with much larger R-D cost than the best mode
               for (int i = 0; i < m_savedNumRdModes[0]; i++)
@@ -5598,7 +5598,7 @@ bool IntraSearch::estIntraPredLumaQT(CodingUnit &cu, Partitioner &partitioner, c
             }
 #endif
           }
-          std::stable_sort(modeInfoWithDCT2Cost.begin(), modeInfoWithDCT2Cost.end(), [](const std::pair<ModeInfo, double> & l, const std::pair<ModeInfo, double> & r) {return l.second < r.second; });
+          stableSortSmall(modeInfoWithDCT2Cost.begin(), modeInfoWithDCT2Cost.end(), [](const std::pair<ModeInfo, double> & l, const std::pair<ModeInfo, double> & r) {return l.second < r.second; });
 
           // **Reorder the modes** and skip checking the modes with much larger R-D cost than the best mode
           for (int i = 0; i < m_savedNumRdModes[0]; i++)
@@ -9686,14 +9686,14 @@ void IntraSearch::estIntraPredChromaQT( CodingUnit &cu, Partitioner &partitioner
           }
 #endif
 #if !LBCCP_TS
-          std::stable_sort(miLmPredFiltList.begin(), miLmPredFiltList.end(), [](const lmPredFiltModeInfo &l, const lmPredFiltModeInfo &r) { return l.cost < r.cost; });
+          stableSortSmall(miLmPredFiltList.begin(), miLmPredFiltList.end(), [](const lmPredFiltModeInfo &l, const lmPredFiltModeInfo &r) { return l.cost < r.cost; });
 #endif
         }
 #endif
 #if LBCCP_TS
         }
 
-      std::stable_sort(miLmPredFiltList.begin(), miLmPredFiltList.end(), [](const lmPredFiltModeInfo &l, const lmPredFiltModeInfo &r) { return l.cost < r.cost; });
+      stableSortSmall(miLmPredFiltList.begin(), miLmPredFiltList.end(), [](const lmPredFiltModeInfo &l, const lmPredFiltModeInfo &r) { return l.cost < r.cost; });
 #endif
       pu.ccInsideFilter = 0;
 #if JVET_AA0057_CCCM
@@ -10485,7 +10485,7 @@ void IntraSearch::estIntraPredChromaQT( CodingUnit &cu, Partitioner &partitioner
 #endif
 
 #if JVET_AL0191_INTRA_CHROMA_ENCOPT_CCP_CONSTRAINTS
-      std::stable_sort(ccpModeList.begin(), ccpModeList.end(), [](const crossComponentPredictionModeInfo &l, const crossComponentPredictionModeInfo &r) { return l.cost < r.cost; });
+      stableSortSmall(ccpModeList.begin(), ccpModeList.end(), [](const crossComponentPredictionModeInfo &l, const crossComponentPredictionModeInfo &r) { return l.cost < r.cost; });
 
       int numLbccpModes = 0;
       int numRDtest = 0;
@@ -11078,7 +11078,7 @@ void IntraSearch::estIntraPredChromaQT( CodingUnit &cu, Partitioner &partitioner
       bool isChromaFusionEnabled[6] = { false };
       if (numAddedCcpMode > 0)
       {
-        std::stable_sort(secondCcpModeList.begin(), secondCcpModeList.end(), [](const crossComponentPredictionModeInfo &l, const crossComponentPredictionModeInfo &r) { return l.cost < r.cost; });
+        stableSortSmall(secondCcpModeList.begin(), secondCcpModeList.end(), [](const crossComponentPredictionModeInfo &l, const crossComponentPredictionModeInfo &r) { return l.cost < r.cost; });
 
         for (int i = 0; i < numAddedCcpMode; i++)
         {
@@ -12126,7 +12126,7 @@ void IntraSearch::estIntraPredChromaQT( CodingUnit &cu, Partitioner &partitioner
             pu.cccmNoSubFlag = 0;
           }
 #endif
-          std::stable_sort(miLmPredFiltList.begin(), miLmPredFiltList.end(), [](const lmPredFiltModeInfo &l, const lmPredFiltModeInfo &r) { return l.cost < r.cost; });
+          stableSortSmall(miLmPredFiltList.begin(), miLmPredFiltList.end(), [](const lmPredFiltModeInfo &l, const lmPredFiltModeInfo &r) { return l.cost < r.cost; });
         }
 #endif
       }
@@ -15822,7 +15822,7 @@ void IntraSearch::xSelectAMTForFullRD(TransformUnit &tu
     uint64_t AbsSum = m_pcTrQuant->transformNxN(tu);
     coeffAbsSum[i] = { i, AbsSum };
   }
-  std::stable_sort(coeffAbsSum.begin(), coeffAbsSum.end(), [](const std::pair<int, uint64_t> & l, const std::pair<int, uint64_t> & r) {return l.second < r.second; });
+  stableSortSmall(coeffAbsSum.begin(), coeffAbsSum.end(), [](const std::pair<int, uint64_t> & l, const std::pair<int, uint64_t> & r) {return l.second < r.second; });
 #if JVET_Y0142_ADAPT_INTRA_MTS
   for (int i = 0; i < nCands; i++)
 #else
@@ -20667,7 +20667,7 @@ bool IntraSearch::xSortISPCandList(double bestCostSoFar, double bestNonISPCost, 
   m_ispCandListVer.clear();
 
   // we sort the normal intra modes according to their full RD costs
-  std::stable_sort(m_regIntraRDListWithCosts.begin(), m_regIntraRDListWithCosts.end(), ModeInfoWithCost::compareModeInfoWithCost);
+  stableSortSmall(m_regIntraRDListWithCosts.begin(), m_regIntraRDListWithCosts.end(), ModeInfoWithCost::compareModeInfoWithCost);
 
   // we get the best angle from the regular intra list
   int bestNormalIntraAngle = -1;
@@ -21068,7 +21068,7 @@ void IntraSearch::setLumaIntraPredIdx(PredictionUnit& pu)
 #if JVET_AM0074_INTRA_MERGE
 void IntraSearch::updateIntraMergeModeTest(static_vector<std::pair<int32_t, double>, FAST_UDI_MAX_RDMODE_NUM> m_uiRdModeCostList)
 {
-  std::stable_sort(m_uiRdModeCostList.begin(), m_uiRdModeCostList.end(), [](const std::pair<int32_t, double>& l, const std::pair<int32_t, double>& r) {return l.second < r.second; });
+  stableSortSmall(m_uiRdModeCostList.begin(), m_uiRdModeCostList.end(), [](const std::pair<int32_t, double>& l, const std::pair<int32_t, double>& r) {return l.second < r.second; });
   const double imThreshold = 1.16;
   double min = m_uiRdModeCostList[0].second;
   for (int i = 1; i < m_uiRdModeCostList.size(); i++)

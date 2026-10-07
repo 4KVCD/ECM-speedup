@@ -10559,7 +10559,7 @@ void EncAdaptiveLoopFilter::determineControlIdcValues(CodingStructure &cs, const
   {
     std::copy_n(curFilterEnabled, MAX_NUM_CC_ALF_FILTERS, filterEnabled);
 
-    std::stable_sort(filterIdxCount, filterIdxCount + MAX_NUM_CC_ALF_FILTERS, compareCounts);
+    stableSortSmall(filterIdxCount, filterIdxCount + MAX_NUM_CC_ALF_FILTERS, compareCounts);
 
     int filterIdc = 1;
     ccAlfFilterCount = 0;
@@ -11981,7 +11981,7 @@ bool EncAdaptiveLoopFilter::determineCtuFlagReuse(CodingStructure &cs, const Com
       }
       paramApsIdAndCount[bestSetId].count++;
     }
-    std::stable_sort(paramApsIdAndCount.begin(), paramApsIdAndCount.end(), compareCountsTALF);
+    stableSortSmall(paramApsIdAndCount.begin(), paramApsIdAndCount.end(), compareCountsTALF);
     params.clear();
     apsIds.clear();
     for(auto p: paramApsIdAndCount)

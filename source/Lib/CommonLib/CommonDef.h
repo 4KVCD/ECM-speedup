@@ -39,6 +39,7 @@
 #define __COMMONDEF__
 
 #include <algorithm>
+#include <functional>
 #include <iostream>
 #include <iomanip>
 #include <limits>
@@ -2222,6 +2223,28 @@ struct ClpRngs
 };
 
 template <typename T> inline T Clip3 (const T minVal, const T maxVal, const T a) { return std::min<T> (std::max<T> (minVal, a) , maxVal); }  ///< general min/max clip
+
+// perf: same result as std::stable_sort (stable, same comparator), but short ranges are sorted in place by
+// insertion instead of going through std::stable_sort's heap-allocated temporary buffer
+template<typename It, typename Cmp> inline void stableSortSmall( It first, It last, Cmp cmp )
+{
+  if( last - first > 32 )
+  {
+    std::stable_sort( first, last, cmp );
+    return;
+  }
+  for( It i = first + ( first != last ); i < last; ++i )
+  {
+    auto x = std::move( *i );
+    It   j = i;
+    for( ; j != first && cmp( x, *( j - 1 ) ); --j )
+    {
+      *j = std::move( *( j - 1 ) );
+    }
+    *j = std::move( x );
+  }
+}
+template<typename It> inline void stableSortSmall( It first, It last ) { stableSortSmall( first, last, std::less<>() ); }
 template <typename T> inline T ClipBD( const T x, const int bitDepth ) { return Clip3( T( 0 ), T( ( 1 << bitDepth ) - 1 ), x ); }
 template <typename T> inline T ClipPel (const T a, const ClpRng& clpRng)         { return std::min<T> (std::max<T> (clpRng.min, a) , clpRng.max); }  ///< clip reconstruction
 

@@ -3517,7 +3517,7 @@ void EncSampleAdaptiveOffset::setupInitCcSaoParam(CodingStructure& cs, const Com
     ctbCost[ctbIdx].cost = (double)dist;
   }
 
-  std::stable_sort(ctbCost, ctbCost + m_numCTUsInPic, compareCtbCost);
+  stableSortSmall(ctbCost, ctbCost + m_numCTUsInPic, compareCtbCost);
 
   for (int ctbIdx = 0; ctbIdx < m_numCTUsInPic; ctbIdx++)
   {
@@ -7004,7 +7004,7 @@ void EncSampleAdaptiveOffset::determineCcSaoControlIdc(CodingStructure& cs, cons
 #endif
   std::copy_n(setEnabled, MAX_CCSAO_SET_NUM, ccSaoParam.setEnabled);
 
-  std::stable_sort(setIdxCount, setIdxCount + MAX_CCSAO_SET_NUM, compareSetIdxCount);
+  stableSortSmall(setIdxCount, setIdxCount + MAX_CCSAO_SET_NUM, compareSetIdxCount);
 
   int setIdc = 1;
   ccSaoParam.setNum = 0;

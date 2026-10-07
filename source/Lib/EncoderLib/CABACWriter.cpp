@@ -11881,7 +11881,10 @@ void CABACWriter::codePredictedSigns( TransformUnit &tu, ComponentID compID )
   }
   else
   {
-    std::vector<SignCombInfo>                  signCombList;
+    // perf: reuse the buffer instead of growing a new vector on every call (single-threaded encoder)
+    static std::vector<SignCombInfo>           signCombListBuf;
+    std::vector<SignCombInfo>&                 signCombList = signCombListBuf;
+    signCombList.clear();
 #if JVET_AL0181_ASBT
     const bool lfnstEnabled = ((tu.checkLFNSTApplied(compID)) || ( (tu.asbtDecimH[compID] || tu.asbtDecimW[compID])
                               && !((tu.asbtDecimH[compID] + tu.asbtDecimW[compID]) == 2 && (tu.blocks[compID].width <= 8 || tu.blocks[compID].height <= 8))
@@ -11949,7 +11952,7 @@ void CABACWriter::codePredictedSigns( TransformUnit &tu, ComponentID compID )
       signs += signBuff.stride;
       signScanIdx += signScanIdxBuff.stride;
     }
-    std::stable_sort(signCombList.begin(), signCombList.end(), compareOrderIdx);
+    stableSortSmall(signCombList.begin(), signCombList.end(), compareOrderIdx);
     int numScanPos = 0;
     for (uint32_t idx = 0; idx < signCombList.size(); idx++)
     {

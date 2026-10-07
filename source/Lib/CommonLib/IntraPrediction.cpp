@@ -4715,7 +4715,7 @@ Mv IntraPrediction::refineChromaBv(const ComponentID compId, const PredictionUni
     }
     aBvCostVec.push_back(std::pair<Mv, Distortion>(*it, uiCost));
   }
-  std::stable_sort(aBvCostVec.begin(), aBvCostVec.end(), [](const std::pair<Mv, Distortion> &l, const std::pair<Mv, Distortion> &r) { return l.second < r.second; });
+  stableSortSmall(aBvCostVec.begin(), aBvCostVec.end(), [](const std::pair<Mv, Distortion> &l, const std::pair<Mv, Distortion> &r) { return l.second < r.second; });
   return aBvCostVec[0].first;
 }
 #endif
@@ -12253,9 +12253,9 @@ void IntraPrediction::deriveSgpmModeOrdered(const CPelBuf &recoBuf, const CompAr
     bVCostVec[i] = { curBv, uiCurCost };
   }
 #if JVET_AL0188_SGPM_FLIPAWARE_BV
-  std::stable_sort(bVCostVec.begin(), bVCostVec.end(), [](const std::pair<BvInfo, Distortion>& l, const std::pair<BvInfo, Distortion>& r) {return l.second < r.second; });
+  stableSortSmall(bVCostVec.begin(), bVCostVec.end(), [](const std::pair<BvInfo, Distortion>& l, const std::pair<BvInfo, Distortion>& r) {return l.second < r.second; });
 #else
-  std::stable_sort(bVCostVec.begin(), bVCostVec.end(), [](const std::pair<Mv, Distortion>& l, const std::pair<Mv, Distortion>& r) {return l.second < r.second; });
+  stableSortSmall(bVCostVec.begin(), bVCostVec.end(), [](const std::pair<Mv, Distortion>& l, const std::pair<Mv, Distortion>& r) {return l.second < r.second; });
 #endif
 #else
   Distortion sadWholeTM[NUM_LUMA_MODE];
@@ -19243,7 +19243,7 @@ void IntraPrediction::reorderIntraMergeCand(const CompArea& area, CodingUnit& cu
     {
       BVCostVec[i] = { { BVs[i], bvLocDeps[i] }, bvCosts[i] };
     }
-    std::stable_sort(BVCostVec.begin(), BVCostVec.end(), [](const std::pair<std::pair<Mv, int>, uint64_t>& l, const std::pair<std::pair<Mv, int>, uint64_t>& r) { return l.second < r.second; });
+    stableSortSmall(BVCostVec.begin(), BVCostVec.end(), [](const std::pair<std::pair<Mv, int>, uint64_t>& l, const std::pair<std::pair<Mv, int>, uint64_t>& r) { return l.second < r.second; });
     // Replace the intra angular mode with block vector mode
     for (int i = 0; i < numBVs; i++)
     {

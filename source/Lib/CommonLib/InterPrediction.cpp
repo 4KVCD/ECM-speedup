@@ -17875,8 +17875,8 @@ void InterPrediction::generateMergeCandidates(PredictionUnit& pu, MergeCtx& mvpM
   pu.mergeIdx = origMergeIdx;
 
   // sort and generate new candidates
-  std::stable_sort(uniPredL0.begin(), uniPredL0.end());
-  std::stable_sort(uniPredL1.begin(), uniPredL1.end());
+  stableSortSmall(uniPredL0.begin(), uniPredL0.end());
+  stableSortSmall(uniPredL1.begin(), uniPredL1.end());
 
   MergeCtx genCands;
   genCands.numValidMergeCand = 0;
@@ -36925,10 +36925,10 @@ void InterPrediction::deriveMVDCandVecFromMotionInforPredGeneral(const Predictio
         miPredListSub.push_back(i);
       }
     }
-    std::stable_sort(miPredListSub.begin(), miPredListSub.end(), [&miPredList](const int& l, const int& r) {return miPredList[l].cost < miPredList[r].cost; });
+    stableSortSmall(miPredListSub.begin(), miPredListSub.end(), [&miPredList](const int& l, const int& r) {return miPredList[l].cost < miPredList[r].cost; });
     int k = 0;
 #else
-    std::stable_sort(miPredList.begin(), miPredList.end(), [](const MotionInfoPred & l, const MotionInfoPred & r) {return l.cost < r.cost; });
+    stableSortSmall(miPredList.begin(), miPredList.end(), [](const MotionInfoPred & l, const MotionInfoPred & r) {return l.cost < r.cost; });
     std::vector<MotionInfoPred> miPredListSub;
     miPredListSub.clear();
     
@@ -37014,7 +37014,7 @@ void InterPrediction::deriveAffineMVDCandVecFromMotionInforPredGeneral(const Pre
       }
     }
     
-    std::stable_sort(miPredListSub.begin(), miPredListSub.end(), [&miPredList](const int& l, const int& r) {return miPredList[l].cost < miPredList[r].cost; });
+    stableSortSmall(miPredListSub.begin(), miPredListSub.end(), [&miPredList](const int& l, const int& r) {return miPredList[l].cost < miPredList[r].cost; });
 
     int k = 0;
     for (size_t i = 0; i < miPredListSub.size(); i++)
@@ -37038,7 +37038,7 @@ void InterPrediction::deriveAffineMVDCandVecFromMotionInforPredGeneral(const Pre
     }
 
 #else
-    std::stable_sort(miPredList.begin(), miPredList.end(), [](const MotionInfoPred & l, const MotionInfoPred & r) {return l.cost < r.cost; });
+    stableSortSmall(miPredList.begin(), miPredList.end(), [](const MotionInfoPred & l, const MotionInfoPred & r) {return l.cost < r.cost; });
 
     std::vector<MotionInfoPred> miPredListSub;
     miPredListSub.clear();
@@ -37115,7 +37115,7 @@ void InterPrediction::deriveMVDCandVecFromMotionInforPred(const PredictionUnit &
           miPredListSub.push_back(i);
         }
       }
-      std::stable_sort(miPredListSub.begin(), miPredListSub.end(), [&miPredList](const int& l, const int& r) {return miPredList[l].cost < miPredList[r].cost; });
+      stableSortSmall(miPredListSub.begin(), miPredListSub.end(), [&miPredList](const int& l, const int& r) {return miPredList[l].cost < miPredList[r].cost; });
 #else
       for (std::vector<MotionInfoPred>::iterator it = miPredList.begin(); it != miPredList.end(); ++it)
       {
@@ -37124,7 +37124,7 @@ void InterPrediction::deriveMVDCandVecFromMotionInforPred(const PredictionUnit &
           miPredListSub.push_back(*it);
         }
       }
-      std::stable_sort(miPredListSub.begin(), miPredListSub.end(), [](const MotionInfoPred & l, const MotionInfoPred & r) {return l.cost < r.cost; });
+      stableSortSmall(miPredListSub.begin(), miPredListSub.end(), [](const MotionInfoPred & l, const MotionInfoPred & r) {return l.cost < r.cost; });
 #endif
     }
     CHECK(!miPredListSub.empty() && cMvdDerivedVec.size() != miPredListSub.size(), "cMvdDerivedVec.size() != miPredListSub.size()");
@@ -37306,9 +37306,9 @@ void InterPrediction::deriveAffineMVDCandVecFromMotionInforPred(const Prediction
         }
       }
 #if JVET_AD0140_MVD_PREDICTION
-      std::stable_sort(miPredListSub.begin(), miPredListSub.end(), [&miPredList](const int& l, const int& r) {return miPredList[l].cost < miPredList[r].cost; });
+      stableSortSmall(miPredListSub.begin(), miPredListSub.end(), [&miPredList](const int& l, const int& r) {return miPredList[l].cost < miPredList[r].cost; });
 #else
-      std::stable_sort(miPredListSub.begin(), miPredListSub.end(), [](const MotionInfoPred& l, const MotionInfoPred& r) {return l.cost < r.cost; });
+      stableSortSmall(miPredListSub.begin(), miPredListSub.end(), [](const MotionInfoPred& l, const MotionInfoPred& r) {return l.cost < r.cost; });
 #endif
     }
     CHECK(!miPredListSub.empty() && cMvdDerivedVec[0].size() != miPredListSub.size(), "cMvdDerivedVec[0].size() != miPredListSub.size()");
@@ -37774,7 +37774,7 @@ void InterPrediction::reorderRefCombList(PredictionUnit &pu, std::vector<RefList
   if (pu.cu->affine || !pu.cs->sps->getRprEnabledFlag() || !enableRprCombList)
   {
 #endif
-  std::stable_sort(refListComb.begin(), refListComb.end(), [](const RefListAndRefIdx & l, const RefListAndRefIdx & r) {return l.cost < r.cost; });
+  stableSortSmall(refListComb.begin(), refListComb.end(), [](const RefListAndRefIdx & l, const RefListAndRefIdx & r) {return l.cost < r.cost; });
 #if JVET_AF0190_RPR_TMP_REORDER_LIC
   }
   else
@@ -37792,12 +37792,12 @@ void InterPrediction::reorderRefCombList(PredictionUnit &pu, std::vector<RefList
     }
     if (rprPos < (int)refListComb.size())
     {
-      std::stable_sort(refListComb.begin(), refListComb.begin() + rprPos, [](const RefListAndRefIdx & l, const RefListAndRefIdx & r) {return l.cost < r.cost; });
-      std::stable_sort(refListComb.begin() + rprPos, refListComb.end(), [](const RefListAndRefIdx & l, const RefListAndRefIdx & r) {return l.cost < r.cost; });
+      stableSortSmall(refListComb.begin(), refListComb.begin() + rprPos, [](const RefListAndRefIdx & l, const RefListAndRefIdx & r) {return l.cost < r.cost; });
+      stableSortSmall(refListComb.begin() + rprPos, refListComb.end(), [](const RefListAndRefIdx & l, const RefListAndRefIdx & r) {return l.cost < r.cost; });
     }
     else
     {
-      std::stable_sort(refListComb.begin(), refListComb.end(), [](const RefListAndRefIdx & l, const RefListAndRefIdx & r) {return l.cost < r.cost; });
+      stableSortSmall(refListComb.begin(), refListComb.end(), [](const RefListAndRefIdx & l, const RefListAndRefIdx & r) {return l.cost < r.cost; });
     }
   }
 #endif
@@ -39148,7 +39148,7 @@ void InterPrediction::reorderRefPairList(PredictionUnit &pu, std::vector<RefPicP
   if (pu.cu->affine || !pu.cs->sps->getRprEnabledFlag() || !enableRprPairedList)
   {
 #endif
-  std::stable_sort(refPairList.begin(), refPairList.end(), [](const RefPicPair & l, const RefPicPair & r) {return l.cost < r.cost; });
+  stableSortSmall(refPairList.begin(), refPairList.end(), [](const RefPicPair & l, const RefPicPair & r) {return l.cost < r.cost; });
 #if JVET_AF0190_RPR_TMP_REORDER_LIC
   }
   else
@@ -39167,12 +39167,12 @@ void InterPrediction::reorderRefPairList(PredictionUnit &pu, std::vector<RefPicP
     }
     if (rprPos < (int)refPairList.size())
     {
-      std::stable_sort(refPairList.begin(), refPairList.begin() + rprPos, [](const RefPicPair & l, const RefPicPair & r) {return l.cost < r.cost; });
-      std::stable_sort(refPairList.begin() + rprPos, refPairList.end(), [](const RefPicPair & l, const RefPicPair & r) {return l.cost < r.cost; });
+      stableSortSmall(refPairList.begin(), refPairList.begin() + rprPos, [](const RefPicPair & l, const RefPicPair & r) {return l.cost < r.cost; });
+      stableSortSmall(refPairList.begin() + rprPos, refPairList.end(), [](const RefPicPair & l, const RefPicPair & r) {return l.cost < r.cost; });
     }
     else
     {
-      std::stable_sort(refPairList.begin(), refPairList.end(), [](const RefPicPair & l, const RefPicPair & r) {return l.cost < r.cost; });
+      stableSortSmall(refPairList.begin(), refPairList.end(), [](const RefPicPair & l, const RefPicPair & r) {return l.cost < r.cost; });
     }
   }
 #endif
@@ -40210,7 +40210,7 @@ void InterPrediction::deriveMvdSign( const Mv& cMvPred, const Mv& cMvdKnownAtDec
     aMvCostVec[n] = { cMvdTest, uiCost };
   }
 
-  std::stable_sort(aMvCostVec.begin(), aMvCostVec.end(), [](const std::pair<Mv, Distortion>& l, const std::pair<Mv, Distortion>& r) {return l.second < r.second; });
+  stableSortSmall(aMvCostVec.begin(), aMvCostVec.end(), [](const std::pair<Mv, Distortion>& l, const std::pair<Mv, Distortion>& r) {return l.second < r.second; });
 
 #if JVET_AA0093_DIVERSITY_CRITERION_FOR_ARMC && !JVET_AD0140_MVD_PREDICTION 
   int sizeCandList = (int) distance(aMvCostVec.begin(), aMvCostVec.end());
@@ -40893,7 +40893,7 @@ void InterPrediction::defineSignHypMatchAffine(PredictionUnit& pu, const RefPicL
     }
 #endif
 
-    std::stable_sort(aMvCostVec.begin(), aMvCostVec.end(), [](const std::pair<Mv, Distortion> & l, const std::pair<Mv, Distortion> & r) {return l.second < r.second; });
+    stableSortSmall(aMvCostVec.begin(), aMvCostVec.end(), [](const std::pair<Mv, Distortion> & l, const std::pair<Mv, Distortion> & r) {return l.second < r.second; });
     
 #if JVET_AA0093_DIVERSITY_CRITERION_FOR_ARMC
     int sizeCandList = (int) distance(aMvCostVec.begin(), aMvCostVec.end());
@@ -41075,7 +41075,7 @@ void InterPrediction::defineSignHypMatchAffine(PredictionUnit& pu, const RefPicL
       }
     }
 #endif
-    std::stable_sort(aMvCostVec.begin(), aMvCostVec.end(), [](const std::pair<Mv, Distortion> & l, const std::pair<Mv, Distortion> & r) {return l.second < r.second; });
+    stableSortSmall(aMvCostVec.begin(), aMvCostVec.end(), [](const std::pair<Mv, Distortion> & l, const std::pair<Mv, Distortion> & r) {return l.second < r.second; });
 #if JVET_AA0093_DIVERSITY_CRITERION_FOR_ARMC && !JVET_AD0140_MVD_PREDICTION
 
     int sizeCandList = (int) distance( aMvCostVec.begin(), aMvCostVec.end());
@@ -41240,7 +41240,7 @@ void InterPrediction::defineSignHypMatchAffine(PredictionUnit& pu, const RefPicL
     }
 #endif 
 
-    std::stable_sort(aMvCostVec.begin(), aMvCostVec.end(), [](const std::pair<Mv, Distortion> & l, const std::pair<Mv, Distortion> & r) {return l.second < r.second; });
+    stableSortSmall(aMvCostVec.begin(), aMvCostVec.end(), [](const std::pair<Mv, Distortion> & l, const std::pair<Mv, Distortion> & r) {return l.second < r.second; });
     
 #if JVET_AA0093_DIVERSITY_CRITERION_FOR_ARMC
     int sizeCandList = (int) distance(aMvCostVec.begin(), aMvCostVec.end());
@@ -41854,7 +41854,7 @@ void InterPrediction::defineSignHypMatchAffine(PredictionUnit& pu, const RefPicL
 #endif
     //--------------------------------------------------------------------------------//
     /////////////////////////////////////////////////////////////////
-    std::stable_sort(aMvCostVec.begin(), aMvCostVec.end(), [](const std::pair<int, Distortion> & l, const std::pair<int, Distortion> & r) {return l.second < r.second; });
+    stableSortSmall(aMvCostVec.begin(), aMvCostVec.end(), [](const std::pair<int, Distortion> & l, const std::pair<int, Distortion> & r) {return l.second < r.second; });
 #if JVET_AA0093_DIVERSITY_CRITERION_FOR_ARMC && !JVET_AD0140_MVD_PREDICTION
     int sizeCandList = (int) distance(aMvCostVec.begin(), aMvCostVec.end());
     if (sizeCandList > 2)
@@ -43540,7 +43540,7 @@ std::vector<Mv> InterPrediction::deriveMVDFromMVSDIdxAffineSI(PredictionUnit& pu
       }
     }
 
-    std::stable_sort(aMvCostVec.begin(), aMvCostVec.end(), [](const std::pair<Mv, Distortion>& l, const std::pair<Mv, Distortion>& r) {return l.second < r.second; });
+    stableSortSmall(aMvCostVec.begin(), aMvCostVec.end(), [](const std::pair<Mv, Distortion>& l, const std::pair<Mv, Distortion>& r) {return l.second < r.second; });
 
     for (int n = 0; n < patternsNum; ++n)
     {

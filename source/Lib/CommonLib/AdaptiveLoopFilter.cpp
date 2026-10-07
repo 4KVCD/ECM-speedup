@@ -9630,7 +9630,7 @@ void AdaptiveLoopFilter::getRefPics(const CodingStructure &cs)
       }
     }
   }
-  std::stable_sort(m_refCombs.begin(), m_refCombs.end(), [](const refComb& l, const refComb&r) { return l.absPocDiff < r.absPocDiff;} );
+  stableSortSmall(m_refCombs.begin(), m_refCombs.end(), [](const refComb& l, const refComb&r) { return l.absPocDiff < r.absPocDiff;} );
 }
 
 MotionInfo getMi(const CodingStructure &cs, const Position pos, const int mode)

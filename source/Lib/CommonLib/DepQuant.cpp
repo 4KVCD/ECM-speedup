@@ -3123,8 +3123,8 @@ void DepQuant::getPredictedSigns(TransformUnit &tu, const ComponentID compID,
       }
       state = int((stateTransTab >> (4 * (2 * state + (level & 1)))) & 15);
     }
-    std::stable_sort(predSignsXYLevel.begin(), predSignsXYLevel.end(),
-                     [](const PositionWithLevel &a, const PositionWithLevel &b) { return a.level > b.level; });
+    stableSortSmall(predSignsXYLevel.begin(), predSignsXYLevel.end(),
+                    [](const PositionWithLevel &a, const PositionWithLevel &b) { return a.level > b.level; });
 
     IdxBuf bufSignsScanIdx = tu.getCoeffSignsScanIdx(compID);
 

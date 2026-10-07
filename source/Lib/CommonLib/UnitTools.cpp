@@ -45806,7 +45806,7 @@ void addOneTypeTempCandidates(const PredictionUnit &pu, std::vector<MotionInfo> 
       }
     }
   }
-  std::stable_sort(tempCandList.begin(), tempCandList.end(), [](const std::pair<MotionInfo, Position> &a, const std::pair<MotionInfo, Position> &b) { return (a.second.x + a.second.y) < (b.second.x + b.second.y); });
+  stableSortSmall(tempCandList.begin(), tempCandList.end(), [](const std::pair<MotionInfo, Position> &a, const std::pair<MotionInfo, Position> &b) { return (a.second.x + a.second.y) < (b.second.x + b.second.y); });
   for(auto cand: tempCandList)
   {
     temporalMiCandList.push_back(cand.first);

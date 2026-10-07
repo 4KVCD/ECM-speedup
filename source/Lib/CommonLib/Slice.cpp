@@ -1004,7 +1004,7 @@ void Slice::generateCombinedList()
 #endif
   if (m_pcSPS->getRprEnabledFlag())
   {
-    std::stable_sort(m_refPicCombinedList.begin(), m_refPicCombinedList.end(), [](const RefListAndRefIdx & l, const RefListAndRefIdx & r) {return l.cost < r.cost; });
+    stableSortSmall(m_refPicCombinedList.begin(), m_refPicCombinedList.end(), [](const RefListAndRefIdx & l, const RefListAndRefIdx & r) {return l.cost < r.cost; });
   }
 }
 
@@ -1059,7 +1059,7 @@ void Slice::generateRefPicPairList()
   }
   if (m_pcSPS->getRprEnabledFlag())
   {
-    std::stable_sort(m_refPicPairList.begin(), m_refPicPairList.end(), [](const RefPicPair & l, const RefPicPair & r) {return l.cost < r.cost; });
+    stableSortSmall(m_refPicPairList.begin(), m_refPicPairList.end(), [](const RefPicPair & l, const RefPicPair & r) {return l.cost < r.cost; });
   }
 }
 #endif

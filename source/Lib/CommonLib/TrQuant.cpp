@@ -2656,7 +2656,7 @@ void TrQuant::transformNxN( TransformUnit& tu, const ComponentID& compID, const 
   if (CU::isInter(*tu.cu) && tu.cu->mtsFlag && compID == COMPONENT_Y)
 #endif
   {
-    std::stable_sort(trCosts.begin(), trCosts.end(), [](const TrCost  l, const TrCost r) {return l.first < r.first; });
+    stableSortSmall(trCosts.begin(), trCosts.end(), [](const TrCost  l, const TrCost r) {return l.first < r.first; });
     std::vector<TrMode> trModesTemp;
     trModesTemp.resize(trModes->size());
     for (int i = 0; i < trModes->size(); i++)

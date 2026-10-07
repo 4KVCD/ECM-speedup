@@ -2584,7 +2584,7 @@ void InterSearch::xIBCEstimation(PredictionUnit& pu, PelUnitBuf& origBuf, Mv *pc
         historyOrdered[i] = { p->first, p->second };
         i++;
       }
-     std::stable_sort(historyOrdered.begin(), historyOrdered.end(),[](const std::pair<Mv, Distortion> &l, const std::pair<Mv, Distortion> &r)
+     stableSortSmall(historyOrdered.begin(), historyOrdered.end(),[](const std::pair<Mv, Distortion> &l, const std::pair<Mv, Distortion> &r)
                      { return (l.second < r.second) || (l.second == r.second && (l.first.getHor() < r.first.getHor() || (l.first.getHor() == r.first.getHor() && l.first.getVer() < r.first.getVer()))); });
      minCostProj = 3 * historyOrdered[0].second;
 
@@ -2822,7 +2822,7 @@ void InterSearch::xIBCEstimation(PredictionUnit& pu, PelUnitBuf& origBuf, Mv *pc
       historyOrdered[i] = { p->first, p->second };
       i++;
     }
-    std::stable_sort(historyOrdered.begin(), historyOrdered.end(),[](const std::pair<Mv, Distortion> &l, const std::pair<Mv, Distortion> &r)
+    stableSortSmall(historyOrdered.begin(), historyOrdered.end(),[](const std::pair<Mv, Distortion> &l, const std::pair<Mv, Distortion> &r)
                      { return (l.second < r.second) || (l.second == r.second && (l.first.getHor() < r.first.getHor() || (l.first.getHor() == r.first.getHor() && l.first.getVer() < r.first.getVer()))); });
 
     for (int i = 0; i < history.size(); i++)

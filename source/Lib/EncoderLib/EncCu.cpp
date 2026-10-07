@@ -4463,7 +4463,7 @@ bool EncCu::xCheckRDCostIntra(CodingStructure *&tempCS, CodingStructure *&bestCS
 #if JVET_AJ0146_TIMDSAD
               if (CU::allowTimdSad(cu))
               {
-                std::stable_sort(m_pcIntraSearch->m_timdModeCostList.begin(),m_pcIntraSearch->m_timdModeCostList.end());
+                stableSortSmall(m_pcIntraSearch->m_timdModeCostList.begin(),m_pcIntraSearch->m_timdModeCostList.end());
                 cu.timdModeSad = m_pcIntraSearch->deriveTimdModeSad(bestCS->picture->getRecoBuf(area), area, cu );
               }
 #endif
@@ -30844,7 +30844,7 @@ void EncCu::xEncodeInterResidual(   CodingStructure *&tempCS
         {
           trCosts.push_back(TrCost(i, int(std::min<double>(costSBT[i], std::numeric_limits<int>::max()))));
         }
-        std::stable_sort(trCosts.begin(), trCosts.end(), [](const TrCost  l, const TrCost r) {return l.second < r.second; });
+        stableSortSmall(trCosts.begin(), trCosts.end(), [](const TrCost  l, const TrCost r) {return l.second < r.second; });
         for (int i = 0; i < NUM_SBT_LFNST_RDO; i++)
         {
           if (trCosts[i].second != MAX_DOUBLE && trCosts[i].second != std::numeric_limits<int>::max())
@@ -31308,7 +31308,7 @@ void EncCu::xReuseCachedResult( CodingStructure *&tempCS, CodingStructure *&best
 
         if (CU::allowTimdSad(cu) && cu.timdSad)
         {
-          std::stable_sort(m_pcIntraSearch->m_timdModeCostList.begin(),m_pcIntraSearch->m_timdModeCostList.end());
+          stableSortSmall(m_pcIntraSearch->m_timdModeCostList.begin(),m_pcIntraSearch->m_timdModeCostList.end());
           cu.timdModeSad = m_pcIntraSearch->deriveTimdModeSad(bestCS->picture->getRecoBuf(area), area, cu );
           pu->intraDir[0] = cu.timdModeSad;
         }
@@ -31835,7 +31835,7 @@ void EncCu::xCheckRDCostInterMultiHyp2Nx2N(CodingStructure *&tempCS, CodingStruc
       const auto survivors = iter > 0 ? 2 : m_pcEncCfg->getNumMHPCandsToTest();
       iter++;
 
-      std::stable_sort(base.begin(), base.end(), RDCostComp);
+      stableSortSmall(base.begin(), base.end(), RDCostComp);
       if (base.size() > survivors)
         base.resize(survivors);
       predInterSearchAdditionalHypothesisMulti(base, out, pu, mrgCtx);
@@ -31844,7 +31844,7 @@ void EncCu::xCheckRDCostInterMultiHyp2Nx2N(CodingStructure *&tempCS, CodingStruc
     } while (!base.empty());
   }
 
-  std::stable_sort(mhResults.begin(), mhResults.end(), RDCostComp);
+  stableSortSmall(mhResults.begin(), mhResults.end(), RDCostComp);
 
   // actual testing with "true" RD costs
   for (int i = 0; i < std::min((int)mhResults.size(), m_pcEncCfg->getAddHypTries()); ++i)
