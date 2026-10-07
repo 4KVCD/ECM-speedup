@@ -391,11 +391,52 @@ void inverseLfnst_SIMD(TCoeff* src, TCoeff*  dst, const int8_t*  trMat, const in
 {
   CHECK((trSize & 0x7) || (zeroOutSize & 0x7), "trSize and zeroOutSize should be multiple of 8");
 
+#if USE_AVX2
+  if( vext >= AVX2 )
+  {
+    // perf: dst[j] accumulated as src[i] times the contiguous matrix row i, 8 or 16 outputs at a time (same int32 sums
+    // as the per-output formulation below, see computeInvNspt_SIMD)
+    const __m256i vrnd8 = _mm256_set1_epi32( 64 );
+    const __m256i vmin8 = _mm256_set1_epi32( outputMinimum );
+    const __m256i vmax8 = _mm256_set1_epi32( outputMaximum );
+    auto finish = [&]( __m256i acc, TCoeff* out ) {
+      acc = _mm256_srai_epi32( _mm256_add_epi32( acc, vrnd8 ), 7 );
+      _mm256_storeu_si256( ( __m256i* ) out, _mm256_min_epi32( vmax8, _mm256_max_epi32( vmin8, acc ) ) );
+    };
+    for( int jb = 0; jb < trSize; jb += 16 )
+    {
+      __m256i acc0 = _mm256_setzero_si256(), acc1 = _mm256_setzero_si256();
+      const int8_t* row = trMat + jb;
+      if( trSize - jb >= 16 )
+      {
+        for( int i = 0; i < zeroOutSize; i++, row += trSize )
+        {
+          const __m256i s = _mm256_set1_epi32( src[i] );
+          acc0 = _mm256_add_epi32( acc0, _mm256_mullo_epi32( s, _mm256_cvtepi8_epi32( _mm_loadl_epi64( ( const __m128i* ) ( row ) ) ) ) );
+          acc1 = _mm256_add_epi32( acc1, _mm256_mullo_epi32( s, _mm256_cvtepi8_epi32( _mm_loadl_epi64( ( const __m128i* ) ( row + 8 ) ) ) ) );
+        }
+        finish( acc0, dst + jb );
+        finish( acc1, dst + jb + 8 );
+      }
+      else   // 8 outputs left
+      {
+        for( int i = 0; i < zeroOutSize; i++, row += trSize )
+        {
+          const __m256i s = _mm256_set1_epi32( src[i] );
+          acc0 = _mm256_add_epi32( acc0, _mm256_mullo_epi32( s, _mm256_cvtepi8_epi32( _mm_loadl_epi64( ( const __m128i* ) ( row ) ) ) ) );
+        }
+        finish( acc0, dst + jb );
+      }
+    }
+    return;
+  }
+#endif
+
   const __m128i vrnd = _mm_set1_epi32(64);
   __m128i vmat[4], vcoef[4], vsrc;
   __m128i vmin = _mm_set1_epi32(outputMinimum);
   __m128i vmax = _mm_set1_epi32(outputMaximum);
-	
+
   int trSize2 = (trSize << 1);
   int trSize3 = trSize2 + trSize;
   int trSize4 = (trSize << 2);
@@ -499,6 +540,40 @@ void computeFwdNspt_SIMD( int* src, int* dst, const uint32_t mode, const uint32_
 
   int shift = shift_1st + shift_2nd - 7;
   int rnd = 1 << ( shift - 1 );
+
+#if USE_AVX2
+  if( vext >= AVX2 && ( trSize & 7 ) == 0 && ( zeroOutSize & 3 ) == 0 )
+  {
+    // perf: the same per-output dot products over the contiguous matrix rows, 8 inputs and 4 outputs per step (the
+    // int32 sums do not depend on the order of the wrapping additions)
+    const __m128i vrnd4 = _mm_set1_epi32( rnd );
+    for( int j = 0; j < zeroOutSize; j += 4 )
+    {
+      const int8_t* r0 = trMat + j * trSize;
+      const int8_t* r1 = r0 + trSize;
+      const int8_t* r2 = r1 + trSize;
+      const int8_t* r3 = r2 + trSize;
+      __m256i acc0 = _mm256_setzero_si256(), acc1 = _mm256_setzero_si256();
+      __m256i acc2 = _mm256_setzero_si256(), acc3 = _mm256_setzero_si256();
+      for( int i = 0; i < trSize; i += 8 )
+      {
+        const __m256i s = _mm256_loadu_si256( ( const __m256i* ) ( src + i ) );
+        acc0 = _mm256_add_epi32( acc0, _mm256_mullo_epi32( s, _mm256_cvtepi8_epi32( _mm_loadl_epi64( ( const __m128i* ) ( r0 + i ) ) ) ) );
+        acc1 = _mm256_add_epi32( acc1, _mm256_mullo_epi32( s, _mm256_cvtepi8_epi32( _mm_loadl_epi64( ( const __m128i* ) ( r1 + i ) ) ) ) );
+        acc2 = _mm256_add_epi32( acc2, _mm256_mullo_epi32( s, _mm256_cvtepi8_epi32( _mm_loadl_epi64( ( const __m128i* ) ( r2 + i ) ) ) ) );
+        acc3 = _mm256_add_epi32( acc3, _mm256_mullo_epi32( s, _mm256_cvtepi8_epi32( _mm_loadl_epi64( ( const __m128i* ) ( r3 + i ) ) ) ) );
+      }
+      // horizontal sums: lanes of acc0..acc3 -> 4 results
+      const __m256i h01 = _mm256_hadd_epi32( acc0, acc1 );
+      const __m256i h23 = _mm256_hadd_epi32( acc2, acc3 );
+      const __m256i h   = _mm256_hadd_epi32( h01, h23 );
+      __m128i       res = _mm_add_epi32( _mm256_castsi256_si128( h ), _mm256_extracti128_si256( h, 1 ) );
+      res               = _mm_srai_epi32( _mm_add_epi32( res, vrnd4 ), shift );
+      _mm_storeu_si128( ( __m128i* ) ( dst + j ), res );
+    }
+    return;
+  }
+#endif
 
   const __m128i vrnd = _mm_set1_epi32( rnd );
   __m128i vmat[ 4 ], vcoef[ 4 ], vsrc;
@@ -613,6 +688,57 @@ void TrQuant::computeInvNspt( int* src, int* dst, const uint32_t mode, const uin
 
   int shift = shift_1st + shift_2nd - 7;
   int rnd = 1 << ( shift - 1 );
+
+#if USE_AVX2
+  if( vext >= AVX2 && ( trSize & 15 ) == 0 )
+  {
+    // perf: dst[j] = sum over i of src[i] * trMat[i * trSize + j], accumulated as src[i] times the contiguous matrix
+    // row i for 16 or 32 outputs at a time (no gathers, no horizontal adds). The int32 sums are the same as in the
+    // per-output formulation below: wrapping integer additions give the same result in any order.
+    const __m256i vrnd8 = _mm256_set1_epi32( rnd );
+    const __m256i vmin8 = _mm256_set1_epi32( outputMinimum );
+    const __m256i vmax8 = _mm256_set1_epi32( outputMaximum );
+    auto finish = [&]( __m256i acc, TCoeff* out ) {
+      acc = _mm256_srai_epi32( _mm256_add_epi32( acc, vrnd8 ), shift );
+      _mm256_storeu_si256( ( __m256i* ) out, _mm256_min_epi32( vmax8, _mm256_max_epi32( vmin8, acc ) ) );
+    };
+    // the per-output loop below consumes the inputs in groups of 4
+    const int numIn = ( zeroOutSize + 3 ) & ~3;
+    for( int jb = 0; jb < trSize; jb += 32 )
+    {
+      __m256i acc0 = _mm256_setzero_si256(), acc1 = _mm256_setzero_si256();
+      __m256i acc2 = _mm256_setzero_si256(), acc3 = _mm256_setzero_si256();
+      const int8_t* row = trMat + jb;
+      if( trSize - jb >= 32 )
+      {
+        for( int i = 0; i < numIn; i++, row += trSize )
+        {
+          const __m256i s = _mm256_set1_epi32( src[i] );
+          acc0 = _mm256_add_epi32( acc0, _mm256_mullo_epi32( s, _mm256_cvtepi8_epi32( _mm_loadl_epi64( ( const __m128i* ) ( row ) ) ) ) );
+          acc1 = _mm256_add_epi32( acc1, _mm256_mullo_epi32( s, _mm256_cvtepi8_epi32( _mm_loadl_epi64( ( const __m128i* ) ( row + 8 ) ) ) ) );
+          acc2 = _mm256_add_epi32( acc2, _mm256_mullo_epi32( s, _mm256_cvtepi8_epi32( _mm_loadl_epi64( ( const __m128i* ) ( row + 16 ) ) ) ) );
+          acc3 = _mm256_add_epi32( acc3, _mm256_mullo_epi32( s, _mm256_cvtepi8_epi32( _mm_loadl_epi64( ( const __m128i* ) ( row + 24 ) ) ) ) );
+        }
+        finish( acc0, dst + jb );
+        finish( acc1, dst + jb + 8 );
+        finish( acc2, dst + jb + 16 );
+        finish( acc3, dst + jb + 24 );
+      }
+      else   // 16 outputs left
+      {
+        for( int i = 0; i < numIn; i++, row += trSize )
+        {
+          const __m256i s = _mm256_set1_epi32( src[i] );
+          acc0 = _mm256_add_epi32( acc0, _mm256_mullo_epi32( s, _mm256_cvtepi8_epi32( _mm_loadl_epi64( ( const __m128i* ) ( row ) ) ) ) );
+          acc1 = _mm256_add_epi32( acc1, _mm256_mullo_epi32( s, _mm256_cvtepi8_epi32( _mm_loadl_epi64( ( const __m128i* ) ( row + 8 ) ) ) ) );
+        }
+        finish( acc0, dst + jb );
+        finish( acc1, dst + jb + 8 );
+      }
+    }
+    return;
+  }
+#endif
 
   const __m128i vrnd = _mm_set1_epi32( rnd );
   __m128i vmat[ 4 ], vcoef[ 4 ], vsrc;
