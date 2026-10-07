@@ -3179,6 +3179,10 @@ void EncSampleAdaptiveOffset::deriveCcSao( CodingStructure& cs, const ComponentI
 
   m_bestCcSaoParam.reset();
   memset( m_bestCcSaoControl, 0, sizeof( uint8_t ) * m_numCTUsInPic );
+  for( int setIdx = 0; setIdx < MAX_CCSAO_SET_NUM; setIdx++ )
+  {
+    m_ccSaoStatState[setIdx][0] = -2;   // statistics of an earlier component / picture
+  }
 
   for( int setNum = 1; setNum <= MAX_CCSAO_SET_NUM; setNum++ )
   {
@@ -3630,6 +3634,31 @@ void EncSampleAdaptiveOffset::getCcSaoStatistics(CodingStructure& cs, const Comp
 
   const PreCalcValues& pcv = *cs.pcv;
 
+  // perf: within deriveCcSao the inputs are fixed and m_ccSaoStatData is only written here, so the statistics of a set
+  // whose band classification (or absence) is the one they were last computed for are still valid: skip them
+  bool skipSet[MAX_CCSAO_SET_NUM] = { false };
+  if( blkStats == m_ccSaoStatData )
+  {
+    for( int setIdx = 0; setIdx < MAX_CCSAO_SET_NUM; setIdx++ )
+    {
+#if JVET_Y0106_CCSAO_EDGE_CLASSIFIER
+#if JVET_AE0151_CCSAO_HISTORY_OFFSETS_AND_EXT_EO
+      const bool isBand = ccSaoParam.setEnabled[setIdx] && ccSaoParam.setType[setIdx] == CCSAO_SET_TYPE_BAND;
+#else
+      const bool isBand = ccSaoParam.setEnabled[setIdx] && ccSaoParam.setType[setIdx] == 0;
+#endif
+#else
+      const bool isBand = ccSaoParam.setEnabled[setIdx];
+#endif
+      const int state[4] = { isBand ? (int) ccSaoParam.candPos[setIdx][COMPONENT_Y] : -1,
+                             isBand ? (int) ccSaoParam.bandNum[setIdx][COMPONENT_Y] : 0,
+                             isBand ? (int) ccSaoParam.bandNum[setIdx][COMPONENT_Cb] : 0,
+                             isBand ? (int) ccSaoParam.bandNum[setIdx][COMPONENT_Cr] : 0 };
+      skipSet[setIdx] = std::equal( state, state + 4, m_ccSaoStatState[setIdx] );
+      std::copy_n( state, 4, m_ccSaoStatState[setIdx] );
+    }
+  }
+
   int ctuRsAddr = 0;
   for( uint32_t yPos = 0; yPos < pcv.lumaHeight; yPos += pcv.maxCUHeight )
   {
@@ -3659,6 +3688,10 @@ void EncSampleAdaptiveOffset::getCcSaoStatistics(CodingStructure& cs, const Comp
 
       for (int setIdx = 0; setIdx < MAX_CCSAO_SET_NUM; setIdx++)
       {
+        if( skipSet[setIdx] )
+        {
+          continue;
+        }
         blkStats[setIdx][ctuRsAddr].reset();
         if (!ccSaoParam.setEnabled[setIdx])
           continue;

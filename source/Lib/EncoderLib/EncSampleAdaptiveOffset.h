@@ -398,6 +398,9 @@ private: //members
   bool                   m_extChroma = false;
 #endif
   CcSaoStatData*         m_ccSaoStatData     [MAX_CCSAO_SET_NUM];
+  // perf: within deriveCcSao, the band classification (-1: none, statistics zero; -2: unknown) for which
+  // m_ccSaoStatData[setIdx] currently holds the statistics: {candPosY, bandNumY, bandNumU, bandNumV}
+  int                    m_ccSaoStatState    [MAX_CCSAO_SET_NUM][4];
   CcSaoStatData          m_ccSaoStatFrame    [MAX_CCSAO_SET_NUM];
 #if JVET_Y0106_CCSAO_EDGE_CLASSIFIER
   CcSaoStatData*         m_ccSaoStatDataEdge [MAX_CCSAO_SET_NUM];
