@@ -1425,6 +1425,24 @@ const CtxSet &ctxSetGt4 = isLfnst ? Ctx::GtxFlagL[6 + chType] : Ctx::GtxFlag[6 +
       196608, 196608, 229376, 229376, 229376, 229376, 229376, 229376, 229376, 229376 }
   };
 
+  // g_goRiceBits with an additional 0 at index RICEMAX (no Rice coded part)
+  struct GoRiceBitsExt
+  {
+    int32_t t[4][RICEMAX + 1];
+    GoRiceBitsExt()
+    {
+      for (int r = 0; r < 4; r++)
+      {
+        for (int i = 0; i <= RICEMAX; i++)
+        {
+          t[r][i] = (i < RICEMAX ? g_goRiceBits[r][i] : 0);
+        }
+      }
+    }
+  };
+  static const GoRiceBitsExt g_goRiceBitsExtTab;
+  static const int32_t (&g_goRiceBitsExt)[4][RICEMAX + 1] = g_goRiceBitsExtTab.t;
+
 #if defined(__GNUC__) && !defined(__clang__)
 #define DQ_UNROLL_STATES _Pragma("GCC unroll 8")   // loops over the trellis states: fully unrolled (constant indices)
 #else
@@ -2106,6 +2124,13 @@ const CtxSet &ctxSetGt4 = isLfnst ? Ctx::GtxFlagL[6 + chType] : Ctx::GtxFlag[6 +
     uint8_t  absLevels[17][8];   // levels of the current sub-block [position][state] (max 255); row 16 stays zero
   };
 
+  // context coded bits of a level: gtx table entry and Rice part (g_goRiceBitsExt index, RICEMAX: none)
+  struct LevelBits
+  {
+    int32_t gtxIdx;
+    int32_t riceIdx;
+  };
+
   // [position][state] -> [state][position] (16 positions, 8 states)
   static inline void transposeAbsLevels(const uint8_t src[17][8], uint8_t dst[8][16])
   {
@@ -2176,16 +2201,17 @@ const CtxSet &ctxSetGt4 = isLfnst ? Ctx::GtxFlagL[6 + chType] : Ctx::GtxFlag[6 +
                        const int *quantCoeff, const TransformUnit &tu, const ComponentID compID, const QpParam &cQP,
                        const double lambda);
     void xInitStates(const unsigned effWidth, const unsigned effHeight, const ChannelType chType);
-    template<int numStates>
-    void xDecideSoA(const ScanPosType spt, const TCoeff absCoeff, const int lastOffset, Decision *decisions,
-                    const TCoeff quanCoeff);
+    template<int numStates, int SPT>
+    void xDecideSoA(const TCoeff absCoeff, const int lastOffset, Decision *decisions, const TCoeff quanCoeff);
     template<int numStates>
     void xUpdateStatesSoA(const ScanInfo &scanInfo, const Decision *decisions, const int ctxType);
     template<int numStates>
     void xUpdateStatesEosSoA(const ScanInfo &scanInfo, const Decision *decisions, const int ctxType);
-    inline void calcRdCostsSoA(const StateArr &st, const int s, const ScanPosType spt, const PQData &pqDataA,
-                               const PQData &pqDataB, int64_t &costA, int64_t &costB, int64_t &costZ) const;
-    inline int64_t calcRdCostStartSoA(const int32_t lastOffset, const PQData &pqData) const;
+    template<int SPT>
+    void calcRdCostsSoA(const StateArr &st, const int s, const PQData &pqDataA, const PQData &pqDataB,
+                        const LevelBits &lbA, const LevelBits &lbB, int64_t &costA, int64_t &costB,
+                        int64_t &costZ) const;
+    inline int64_t calcRdCostStartSoA(const int32_t lastOffset, const PQData &pqData, const LevelBits &lb) const;
 
     StateArr           m_stateArr[3];
     StateArr *         m_currArr;
@@ -2626,67 +2652,52 @@ const CtxSet &ctxSetGt4 = isLfnst ? Ctx::GtxFlagL[6 + chType] : Ctx::GtxFlag[6 +
     m_initRemRegBins = (effWidth * effHeight * ctxBinSampleRatio) / 16;
   }
 
-  // State::calcRdCosts for state s of a StateArr
-  inline void DepQuant::calcRdCostsSoA(const StateArr &st, const int s, const ScanPosType spt, const PQData &pqDataA,
-                                       const PQData &pqDataB, int64_t &costA, int64_t &costB, int64_t &costZ) const
+  // State::calcRdCosts for state s of a StateArr (scan position type SPT)
+  template<int SPT>
+  ALWAYS_INLINE void DepQuant::calcRdCostsSoA(const StateArr &st, const int s, const PQData &pqDataA,
+                                              const PQData &pqDataB, const LevelBits &lbA, const LevelBits &lbB,
+                                              int64_t &costA, int64_t &costB, int64_t &costZ) const
   {
-    const int32_t *goRiceTab = g_goRiceBits[st.goRicePar[s]];
+    const int32_t *goRiceTab = g_goRiceBitsExt[st.goRicePar[s]];
     int64_t        rdCostA   = st.rdCost[s] + pqDataA.deltaDist;
     int64_t        rdCostB   = st.rdCost[s] + pqDataB.deltaDist;
     int64_t        rdCostZ   = st.rdCost[s];
-    const TCoeff   absLevelA = pqDataA.absLevel;
-    const TCoeff   absLevelB = pqDataB.absLevel;
 
     if (st.remRegBins[s] >= 4)
     {
       const int32_t *bits = gtxFracBits(0)[st.gtxCtx[s]].bits;
-      if (absLevelA < GTN_LEVEL)
-      {
-        rdCostA += bits[absLevelA];
-      }
-      else
-      {
-        const TCoeff value = (absLevelA - GTN_LEVEL) >> 1;
-        rdCostA += bits[absLevelA - (value << 1)] + goRiceTab[value < RICEMAX ? value : RICEMAX - 1];
-      }
-      if (absLevelB < GTN_LEVEL)
-      {
-        rdCostB += bits[absLevelB];
-      }
-      else
-      {
-        const TCoeff value = (absLevelB - GTN_LEVEL) >> 1;
-        rdCostB += bits[absLevelB - (value << 1)] + goRiceTab[value < RICEMAX ? value : RICEMAX - 1];
-      }
+      rdCostA += bits[lbA.gtxIdx] + goRiceTab[lbA.riceIdx];
+      rdCostB += bits[lbB.gtxIdx] + goRiceTab[lbB.riceIdx];
       const BinFracBits &sigBits = m_sigTab[s][st.sigCtx[s]];
       const int          sigBit1 = sigBits.intBits[1];
-      if (spt == SCAN_ISCSBB)
+      if (SPT == SCAN_ISCSBB)
       {
         rdCostA += sigBit1;
         rdCostB += sigBit1;
         rdCostZ += sigBits.intBits[0];
       }
-      else if (spt == SCAN_SOCSBB)
+      else if (SPT == SCAN_SOCSBB)
       {
         const int sbbBit1 = st.sbbBits1[s];
         rdCostA += sbbBit1 + sigBit1;
         rdCostB += sbbBit1 + sigBit1;
         rdCostZ += sbbBit1 + sigBits.intBits[0];
       }
-      else if (st.numSigSbb[s])
-      {
-        rdCostA += sigBit1;
-        rdCostB += sigBit1;
-        rdCostZ += sigBits.intBits[0];
-      }
       else
       {
-        rdCostZ = std::numeric_limits<int64_t>::max();   // last coefficient of a coded sub-block: zero not allowed
+        // without other significant coefficients in the sub-block the last one is inferred: no sig flag, zero
+        // not allowed (the stock code compared a cost equal to the current decision, which never wins)
+        const bool sig = st.numSigSbb[s] != 0;
+        rdCostA += (sig ? sigBit1 : 0);
+        rdCostB += (sig ? sigBit1 : 0);
+        rdCostZ = (sig ? rdCostZ + sigBits.intBits[0] : std::numeric_limits<int64_t>::max());
       }
     }
     else
     {
-      const int goRiceZero = st.goRiceZero[s];
+      const TCoeff absLevelA  = pqDataA.absLevel;
+      const TCoeff absLevelB  = pqDataB.absLevel;
+      const int    goRiceZero = st.goRiceZero[s];
       rdCostA += (1 << SCALE_BITS)
                  + goRiceTab[absLevelA <= goRiceZero ? absLevelA - 1 : (absLevelA < RICEMAX ? absLevelA : RICEMAX - 1)];
       rdCostB += (1 << SCALE_BITS)
@@ -2699,25 +2710,17 @@ const CtxSet &ctxSetGt4 = isLfnst ? Ctx::GtxFlagL[6 + chType] : Ctx::GtxFlag[6 +
   }
 
   // State::calcRdCostStart of the start state (gtx context 0, Rice parameter 0)
-  inline int64_t DepQuant::calcRdCostStartSoA(const int32_t lastOffset, const PQData &pqData) const
+  inline int64_t DepQuant::calcRdCostStartSoA(const int32_t lastOffset, const PQData &pqData,
+                                              const LevelBits &lb) const
   {
-    const int32_t *bits   = gtxFracBits(0)[0].bits;
-    int64_t        rdCost = pqData.deltaDist + lastOffset;
-    if (pqData.absLevel < GTN_LEVEL)
-    {
-      rdCost += bits[pqData.absLevel];
-    }
-    else
-    {
-      const TCoeff value = (pqData.absLevel - GTN_LEVEL) >> 1;
-      rdCost += bits[pqData.absLevel - (value << 1)] + g_goRiceBits[0][value < RICEMAX ? value : RICEMAX - 1];
-    }
+    int64_t rdCost = pqData.deltaDist + lastOffset;
+    rdCost += gtxFracBits(0)[0].bits[lb.gtxIdx] + g_goRiceBitsExt[0][lb.riceIdx];
     return rdCost;
   }
 
-  template<int numStates>
-  ALWAYS_INLINE void DepQuant::xDecideSoA(const ScanPosType spt, const TCoeff absCoeff, const int lastOffset,
-                                          Decision *decisions, const TCoeff quanCoeff)
+  template<int numStates, int SPT>
+  ALWAYS_INLINE void DepQuant::xDecideSoA(const TCoeff absCoeff, const int lastOffset, Decision *decisions,
+                                          const TCoeff quanCoeff)
   {
     // For destination state j the candidates are: level A and zero from state P[j] and level B from state Q[j]
     // (next state of P[j] for an even level / of Q[j] for an odd level), in the stock evaluation order (by source
@@ -2731,6 +2734,18 @@ const CtxSet &ctxSetGt4 = isLfnst ? Ctx::GtxFlagL[6 + chType] : Ctx::GtxFlag[6 +
 
     PQData pqData[4];
     m_quant.preQuantCoeff(absCoeff, pqData, quanCoeff);
+    // context coded bits of the four levels: gtx table entry + Rice part (g_goRiceBitsExt[.][RICEMAX] = 0)
+    LevelBits lb[4];
+    for (int k = 0; k < 4; k++)
+    {
+      const TCoeff absLevel = pqData[k].absLevel;
+      const TCoeff value    = (absLevel - GTN_LEVEL) >> 1;
+      lb[k].gtxIdx          = (absLevel < GTN_LEVEL ? absLevel : absLevel - (value << 1));
+      lb[k].riceIdx         = (absLevel < GTN_LEVEL ? RICEMAX : (value < RICEMAX ? value : RICEMAX - 1));
+    }
+    // payload of a decision: absLevel (low 32 bits) and prevId (high 32 bits), as stored in Decision
+    auto payload = [](const TCoeff absLevel, const int prevId)
+    { return (int64_t) (((uint64_t) (uint32_t) prevId << 32) | (uint32_t) absLevel); };
 
     const StateArr &prv = *m_prevArr;
     const StateArr &skp = *m_skipArr;
@@ -2739,53 +2754,52 @@ const CtxSet &ctxSetGt4 = isLfnst ? Ctx::GtxFlagL[6 + chType] : Ctx::GtxFlag[6 +
     DQ_UNROLL_STATES
     for (int s = 0; s < numStates; s++)
     {
-      calcRdCostsSoA(prv, s, spt, pqData[(s & 1) ? 3 : 0], pqData[(s & 1) ? 1 : 2], costA[s], costB[s], costZ[s]);
+      const int a = (s & 1) ? 3 : 0;
+      const int b = (s & 1) ? 1 : 2;
+      calcRdCostsSoA<SPT>(prv, s, pqData[a], pqData[b], lb[a], lb[b], costA[s], costB[s], costZ[s]);
     }
-    const int64_t startCostA = calcRdCostStartSoA(lastOffset, pqData[0]);
-    const int64_t startCostB = calcRdCostStartSoA(lastOffset, pqData[2]);
+    const int64_t startCostA = calcRdCostStartSoA(lastOffset, pqData[0], lb[0]);
+    const int64_t startCostB = calcRdCostStartSoA(lastOffset, pqData[2], lb[2]);
 
     DQ_UNROLL_STATES
     for (int j = 0; j < numStates; j++)
     {
-      const int p        = P_[j];
-      const int q        = Q_[j];
-      int64_t   cost     = startDec.rdCost;
-      TCoeff    absLevel = startDec.absLevel;
-      int       prevId   = startDec.prevId;
-      auto      select   = [&](const int64_t c, const TCoeff l, const int id)
+      const int p    = P_[j];
+      const int q    = Q_[j];
+      int64_t   cost = startDec.rdCost;
+      int64_t   pay  = payload(startDec.absLevel, startDec.prevId);
+      auto      select = [&](const int64_t c, const int64_t cPay)
       {
         const bool better = c < cost;
         cost              = better ? c : cost;
-        absLevel          = better ? l : absLevel;
-        prevId            = better ? id : prevId;
+        pay               = better ? cPay : pay;
       };
       if (p < q)
       {
-        select(costA[p], pqData[(p & 1) ? 3 : 0].absLevel, p);
-        select(costZ[p], 0, p);
-        select(costB[q], pqData[(q & 1) ? 1 : 2].absLevel, q);
+        select(costA[p], payload(pqData[(p & 1) ? 3 : 0].absLevel, p));
+        select(costZ[p], payload(0, p));
+        select(costB[q], payload(pqData[(q & 1) ? 1 : 2].absLevel, q));
       }
       else
       {
-        select(costB[q], pqData[(q & 1) ? 1 : 2].absLevel, q);
-        select(costA[p], pqData[(p & 1) ? 3 : 0].absLevel, p);
-        select(costZ[p], 0, p);
+        select(costB[q], payload(pqData[(q & 1) ? 1 : 2].absLevel, q));
+        select(costA[p], payload(pqData[(p & 1) ? 3 : 0].absLevel, p));
+        select(costZ[p], payload(0, p));
       }
-      if (spt == SCAN_EOCSBB)
+      if (SPT == SCAN_EOCSBB)
       {
-        select(skp.rdCost[j] + skp.sbbBits0[j], 0, numStates + j);
+        select(skp.rdCost[j] + skp.sbbBits0[j], payload(0, numStates + j));
       }
       if (j == 0)
       {
-        select(startCostA, pqData[0].absLevel, -1);
+        select(startCostA, payload(pqData[0].absLevel, -1));
       }
       if (j == START_B)
       {
-        select(startCostB, pqData[2].absLevel, -1);
+        select(startCostB, payload(pqData[2].absLevel, -1));
       }
       // one 16-byte store per decision (the state update reads the decisions as vectors)
-      _mm_storeu_si128((__m128i *) &decisions[j],
-                       _mm_set_epi64x((int64_t) (((uint64_t) (uint32_t) prevId << 32) | (uint32_t) absLevel), cost));
+      _mm_storeu_si128((__m128i *) &decisions[j], _mm_set_epi64x(pay, cost));
       cur.rdCost[j] = cost;
     }
   }
@@ -2827,13 +2841,12 @@ const CtxSet &ctxSetGt4 = isLfnst ? Ctx::GtxFlagL[6 + chType] : Ctx::GtxFlag[6 +
       }
     }
     const __m128i prev8 = _mm_packs_epi16(_mm_packs_epi32(prv03, prv47), zero);   // bytes 0..7
+    // states without a path (only in the first stages of a TU) keep all members except rdCost
     const __m128i dead8 = _mm_cmpeq_epi8(prev8, _mm_set1_epi8(-2));
-    const int     dead  = _mm_movemask_epi8(dead8) & 0xff;   // only in the first stages of a TU
-    alignas(64) StateArr deadKeep;
-    if (dead)
-    {
-      deadKeep = cur;
-    }
+    const __m128i dead2 = _mm_unpacklo_epi64(dead8, dead8);
+    const bool    dead  = (_mm_movemask_epi8(dead8) & 0xff) != 0;
+    auto          keepDead = [&](const __m128i v, const void *old, const __m128i mask)
+    { return dead ? _mm_blendv_epi8(v, _mm_load_si128((const __m128i *) old), mask) : v; };
     const __m128i start8  = _mm_cmpeq_epi8(prev8, _mm_set1_epi8(-1));
     const __m128i start03 = _mm_cmpeq_epi32(prv03, _mm_set1_epi32(-1));
     const __m128i start47 = _mm_cmpeq_epi32(prv47, _mm_set1_epi32(-1));
@@ -2847,13 +2860,13 @@ const CtxSet &ctxSetGt4 = isLfnst ? Ctx::GtxFlagL[6 + chType] : Ctx::GtxFlag[6 +
       __m128i v = _mm_shuffle_epi8(_mm_load_si128((const __m128i *) prv.numSigSbb), idx2);
       v         = _mm_add_epi8(v, _mm_add_epi8(_mm_set1_epi8(1), _mm_cmpeq_epi8(abs8, zero)));   // high half: + 0
       v         = _mm_or_si128(v, _mm_slli_si128(start8, 8));
-      _mm_store_si128((__m128i *) cur.numSigSbb, v);
+      _mm_store_si128((__m128i *) cur.numSigSbb, keepDead(v, cur.numSigSbb, dead2));
     }
     //----- ctxInitIdx (start: zero template init) -----
     {
       __m128i v = _mm_shuffle_epi8(_mm_load_si128((const __m128i *) prv.ctxInitIdx), idx2);
       v         = _mm_or_si128(v, _mm_and_si128(start8, _mm_set1_epi8(CTX_INIT_ZERO)));
-      _mm_store_si128((__m128i *) cur.ctxInitIdx, v);
+      _mm_store_si128((__m128i *) cur.ctxInitIdx, keepDead(v, cur.ctxInitIdx, dead2));
     }
     //----- int32 members of the predecessors: remRegBins, sbbBits -----
     __m128i rem03, rem47;
@@ -2889,8 +2902,10 @@ const CtxSet &ctxSetGt4 = isLfnst ? Ctx::GtxFlagL[6 + chType] : Ctx::GtxFlag[6 +
                                                  _mm_min_epi32(abs03, maxDec)));
       rem47 = _mm_sub_epi32(rem47, _mm_and_si128(_mm_or_si128(_mm_cmpgt_epi32(rem47, three), start47),
                                                  _mm_min_epi32(abs47, maxDec)));
-      _mm_store_si128((__m128i *) &cur.remRegBins[0], rem03);
-      _mm_store_si128((__m128i *) &cur.remRegBins[4], rem47);
+      _mm_store_si128((__m128i *) &cur.remRegBins[0],
+                      keepDead(rem03, &cur.remRegBins[0], _mm_cmpeq_epi32(prv03, _mm_set1_epi32(-2))));
+      _mm_store_si128((__m128i *) &cur.remRegBins[4],
+                      keepDead(rem47, &cur.remRegBins[4], _mm_cmpeq_epi32(prv47, _mm_set1_epi32(-2))));
       // sbbBits: from the predecessor; the start of a path keeps the value of the state
       const __m128i own03 = _mm_cmplt_epi32(prv03, zero);
       const __m128i own47 = _mm_cmplt_epi32(prv47, zero);
@@ -2916,11 +2931,12 @@ const CtxSet &ctxSetGt4 = isLfnst ? Ctx::GtxFlagL[6 + chType] : Ctx::GtxFlag[6 +
       __m128i *      dst = (__m128i *) cur.absLevels;
       for (int r = 0; r < 8; r++)
       {
-        _mm_store_si128(dst + r, _mm_shuffle_epi8(_mm_load_si128(src + r), idx2));
+        _mm_store_si128(dst + r, keepDead(_mm_shuffle_epi8(_mm_load_si128(src + r), idx2), dst + r, dead2));
       }
       const __m128i lev8 = _mm_packus_epi16(_mm_packs_epi32(abs03, abs47), zero);
-      const __m128i half = _mm_cmpeq_epi32(_mm_set1_epi32(scanInfo.insidePos & 1), _mm_setr_epi32(0, 0, 1, 1));
-      __m128i *     row2 = dst + (scanInfo.insidePos >> 1);
+      const __m128i half = _mm_andnot_si128(
+        dead2, _mm_cmpeq_epi32(_mm_set1_epi32(scanInfo.insidePos & 1), _mm_setr_epi32(0, 0, 1, 1)));
+      __m128i *row2 = dst + (scanInfo.insidePos >> 1);
       _mm_store_si128(row2, _mm_blendv_epi8(_mm_load_si128(row2), _mm_unpacklo_epi64(lev8, lev8), half));
     }
 
@@ -2979,40 +2995,15 @@ const CtxSet &ctxSetGt4 = isLfnst ? Ctx::GtxFlagL[6 + chType] : Ctx::GtxFlag[6 +
     //----- { goRicePar, goRiceZero }: goRiceZero is only set when bypass coded (as in State::updateState) -----
     {
       const __m128i old   = _mm_load_si128((const __m128i *) cur.goRicePar);
-      const __m128i par8  = _mm_blendv_epi8(parByp8, parReg8, reg8);
-      const __m128i zero8 = _mm_blendv_epi8(_mm_srli_si128(old, 8), zeroByp8, _mm_andnot_si128(reg8, _mm_andnot_si128(dead8, _mm_set1_epi8(-1))));
+      const __m128i par8  = _mm_blendv_epi8(_mm_blendv_epi8(parByp8, parReg8, reg8), old, dead8);
+      const __m128i zero8 = _mm_blendv_epi8(zeroByp8, _mm_srli_si128(old, 8), _mm_or_si128(reg8, dead8));
       _mm_store_si128((__m128i *) cur.goRicePar, _mm_unpacklo_epi64(par8, zero8));
     }
     //----- { sigCtx, gtxCtx }: only set when context coded -----
     {
       const __m128i old  = _mm_load_si128((const __m128i *) cur.sigCtx);
-      const __m128i reg2 = _mm_unpacklo_epi64(reg8, reg8);
-      _mm_store_si128((__m128i *) cur.sigCtx, _mm_blendv_epi8(old, _mm_unpacklo_epi64(sig8, gtx8), reg2));
-    }
-
-    //----- states without a path keep all members (except rdCost) -----
-    if (dead)
-    {
-      for (int j = 0; j < 8; j++)
-      {
-        if ((dead >> j) & 1)
-        {
-          cur.remRegBins[j]  = deadKeep.remRegBins[j];
-          cur.sbbBits0[j]    = deadKeep.sbbBits0[j];
-          cur.sbbBits1[j]    = deadKeep.sbbBits1[j];
-          cur.numSigSbb[j]   = deadKeep.numSigSbb[j];
-          cur.refSbbCtxId[j] = deadKeep.refSbbCtxId[j];
-          cur.ctxInitIdx[j]  = deadKeep.ctxInitIdx[j];
-          cur.goRicePar[j]   = deadKeep.goRicePar[j];
-          cur.goRiceZero[j]  = deadKeep.goRiceZero[j];
-          cur.sigCtx[j]      = deadKeep.sigCtx[j];
-          cur.gtxCtx[j]      = deadKeep.gtxCtx[j];
-          for (int pos = 0; pos < 16; pos++)
-          {
-            cur.absLevels[pos][j] = deadKeep.absLevels[pos][j];
-          }
-        }
-      }
+      const __m128i set2 = _mm_andnot_si128(dead2, _mm_unpacklo_epi64(reg8, reg8));
+      _mm_store_si128((__m128i *) cur.sigCtx, _mm_blendv_epi8(old, _mm_unpacklo_epi64(sig8, gtx8), set2));
     }
   }
 
@@ -3100,9 +3091,21 @@ const CtxSet &ctxSetGt4 = isLfnst ? Ctx::GtxFlagL[6 + chType] : Ctx::GtxFlag[6 +
         m_quant.initQuantBlock(tu, compID, cQP, lambda, quantCoeff[scanInfo.rasterPos]);
         quanCoeff = quantCoeff[scanInfo.rasterPos];
       }
-      Decision *decisions = m_trellis + scanIdx * numStates;
+      Decision *   decisions = m_trellis + scanIdx * numStates;
+      const TCoeff absCoeff  = abs(tCoeff[scanInfo.rasterPos]);
       std::swap(m_prevArr, m_currArr);
-      xDecideSoA<numStates>(scanInfo.spt, abs(tCoeff[scanInfo.rasterPos]), lastOffset(scanIdx), decisions, quanCoeff);
+      if (scanInfo.spt == SCAN_ISCSBB)
+      {
+        xDecideSoA<numStates, SCAN_ISCSBB>(absCoeff, lastOffset(scanIdx), decisions, quanCoeff);
+      }
+      else if (scanInfo.spt == SCAN_SOCSBB)
+      {
+        xDecideSoA<numStates, SCAN_SOCSBB>(absCoeff, lastOffset(scanIdx), decisions, quanCoeff);
+      }
+      else
+      {
+        xDecideSoA<numStates, SCAN_EOCSBB>(absCoeff, lastOffset(scanIdx), decisions, quanCoeff);
+      }
       if (scanIdx)
       {
         if (scanInfo.eosbb)
