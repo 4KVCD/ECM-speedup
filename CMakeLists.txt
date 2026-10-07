@@ -116,6 +116,10 @@ if( CMAKE_CXX_COMPILER_ID STREQUAL "GNU" )
   if( CMAKE_CXX_COMPILER_VERSION VERSION_LESS 5.0 )
     add_compile_options( "-fabi-version=6" )
   endif()
+
+  # EncAdaptiveLoopFilter.cpp indexes m_chromaScaleIdxFinal[4][1] with altIdx up to 7; keep newer GCC
+  # from exploiting that UB (and from failing the build with -Werror) so behaviour matches the reference
+  add_compile_options( "-fno-aggressive-loop-optimizations" )
 endif()
 
 
