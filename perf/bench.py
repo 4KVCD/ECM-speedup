@@ -101,6 +101,41 @@ def cmd_run(args):
     return 0
 
 
+def cmd_ab(args):
+    """Paired measurement: for every test, build A and build B run at the same time, so both see the same load."""
+    names = args.tests.split(",") if args.tests else DEFAULT_TESTS
+    res = {args.a: {}, args.b: {}}
+    jobs = []
+    for _ in range(args.reps):
+        for n in names:
+            for build in (args.a, args.b):
+                jobs.append((build, n))
+    with cf.ThreadPoolExecutor(args.jobs) as ex:
+        futs = {}
+        for build, n in jobs:
+            outdir = os.path.join(ROOT, "runs", "ab_" + build)
+            os.makedirs(outdir, exist_ok=True)
+            futs[ex.submit(run_test, f"{ROOT}/bin/{build}/EncoderApp.exe", outdir, n)] = build
+        for fu in cf.as_completed(futs):
+            build = futs[fu]
+            n, r = fu.result()
+            prev = res[build].get(n)
+            if prev:  # keep the minimum over repetitions; md5 must agree
+                r["md5"] = r["md5"] if r["md5"] == prev["md5"] else None
+                r["time"] = min(r["time"], prev["time"])
+                r["cpu"] = min(r["cpu"], prev["cpu"]) if r.get("cpu") and prev.get("cpu") else None
+            res[build][n] = r
+            print(f"{build:6s} {n:14s} {r['time']:9.2f}s  {r['md5']}", flush=True)
+    ref = json.load(open(os.path.join(RESULTS, "ref.json")))
+    ok = True
+    for build in (args.a, args.b):
+        for n, r in res[build].items():
+            ok &= r["md5"] is not None and r["md5"] == ref[n]["md5"]
+    rc = compare(res[args.a], res[args.b], args.a, args.b)
+    print("bit-exact vs ref:", "ALL MATCH" if ok else "*** MISMATCH ***")
+    return 0 if ok and rc == 0 else 1
+
+
 def compare(a, b, an, bn):
     ok = True
     ta = tb = 0.0
@@ -138,9 +173,17 @@ def main():
     c = sub.add_parser("cmp")
     c.add_argument("base")
     c.add_argument("new")
+    p = sub.add_parser("ab")
+    p.add_argument("a")
+    p.add_argument("b")
+    p.add_argument("--jobs", type=int, default=6)
+    p.add_argument("--reps", type=int, default=1)
+    p.add_argument("--tests")
     args = ap.parse_args()
     if args.cmd == "run":
         return cmd_run(args)
+    if args.cmd == "ab":
+        return cmd_ab(args)
     load = lambda n: json.load(open(os.path.join(RESULTS, n + ".json")))
     return compare(load(args.base), load(args.new), args.base, args.new)
 
