@@ -2607,12 +2607,12 @@ void CodingStructure::initSubStructure( CodingStructure& subStruct, const Channe
 
   subStruct.m_isTuEnc = isTuEnc;
 
-  subStruct.motionLut = motionLut;
+  subStruct.motionLut.assignUsed( motionLut );
 #if JVET_AD0188_CCP_MERGE
-  subStruct.ccpLut    = ccpLut;
+  subStruct.ccpLut.assignUsed( ccpLut );
 #endif
 #if JVET_AG0058_EIP
-  subStruct.eipLut = eipLut;
+  subStruct.eipLut.assignUsed( eipLut );
 #endif
   subStruct.prevPLT = prevPLT;
 #if !INTRA_RM_SMALL_BLOCK_SIZE_CONSTRAINTS
@@ -2770,15 +2770,15 @@ void CodingStructure::useSubStructure( const CodingStructure& subStruct, const C
 
     ownMB.copyFrom( subMB );
 
-    motionLut = subStruct.motionLut;
+    motionLut.assignUsed( subStruct.motionLut );
   }
 #if JVET_AD0188_CCP_MERGE
-  ccpLut = subStruct.ccpLut;
+  ccpLut.assignUsed( subStruct.ccpLut );
 #endif
 #if JVET_AG0058_EIP
   if ((slice->isIntra() || (!slice->isIntra() && !subStruct.m_isTuEnc)) && chType != CHANNEL_TYPE_CHROMA)
   {
-    eipLut = subStruct.eipLut;
+    eipLut.assignUsed( subStruct.eipLut );
   }
 #endif
 #if JVET_W0123_TIMD_FUSION
@@ -2939,14 +2939,14 @@ void CodingStructure::copyStructure( const CodingStructure& other, const Channel
 
     ownMB.copyFrom( subMB );
 
-    motionLut = other.motionLut;
+    motionLut.assignUsed( other.motionLut );
   }
 
 #if JVET_AL0143_CHROMA_PARTITION_PREDICTION
   splitPredLuma = other.splitPredLuma;
 #endif
 #if JVET_AD0188_CCP_MERGE
-  ccpLut = other.ccpLut;
+  ccpLut.assignUsed( other.ccpLut );
 #endif
 #if JVET_AE0043_CCP_MERGE_TEMPORAL
   CCPModelIdxBuf  ownIdxB = getCcpmIdxBuf();
@@ -2955,7 +2955,7 @@ void CodingStructure::copyStructure( const CodingStructure& other, const Channel
   m_ccpModelLUT = other.m_ccpModelLUT;
 #endif
 #if JVET_AG0058_EIP
-  eipLut = other.eipLut;
+  eipLut.assignUsed( other.eipLut );
 #endif
 #if JVET_AG0058_EIP
   EipModelIdxBuf ownEipIdxB = getEipIdxBuf();

@@ -624,6 +624,36 @@ struct LutMotionCand
   static_vector<AffineInheritInfo, MAX_NUM_AFF_INHERIT_HMVP_CANDS> lutAffInherit;
 #endif
 #endif
+
+  // perf: same as assignment, but copies only the table entries in use (15 KB per copy otherwise)
+  void assignUsed( const LutMotionCand& o )
+  {
+#if JVET_Z0118_GDR
+    lut0.assignUsed( o.lut0 );
+    lut1.assignUsed( o.lut1 );
+    lutIbc0.assignUsed( o.lutIbc0 );
+    lutIbc1.assignUsed( o.lutIbc1 );
+#if JVET_Z0139_HIST_AFF
+    for( int i = 0; i < 2 * MAX_NUM_AFFHMVP_ENTRIES_ONELIST; i++ )
+    {
+      lutAff0[i].assignUsed( o.lutAff0[i] );
+      lutAff1[i].assignUsed( o.lutAff1[i] );
+    }
+    lutAffInherit0.assignUsed( o.lutAffInherit0 );
+    lutAffInherit1.assignUsed( o.lutAffInherit1 );
+#endif
+#else
+    lut.assignUsed( o.lut );
+    lutIbc.assignUsed( o.lutIbc );
+#if JVET_Z0139_HIST_AFF
+    for( int i = 0; i < 2 * MAX_NUM_AFFHMVP_ENTRIES_ONELIST; i++ )
+    {
+      lutAff[i].assignUsed( o.lutAff[i] );
+    }
+    lutAffInherit.assignUsed( o.lutAffInherit );
+#endif
+#endif
+  }
 };
 
 struct PatentBvCand

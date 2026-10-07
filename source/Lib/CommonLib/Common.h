@@ -701,13 +701,24 @@ struct CCPModelCandidate
 
 struct LutCCP
 {
-#if JVET_Z0118_GDR  
+#if JVET_Z0118_GDR
   static_vector<CCPModelCandidate, MAX_NUM_HCCP_CANDS> lutCCP0;
   static_vector<CCPModelCandidate, MAX_NUM_HCCP_CANDS> lutCCP1;
 #else
   static_vector<CCPModelCandidate, MAX_NUM_HCCP_CANDS> lutCCP;
 #endif
   // Postions for future extensions
+
+  // perf: same as assignment, but copies only the entries in use
+  void assignUsed( const LutCCP& o )
+  {
+#if JVET_Z0118_GDR
+    lutCCP0.assignUsed( o.lutCCP0 );
+    lutCCP1.assignUsed( o.lutCCP1 );
+#else
+    lutCCP.assignUsed( o.lutCCP );
+#endif
+  }
 };
 #endif
 
@@ -775,13 +786,24 @@ struct EipModelCandidate
 
 struct LutEIP
 {
-#if JVET_Z0118_GDR  
+#if JVET_Z0118_GDR
   static_vector<EipModelCandidate, MAX_NUM_HEIP_CANDS> lutEip0;
   static_vector<EipModelCandidate, MAX_NUM_HEIP_CANDS> lutEip1;
 #else
   static_vector<EipModelCandidate, MAX_NUM_HEIP_CANDS> lutEip;
 #endif
   // Postions for future extensions
+
+  // perf: same as assignment, but copies only the entries in use
+  void assignUsed( const LutEIP& o )
+  {
+#if JVET_Z0118_GDR
+    lutEip0.assignUsed( o.lutEip0 );
+    lutEip1.assignUsed( o.lutEip1 );
+#else
+    lutEip.assignUsed( o.lutEip );
+#endif
+  }
 };
 #endif
 

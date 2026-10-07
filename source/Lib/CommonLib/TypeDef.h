@@ -2405,6 +2405,13 @@ public:
 
   static_vector() : _size( 0 )                                 { }
   static_vector( size_t N_ ) : _size( N_ )                     { }
+  // perf: like assignment, but copies only the elements in use instead of the whole capacity; for hot copies of
+  // vectors that are never read past size() (the class stays trivially copyable)
+  void assignUsed( const static_vector& _other )
+  {
+    std::copy( _other._arr, _other._arr + _other._size, _arr );
+    _size = _other._size;
+  }
   static_vector( size_t N_, const T& _val ) : _size( 0 )       { resize( N_, _val ); }
   template<typename It>
   static_vector( It _it1, It _it2 ) : _size( 0 )               { while( _it1 < _it2 ) _arr[ _size++ ] = *_it1++; }

@@ -3022,17 +3022,17 @@ void EncCu::xCheckModeSplit(CodingStructure *&tempCS, CodingStructure *&bestCS, 
 #if !INTRA_RM_SMALL_BLOCK_SIZE_CONSTRAINTS
         if( partitioner.chType == CHANNEL_TYPE_LUMA )
         {
-          tempCS->motionLut = oldMotionLut;
+          tempCS->motionLut.assignUsed( oldMotionLut );
         }
 #endif
 
 #if JVET_Z0118_GDR
-        tempCS->motionLut = oldMotionLut;
+        tempCS->motionLut.assignUsed( oldMotionLut );
 #if JVET_AD0188_CCP_MERGE
-        tempCS->ccpLut  = oldCCPLut;
+        tempCS->ccpLut.assignUsed( oldCCPLut );
 #endif
 #if JVET_AG0058_EIP
-        tempCS->eipLut  = oldEipLut;
+        tempCS->eipLut.assignUsed( oldEipLut );
 #endif
         tempCS->prevPLT = oldPLT;
         tempCS->releaseIntermediateData();
@@ -3080,7 +3080,7 @@ void EncCu::xCheckModeSplit(CodingStructure *&tempCS, CodingStructure *&bestCS, 
           partitioner.exitCurrSplit();
           if( partitioner.chType == CHANNEL_TYPE_LUMA )
           {
-            tempCS->motionLut = oldMotionLut;
+            tempCS->motionLut.assignUsed( oldMotionLut );
           }
           return;
         }
@@ -3302,14 +3302,14 @@ void EncCu::xCheckModeSplit(CodingStructure *&tempCS, CodingStructure *&bestCS, 
   }
 #endif
 
-  tempCS->motionLut = oldMotionLut;
+  tempCS->motionLut.assignUsed( oldMotionLut );
 
   tempCS->prevPLT   = oldPLT;
 #if JVET_AD0188_CCP_MERGE
-  tempCS->ccpLut    = oldCCPLut;
+  tempCS->ccpLut.assignUsed( oldCCPLut );
 #endif
 #if JVET_AG0058_EIP
-  tempCS->eipLut    = oldEipLut;
+  tempCS->eipLut.assignUsed( oldEipLut );
 #endif
 
   tempCS->releaseIntermediateData();
