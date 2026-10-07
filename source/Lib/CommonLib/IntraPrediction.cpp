@@ -6731,7 +6731,7 @@ void IntraPrediction::xPredIntraAng(
   {
     std::swap(width, height);
   }
-  Pel       tempArray[MAX_CU_SIZE * MAX_CU_SIZE];
+  Pel      *tempArray = m_angPredTransposed;
   const int dstStride = bIsModeVer ? pDst.stride : width;
   Pel *     pDstBuf   = bIsModeVer ? pDst.buf : tempArray;
 

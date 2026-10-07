@@ -475,6 +475,9 @@ protected:
 #if JVET_AJ0112_REGRESSION_SGPM
   std::vector <int16_t> m_blendBuf;
 #endif
+  // perf: transposed prediction of horizontal angular modes in xPredIntraAng(); as a 128 KB stack array it made every
+  // call probe ~32 stack pages (___chkstk_ms)
+  Pel        m_angPredTransposed[MAX_CU_SIZE * MAX_CU_SIZE];
 #if JVET_AC0094_REF_SAMPLES_OPT
   Pel        m_refBuffer[MAX_NUM_COMPONENT][NUM_PRED_BUF][((MAX_CU_SIZE << 3) + 1 + MAX_REF_LINE_IDX) * 2];
 #else

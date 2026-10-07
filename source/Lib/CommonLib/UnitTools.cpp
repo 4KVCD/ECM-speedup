@@ -645,9 +645,10 @@ bool CU::isPLT(const CodingUnit &cu)
   return cu.predMode == MODE_PLT;
 }
 
+// perf: the same Slice object has the same index, which saves loading the slices in the common case
 bool CU::isSameSlice(const CodingUnit& cu, const CodingUnit& cu2)
 {
-  return cu.slice->getIndependentSliceIdx() == cu2.slice->getIndependentSliceIdx();
+  return cu.slice == cu2.slice || cu.slice->getIndependentSliceIdx() == cu2.slice->getIndependentSliceIdx();
 }
 
 bool CU::isSameTile(const CodingUnit& cu, const CodingUnit& cu2)
@@ -657,7 +658,8 @@ bool CU::isSameTile(const CodingUnit& cu, const CodingUnit& cu2)
 
 bool CU::isSameSliceAndTile(const CodingUnit& cu, const CodingUnit& cu2)
 {
-  return ( cu.slice->getIndependentSliceIdx() == cu2.slice->getIndependentSliceIdx() ) && ( cu.tileIdx == cu2.tileIdx );
+  return ( cu.tileIdx == cu2.tileIdx )
+         && ( cu.slice == cu2.slice || cu.slice->getIndependentSliceIdx() == cu2.slice->getIndependentSliceIdx() );
 }
 
 bool CU::isSameSubPic(const CodingUnit& cu, const CodingUnit& cu2)

@@ -249,6 +249,10 @@ private:
   TCoeff   m_nsptTempInMatrix[ 256 ];
   TCoeff   m_nsptTempOutMatrix[ 256 ];
 #endif
+  // perf: work buffers of xT(); as stack arrays (256 KB + alloca) they made every forward transform probe ~64 stack
+  // pages (___chkstk_ms) and pushed the callees' frames far down the stack
+  ALIGN_DATA( MEMORY_ALIGN_DEF_SIZE, TCoeff m_fwdTrBlock[MAX_TB_SIZEY * MAX_TB_SIZEY] );
+  ALIGN_DATA( MEMORY_ALIGN_DEF_SIZE, TCoeff m_fwdTrTmp[MAX_TB_SIZEY * MAX_TB_SIZEY] );
   static const int maxAbsIctMode = 3;
   void                      (*m_invICTMem[1+2*maxAbsIctMode])(PelBuf&,PelBuf&);
   std::pair<int64_t,int64_t>(*m_fwdICTMem[1+2*maxAbsIctMode])(const PelBuf&,const PelBuf&,PelBuf&,PelBuf&);

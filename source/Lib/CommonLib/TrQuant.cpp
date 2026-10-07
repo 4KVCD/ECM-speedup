@@ -1799,7 +1799,7 @@ void TrQuant::xT( const TransformUnit &tu, const ComponentID &compID, const CPel
   }
 #endif
 
-  ALIGN_DATA( MEMORY_ALIGN_DEF_SIZE, TCoeff block[MAX_TB_SIZEY * MAX_TB_SIZEY] );
+  TCoeff *block = m_fwdTrBlock;
 
   const Pel *resiBuf    = resi.buf;
   const int  resiStride = resi.stride;
@@ -1820,7 +1820,7 @@ void TrQuant::xT( const TransformUnit &tu, const ComponentID &compID, const CPel
     const int      shift_2nd              =  (floorLog2(height))            + TRANSFORM_MATRIX_SHIFT                          + COM16_C806_TRANS_PREC;
     CHECK( shift_1st < 0, "Negative shift" );
     CHECK( shift_2nd < 0, "Negative shift" );
-    TCoeff *tmp = (TCoeff *) alloca(width * height * sizeof(TCoeff));
+    TCoeff *tmp = m_fwdTrTmp;
 
 #if JVET_AC0130_NSPT
     if( CU::nsptApplyCond( tu, compID, allowNSPT ) )
