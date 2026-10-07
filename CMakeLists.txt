@@ -94,7 +94,7 @@ if( (UNIX OR MINGW) AND NOT (CMAKE_SYSTEM_PROCESSOR STREQUAL "arm64") )
   if( ECM_MARCH )
     add_compile_options( "-march=${ECM_MARCH}" )
   endif()
-  if( MINGW )
+  if( MINGW AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU" )
     # Win64 GCC cannot realign the stack for 32-byte AVX spills (GCC bug 54412): emit unaligned vector moves
     add_compile_options( "-Wa,-muse-unaligned-vector-move" )
   endif()
