@@ -39,6 +39,9 @@
 #if JVET_AK0123_ALF_COEFF_RESTRICTION
 #include <inttypes.h>
 #include <unordered_set>
+#if ENABLE_SIMD_OPT && defined( TARGET_SIMD_X86 )
+#include <immintrin.h>
+#endif
 #endif
 
 #include "CommonLib/Picture.h"
@@ -6224,6 +6227,47 @@ void EncAdaptiveLoopFilter::deriveStatsForFiltering( PelUnitBuf& orgYuv, PelUnit
   }
 }
 
+#if JVET_AF0177_ALF_COV_FLOAT
+// perf: dst[l] += a * e[l] (weighted: += w * (a * e[l])), plus the same products into dst2, for l < n, in single
+// precision without contraction. Each accumulator receives the same additions in the same order as in the scalar
+// loops of getBlkStats, so results are identical: only independent accumulators are processed in parallel.
+template<bool twoDst, bool weighted>
+static inline void alfAccumulateRow( float* dst, float* dst2, const float a, const float w, const float* e, const ptrdiff_t n )
+{
+  ptrdiff_t l = 0;
+#if ENABLE_SIMD_OPT && defined( TARGET_SIMD_X86 )
+  const __m128 va = _mm_set1_ps( a );
+  const __m128 vw = _mm_set1_ps( w );
+  for( ; l + 4 <= n; l += 4 )
+  {
+    __m128 p = _mm_mul_ps( va, _mm_loadu_ps( e + l ) );
+    if( weighted )
+    {
+      p = _mm_mul_ps( vw, p );
+    }
+    _mm_storeu_ps( dst + l, _mm_add_ps( _mm_loadu_ps( dst + l ), p ) );
+    if( twoDst )
+    {
+      _mm_storeu_ps( dst2 + l, _mm_add_ps( _mm_loadu_ps( dst2 + l ), p ) );
+    }
+  }
+#endif
+  for( ; l < n; l++ )
+  {
+    float p = a * e[l];
+    if( weighted )
+    {
+      p = w * p;
+    }
+    dst[l] += p;
+    if( twoDst )
+    {
+      dst2[l] += p;
+    }
+  }
+}
+#endif
+
 #if ALF_IMPROVEMENT
 #if JVET_AD0222_ALF_RESI_CLASS
 template<bool m_alfWSSD, bool reuse>
@@ -6370,6 +6414,37 @@ calcCovariance( ELocal, rec + j, recStride, recBeforeDb + j, recBeforeDbStride, 
       calcCovariance( ELocal, rec + j, recStride, shape, transposeIdx, channel, vbDistance );
 #endif
 
+#if JVET_AF0177_ALF_COV_FLOAT && JVET_AD0222_ALF_RESI_CLASS && JVET_R0351_HIGH_BIT_DEPTH_SUPPORT && JVET_AB0184_ALF_MORE_FIXED_FILTER_OUTPUT_TAPS
+      // perf: same accumulations as the scalar loops below, vectorized over l (see alfAccumulateRow)
+      {
+        (void) curY;
+        float ET[MaxAlfNumClippingValues][MAX_NUM_ALF_LUMA_COEFF];
+        for( ptrdiff_t b = 0; b < numBins; b++ )
+        {
+          for( ptrdiff_t k = 0; k < numCoeff; k++ )
+          {
+            ET[b][k] = (float) ELocal[k][b];
+          }
+        }
+        AlfCovariance& cov      = alfCovariance[classIdx];
+        float*         data     = cov.data.data();
+        float*         dataNext = reuse ? alfCovarianceNext[classIdxNext].data.data() : nullptr;
+        for( ptrdiff_t b0 = 0; b0 < numBins; b0++ )
+        {
+          for( ptrdiff_t k = 0; k < numCoeff; k++ )
+          {
+            for( ptrdiff_t b1 = 0; b1 <= b0; b1++ )
+            {
+              const ptrdiff_t maxl = b0 == b1 ? k + 1 : shape.numCoeff;
+              const ptrdiff_t oe   = cov.getOffsetEfast( b0, b1, k, 0 );
+              alfAccumulateRow<reuse, m_alfWSSD>( data + oe, reuse ? dataNext + oe : nullptr, ET[b0][k], weight, ET[b1], maxl );
+            }
+          }
+          const ptrdiff_t oy = cov.getOffsetY( b0, 0 );
+          alfAccumulateRow<reuse, m_alfWSSD>( data + oy, reuse ? dataNext + oy : nullptr, (float) yLocal, weight, ET[b0], numCoeff );
+        }
+      }
+#else
       for (ptrdiff_t b0 = 0; b0 < numBins; b0++)
       {
 #if JVET_AB0184_ALF_MORE_FIXED_FILTER_OUTPUT_TAPS
@@ -6499,6 +6574,7 @@ calcCovariance( ELocal, rec + j, recStride, recBeforeDb + j, recBeforeDbStride, 
           }
         }
       }
+#endif
       if (m_alfWSSD)
       {
 #if JVET_R0351_HIGH_BIT_DEPTH_SUPPORT
