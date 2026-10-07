@@ -104,8 +104,10 @@ namespace DQIntern
     NbInfoSbb   nextNbInfoSbb;
 #if JVET_AE0102_LFNST_CTX
     uint8_t     nextNbShuffle[2][16];   // nextNbInfoSbb.inPos[ctxType][0..num-1] as byte-shuffle indices, 0x80 = unused
+    uint8_t     nextNbRows[2][5];       // nextNbInfoSbb.inPos[ctxType][0..num-1], 16 (an all-zero level row) = unused
 #else
     uint8_t     nextNbShuffle[1][16];
+    uint8_t     nextNbRows[1][5];
 #endif
     int         nextSbbRight;
     int         nextSbbBelow;
@@ -580,6 +582,7 @@ namespace DQIntern
     scanInfo.posX = m_scanId2BlkPos[scanIdx].x;
     scanInfo.posY = m_scanId2BlkPos[scanIdx].y;
     ::memset(scanInfo.nextNbShuffle, 0x80, sizeof(scanInfo.nextNbShuffle));
+    ::memset(scanInfo.nextNbRows, 16, sizeof(scanInfo.nextNbRows));
     if (scanIdx)
     {
       const int nextScanIdx = scanIdx - 1;
@@ -612,12 +615,14 @@ namespace DQIntern
         for (int k = 0; k < std::min<int>(5, scanInfo.nextNbInfoSbb.num[ctxType]); k++)
         {
           scanInfo.nextNbShuffle[ctxType][k] = scanInfo.nextNbInfoSbb.inPos[ctxType][k];
+          scanInfo.nextNbRows[ctxType][k]    = scanInfo.nextNbInfoSbb.inPos[ctxType][k];
         }
       }
 #else
       for (int k = 0; k < std::min<int>(5, scanInfo.nextNbInfoSbb.num); k++)
       {
         scanInfo.nextNbShuffle[0][k] = scanInfo.nextNbInfoSbb.inPos[k];
+        scanInfo.nextNbRows[0][k]    = scanInfo.nextNbInfoSbb.inPos[k];
       }
 #endif
       if (scanInfo.eosbb)
@@ -1343,17 +1348,20 @@ const CtxSet &ctxSetGt4 = isLfnst ? Ctx::GtxFlagL[6 + chType] : Ctx::GtxFlag[6 +
   {
   public:
 #if TCQ_8STATES
-    CommonCtx() : m_currSbbCtx(m_allSbbCtx), m_prevSbbCtx(m_currSbbCtx + 8) { ::memset(m_ctxInit, 0, sizeof(m_ctxInit)); }
+    CommonCtx() : m_currSbbCtx(m_allSbbCtx), m_prevSbbCtx(m_currSbbCtx + 8) { ::memset(m_ctxInitT, 0, sizeof(m_ctxInitT)); }
 #else
-    CommonCtx() : m_currSbbCtx(m_allSbbCtx), m_prevSbbCtx(m_currSbbCtx + 4) { ::memset(m_ctxInit, 0, sizeof(m_ctxInit)); }
+    CommonCtx() : m_currSbbCtx(m_allSbbCtx), m_prevSbbCtx(m_currSbbCtx + 4) { ::memset(m_ctxInitT, 0, sizeof(m_ctxInitT)); }
 #endif
 
     inline void swap() { std::swap(m_currSbbCtx, m_prevSbbCtx); }
 
     // template sums contributed by the neighbours outside the current sub-block, for each position inside it
     // (sumNum + (sumAbs1 << 3) + (sumAbs << 8)); computed per state at the end of the previous sub-block and shared by
-    // all states that descend from it (a state only keeps the index, instead of a copy per state and scan position)
-    inline const uint16_t *ctxInit(int idx) const { return m_ctxInit[idx]; }
+    // all states that descend from it (a state only keeps the index, instead of a copy per state and scan position).
+    // Stored as [position][state]; the columns >= 8 stay zero (CTX_INIT_ZERO).
+    inline uint16_t        ctxInit(int idx, int pos) const { return m_ctxInitT[pos][idx]; }
+    inline const uint16_t *ctxInitRow(int pos) const { return m_ctxInitT[pos]; }
+    inline const BinFracBits &sbbFlagBits(int idx) const { return m_sbbFlagBits[idx]; }
 
     inline void reset(const TUParameters &tuPars, const RateEstimator &rateEst)
     {
@@ -1377,11 +1385,16 @@ const CtxSet &ctxSetGt4 = isLfnst ? Ctx::GtxFlagL[6 + chType] : Ctx::GtxFlag[6 +
 #else
     inline void update(const ScanInfo &scanInfo, const State *prevState, State &currState);
 #endif
+    // end of a sub-block for state stateId (sub-block context of its predecessor: prevRefSbbCtxId, -1 = none):
+    // sub-block flags and levels memory of the state, template init of the next sub-block (ctxInit(stateId, .));
+    // returns the context of the next sub-block's flag (index for sbbFlagBits)
+    inline int updateSbb(const ScanInfo &scanInfo, const int prevRefSbbCtxId, const int stateId, const bool sigSbb,
+                         const uint8_t *absLevels, const bool lfnstidx);
 
   private:
     const NbInfoOut *m_nbInfo;
     BinFracBits      m_sbbFlagBits[2];
-    alignas(16) uint16_t m_ctxInit[CTX_INIT_ZERO + 1][16];
+    alignas(16) uint16_t m_ctxInitT[16][16];
 #if TCQ_8STATES
     SbbCtx m_allSbbCtx[16];
 #else
@@ -1417,9 +1430,16 @@ const CtxSet &ctxSetGt4 = isLfnst ? Ctx::GtxFlagL[6 + chType] : Ctx::GtxFlag[6 +
 #else
 #define DQ_UNROLL_STATES
 #endif
-// per-TU trellis loop as a template on the number of states, with the per-coefficient decision and update inlined
+#if defined(__SSE4_1__)
+#define DQ_SSE41 1
+#else
+#define DQ_SSE41 0
+#endif
+// trellis of the active configuration: per-TU loop templated on the number of states, states as a structure of
+// arrays updated with SSE4.1 (other configurations keep the State based implementation)
 #define DQ_TRELLIS_LOOP_TEMPLATE                                                                                       \
-  (TCQ_8STATES && TU_256 && !EXTENDED_LFNST && JVET_R0351_HIGH_BIT_DEPTH_SUPPORT_VS && JVET_AE0102_LFNST_CTX)
+  (TCQ_8STATES && TU_256 && !EXTENDED_LFNST && JVET_R0351_HIGH_BIT_DEPTH_SUPPORT_VS && JVET_AE0102_LFNST_CTX           \
+   && JVET_AG0100_TRANSFORM_COEFFICIENT_CODING && DQ_SSE41)
 
 #if JVET_AG0100_TRANSFORM_COEFFICIENT_CODING
   static const int TPL_LEVEL_CLIP = GTN_LEVEL;   // a template neighbour adds min(TPL_LEVEL_CLIP + (t & 1), t) to sumAbs1
@@ -1811,7 +1831,7 @@ const CtxSet &ctxSetGt4 = isLfnst ? Ctx::GtxFlagL[6 + chType] : Ctx::GtxFlag[6 +
       setAbsLevels(m_absLevels, prvLevels, scanInfo.insidePos, (uint8_t) std::min<TCoeff>(255, decision.absLevel));
 
       // template of the next scan position: neighbours outside (ctx init) and inside the sub-block
-      const int tinit = m_commonCtx.ctxInit(m_ctxInitIdx)[scanInfo.nextInsidePos];
+      const int tinit = m_commonCtx.ctxInit(m_ctxInitIdx, scanInfo.nextInsidePos);
 #if JVET_AE0102_LFNST_CTX
       const uint8_t *nbShuffle = scanInfo.nextNbShuffle[lfnstIdx > 0 ? 1 : 0];
 #else
@@ -1900,7 +1920,7 @@ const CtxSet &ctxSetGt4 = isLfnst ? Ctx::GtxFlagL[6 + chType] : Ctx::GtxFlag[6 +
       m_commonCtx.update(scanInfo, prvState, *this);
 #endif
 
-      TCoeff  tinit   = m_commonCtx.ctxInit(m_ctxInitIdx)[scanInfo.nextInsidePos];
+      TCoeff  tinit   = m_commonCtx.ctxInit(m_ctxInitIdx, scanInfo.nextInsidePos);
       TCoeff  sumNum  =   tinit        & 7;
       TCoeff  sumAbs1 = ( tinit >> 3 ) & 31;
       TCoeff  sumGt1  = sumAbs1        - sumNum;
@@ -1922,52 +1942,34 @@ const CtxSet &ctxSetGt4 = isLfnst ? Ctx::GtxFlagL[6 + chType] : Ctx::GtxFlag[6 +
 
     }
   }
-#if JVET_AE0102_LFNST_CTX
-  inline void CommonCtx::update(const ScanInfo &scanInfo, const State *prevState, State &currState, bool lfnstidx)
-#else
-  inline void CommonCtx::update(const ScanInfo &scanInfo, const State *prevState, State &currState)
-#endif
+  inline int CommonCtx::updateSbb(const ScanInfo &scanInfo, const int prevRefSbbCtxId, const int stateId,
+                                  const bool sigSbb, const uint8_t *absLevels16, const bool lfnstidx)
   {
-    uint8_t *sbbFlags = m_currSbbCtx[currState.m_stateId].sbbFlags;
-    uint8_t *levels   = m_currSbbCtx[currState.m_stateId].levels;
+    uint8_t *sbbFlags = m_currSbbCtx[stateId].sbbFlags;
+    uint8_t *levels   = m_currSbbCtx[stateId].levels;
 #if JVET_AE0102_LFNST_CTX
     std::size_t setCpSize = m_nbInfo[scanInfo.scanIdx - 1].maxDist[lfnstidx] * sizeof(uint8_t);
 #else
     std::size_t setCpSize = m_nbInfo[scanInfo.scanIdx - 1].maxDist * sizeof(uint8_t);
 #endif
-    if (prevState && prevState->m_refSbbCtxId >= 0)
+    if (prevRefSbbCtxId >= 0)
     {
-      ::memcpy(sbbFlags, m_prevSbbCtx[prevState->m_refSbbCtxId].sbbFlags, scanInfo.numSbb * sizeof(uint8_t));
-      ::memcpy(levels + scanInfo.scanIdx, m_prevSbbCtx[prevState->m_refSbbCtxId].levels + scanInfo.scanIdx, setCpSize);
+      ::memcpy(sbbFlags, m_prevSbbCtx[prevRefSbbCtxId].sbbFlags, scanInfo.numSbb * sizeof(uint8_t));
+      ::memcpy(levels + scanInfo.scanIdx, m_prevSbbCtx[prevRefSbbCtxId].levels + scanInfo.scanIdx, setCpSize);
     }
     else
     {
       ::memset(sbbFlags, 0, scanInfo.numSbb * sizeof(uint8_t));
       ::memset(levels + scanInfo.scanIdx, 0, setCpSize);
     }
-    sbbFlags[scanInfo.sbbPos] = !!currState.m_numSigSbb;
-    ::memcpy(levels + scanInfo.scanIdx, currState.m_absLevels, scanInfo.sbbSize * sizeof(uint8_t));
+    sbbFlags[scanInfo.sbbPos] = sigSbb;
+    ::memcpy(levels + scanInfo.scanIdx, absLevels16, scanInfo.sbbSize * sizeof(uint8_t));
 
-    const int sigNSbb     = ((scanInfo.nextSbbRight ? sbbFlags[scanInfo.nextSbbRight] : false)
+    const int sigNSbb = ((scanInfo.nextSbbRight ? sbbFlags[scanInfo.nextSbbRight] : false)
                              || (scanInfo.nextSbbBelow ? sbbFlags[scanInfo.nextSbbBelow] : false)
-                               ? 1
-                               : 0);
-    currState.m_numSigSbb = 0;
-    if (prevState)
-    {
-      currState.m_remRegBins = prevState->m_remRegBins;
-    }
-    else
-    {
-      int ctxBinSampleRatio  = (scanInfo.chType == CHANNEL_TYPE_LUMA) ? MAX_TU_LEVEL_CTX_CODED_BIN_CONSTRAINT_LUMA
-                                                                      : MAX_TU_LEVEL_CTX_CODED_BIN_CONSTRAINT_CHROMA;
-      currState.m_remRegBins = (currState.effWidth * currState.effHeight * ctxBinSampleRatio) / 16;
-    }
-    currState.m_goRicePar   = 0;
-    currState.m_refSbbCtxId = currState.m_stateId;
-    currState.m_sbbFracBits = m_sbbFlagBits[sigNSbb];
+                           ? 1
+                           : 0);
 
-    uint16_t        *templateCtxInit = m_ctxInit[currState.m_stateId];
     const int        scanBeg   = scanInfo.scanIdx - scanInfo.sbbSize;
     const NbInfoOut *nbOut     = m_nbInfo + scanBeg;
     const uint8_t *  absLevels = levels + scanBeg;
@@ -2030,21 +2032,126 @@ const CtxSet &ctxSetGt4 = isLfnst ? Ctx::GtxFlagL[6 + chType] : Ctx::GtxFlag[6 +
 #endif
 #undef UPDATE
 #if JVET_AG0100_TRANSFORM_COEFFICIENT_CODING
-        templateCtxInit[id] = uint16_t(sumNum) + (uint16_t(std::min<TCoeff>(31, sumAbs1)) << 3) + ((uint16_t)std::min<TCoeff>(127, sumAbs) << 8);
+        m_ctxInitT[id][stateId] = uint16_t(sumNum) + (uint16_t(std::min<TCoeff>(31, sumAbs1)) << 3) + ((uint16_t)std::min<TCoeff>(127, sumAbs) << 8);
 #else
-        templateCtxInit[id] = uint16_t(sumNum) + ( uint16_t(sumAbs1) << 3 ) + ( (uint16_t)std::min<TCoeff>( 127, sumAbs ) << 8 );
+        m_ctxInitT[id][stateId] = uint16_t(sumNum) + ( uint16_t(sumAbs1) << 3 ) + ( (uint16_t)std::min<TCoeff>( 127, sumAbs ) << 8 );
 #endif
 
       }
       else
       {
-        templateCtxInit[id] = 0;
+        m_ctxInitT[id][stateId] = 0;
       }
     }
-    ::memset(templateCtxInit + scanInfo.sbbSize, 0, (16 - scanInfo.sbbSize) * sizeof(uint16_t));
+    for (int id = scanInfo.sbbSize; id < 16; id++)
+    {
+      m_ctxInitT[id][stateId] = 0;
+    }
+    return sigNSbb;
+  }
+
+#if JVET_AE0102_LFNST_CTX
+  inline void CommonCtx::update(const ScanInfo &scanInfo, const State *prevState, State &currState, bool lfnstidx)
+#else
+  inline void CommonCtx::update(const ScanInfo &scanInfo, const State *prevState, State &currState)
+#endif
+  {
+#if !JVET_AE0102_LFNST_CTX
+    const bool lfnstidx = false;
+#endif
+    const int sigNSbb = updateSbb(scanInfo, prevState ? prevState->m_refSbbCtxId : -1, currState.m_stateId,
+                                  currState.m_numSigSbb != 0, currState.m_absLevels, lfnstidx);
+    currState.m_numSigSbb = 0;
+    if (prevState)
+    {
+      currState.m_remRegBins = prevState->m_remRegBins;
+    }
+    else
+    {
+      int ctxBinSampleRatio  = (scanInfo.chType == CHANNEL_TYPE_LUMA) ? MAX_TU_LEVEL_CTX_CODED_BIN_CONSTRAINT_LUMA
+                                                                      : MAX_TU_LEVEL_CTX_CODED_BIN_CONSTRAINT_CHROMA;
+      currState.m_remRegBins = (currState.effWidth * currState.effHeight * ctxBinSampleRatio) / 16;
+    }
+    currState.m_goRicePar   = 0;
+    currState.m_refSbbCtxId = currState.m_stateId;
+    currState.m_sbbFracBits = m_sbbFlagBits[sigNSbb];
     ::memset(currState.m_absLevels, 0, sizeof(currState.m_absLevels));
     currState.m_ctxInitIdx = currState.m_stateId;
   }
+
+#if DQ_TRELLIS_LOOP_TEMPLATE
+  // The states of one trellis stage as a structure of arrays (lane = state id; 4 or 8 states), so that the state
+  // update after each decision runs on all states at once. Relation to the members of State:
+  //   m_sigFracBits = sigFlagBits(state) + sigCtx, m_coeffFracBits = gtxFracBits + gtxCtx,
+  //   m_sbbFracBits = { sbbBits0, sbbBits1 }, m_absLevelsAndCtxInit = absLevels column + ctxInit(ctxInitIdx).
+  // Every lane reproduces its State exactly, including states without a path (decision.prevId == -2, which keep
+  // all members) and their descendants: their members only enter costs that never win against a real path, but the
+  // slot values they leave behind (e.g. goRiceZero, which a sub-block end keeps) are read later by real paths.
+  // numSigSbb, refSbbCtxId, ctxInitIdx, sbbBits, remRegBins and absLevels are taken over from the predecessor
+  // (shuffles); goRicePar, goRiceZero, sigCtx and gtxCtx belong to the state slot (recomputed or kept as in State).
+  struct alignas(64) StateArr
+  {
+    int64_t  rdCost[8];
+    int32_t  remRegBins[8];
+    uint32_t sbbBits0[8];   // m_sbbFracBits: kept by the start of a path and by State::init (i.e. across TUs)
+    uint32_t sbbBits1[8];
+    int8_t   numSigSbb[8];   // 16-byte pairs: { numSigSbb, refSbbCtxId }, { ctxInitIdx, (unused) },
+    int8_t   refSbbCtxId[8];   //                { goRicePar, goRiceZero }, { sigCtx, gtxCtx }
+    uint8_t  ctxInitIdx[8];
+    uint8_t  unused[8];
+    int8_t   goRicePar[8];
+    int8_t   goRiceZero[8];
+    uint8_t  sigCtx[8];
+    uint8_t  gtxCtx[8];
+    uint8_t  absLevels[17][8];   // levels of the current sub-block [position][state] (max 255); row 16 stays zero
+  };
+
+  // [position][state] -> [state][position] (16 positions, 8 states)
+  static inline void transposeAbsLevels(const uint8_t src[17][8], uint8_t dst[8][16])
+  {
+#if defined(__SSE4_1__)
+    const __m128i ilv = _mm_setr_epi8(0, 8, 1, 9, 2, 10, 3, 11, 4, 12, 5, 13, 6, 14, 7, 15);
+    __m128i       t[8];
+    for (int r = 0; r < 8; r++)
+    {
+      // 16-bit element s: levels of state s at positions 2r and 2r+1
+      t[r] = _mm_shuffle_epi8(_mm_load_si128((const __m128i *) src[2 * r]), ilv);
+    }
+    const __m128i a0 = _mm_unpacklo_epi16(t[0], t[1]);
+    const __m128i a1 = _mm_unpackhi_epi16(t[0], t[1]);
+    const __m128i a2 = _mm_unpacklo_epi16(t[2], t[3]);
+    const __m128i a3 = _mm_unpackhi_epi16(t[2], t[3]);
+    const __m128i a4 = _mm_unpacklo_epi16(t[4], t[5]);
+    const __m128i a5 = _mm_unpackhi_epi16(t[4], t[5]);
+    const __m128i a6 = _mm_unpacklo_epi16(t[6], t[7]);
+    const __m128i a7 = _mm_unpackhi_epi16(t[6], t[7]);
+    const __m128i b0 = _mm_unpacklo_epi32(a0, a2);
+    const __m128i b1 = _mm_unpackhi_epi32(a0, a2);
+    const __m128i b2 = _mm_unpacklo_epi32(a1, a3);
+    const __m128i b3 = _mm_unpackhi_epi32(a1, a3);
+    const __m128i b4 = _mm_unpacklo_epi32(a4, a6);
+    const __m128i b5 = _mm_unpackhi_epi32(a4, a6);
+    const __m128i b6 = _mm_unpacklo_epi32(a5, a7);
+    const __m128i b7 = _mm_unpackhi_epi32(a5, a7);
+    _mm_store_si128((__m128i *) dst[0], _mm_unpacklo_epi64(b0, b4));
+    _mm_store_si128((__m128i *) dst[1], _mm_unpackhi_epi64(b0, b4));
+    _mm_store_si128((__m128i *) dst[2], _mm_unpacklo_epi64(b1, b5));
+    _mm_store_si128((__m128i *) dst[3], _mm_unpackhi_epi64(b1, b5));
+    _mm_store_si128((__m128i *) dst[4], _mm_unpacklo_epi64(b2, b6));
+    _mm_store_si128((__m128i *) dst[5], _mm_unpackhi_epi64(b2, b6));
+    _mm_store_si128((__m128i *) dst[6], _mm_unpacklo_epi64(b3, b7));
+    _mm_store_si128((__m128i *) dst[7], _mm_unpackhi_epi64(b3, b7));
+#else
+    for (int s = 0; s < 8; s++)
+    {
+      for (int pos = 0; pos < 16; pos++)
+      {
+        dst[s][pos] = src[pos][s];
+      }
+    }
+#endif
+  }
+#endif
 
   /*================================================================================*/
   /*=====                                                                      =====*/
@@ -2068,6 +2175,26 @@ const CtxSet &ctxSetGt4 = isLfnst ? Ctx::GtxFlagL[6 + chType] : Ctx::GtxFlag[6 +
                        const TCoeff defaultQuantisationCoefficient, const bool enableScalingLists,
                        const int *quantCoeff, const TransformUnit &tu, const ComponentID compID, const QpParam &cQP,
                        const double lambda);
+    void xInitStates(const unsigned effWidth, const unsigned effHeight, const ChannelType chType);
+    template<int numStates>
+    void xDecideSoA(const ScanPosType spt, const TCoeff absCoeff, const int lastOffset, Decision *decisions,
+                    const TCoeff quanCoeff);
+    template<int numStates>
+    void xUpdateStatesSoA(const ScanInfo &scanInfo, const Decision *decisions, const int ctxType);
+    template<int numStates>
+    void xUpdateStatesEosSoA(const ScanInfo &scanInfo, const Decision *decisions, const int ctxType);
+    inline void calcRdCostsSoA(const StateArr &st, const int s, const ScanPosType spt, const PQData &pqDataA,
+                               const PQData &pqDataB, int64_t &costA, int64_t &costB, int64_t &costZ) const;
+    inline int64_t calcRdCostStartSoA(const int32_t lastOffset, const PQData &pqData) const;
+
+    StateArr           m_stateArr[3];
+    StateArr *         m_currArr;
+    StateArr *         m_prevArr;
+    StateArr *         m_skipArr;
+    const BinFracBits *m_sigTab[8];         // sig flag rate table of each state id
+    int32_t            m_initRemRegBins;    // budget of context coded bins of the current TU
+    int16_t            m_riceThrGtn[3];     // g_auiGoRiceParsCoeffGTN[x] = number of thresholds <= x
+    int16_t            m_riceThrCoeff[3];   // g_auiGoRiceParsCoeff[x]    = number of thresholds <= x
 #endif
 #if TU_256 && !EXTENDED_LFNST
 #if TCQ_8STATES
@@ -2161,6 +2288,41 @@ const CtxSet &ctxSetGt4 = isLfnst ? Ctx::GtxFlagL[6 + chType] : Ctx::GtxFlag[6 +
                                       ,
     m_startState TINIT(0)
   {
+#if DQ_TRELLIS_LOOP_TEMPLATE
+    ::memset(m_stateArr, 0, sizeof(m_stateArr));
+    m_currArr = m_stateArr;
+    m_prevArr = m_stateArr + 1;
+    m_skipArr = m_stateArr + 2;
+    for (int k = 0; k < 8; k++)
+    {
+      m_sigTab[k] = sigFlagBits(k);
+    }
+    m_initRemRegBins = 0;
+    // the Rice parameter tables are non-decreasing with values 0..3: parameter = number of thresholds reached
+    for (int i = 1; i < GTN_MAXSUM; i++)
+    {
+      CHECK(g_auiGoRiceParsCoeffGTN[i] < g_auiGoRiceParsCoeffGTN[i - 1] || g_auiGoRiceParsCoeffGTN[i] > 3,
+            "unexpected Rice parameter table");
+    }
+    for (int i = 1; i < 32; i++)
+    {
+      CHECK(g_auiGoRiceParsCoeff[i] < g_auiGoRiceParsCoeff[i - 1] || g_auiGoRiceParsCoeff[i] > 3,
+            "unexpected Rice parameter table");
+    }
+    for (int t = 0; t < 3; t++)
+    {
+      m_riceThrGtn[t]   = GTN_MAXSUM;
+      m_riceThrCoeff[t] = 32;
+      for (int i = GTN_MAXSUM - 1; i >= 0; i--)
+      {
+        m_riceThrGtn[t] = (g_auiGoRiceParsCoeffGTN[i] > (uint32_t) t ? i : m_riceThrGtn[t]);
+      }
+      for (int i = 31; i >= 0; i--)
+      {
+        m_riceThrCoeff[t] = (g_auiGoRiceParsCoeff[i] > (uint32_t) t ? i : m_riceThrCoeff[t]);
+      }
+    }
+#endif
   }
 #undef TINIT
 
@@ -2439,25 +2601,523 @@ const CtxSet &ctxSetGt4 = isLfnst ? Ctx::GtxFlagL[6 + chType] : Ctx::GtxFlag[6 +
   }
 
 #if DQ_TRELLIS_LOOP_TEMPLATE
+  void DepQuant::xInitStates(const unsigned effWidth, const unsigned effHeight, const ChannelType chType)
+  {
+    // same values as State::init for all states of the three arrays (which keeps m_sbbFracBits)
+    for (int a = 0; a < 3; a++)
+    {
+      StateArr &st = m_stateArr[a];
+      for (int k = 0; k < 8; k++)
+      {
+        st.rdCost[k]      = std::numeric_limits<int64_t>::max() >> 1;
+        st.remRegBins[k]  = 4;   // just large enough for last scan pos
+        st.numSigSbb[k]   = 0;
+        st.refSbbCtxId[k] = -1;
+        st.ctxInitIdx[k]  = CTX_INIT_ZERO;
+        st.goRicePar[k]   = 0;
+        st.goRiceZero[k]  = 0;
+        st.sigCtx[k]      = 0;
+        st.gtxCtx[k]      = 0;
+      }
+      ::memset(st.absLevels, 0, sizeof(st.absLevels));
+    }
+    const int ctxBinSampleRatio = (chType == CHANNEL_TYPE_LUMA) ? MAX_TU_LEVEL_CTX_CODED_BIN_CONSTRAINT_LUMA
+                                                                : MAX_TU_LEVEL_CTX_CODED_BIN_CONSTRAINT_CHROMA;
+    m_initRemRegBins = (effWidth * effHeight * ctxBinSampleRatio) / 16;
+  }
+
+  // State::calcRdCosts for state s of a StateArr
+  inline void DepQuant::calcRdCostsSoA(const StateArr &st, const int s, const ScanPosType spt, const PQData &pqDataA,
+                                       const PQData &pqDataB, int64_t &costA, int64_t &costB, int64_t &costZ) const
+  {
+    const int32_t *goRiceTab = g_goRiceBits[st.goRicePar[s]];
+    int64_t        rdCostA   = st.rdCost[s] + pqDataA.deltaDist;
+    int64_t        rdCostB   = st.rdCost[s] + pqDataB.deltaDist;
+    int64_t        rdCostZ   = st.rdCost[s];
+    const TCoeff   absLevelA = pqDataA.absLevel;
+    const TCoeff   absLevelB = pqDataB.absLevel;
+
+    if (st.remRegBins[s] >= 4)
+    {
+      const int32_t *bits = gtxFracBits(0)[st.gtxCtx[s]].bits;
+      if (absLevelA < GTN_LEVEL)
+      {
+        rdCostA += bits[absLevelA];
+      }
+      else
+      {
+        const TCoeff value = (absLevelA - GTN_LEVEL) >> 1;
+        rdCostA += bits[absLevelA - (value << 1)] + goRiceTab[value < RICEMAX ? value : RICEMAX - 1];
+      }
+      if (absLevelB < GTN_LEVEL)
+      {
+        rdCostB += bits[absLevelB];
+      }
+      else
+      {
+        const TCoeff value = (absLevelB - GTN_LEVEL) >> 1;
+        rdCostB += bits[absLevelB - (value << 1)] + goRiceTab[value < RICEMAX ? value : RICEMAX - 1];
+      }
+      const BinFracBits &sigBits = m_sigTab[s][st.sigCtx[s]];
+      const int          sigBit1 = sigBits.intBits[1];
+      if (spt == SCAN_ISCSBB)
+      {
+        rdCostA += sigBit1;
+        rdCostB += sigBit1;
+        rdCostZ += sigBits.intBits[0];
+      }
+      else if (spt == SCAN_SOCSBB)
+      {
+        const int sbbBit1 = st.sbbBits1[s];
+        rdCostA += sbbBit1 + sigBit1;
+        rdCostB += sbbBit1 + sigBit1;
+        rdCostZ += sbbBit1 + sigBits.intBits[0];
+      }
+      else if (st.numSigSbb[s])
+      {
+        rdCostA += sigBit1;
+        rdCostB += sigBit1;
+        rdCostZ += sigBits.intBits[0];
+      }
+      else
+      {
+        rdCostZ = std::numeric_limits<int64_t>::max();   // last coefficient of a coded sub-block: zero not allowed
+      }
+    }
+    else
+    {
+      const int goRiceZero = st.goRiceZero[s];
+      rdCostA += (1 << SCALE_BITS)
+                 + goRiceTab[absLevelA <= goRiceZero ? absLevelA - 1 : (absLevelA < RICEMAX ? absLevelA : RICEMAX - 1)];
+      rdCostB += (1 << SCALE_BITS)
+                 + goRiceTab[absLevelB <= goRiceZero ? absLevelB - 1 : (absLevelB < RICEMAX ? absLevelB : RICEMAX - 1)];
+      rdCostZ += goRiceTab[goRiceZero];
+    }
+    costA = rdCostA;
+    costB = rdCostB;
+    costZ = rdCostZ;
+  }
+
+  // State::calcRdCostStart of the start state (gtx context 0, Rice parameter 0)
+  inline int64_t DepQuant::calcRdCostStartSoA(const int32_t lastOffset, const PQData &pqData) const
+  {
+    const int32_t *bits   = gtxFracBits(0)[0].bits;
+    int64_t        rdCost = pqData.deltaDist + lastOffset;
+    if (pqData.absLevel < GTN_LEVEL)
+    {
+      rdCost += bits[pqData.absLevel];
+    }
+    else
+    {
+      const TCoeff value = (pqData.absLevel - GTN_LEVEL) >> 1;
+      rdCost += bits[pqData.absLevel - (value << 1)] + g_goRiceBits[0][value < RICEMAX ? value : RICEMAX - 1];
+    }
+    return rdCost;
+  }
+
+  template<int numStates>
+  ALWAYS_INLINE void DepQuant::xDecideSoA(const ScanPosType spt, const TCoeff absCoeff, const int lastOffset,
+                                          Decision *decisions, const TCoeff quanCoeff)
+  {
+    // For destination state j the candidates are: level A and zero from state P[j] and level B from state Q[j]
+    // (next state of P[j] for an even level / of Q[j] for an odd level), in the stock evaluation order (by source
+    // state), then skipping the sub-block (from skip state j) and starting the path (j = 0: pqData[0], j = START_B:
+    // pqData[2]). The selection is branch-free; ties keep the earlier candidate as before (strict "<").
+    static const int8_t P[2][8] = { { 0, 2, 1, 3, -1, -1, -1, -1 }, { 0, 2, 4, 6, 5, 1, 3, 7 } };
+    static const int8_t Q[2][8] = { { 2, 0, 3, 1, -1, -1, -1, -1 }, { 4, 6, 0, 2, 3, 7, 5, 1 } };
+    const int           START_B = (numStates > 4 ? 2 : 1);
+    const int8_t *      P_      = P[numStates > 4];
+    const int8_t *      Q_      = Q[numStates > 4];
+
+    PQData pqData[4];
+    m_quant.preQuantCoeff(absCoeff, pqData, quanCoeff);
+
+    const StateArr &prv = *m_prevArr;
+    const StateArr &skp = *m_skipArr;
+    StateArr &      cur = *m_currArr;
+    int64_t         costA[numStates], costB[numStates], costZ[numStates];
+    DQ_UNROLL_STATES
+    for (int s = 0; s < numStates; s++)
+    {
+      calcRdCostsSoA(prv, s, spt, pqData[(s & 1) ? 3 : 0], pqData[(s & 1) ? 1 : 2], costA[s], costB[s], costZ[s]);
+    }
+    const int64_t startCostA = calcRdCostStartSoA(lastOffset, pqData[0]);
+    const int64_t startCostB = calcRdCostStartSoA(lastOffset, pqData[2]);
+
+    DQ_UNROLL_STATES
+    for (int j = 0; j < numStates; j++)
+    {
+      const int p        = P_[j];
+      const int q        = Q_[j];
+      int64_t   cost     = startDec.rdCost;
+      TCoeff    absLevel = startDec.absLevel;
+      int       prevId   = startDec.prevId;
+      auto      select   = [&](const int64_t c, const TCoeff l, const int id)
+      {
+        const bool better = c < cost;
+        cost              = better ? c : cost;
+        absLevel          = better ? l : absLevel;
+        prevId            = better ? id : prevId;
+      };
+      if (p < q)
+      {
+        select(costA[p], pqData[(p & 1) ? 3 : 0].absLevel, p);
+        select(costZ[p], 0, p);
+        select(costB[q], pqData[(q & 1) ? 1 : 2].absLevel, q);
+      }
+      else
+      {
+        select(costB[q], pqData[(q & 1) ? 1 : 2].absLevel, q);
+        select(costA[p], pqData[(p & 1) ? 3 : 0].absLevel, p);
+        select(costZ[p], 0, p);
+      }
+      if (spt == SCAN_EOCSBB)
+      {
+        select(skp.rdCost[j] + skp.sbbBits0[j], 0, numStates + j);
+      }
+      if (j == 0)
+      {
+        select(startCostA, pqData[0].absLevel, -1);
+      }
+      if (j == START_B)
+      {
+        select(startCostB, pqData[2].absLevel, -1);
+      }
+      // one 16-byte store per decision (the state update reads the decisions as vectors)
+      _mm_storeu_si128((__m128i *) &decisions[j],
+                       _mm_set_epi64x((int64_t) (((uint64_t) (uint32_t) prevId << 32) | (uint32_t) absLevel), cost));
+      cur.rdCost[j] = cost;
+    }
+  }
+
+  // State::updateState for all states (stage inside a sub-block)
+  template<int numStates>
+  ALWAYS_INLINE void DepQuant::xUpdateStatesSoA(const ScanInfo &scanInfo, const Decision *decisions, const int ctxType)
+  {
+    StateArr &      cur  = *m_currArr;
+    const StateArr &prv  = *m_prevArr;
+    const __m128i   zero = _mm_setzero_si128();
+
+    //----- decisions: absolute levels (int32) and predecessors (-2: none, -1: start of the path) -----
+    __m128i abs03, abs47, prv03, prv47;
+    {
+      const __m128i h01 = _mm_unpackhi_epi64(_mm_loadu_si128((const __m128i *) &decisions[0]),
+                                             _mm_loadu_si128((const __m128i *) &decisions[1]));
+      const __m128i h23 = _mm_unpackhi_epi64(_mm_loadu_si128((const __m128i *) &decisions[2]),
+                                             _mm_loadu_si128((const __m128i *) &decisions[3]));
+      const __m128i s01 = _mm_shuffle_epi32(h01, _MM_SHUFFLE(3, 1, 2, 0));   // a0 a1 p0 p1
+      const __m128i s23 = _mm_shuffle_epi32(h23, _MM_SHUFFLE(3, 1, 2, 0));   // a2 a3 p2 p3
+      abs03             = _mm_unpacklo_epi64(s01, s23);
+      prv03             = _mm_unpackhi_epi64(s01, s23);
+      if (numStates > 4)
+      {
+        const __m128i h45 = _mm_unpackhi_epi64(_mm_loadu_si128((const __m128i *) &decisions[4]),
+                                               _mm_loadu_si128((const __m128i *) &decisions[5]));
+        const __m128i h67 = _mm_unpackhi_epi64(_mm_loadu_si128((const __m128i *) &decisions[6]),
+                                               _mm_loadu_si128((const __m128i *) &decisions[7]));
+        const __m128i s45 = _mm_shuffle_epi32(h45, _MM_SHUFFLE(3, 1, 2, 0));
+        const __m128i s67 = _mm_shuffle_epi32(h67, _MM_SHUFFLE(3, 1, 2, 0));
+        abs47             = _mm_unpacklo_epi64(s45, s67);
+        prv47             = _mm_unpackhi_epi64(s45, s67);
+      }
+      else
+      {
+        abs47 = _mm_set1_epi32(-1);
+        prv47 = _mm_set1_epi32(-2);   // unused lanes: like states without a path (kept as they are)
+      }
+    }
+    const __m128i prev8 = _mm_packs_epi16(_mm_packs_epi32(prv03, prv47), zero);   // bytes 0..7
+    const __m128i dead8 = _mm_cmpeq_epi8(prev8, _mm_set1_epi8(-2));
+    const int     dead  = _mm_movemask_epi8(dead8) & 0xff;   // only in the first stages of a TU
+    alignas(64) StateArr deadKeep;
+    if (dead)
+    {
+      deadKeep = cur;
+    }
+    const __m128i start8  = _mm_cmpeq_epi8(prev8, _mm_set1_epi8(-1));
+    const __m128i start03 = _mm_cmpeq_epi32(prv03, _mm_set1_epi32(-1));
+    const __m128i start47 = _mm_cmpeq_epi32(prv47, _mm_set1_epi32(-1));
+    // shuffle gathering two byte fields (2 x 8 bytes) of the predecessors; negative ids give 0
+    const __m128i idx2 =
+      _mm_unpacklo_epi64(prev8, _mm_blendv_epi8(_mm_add_epi8(prev8, _mm_set1_epi8(8)), prev8, prev8));
+    const __m128i abs8 = _mm_packs_epi16(_mm_packs_epi32(abs03, abs47), zero);   // only compared to 0
+
+    //----- numSigSbb (+ 1 for a non-zero level; start: 1), refSbbCtxId (start: -1) -----
+    {
+      __m128i v = _mm_shuffle_epi8(_mm_load_si128((const __m128i *) prv.numSigSbb), idx2);
+      v         = _mm_add_epi8(v, _mm_add_epi8(_mm_set1_epi8(1), _mm_cmpeq_epi8(abs8, zero)));   // high half: + 0
+      v         = _mm_or_si128(v, _mm_slli_si128(start8, 8));
+      _mm_store_si128((__m128i *) cur.numSigSbb, v);
+    }
+    //----- ctxInitIdx (start: zero template init) -----
+    {
+      __m128i v = _mm_shuffle_epi8(_mm_load_si128((const __m128i *) prv.ctxInitIdx), idx2);
+      v         = _mm_or_si128(v, _mm_and_si128(start8, _mm_set1_epi8(CTX_INIT_ZERO)));
+      _mm_store_si128((__m128i *) cur.ctxInitIdx, v);
+    }
+    //----- int32 members of the predecessors: remRegBins, sbbBits -----
+    __m128i rem03, rem47;
+    {
+      const __m128i byteOffs = _mm_setr_epi8(0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3);
+      // shuffles reading lane prevId of an int32 array held in two registers (lanes 0-3, lanes 4-7)
+      auto gatherIdx = [&](const __m128i spread, __m128i &i0, __m128i &i1)
+      {
+        __m128i i = _mm_shuffle_epi8(prev8, spread);   // predecessor id in each byte of an int32 lane
+        i         = _mm_add_epi8(i, i);
+        i         = _mm_add_epi8(_mm_add_epi8(i, i), byteOffs);   // 4 * id + byte (negative ids stay negative)
+        i0 = _mm_or_si128(i, _mm_and_si128(_mm_cmpgt_epi8(i, _mm_set1_epi8(15)), _mm_set1_epi8((char) 0x80)));
+        i1 = _mm_sub_epi8(i, _mm_set1_epi8(16));
+      };
+      __m128i iLo0, iLo1, iHi0, iHi1;
+      gatherIdx(_mm_setr_epi8(0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3), iLo0, iLo1);
+      gatherIdx(_mm_setr_epi8(4, 4, 4, 4, 5, 5, 5, 5, 6, 6, 6, 6, 7, 7, 7, 7), iHi0, iHi1);
+      auto gather32 = [&](const void *src, __m128i &lo, __m128i &hi)
+      {
+        const __m128i r0 = _mm_load_si128((const __m128i *) src);
+        const __m128i r1 = _mm_load_si128((const __m128i *) src + 1);
+        lo = _mm_or_si128(_mm_shuffle_epi8(r0, iLo0), _mm_shuffle_epi8(r1, iLo1));
+        hi = _mm_or_si128(_mm_shuffle_epi8(r0, iHi0), _mm_shuffle_epi8(r1, iHi1));
+      };
+      // remRegBins: predecessor - 1 - (>= 4 ? min(absLevel, 7) : 0); start: init - min(absLevel, 7)
+      gather32(prv.remRegBins, rem03, rem47);
+      const __m128i initRem1 = _mm_set1_epi32(m_initRemRegBins + 1);
+      const __m128i three    = _mm_set1_epi32(3);
+      const __m128i maxDec   = _mm_set1_epi32(GTN_LEVEL - 1);
+      rem03 = _mm_sub_epi32(_mm_blendv_epi8(rem03, initRem1, start03), _mm_set1_epi32(1));
+      rem47 = _mm_sub_epi32(_mm_blendv_epi8(rem47, initRem1, start47), _mm_set1_epi32(1));
+      rem03 = _mm_sub_epi32(rem03, _mm_and_si128(_mm_or_si128(_mm_cmpgt_epi32(rem03, three), start03),
+                                                 _mm_min_epi32(abs03, maxDec)));
+      rem47 = _mm_sub_epi32(rem47, _mm_and_si128(_mm_or_si128(_mm_cmpgt_epi32(rem47, three), start47),
+                                                 _mm_min_epi32(abs47, maxDec)));
+      _mm_store_si128((__m128i *) &cur.remRegBins[0], rem03);
+      _mm_store_si128((__m128i *) &cur.remRegBins[4], rem47);
+      // sbbBits: from the predecessor; the start of a path keeps the value of the state
+      const __m128i own03 = _mm_cmplt_epi32(prv03, zero);
+      const __m128i own47 = _mm_cmplt_epi32(prv47, zero);
+      __m128i       lo, hi;
+      gather32(prv.sbbBits0, lo, hi);
+      _mm_store_si128((__m128i *) &cur.sbbBits0[0],
+                      _mm_blendv_epi8(lo, _mm_load_si128((const __m128i *) &cur.sbbBits0[0]), own03));
+      _mm_store_si128((__m128i *) &cur.sbbBits0[4],
+                      _mm_blendv_epi8(hi, _mm_load_si128((const __m128i *) &cur.sbbBits0[4]), own47));
+      gather32(prv.sbbBits1, lo, hi);
+      _mm_store_si128((__m128i *) &cur.sbbBits1[0],
+                      _mm_blendv_epi8(lo, _mm_load_si128((const __m128i *) &cur.sbbBits1[0]), own03));
+      _mm_store_si128((__m128i *) &cur.sbbBits1[4],
+                      _mm_blendv_epi8(hi, _mm_load_si128((const __m128i *) &cur.sbbBits1[4]), own47));
+    }
+    const __m128i three = _mm_set1_epi32(3);
+    const __m128i reg8  = _mm_packs_epi16(
+      _mm_packs_epi32(_mm_cmpgt_epi32(rem03, three), _mm_cmpgt_epi32(rem47, three)), zero);   // ctx coded bins left
+
+    //----- levels of the sub-block: predecessor's, with min(255, absLevel) at the current position -----
+    {
+      const __m128i *src = (const __m128i *) prv.absLevels;
+      __m128i *      dst = (__m128i *) cur.absLevels;
+      for (int r = 0; r < 8; r++)
+      {
+        _mm_store_si128(dst + r, _mm_shuffle_epi8(_mm_load_si128(src + r), idx2));
+      }
+      const __m128i lev8 = _mm_packus_epi16(_mm_packs_epi32(abs03, abs47), zero);
+      const __m128i half = _mm_cmpeq_epi32(_mm_set1_epi32(scanInfo.insidePos & 1), _mm_setr_epi32(0, 0, 1, 1));
+      __m128i *     row2 = dst + (scanInfo.insidePos >> 1);
+      _mm_store_si128(row2, _mm_blendv_epi8(_mm_load_si128(row2), _mm_unpacklo_epi64(lev8, lev8), half));
+    }
+
+    //----- template of the next scan position -----
+    const __m128i one16 = _mm_set1_epi16(1);
+    __m128i       sAbs = zero, sAbs1 = zero, sNum = zero;
+    {
+      const uint8_t *nbRows = scanInfo.nextNbRows[ctxType];
+      const __m128i  clip   = _mm_set1_epi16(TPL_LEVEL_CLIP);
+      for (int k = 0; k < 5; k++)
+      {
+        const __m128i t = _mm_cvtepu8_epi16(_mm_loadl_epi64((const __m128i *) cur.absLevels[nbRows[k]]));
+        sAbs            = _mm_add_epi16(sAbs, t);
+        sAbs1           = _mm_add_epi16(sAbs1, _mm_min_epi16(t, _mm_add_epi16(_mm_and_si128(t, one16), clip)));
+        sNum            = _mm_add_epi16(sNum, _mm_min_epi16(t, one16));
+      }
+    }
+    __m128i tinit;
+    {
+      const __m128i cii   = _mm_loadl_epi64((const __m128i *) cur.ctxInitIdx);
+      const __m128i none  = _mm_cmpgt_epi8(cii, _mm_set1_epi8(7));   // CTX_INIT_ZERO
+      const __m128i c2    = _mm_add_epi8(cii, cii);
+      const __m128i ciIdx = _mm_unpacklo_epi8(_mm_or_si128(c2, none),
+                                              _mm_or_si128(_mm_add_epi8(c2, _mm_set1_epi8(1)), none));
+      tinit = _mm_shuffle_epi8(_mm_load_si128((const __m128i *) m_commonCtx.ctxInitRow(scanInfo.nextInsidePos)),
+                               ciIdx);
+    }
+    const __m128i sumAbs1 = _mm_add_epi16(_mm_and_si128(_mm_srli_epi16(tinit, 3), _mm_set1_epi16(31)), sAbs1);
+    const __m128i sumNum  = _mm_add_epi16(_mm_and_si128(tinit, _mm_set1_epi16(7)), sNum);
+    const __m128i sumAbs  = _mm_add_epi16(_mm_srli_epi16(tinit, 8), sAbs);
+
+    // context coded: sig / gtx contexts and Rice parameter from the template
+    const __m128i sig8 = _mm_packus_epi16(
+      _mm_add_epi16(_mm_set1_epi16(scanInfo.sigCtxOffsetNext),
+                    _mm_min_epi16(_mm_srli_epi16(_mm_add_epi16(sumAbs1, one16), 1), _mm_set1_epi16(NSIGCTX - 1))),
+      zero);
+    const __m128i gtx8 = _mm_packus_epi16(
+      _mm_add_epi16(_mm_set1_epi16(scanInfo.gtxCtxOffsetNext),
+                    _mm_min_epi16(_mm_sub_epi16(sumAbs1, sumNum), _mm_set1_epi16(NGTXCTX - 1))),
+      zero);
+    const __m128i sumAll = _mm_max_epi16(
+      _mm_min_epi16(_mm_sub_epi16(sumAbs, sumNum), _mm_set1_epi16(GTN_MAXSUM - 1)), zero);
+    // bypass coded: Rice parameter from min(31, sumAbs), goRiceZero = (1 + (state & 1)) << parameter
+    const __m128i sum31 = _mm_min_epi16(sumAbs, _mm_set1_epi16(31));
+    __m128i       parReg = zero, parByp = zero;
+    for (int t = 0; t < 3; t++)
+    {
+      parReg = _mm_sub_epi16(parReg, _mm_cmpgt_epi16(sumAll, _mm_set1_epi16(m_riceThrGtn[t] - 1)));
+      parByp = _mm_sub_epi16(parByp, _mm_cmpgt_epi16(sum31, _mm_set1_epi16(m_riceThrCoeff[t] - 1)));
+    }
+    const __m128i parReg8  = _mm_packus_epi16(parReg, zero);
+    const __m128i parByp8  = _mm_packus_epi16(parByp, zero);
+    const __m128i zeroByp8 = _mm_shuffle_epi8(_mm_setr_epi8(1, 2, 4, 8, 2, 4, 8, 16, 0, 0, 0, 0, 0, 0, 0, 0),
+                                              _mm_add_epi8(parByp8, _mm_setr_epi8(0, 4, 0, 4, 0, 4, 0, 4, 0, 0, 0, 0,
+                                                                                  0, 0, 0, 0)));
+    //----- { goRicePar, goRiceZero }: goRiceZero is only set when bypass coded (as in State::updateState) -----
+    {
+      const __m128i old   = _mm_load_si128((const __m128i *) cur.goRicePar);
+      const __m128i par8  = _mm_blendv_epi8(parByp8, parReg8, reg8);
+      const __m128i zero8 = _mm_blendv_epi8(_mm_srli_si128(old, 8), zeroByp8, _mm_andnot_si128(reg8, _mm_andnot_si128(dead8, _mm_set1_epi8(-1))));
+      _mm_store_si128((__m128i *) cur.goRicePar, _mm_unpacklo_epi64(par8, zero8));
+    }
+    //----- { sigCtx, gtxCtx }: only set when context coded -----
+    {
+      const __m128i old  = _mm_load_si128((const __m128i *) cur.sigCtx);
+      const __m128i reg2 = _mm_unpacklo_epi64(reg8, reg8);
+      _mm_store_si128((__m128i *) cur.sigCtx, _mm_blendv_epi8(old, _mm_unpacklo_epi64(sig8, gtx8), reg2));
+    }
+
+    //----- states without a path keep all members (except rdCost) -----
+    if (dead)
+    {
+      for (int j = 0; j < 8; j++)
+      {
+        if ((dead >> j) & 1)
+        {
+          cur.remRegBins[j]  = deadKeep.remRegBins[j];
+          cur.sbbBits0[j]    = deadKeep.sbbBits0[j];
+          cur.sbbBits1[j]    = deadKeep.sbbBits1[j];
+          cur.numSigSbb[j]   = deadKeep.numSigSbb[j];
+          cur.refSbbCtxId[j] = deadKeep.refSbbCtxId[j];
+          cur.ctxInitIdx[j]  = deadKeep.ctxInitIdx[j];
+          cur.goRicePar[j]   = deadKeep.goRicePar[j];
+          cur.goRiceZero[j]  = deadKeep.goRiceZero[j];
+          cur.sigCtx[j]      = deadKeep.sigCtx[j];
+          cur.gtxCtx[j]      = deadKeep.gtxCtx[j];
+          for (int pos = 0; pos < 16; pos++)
+          {
+            cur.absLevels[pos][j] = deadKeep.absLevels[pos][j];
+          }
+        }
+      }
+    }
+  }
+
+  // State::updateStateEOS for all states (last scan position of a sub-block)
+  template<int numStates>
+  void DepQuant::xUpdateStatesEosSoA(const ScanInfo &scanInfo, const Decision *decisions, const int ctxType)
+  {
+    StateArr &      cur = *m_currArr;
+    const StateArr &prv = *m_prevArr;
+    const StateArr &skp = *m_skipArr;
+    alignas(16) uint8_t prvLevels[8][16];
+    transposeAbsLevels(prv.absLevels, prvLevels);
+    for (int j = 0; j < numStates; j++)
+    {
+      const Decision &decision = decisions[j];
+      if (decision.prevId > -2)
+      {
+        int            prevRef   = -1;
+        int            prevRem   = m_initRemRegBins;
+        int            numSig    = 1;
+        const uint8_t *srcLevels = g_zeroAbsLevels;
+        if (decision.prevId >= numStates)
+        {
+          CHECKD(decision.absLevel != 0, "cannot happen");
+          const int k = decision.prevId - numStates;
+          prevRef     = skp.refSbbCtxId[k];
+          prevRem     = skp.remRegBins[k];
+          numSig      = 0;
+        }
+        else if (decision.prevId >= 0)
+        {
+          const int p = decision.prevId;
+          prevRef     = prv.refSbbCtxId[p];
+          prevRem     = prv.remRegBins[p];
+          numSig      = prv.numSigSbb[p] + !!decision.absLevel;
+          srcLevels   = prvLevels[p];
+        }
+        alignas(16) uint8_t levels[16];
+        setAbsLevels(levels, srcLevels, scanInfo.insidePos, (uint8_t) std::min<TCoeff>(255, decision.absLevel));
+        const int sigNSbb = m_commonCtx.updateSbb(scanInfo, prevRef, j, numSig != 0, levels, ctxType > 0);
+
+        cur.numSigSbb[j]   = 0;
+        cur.remRegBins[j]  = prevRem;
+        cur.goRicePar[j]   = 0;
+        cur.refSbbCtxId[j] = j;
+        cur.sbbBits0[j]    = m_commonCtx.sbbFlagBits(sigNSbb).intBits[0];
+        cur.sbbBits1[j]    = m_commonCtx.sbbFlagBits(sigNSbb).intBits[1];
+        cur.ctxInitIdx[j]  = j;
+        const int tinit    = m_commonCtx.ctxInit(j, scanInfo.nextInsidePos);
+        const int sumNum   = tinit & 7;
+        const int sumAbs1  = (tinit >> 3) & 31;
+        const int sumGt1   = sumAbs1 - sumNum;
+        cur.sigCtx[j]      = scanInfo.sigCtxOffsetNext + std::min((sumAbs1 + 1) >> 1, NSIGCTX - 1);
+        cur.gtxCtx[j]      = scanInfo.gtxCtxOffsetNext + std::min(sumGt1, NGTXCTX - 1);
+      }
+    }
+    // the levels of the new states are zero; states without a path keep theirs
+    alignas(8) uint8_t keep[8];
+    for (int j = 0; j < 8; j++)
+    {
+      keep[j] = (j >= numStates || decisions[j].prevId == -2 ? 0xff : 0);
+    }
+    const __m128i keep8 = _mm_loadl_epi64((const __m128i *) keep);
+    const __m128i keep2 = _mm_unpacklo_epi64(keep8, keep8);
+    __m128i      *rows  = (__m128i *) cur.absLevels;
+    for (int r = 0; r < 8; r++)
+    {
+      _mm_store_si128(rows + r, _mm_and_si128(_mm_load_si128(rows + r), keep2));
+    }
+  }
+
   template<int numStates>
   void DepQuant::xQuantTrellis(const TUParameters &tuPars, const TCoeff *tCoeff, const int firstTestPos,
                                const int lfnstIdx, const TCoeff defaultQuantisationCoefficient,
                                const bool enableScalingLists, const int *quantCoeff, const TransformUnit &tu,
                                const ComponentID compID, const QpParam &cQP, const double lambda)
   {
+    const int ctxType = lfnstIdx > 0 ? 1 : 0;
     for (int scanIdx = firstTestPos; scanIdx >= 0; scanIdx--)
     {
-      const ScanInfo &scanInfo = tuPars.m_scanInfo[scanIdx];
+      const ScanInfo &scanInfo  = tuPars.m_scanInfo[scanIdx];
+      TCoeff          quanCoeff = defaultQuantisationCoefficient;
       if (enableScalingLists)
       {
         m_quant.initQuantBlock(tu, compID, cQP, lambda, quantCoeff[scanInfo.rasterPos]);
-        xDecideAndUpdate<numStates>(abs(tCoeff[scanInfo.rasterPos]), scanInfo, quantCoeff[scanInfo.rasterPos],
-                                    lfnstIdx);
+        quanCoeff = quantCoeff[scanInfo.rasterPos];
       }
-      else
+      Decision *decisions = m_trellis + scanIdx * numStates;
+      std::swap(m_prevArr, m_currArr);
+      xDecideSoA<numStates>(scanInfo.spt, abs(tCoeff[scanInfo.rasterPos]), lastOffset(scanIdx), decisions, quanCoeff);
+      if (scanIdx)
       {
-        xDecideAndUpdate<numStates>(abs(tCoeff[scanInfo.rasterPos]), scanInfo, defaultQuantisationCoefficient,
-                                    lfnstIdx);
+        if (scanInfo.eosbb)
+        {
+          m_commonCtx.swap();
+          xUpdateStatesEosSoA<numStates>(scanInfo, decisions, ctxType);
+        }
+        else
+        {
+          xUpdateStatesSoA<numStates>(scanInfo, decisions, ctxType);
+        }
+        if (scanInfo.spt == SCAN_SOCSBB)
+        {
+          std::swap(m_prevArr, m_skipArr);
+        }
       }
     }
   }
@@ -2665,7 +3325,9 @@ const CtxSet &ctxSetGt4 = isLfnst ? Ctx::GtxFlagL[6 + chType] : Ctx::GtxFlag[6 +
     effectWidth  = (lfnst_threshold > 0) ? lfnst_threshold : effectWidth;
     effectHeight = (lfnst_threshold > 0) ? lfnst_threshold : effectHeight;
 #endif
-#if TCQ_8STATES
+#if DQ_TRELLIS_LOOP_TEMPLATE
+    xInitStates(effectWidth, effectHeight, toChannelType(compID));
+#elif TCQ_8STATES
     for (int k = 0; k < numStates; k++)
     {
       m_allStates[k].init(effectWidth, effectHeight);
