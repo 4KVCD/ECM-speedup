@@ -100,6 +100,13 @@ if (NOT (CMAKE_SYSTEM_PROCESSOR STREQUAL "arm64") )
     set_property( SOURCE ${SSE42_SRC_FILES} APPEND PROPERTY COMPILE_FLAGS "-msse4.2" )
     set_property( SOURCE ${AVX_SRC_FILES}   APPEND PROPERTY COMPILE_FLAGS "-mavx" )
     set_property( SOURCE ${AVX2_SRC_FILES}  APPEND PROPERTY COMPILE_FLAGS "-mavx2" )
+    # perf: the SADL intra-NN code selects implementations via __AVX2__/__SSE4_2__ and its template
+    # instantiations are COMDAT-merged across these TUs; keep them on the stock ISA so ECM_MARCH stays bit-exact
+    # (a trailing -march=x86-64 keeps the explicit -msse4.x/-mavx2 flags above)
+    if( ECM_MARCH )
+      set_property( SOURCE IntraPredictionNN.cpp IntraNnip_scalar.cpp ${CMAKE_CURRENT_SOURCE_DIR}/x86/sse42/IntraNnip_sse42.cpp
+                    ${CMAKE_CURRENT_SOURCE_DIR}/x86/avx2/IntraNnip_avx2.cpp APPEND_STRING PROPERTY COMPILE_FLAGS " -march=x86-64" )
+    endif()
   endif()
 endif()
 

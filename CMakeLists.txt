@@ -88,6 +88,18 @@ bb_enable_warnings( msvc warnings-as-errors "/wd4996" )
 # enable sse4.1 build for all source files for gcc and clang
 if( (UNIX OR MINGW) AND NOT (CMAKE_SYSTEM_PROCESSOR STREQUAL "arm64") )
   add_compile_options( "-msse4.1" )
+  # perf: target ISA for all (non-dispatched) code, e.g. x86-64-v3 (AVX2/BMI2/FMA), "native", or "" for stock.
+  # Measured: x86-64-v3 is bit-exact but gives no speedup (hot code is hand-written SIMD), so stock is the default.
+  set( ECM_MARCH "" CACHE STRING "-march value for all source files (empty: stock SSE4.1 build)" )
+  if( ECM_MARCH )
+    add_compile_options( "-march=${ECM_MARCH}" )
+  endif()
+  if( MINGW )
+    # Win64 GCC cannot realign the stack for 32-byte AVX spills (GCC bug 54412): emit unaligned vector moves
+    add_compile_options( "-Wa,-muse-unaligned-vector-move" )
+  endif()
+  # never contract a*b+c into FMA: RD costs are doubles and must stay bit-exact with the reference build
+  add_compile_options( "-ffp-contract=off" )
 endif()
 
 if (EXTENSION_NNLF)
@@ -120,6 +132,8 @@ if( CMAKE_CXX_COMPILER_ID STREQUAL "GNU" )
   # EncAdaptiveLoopFilter.cpp indexes m_chromaScaleIdxFinal[4][1] with altIdx up to 7; keep newer GCC
   # from exploiting that UB (and from failing the build with -Werror) so behaviour matches the reference
   add_compile_options( "-fno-aggressive-loop-optimizations" )
+  # newer GCC emits false-positive maybe-uninitialized warnings at higher -march levels; keep them non-fatal
+  add_compile_options( "-Wno-error=maybe-uninitialized" )
 endif()
 
 
