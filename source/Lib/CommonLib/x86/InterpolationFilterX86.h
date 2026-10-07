@@ -3703,6 +3703,10 @@ static void simdFilter( const ClpRng& clpRng, Pel const *src, int srcStride, Pel
         {
           simdInterpolateVerM16_AVX2<vext, 12, isLast>( src, srcStride, dst, dstStride, width, height, shift, offset, clpRng, c );
         }
+        else if( vext >= AVX2 && !( width & 7 ) )
+        {
+          simdInterpolateVerM8_AVX2<vext, 12, isLast>( src, srcStride, dst, dstStride, width, height, shift, offset, clpRng, c );
+        }
         else
         {
           simdInterpolateVerM4_12tap<vext, 12, isLast>(src, srcStride, dst, dstStride, width, height, shift, offset, clpRng, c);
