@@ -24,6 +24,11 @@ Benchmark suite (`perf/bench.py`)
 | 0 | stock ECM-20.0 (GCC 16.2 -O3, static) | - | 986.0 s | - | - |
 | 1 | `-march=x86-64-v3 -ffp-contract=off` (kept as `ECM_MARCH` option, default off) | yes | 982.7 s | +0.3 % (noise) | +0.3 % |
 | 2 | link-time optimization | yes | 932.8 s | +5.3 % | +5.7 % |
+| 3 | profile-guided optimization on top of LTO (`perf/pgo.ps1`, trained on FourPeople crops) | yes | 877.7 s | +6.3 % | +12.3 % |
+
+In progress (not yet measured): built-in segment-parallel encoding (`--ParallelSegments=N`, `--SegmentLength`),
+`source/App/EncoderApp/SegmentParallel.cpp`. The manual chunk+parcat procedure is verified byte-identical; the
+built-in mode still has to pass `runs/segpar` checks (RA 65 frames vs md5 C683AD08..., AI 9 frames vs serial).
 
 ## Notes
 - GCC 16 needed two build fixes (missing `<cstdint>`; `-fno-aggressive-loop-optimizations`, because

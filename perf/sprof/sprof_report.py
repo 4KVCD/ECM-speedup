@@ -99,6 +99,15 @@ def main():
             print(f"{100.0 * n / total:6.2f}%  {name}")
 
     print(f"total samples: {total}")
+    # how concentrated is the profile: number of functions needed to cover x% of self time
+    acc, k, marks = 0, 0, [0.25, 0.5, 0.75, 0.9, 0.95]
+    cov = []
+    for name, n in self_t.most_common():
+        acc += n
+        k += 1
+        while marks and acc >= marks[0] * total:
+            cov.append(f"{int(marks.pop(0) * 100)}%: {k} functions")
+    print("self-time coverage: " + ", ".join(cov) + f" (of {len(self_t)} sampled functions)")
     pr(f"self time (top {args.top})", self_t)
     pr(f"inclusive time (top {args.top})", incl_t)
     if args.callers:

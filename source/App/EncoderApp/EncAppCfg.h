@@ -120,6 +120,8 @@ protected:
   int       m_confWinBottom;
   int       m_firstValidFrame;
   int       m_lastValidFrame;
+  int       m_parallelSegments;                               ///< number of intra-period chunks encoded concurrently (1: off)
+  int       m_segmentLength;                                  ///< frames per chunk, a multiple of the intra period (0: automatic)
   int       m_framesToBeEncoded;                              ///< number of encoded frames
 #if JVET_AA0146_WRAP_AROUND_FIX
   int       m_sourcePadding[2];                               ///< number of padded pixels for width and height
@@ -1313,6 +1315,18 @@ public:
   void  create    ();                                         ///< create option handling class
   void  destroy   ();                                         ///< destroy option handling class
   bool  parseCfg  ( int argc, char* argv[] );                ///< parse configuration file to fill member variables
+
+  // segment-parallel encoding (see SegmentParallel.h)
+  int                getParallelSegments()      const { return m_parallelSegments; }
+  int                getSegmentLength()         const { return m_segmentLength; }
+  int                getIntraPeriod()           const { return m_iIntraPeriod; }
+  int                getDecodingRefreshType()   const { return m_iDecodingRefreshType; }
+  int                getFramesToBeEncoded()     const { return m_framesToBeEncoded; }
+  int                getFrameSkip()             const { return (int) m_FrameSkip; }
+  int                getTemporalSubsampleRatio() const { return (int) m_temporalSubsampleRatio; }
+  int                getFrameRate()             const { return m_iFrameRate; }
+  const std::string& getBitstreamFileName()     const { return m_bitstreamFileName; }
+  const std::string& getReconFileName()         const { return m_reconFileName; }
 
 };// END CLASS DEFINITION EncAppCfg
 

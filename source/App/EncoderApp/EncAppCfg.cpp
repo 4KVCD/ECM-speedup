@@ -2079,6 +2079,8 @@ bool EncAppCfg::parseCfg( int argc, char* argv[] )
     ("TemporalFilterFutureRefs",                      m_gopBasedTemporalFilterFutureRefs,        TF_DEFAULT_REFS, "Number of future references for temporal prefilter")
     ("FirstValidFrame",                               m_firstValidFrame,                                       0, "First valid frame")
     ("LastValidFrame",                                m_lastValidFrame,                                  MAX_INT, "Last valid frame")
+    ("ParallelSegments",                              m_parallelSegments,                                      1, "Encode intra-period chunks in this many concurrent processes and join them (bit-exact with a sequential encode; RA/AI with CRA refresh)")
+    ("SegmentLength",                                 m_segmentLength,                                         0, "Frames per chunk for ParallelSegments, a multiple of IntraPeriod (0: automatic)")
 #if JVET_AJ0249_NEURAL_NETWORK_BASED
     ("IntraNN",                                       m_intraNN,                                            true, "Neural Network Intra Prediction: 1 activated, 0 deactivated")
 #endif

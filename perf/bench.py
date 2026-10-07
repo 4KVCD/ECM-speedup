@@ -38,6 +38,20 @@ def md5(path):
     return h.hexdigest()
 
 
+def process_cpu_seconds(proc):
+    """user+kernel CPU time of a finished (not yet reaped) child process; less load-sensitive than wall time."""
+    if os.name != "nt":
+        return None
+    import ctypes
+    from ctypes import wintypes
+    ft = [wintypes.FILETIME() for _ in range(4)]
+    ok = ctypes.windll.kernel32.GetProcessTimes(wintypes.HANDLE(int(proc._handle)), *[ctypes.byref(f) for f in ft])
+    if not ok:
+        return None
+    val = lambda f: (f.dwHighDateTime << 32 | f.dwLowDateTime) / 1e7
+    return val(ft[2]) + val(ft[3])
+
+
 def run_test(exe, outdir, name):
     cfg, yuv, w, h, fps, frames, qp, extra = TESTS[name]
     bs = os.path.join(outdir, name + ".bin")
@@ -46,9 +60,13 @@ def run_test(exe, outdir, name):
            "--InputBitDepth=8", "-f", str(frames), "-q", str(qp), "-b", bs, "-o", "NUL"] + extra
     t0 = time.perf_counter()
     with open(log, "w") as lf:
-        rc = subprocess.run(cmd, stdout=lf, stderr=subprocess.STDOUT).returncode
+        proc = subprocess.Popen(cmd, stdout=lf, stderr=subprocess.STDOUT)
+        proc.wait()
+        cpu = process_cpu_seconds(proc)
+        rc = proc.returncode
     dt = time.perf_counter() - t0
-    return name, {"time": round(dt, 2), "rc": rc, "md5": md5(bs) if rc == 0 and os.path.exists(bs) else None}
+    return name, {"time": round(dt, 2), "cpu": round(cpu, 2) if cpu else None, "rc": rc,
+                  "md5": md5(bs) if rc == 0 and os.path.exists(bs) else None}
 
 
 def cmd_run(args):

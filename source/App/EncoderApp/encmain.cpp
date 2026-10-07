@@ -42,6 +42,7 @@
 
 #include "EncoderLib/EncLibCommon.h"
 #include "EncApp.h"
+#include "SegmentParallel.h"
 #include "Utilities/program_options_lite.h"
 
 //! \ingroup EncoderApp
@@ -190,6 +191,32 @@ int main(int argc, char* argv[])
     {
       std::cerr << "Error parsing option \"" << e.arg << "\" with argument \"" << e.val << "\"." << std::endl;
       return 1;
+    }
+
+    if( layerIdx == 0 && pcEncApp[0]->getParallelSegments() > 1 )
+    {
+      // encode intra-period chunks in concurrent child processes and join them (bit-exact)
+      SegmentParallelCfg spc;
+      spc.numWorkers        = pcEncApp[0]->getParallelSegments();
+      spc.segmentLength     = pcEncApp[0]->getSegmentLength();
+      spc.intraPeriod       = pcEncApp[0]->getIntraPeriod();
+      spc.framesToBeEncoded = pcEncApp[0]->getFramesToBeEncoded();
+      spc.frameSkip         = pcEncApp[0]->getFrameSkip();
+      spc.frameRate         = pcEncApp[0]->getFrameRate();
+      spc.bitstreamFile     = pcEncApp[0]->getBitstreamFileName();
+      spc.reconFile         = pcEncApp[0]->getReconFileName();
+      std::string reason;
+      if( segmentParallelSupported( spc, pcEncApp[0]->getDecodingRefreshType(), pcEncApp[0]->getTemporalSubsampleRatio(),
+                                    pcEncApp[0]->getMaxLayers(), reason ) )
+      {
+        const int ret = runSegmentParallel( argc, argv, spc );
+        pcEncApp[0]->destroy();
+        delete pcEncApp[0];
+        delete[] layerArgv;
+        destroyROM();
+        return ret;
+      }
+      printf( "\nParallelSegments ignored: %s\n", reason.c_str() );
     }
 
     pcEncApp[layerIdx]->createLib( layerIdx );
