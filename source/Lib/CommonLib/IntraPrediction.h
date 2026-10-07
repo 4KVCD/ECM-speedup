@@ -482,7 +482,7 @@ protected:
 #if ANG_REF_PERSISTENT
   // perf: reference sample buffers of xPredIntraAng() (above, left, above 2nd line, left 2nd line). They are all zero
   // between calls: each call clears the part it wrote, instead of zeroing the whole stack arrays on every call.
-  static const int ANG_REF_BUF_SIZE = ( MAX_CU_SIZE << 3 ) + 64 + 33 * ( MAX_REF_LINE_IDX + 1 );
+  static constexpr int ANG_REF_BUF_SIZE = ( MAX_CU_SIZE << 3 ) + 64 + 33 * ( MAX_REF_LINE_IDX + 1 );   // constexpr: inline, std::min binds it to a reference
   Pel        m_angRefBuf[4][ANG_REF_BUF_SIZE] = {};
 #endif
 #if JVET_AC0094_REF_SAMPLES_OPT
