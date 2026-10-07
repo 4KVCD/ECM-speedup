@@ -770,6 +770,9 @@ void CtxStore<BinProbModel>::initVersions()
 {
   // stamps are unique across stores: store number in the upper bits, per-store counter in the lower 40 bits
   m_verCounter = ( ++s_numCtxStores ) << 40;
+  m_epoch      = m_verCounter;
+  m_syncSrc    = nullptr;
+  m_syncEpoch  = 0;
   std::fill_n( m_ver, CTX_MAX_BLOCKS, uint64_t( 0 ) );
   std::fill_n( m_dirty, CTX_MAX_BLOCKS, uint8_t( 0 ) );
   markAllDirty();

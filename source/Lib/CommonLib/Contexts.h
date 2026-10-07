@@ -944,10 +944,18 @@ public:
     checkInit();
     src.syncVersions();
     uint64_t diff = takeDirtyMask();
-    for( int b = 0; b < CTX_MAX_BLOCKS; b++ )
+    // Restores in a loop (the same snapshot copied back after each test) need no stamp comparison: if this store was
+    // last synced with src and src's stamps have not changed since (same epoch), only this store's dirty blocks differ.
+    if( m_syncSrc != &src || m_syncEpoch != src.m_epoch )
     {
-      diff |= uint64_t( m_ver[b] != src.m_ver[b] ) << b;
+      for( int b = 0; b < CTX_MAX_BLOCKS; b++ )
+      {
+        diff |= uint64_t( m_ver[b] != src.m_ver[b] ) << b;
+      }
     }
+    m_syncSrc   = &src;
+    m_syncEpoch = src.m_epoch;
+    m_epoch     = ++m_verCounter;   // this store's stamps may change below
     const size_t numCtx = m_ctxBuffer.size();
     while( diff )
     {
@@ -1074,10 +1082,17 @@ private:
   // gives the dirty blocks fresh version stamps
   void syncVersions() const
   {
-    for( uint64_t d = takeDirtyMask(); d; d &= d - 1 )
+    const uint64_t dirty = takeDirtyMask();
+    if( !dirty )
+    {
+      return;
+    }
+    for( uint64_t d = dirty; d; d &= d - 1 )
     {
       m_ver[ctxBlockCtz( d )] = ++m_verCounter;
     }
+    m_epoch   = m_verCounter;
+    m_syncSrc = nullptr;   // blocks changed since the last sync are no longer marked dirty
   }
 private:
   std::vector<BinProbModel> m_ctxBuffer;
@@ -1085,6 +1100,11 @@ private:
   mutable uint64_t          m_verCounter;
   mutable uint64_t          m_ver[CTX_MAX_BLOCKS];
   mutable uint8_t           m_dirty[CTX_MAX_BLOCKS];
+  // m_epoch changes (to a unique value) whenever the stamps of this store change; m_syncSrc / m_syncEpoch: the store
+  // this one was last copied from and its epoch at that time
+  mutable uint64_t          m_epoch;
+  mutable const CtxStore*   m_syncSrc;
+  mutable uint64_t          m_syncEpoch;
 };
 
 
