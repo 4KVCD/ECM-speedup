@@ -454,6 +454,7 @@ void InterSearch::init( EncCfg*        pcEncCfg,
 )
 {
   CHECK(m_isInitialized, "Already initialized");
+  setUseMcCache( true );
   m_numBVs = 0;
   for (int i = 0; i < IBC_NUM_CANDIDATES; i++)
   {
