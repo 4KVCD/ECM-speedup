@@ -1417,6 +1417,9 @@ const CtxSet &ctxSetGt4 = isLfnst ? Ctx::GtxFlagL[6 + chType] : Ctx::GtxFlag[6 +
 #else
 #define DQ_UNROLL_STATES
 #endif
+// per-TU trellis loop as a template on the number of states, with the per-coefficient decision and update inlined
+#define DQ_TRELLIS_LOOP_TEMPLATE                                                                                       \
+  (TCQ_8STATES && TU_256 && !EXTENDED_LFNST && JVET_R0351_HIGH_BIT_DEPTH_SUPPORT_VS && JVET_AE0102_LFNST_CTX)
 
 #if JVET_AG0100_TRANSFORM_COEFFICIENT_CODING
   static const int TPL_LEVEL_CLIP = GTN_LEVEL;   // a template neighbour adds min(TPL_LEVEL_CLIP + (t & 1), t) to sumAbs1
@@ -2059,6 +2062,13 @@ const CtxSet &ctxSetGt4 = isLfnst ? Ctx::GtxFlagL[6 + chType] : Ctx::GtxFlag[6 +
                  bool enableScalingLists, int *quantCoeff);
 
   private:
+#if DQ_TRELLIS_LOOP_TEMPLATE
+    template<int numStates>
+    void xQuantTrellis(const TUParameters &tuPars, const TCoeff *tCoeff, const int firstTestPos, const int lfnstIdx,
+                       const TCoeff defaultQuantisationCoefficient, const bool enableScalingLists,
+                       const int *quantCoeff, const TransformUnit &tu, const ComponentID compID, const QpParam &cQP,
+                       const double lambda);
+#endif
 #if TU_256 && !EXTENDED_LFNST
 #if TCQ_8STATES
     template<int numStates>
@@ -2181,7 +2191,7 @@ const CtxSet &ctxSetGt4 = isLfnst ? Ctx::GtxFlagL[6 + chType] : Ctx::GtxFlag[6 +
 #undef DINIT
 
 #if TCQ_8STATES
-  template<int numStates>
+  template<int numStates> ALWAYS_INLINE
 #endif
 #if TU_256 && !EXTENDED_LFNST
 #if JVET_R0351_HIGH_BIT_DEPTH_SUPPORT_VS
@@ -2319,7 +2329,7 @@ const CtxSet &ctxSetGt4 = isLfnst ? Ctx::GtxFlagL[6 + chType] : Ctx::GtxFlag[6 +
   }
 
 #if TCQ_8STATES
-  template<int numStates>
+  template<int numStates> ALWAYS_INLINE
 #endif
 #if TU_256 && !EXTENDED_LFNST
 #if JVET_R0351_HIGH_BIT_DEPTH_SUPPORT_VS
@@ -2427,6 +2437,31 @@ const CtxSet &ctxSetGt4 = isLfnst ? Ctx::GtxFlagL[6 + chType] : Ctx::GtxFlag[6 +
       }
     }
   }
+
+#if DQ_TRELLIS_LOOP_TEMPLATE
+  template<int numStates>
+  void DepQuant::xQuantTrellis(const TUParameters &tuPars, const TCoeff *tCoeff, const int firstTestPos,
+                               const int lfnstIdx, const TCoeff defaultQuantisationCoefficient,
+                               const bool enableScalingLists, const int *quantCoeff, const TransformUnit &tu,
+                               const ComponentID compID, const QpParam &cQP, const double lambda)
+  {
+    for (int scanIdx = firstTestPos; scanIdx >= 0; scanIdx--)
+    {
+      const ScanInfo &scanInfo = tuPars.m_scanInfo[scanIdx];
+      if (enableScalingLists)
+      {
+        m_quant.initQuantBlock(tu, compID, cQP, lambda, quantCoeff[scanInfo.rasterPos]);
+        xDecideAndUpdate<numStates>(abs(tCoeff[scanInfo.rasterPos]), scanInfo, quantCoeff[scanInfo.rasterPos],
+                                    lfnstIdx);
+      }
+      else
+      {
+        xDecideAndUpdate<numStates>(abs(tCoeff[scanInfo.rasterPos]), scanInfo, defaultQuantisationCoefficient,
+                                    lfnstIdx);
+      }
+    }
+  }
+#endif
 
   void DepQuant::quant(TransformUnit &tu, const CCoeffBuf &srcCoeff, const ComponentID compID, const QpParam &cQP,
                        const double lambda, const Ctx &ctx, TCoeff &absSum, bool enableScalingLists, int *quantCoeff)
@@ -2648,6 +2683,18 @@ const CtxSet &ctxSetGt4 = isLfnst ? Ctx::GtxFlagL[6 + chType] : Ctx::GtxFlag[6 +
     m_startState.effHeight = effectHeight;
 #endif
     //===== populate trellis ===== //
+#if DQ_TRELLIS_LOOP_TEMPLATE
+    if (numStates > 4)
+    {
+      xQuantTrellis<8>(tuPars, tCoeff, firstTestPos, tu.cu->lfnstIdx, defaultQuantisationCoefficient,
+                       enableScalingLists, quantCoeff, tu, compID, cQP, lambda);
+    }
+    else
+    {
+      xQuantTrellis<4>(tuPars, tCoeff, firstTestPos, tu.cu->lfnstIdx, defaultQuantisationCoefficient,
+                       enableScalingLists, quantCoeff, tu, compID, cQP, lambda);
+    }
+#else
 #if TCQ_8STATES
 #if TU_256 && !EXTENDED_LFNST
 #if JVET_AE0102_LFNST_CTX
@@ -2717,6 +2764,7 @@ const CtxSet &ctxSetGt4 = isLfnst ? Ctx::GtxFlagL[6 + chType] : Ctx::GtxFlag[6 +
 #endif
 #endif
     }
+#endif
 
     //===== find best path =====
     Decision decision    = { std::numeric_limits<int64_t>::max(), -1, -2 };
