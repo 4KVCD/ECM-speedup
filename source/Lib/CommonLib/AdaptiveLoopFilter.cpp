@@ -190,6 +190,7 @@ AdaptiveLoopFilter::AdaptiveLoopFilter()
 #endif
 #if ENABLE_SIMD_OPT_ALF_CHOLESKY
   m_fastCholeskyDec = fastCholeskyDec;
+  m_choleskySolveLanes = choleskySolveLanes;
 #endif
 
 #if JVET_AK0065_TALF
@@ -10514,6 +10515,78 @@ int AdaptiveLoopFilter::fastCholeskyDec(cholesky_matrix inpMatr, cholesky_matrix
   return 1; // Signal that Cholesky factorization is successfully performed
 }
 
+void(*AdaptiveLoopFilter::m_choleskySolveLanes)(cholesky_float_t* mat, const cholesky_float_t* rhs, cholesky_float_t* x, int numEq, int numBatches, int* okMask);
+
+void AdaptiveLoopFilter::choleskySolveLanes(cholesky_float_t* mat, const cholesky_float_t* rhs, cholesky_float_t* x, int numEq, int numBatches, int* okMask)
+{
+  const int L       = cholesky_lanes;
+  const int matSize = cholesky_tri_size( numEq ) * L;
+  for( int b = 0; b < numBatches; b++, mat += matSize, rhs += numEq * L, x += numEq * L )
+  {
+    okMask[b] = 0;
+    for( int t = 0; t < L; t++ )
+    {
+      auto U = [&]( int i, int j ) -> cholesky_float_t& { return mat[cholesky_tri_idx( i, j, numEq ) * L + t]; };
+
+      // factorization, as in fastCholeskyDec
+      bool ok = true;
+      for( int i = 0; i < numEq && ok; i++ )
+      {
+        cholesky_float_t scale = U( i, i );
+        for( int k = 0; k < i; k++ )
+        {
+          scale -= U( k, i ) * U( k, i );
+        }
+        if( scale <= AdaptiveLoopFilter::cholesky_reg_sqr )
+        {
+          ok = false;
+          break;
+        }
+        U( i, i ) = sqrt( scale );
+        cholesky_float_t tmp = (cholesky_float_t)1 / U( i, i );
+        for( int j = i + 1; j < numEq; j++ )
+        {
+          scale = U( i, j );
+          for( int k = 0; k < i; k++ )
+          {
+            scale -= U( k, j ) * U( k, i );
+          }
+          U( i, j ) = scale * tmp;
+        }
+      }
+      if( !ok )
+      {
+        continue;
+      }
+      okMask[b] |= 1 << t;
+
+      // forward substitution (U' aux = rhs), as in AlfCovariance::gnsTransposeBacksubstitution
+      cholesky_float_t aux[MAX_NUM_ALF_LUMA_COEFF];
+      aux[0] = rhs[t] / U( 0, 0 );
+      for( int i = 1; i < numEq; i++ )
+      {
+        cholesky_float_t sum = 0;
+        for( int j = 0; j < i; j++ )
+        {
+          sum += aux[j] * U( j, i );
+        }
+        aux[i] = ( rhs[i * L + t] - sum ) / U( i, i );
+      }
+
+      // backward substitution (U x = aux), as in AlfCovariance::gnsBacksubstitution
+      x[( numEq - 1 ) * L + t] = aux[numEq - 1] / U( numEq - 1, numEq - 1 );
+      for( int i = numEq - 2; i >= 0; i-- )
+      {
+        cholesky_float_t sum = 0;
+        for( int j = i + 1; j < numEq; j++ )
+        {
+          sum += U( i, j ) * x[j * L + t];
+        }
+        x[i * L + t] = ( aux[i] - sum ) / U( i, i );
+      }
+    }
+  }
+}
 #endif
 
 #if JVET_AK0123_ALF_COEFF_RESTRICTION

@@ -1217,6 +1217,19 @@ protected:
   static constexpr cholesky_float_t cholesky_reg_sqr = cholesky_float_t(0.0000001);
   static int(*m_fastCholeskyDec)(cholesky_matrix inpMatr, cholesky_matrix outMatr, int numEq);
   static int fastCholeskyDec(cholesky_matrix inpMatr, cholesky_matrix outMatr, int numEq);
+
+  // perf: solves cholesky_lanes independent systems at once (one system per lane) with exactly the arithmetic of the
+  // encoder's AlfCovariance::gnsSolveByChol when its factorization succeeds: factorization as in fastCholeskyDec, then
+  // forward and backward substitution. numBatches groups of cholesky_lanes systems are processed together.
+  // mat:  per batch the upper triangles, packed row by row: element (i, j), i <= j, at index
+  //       cholesky_tri_idx(i, j, numEq) * cholesky_lanes + lane; overwritten by the factor U
+  // rhs, x: per batch element i of lane t at index i * cholesky_lanes + t
+  // okMask: per batch the bit mask of the lanes whose factorization succeeded; x of the other lanes is undefined
+  static constexpr int cholesky_lanes = 8;
+  static int  cholesky_tri_idx( int i, int j, int numEq ) { return i * numEq - ( ( i * ( i - 1 ) ) >> 1 ) + j - i; }
+  static int  cholesky_tri_size( int numEq ) { return ( numEq * ( numEq + 1 ) ) >> 1; }
+  static void(*m_choleskySolveLanes)(cholesky_float_t* mat, const cholesky_float_t* rhs, cholesky_float_t* x, int numEq, int numBatches, int* okMask);
+  static void choleskySolveLanes(cholesky_float_t* mat, const cholesky_float_t* rhs, cholesky_float_t* x, int numEq, int numBatches, int* okMask);
 #endif
 };
 

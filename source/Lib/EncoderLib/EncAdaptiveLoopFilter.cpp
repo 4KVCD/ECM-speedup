@@ -210,6 +210,13 @@ double AlfCovariance::optimizeFilter(const AlfFilterShape& alfShape, int* clip, 
 
   setEyFromClip( clip, kE, ky, size );
 
+#if ALF_BATCHED_SOLVES
+  float diagBefore[MAX_NUM_ALF_LUMA_COEFF];
+  for( int k = 0; k < size; k++ )
+  {
+    diagBefore[k] = kE[k][k];
+  }
+#endif
   gnsSolveByChol( kE, ky, f, size 
 #if JVET_AN0086_RESIDUAL_CHECK
   , encAlfResidualCheck
@@ -219,6 +226,20 @@ double AlfCovariance::optimizeFilter(const AlfFilterShape& alfShape, int* clip, 
   memcpy( fBest, f, copySize );
   int step = optimize_clip ? (numBins+1)/2 : 0;
 
+#if ALF_BATCHED_SOLVES
+  if( step > 0 && !encAlfResidualCheck )
+  {
+    // a regularized (singular) solve adds REG to the diagonal of kE
+    bool mayDrift = false;
+    for( int k = 0; k < size; k++ )
+    {
+      mayDrift |= std::memcmp( &diagBefore[k], &kE[k][k], sizeof( float ) ) != 0;
+    }
+    optimizeClipBatched( clip, clip_max, kE, ky, fBest, err_best, step, enableLessClip, mayDrift, size );
+  }
+  else
+#endif
+  {
 #if JVET_AD0222_ALF_RESI_CLASS
   int iter = 0;
   while( enableLessClip ? step > 0 && iter < 32 : step > 0 )
@@ -327,6 +348,7 @@ double AlfCovariance::optimizeFilter(const AlfFilterShape& alfShape, int* clip, 
       --step;
     }
   }
+  }
 
   if (optimize_clip)
   {
@@ -363,6 +385,247 @@ double AlfCovariance::optimizeFilter(const AlfFilterShape& alfShape, int* clip, 
 
   return err_best;
 }
+
+#if ALF_BATCHED_SOLVES
+// perf: the clipping search of optimizeFilter (the passes of its while loop), with the systems of all trials of a pass
+// solved together in the lanes of AdaptiveLoopFilter::m_choleskySolveLanes. Every trial solves the system that the
+// sequential loop would solve at that point, with the same arithmetic, and the results are evaluated in the original
+// order, so the outcome is identical:
+// - the sequential loop modifies row/column k of kE for its trials at k and restores it afterwards ("refresh"), so the
+//   matrix of a trial is kE with row/column k of the trial;
+// - only a regularized solve (singular matrix) modifies kE beyond that: it adds REG to the whole diagonal. Such a trial
+//   is detected by the lanes kernel (failed factorization) and repeated with the sequential code at its position; the
+//   later trials are then solved again with the modified kE. Once the diagonal may contain REG ("drift"), the refresh
+//   of row k at the end of iteration k matters for the later trials of the pass: their diagonal elements of rows
+//   [refreshedUpTo, k) are taken fresh from the statistics.
+void AlfCovariance::optimizeClipBatched( int* clip, const int* clipMax, TE kE, Ty ky, Ty fBest, double& errBest, int step, bool enableLessClip, bool mayDrift, int size ) const
+{
+  constexpr int L          = AdaptiveLoopFilter::cholesky_lanes;
+  constexpr int maxBatches = 4;
+  const int     triSize    = AdaptiveLoopFilter::cholesky_tri_size( size );
+  const int     matSize    = triSize * L;
+  const int     copySize   = sizeof( float ) * size;
+
+  static thread_local std::vector<float> baseBuf, matBuf, rhsBuf, xBuf;
+  baseBuf.resize( matSize );
+  matBuf.resize( maxBatches * matSize );
+  rhsBuf.resize( maxBatches * size * L );
+  xBuf.resize( maxBatches * size * L );
+  float* base = baseBuf.data();
+  float* mat  = matBuf.data();
+  float* rhs  = rhsBuf.data();
+  float* x    = xBuf.data();
+
+  int  triRow[MAX_NUM_ALF_LUMA_COEFF];   // element index of (i, i)
+  for( int i = 0; i < size; i++ )
+  {
+    triRow[i] = AdaptiveLoopFilter::cholesky_tri_idx( i, i, size );
+  }
+  // kE in all lanes
+  auto buildBase = [&]() {
+    for( int i = 0; i < size; i++ )
+    {
+      float* dst = base + triRow[i] * L;
+      for( int j = i; j < size; j++, dst += L )
+      {
+        const float v = kE[i][j];
+        for( int t = 0; t < L; t++ )
+        {
+          dst[t] = v;
+        }
+      }
+    }
+  };
+  // rows / columns that the sequential loop restores at the end of iteration k
+  auto refresh = [&]( int k ) {
+    ky[k] = y( clip[k], k );
+    for( int l = 0; l < k; l++ )
+    {
+      kE[l][k] = E( clip[l], clip[k], l, k );
+    }
+    for( int l = k; l < size; l++ )
+    {
+      kE[k][l] = E( clip[k], clip[l], k, l );
+    }
+  };
+
+  int trialK[2 * MAX_NUM_ALF_LUMA_COEFF];
+  int trialInc[2 * MAX_NUM_ALF_LUMA_COEFF];
+  int okMask[maxBatches];
+  Ty  f;
+
+  int iter = 0;
+  while( enableLessClip ? step > 0 && iter < 32 : step > 0 )
+  {
+    iter++;
+    double errMin = errBest;
+    int    idxMin = -1;
+    int    incMin = 0;
+
+    int numTrials = 0;
+    for( int k = 0; k < size - 1; ++k )
+    {
+      if( clip[k] - step >= clipMax[k] )
+      {
+        trialK[numTrials]     = k;
+        trialInc[numTrials++] = -step;
+      }
+      if( clip[k] + step < numBins )
+      {
+        trialK[numTrials]     = k;
+        trialInc[numTrials++] = step;
+      }
+    }
+
+    int  refreshedUpTo = 0;   // with drift: rows / columns [0, refreshedUpTo) have been refreshed in kE in this pass
+    bool baseValid     = false;
+    int  t0            = 0;
+    while( t0 < numTrials )
+    {
+      if( !baseValid )
+      {
+        buildBase();
+        baseValid = true;
+      }
+      const int cnt = std::min( numTrials - t0, maxBatches * L );
+      const int nb  = ( cnt + L - 1 ) / L;
+      for( int b = 0; b < nb; b++ )
+      {
+        float* m = mat + b * matSize;
+        float* r = rhs + b * size * L;
+        std::memcpy( m, base, sizeof( float ) * matSize );
+        for( int i = 0; i < size; i++ )
+        {
+          for( int t = 0; t < L; t++ )
+          {
+            r[i * L + t] = ky[i];
+          }
+        }
+        for( int t = 0; t < L && b * L + t < cnt; t++ )
+        {
+          const int k = trialK[t0 + b * L + t];
+          const int c = clip[k] + trialInc[t0 + b * L + t];
+          r[k * L + t] = y( c, k );
+          for( int l = 0; l < k; l++ )
+          {
+            m[( triRow[l] + k - l ) * L + t] = E( clip[l], c, l, k );
+          }
+          m[triRow[k] * L + t] = E( c, c, k, k );
+          for( int l = k + 1; l < size; l++ )
+          {
+            m[( triRow[k] + l - k ) * L + t] = E( c, clip[l], k, l );
+          }
+          if( mayDrift )
+          {
+            // rows refreshed by the sequential loop before this trial
+            for( int l = refreshedUpTo; l < k; l++ )
+            {
+              m[triRow[l] * L + t] = E( clip[l], clip[l], l, l );
+            }
+          }
+        }
+      }
+
+      AdaptiveLoopFilter::m_choleskySolveLanes( mat, rhs, x, size, nb, okMask );
+
+      // evaluate in the order of the sequential loop, up to the first trial that needs regularization
+      int u = 0;
+      for( ; u < cnt; u++ )
+      {
+        const int b = u / L, t = u % L;
+        if( !( ( okMask[b] >> t ) & 1 ) )
+        {
+          break;
+        }
+        const int    k  = trialK[t0 + u];
+        const int    c  = clip[k] + trialInc[t0 + u];
+        const float* xb = x + b * size * L + t;
+        double       sum = 0;   // calculateError with clip[k] = c
+        for( int i = 0; i < size; i++ )
+        {
+          f[i] = xb[i * L];
+          sum += f[i] * ( i == k ? y( c, k ) : y( clip[i], i ) );
+        }
+        const double errLast = pixAcc - sum;
+        if( errLast < errMin )
+        {
+          errMin = errLast;
+          idxMin = k;
+          incMin = trialInc[t0 + u];
+          memcpy( fBest, f, copySize );
+        }
+      }
+      t0 += u;
+
+      if( u < cnt )
+      {
+        // trial t0 needs the regularized solve: replicate the sequential loop
+        const int k   = trialK[t0];
+        const int inc = trialInc[t0];
+        if( mayDrift )
+        {
+          for( int l = refreshedUpTo; l < k; l++ )
+          {
+            refresh( l );
+          }
+        }
+        clip[k] += inc;
+        ky[k] = y( clip[k], k );
+        for( int l = 0; l < k; l++ )
+        {
+          kE[l][k] = E( clip[l], clip[k], l, k );
+        }
+        for( int l = k; l < size; l++ )
+        {
+          kE[k][l] = E( clip[k], clip[l], k, l );
+        }
+        gnsSolveByChol( kE, ky, f, size, false );
+        const double errLast = calculateError( clip, f, size );
+        if( errLast < errMin )
+        {
+          errMin = errLast;
+          idxMin = k;
+          incMin = inc;
+          memcpy( fBest, f, copySize );
+        }
+        clip[k] -= inc;
+        // the sequential loop overwrites row / column k for the other trial at k or restores it at the end of iteration k
+        refresh( k );
+        mayDrift      = true;
+        refreshedUpTo = k + 1;
+        baseValid     = false;
+        t0++;
+      }
+    }
+    if( mayDrift )
+    {
+      for( int l = refreshedUpTo; l < size - 1; l++ )
+      {
+        refresh( l );
+      }
+    }
+
+    if( idxMin >= 0 )
+    {
+      errBest = errMin;
+      clip[idxMin] += incMin;
+      ky[idxMin] = y( clip[idxMin], idxMin );
+      for( int l = 0; l < idxMin; l++ )
+      {
+        kE[l][idxMin] = E( clip[l], clip[idxMin], l, idxMin );
+      }
+      for( int l = idxMin; l < size; l++ )
+      {
+        kE[idxMin][l] = E( clip[idxMin], clip[l], idxMin, l );
+      }
+    }
+    else
+    {
+      --step;
+    }
+  }
+}
+#endif
 
 #if ALF_PRECISION_VARIETY
 void AlfCovariance::calcInitErrorForCoeffs(double *cAc, double *cA, double *bc,  const int *clip, const int *coeff, const int numCoeff, const int bitDepth, const int scaleIdx) const

@@ -14665,6 +14665,180 @@ static int simdFastCholeskyDec(AdaptiveLoopFilter::cholesky_matrix inpMatr, Adap
 }
 #endif
 
+#if ENABLE_SIMD_OPT_ALF_CHOLESKY && USE_AVX2 && JVET_AF0177_ALF_COV_FLOAT
+// perf: backward substitution of NB batches at once (independent dependency chains overlap); per lane exactly
+// x[i] = (aux[i] - (0 + U[i][i+1] * x[i+1] + ... + U[i][n-1] * x[n-1])) / U[i][i], computed in place (x holds aux)
+template<int NB>
+static inline void simdCholeskyBackSubstLanes( const float* mat, float* x, const int n, const int matSize, const int* rowOff )
+{
+  for( int b = 0; b < NB; b++ )
+  {
+    float* xb = x + b * n * 8;
+    _mm256_storeu_ps( xb + ( n - 1 ) * 8, _mm256_div_ps( _mm256_loadu_ps( xb + ( n - 1 ) * 8 ), _mm256_loadu_ps( mat + b * matSize + rowOff[n - 1] ) ) );
+  }
+  for( int i = n - 2; i >= 0; i-- )
+  {
+    __m256 s[NB];
+    for( int b = 0; b < NB; b++ )
+    {
+      s[b] = _mm256_setzero_ps();
+    }
+    for( int j = i + 1; j < n; j++ )
+    {
+      for( int b = 0; b < NB; b++ )
+      {
+        const __m256 u = _mm256_loadu_ps( mat + b * matSize + rowOff[i] + ( j - i ) * 8 );
+        s[b]           = _mm256_add_ps( s[b], _mm256_mul_ps( u, _mm256_loadu_ps( x + b * n * 8 + j * 8 ) ) );
+      }
+    }
+    for( int b = 0; b < NB; b++ )
+    {
+      float* xi = x + b * n * 8 + i * 8;
+      _mm256_storeu_ps( xi, _mm256_div_ps( _mm256_sub_ps( _mm256_loadu_ps( xi ), s[b] ), _mm256_loadu_ps( mat + b * matSize + rowOff[i] ) ) );
+    }
+  }
+}
+
+// perf: see AdaptiveLoopFilter::choleskySolveLanes; one AVX2 register holds element (i, j) of all 8 systems, every lane
+// performs the operations of the scalar code in the same order (no contraction, no reassociation)
+template<X86_VEXT vext>
+static void simdCholeskySolveLanes( float* mat, const float* rhs, float* x, int n, int numBatches, int* okMask )
+{
+  static_assert( AdaptiveLoopFilter::cholesky_lanes == 8, "one AVX2 register per matrix element" );
+  CHECK( n < 1 || n > MAX_NUM_ALF_LUMA_COEFF, "Wrong number of equations" );
+  const int matSize = AdaptiveLoopFilter::cholesky_tri_size( n ) * 8;
+  int       rowOff[MAX_NUM_ALF_LUMA_COEFF];   // offset of element (i, i); element (i, j) is at rowOff[i] + (j - i) * 8
+  for( int i = 0; i < n; i++ )
+  {
+    rowOff[i] = AdaptiveLoopFilter::cholesky_tri_idx( i, i, n ) * 8;
+  }
+  const __m256 vRegSqr = _mm256_set1_ps( AdaptiveLoopFilter::cholesky_reg_sqr );
+  const __m256 vOne    = _mm256_set1_ps( 1.0f );
+
+  for( int b = 0; b < numBatches; b++ )
+  {
+    float*       M = mat + b * matSize;
+    const float* R = rhs + b * n * 8;
+    float*       X = x + b * n * 8;
+    __m256       fsum[MAX_NUM_ALF_LUMA_COEFF];   // partial sums of the forward substitution
+    for( int i = 0; i < n; i++ )
+    {
+      fsum[i] = _mm256_setzero_ps();
+    }
+    __m256 fail = _mm256_setzero_ps();
+    __m256 diag = _mm256_loadu_ps( M );   // diagonal of the current row, all subtractions done
+
+    for( int i = 0; i < n; i++ )
+    {
+      float* Ri = M + rowOff[i];
+      fail = _mm256_or_ps( fail, _mm256_cmp_ps( diag, vRegSqr, _CMP_LE_OQ ) );
+      const __m256 d = _mm256_sqrt_ps( diag );
+      _mm256_storeu_ps( Ri, d );
+      const __m256 tmp = _mm256_div_ps( vOne, d );
+      // forward substitution: aux[i] = (rhs[i] - sum) / U[i][i]
+      const __m256 auxI = i == 0 ? _mm256_div_ps( _mm256_loadu_ps( R ), d ) : _mm256_div_ps( _mm256_sub_ps( _mm256_loadu_ps( R + i * 8 ), fsum[i] ), d );
+      _mm256_storeu_ps( X + i * 8, auxI );
+
+      // diagonal of row i + 1: A[i+1][i+1] - U[0][i+1]^2 - ... - U[i][i+1]^2, accumulated along with column i + 1
+      __m256 dn = i + 1 < n ? _mm256_loadu_ps( M + rowOff[i + 1] ) : _mm256_setzero_ps();
+
+      int j = i + 1;
+      for( ; j + 4 <= n; j += 4 )
+      {
+        float* Rij = Ri + ( j - i ) * 8;
+        __m256 s0  = _mm256_loadu_ps( Rij );
+        __m256 s1  = _mm256_loadu_ps( Rij + 8 );
+        __m256 s2  = _mm256_loadu_ps( Rij + 16 );
+        __m256 s3  = _mm256_loadu_ps( Rij + 24 );
+        if( j == i + 1 )
+        {
+          for( int p = 0; p < i; p++ )
+          {
+            const float* Rp  = M + rowOff[p];
+            const __m256 up  = _mm256_loadu_ps( Rp + ( i - p ) * 8 );
+            const float* Rpj = Rp + ( j - p ) * 8;
+            const __m256 u0  = _mm256_loadu_ps( Rpj );
+            s0 = _mm256_sub_ps( s0, _mm256_mul_ps( u0, up ) );
+            s1 = _mm256_sub_ps( s1, _mm256_mul_ps( _mm256_loadu_ps( Rpj + 8 ), up ) );
+            s2 = _mm256_sub_ps( s2, _mm256_mul_ps( _mm256_loadu_ps( Rpj + 16 ), up ) );
+            s3 = _mm256_sub_ps( s3, _mm256_mul_ps( _mm256_loadu_ps( Rpj + 24 ), up ) );
+            dn = _mm256_sub_ps( dn, _mm256_mul_ps( u0, u0 ) );
+          }
+        }
+        else
+        {
+          for( int p = 0; p < i; p++ )
+          {
+            const float* Rp  = M + rowOff[p];
+            const __m256 up  = _mm256_loadu_ps( Rp + ( i - p ) * 8 );
+            const float* Rpj = Rp + ( j - p ) * 8;
+            s0 = _mm256_sub_ps( s0, _mm256_mul_ps( _mm256_loadu_ps( Rpj ), up ) );
+            s1 = _mm256_sub_ps( s1, _mm256_mul_ps( _mm256_loadu_ps( Rpj + 8 ), up ) );
+            s2 = _mm256_sub_ps( s2, _mm256_mul_ps( _mm256_loadu_ps( Rpj + 16 ), up ) );
+            s3 = _mm256_sub_ps( s3, _mm256_mul_ps( _mm256_loadu_ps( Rpj + 24 ), up ) );
+          }
+        }
+        s0 = _mm256_mul_ps( s0, tmp );
+        s1 = _mm256_mul_ps( s1, tmp );
+        s2 = _mm256_mul_ps( s2, tmp );
+        s3 = _mm256_mul_ps( s3, tmp );
+        _mm256_storeu_ps( Rij, s0 );
+        _mm256_storeu_ps( Rij + 8, s1 );
+        _mm256_storeu_ps( Rij + 16, s2 );
+        _mm256_storeu_ps( Rij + 24, s3 );
+        fsum[j]     = _mm256_add_ps( fsum[j], _mm256_mul_ps( auxI, s0 ) );
+        fsum[j + 1] = _mm256_add_ps( fsum[j + 1], _mm256_mul_ps( auxI, s1 ) );
+        fsum[j + 2] = _mm256_add_ps( fsum[j + 2], _mm256_mul_ps( auxI, s2 ) );
+        fsum[j + 3] = _mm256_add_ps( fsum[j + 3], _mm256_mul_ps( auxI, s3 ) );
+        if( j == i + 1 )
+        {
+          dn = _mm256_sub_ps( dn, _mm256_mul_ps( s0, s0 ) );
+        }
+      }
+      for( ; j < n; j++ )
+      {
+        float* Rij = Ri + ( j - i ) * 8;
+        __m256 s0  = _mm256_loadu_ps( Rij );
+        for( int p = 0; p < i; p++ )
+        {
+          const float* Rp = M + rowOff[p];
+          const __m256 up = _mm256_loadu_ps( Rp + ( i - p ) * 8 );
+          const __m256 u0 = _mm256_loadu_ps( Rp + ( j - p ) * 8 );
+          s0 = _mm256_sub_ps( s0, _mm256_mul_ps( u0, up ) );
+          if( j == i + 1 )
+          {
+            dn = _mm256_sub_ps( dn, _mm256_mul_ps( u0, u0 ) );
+          }
+        }
+        s0 = _mm256_mul_ps( s0, tmp );
+        _mm256_storeu_ps( Rij, s0 );
+        fsum[j] = _mm256_add_ps( fsum[j], _mm256_mul_ps( auxI, s0 ) );
+        if( j == i + 1 )
+        {
+          dn = _mm256_sub_ps( dn, _mm256_mul_ps( s0, s0 ) );
+        }
+      }
+      diag = dn;
+    }
+    okMask[b] = ~_mm256_movemask_ps( fail ) & 0xff;
+  }
+
+  // backward substitution, up to 4 batches interleaved
+  int b = 0;
+  for( ; b + 4 <= numBatches; b += 4 )
+  {
+    simdCholeskyBackSubstLanes<4>( mat + b * matSize, x + b * n * 8, n, matSize, rowOff );
+  }
+  switch( numBatches - b )
+  {
+  case 3: simdCholeskyBackSubstLanes<3>( mat + b * matSize, x + b * n * 8, n, matSize, rowOff ); break;
+  case 2: simdCholeskyBackSubstLanes<2>( mat + b * matSize, x + b * n * 8, n, matSize, rowOff ); break;
+  case 1: simdCholeskyBackSubstLanes<1>( mat + b * matSize, x + b * n * 8, n, matSize, rowOff ); break;
+  default: break;
+  }
+}
+#endif
+
 template <X86_VEXT vext>
 void AdaptiveLoopFilter::_initAdaptiveLoopFilterX86()
 {
@@ -14787,6 +14961,12 @@ void AdaptiveLoopFilter::_initAdaptiveLoopFilterX86()
 #endif
 #if ENABLE_SIMD_OPT_ALF_CHOLESKY
   m_fastCholeskyDec = simdFastCholeskyDec<vext>;
+#if USE_AVX2 && JVET_AF0177_ALF_COV_FLOAT
+  if( vext >= AVX2 )
+  {
+    m_choleskySolveLanes = simdCholeskySolveLanes<vext>;
+  }
+#endif
 #endif
 }
 

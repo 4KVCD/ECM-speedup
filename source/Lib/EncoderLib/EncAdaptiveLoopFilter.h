@@ -66,6 +66,7 @@ struct CandTALF
 #define ALF_PRECISION_VARIETY                             (JVET_AG0158_ALF_LUMA_COEFF_PRECISION || JVET_AK0123_ALF_COEFF_RESTRICTION)
 #define ALF_RD_COST_BUG_FIX                               JVET_AK0123_ALF_COEFF_RESTRICTION
 #define ALF_OPT_FILTER_CACHE                              (JVET_AF0177_ALF_COV_FLOAT && JVET_AD0222_ALF_RESI_CLASS && JVET_AN0086_RESIDUAL_CHECK)
+#define ALF_BATCHED_SOLVES                                (JVET_AF0177_ALF_COV_FLOAT && JVET_AD0222_ALF_RESI_CLASS && JVET_AN0086_RESIDUAL_CHECK && ENABLE_SIMD_OPT_ALF_CHOLESKY)
 
 struct AlfCovariance
 {
@@ -394,6 +395,9 @@ private:
   void gnsTransposeBacksubstitution( TE U, double* rhs, double* x, int order ) const;
 #endif
   int  gnsCholeskyDec( TE inpMatr, TE outMatr, int numEq ) const;
+#if ALF_BATCHED_SOLVES
+  void optimizeClipBatched( int* clip, const int* clipMax, TE kE, Ty ky, Ty fBest, double& errBest, int step, bool enableLessClip, bool mayDrift, int size ) const;
+#endif
 };
 
 class EncAdaptiveLoopFilter : public AdaptiveLoopFilter
