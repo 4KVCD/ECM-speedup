@@ -5581,6 +5581,50 @@ template <int N> int convolve(Pel* const p, const TFilterCoeff* const f)
 
   return res;
 }
+
+// perf: one row of the long-tap angular interpolation of xPredIntraAng() with the tap count known at compile time,
+// so that convolve<N> is inlined instead of a call with a switch per sample; the arithmetic is unchanged
+template <int N>
+static void angLongTapRow( Pel* const pDsty, const int width, const int weightMode, Pel* const refMain, const int deltaInt,
+                           const TFilterCoeff* const f, Pel* const refMain2nd, const int deltaInt2nd,
+                           const TFilterCoeff* const fRL, const ClpRng& clpRng )
+{
+  constexpr int normNum              = 128;
+  constexpr int bitShift             = 8;
+  constexpr int numExtraSamplesForIf = N / 2 - 2;
+
+  if( weightMode == 0 )
+  {
+    for( int x = 0; x < width; x++ )
+    {
+      const int val32 = ( convolve<N>( refMain2nd + deltaInt2nd + x - numExtraSamplesForIf, fRL ) + normNum ) >> bitShift;
+      const Pel val   = (Pel) ClipPel( val32, clpRng );
+      pDsty[x]        = ClipPel( val, clpRng );
+    }
+  }
+  else if( weightMode == 4 )
+  {
+    for( int x = 0; x < width; x++ )
+    {
+      const int val32 = ( convolve<N>( refMain + deltaInt + x - numExtraSamplesForIf, f ) + normNum ) >> bitShift;
+      const Pel val   = (Pel) ClipPel( val32, clpRng );
+      pDsty[x]        = ClipPel( val, clpRng );
+    }
+  }
+  else
+  {
+    const int w0 = weightMode;
+    const int w1 = 4 - weightMode;
+    for( int x = 0; x < width; x++ )
+    {
+      const int val32 = ( w0 * convolve<N>( refMain + deltaInt + x - numExtraSamplesForIf, f )
+                          + w1 * convolve<N>( refMain2nd + deltaInt2nd + x - numExtraSamplesForIf, fRL ) + normNum * 4 )
+                        >> ( bitShift + 2 );
+      const Pel val   = (Pel) ClipPel( val32, clpRng );
+      pDsty[x]        = ClipPel( val, clpRng );
+    }
+  }
+}
 int convolve(const int N,  Pel * const p, const TFilterCoeff * const f)
 {
   switch (N)
@@ -6976,6 +7020,16 @@ void IntraPrediction::xPredIntraAng(
 
           const int numExtraSamplesForIf = numberOfTaps/2 - 2;
 
+          switch( numberOfTaps )
+          {
+          case 4:  angLongTapRow<4> ( pDsty, width, weightMode, refMain, deltaInt, f, refMain2nd, deltaInt2nd, fRL, clpRng ); break;
+          case 6:  angLongTapRow<6> ( pDsty, width, weightMode, refMain, deltaInt, f, refMain2nd, deltaInt2nd, fRL, clpRng ); break;
+          case 8:  angLongTapRow<8> ( pDsty, width, weightMode, refMain, deltaInt, f, refMain2nd, deltaInt2nd, fRL, clpRng ); break;
+          case 10: angLongTapRow<10>( pDsty, width, weightMode, refMain, deltaInt, f, refMain2nd, deltaInt2nd, fRL, clpRng ); break;
+          case 12: angLongTapRow<12>( pDsty, width, weightMode, refMain, deltaInt, f, refMain2nd, deltaInt2nd, fRL, clpRng ); break;
+          case 14: angLongTapRow<14>( pDsty, width, weightMode, refMain, deltaInt, f, refMain2nd, deltaInt2nd, fRL, clpRng ); break;
+          case 16: angLongTapRow<16>( pDsty, width, weightMode, refMain, deltaInt, f, refMain2nd, deltaInt2nd, fRL, clpRng ); break;
+          default:
           if (weightMode == 0)
           {
             for (int x = 0; x < width; x++)
@@ -7009,6 +7063,8 @@ void IntraPrediction::xPredIntraAng(
               const Pel val = (Pel)ClipPel(val32, clpRng);
               pDsty[x] = ClipPel(val, clpRng);   // always clip even though not always needed
             }
+          }
+            break;
           }
 #else
 #if JVET_AK0087_INTRA_8TAP
