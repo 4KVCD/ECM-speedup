@@ -4609,11 +4609,9 @@ void InterPrediction::xPredInterBlk ( const ComponentID& compID, const Predictio
 #if JVET_AL0161_4TAP_TM
     const bool use4TapTM = (filterIdx == 1 && isLuma(compID) && !bilinearMC && !isIBC) ? true : false;
 #endif
-    // perf: reuse an identical earlier interpolation of this picture (see McCache.h); only for interpolation from
-    // reference pictures (no IBC, no DMVR padding buffers or sizes). For BDOF the cached part is the extended block
-    // written by the filters below; the border handling after them still runs on every call.
-    const bool useMcCache = m_useMcCache && !isIBC && srcPadBuf == NULL && dmvrWidth == 0
-                            && McBlockCache::worthCaching( backupWidth, backupHeight, xFrac, yFrac );
+    // perf: reuse an identical earlier interpolation of this picture (see McCache.h); only for plain reference
+    // picture interpolation (no IBC, no BDOF-extended output, no DMVR padding buffers or sizes)
+    const bool useMcCache = m_useMcCache && !isIBC && !( bioApplied && compID == COMPONENT_Y ) && srcPadBuf == NULL && dmvrWidth == 0;
     McCacheKey mcKey;
     if( useMcCache )
     {
@@ -27842,8 +27840,7 @@ void InterPrediction::xGetPredBlkTpl(const CodingUnit& cu, const ComponentID com
   // match what xPredInterBlk would use for the same filter calls (not bilinear, no alternative half-pel filter,
   // no bi filter, rounded output)
   McCacheKey mcKey;
-  const bool useMcCache = m_useMcCache && McBlockCache::worthCaching( bw, bh, xFrac, yFrac );
-  if( useMcCache )
+  if( m_useMcCache )
   {
     m_mcCache.setPicture( cu.cs->picture, cu.slice->getPOC() );
     uint8_t flags = 16;
@@ -27914,7 +27911,7 @@ void InterPrediction::xGetPredBlkTpl(const CodingUnit& cu, const ComponentID com
 #endif
     JVET_AM0295_POP_CACHE_ENABLE();
   }
-  if( useMcCache )
+  if( m_useMcCache )
   {
     m_mcCache.store( mcKey, dst, dstStride );
   }
