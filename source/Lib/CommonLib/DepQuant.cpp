@@ -1399,8 +1399,8 @@ const CtxSet &ctxSetGt4 = isLfnst ? Ctx::GtxFlagL[6 + chType] : Ctx::GtxFlag[6 +
       m_numSigSbb     = 0;
       m_remRegBins    = 4;   // just large enough for last scan pos
       m_refSbbCtxId   = -1;
-      m_sigFracBits   = m_sigFracBitsArray[0];
-      m_coeffFracBits = m_gtxFracBitsArray[0];
+      m_sigFracBits   = m_sigFracBitsArray;
+      m_coeffFracBits = m_gtxFracBitsArray;
       m_goRicePar     = 0;
       m_goRiceZero    = 0;
 #if TCQ_8STATES
@@ -1418,7 +1418,7 @@ const CtxSet &ctxSetGt4 = isLfnst ? Ctx::GtxFlagL[6 + chType] : Ctx::GtxFlag[6 +
 
       const TCoeff   absLevelA = pqDataA.absLevel;
       const TCoeff   absLevelB = pqDataB.absLevel;
-      const int32_t *bits      = m_coeffFracBits.bits;
+      const int32_t *bits      = m_coeffFracBits->bits;
 
       if (m_remRegBins >= 4)
       {
@@ -1465,13 +1465,13 @@ const CtxSet &ctxSetGt4 = isLfnst ? Ctx::GtxFlagL[6 + chType] : Ctx::GtxFlag[6 +
 #endif
           rdCostB += bits[absLevelB - (value << 1)] + goRiceTab[value < RICEMAX ? value : RICEMAX - 1];
         }
-        const int sigBit1 = m_sigFracBits.intBits[1];
+        const int sigBit1 = m_sigFracBits->intBits[1];
 
         if (spt == SCAN_ISCSBB)
         {
           rdCostA += sigBit1;
           rdCostB += sigBit1;
-          rdCostZ += m_sigFracBits.intBits[0];
+          rdCostZ += m_sigFracBits->intBits[0];
         }
         else if (spt == SCAN_SOCSBB)
         {
@@ -1479,13 +1479,13 @@ const CtxSet &ctxSetGt4 = isLfnst ? Ctx::GtxFlagL[6 + chType] : Ctx::GtxFlag[6 +
 
           rdCostA += sbbBit1 + sigBit1;
           rdCostB += sbbBit1 + sigBit1;
-          rdCostZ += sbbBit1 + m_sigFracBits.intBits[0];
+          rdCostZ += sbbBit1 + m_sigFracBits->intBits[0];
         }
         else if (m_numSigSbb)
         {
           rdCostA += sigBit1;
           rdCostB += sigBit1;
-          rdCostZ += m_sigFracBits.intBits[0];
+          rdCostZ += m_sigFracBits->intBits[0];
         }
         else
         {
@@ -1532,7 +1532,7 @@ const CtxSet &ctxSetGt4 = isLfnst ? Ctx::GtxFlagL[6 + chType] : Ctx::GtxFlag[6 +
       if (pqData.absLevel < 4)
 #endif
       {
-        rdCost += m_coeffFracBits.bits[pqData.absLevel];
+        rdCost += m_coeffFracBits->bits[pqData.absLevel];
       }
       else
       {
@@ -1545,7 +1545,7 @@ const CtxSet &ctxSetGt4 = isLfnst ? Ctx::GtxFlagL[6 + chType] : Ctx::GtxFlag[6 +
 #else
         const unsigned value = (pqData.absLevel - 4) >> 1;
 #endif
-        rdCost += m_coeffFracBits.bits[pqData.absLevel - (value << 1)]
+        rdCost += m_coeffFracBits->bits[pqData.absLevel - (value << 1)]
                   + g_goRiceBits[m_goRicePar][value < RICEMAX ? value : RICEMAX - 1];
       }
       if (rdCost < decision.rdCost)
@@ -1599,8 +1599,8 @@ const CtxSet &ctxSetGt4 = isLfnst ? Ctx::GtxFlagL[6 + chType] : Ctx::GtxFlag[6 +
     int                        m_remRegBins;
     int8_t                     m_refSbbCtxId;
     BinFracBits                m_sbbFracBits;
-    BinFracBits                m_sigFracBits;
-    CoeffFracBits              m_coeffFracBits;
+    const BinFracBits *        m_sigFracBits;     // points into the rate tables (fixed while a TU is quantized)
+    const CoeffFracBits *      m_coeffFracBits;
     int8_t                     m_goRicePar;
     int8_t                     m_goRiceZero;
     const int8_t               m_stateId;
@@ -1615,6 +1615,8 @@ const CtxSet &ctxSetGt4 = isLfnst ? Ctx::GtxFlagL[6 + chType] : Ctx::GtxFlag[6 +
 
   State::State(const RateEstimator &rateEst, CommonCtx &commonCtx, const int stateId)
     : m_sbbFracBits{ { 0, 0 } }
+    , m_sigFracBits(rateEst.sigFlagBits(stateId))
+    , m_coeffFracBits(rateEst.gtxFracBits(stateId))
     , m_stateId(stateId)
     , m_sigFracBitsArray(rateEst.sigFlagBits(stateId))
     , m_gtxFracBitsArray(rateEst.gtxFracBits(stateId))
@@ -1735,17 +1737,17 @@ const CtxSet &ctxSetGt4 = isLfnst ? Ctx::GtxFlagL[6 + chType] : Ctx::GtxFlag[6 +
         TCoeff sumGt1 = sumAbs1 - sumNum;
 #if JVET_R0351_HIGH_BIT_DEPTH_SUPPORT
 #if JVET_AG0100_TRANSFORM_COEFFICIENT_CODING
-        m_sigFracBits = m_sigFracBitsArray[scanInfo.sigCtxOffsetNext + std::min<TCoeff>((sumAbs1 + 1) >> 1, NSIGCTX-1)];
+        m_sigFracBits = m_sigFracBitsArray + (scanInfo.sigCtxOffsetNext + std::min<TCoeff>((sumAbs1 + 1) >> 1, NSIGCTX-1));
 #else
-        m_sigFracBits = m_sigFracBitsArray[scanInfo.sigCtxOffsetNext + std::min<TCoeff>( (sumAbs1+1)>>1, 3 )];
+        m_sigFracBits = m_sigFracBitsArray + (scanInfo.sigCtxOffsetNext + std::min<TCoeff>( (sumAbs1+1)>>1, 3 ));
 #endif
 #else
-        m_sigFracBits = m_sigFracBitsArray[scanInfo.sigCtxOffsetNext + std::min((sumAbs1 + 1) >> 1, 3)];
+        m_sigFracBits = m_sigFracBitsArray + (scanInfo.sigCtxOffsetNext + std::min((sumAbs1 + 1) >> 1, 3));
 #endif
 #if JVET_AG0100_TRANSFORM_COEFFICIENT_CODING
-        m_coeffFracBits = m_gtxFracBitsArray[scanInfo.gtxCtxOffsetNext + (sumGt1 < (NGTXCTX-1) ? sumGt1 : (NGTXCTX - 1))];
+        m_coeffFracBits = m_gtxFracBitsArray + (scanInfo.gtxCtxOffsetNext + (sumGt1 < (NGTXCTX-1) ? sumGt1 : (NGTXCTX - 1)));
 #else
-        m_coeffFracBits = m_gtxFracBitsArray[scanInfo.gtxCtxOffsetNext + (sumGt1 < 4 ? sumGt1 : 4)];
+        m_coeffFracBits = m_gtxFracBitsArray + (scanInfo.gtxCtxOffsetNext + (sumGt1 < 4 ? sumGt1 : 4));
 #endif
 
         TCoeff sumAbs = m_absLevelsAndCtxInit[8 + scanInfo.nextInsidePos] >> 8;
@@ -1918,17 +1920,17 @@ const CtxSet &ctxSetGt4 = isLfnst ? Ctx::GtxFlagL[6 + chType] : Ctx::GtxFlag[6 +
 
 #if JVET_R0351_HIGH_BIT_DEPTH_SUPPORT
 #if JVET_AG0100_TRANSFORM_COEFFICIENT_CODING
-      m_sigFracBits = m_sigFracBitsArray[scanInfo.sigCtxOffsetNext + std::min<TCoeff>((sumAbs1 + 1) >> 1, NSIGCTX-1)];
+      m_sigFracBits = m_sigFracBitsArray + (scanInfo.sigCtxOffsetNext + std::min<TCoeff>((sumAbs1 + 1) >> 1, NSIGCTX-1));
 #else
-      m_sigFracBits   = m_sigFracBitsArray[ scanInfo.sigCtxOffsetNext + std::min<TCoeff>( (sumAbs1+1)>>1, 3 ) ];
+      m_sigFracBits   = m_sigFracBitsArray + ( scanInfo.sigCtxOffsetNext + std::min<TCoeff>( (sumAbs1+1)>>1, 3 ) );
 #endif
 #else
-      m_sigFracBits = m_sigFracBitsArray[scanInfo.sigCtxOffsetNext + std::min((sumAbs1 + 1) >> 1, 3)];
+      m_sigFracBits = m_sigFracBitsArray + (scanInfo.sigCtxOffsetNext + std::min((sumAbs1 + 1) >> 1, 3));
 #endif
 #if JVET_AG0100_TRANSFORM_COEFFICIENT_CODING
-      m_coeffFracBits = m_gtxFracBitsArray[scanInfo.gtxCtxOffsetNext + (sumGt1 < (NGTXCTX-1) ? sumGt1 : (NGTXCTX - 1))];
+      m_coeffFracBits = m_gtxFracBitsArray + (scanInfo.gtxCtxOffsetNext + (sumGt1 < (NGTXCTX-1) ? sumGt1 : (NGTXCTX - 1)));
 #else
-      m_coeffFracBits = m_gtxFracBitsArray[ scanInfo.gtxCtxOffsetNext + ( sumGt1  < 4 ? sumGt1  : 4 ) ];
+      m_coeffFracBits = m_gtxFracBitsArray + ( scanInfo.gtxCtxOffsetNext + ( sumGt1  < 4 ? sumGt1  : 4 ) );
 #endif
 
     }
