@@ -2050,7 +2050,29 @@ void AdaptiveLoopFilter::create(const int picWidth, const int picHeight, const C
 void AdaptiveLoopFilter::create(const int picWidth, const int picHeight, const ChromaFormat format, const int maxCUWidth, const int maxCUHeight, const int maxCUDepth, const int inputBitDepth[MAX_NUM_CHANNEL_TYPE])
 #endif
 {
-  destroy();
+  // perf: the decoder calls create() for every picture, and destroy() made it free and allocate all ALF picture
+  // buffers each time. With unchanged parameters the buffers are kept (a new allocation leaves their contents
+  // indeterminate as well), and all other state is set up as before: see the m_created branch below
+  if( m_created && picWidth == m_picWidth && picHeight == m_picHeight && format == m_chromaFormat
+      && maxCUWidth == m_maxCUWidth && maxCUHeight == m_maxCUHeight && maxCUDepth == m_maxCUDepth
+      && !memcmp( inputBitDepth, m_inputBitDepth, sizeof( m_inputBitDepth ) )
+#if FIXFILTER_CFG
+      && useFixedFilter == m_createdUseFixedFilter
+#endif
+    )
+  {
+    // what destroy() resets apart from the buffers
+    m_filterShapes[CHANNEL_TYPE_LUMA].clear();
+    m_filterShapes[CHANNEL_TYPE_CHROMA].clear();
+    m_filterShapesCcAlf.clear();
+  }
+  else
+  {
+    destroy();
+  }
+#if FIXFILTER_CFG
+  m_createdUseFixedFilter = useFixedFilter;
+#endif
   std::memcpy(m_inputBitDepth, inputBitDepth, sizeof(m_inputBitDepth));
   m_picWidth = picWidth;
   m_picHeight = picHeight;
@@ -2179,6 +2201,20 @@ void AdaptiveLoopFilter::create(const int picWidth, const int picHeight, const C
   }
   if (m_created)
   {
+    // buffers kept: what the code below sets besides the allocations (the contents of new buffers are indeterminate)
+#if ALF_IMPROVEMENT && JVET_AB0184_ALF_MORE_FIXED_FILTER_OUTPUT_TAPS
+    m_isFixedFilterPaddedPerCtu = true;
+    memset( m_ctuEnableOnlineLumaFlag, 0, sizeof( uint8_t ) * m_numCTUsInPic );
+#if JVET_AE0139_ALF_IMPROVED_FIXFILTER
+    memset( m_ctuPadFlag, 0, sizeof( uint8_t ) * m_numCTUsInPic );
+#endif
+#endif
+#if JVET_AK0065_TALF
+    for( int i = 0; i < m_numCTUsInPic; i++ )
+    {
+      m_tAlfCtbControl[i].reset();   // the TAlfCtbParam constructor
+    }
+#endif
     return;
   }
 

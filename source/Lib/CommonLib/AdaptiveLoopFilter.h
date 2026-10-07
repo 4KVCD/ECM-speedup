@@ -1043,6 +1043,7 @@ protected:
   short                        m_clipDefault[MAX_NUM_ALF_CLASSES * MAX_NUM_ALF_LUMA_COEFF];
 #endif
   bool                         m_created = false;
+  bool                         m_createdUseFixedFilter = true;   ///< create() parameter of the current buffers
   short                        m_chromaCoeffFinal[MAX_NUM_ALF_ALTERNATIVES_CHROMA][MAX_NUM_ALF_CHROMA_COEFF];
 #if JVET_AK0123_ALF_COEFF_RESTRICTION
   char                         m_chromaScaleIdxFinal[MAX_NUM_ALF_ALTERNATIVES_LUMA][1];

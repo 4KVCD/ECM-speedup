@@ -591,21 +591,27 @@ void IntraPrediction::init(ChromaFormat chromaFormatIDC, const unsigned bitDepth
   }
 #endif
 #if JVET_AB0155_SGPM
+#if JVET_AJ0112_REGRESSION_SGPM
+  const size_t numSgpmBuffers = NUM_PRIMARY_MOST_PROBABLE_MODES + SGPM_NUM_BVS + 1;
+#else
+  const size_t numSgpmBuffers = 1;
+#endif
+  // perf: init() runs for every picture of the decoder; these fixed-size buffers are kept once allocated (a new
+  // allocation would leave their contents indeterminate as well)
+  if (m_sgpmBuffer.size() != numSgpmBuffers || m_sgpmBuffer.back().bufs.empty())
+  {
   for (auto &buffer: m_sgpmBuffer)
   {
     buffer.destroy();
   }
 
   // the number of total temporal buffers can be adjusted by changing the number here
-#if JVET_AJ0112_REGRESSION_SGPM
-  m_sgpmBuffer.resize(NUM_PRIMARY_MOST_PROBABLE_MODES + SGPM_NUM_BVS + 1);
-#else
-  m_sgpmBuffer.resize(1);
-#endif
+  m_sgpmBuffer.resize(numSgpmBuffers);
 
   for (auto &buffer: m_sgpmBuffer)
   {
     buffer.create(CHROMA_400, Area(0, 0, MAX_CU_SIZE + DIMD_MAX_TEMP_SIZE, MAX_CU_SIZE + DIMD_MAX_TEMP_SIZE));
+  }
   }
 #endif
 #if JVET_AL0134_SGPM_INTER
@@ -620,6 +626,8 @@ void IntraPrediction::init(ChromaFormat chromaFormatIDC, const unsigned bitDepth
     }
   }
 #endif
+  if (m_intraPredBuffer.size() != 1 || m_intraPredBuffer.back().bufs.empty())   // perf: kept once allocated, as above
+  {
   for (auto &buffer: m_intraPredBuffer)
   {
     buffer.destroy();
@@ -639,6 +647,7 @@ void IntraPrediction::init(ChromaFormat chromaFormatIDC, const unsigned bitDepth
     buffer.create(CHROMA_400, Area(0, 0, MAX_CU_SIZE + DIMD_MAX_TEMP_SIZE, MAX_CU_SIZE + DIMD_MAX_TEMP_SIZE));
   }
 #endif
+  }
 
   memset(m_tempRefAbove, 0, ((MAX_CU_SIZE << 3) + 5 + 33 * MAX_REF_LINE_IDX) * sizeof(Pel));
   memset(m_tempRefLeft, 0, ((MAX_CU_SIZE << 3) + 5 + 33 * MAX_REF_LINE_IDX) * sizeof(Pel));
