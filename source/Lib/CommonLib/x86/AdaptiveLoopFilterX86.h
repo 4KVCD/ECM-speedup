@@ -1,4 +1,4 @@
-﻿/* The copyright in this software is being made available under the BSD
+/* The copyright in this software is being made available under the BSD
  * License, included below. This software may be subject to other third party
  * and contributor rights, including patent rights, and no such rights are
  * granted under this license.
@@ -14702,7 +14702,7 @@ static inline void simdCholeskyBackSubstLanes( const float* mat, float* x, const
 // perf: see AdaptiveLoopFilter::choleskySolveLanes; one AVX2 register holds element (i, j) of all 8 systems, every lane
 // performs the operations of the scalar code in the same order (no contraction, no reassociation)
 template<X86_VEXT vext>
-static void simdCholeskySolveLanes( float* mat, const float* rhs, float* x, int n, int numBatches, int* okMask )
+static void simdCholeskySolveLanes( float* mat, const float* rhs, float* x, int n, int numBatches, int* okMask, const int* startRow, const float* fsumInit )
 {
   static_assert( AdaptiveLoopFilter::cholesky_lanes == 8, "one AVX2 register per matrix element" );
   CHECK( n < 1 || n > MAX_NUM_ALF_LUMA_COEFF, "Wrong number of equations" );
@@ -14720,15 +14720,16 @@ static void simdCholeskySolveLanes( float* mat, const float* rhs, float* x, int 
     float*       M = mat + b * matSize;
     const float* R = rhs + b * n * 8;
     float*       X = x + b * n * 8;
+    const int    s = startRow ? startRow[b] : 0;   // rows < s are given (see choleskySolveLanes)
     __m256       fsum[MAX_NUM_ALF_LUMA_COEFF];   // partial sums of the forward substitution
-    for( int i = 0; i < n; i++ )
+    for( int i = s; i < n; i++ )
     {
-      fsum[i] = _mm256_setzero_ps();
+      fsum[i] = fsumInit && s > 0 ? _mm256_loadu_ps( fsumInit + b * n * 8 + i * 8 ) : _mm256_setzero_ps();
     }
     __m256 fail = _mm256_setzero_ps();
-    __m256 diag = _mm256_loadu_ps( M );   // diagonal of the current row, all subtractions done
+    __m256 diag = _mm256_loadu_ps( M + rowOff[s] );   // diagonal of the current row, all subtractions done
 
-    for( int i = 0; i < n; i++ )
+    for( int i = s; i < n; i++ )
     {
       float* Ri = M + rowOff[i];
       fail = _mm256_or_ps( fail, _mm256_cmp_ps( diag, vRegSqr, _CMP_LE_OQ ) );
@@ -14752,7 +14753,7 @@ static void simdCholeskySolveLanes( float* mat, const float* rhs, float* x, int 
         __m256 s3  = _mm256_loadu_ps( Rij + 24 );
         if( j == i + 1 )
         {
-          for( int p = 0; p < i; p++ )
+          for( int p = s; p < i; p++ )
           {
             const float* Rp  = M + rowOff[p];
             const __m256 up  = _mm256_loadu_ps( Rp + ( i - p ) * 8 );
@@ -14767,7 +14768,7 @@ static void simdCholeskySolveLanes( float* mat, const float* rhs, float* x, int 
         }
         else
         {
-          for( int p = 0; p < i; p++ )
+          for( int p = s; p < i; p++ )
           {
             const float* Rp  = M + rowOff[p];
             const __m256 up  = _mm256_loadu_ps( Rp + ( i - p ) * 8 );
@@ -14799,7 +14800,7 @@ static void simdCholeskySolveLanes( float* mat, const float* rhs, float* x, int 
       {
         float* Rij = Ri + ( j - i ) * 8;
         __m256 s0  = _mm256_loadu_ps( Rij );
-        for( int p = 0; p < i; p++ )
+        for( int p = s; p < i; p++ )
         {
           const float* Rp = M + rowOff[p];
           const __m256 up = _mm256_loadu_ps( Rp + ( i - p ) * 8 );

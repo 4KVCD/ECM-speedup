@@ -1225,11 +1225,15 @@ protected:
   //       cholesky_tri_idx(i, j, numEq) * cholesky_lanes + lane; overwritten by the factor U
   // rhs, x: per batch element i of lane t at index i * cholesky_lanes + t
   // okMask: per batch the bit mask of the lanes whose factorization succeeded; x of the other lanes is undefined
+  // startRow (optional, per batch s): the factorization starts at row s; rows i < s of mat already hold U, elements
+  //   (i, j), s <= i <= j, hold A[i][j] - U[0][i] * U[0][j] - ... - U[s-1][i] * U[s-1][j] (subtracted in this order),
+  //   x[i] for i < s holds the forward substitution result aux[i], and fsumInit (per batch like x) holds
+  //   0 + aux[0] * U[0][i] + ... + aux[s-1] * U[s-1][i] for i >= s
   static constexpr int cholesky_lanes = 8;
   static int  cholesky_tri_idx( int i, int j, int numEq ) { return i * numEq - ( ( i * ( i - 1 ) ) >> 1 ) + j - i; }
   static int  cholesky_tri_size( int numEq ) { return ( numEq * ( numEq + 1 ) ) >> 1; }
-  static void(*m_choleskySolveLanes)(cholesky_float_t* mat, const cholesky_float_t* rhs, cholesky_float_t* x, int numEq, int numBatches, int* okMask);
-  static void choleskySolveLanes(cholesky_float_t* mat, const cholesky_float_t* rhs, cholesky_float_t* x, int numEq, int numBatches, int* okMask);
+  static void(*m_choleskySolveLanes)(cholesky_float_t* mat, const cholesky_float_t* rhs, cholesky_float_t* x, int numEq, int numBatches, int* okMask, const int* startRow, const cholesky_float_t* fsumInit);
+  static void choleskySolveLanes(cholesky_float_t* mat, const cholesky_float_t* rhs, cholesky_float_t* x, int numEq, int numBatches, int* okMask, const int* startRow, const cholesky_float_t* fsumInit);
 #endif
 #if JVET_AF0177_ALF_COV_FLOAT
   // perf: encoder statistics: adds the contributions of count samples, in the order of idx, to a covariance of size N

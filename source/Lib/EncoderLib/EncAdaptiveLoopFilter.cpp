@@ -398,6 +398,10 @@ double AlfCovariance::optimizeFilter(const AlfFilterShape& alfShape, int* clip, 
 //   later trials are then solved again with the modified kE. Once the diagonal may contain REG ("drift"), the refresh
 //   of row k at the end of iteration k matters for the later trials of the pass: their diagonal elements of rows
 //   [refreshedUpTo, k) are taken fresh from the statistics.
+// - the factorizations of the trials of a batch (trials at k >= s) share rows < s of the factor of kE, except column k,
+//   and the first s subtractions of the remaining elements except row / column k ("startRow" s of the lanes kernel):
+//   these are computed once from the factorization of kE (same operations and order as the sequential code), the
+//   column k elements and row / column k sums of each trial separately.
 void AlfCovariance::optimizeClipBatched( int* clip, const int* clipMax, TE kE, Ty ky, Ty fBest, double& errBest, int step, bool enableLessClip, bool mayDrift, int size ) const
 {
   constexpr int L          = AdaptiveLoopFilter::cholesky_lanes;
@@ -406,15 +410,22 @@ void AlfCovariance::optimizeClipBatched( int* clip, const int* clipMax, TE kE, T
   const int     matSize    = triSize * L;
   const int     copySize   = sizeof( float ) * size;
 
-  static thread_local std::vector<float> baseBuf, matBuf, rhsBuf, xBuf;
+  static thread_local std::vector<float> baseBuf, matBuf, rhsBuf, xBuf, fsumBuf, facBuf;
   baseBuf.resize( matSize );
   matBuf.resize( maxBatches * matSize );
   rhsBuf.resize( maxBatches * size * L );
   xBuf.resize( maxBatches * size * L );
+  fsumBuf.resize( maxBatches * size * L );
+  facBuf.resize( triSize );
   float* base = baseBuf.data();
   float* mat  = matBuf.data();
   float* rhs  = rhsBuf.data();
   float* x    = xBuf.data();
+  float* fsum = fsumBuf.data();
+  float* fac  = facBuf.data();   // factorization of kE in progress: rows < facStep hold U, the others the partial sums
+  float  facTmp[MAX_NUM_ALF_LUMA_COEFF], facAux[MAX_NUM_ALF_LUMA_COEFF], facP[MAX_NUM_ALF_LUMA_COEFF];
+  int    facStep = 0, facFailedAt = size;
+  constexpr int minStartRow = 4;
 
   int  triRow[MAX_NUM_ALF_LUMA_COEFF];   // element index of (i, i)
   for( int i = 0; i < size; i++ )
@@ -449,9 +460,70 @@ void AlfCovariance::optimizeClipBatched( int* clip, const int* clipMax, TE kE, T
     }
   };
 
+  // factorization of kE (right-looking, the operations of fastCholeskyDec and of the forward substitution in the same
+  // order per element), advanced to step target
+  auto facReset = [&]() {
+    for( int i = 0; i < size; i++ )
+    {
+      std::copy_n( &kE[i][i], size - i, fac + triRow[i] );
+      facP[i] = 0;
+    }
+    facStep     = 0;
+    facFailedAt = size;
+  };
+  auto facAdvance = [&]( const int target ) {
+    for( ; facStep < target && facStep < facFailedAt; facStep++ )
+    {
+      const int m  = facStep;
+      float*    Rm = fac + triRow[m];
+      if( Rm[0] <= AdaptiveLoopFilter::cholesky_reg_sqr )
+      {
+        facFailedAt = m;
+        break;
+      }
+      const float u   = sqrtf( Rm[0] );
+      Rm[0]           = u;
+      const float tmp = 1.0f / u;
+      facTmp[m]       = tmp;
+      for( int j = 1; j < size - m; j++ )
+      {
+        Rm[j] = Rm[j] * tmp;
+      }
+      facAux[m] = m == 0 ? ky[0] / u : ( ky[m] - facP[m] ) / u;
+      for( int i = m + 1; i < size; i++ )
+      {
+        const float  umi = Rm[i - m];
+        float*       Ri  = fac + triRow[i];
+        const float* Rmi = Rm + ( i - m );
+        for( int j = 0; j < size - i; j++ )
+        {
+          Ri[j] -= Rmi[j] * umi;
+        }
+        facP[i] += facAux[m] * umi;
+      }
+    }
+  };
+  // with drift: first row r >= refreshedUpTo whose diagonal in kE differs from the refreshed value (lanes for trials at
+  // k > r get a different diagonal element than kE)
+  auto firstDriftRow = [&]( const int refreshedUpTo ) {
+    if( mayDrift )
+    {
+      for( int r = refreshedUpTo; r < size - 1; r++ )
+      {
+        const float fresh = E( clip[r], clip[r], r, r );
+        if( std::memcmp( &fresh, &kE[r][r], sizeof( float ) ) )
+        {
+          return r;
+        }
+      }
+    }
+    return size;
+  };
+
   int trialK[2 * MAX_NUM_ALF_LUMA_COEFF];
   int trialInc[2 * MAX_NUM_ALF_LUMA_COEFF];
   int okMask[maxBatches];
+  int startRow[maxBatches];
   Ty  f;
 
   int iter = 0;
@@ -479,20 +551,126 @@ void AlfCovariance::optimizeClipBatched( int* clip, const int* clipMax, TE kE, T
 
     int  refreshedUpTo = 0;   // with drift: rows / columns [0, refreshedUpTo) have been refreshed in kE in this pass
     bool baseValid     = false;
+    bool facValid      = false;
+    int  firstDrift    = -1;
     int  t0            = 0;
     while( t0 < numTrials )
     {
-      if( !baseValid )
+      if( firstDrift < 0 )
       {
-        buildBase();
-        baseValid = true;
+        firstDrift = firstDriftRow( refreshedUpTo );
       }
       const int cnt = std::min( numTrials - t0, maxBatches * L );
       const int nb  = ( cnt + L - 1 ) / L;
       for( int b = 0; b < nb; b++ )
       {
-        float* m = mat + b * matSize;
-        float* r = rhs + b * size * L;
+        float*    m      = mat + b * matSize;
+        float*    r      = rhs + b * size * L;
+        const int nLanes = std::min( L, cnt - b * L );
+        int       sRow   = trialK[t0 + b * L];
+        if( sRow < minStartRow || trialK[t0 + b * L + nLanes - 1] > firstDrift )
+        {
+          sRow = 0;
+        }
+        if( sRow )
+        {
+          if( !facValid )
+          {
+            facReset();
+            facValid = true;
+          }
+          facAdvance( sRow );
+          if( facStep != sRow )
+          {
+            sRow = 0;   // kE is singular before row sRow (or the factorization is already beyond it)
+          }
+        }
+        startRow[b] = sRow;
+        if( sRow )
+        {
+          // shared part: rows < sRow of the factor of kE, partial sums of the other rows, forward substitution
+          float* xb = x + b * size * L;
+          float* fb = fsum + b * size * L;
+          for( int idx = 0; idx < triSize; idx++ )
+          {
+            const float v = fac[idx];
+            for( int t = 0; t < L; t++ )
+            {
+              m[idx * L + t] = v;
+            }
+          }
+          for( int i = 0; i < size; i++ )
+          {
+            const float a = i < sRow ? facAux[i] : 0.0f, p = i < sRow ? 0.0f : facP[i];
+            for( int t = 0; t < L; t++ )
+            {
+              r[i * L + t]  = ky[i];
+              xb[i * L + t] = a;
+              fb[i * L + t] = p;
+            }
+          }
+          for( int t = 0; t < nLanes; t++ )
+          {
+            const int k = trialK[t0 + b * L + t];
+            const int c = clip[k] + trialInc[t0 + b * L + t];
+            r[k * L + t] = y( c, k );
+            float col[MAX_NUM_ALF_LUMA_COEFF], tc[MAX_NUM_ALF_LUMA_COEFF], tr[MAX_NUM_ALF_LUMA_COEFF];
+            for( int i = 0; i < k; i++ )
+            {
+              tc[i] = E( clip[i], c, i, k );
+            }
+            tr[k] = E( c, c, k, k );
+            for( int j = k + 1; j < size; j++ )
+            {
+              tr[j] = E( c, clip[j], k, j );
+            }
+            // column k of rows < sRow
+            for( int p = 0; p < sRow; p++ )
+            {
+              col[p]          = tc[p] * facTmp[p];
+              const float* Rp = fac + triRow[p] - p;   // Rp[q] = U[p][q]
+              for( int q = p + 1; q < sRow; q++ )
+              {
+                tc[q] -= col[p] * Rp[q];
+              }
+            }
+            // first sRow subtractions of the elements of row / column k in rows >= sRow, forward substitution of row k
+            float fk = 0;
+            for( int p = 0; p < sRow; p++ )
+            {
+              const float* Rp = fac + triRow[p] - p;
+              for( int i = sRow; i < k; i++ )
+              {
+                tc[i] -= col[p] * Rp[i];
+              }
+              tr[k] -= col[p] * col[p];
+              for( int j = k + 1; j < size; j++ )
+              {
+                tr[j] -= Rp[j] * col[p];
+              }
+              fk += facAux[p] * col[p];
+            }
+            for( int i = 0; i < sRow; i++ )
+            {
+              m[( triRow[i] + k - i ) * L + t] = col[i];
+            }
+            for( int i = sRow; i < k; i++ )
+            {
+              m[( triRow[i] + k - i ) * L + t] = tc[i];
+            }
+            for( int j = k; j < size; j++ )
+            {
+              m[( triRow[k] + j - k ) * L + t] = tr[j];
+            }
+            fb[k * L + t] = fk;
+          }
+          continue;
+        }
+        if( !baseValid )
+        {
+          buildBase();
+          baseValid = true;
+        }
         std::memcpy( m, base, sizeof( float ) * matSize );
         for( int i = 0; i < size; i++ )
         {
@@ -526,7 +704,7 @@ void AlfCovariance::optimizeClipBatched( int* clip, const int* clipMax, TE kE, T
         }
       }
 
-      AdaptiveLoopFilter::m_choleskySolveLanes( mat, rhs, x, size, nb, okMask );
+      AdaptiveLoopFilter::m_choleskySolveLanes( mat, rhs, x, size, nb, okMask, startRow, fsum );
 
       // evaluate in the order of the sequential loop, up to the first trial that needs regularization
       int u = 0;
@@ -594,6 +772,8 @@ void AlfCovariance::optimizeClipBatched( int* clip, const int* clipMax, TE kE, T
         mayDrift      = true;
         refreshedUpTo = k + 1;
         baseValid     = false;
+        facValid      = false;
+        firstDrift    = -1;
         t0++;
       }
     }
@@ -5971,7 +6151,7 @@ void EncAdaptiveLoopFilter::mergeClassesLinearBatched( AlfCovariance* cov, AlfCo
         }
       }
 
-      m_choleskySolveLanes( mat, rhs, x, n, nb, okMask );
+      m_choleskySolveLanes( mat, rhs, x, n, nb, okMask, nullptr, nullptr );
 
       for( int u = 0; u < cnt; u++ )
       {

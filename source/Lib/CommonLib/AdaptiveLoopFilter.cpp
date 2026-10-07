@@ -10562,25 +10562,26 @@ void AdaptiveLoopFilter::covAccumulate(float* E, float* y, float* pixAcc, const 
 #endif
 
 #if ENABLE_SIMD_OPT_ALF_CHOLESKY
-void(*AdaptiveLoopFilter::m_choleskySolveLanes)(cholesky_float_t* mat, const cholesky_float_t* rhs, cholesky_float_t* x, int numEq, int numBatches, int* okMask);
+void(*AdaptiveLoopFilter::m_choleskySolveLanes)(cholesky_float_t* mat, const cholesky_float_t* rhs, cholesky_float_t* x, int numEq, int numBatches, int* okMask, const int* startRow, const cholesky_float_t* fsumInit);
 
-void AdaptiveLoopFilter::choleskySolveLanes(cholesky_float_t* mat, const cholesky_float_t* rhs, cholesky_float_t* x, int numEq, int numBatches, int* okMask)
+void AdaptiveLoopFilter::choleskySolveLanes(cholesky_float_t* mat, const cholesky_float_t* rhs, cholesky_float_t* x, int numEq, int numBatches, int* okMask, const int* startRow, const cholesky_float_t* fsumInit)
 {
   const int L       = cholesky_lanes;
   const int matSize = cholesky_tri_size( numEq ) * L;
   for( int b = 0; b < numBatches; b++, mat += matSize, rhs += numEq * L, x += numEq * L )
   {
+    const int s = startRow ? startRow[b] : 0;
     okMask[b] = 0;
     for( int t = 0; t < L; t++ )
     {
       auto U = [&]( int i, int j ) -> cholesky_float_t& { return mat[cholesky_tri_idx( i, j, numEq ) * L + t]; };
 
-      // factorization, as in fastCholeskyDec
+      // factorization, as in fastCholeskyDec (rows >= s; the subtractions of rows < s are already done)
       bool ok = true;
-      for( int i = 0; i < numEq && ok; i++ )
+      for( int i = s; i < numEq && ok; i++ )
       {
         cholesky_float_t scale = U( i, i );
-        for( int k = 0; k < i; k++ )
+        for( int k = s; k < i; k++ )
         {
           scale -= U( k, i ) * U( k, i );
         }
@@ -10594,7 +10595,7 @@ void AdaptiveLoopFilter::choleskySolveLanes(cholesky_float_t* mat, const cholesk
         for( int j = i + 1; j < numEq; j++ )
         {
           scale = U( i, j );
-          for( int k = 0; k < i; k++ )
+          for( int k = s; k < i; k++ )
           {
             scale -= U( k, j ) * U( k, i );
           }
@@ -10609,11 +10610,18 @@ void AdaptiveLoopFilter::choleskySolveLanes(cholesky_float_t* mat, const cholesk
 
       // forward substitution (U' aux = rhs), as in AlfCovariance::gnsTransposeBacksubstitution
       cholesky_float_t aux[MAX_NUM_ALF_LUMA_COEFF];
-      aux[0] = rhs[t] / U( 0, 0 );
-      for( int i = 1; i < numEq; i++ )
+      for( int i = 0; i < s; i++ )
       {
-        cholesky_float_t sum = 0;
-        for( int j = 0; j < i; j++ )
+        aux[i] = x[i * L + t];
+      }
+      if( s == 0 )
+      {
+        aux[0] = rhs[t] / U( 0, 0 );
+      }
+      for( int i = std::max( s, 1 ); i < numEq; i++ )
+      {
+        cholesky_float_t sum = s > 0 && fsumInit ? fsumInit[b * numEq * L + i * L + t] : 0;
+        for( int j = s; j < i; j++ )
         {
           sum += aux[j] * U( j, i );
         }
