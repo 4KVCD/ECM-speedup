@@ -210,8 +210,8 @@ int main(int argc, char* argv[])
                                     pcEncApp[0]->getMaxLayers(), reason ) )
       {
         const int ret = runSegmentParallel( argc, argv, spc );
+        // no delete: ~EncApp() -> ~EncGOP() dereferences state that only createLib() initializes
         pcEncApp[0]->destroy();
-        delete pcEncApp[0];
         delete[] layerArgv;
         destroyROM();
         return ret;
