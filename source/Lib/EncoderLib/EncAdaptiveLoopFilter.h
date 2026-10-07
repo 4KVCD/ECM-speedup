@@ -65,6 +65,7 @@ struct CandTALF
 
 #define ALF_PRECISION_VARIETY                             (JVET_AG0158_ALF_LUMA_COEFF_PRECISION || JVET_AK0123_ALF_COEFF_RESTRICTION)
 #define ALF_RD_COST_BUG_FIX                               JVET_AK0123_ALF_COEFF_RESTRICTION
+#define ALF_OPT_FILTER_CACHE                              (JVET_AF0177_ALF_COV_FLOAT && JVET_AD0222_ALF_RESI_CLASS && JVET_AN0086_RESIDUAL_CHECK)
 
 struct AlfCovariance
 {
@@ -511,6 +512,29 @@ private:
 #endif
 #if JVET_AI0084_ALF_RESIDUALS_SCALING
   ScaleAlfEnc            m_scaleAlfEncParam[ALF_CTB_MAX_NUM_APS][MAX_NUM_ALF_ALTERNATIVES_LUMA];
+#endif
+#if ALF_OPT_FILTER_CACHE
+  // perf: results of the clipping search (AlfCovariance::optimizeFilter with optimize_clip) within one picture.
+  // The search is a pure function of the covariance contents, the initial clipping and the flags; in random access
+  // about two thirds of the searches of a picture repeat an earlier one with identical inputs (same frame statistics
+  // and class merges; mostly short searches, ~12 % of the search time), so their outputs are reused. Entries are
+  // verified bit by bit, so the reuse is exact.
+  struct OptimizeFilterCacheEntry
+  {
+    uint64_t           hash;
+    std::vector<float> data;
+    float              pixAcc;
+    int                numBins, numCoeff, size;
+    ptrdiff_t          stridey, offsetE;
+    bool               enableLessClip, residualCheck;
+    int                clipIn[MAX_NUM_ALF_LUMA_COEFF];
+    int                clipOut[MAX_NUM_ALF_LUMA_COEFF];
+    float              coeff[MAX_NUM_ALF_LUMA_COEFF];
+    double             err;
+  };
+  std::vector<OptimizeFilterCacheEntry> m_optFilterCache;       // entries [0, m_optFilterCacheSize) are valid
+  size_t                                m_optFilterCacheSize = 0;
+  double optimizeFilterCached( const AlfCovariance& cov, const AlfFilterShape& shape, int* clip, AlfCovariance::Ty f, bool optimizeClip );
 #endif
 
 public:

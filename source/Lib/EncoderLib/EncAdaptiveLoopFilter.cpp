@@ -1704,6 +1704,9 @@ void EncAdaptiveLoopFilter::ALFProcess( CodingStructure& cs, const double *lambd
 )
 {
   int layerIdx = cs.vps == nullptr ? 0 : cs.vps->getGeneralLayerIdx( cs.slice->getPic()->layerId );
+#if ALF_OPT_FILTER_CACHE
+  m_optFilterCacheSize = 0;   // statistics of a new picture: earlier clipping searches will not repeat
+#endif
 
   // IRAP AU is assumed
   if( !layerIdx && ( cs.slice->getPendingRasInit() || cs.slice->isIDRorBLA() ) )
@@ -4049,6 +4052,107 @@ int EncAdaptiveLoopFilter::getCostFilterCoeffForce0( AlfFilterShape& alfShape, i
   return len;
 }
 
+#if ALF_OPT_FILTER_CACHE
+// perf: hash of the 32-bit words of a buffer (four independent multiply-xorshift lanes); only used to find candidate
+// cache entries, which are then compared bit by bit
+static uint64_t alfHashWords( const uint32_t* p, size_t n, uint64_t seed )
+{
+  const uint64_t m = 0x9E3779B97F4A7C15ull;
+  uint64_t       h0 = seed ^ 0x243F6A8885A308D3ull, h1 = seed ^ 0x13198A2E03707344ull, h2 = seed ^ 0xA4093822299F31D0ull, h3 = seed ^ 0x082EFA98EC4E6C89ull;
+  size_t         i = 0;
+  for( ; i + 8 <= n; i += 8 )
+  {
+    h0 = ( h0 ^ ( p[i + 0] | ( (uint64_t) p[i + 1] << 32 ) ) ) * m;
+    h1 = ( h1 ^ ( p[i + 2] | ( (uint64_t) p[i + 3] << 32 ) ) ) * m;
+    h2 = ( h2 ^ ( p[i + 4] | ( (uint64_t) p[i + 5] << 32 ) ) ) * m;
+    h3 = ( h3 ^ ( p[i + 6] | ( (uint64_t) p[i + 7] << 32 ) ) ) * m;
+    h0 ^= h0 >> 29; h1 ^= h1 >> 29; h2 ^= h2 >> 29; h3 ^= h3 >> 29;
+  }
+  for( ; i < n; i++ )
+  {
+    h0 = ( h0 ^ p[i] ) * m;
+    h0 ^= h0 >> 29;
+  }
+  uint64_t h = h0 ^ ( h1 * 0xC2B2AE3D27D4EB4Full ) ^ ( h2 * 0x165667B19E3779F9ull ) ^ ( h3 * 0x27D4EB2F165667C5ull ) ^ n;
+  h ^= h >> 31;
+  h *= m;
+  h ^= h >> 29;
+  return h;
+}
+
+// perf: AlfCovariance::optimizeFilter, with the results of clipping searches reused within a picture when all inputs
+// (covariance contents and layout, error offset, initial clipping, size and flags) are bit-identical to an earlier search
+double EncAdaptiveLoopFilter::optimizeFilterCached( const AlfCovariance& cov, const AlfFilterShape& shape, int* clip, AlfCovariance::Ty f, bool optimizeClip )
+{
+  const bool residualCheck = m_encCfg->getAlfResidualCheckEnabled();
+  if( !optimizeClip )
+  {
+    // a single solve: not worth caching
+    return cov.optimizeFilter( shape, clip, f, optimizeClip, m_enableLessClip, residualCheck );
+  }
+
+  const int size = shape.numCoeff;
+  CHECK( size > MAX_NUM_ALF_LUMA_COEFF, "Too many coefficients" );
+
+  uint64_t hash = alfHashWords( reinterpret_cast<const uint32_t*>( cov.data.data() ), cov.data.size(), 0x5bd1e995ull );
+  uint32_t header[8];
+  std::memcpy( &header[0], &cov.pixAcc, sizeof( float ) );
+  header[1] = (uint32_t) cov.numBins;
+  header[2] = (uint32_t) cov.numCoeff;
+  header[3] = (uint32_t) size;
+  header[4] = (uint32_t) cov.stridey;
+  header[5] = (uint32_t) cov.offsetE;
+  header[6] = ( m_enableLessClip ? 1u : 0u ) | ( residualCheck ? 2u : 0u );
+  header[7] = (uint32_t) cov.data.size();
+  hash = alfHashWords( header, 8, hash );
+  hash = alfHashWords( reinterpret_cast<const uint32_t*>( clip ), size, hash );
+
+  for( size_t i = 0; i < m_optFilterCacheSize; i++ )
+  {
+    const OptimizeFilterCacheEntry& e = m_optFilterCache[i];
+    if( e.hash == hash && e.size == size && e.numBins == cov.numBins && e.numCoeff == cov.numCoeff && e.stridey == cov.stridey
+        && e.offsetE == cov.offsetE && e.enableLessClip == m_enableLessClip && e.residualCheck == residualCheck
+        && std::memcmp( &e.pixAcc, &cov.pixAcc, sizeof( float ) ) == 0 && e.data.size() == cov.data.size()
+        && std::memcmp( e.clipIn, clip, sizeof( int ) * size ) == 0
+        && std::memcmp( e.data.data(), cov.data.data(), sizeof( float ) * cov.data.size() ) == 0 )
+    {
+      std::memcpy( clip, e.clipOut, sizeof( int ) * size );
+      std::memcpy( f, e.coeff, sizeof( float ) * size );
+      return e.err;
+    }
+  }
+
+  int clipIn[MAX_NUM_ALF_LUMA_COEFF];
+  std::memcpy( clipIn, clip, sizeof( int ) * size );
+  const double err = cov.optimizeFilter( shape, clip, f, optimizeClip, m_enableLessClip, residualCheck );
+
+  static const size_t maxEntries = 1024;
+  if( m_optFilterCacheSize < maxEntries )
+  {
+    if( m_optFilterCache.size() <= m_optFilterCacheSize )
+    {
+      m_optFilterCache.resize( m_optFilterCacheSize + 1 );
+    }
+    OptimizeFilterCacheEntry& e = m_optFilterCache[m_optFilterCacheSize++];
+    e.hash           = hash;
+    e.data           = cov.data;
+    e.pixAcc         = cov.pixAcc;
+    e.numBins        = cov.numBins;
+    e.numCoeff       = cov.numCoeff;
+    e.size           = size;
+    e.stridey        = cov.stridey;
+    e.offsetE        = cov.offsetE;
+    e.enableLessClip = m_enableLessClip;
+    e.residualCheck  = residualCheck;
+    std::memcpy( e.clipIn, clipIn, sizeof( int ) * size );
+    std::memcpy( e.clipOut, clip, sizeof( int ) * size );
+    std::memcpy( e.coeff, f, sizeof( float ) * size );
+    e.err = err;
+  }
+  return err;
+}
+#endif
+
 #if ALF_IMPROVEMENT
 #if ALF_PRECISION_VARIETY
 void EncAdaptiveLoopFilter::deriveCoeffQuantMultipleBitDepths(int *filterClipp, const AlfCovariance& cov, const AlfFilterShape& shape, const bool optimizeClip, int filtIdx, double errorTabForce0Coeff[m_alfPrecisionVariety][MAX_NUM_ALF_CLASSES][2], double lambda, bool tryImproveScale)
@@ -4062,7 +4166,9 @@ void EncAdaptiveLoopFilter::deriveCoeffQuantMultipleBitDepths(int *filterClipp, 
   double    filterCoeff[MAX_NUM_ALF_LUMA_COEFF];
 #endif
 
-#if JVET_AD0222_ALF_RESI_CLASS
+#if ALF_OPT_FILTER_CACHE
+  optimizeFilterCached( cov, shape, filterClipp, filterCoeff, optimizeClip );
+#elif JVET_AD0222_ALF_RESI_CLASS
   cov.optimizeFilter( shape, filterClipp, filterCoeff, optimizeClip, m_enableLessClip 
 #if JVET_AN0086_RESIDUAL_CHECK
   , m_encCfg->getAlfResidualCheckEnabled()
@@ -4840,7 +4946,9 @@ double EncAdaptiveLoopFilter::deriveCoeffQuant(int* filterClipp, int* filterCoef
   double cAc, bc, coeffDelta;
   static double cA[MAX_NUM_ALF_LUMA_COEFF];
 #endif
-#if JVET_AD0222_ALF_RESI_CLASS
+#if ALF_OPT_FILTER_CACHE
+  optimizeFilterCached( cov, shape, filterClipp, filterCoeff, optimizeClip );
+#elif JVET_AD0222_ALF_RESI_CLASS
   cov.optimizeFilter( shape, filterClipp, filterCoeff, optimizeClip, m_enableLessClip 
 #if JVET_AN0086_RESIDUAL_CHECK
   , m_encCfg->getAlfResidualCheckEnabled()
@@ -5003,7 +5111,9 @@ double EncAdaptiveLoopFilter::deriveCoeffForTAlfQuant(int* filterClipp, int* fil
   double cAc, bc, coeffDelta;
   static double cA[MAX_NUM_ALF_LUMA_COEFF];
 #endif
-#if JVET_AD0222_ALF_RESI_CLASS
+#if ALF_OPT_FILTER_CACHE
+  optimizeFilterCached( cov, shape, filterClipp, filterCoeff, optimizeClip );
+#elif JVET_AD0222_ALF_RESI_CLASS
   cov.optimizeFilter( shape, filterClipp, filterCoeff, optimizeClip, m_enableLessClip 
 #if JVET_AN0086_RESIDUAL_CHECK
   , m_encCfg->getAlfResidualCheckEnabled()
