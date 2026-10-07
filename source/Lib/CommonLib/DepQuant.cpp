@@ -2132,7 +2132,7 @@ const CtxSet &ctxSetGt4 = isLfnst ? Ctx::GtxFlagL[6 + chType] : Ctx::GtxFlag[6 +
     State     m_startState;
     Quantizer m_quant;
 #if TCQ_8STATES
-    Decision m_trellis[MAX_TB_SIZEY * MAX_TB_SIZEY * 16];
+    Decision m_trellis[MAX_TB_SIZEY * MAX_TB_SIZEY * 8];
 #else
     Decision m_trellis[MAX_TB_SIZEY * MAX_TB_SIZEY][8];
 #endif
@@ -2186,13 +2186,10 @@ const CtxSet &ctxSetGt4 = isLfnst ? Ctx::GtxFlagL[6 + chType] : Ctx::GtxFlag[6 +
     std::numeric_limits<int64_t>::max() >> 2, l, p                                                                     \
   }
 #if TCQ_8STATES
-  static const Decision startDec[2][16] = {
-    { DINIT(-1, -2), DINIT(-1, -2), DINIT(-1, -2), DINIT(-1, -2), DINIT(0, 4), DINIT(0, 5), DINIT(0, 6), DINIT(0, 7),
-      DINIT(0, 0), DINIT(0, 0), DINIT(0, 0), DINIT(0, 0), DINIT(0, 0), DINIT(0, 0), DINIT(0, 0), DINIT(0, 0) },
-    { DINIT(-1, -2), DINIT(-1, -2), DINIT(-1, -2), DINIT(-1, -2), DINIT(-1, -2), DINIT(-1, -2), DINIT(-1, -2),
-      DINIT(-1, -2), DINIT(0, 8), DINIT(0, 9), DINIT(0, 10), DINIT(0, 11), DINIT(0, 12), DINIT(0, 13), DINIT(0, 14),
-      DINIT(0, 15) }
-  };
+  // A trellis stage holds one decision per state. A decision for a skipped sub-block refers to state
+  // numStates + k; the backtracking resolves it directly to state k at the end of the next sub-block
+  // (the original stored a chain of (0, numStates + k) entries for that, i.e. twice the decisions per stage).
+  static const Decision startDec = DINIT(-1, -2);
 #else
   static const Decision startDec[8] = { DINIT(-1, -2), DINIT(-1, -2), DINIT(-1, -2), DINIT(-1, -2),
                                         DINIT(0, 4),   DINIT(0, 5),   DINIT(0, 6),   DINIT(0, 7) };
@@ -2221,7 +2218,10 @@ const CtxSet &ctxSetGt4 = isLfnst ? Ctx::GtxFlagL[6 + chType] : Ctx::GtxFlag[6 +
 #endif
   {
 #if TCQ_8STATES
-    ::memcpy(decisions, startDec[numStates >> 3], (numStates << 1) * sizeof(Decision));
+    for (int k = 0; k < numStates; k++)
+    {
+      decisions[k] = startDec;
+    }
 #else
     ::memcpy(decisions, startDec, 8 * sizeof(Decision));
 #endif
@@ -2284,10 +2284,15 @@ const CtxSet &ctxSetGt4 = isLfnst ? Ctx::GtxFlagL[6 + chType] : Ctx::GtxFlag[6 +
       m_skipStates[1].checkRdCostSkipSbb(decisions[1], numStates);
       m_skipStates[2].checkRdCostSkipSbb(decisions[2], numStates);
       m_skipStates[3].checkRdCostSkipSbb(decisions[3], numStates);
-      m_skipStates[4].checkRdCostSkipSbb(decisions[4], numStates);
-      m_skipStates[5].checkRdCostSkipSbb(decisions[5], numStates);
-      m_skipStates[6].checkRdCostSkipSbb(decisions[6], numStates);
-      m_skipStates[7].checkRdCostSkipSbb(decisions[7], numStates);
+      // (with 4 states the stock code also "checked" decisions[4..7], which were overwritten by the copy at the
+      // end of the sub-block; a stage now only holds numStates decisions)
+      if (numStates > 4)
+      {
+        m_skipStates[4].checkRdCostSkipSbb(decisions[4], numStates);
+        m_skipStates[5].checkRdCostSkipSbb(decisions[5], numStates);
+        m_skipStates[6].checkRdCostSkipSbb(decisions[6], numStates);
+        m_skipStates[7].checkRdCostSkipSbb(decisions[7], numStates);
+      }
 #else
       m_skipStates[0].checkRdCostSkipSbb(decisions[0]);
       m_skipStates[1].checkRdCostSkipSbb(decisions[1]);
@@ -2334,7 +2339,7 @@ const CtxSet &ctxSetGt4 = isLfnst ? Ctx::GtxFlagL[6 + chType] : Ctx::GtxFlag[6 +
 #endif
   {
 #if TCQ_8STATES
-    Decision *decisions = m_trellis + scanInfo.scanIdx * (numStates << 1);
+    Decision *decisions = m_trellis + scanInfo.scanIdx * numStates;
 #else
     Decision *decisions = m_trellis[scanInfo.scanIdx];
 #endif
@@ -2387,7 +2392,6 @@ const CtxSet &ctxSetGt4 = isLfnst ? Ctx::GtxFlagL[6 + chType] : Ctx::GtxFlag[6 +
           m_currStates[7].updateStateEOS(scanInfo, m_prevStates, m_skipStates, decisions[7], numStates);
         }
 #endif
-        ::memcpy(decisions + numStates, decisions, numStates * sizeof(Decision));
 #else
         m_currStates[0].updateStateEOS(scanInfo, m_prevStates, m_skipStates, decisions[0]);
         m_currStates[1].updateStateEOS(scanInfo, m_prevStates, m_skipStates, decisions[1]);
@@ -2934,13 +2938,25 @@ const CtxSet &ctxSetGt4 = isLfnst ? Ctx::GtxFlagL[6 + chType] : Ctx::GtxFlag[6 +
     //===== backward scanning =====
     int scanIdx = 0;
 #if TCQ_8STATES
-    for (const Decision *trellisStage = m_trellis; decision.prevId >= 0; scanIdx++, trellisStage += (numStates << 1))
+    for (const Decision *trellisStage = m_trellis; decision.prevId >= 0; scanIdx++, trellisStage += numStates)
 #else
     for (; decision.prevId >= 0; scanIdx++)
 #endif
     {
 #if TCQ_8STATES
-      decision = trellisStage[decision.prevId];
+      if (decision.prevId >= numStates)
+      {
+        // skipped sub-block (decided at its first scan position): its coefficients stay zero; continue with
+        // state prevId - numStates at the first scan position of the next sub-block
+        const int skip = tuPars.m_sbbSize - 1;
+        scanIdx += skip;
+        trellisStage += skip * numStates;
+        decision = trellisStage[decision.prevId - numStates];
+      }
+      else
+      {
+        decision = trellisStage[decision.prevId];
+      }
 #else
       decision = m_trellis[scanIdx][decision.prevId];
 #endif
