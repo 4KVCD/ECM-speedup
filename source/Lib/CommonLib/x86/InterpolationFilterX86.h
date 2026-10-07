@@ -3336,35 +3336,6 @@ static void simdInterpolateN2_10BIT_M4(const int16_t* src, int srcStride, int16_
   }
 }
 
-#if ECM_IF_STATS
-#include <cstdio>
-#include <map>
-#include <mutex>
-#include <tuple>
-struct IfStats
-{
-  std::map<std::tuple<int, int, int, int, int, int, int, int>, long long> m;
-  std::mutex mu;
-  ~IfStats()
-  {
-    FILE* f = fopen( "ifstats.txt", "w" );
-    for( auto& kv : m )
-    {
-      auto& k = kv.first;
-      fprintf( f, "%s N=%2d w=%3d h=%3d ver=%d first=%d last=%d bi=%d : %lld\n", std::get<0>( k ) ? "SCALAR" : "all   ", std::get<1>( k ),
-               std::get<2>( k ), std::get<3>( k ), std::get<4>( k ), std::get<5>( k ), std::get<6>( k ), std::get<7>( k ), kv.second );
-    }
-    fclose( f );
-  }
-};
-static inline IfStats& ifStats() { static IfStats s; return s; }
-static inline void ifStatsCount( int scalar, int N, int w, int h, int ver, int first, int last, int bi )
-{
-  std::lock_guard<std::mutex> l( ifStats().mu );
-  ifStats().m[std::make_tuple( scalar, N, w, h, ver, first, last, bi )]++;
-}
-#endif
-
 // perf: 1- and 2-sample wide blocks (template rows/columns of the sub-block and template-matching tools, chroma of
 // small blocks) were filtered by the scalar loop below; tens of millions of calls per frame. Each output sample is a
 // dot product of N taps; with the taps contiguous in memory it maps onto pmaddwd. Loads cover exactly the taps (no
@@ -3510,9 +3481,6 @@ static void simdFilterNarrow( const ClpRng& clpRng, const Pel* src, int srcStrid
 template<X86_VEXT vext, int N, bool isVertical, bool isFirst, bool isLast>
 static void simdFilter( const ClpRng& clpRng, Pel const *src, int srcStride, Pel *dst, int dstStride, int width, int height, TFilterCoeff const *coeff, bool biMCForDMVR)
 {
-#if ECM_IF_STATS
-  ifStatsCount( 0, N, width, height, isVertical, isFirst, isLast, biMCForDMVR );
-#endif
   int row, col;
 #if JVET_Z0117_CHROMA_IF
   bool issym = false;
