@@ -5824,15 +5824,22 @@ void EncAdaptiveLoopFilter::mergeClassesLinearBatched( AlfCovariance* cov, AlfCo
   int    cls1[MAX_NUM_ALF_CLASSES * MAX_NUM_ALF_CLASSES / 2 + MAX_NUM_ALF_CLASSES];
   int    cls2[MAX_NUM_ALF_CLASSES * MAX_NUM_ALF_CLASSES / 2 + MAX_NUM_ALF_CLASSES];
   double sysErr[MAX_NUM_ALF_CLASSES * MAX_NUM_ALF_CLASSES / 2 + MAX_NUM_ALF_CLASSES];
-  auto   solveSystems = [&]( const int numSys ) {
+  static thread_local std::vector<float> sysX;
+  sysX.resize( ( MAX_NUM_ALF_CLASSES * MAX_NUM_ALF_CLASSES / 2 + MAX_NUM_ALF_CLASSES ) * n );
+  int    sysList[MAX_NUM_ALF_CLASSES * MAX_NUM_ALF_CLASSES / 2 + MAX_NUM_ALF_CLASSES];
+  // solves the systems sysList[0 .. num - 1] (AlfCovariance::gnsSolveByChol: if regularize, those of the regularized
+  // matrices, diagonal + REG); solutions to sysX, returns the number of systems whose factorization failed, which are
+  // moved to the front of sysList
+  auto   solveList = [&]( const int num, const bool regularize ) {
     int okMask[maxBatches];
-    for( int s0 = 0; s0 < numSys; s0 += maxBatches * L )
+    int numFailed = 0;
+    for( int s0 = 0; s0 < num; s0 += maxBatches * L )
     {
-      const int cnt = std::min( numSys - s0, maxBatches * L );
+      const int cnt = std::min( num - s0, maxBatches * L );
       const int nb  = ( cnt + L - 1 ) / L;
       for( int u = 0; u < nb * L; u++ )
       {
-        const int    s  = s0 + std::min( u, cnt - 1 );   // unused lanes repeat the last system
+        const int    s  = sysList[s0 + std::min( u, cnt - 1 )];   // unused lanes repeat the last system
         const float* e1 = statE.data() + cls1[s] * triSize;
         const float* y1 = statY.data() + cls1[s] * n;
         float*       m  = mat + ( u / L ) * matSize + ( u % L );
@@ -5861,53 +5868,65 @@ void EncAdaptiveLoopFilter::mergeClassesLinearBatched( AlfCovariance* cov, AlfCo
             r[k * L] = y1[k];
           }
         }
+        if( regularize )
+        {
+          for( int k = 0; k < n; k++ )
+          {
+            m[cholesky_tri_idx( k, k, n ) * L] += REG;
+          }
+        }
       }
 
       m_choleskySolveLanes( mat, rhs, x, n, nb, okMask );
 
       for( int u = 0; u < cnt; u++ )
       {
-        const int s = s0 + u;
+        const int s = sysList[s0 + u];
         const int b = u / L, t = u % L;
-        float     ySum[MAX_NUM_ALF_LUMA_COEFF];
-        AlfCovariance::Ty f;
-        const float pix = cls2[s] >= 0 ? statP[cls1[s]] + statP[cls2[s]] : statP[cls1[s]];
-        for( int k = 0; k < n; k++ )
-        {
-          ySum[k] = rhs[b * n * L + k * L + t];
-        }
         if( ( okMask[b] >> t ) & 1 )
         {
           for( int k = 0; k < n; k++ )
           {
-            f[k] = x[b * n * L + k * L + t];
+            sysX[s * n + k] = x[b * n * L + k * L + t];
           }
         }
         else
         {
-          // singular: regularized solve of AlfCovariance::gnsSolveByChol
-          AlfCovariance::TE lhs;
-          AlfCovariance::Ty rhsS;
-          const float*      e1 = statE.data() + cls1[s] * triSize;
-          const float*      e2 = cls2[s] >= 0 ? statE.data() + cls2[s] * triSize : nullptr;
-          for( int k = 0; k < n; k++ )
-          {
-            for( int l = k; l < n; l++ )
-            {
-              const int idx = cholesky_tri_idx( k, l, n );
-              lhs[k][l]     = e2 ? e1[idx] + e2[idx] : e1[idx];
-            }
-            rhsS[k] = ySum[k];
-          }
-          tmpCov.gnsSolveByChol( lhs, rhsS, f, n, false );
+          sysList[numFailed++] = s;
         }
-        double sum = 0;   // AlfCovariance::calculateError
-        for( int k = 0; k < n; k++ )
-        {
-          sum += f[k] * ySum[k];
-        }
-        sysErr[s] = pix - sum;
       }
+    }
+    return numFailed;
+  };
+  // errors (AlfCovariance::calculateError) of the systems 0 .. numSys - 1
+  auto solveSystems = [&]( const int numSys ) {
+    for( int s = 0; s < numSys; s++ )
+    {
+      sysList[s] = s;
+    }
+    int numFailed = solveList( numSys, false );
+    if( numFailed )
+    {
+      // singular: regularized solve of AlfCovariance::gnsSolveByChol, solution 0 if that fails too
+      numFailed = solveList( numFailed, true );
+      for( int i = 0; i < numFailed; i++ )
+      {
+        std::fill_n( sysX.data() + sysList[i] * n, n, 0.0f );
+      }
+    }
+    for( int s = 0; s < numSys; s++ )
+    {
+      const float  pix = cls2[s] >= 0 ? statP[cls1[s]] + statP[cls2[s]] : statP[cls1[s]];
+      const float* y1  = statY.data() + cls1[s] * n;
+      const float* y2  = cls2[s] >= 0 ? statY.data() + cls2[s] * n : nullptr;
+      const float* f   = sysX.data() + s * n;
+      double       sum = 0;
+      for( int k = 0; k < n; k++ )
+      {
+        const float yk = y2 ? y1[k] + y2[k] : y1[k];
+        sum += f[k] * yk;
+      }
+      sysErr[s] = pix - sum;
     }
   };
 
