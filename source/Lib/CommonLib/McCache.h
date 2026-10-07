@@ -143,9 +143,16 @@ public:
     m_writePos += size;
   }
 
+  // only worth it when recomputing is clearly more expensive than a lookup: 2-D interpolation of larger blocks
+  static bool worthCaching( int width, int height, int xFrac, int yFrac )
+  {
+    return xFrac != 0 && yFrac != 0 && width * height >= 64;
+  }
+
 private:
-  static constexpr int      LOG2_SLOTS = 17;
-  static constexpr uint64_t ARENA_SIZE = uint64_t( 1 ) << 24;   // samples (32 MB)
+  // small enough to stay cache resident: a lookup that misses the CPU caches costs as much as a small interpolation
+  static constexpr int      LOG2_SLOTS = 13;
+  static constexpr uint64_t ARENA_SIZE = uint64_t( 1 ) << 21;   // samples (4 MB)
 
   struct Slot
   {
