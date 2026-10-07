@@ -772,17 +772,25 @@ template <class BinProbModel>
 CtxStore<BinProbModel>::CtxStore( bool dummy )
   : m_ctxBuffer ( ContextSetCfg::NumberOfContexts )
   , m_ctx       ( m_ctxBuffer.data() )
-{}
+{
+  initTracking();
+}
 
 template <class BinProbModel>
 CtxStore<BinProbModel>::CtxStore( const CtxStore<BinProbModel>& ctxStore )
   : m_ctxBuffer ( ctxStore.m_ctxBuffer )
-  , m_ctx       ( m_ctxBuffer.data() )
-{}
+  , m_ctx       ( m_ctxBuffer.empty() ? nullptr : m_ctxBuffer.data() )
+{
+  if( m_ctx )
+  {
+    initTracking();
+  }
+}
 
 template <class BinProbModel>
 void CtxStore<BinProbModel>::init( int qp, int initId )
 {
+  invalidateTracking();
   const std::vector<uint8_t>& initTable = ContextSetCfg::getInitTable( initId );
   CHECK( m_ctxBuffer.size() != initTable.size(),
         "Size of init table (" << initTable.size() << ") does not match size of context buffer (" << m_ctxBuffer.size() << ")." );
@@ -860,6 +868,7 @@ void CtxStore<BinProbModel>::saveRateOffsets( std::vector<uint8_t>& rateOffset0,
 template <class BinProbModel>
 void CtxStore<BinProbModel>::loadRateOffsets( const std::vector<uint8_t>& rateOffset0, const std::vector<uint8_t>& rateOffset1 )
 {
+  invalidateTracking();
   CHECK( m_ctxBuffer.size() != rateOffset0.size(),
     "Size of prob states table (" << rateOffset0.size() << ") does not match size of context buffer (" << m_ctxBuffer.size() << ")." );
 
@@ -888,6 +897,7 @@ void CtxStore<BinProbModel>::saveWinSizes( std::vector<uint8_t>& windows ) const
 template <class BinProbModel>
 void CtxStore<BinProbModel>::loadWinSizes( const std::vector<uint8_t>& windows )
 {
+  invalidateTracking();
   CHECK( m_ctxBuffer.size() != windows.size(),
          "Size of prob states table (" << windows.size() << ") does not match size of context buffer (" << m_ctxBuffer.size() << ")." );
   for( std::size_t k = 0; k < m_ctxBuffer.size(); k++ )
@@ -899,6 +909,7 @@ void CtxStore<BinProbModel>::loadWinSizes( const std::vector<uint8_t>& windows )
 template <class BinProbModel>
 void CtxStore<BinProbModel>::loadWeights( const std::vector<uint8_t>& weights )
 {
+  invalidateTracking();
   CHECK( m_ctxBuffer.size() != weights.size(),
          "Size of prob states table (" << weights.size() << ") does not match size of context buffer (" << m_ctxBuffer.size() << ")." );
   for( std::size_t k = 0; k < m_ctxBuffer.size(); k++ )
@@ -921,6 +932,7 @@ void CtxStore<BinProbModel>::saveWeights( std::vector<uint8_t>& weights ) const
 template <class BinProbModel>
 void CtxStore<BinProbModel>::loadPStates( const std::vector<std::pair<uint16_t, uint16_t>>& probStates )
 {
+  invalidateTracking();
   CHECK( m_ctxBuffer.size() != probStates.size(),
          "Size of prob states table (" << probStates.size() << ") does not match size of context buffer (" << m_ctxBuffer.size() << ")." );
   for( std::size_t k = 0; k < m_ctxBuffer.size(); k++ )
@@ -950,6 +962,7 @@ void CtxStore<BinProbModel>::savePStates( std::vector<std::pair<uint16_t, uint16
 template <class BinProbModel>
 void CtxStore<BinProbModel>::loadPStates( const std::vector<uint16_t>& probStates )
 {
+  invalidateTracking();
   CHECK( m_ctxBuffer.size() != probStates.size(),
         "Size of prob states table (" << probStates.size() << ") does not match size of context buffer (" << m_ctxBuffer.size() << ")." );
   for( std::size_t k = 0; k < m_ctxBuffer.size(); k++ )

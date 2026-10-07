@@ -913,17 +913,51 @@ public:
   CtxStore( bool dummy );
   CtxStore( const CtxStore<BinProbModel>& ctxStore );
 public:
+  CtxStore& operator=( const CtxStore<BinProbModel>& ) = delete;
+
   void copyFrom(const CtxStore<BinProbModel>& src)
   {
     checkInit();
+    if( &src == this )
+    {
+      return;
+    }
+    // perf: the RD search restores the same snapshot again and again (e.g. once per tested mode); if this store
+    // was last made identical to src and src is unchanged since, only the entries written here since then differ
+    if( m_peer == &src && m_peerGen == src.m_gen )
+    {
+      if( !m_dirtyList.empty() )
+      {
+        for( const uint16_t id : m_dirtyList )
+        {
+          m_ctx[id]     = src.m_ctx[id];
+          m_isDirty[id] = 0;
+        }
+        m_dirtyList.clear();
+        m_gen = ++s_gen;
+      }
+      return;
+    }
     std::copy_n(reinterpret_cast<const char*>(src.m_ctx), sizeof(BinProbModel) * ContextSetCfg::NumberOfContexts,
       reinterpret_cast<char*>(m_ctx));
+    // both stores are identical now: track the changes of each one relative to the other
+    clearDirty();
+    m_gen         = ++s_gen;
+    m_peer        = &src;
+    m_peerGen     = src.m_gen;
+    src.clearDirty();
+    src.m_peer    = this;
+    src.m_peerGen = m_gen;
   }
   void copyFrom(const CtxStore<BinProbModel>& src, const CtxSet& ctxSet)
   {
     checkInit();
     std::copy_n(reinterpret_cast<const char*>(src.m_ctx + ctxSet.Offset), sizeof(BinProbModel) * ctxSet.Size,
       reinterpret_cast<char*>(m_ctx + ctxSet.Offset));
+    for( unsigned id = ctxSet.Offset; id < ctxSet.Offset + ctxSet.Size; id++ )
+    {
+      markDirty( id );
+    }
   }
   void init(int qp, int initId);
 #if JVET_Z0135_TEMP_CABAC_WIN_WEIGHT
@@ -953,6 +987,10 @@ public:
     {
       const BinStoreElem& store = vector[ ctxType ];
 
+      if( store.count )
+      {
+        markDirty( store.ctxId );
+      }
       for ( int i = 0; i < store.count; i++ )
       {
         m_ctxBuffer[ store.ctxId ].updateShortWin( store.bin(i) );
@@ -962,17 +1000,61 @@ public:
 #endif
 
   const BinProbModel& operator[]      ( unsigned  ctxId  )  const { return m_ctx[ctxId]; }
-  BinProbModel&       operator[]      ( unsigned  ctxId  )        { return m_ctx[ctxId]; }
+  BinProbModel&       operator[]      ( unsigned  ctxId  )        { markDirty( ctxId ); return m_ctx[ctxId]; }
   uint32_t            estFracBits     ( unsigned  bin,
                                         unsigned  ctxId  )  const { return m_ctx[ctxId].estFracBits(bin); }
 
   BinFracBits         getFracBitsArray( unsigned  ctxId  )  const { return m_ctx[ctxId].getFracBitsArray(); }
 
 private:
-  inline void checkInit() { if( m_ctx ) return; m_ctxBuffer.resize( ContextSetCfg::NumberOfContexts ); m_ctx = m_ctxBuffer.data(); }
+  inline void checkInit() { if( m_ctx ) return; m_ctxBuffer.resize( ContextSetCfg::NumberOfContexts ); m_ctx = m_ctxBuffer.data(); initTracking(); }
+
+  // Change tracking for copyFrom(). Invariant: if m_peer != nullptr and m_peerGen == m_peer->m_gen, this store
+  // differs from *m_peer at most in the entries listed in m_dirtyList. m_gen gets a new globally unique value
+  // whenever the content changes in a way not recorded in m_dirtyList, and on the first write to an entry after a
+  // synchronization (both stores' lists are cleared then, so every later write to either one is a first write).
+  inline void initTracking()
+  {
+    m_isDirty.assign( m_ctxBuffer.size(), 0 );
+    m_dirtyList.clear();
+    m_dirtyList.reserve( m_ctxBuffer.size() );
+    m_peer = nullptr;
+    m_gen  = ++s_gen;
+  }
+  inline void markDirty( unsigned id )
+  {
+    if( !m_isDirty[id] )
+    {
+      m_isDirty[id] = 1;
+      m_dirtyList.push_back( (uint16_t) id );
+      m_gen = ++s_gen;
+    }
+  }
+  inline void clearDirty() const
+  {
+    for( const uint16_t id : m_dirtyList )
+    {
+      m_isDirty[id] = 0;
+    }
+    m_dirtyList.clear();
+  }
+  inline void invalidateTracking()
+  {
+    clearDirty();
+    m_peer = nullptr;
+    m_gen  = ++s_gen;
+  }
+
 private:
   std::vector<BinProbModel> m_ctxBuffer;
   BinProbModel*             m_ctx;
+
+  mutable std::vector<uint8_t>  m_isDirty;
+  mutable std::vector<uint16_t> m_dirtyList;
+  mutable const CtxStore*       m_peer    = nullptr;
+  mutable uint64_t              m_peerGen = 0;
+  uint64_t                      m_gen     = 0;
+  static inline uint64_t        s_gen     = 0;
 };
 
 
