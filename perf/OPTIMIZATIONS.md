@@ -36,10 +36,13 @@ Benchmark suite (`perf/bench.py`)
 | 6 | sparse CABAC context restore (dirty tracking) - **reverted**: only 20-39 % of the 6.5 M context copies per frame qualified, no measurable gain | yes | ~0 % | |
 | 7 | stable sorts of short lists without heap temporaries; reused sign-prediction buffer | yes | +1.2 % | |
 | 8 | ALF covariance statistics with SSE over independent float accumulators | yes | +1.8 % | |
-| 9 | cache of motion-compensation interpolation results within a picture (54 % of MC calls repeated) | yes | pending | |
-| 10 | template interpolations share the MC cache (56 % of 22.6 M template calls repeated) | yes | pending | |
+| 9-11 | MC / template interpolation result cache (54-56 % of calls repeat identical inputs) - three variants, **reverted**: the repeated calls are the cheap ones, lookup + arena traffic cost as much as recomputing | yes | ~0 % | |
+| 12 | copy only the used entries of the HMVP/CCP/EIP history tables (15+5.6+3.2 KB per coding-structure init) | yes | +0.5 % | |
+| - | clang 23 + ThinLTO instead of GCC: AI +1.5 %, but inter coding crashes (UB-sensitive) - dropped | - | - | |
 
-Code steps 4-8 together: +6.5 % on top of LTO (product of the paired ratios).
+Paired totals (both builds run each test at the same time):
+- code steps 4-12 on top of PGO: `pgo` -> `best`: **+5.8 %** (every test 1.05-1.07x)
+- stock -> `best` (LTO + PGO + code steps): **1.15x** (every test 1.13-1.17x, wall and CPU)
 
 ## Segment-parallel encoding (`--ParallelSegments=N`)
 
@@ -47,12 +50,14 @@ Chunks of whole intra periods are encoded by concurrent child processes and join
 each later chunk dropped, POC LSBs rebased at RBSP level). Verified byte-identical to the sequential encode:
 RA 65 frames (2 chunks), AI 9 frames (4 chunks) incl. reconstruction.
 
-Stock serial baselines for the long tests (measured under background load, CPU time is the reliable number):
+| test | coded frames | stock serial | best, 8 segments | wall-clock speedup | bit-exact |
+|---|---|---|---|---|---|
+| ra_long (foreman 128x128 crop, RA, QP 32, intra period 32) | 257 | 6011 s (5929 s CPU) | 1090.6 s (8 chunks) | **5.51x** | yes |
+| ai_long (foreman 128x128 crop, AI, QP 32, 257 input frames, TemporalSubsampleRatio 8) | 33 | 579.2 s | pending | | |
 
-| test | frames | stock wall | stock CPU |
-|---|---|---|---|
-| ra_long (foreman 128x128 crop, RA, QP 32) | 257 | 6011 s | 5929 s |
-| ai_long (foreman 128x128 crop, AI, QP 32) | 65 | 242 s | 226 s |
+RA parallel efficiency is ~60 % (1.15x single-thread x 8 workers would be 9.2x): shared L3/DRAM bandwidth,
+lower all-core turbo, one duplicated intra frame per chunk, unequal chunk complexity. With intra period 32 a
+257-frame sequence has only 8 chunks, so hyperthreads cannot be used.
 
 ## Notes
 - GCC 16 needed two build fixes (missing `<cstdint>`; `-fno-aggressive-loop-optimizations`, because
