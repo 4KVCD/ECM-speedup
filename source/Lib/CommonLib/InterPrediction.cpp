@@ -56,6 +56,30 @@
 #include "CommonDefX86.h"
 #endif
 
+
+// perf: clipMv is a function pointer (clipMvInPic or clipMvInSubPic), so the per-sub-block calls in this file could not
+// be inlined. clipMvInl does the same as clipMvInPic (same expressions) when clipMv points to it and wrap-around is
+// off, and calls clipMv otherwise.
+static inline void clipMvInl( Mv& rcMv, const Position& pos, const Size& size, const SPS& sps, const PPS& pps )
+{
+  if( clipMv != clipMvInPic || sps.getWrapAroundEnabledFlag() )
+  {
+    clipMv( rcMv, pos, size, sps, pps );
+    return;
+  }
+  const int mvShift = MV_FRACTIONAL_BITS_INTERNAL;
+  int       offset  = 8;
+#if JVET_AA0096_MC_BOUNDARY_PADDING
+  offset += MC_PAD_SIZE;
+#endif
+  const int horMax = ( pps.getPicWidthInLumaSamples() + offset - (int) pos.x - 1 ) << mvShift;
+  const int horMin = ( -(int) sps.getMaxCUWidth() - offset - (int) pos.x + 1 ) << mvShift;
+  const int verMax = ( pps.getPicHeightInLumaSamples() + offset - (int) pos.y - 1 ) << mvShift;
+  const int verMin = ( -(int) sps.getMaxCUHeight() - offset - (int) pos.y + 1 ) << mvShift;
+  rcMv.setHor( std::min( horMax, std::max( horMin, rcMv.getHor() ) ) );
+  rcMv.setVer( std::min( verMax, std::max( verMin, rcMv.getVer() ) ) );
+}
+
 #if JVET_AL0079_AFFINE_MC
 #if defined( __SSE2__ )
 #include <emmintrin.h>
@@ -1761,7 +1785,7 @@ void InterPrediction::xSubPuBio(PredictionUnit& pu, PelUnitBuf& predBuf, const R
       }
       else
       {
-        clipMv(cMv, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
+        clipMvInl(cMv, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
       }
 
       int width = predBuf.bufs[compID].width + (filtersize - 1);
@@ -1912,7 +1936,7 @@ void InterPrediction::xPredInterUni(const PredictionUnit &pu, const RefPicList &
               *pu.cs->pps, 6);
           }
 #endif
-          clipMv(mv[0], pu.lumaPos().offset(-(BIO_EXTEND_SIZE + 1), -(BIO_EXTEND_SIZE + 1)), pu.lumaSize(), sps,
+          clipMvInl(mv[0], pu.lumaPos().offset(-(BIO_EXTEND_SIZE + 1), -(BIO_EXTEND_SIZE + 1)), pu.lumaSize(), sps,
                  *pu.cs->pps);
         }
         else
@@ -1923,10 +1947,10 @@ void InterPrediction::xPredInterUni(const PredictionUnit &pu, const RefPicList &
             clipMv2(mvHighPrec[0], pu.lumaPos(), pu.lumaSize(), sps, *pu.cs->pps, 6);
           }
 #endif
-          clipMv(mv[0], pu.lumaPos(), pu.lumaSize(), sps, *pu.cs->pps);
+          clipMvInl(mv[0], pu.lumaPos(), pu.lumaSize(), sps, *pu.cs->pps);
         }
 #else
-        clipMv( mv[0], pu.cu->lumaPos(), pu.cu->lumaSize(), sps, *pu.cs->pps );
+        clipMvInl( mv[0], pu.cu->lumaPos(), pu.cu->lumaSize(), sps, *pu.cs->pps );
 #endif
       }
     }
@@ -5137,7 +5161,7 @@ void InterPrediction::xPredInterBlk ( const ComponentID& compID, const Predictio
         }
         else
         {
-          clipMv(mvCurrClip, pu.lumaPos(), pu.lumaSize(), *pu.cu->cs->sps, *pu.cu->cs->pps);
+          clipMvInl(mvCurrClip, pu.lumaPos(), pu.lumaSize(), *pu.cu->cs->sps, *pu.cu->cs->pps);
         }
 #if JVET_AF0190_RPR_TMP_REORDER_LIC
         xLocalIlluComp(pu, compID, *refPic, mvCurrClip, bi, dstBuf, wrapRef, &scalingRatio);
@@ -5160,7 +5184,7 @@ void InterPrediction::xPredInterBlk ( const ComponentID& compID, const Predictio
         }
         else
         {
-          clipMv(mvClip, pu.lumaPos(), pu.lumaSize(), *pu.cu->cs->sps, *pu.cu->cs->pps);
+          clipMvInl(mvClip, pu.lumaPos(), pu.lumaSize(), *pu.cu->cs->sps, *pu.cu->cs->pps);
         }
 #if JVET_AF0190_RPR_TMP_REORDER_LIC
         xLocalIlluComp(pu, compID, *refPic, mvClip, bi, dstBuf, wrapRef, &scalingRatio);
@@ -6072,7 +6096,7 @@ void InterPrediction::xPredAffineBlk(const ComponentID &compID, const Prediction
 #endif
             {
 #if JVET_AJ0158_SUBBLOCK_INTER_EXTENSION
-              clipMv(tmpMv, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
+              clipMvInl(tmpMv, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
 #else
               Mv tmpMv(iMvScaleTmpHor, iMvScaleTmpVer);
               wrapRef = wrapClipMv(tmpMv, Position(pu.Y().x + w, pu.Y().y + h), Size(blockWidth, blockHeight), &sps, pu.cs->pps);
@@ -6086,7 +6110,7 @@ void InterPrediction::xPredAffineBlk(const ComponentID &compID, const Prediction
               wrapRef = false;
               if (!refPic->isRefScaled(pu.cs->pps))
               {
-                clipMv(tmpMv, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
+                clipMvInl(tmpMv, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
                 iMvScaleTmpHor = tmpMv.getHor();
                 iMvScaleTmpVer = tmpMv.getVer();
               }
@@ -6586,7 +6610,7 @@ void InterPrediction::xPredAffineBlk(const ComponentID &compID, const Prediction
           if (refPic->isRefScaled(pu.cs->pps) == false)
 #endif
           {
-            clipMv(tmpMv, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
+            clipMvInl(tmpMv, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
             iMvScaleTmpHor = tmpMv.getHor();
             iMvScaleTmpVer = tmpMv.getVer();
           }
@@ -6674,7 +6698,7 @@ void InterPrediction::xPredAffineBlk(const ComponentID &compID, const Prediction
           if (refPic->isRefScaled(pu.cs->pps) == false)
 #endif
           {
-            clipMv(curMv, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
+            clipMvInl(curMv, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
           }
         }
         iMvScaleTmpHor = curMv.hor;
@@ -8681,7 +8705,7 @@ void InterPrediction::xPredAffineTpl(const PredictionUnit &pu, const RefPicList 
           // clip and scale
           if (refPic->isRefScaled(pu.cs->pps) == false)
           {
-            clipMv(tmpMv, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
+            clipMvInl(tmpMv, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
 #if JVET_AD0140_MVD_PREDICTION
             if ( Mv(iMvScaleTmpHor, iMvScaleTmpVer) != tmpMv && exitIfOob )
             {
@@ -8899,7 +8923,7 @@ void InterPrediction::xPredAffineTpl(const PredictionUnit &pu, const RefPicList 
 #if JVET_AJ0158_SUBBLOCK_INTER_EXTENSION
                 clipMv2(tmpMv, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps, 6);
 #else
-                clipMv(tmpMv, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
+                clipMvInl(tmpMv, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
 #endif
 #if JVET_AD0140_MVD_PREDICTION
                 if (Mv(iMvScaleTmpHorLeft, iMvScaleTmpVerLeft) != tmpMv && exitIfOob)
@@ -8948,7 +8972,7 @@ void InterPrediction::xPredAffineTpl(const PredictionUnit &pu, const RefPicList 
 #if JVET_AJ0158_SUBBLOCK_INTER_EXTENSION
                 clipMv2(tmpMv, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps, 6);
 #else
-                clipMv(tmpMv, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
+                clipMvInl(tmpMv, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
 #endif
 #if JVET_AD0140_MVD_PREDICTION
                 if (Mv(iMvScaleTmpHorAbove, iMvScaleTmpVerAbove) != tmpMv && exitIfOob)
@@ -8986,7 +9010,7 @@ void InterPrediction::xPredAffineTpl(const PredictionUnit &pu, const RefPicList 
 #endif
             if (refPic->isRefScaled(pu.cs->pps) == false)
             {
-              clipMv(tmpMv, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
+              clipMvInl(tmpMv, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
 #if JVET_AD0140_MVD_PREDICTION
               if (Mv(iMvScaleTmpHor, iMvScaleTmpVer) != tmpMv && exitIfOob)
               {
@@ -10854,7 +10878,7 @@ bool InterPrediction::skipObmcConditionByPixel(PredictionUnit& pu, ComponentID c
     if (pu.interDir & (refList + 1))
     {
       Mv mv = pu.mv[refList];
-      clipMv(mv, pu.lumaPos(), pu.lumaSize(), sps, *pu.cs->pps);
+      clipMvInl(mv, pu.lumaPos(), pu.lumaSize(), sps, *pu.cs->pps);
       mv.roundToPrecision(MV_PRECISION_INTERNAL, MV_PRECISION_INT);
 #if JVET_AK0076_EXTENDED_OBMC_IBC
       if (CU::isIBC(*pu.cu))
@@ -13848,7 +13872,7 @@ void InterPrediction::xPrefetch(PredictionUnit& pu, PelUnitBuf &pcPad, RefPicLis
     }
     else
     {
-      clipMv( cMv, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps );
+      clipMvInl( cMv, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps );
     }
     /* Pre-fetch similar to HEVC*/
     {
@@ -14096,7 +14120,7 @@ void InterPrediction::xFinalPaddedMCForDMVR(PredictionUnit &pu, PelUnitBuf &pcYu
     Mv cMvClipped = cMv;
     if( !pu.cs->pps->getWrapAroundEnabledFlag() )
     {
-      clipMv( cMvClipped, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps );
+      clipMvInl( cMvClipped, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps );
     }
 
     Mv startMv = mergeMV[refId];
@@ -14193,8 +14217,8 @@ void InterPrediction::xinitMC(PredictionUnit& pu, const ClpRngs &clpRngs)
   /*Clip the starting MVs*/
   if( !pu.cs->pps->getWrapAroundEnabledFlag() )
   {
-    clipMv( mergeMVL0, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps );
-    clipMv( mergeMVL1, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps );
+    clipMvInl( mergeMVL0, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps );
+    clipMvInl( mergeMVL1, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps );
   }
 
   /*L0 MC for refinement*/
@@ -14279,7 +14303,7 @@ void InterPrediction::xProcessDMVR(PredictionUnit& pu, PelUnitBuf &pcYuvDst, con
       }
       else
       {
-        clipMv(cMv, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
+        clipMvInl(cMv, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
       }
 
       int width = pcYuvDst.bufs[compID].width + (filtersize - 1);
@@ -17086,14 +17110,14 @@ Distortion InterPrediction::deriveBcwBlendingBiDir( PredictionUnit& pu, MvField 
       m_iRefListIdx = refList;
       mvCurr        = mvField[refList].mv;
       Mv subPelMv   = mvCurr;
-      clipMv( mvCurr, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps );
+      clipMvInl( mvCurr, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps );
 
       if ( m_bAMLTemplateAvailabe[0] )
       {
         Mv mvTop(0, -(AML_MERGE_TEMPLATE_SIZE << verShift));
         mvTop += subPelMv;
 
-        clipMv(mvTop, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
+        clipMvInl(mvTop, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
 
         Pel* pelTab = bUniDir ? m_tplBuffers.getPred(iPart, 0, false) : m_acYuvRefAboveTemplate[iPart][refList] ;
         PelUnitBuf pcMbBuf = PelUnitBuf(pu.chromaFormat, PelBuf(pelTab, pcBufPredRefTop[bUniDir ? 0 : refList].Y()));
@@ -17108,7 +17132,7 @@ Distortion InterPrediction::deriveBcwBlendingBiDir( PredictionUnit& pu, MvField 
         Mv mvLeft(-(AML_MERGE_TEMPLATE_SIZE << horShift), 0);
         mvLeft += subPelMv;
 
-        clipMv(mvLeft, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
+        clipMvInl(mvLeft, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
 
         Pel* pelTab = bUniDir ? m_tplBuffers.getPred(iPart, 1, false) : m_acYuvRefLeftTemplate[iPart][refList] ;
         PelUnitBuf pcMbBuf = PelUnitBuf(pu.chromaFormat, PelBuf(pelTab, pcBufPredRefLeft[bUniDir ? 0 : refList].Y()));
@@ -17348,14 +17372,14 @@ Distortion InterPrediction::deriveBcwBlendingBiDirIntra(PredictionUnit& pu, Intr
         m_iRefListIdx = refList;
         mvCurr = mvField[refList].mv;
         Mv subPelMv = mvCurr;
-        clipMv(mvCurr, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
+        clipMvInl(mvCurr, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
 
         if (m_bAMLTemplateAvailabe[0])
         {
           Mv mvTop(0, -(AML_MERGE_TEMPLATE_SIZE << verShift));
           mvTop += subPelMv;
 
-          clipMv(mvTop, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
+          clipMvInl(mvTop, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
 
           Pel* pelTab = bUniDir ? m_tplBuffers.getPred(iPart, 0, false) : m_acYuvRefAboveTemplate[iPart][refList];
           PelUnitBuf pcMbBuf = PelUnitBuf(pu.chromaFormat, PelBuf(pelTab, pcBufPredRefTop[bUniDir ? 0 : refList].Y()));
@@ -17370,7 +17394,7 @@ Distortion InterPrediction::deriveBcwBlendingBiDirIntra(PredictionUnit& pu, Intr
           Mv mvLeft(-(AML_MERGE_TEMPLATE_SIZE << horShift), 0);
           mvLeft += subPelMv;
 
-          clipMv(mvLeft, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
+          clipMvInl(mvLeft, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
 
           Pel* pelTab = bUniDir ? m_tplBuffers.getPred(iPart, 1, false) : m_acYuvRefLeftTemplate[iPart][refList];
           PelUnitBuf pcMbBuf = PelUnitBuf(pu.chromaFormat, PelBuf(pelTab, pcBufPredRefLeft[bUniDir ? 0 : refList].Y()));
@@ -17510,14 +17534,14 @@ void InterPrediction::adjustMergeCandidatesBcwIdx(PredictionUnit& pu, MergeCtx& 
       m_iRefListIdx = refList;
       mvCurr = pu.mv[refList];
       Mv subPelMv = mvCurr;
-      clipMv(mvCurr, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
+      clipMvInl(mvCurr, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
 
       if (m_bAMLTemplateAvailabe[0])
       {
         Mv mvTop(0, -(AML_MERGE_TEMPLATE_SIZE << verShift));
         mvTop += subPelMv;
 
-        clipMv(mvTop, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
+        clipMvInl(mvTop, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
 
         PelUnitBuf pcMbBuf = PelUnitBuf(pu.chromaFormat, PelBuf(m_acYuvRefAboveTemplate[refList][0], pcBufPredRefTop.Y()));
 
@@ -17556,7 +17580,7 @@ void InterPrediction::adjustMergeCandidatesBcwIdx(PredictionUnit& pu, MergeCtx& 
         Mv mvLeft(-(AML_MERGE_TEMPLATE_SIZE << horShift), 0);
         mvLeft += subPelMv;
 
-        clipMv(mvLeft, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
+        clipMvInl(mvLeft, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
 
         PelUnitBuf pcMbBuf = PelUnitBuf(pu.chromaFormat, PelBuf(m_acYuvRefLeftTemplate[refList][0], pcBufPredRefLeft.Y()));
 
@@ -20624,7 +20648,7 @@ void InterPrediction::getBlkAMLRefTemplateSubTMVP(PredictionUnit &pu, PelUnitBuf
     const int verIntMv = (mvCurr.getVer() + ((1 << verShift) >> 1)) >> verShift;
     Mv    subPelMv(horIntMv << horShift, verIntMv << verShift);*/
     Mv subPelMv = mvCurr;
-    clipMv(mvCurr, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
+    clipMvInl(mvCurr, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
     CHECK(pu.refIdx[0] < 0, "invalid ref idx");
 
     if (m_bAMLTemplateAvailabe[0])
@@ -20632,7 +20656,7 @@ void InterPrediction::getBlkAMLRefTemplateSubTMVP(PredictionUnit &pu, PelUnitBuf
       Mv mvTop(0, -(AML_MERGE_TEMPLATE_SIZE << verShift));
       mvTop += subPelMv;
 
-      clipMv(mvTop, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
+      clipMvInl(mvTop, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
 
 #if RPR_ENABLE
       const Picture* picRef = pu.cu->slice->getRefPic(REF_PIC_LIST_0, pu.refIdx[0])->unscaledPic;
@@ -20660,7 +20684,7 @@ void InterPrediction::getBlkAMLRefTemplateSubTMVP(PredictionUnit &pu, PelUnitBuf
       Mv mvLeft(-(AML_MERGE_TEMPLATE_SIZE << horShift), 0);
       mvLeft += subPelMv;
 
-      clipMv(mvLeft, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
+      clipMvInl(mvLeft, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
 
 #if RPR_ENABLE
       const Picture* picRef = pu.cu->slice->getRefPic(REF_PIC_LIST_0, pu.refIdx[0])->unscaledPic;
@@ -20698,14 +20722,14 @@ void InterPrediction::getBlkAMLRefTemplateSubTMVP(PredictionUnit &pu, PelUnitBuf
       m_iRefListIdx = refList;
       mvCurr = pu.mv[refList];
       Mv subPelMv = mvCurr;
-      clipMv(mvCurr, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
+      clipMvInl(mvCurr, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
 
       if (m_bAMLTemplateAvailabe[0])
       {
         Mv mvTop(0, -(AML_MERGE_TEMPLATE_SIZE << verShift));
         mvTop += subPelMv;
 
-        clipMv(mvTop, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
+        clipMvInl(mvTop, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
 
         PelUnitBuf pcMbBuf =
           PelUnitBuf(pu.chromaFormat, PelBuf(m_acYuvRefAboveTemplate[refList][0], pcBufPredRefTop.Y()));
@@ -20761,7 +20785,7 @@ void InterPrediction::getBlkAMLRefTemplateSubTMVP(PredictionUnit &pu, PelUnitBuf
         Mv mvLeft(-(AML_MERGE_TEMPLATE_SIZE << horShift), 0);
         mvLeft += subPelMv;
 
-        clipMv(mvLeft, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
+        clipMvInl(mvLeft, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
 
         PelUnitBuf pcMbBuf =
           PelUnitBuf(pu.chromaFormat, PelBuf(m_acYuvRefLeftTemplate[refList][0], pcBufPredRefLeft.Y()));
@@ -20866,7 +20890,7 @@ void InterPrediction::getBlkAMLRefTemplate(PredictionUnit &pu, PelUnitBuf &pcBuf
         const int verIntMv = (mvCurr.getVer() + ((1 << verShift) >> 1)) >> verShift;
         Mv    subPelMv(horIntMv << horShift, verIntMv << verShift);*/
       Mv subPelMv = mvCurr;
-      clipMv(mvCurr, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
+      clipMvInl(mvCurr, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
       CHECK(pu.refIdx[0] < 0, "invalid ref idx");
 
       if (m_bAMLTemplateAvailabe[0])
@@ -20874,7 +20898,7 @@ void InterPrediction::getBlkAMLRefTemplate(PredictionUnit &pu, PelUnitBuf &pcBuf
         Mv mvTop(0, -(AML_MERGE_TEMPLATE_SIZE << verShift));
         mvTop += subPelMv;
 
-        clipMv(mvTop, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
+        clipMvInl(mvTop, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
 
 #if RPR_ENABLE
         const Picture* picRef = pu.cu->slice->getRefPic(REF_PIC_LIST_0, pu.refIdx[0])->unscaledPic;
@@ -20915,7 +20939,7 @@ void InterPrediction::getBlkAMLRefTemplate(PredictionUnit &pu, PelUnitBuf &pcBuf
         Mv mvLeft(-(AML_MERGE_TEMPLATE_SIZE << horShift), 0);
         mvLeft += subPelMv;
 
-        clipMv(mvLeft, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
+        clipMvInl(mvLeft, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
 
 #if RPR_ENABLE
         const Picture* picRef = pu.cu->slice->getRefPic(REF_PIC_LIST_0, pu.refIdx[0])->unscaledPic;
@@ -20991,14 +21015,14 @@ void InterPrediction::getBlkAMLRefTemplate(PredictionUnit &pu, PelUnitBuf &pcBuf
           const int verIntMv = (mvCurr.getVer() + ((1 << verShift) >> 1)) >> verShift;
           Mv    subPelMv(horIntMv << horShift, verIntMv << verShift);*/
         Mv subPelMv = mvCurr;
-        clipMv(mvCurr, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
+        clipMvInl(mvCurr, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
         
         if (m_bAMLTemplateAvailabe[0])
         {
           Mv mvTop(0, -(AML_MERGE_TEMPLATE_SIZE << verShift));
           mvTop += subPelMv;
           
-          clipMv(mvTop, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
+          clipMvInl(mvTop, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
           
 #if JVET_AA0093_ENHANCED_MMVD_EXTENSION
           int offsetA = bLoadSave ? (refList == 0 ? posList0 : posList1) * MAX_CU_SIZE : 0;
@@ -21080,7 +21104,7 @@ void InterPrediction::getBlkAMLRefTemplate(PredictionUnit &pu, PelUnitBuf &pcBuf
           Mv mvLeft(-(AML_MERGE_TEMPLATE_SIZE << horShift), 0);
           mvLeft += subPelMv;
           
-          clipMv(mvLeft, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
+          clipMvInl(mvLeft, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
           
 #if JVET_AA0093_ENHANCED_MMVD_EXTENSION
           int offsetA = bLoadSave ? (refList == 0 ? posList0 : posList1) * MAX_CU_SIZE : 0;
@@ -21320,14 +21344,14 @@ void InterPrediction::getBlkAMLRefTemplateAlt(PredictionUnit &pu, PelUnitBuf &pc
     m_iRefListIdx = refList;
     mvCurr = pu.mv[refList];
     Mv subPelMv = mvCurr;
-    clipMv(mvCurr, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
+    clipMvInl(mvCurr, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
 
     if (m_bAMLTemplateAvailabe[0])
     {
       Mv mvTop(0, -(AML_MERGE_TEMPLATE_SIZE << verShift));
       mvTop += subPelMv;
 
-      clipMv(mvTop, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
+      clipMvInl(mvTop, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
 
       int offsetA = bLoadSave ? (refList == 0 ? posList0 : posList1) * MAX_CU_SIZE : 0;
       PelUnitBuf pcMbBuf = PelUnitBuf(pu.chromaFormat, PelBuf(m_acYuvRefAboveTemplate[refList][0] + offsetA, pcBufPredRefTop.Y())); // changed
@@ -21368,7 +21392,7 @@ void InterPrediction::getBlkAMLRefTemplateAlt(PredictionUnit &pu, PelUnitBuf &pc
       Mv mvLeft(-(AML_MERGE_TEMPLATE_SIZE << horShift), 0);
       mvLeft += subPelMv;
 
-      clipMv(mvLeft, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
+      clipMvInl(mvLeft, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
 
       int offsetA = bLoadSave ? (refList == 0 ? posList0 : posList1) * MAX_CU_SIZE : 0;
       PelUnitBuf pcMbBuf = PelUnitBuf(pu.chromaFormat, PelBuf(m_acYuvRefLeftTemplate[refList][0] + offsetA, pcBufPredRefLeft.Y())); // changed
@@ -23053,7 +23077,7 @@ void InterPrediction::getAffAMLRefTemplate(PredictionUnit &pu, PelUnitBuf &pcBuf
             const Picture* refPic = pu.cu->slice->getRefPic(eRefPicList, iRefIdx)->unscaledPic;
             if (refPic->isRefScaled(pu.cs->pps) == false)
             {
-              clipMv(tmpMv, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
+              clipMvInl(tmpMv, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
               iMvScaleTmpHor = tmpMv.getHor();
               iMvScaleTmpVer = tmpMv.getVer();
             }
@@ -23666,7 +23690,7 @@ void InterPrediction::getAffAndSbtmvpRefTemplate(PredictionUnit& pu, PelUnitBuf&
               const Picture* refPic = pu.cu->slice->getRefPic(eRefPicList, iRefIdx)->unscaledPic;
               if (refPic->isRefScaled(pu.cs->pps) == false)
               {
-                clipMv(tmpMv, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
+                clipMvInl(tmpMv, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
                 iMvScaleTmpHor = tmpMv.getHor();
                 iMvScaleTmpVer = tmpMv.getVer();
               }
@@ -25301,14 +25325,14 @@ void InterPrediction::getBlkOBMCRefTemplate(PredictionUnit &subblockPu, PelUnitB
 #endif
     mvCurr      = tryMi.mv[0];
     Mv subPelMv = mvCurr;
-    clipMv(mvCurr, subblockPu.lumaPos(), subblockPu.lumaSize(), *subblockPu.cs->sps, *subblockPu.cs->pps);
+    clipMvInl(mvCurr, subblockPu.lumaPos(), subblockPu.lumaSize(), *subblockPu.cs->sps, *subblockPu.cs->pps);
     CHECK(tryMi.refIdx[0] < 0, "invalid ref idx");
 
     if ((isAbove) && (m_bAMLTemplateAvailabe[0]))
     {
       Mv mvTop(0, -(TM_OBMC_TEMPLATE_SIZE << verShift));
       mvTop += subPelMv;
-      clipMv(mvTop, subblockPu.lumaPos(), subblockPu.lumaSize(), *subblockPu.cs->sps, *subblockPu.cs->pps);
+      clipMvInl(mvTop, subblockPu.lumaPos(), subblockPu.lumaSize(), *subblockPu.cs->sps, *subblockPu.cs->pps);
 
 #if RPR_ENABLE
       const Picture *            picRef = subblockPu.cu->slice->getRefPic(REF_PIC_LIST_0, tryMi.refIdx[0])->unscaledPic;
@@ -25350,7 +25374,7 @@ void InterPrediction::getBlkOBMCRefTemplate(PredictionUnit &subblockPu, PelUnitB
     {
       Mv mvLeft(-(TM_OBMC_TEMPLATE_SIZE << horShift), 0);
       mvLeft += subPelMv;
-      clipMv(mvLeft, subblockPu.lumaPos(), subblockPu.lumaSize(), *subblockPu.cs->sps, *subblockPu.cs->pps);
+      clipMvInl(mvLeft, subblockPu.lumaPos(), subblockPu.lumaSize(), *subblockPu.cs->sps, *subblockPu.cs->pps);
 #if RPR_ENABLE
       const Picture *            picRef = subblockPu.cu->slice->getRefPic(REF_PIC_LIST_0, tryMi.refIdx[0])->unscaledPic;
       const std::pair<int, int> &scalingRatio = subblockPu.cu->slice->getScalingRatio(REF_PIC_LIST_0, tryMi.refIdx[0]);
@@ -25403,14 +25427,14 @@ void InterPrediction::getBlkOBMCRefTemplate(PredictionUnit &subblockPu, PelUnitB
       m_iRefListIdx = refList;
       mvCurr        = tryMi.mv[refList];
       Mv subPelMv   = mvCurr;
-      clipMv(mvCurr, subblockPu.lumaPos(), subblockPu.lumaSize(), *subblockPu.cs->sps, *subblockPu.cs->pps);
+      clipMvInl(mvCurr, subblockPu.lumaPos(), subblockPu.lumaSize(), *subblockPu.cs->sps, *subblockPu.cs->pps);
 
       if ((isAbove) && (m_bAMLTemplateAvailabe[0]))
       {
         Mv mvTop(0, -(TM_OBMC_TEMPLATE_SIZE << verShift));
         mvTop += subPelMv;
 
-        clipMv(mvTop, subblockPu.lumaPos(), subblockPu.lumaSize(), *subblockPu.cs->sps, *subblockPu.cs->pps);
+        clipMvInl(mvTop, subblockPu.lumaPos(), subblockPu.lumaSize(), *subblockPu.cs->sps, *subblockPu.cs->pps);
 
         PelUnitBuf pcMbBuf =
           PelUnitBuf(subblockPu.chromaFormat,
@@ -25524,7 +25548,7 @@ void InterPrediction::getBlkOBMCRefTemplate(PredictionUnit &subblockPu, PelUnitB
         Mv mvLeft(-(TM_OBMC_TEMPLATE_SIZE << horShift), 0);
         mvLeft += subPelMv;
 
-        clipMv(mvLeft, subblockPu.lumaPos(), subblockPu.lumaSize(), *subblockPu.cs->sps, *subblockPu.cs->pps);
+        clipMvInl(mvLeft, subblockPu.lumaPos(), subblockPu.lumaSize(), *subblockPu.cs->sps, *subblockPu.cs->pps);
 
         PelUnitBuf pcMbBuf =
           PelUnitBuf(subblockPu.chromaFormat,
@@ -28478,7 +28502,7 @@ void InterPrediction::deriveTemplateLIC(TplMatchingCtrl& tplCtrl, RefPicList eRe
   {
 #endif
   m_numTemplate[COMPONENT_Y][0] = m_numTemplate[COMPONENT_Y][1] = 0;
-  clipMv(mv, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
+  clipMvInl(mv, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
 #if JVET_AF0190_RPR_TMP_REORDER_LIC
   CHECK(tplCtrl.m_refPic.isRefScaled(cu.cs->pps), "tplCtrl.m_refPic.isRefScaled(*cu.cs->pps)");
 #endif
@@ -29477,14 +29501,14 @@ PelBuf TplMatchingCtrl::xGetRefTemplate(const PredictionUnit& curPu, const Pictu
     }
     else
     {
-      clipMv( mv, blkPos, blkSize, *m_cu.cs->sps, *m_cu.cs->pps );
+      clipMvInl( mv, blkPos, blkSize, *m_cu.cs->sps, *m_cu.cs->pps );
     }
   }
 #else
 #if JVET_Z0084_IBC_TM
   if( !CU::isIBC(m_cu) )
 #endif
-  clipMv( mv, blkPos, blkSize, *m_cu.cs->sps, *m_cu.cs->pps );
+  clipMvInl( mv, blkPos, blkSize, *m_cu.cs->sps, *m_cu.cs->pps );
 #endif
 
   const int lumaShift = 2 + MV_FRACTIONAL_BITS_DIFF;
@@ -31339,7 +31363,7 @@ Distortion InterPrediction::xGetBilateralMatchingErrorAdaptiveAffine(const Predi
       }
       Mv mv = it->m_mv[i] + mvOffset[i];
 
-      clipMv(mv, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
+      clipMvInl(mv, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
       iMvScaleTmpHor = mv.getHor();
       iMvScaleTmpVer = mv.getVer();
 
@@ -31416,7 +31440,7 @@ bool InterPrediction::bmAdaptiveAffineRegression(PredictionUnit &pu, Distortion 
         iMvScaleTmpVer = iMvScaleTmpVer0 + deltaMvVerY * pu.lumaSize().height;
         roundAffineMv(iMvScaleTmpHor, iMvScaleTmpVer, MAX_CU_DEPTH);
         mv = Mv(iMvScaleTmpHor, iMvScaleTmpVer);
-        clipMv(mv, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
+        clipMvInl(mv, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
         pu.mvAffi[list][2] = mv;
       }
       mvAffieRMVF[list][2] = pu.mvAffi[list][2];
@@ -31751,7 +31775,7 @@ Distortion InterPrediction::xGetBilateralMatchingErrorAffine(const PredictionUni
     {
 
       Mv mv = it->m_mv[i] + mvOffset[i];
-      clipMv(mv, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
+      clipMvInl(mv, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
       iMvScaleTmpHor = mv.getHor();
       iMvScaleTmpVer = mv.getVer();
 
@@ -31845,7 +31869,7 @@ Distortion InterPrediction::xGetBilateralMatchingErrorAffine(const PredictionUni
       iMvScaleTmpVer = iMvScaleTmpVer0[i] + deltaMvHorY[i] * it->m_cXInPU + deltaMvVerY[i] * it->m_cYInPU;
       roundAffineMv(iMvScaleTmpHor, iMvScaleTmpVer, MAX_CU_DEPTH);
       mv[i] = Mv(iMvScaleTmpHor, iMvScaleTmpVer);
-      clipMv(mv[i], pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
+      clipMvInl(mv[i], pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
     }
 #if JVET_AD0182_AFFINE_DMVR_PLUS_EXTENSIONS
     const int offset = it->getX() - initPosX + (it->getY() - initPosY) * dstStride;
@@ -32105,7 +32129,7 @@ Distortion InterPrediction::xGetBilateralMatchingErrorAffineCheckMv(const Predic
       iMvScaleTmpVer = iMvScaleTmpVer0[i] + deltaMvHorY[i] * it->m_cXInPU + deltaMvVerY[i] * it->m_cYInPU;
       roundAffineMv(iMvScaleTmpHor, iMvScaleTmpVer, MAX_CU_DEPTH);
       mv[i] = Mv(iMvScaleTmpHor, iMvScaleTmpVer);
-      clipMv(mv[i], pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
+      clipMvInl(mv[i], pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
     }
     const int offset = it->getX() - initPosX + (it->getY() - initPosY) * dstStride;
 
@@ -33954,8 +33978,8 @@ bool InterPrediction::processBDMVR(PredictionUnit& pu)
         m_offset[1][COMPONENT_Y] = 0;
 
         Mv mv0Clip = pu.mv[0], mv1Clip = pu.mv[1];
-        clipMv(mv0Clip, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
-        clipMv(mv1Clip, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
+        clipMvInl(mv0Clip, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
+        clipMvInl(mv1Clip, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
         xGetSublkTemplateAndRef(*pu.cu, COMPONENT_Y, *pu.cu->slice->getRefPic(REF_PIC_LIST_0, pu.refIdx[0]), mv0Clip, pu.blocks[COMPONENT_Y].width, pu.blocks[COMPONENT_Y].height, 0, 0, m_numTemplate[COMPONENT_Y],
           m_pcLICRefLeftTemplate[0][COMPONENT_Y], m_pcLICRefAboveTemplate[0][COMPONENT_Y],
           m_pcLICRecLeftTemplate[COMPONENT_Y], m_pcLICRecAboveTemplate[COMPONENT_Y], true, true);
@@ -34019,8 +34043,8 @@ bool InterPrediction::processBDMVR(PredictionUnit& pu)
           m_offset[0][COMPONENT_Y] = 0;
           m_offset[1][COMPONENT_Y] = 0;
           Mv mv0Clip = pu.mv[0], mv1Clip = pu.mv[1];
-          clipMv(mv0Clip, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
-          clipMv(mv1Clip, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
+          clipMvInl(mv0Clip, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
+          clipMvInl(mv1Clip, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
           xGetSublkTemplateAndRef(*pu.cu, COMPONENT_Y, *pu.cu->slice->getRefPic(REF_PIC_LIST_0, pu.refIdx[0]), mv0Clip, pu.blocks[COMPONENT_Y].width, pu.blocks[COMPONENT_Y].height, 0, 0, m_numTemplate[COMPONENT_Y],
             m_pcLICRefLeftTemplate[0][COMPONENT_Y], m_pcLICRefAboveTemplate[0][COMPONENT_Y],
             m_pcLICRecLeftTemplate[COMPONENT_Y], m_pcLICRecAboveTemplate[COMPONENT_Y], true, true);
@@ -34573,7 +34597,7 @@ void InterPrediction::xBDMVRFillBlkPredPelBufferAffine(const PredictionUnit& pu,
         wrapRef = false;
         if (refPic.isRefScaled(pu.cs->pps) == false)
         {
-          clipMv(tmpMv, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
+          clipMvInl(tmpMv, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
           iMvScaleTmpHor = tmpMv.getHor();
           iMvScaleTmpVer = tmpMv.getVer();
         }
@@ -34785,7 +34809,7 @@ void InterPrediction::xCalculteAffineParameters(const PredictionUnit& pu, const 
       {
         if (refPic.isRefScaled(pu.cs->pps) == false)
         {
-          clipMv(tmpOrgMv, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
+          clipMvInl(tmpOrgMv, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
           iMvScaleOrgHor = tmpOrgMv.getHor();
           iMvScaleOrgVer = tmpOrgMv.getVer();
         }
@@ -34816,7 +34840,7 @@ void InterPrediction::xBDMVRFillBlkPredPelBuffer(const PredictionUnit& pu, const
   }
   else
   {
-    clipMv(mv, pu.lumaPos(), pu.lumaSize(), *pu.cu->cs->sps, *pu.cu->cs->pps);
+    clipMvInl(mv, pu.lumaPos(), pu.lumaSize(), *pu.cu->cs->sps, *pu.cu->cs->pps);
   }
   const CPelBuf     refBuf = refPic.getRecoBuf(refPic.blocks[compID], wrapRef);
 #else
@@ -34829,7 +34853,7 @@ void InterPrediction::xBDMVRFillBlkPredPelBuffer(const PredictionUnit& pu, const
 
 #if !JVET_AA0146_WRAP_AROUND_FIX
   Mv mv(_mv);
-  clipMv(mv, pu.lumaPos(), pu.lumaSize(), *pu.cu->cs->sps, *pu.cu->cs->pps);
+  clipMvInl(mv, pu.lumaPos(), pu.lumaSize(), *pu.cu->cs->sps, *pu.cu->cs->pps);
 #endif
   const int xInt  = mv.getHor() >> horShift;
   const int yInt  = mv.getVer() >> verShift;
@@ -36825,8 +36849,8 @@ void InterPrediction::amvpMergeModeMvRefinement(PredictionUnit& pu, MvField* mvF
       m_offset[0][COMPONENT_Y] = 0;
       m_offset[1][COMPONENT_Y] = 0;
       Mv mv0Clip = pu.mv[0], mv1Clip = pu.mv[1];
-      clipMv(mv0Clip, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
-      clipMv(mv1Clip, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
+      clipMvInl(mv0Clip, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
+      clipMvInl(mv1Clip, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
       xGetSublkTemplateAndRef(*pu.cu, COMPONENT_Y, *pu.cu->slice->getRefPic(REF_PIC_LIST_0, pu.refIdx[0]), mv0Clip, pu.blocks[COMPONENT_Y].width, pu.blocks[COMPONENT_Y].height, 0, 0, m_numTemplate[COMPONENT_Y],
         m_pcLICRefLeftTemplate[0][COMPONENT_Y], m_pcLICRefAboveTemplate[0][COMPONENT_Y],
         m_pcLICRecLeftTemplate[COMPONENT_Y], m_pcLICRecAboveTemplate[COMPONENT_Y], true, true);
@@ -36884,8 +36908,8 @@ void InterPrediction::amvpMergeModeMvRefinement(PredictionUnit& pu, MvField* mvF
       m_offset[0][COMPONENT_Y] = 0;
       m_offset[1][COMPONENT_Y] = 0;
       Mv mv0Clip = pu.mv[0], mv1Clip = pu.mv[1];
-      clipMv(mv0Clip, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
-      clipMv(mv1Clip, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
+      clipMvInl(mv0Clip, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
+      clipMvInl(mv1Clip, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
       xGetSublkTemplateAndRef(*pu.cu, COMPONENT_Y, *pu.cu->slice->getRefPic(REF_PIC_LIST_0, pu.refIdx[0]), mv0Clip, pu.blocks[COMPONENT_Y].width, pu.blocks[COMPONENT_Y].height, 0, 0, m_numTemplate[COMPONENT_Y],
         m_pcLICRefLeftTemplate[0][COMPONENT_Y], m_pcLICRefAboveTemplate[0][COMPONENT_Y],
         m_pcLICRecLeftTemplate[COMPONENT_Y], m_pcLICRecAboveTemplate[COMPONENT_Y], true, true);
@@ -40967,7 +40991,7 @@ void InterPrediction::defineSignHypMatchAffine(PredictionUnit& pu, const RefPicL
           Pel* recAboveTemplate = m_pcLICRecAboveTemplate[COMPONENT_Y];
 
           m_numTemplate[COMPONENT_Y][0] = m_numTemplate[COMPONENT_Y][1] = 0;
-          clipMv(cMvTest, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
+          clipMvInl(cMvTest, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
           xGetSublkTemplate(*pu.cu, COMPONENT_Y, refPic, cMvTest, pu.blocks[COMPONENT_Y].width, pu.blocks[COMPONENT_Y].height, 0, 0, m_numTemplate[COMPONENT_Y], refLeftTemplate, refAboveTemplate, recLeftTemplate, recAboveTemplate);
           m_fillLicTpl[COMPONENT_Y] = true;
           xGetLICParamGeneral(*pu.cu, COMPONENT_Y, m_numTemplate[COMPONENT_Y], refLeftTemplate, refAboveTemplate, recLeftTemplate, recAboveTemplate, m_shift[eRefList][COMPONENT_Y], m_scale[eRefList][COMPONENT_Y], m_offset[eRefList][COMPONENT_Y]);
@@ -41314,7 +41338,7 @@ void InterPrediction::defineSignHypMatchAffine(PredictionUnit& pu, const RefPicL
           Pel* recAboveTemplate = m_pcLICRecAboveTemplate[COMPONENT_Y];
 
           m_numTemplate[COMPONENT_Y][0] = m_numTemplate[COMPONENT_Y][1] = 0;
-          clipMv(cMvTest, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
+          clipMvInl(cMvTest, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
           xGetSublkTemplate(*pu.cu, COMPONENT_Y, refPic, cMvTest, pu.blocks[COMPONENT_Y].width, pu.blocks[COMPONENT_Y].height, 0, 0, m_numTemplate[COMPONENT_Y], refLeftTemplate, refAboveTemplate, recLeftTemplate, recAboveTemplate);
           m_fillLicTpl[COMPONENT_Y] = true;
           xGetLICParamGeneral(*pu.cu, COMPONENT_Y, m_numTemplate[COMPONENT_Y], refLeftTemplate, refAboveTemplate, recLeftTemplate, recAboveTemplate, m_shift[REF_PIC_LIST_0][COMPONENT_Y], m_scale[REF_PIC_LIST_0][COMPONENT_Y], m_offset[REF_PIC_LIST_0][COMPONENT_Y]);
@@ -41889,7 +41913,7 @@ void InterPrediction::defineSignHypMatchAffine(PredictionUnit& pu, const RefPicL
           }
           else
 #endif
-          clipMv(tmpMv, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
+          clipMvInl(tmpMv, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
           iMvScaleTmpHor = tmpMv.getHor();
           iMvScaleTmpVer = tmpMv.getVer();
 #if JVET_AD0213_LIC_IMP
@@ -44926,7 +44950,7 @@ std::vector<Mv> InterPrediction::deriveMVDFromMVSDIdxAffineSI(PredictionUnit& pu
     m_iRefListIdx = refList;
     mvCurr = pu.mv[refList];
     Mv subPelMv = mvCurr;
-    clipMv(mvCurr, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
+    clipMvInl(mvCurr, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
     if (subPelMv != mvCurr)
     {
       return false;
@@ -44937,7 +44961,7 @@ std::vector<Mv> InterPrediction::deriveMVDFromMVSDIdxAffineSI(PredictionUnit& pu
       Mv mvTop(0, -(AML_MERGE_TEMPLATE_SIZE << verShift));
       mvTop += subPelMv;
       auto mvTopNonClipped = mvTop;
-      clipMv(mvTop, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
+      clipMvInl(mvTop, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
       if (mvTopNonClipped != mvTop)
       {
         return false;
@@ -44971,7 +44995,7 @@ std::vector<Mv> InterPrediction::deriveMVDFromMVSDIdxAffineSI(PredictionUnit& pu
       Mv mvLeft(-(AML_MERGE_TEMPLATE_SIZE << horShift), 0);
       mvLeft += subPelMv;
       auto mvLeftNonClipped = mvLeft;
-      clipMv(mvLeft, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
+      clipMvInl(mvLeft, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
       if (mvLeftNonClipped != mvLeft)
       {
         return false;
@@ -45019,7 +45043,7 @@ std::vector<Mv> InterPrediction::deriveMVDFromMVSDIdxAffineSI(PredictionUnit& pu
     m_iRefListIdx = refList;
     mvCurr = pu.mv[refList];
     Mv subPelMv = mvCurr;
-    clipMv(mvCurr, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
+    clipMvInl(mvCurr, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
     if (subPelMv != mvCurr)
     {
       return false;
@@ -45030,7 +45054,7 @@ std::vector<Mv> InterPrediction::deriveMVDFromMVSDIdxAffineSI(PredictionUnit& pu
       Mv mvTop(0, -(AML_MERGE_TEMPLATE_SIZE << verShift));
       mvTop += subPelMv;
       auto mvTopNonClipped = mvTop;
-      clipMv(mvTop, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
+      clipMvInl(mvTop, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
       if (mvTopNonClipped != mvTop)
       {
         return false;
@@ -45062,7 +45086,7 @@ std::vector<Mv> InterPrediction::deriveMVDFromMVSDIdxAffineSI(PredictionUnit& pu
       Mv mvLeft(-(AML_MERGE_TEMPLATE_SIZE << horShift), 0);
       mvLeft += subPelMv;
       auto mvLeftNonClipped = mvLeft;
-      clipMv(mvLeft, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
+      clipMvInl(mvLeft, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
       if (mvLeftNonClipped != mvLeft)
       {
         return false;
@@ -45104,7 +45128,7 @@ std::vector<Mv> InterPrediction::deriveMVDFromMVSDIdxAffineSI(PredictionUnit& pu
     {
       mvCurr = pu.mv[0];
       Mv subPelMv = mvCurr;
-      clipMv(mvCurr, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
+      clipMvInl(mvCurr, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
       if (subPelMv != mvCurr)
       {
         return false;
@@ -45116,7 +45140,7 @@ std::vector<Mv> InterPrediction::deriveMVDFromMVSDIdxAffineSI(PredictionUnit& pu
         Mv mvTop(0, -(AML_MERGE_TEMPLATE_SIZE << verShift));
         mvTop += subPelMv;
         auto mvTopNonClipped = mvTop;
-        clipMv(mvTop, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
+        clipMvInl(mvTop, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
         if (mvTopNonClipped != mvTop)
         {
           return false;
@@ -45148,7 +45172,7 @@ std::vector<Mv> InterPrediction::deriveMVDFromMVSDIdxAffineSI(PredictionUnit& pu
         Mv mvLeft(-(AML_MERGE_TEMPLATE_SIZE << horShift), 0);
         mvLeft += subPelMv;
         auto mvLeftNonClipped = mvLeft;
-        clipMv(mvLeft, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
+        clipMvInl(mvLeft, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
         if (mvLeftNonClipped != mvLeft)
         {
           return false;
@@ -45190,7 +45214,7 @@ std::vector<Mv> InterPrediction::deriveMVDFromMVSDIdxAffineSI(PredictionUnit& pu
         m_iRefListIdx = refList;
         mvCurr = pu.mv[refList];
         Mv subPelMv = mvCurr;
-        clipMv(mvCurr, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
+        clipMvInl(mvCurr, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
         if (subPelMv != mvCurr)
         {
           return false;
@@ -45201,7 +45225,7 @@ std::vector<Mv> InterPrediction::deriveMVDFromMVSDIdxAffineSI(PredictionUnit& pu
           Mv mvTop(0, -(AML_MERGE_TEMPLATE_SIZE << verShift));
           mvTop += subPelMv;
           auto mvTopNonClipped = mvTop;
-          clipMv(mvTop, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
+          clipMvInl(mvTop, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
           if (mvTopNonClipped != mvTop)
           {
             return false;
@@ -45260,7 +45284,7 @@ std::vector<Mv> InterPrediction::deriveMVDFromMVSDIdxAffineSI(PredictionUnit& pu
           Mv mvLeft(-(AML_MERGE_TEMPLATE_SIZE << horShift), 0);
           mvLeft += subPelMv;
           auto mvLeftNonClipped = mvLeft;
-          clipMv(mvLeft, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
+          clipMvInl(mvLeft, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, *pu.cs->pps);
           if (mvLeftNonClipped != mvLeft)
           {
             return false;
@@ -46912,8 +46936,8 @@ void InterPrediction::refineTmvpCoverSearchForRefinedMv(bool refineTmvpIsSbTmvp,
       CHECK(1, "this is not possible");
     }
     Mv refineTmvpRangeMinClip(refineTmvpHorMin, refineTmvpVerMin), refineTmvpRangeMaxClip(refineTmvpHorMax, refineTmvpVerMax);
-    clipMv(refineTmvpRangeMinClip, pos, Size(4, 4), *pu.cu->cs->sps, *pu.cu->cs->pps);
-    clipMv(refineTmvpRangeMaxClip, pos, Size(4, 4), *pu.cu->cs->sps, *pu.cu->cs->pps);
+    clipMvInl(refineTmvpRangeMinClip, pos, Size(4, 4), *pu.cu->cs->sps, *pu.cu->cs->pps);
+    clipMvInl(refineTmvpRangeMaxClip, pos, Size(4, 4), *pu.cu->cs->sps, *pu.cu->cs->pps);
     refineTmvpHorMin = std::min(refineTmvpRangeMinClip.hor, scaledColMv.hor);
     refineTmvpVerMin = std::min(refineTmvpRangeMinClip.ver, scaledColMv.ver);
     refineTmvpHorMax = std::max(refineTmvpRangeMaxClip.hor, scaledColMv.hor);
