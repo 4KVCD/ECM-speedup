@@ -50,6 +50,13 @@ Benchmark suite (`perf/bench.py`)
 | - | `-fno-tree-loop-distribute-patterns` (keep small copy loops inline) | yes | 1.00x - dropped | |
 | 19 | angular-prediction reference buffers kept zero between calls (each call clears the range it wrote; verified by a build that checks the whole buffers after every call); SSE2 dot products for the CCCM normal equations | yes | +0.6 % CPU (LTO) | |
 | 20 | long-tap angular interpolation rows specialized on the tap count (no out-of-line call + switch per sample) | yes | AI +1 %, RA/LD 0 | |
+| 21 | context store restores skip the stamp comparison when the source is unchanged since the last sync | yes | +1 % CPU (AI +1-2 %) | |
+| 22 | AVX2 NSPT / LFNST kernels without gathers (axpy over contiguous matrix rows) | yes | +0.4 % (inverse NSPT; forward NSPT / inverse LFNST 0) | |
+| - | getCURestricted: wavefront check only when wavefronts are on | yes | 1.00x - dropped | |
+| 23 | small-object allocator behind operator new / delete (size-class free lists, 16-byte headers) | yes | +2 % CPU (every test 1.02-1.03x) | |
+
+Direct paired measurement stock vs current (LTO, no PGO, steps 4-22): **1.17x** (every test 1.15-1.19x, wall and
+CPU, bit-exact); with step 23: ~1.19x. PGO (+~6 %) is re-applied at the end.
 
 Steps 15-18 were measured on builds without LTO (perf/build.ps1 did not enable it; it does now), both sides of each
 comparison built the same way; steps 19+ on LTO builds.
