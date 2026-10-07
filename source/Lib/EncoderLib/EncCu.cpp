@@ -21979,7 +21979,13 @@ void EncCu::xCheckRDCostMergeGeo2Nx2N(CodingStructure *&tempCS, CodingStructure 
 }
 #endif
 #if MERGE_ENC_OPT
-void EncCu::xCheckSATDCostRegularMerge(CodingStructure *&tempCS, CodingUnit &cu, PredictionUnit &pu, MergeCtx mergeCtx, PelUnitBuf *acMergeTempBuffer[MMVD_MRG_MAX_RD_NUM], PelUnitBuf *&singleMergeTempBuffer, PelUnitBuf  acMergeTmpBuffer[MRG_MAX_NUM_CANDS]
+void EncCu::xCheckSATDCostRegularMerge(CodingStructure *&tempCS, CodingUnit &cu, PredictionUnit &pu
+#if MULTI_PASS_DMVR
+  , const MergeCtx& mergeCtx
+#else
+  , MergeCtx mergeCtx
+#endif
+  , PelUnitBuf *acMergeTempBuffer[MMVD_MRG_MAX_RD_NUM], PelUnitBuf *&singleMergeTempBuffer, PelUnitBuf  acMergeTmpBuffer[MRG_MAX_NUM_CANDS]
 #if !MULTI_PASS_DMVR
   , Mv   refinedMvdL0[MAX_NUM_PARTS_IN_CTU][MRG_MAX_NUM_CANDS]
 #endif
@@ -22200,7 +22206,7 @@ void EncCu::xCheckSATDCostRegularMerge(CodingStructure *&tempCS, CodingUnit &cu,
 }
 
 #if JVET_AG0135_AFFINE_CIIP
-void EncCu::xCheckSATDCostCiipAffineMerge(CodingStructure *&tempCS, CodingUnit &cu, PredictionUnit &pu, AffineMergeCtx affineMergeCtx, MergeCtx mergeCtx, PelUnitBuf *acMergeTempBuffer[MMVD_MRG_MAX_RD_NUM], PelUnitBuf *&singleMergeTempBuffer, PelUnitBuf  acMergeCIIPAffineBuffer[AFFINE_MRG_MAX_NUM_CANDS]
+void EncCu::xCheckSATDCostCiipAffineMerge(CodingStructure *&tempCS, CodingUnit &cu, PredictionUnit &pu, const AffineMergeCtx& affineMergeCtx, const MergeCtx& mergeCtx, PelUnitBuf *acMergeTempBuffer[MMVD_MRG_MAX_RD_NUM], PelUnitBuf *&singleMergeTempBuffer, PelUnitBuf  acMergeCIIPAffineBuffer[AFFINE_MRG_MAX_NUM_CANDS]
   , unsigned& uiNumMrgSATDCand, static_vector<ModeInfo, MRG_MAX_NUM_CANDS + MMVD_ADD_NUM>  &rdModeList, static_vector<double, MRG_MAX_NUM_CANDS + MMVD_ADD_NUM> &candCostList, DistParam distParam, const TempCtx &ctxStart)
 {
 #if INTER_LIC
@@ -22360,7 +22366,13 @@ void EncCu::xCheckSATDCostCiipAffineMerge(CodingStructure *&tempCS, CodingUnit &
 }
 #endif
 #if JVET_AG0276_LIC_FLAG_SIGNALING
-void EncCu::xCheckSATDCostRegularMergeOppositeLic(CodingStructure *&tempCS, CodingUnit &cu, PredictionUnit &pu, MergeCtx mergeCtxOppositeLic, PelUnitBuf *acMergeTempBuffer[MMVD_MRG_MAX_RD_NUM], PelUnitBuf *&singleMergeTempBuffer, PelUnitBuf  acMergeTmpBuffer[MRG_MAX_NUM_CANDS]
+void EncCu::xCheckSATDCostRegularMergeOppositeLic(CodingStructure *&tempCS, CodingUnit &cu, PredictionUnit &pu
+#if MULTI_PASS_DMVR
+  , const MergeCtx& mergeCtxOppositeLic
+#else
+  , MergeCtx mergeCtxOppositeLic
+#endif
+  , PelUnitBuf *acMergeTempBuffer[MMVD_MRG_MAX_RD_NUM], PelUnitBuf *&singleMergeTempBuffer, PelUnitBuf  acMergeTmpBuffer[MRG_MAX_NUM_CANDS]
 #if !MULTI_PASS_DMVR
   , Mv   refinedMvdL0[MAX_NUM_PARTS_IN_CTU][MRG_MAX_NUM_CANDS]
 #endif
@@ -22496,9 +22508,9 @@ void EncCu::xCheckSATDCostRegularMergeOppositeLic(CodingStructure *&tempCS, Codi
   pu.mergeOppositeLic = false;
 }
 #endif
-void EncCu::xCheckSATDCostCiipMerge(CodingStructure *&tempCS, CodingUnit &cu, PredictionUnit &pu, MergeCtx mergeCtx, PelUnitBuf *acMergeTempBuffer[MMVD_MRG_MAX_RD_NUM], PelUnitBuf *&singleMergeTempBuffer, PelUnitBuf  acMergeTmpBuffer[MRG_MAX_NUM_CANDS]
+void EncCu::xCheckSATDCostCiipMerge(CodingStructure *&tempCS, CodingUnit &cu, PredictionUnit &pu, const MergeCtx& mergeCtx, PelUnitBuf *acMergeTempBuffer[MMVD_MRG_MAX_RD_NUM], PelUnitBuf *&singleMergeTempBuffer, PelUnitBuf  acMergeTmpBuffer[MRG_MAX_NUM_CANDS]
 #if JVET_AG0276_NLIC || JVET_AH0314_LIC_INHERITANCE_FOR_MRG
-  , unsigned& uiNumMrgSATDCand, static_vector<ModeInfo, MRG_MAX_NUM_CANDS + MMVD_ADD_NUM>  &rdModeList, static_vector<double, MRG_MAX_NUM_CANDS + MMVD_ADD_NUM> &candCostList, DistParam distParam, const TempCtx &ctxStart, MergeCtx mergeCtx1)
+  , unsigned& uiNumMrgSATDCand, static_vector<ModeInfo, MRG_MAX_NUM_CANDS + MMVD_ADD_NUM>  &rdModeList, static_vector<double, MRG_MAX_NUM_CANDS + MMVD_ADD_NUM> &candCostList, DistParam distParam, const TempCtx &ctxStart, const MergeCtx& mergeCtx1)
 #else
   , unsigned& uiNumMrgSATDCand, static_vector<ModeInfo, MRG_MAX_NUM_CANDS + MMVD_ADD_NUM>  &rdModeList, static_vector<double, MRG_MAX_NUM_CANDS + MMVD_ADD_NUM> &candCostList, DistParam distParam, const TempCtx &ctxStart)
 #endif
@@ -22647,7 +22659,7 @@ pu.ciipAffine = false;
 }
 
 #if JVET_X0141_CIIP_TIMD_TM && TM_MRG
-void EncCu::xCheckSATDCostCiipTmMerge(CodingStructure *&tempCS, CodingUnit &cu, PredictionUnit &pu, MergeCtx mergeCtx, PelUnitBuf *acMergeTempBuffer[MMVD_MRG_MAX_RD_NUM], PelUnitBuf *&singleMergeTempBuffer, PelUnitBuf  acTmMergeTmpBuffer[MRG_MAX_NUM_CANDS]
+void EncCu::xCheckSATDCostCiipTmMerge(CodingStructure *&tempCS, CodingUnit &cu, PredictionUnit &pu, const MergeCtx& mergeCtx, PelUnitBuf *acMergeTempBuffer[MMVD_MRG_MAX_RD_NUM], PelUnitBuf *&singleMergeTempBuffer, PelUnitBuf  acTmMergeTmpBuffer[MRG_MAX_NUM_CANDS]
   , unsigned& uiNumMrgSATDCand, static_vector<ModeInfo, MRG_MAX_NUM_CANDS + MMVD_ADD_NUM>  &rdModeList, static_vector<double, MRG_MAX_NUM_CANDS + MMVD_ADD_NUM> &candCostList, DistParam distParam, const TempCtx &ctxStart)
 {
 #if JVET_AG0276_NLIC
@@ -22785,7 +22797,7 @@ void EncCu::xCheckSATDCostCiipTmMerge(CodingStructure *&tempCS, CodingUnit &cu, 
 }
 #endif
 
-void EncCu::xCheckSATDCostMmvdMerge(CodingStructure *&tempCS, CodingUnit &cu, PredictionUnit &pu, MergeCtx mergeCtx, PelUnitBuf *acMergeTempBuffer[MMVD_MRG_MAX_RD_NUM], PelUnitBuf *&singleMergeTempBuffer
+void EncCu::xCheckSATDCostMmvdMerge(CodingStructure *&tempCS, CodingUnit &cu, PredictionUnit &pu, const MergeCtx& mergeCtx, PelUnitBuf *acMergeTempBuffer[MMVD_MRG_MAX_RD_NUM], PelUnitBuf *&singleMergeTempBuffer
   , unsigned& uiNumMrgSATDCand, static_vector<ModeInfo, MRG_MAX_NUM_CANDS + MMVD_ADD_NUM>  &rdModeList, static_vector<double, MRG_MAX_NUM_CANDS + MMVD_ADD_NUM> &candCostList, DistParam distParam, const TempCtx &ctxStart
 #if JVET_Y0067_ENHANCED_MMVD_MVD_SIGN_PRED
     , uint32_t * mmvdLUT
@@ -23665,7 +23677,7 @@ void EncCu::xCheckSATDCostTMMergeOppositeLic( CodingStructure*& tempCS,
 void EncCu::xCheckSATDCostAffineMmvdMerge(       CodingStructure*& tempCS,
                                                  CodingUnit&       cu,
                                                  PredictionUnit&   pu,
-                                                 AffineMergeCtx    affineMergeCtx,
+                                           const AffineMergeCtx&   affineMergeCtx,
                                                  MergeCtx&         mrgCtx,
                                                  PelUnitBuf*       acMergeTempBuffer[MMVD_MRG_MAX_RD_NUM],
                                                  PelUnitBuf*&      singleMergeTempBuffer,

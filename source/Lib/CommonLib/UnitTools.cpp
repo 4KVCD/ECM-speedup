@@ -10203,7 +10203,7 @@ uint8_t PU::getLFNSTIdx( int intraMode, int mtsMode )
 #if JVET_AC0185_ENHANCED_TEMPORAL_MOTION_DERIVATION
 void PU::addMergeHMVPCandSubTMVP(const CodingStructure &cs, MergeCtx &mrgCtx, const int &mrgCandIdx,
   const uint32_t maxNumMergeCand, int &cnt, const bool isAvailableA1,
-  const MotionInfo miLeft, const bool isAvailableB1, const MotionInfo miAbove,
+  const MotionInfo& miLeft, const bool isAvailableB1, const MotionInfo& miAbove,
 #if !JVET_Z0075_IBC_HMVP_ENLARGE
   const bool ibcFlag,
   const bool isGt4x4,
@@ -10313,7 +10313,7 @@ void PU::addMergeHMVPCandSubTMVP(const CodingStructure &cs, MergeCtx &mrgCtx, co
 #endif
 bool PU::addMergeHMVPCand(const CodingStructure &cs, MergeCtx &mrgCtx, const int &mrgCandIdx,
                           const uint32_t maxNumMergeCandMin1, int &cnt, const bool isAvailableA1,
-                          const MotionInfo miLeft, const bool isAvailableB1, const MotionInfo miAbove
+                          const MotionInfo& miLeft, const bool isAvailableB1, const MotionInfo& miAbove
 #if !JVET_Z0075_IBC_HMVP_ENLARGE
                         , const bool ibcFlag, const bool isGt4x4
 #endif
@@ -12852,9 +12852,9 @@ void PU::getIBCMergeCandidates(const PredictionUnit &pu, MergeCtx& mrgCtx, const
 #if  JVET_Y0058_IBC_LIST_MODIFY || JVET_AD0208_IBC_ADAPT_FOR_CAM_CAPTURED_CONTENTS
 bool PU::checkIsIBCCandidateValid(const PredictionUnit& pu
 #if JVET_AD0208_IBC_ADAPT_FOR_CAM_CAPTURED_CONTENTS
-                                ,       MotionInfo miNeighbor
+                                , const MotionInfo& miNeighbor
 #else
-                                , const MotionInfo miNeighbor
+                                , const MotionInfo& miNeighbor
 #endif
 #if JVET_AD0208_IBC_ADAPT_FOR_CAM_CAPTURED_CONTENTS
                                 ,       int filterIdx
@@ -12894,17 +12894,17 @@ bool PU::checkIsIBCCandidateValid(const PredictionUnit& pu
 #endif
 
 #if JVET_AE0169_BIPREDICTIVE_IBC
-bool PU::checkIsIBCCandidateValidBi(const PredictionUnit &pu, MotionInfo miNeighbor)
+bool PU::checkIsIBCCandidateValidBi(const PredictionUnit &pu, const MotionInfo& miNeighbor)
 {
   bool ret = checkIsIBCCandidateValid(pu, miNeighbor);
   if (!ret || miNeighbor.interDir == 1)
   {
     return ret;
   }
-  Mv mvbak = miNeighbor.mv[REF_PIC_LIST_0];
-  miNeighbor.mv[REF_PIC_LIST_0] = miNeighbor.mv[REF_PIC_LIST_1];
-  ret = checkIsIBCCandidateValid(pu, miNeighbor);
-  miNeighbor.mv[REF_PIC_LIST_0] = mvbak;
+  // check the L1 BV: same as the L0 check on a copy whose L0 BV is replaced by the L1 BV
+  MotionInfo miNeighborL1 = miNeighbor;
+  miNeighborL1.mv[REF_PIC_LIST_0] = miNeighbor.mv[REF_PIC_LIST_1];
+  ret = checkIsIBCCandidateValid(pu, miNeighborL1);
   return ret;
 }
 #endif
@@ -12985,7 +12985,7 @@ uint32_t PU::checkValidBv(const PredictionUnit& pu, ComponentID compID, int comp
 #endif
 
 #if JVET_AE0159_FIBC
-bool PU::checkIsIBCFilterCandidateValid(const PredictionUnit& pu, const MotionInfo miNeighbor, int filterIdx, bool isRefTemplate, bool isRefAbove)
+bool PU::checkIsIBCFilterCandidateValid(const PredictionUnit& pu, const MotionInfo& miNeighbor, int filterIdx, bool isRefTemplate, bool isRefAbove)
 {
   int roiWidth  = (isRefTemplate && !isRefAbove) ? FIBC_TEMPLATE_SIZE : pu.lwidth();
   int roiHeight = (isRefTemplate &&  isRefAbove) ? FIBC_TEMPLATE_SIZE : pu.lheight();
@@ -16678,7 +16678,7 @@ bool PU::isBiPredFromDifferentDirEqDistPoc(const PredictionUnit& pu, int refIdx0
 
 bool PU::addBMMergeHMVPCand(const CodingStructure &cs, MergeCtx &mrgCtx, const int &mrgCandIdx,
   const uint32_t maxNumMergeCandMin1, int &cnt, const bool isAvailableA1,
-  const MotionInfo miLeft, const bool isAvailableB1, const MotionInfo miAbove
+  const MotionInfo& miLeft, const bool isAvailableB1, const MotionInfo& miAbove
 #if JVET_AI0187_TMVP_FOR_CMVP
   , MergeCtx& tmpMrgCtx, int& tmpMrgIdx
 #endif
@@ -29063,7 +29063,7 @@ bool PU::addNonAdjAffineConstructedCPMV(const PredictionUnit &pu, MotionInfo miN
 }
 
 #if JVET_AL0162_CONSTRUCTED_AFFINE_CMVP
-void PU::deriveChainedMVForAff(const PredictionUnit &pu, int list, MvField mvField, const MotionInfo miCascaded, int& interDir, int8_t* chainedRefIdx, Mv* chainedMv)
+void PU::deriveChainedMVForAff(const PredictionUnit &pu, int list, MvField mvField, const MotionInfo& miCascaded, int& interDir, int8_t* chainedRefIdx, Mv* chainedMv)
 {
   const Slice &          slice = *pu.cs->slice;
   const Picture* const pColPic = slice.getRefPic(RefPicList(list), mvField.refIdx);
@@ -30967,8 +30967,8 @@ void PU::getAffineMergeCand( const PredictionUnit &pu, AffineMergeCtx& affMrgCtx
   InterPrediction* m_pcInterSearch,
 #endif
 #if JVET_AD0182_AFFINE_DMVR_PLUS_EXTENSIONS
-  AffineMergeCtx affineRMVFCtx,
-  AffineMergeCtx affineRMVFOriCtx,
+  const AffineMergeCtx& affineRMVFCtx,
+  const AffineMergeCtx& affineRMVFOriCtx,
   uint16_t numCandtoAdd,
 #endif
 #if JVET_AK0095_ENHANCED_AFFINE_CANDIDATE
@@ -33187,9 +33187,9 @@ bool PU::isAffBMMergeFlagCoded(const PredictionUnit& pu)
   return false;
 }
 #if JVET_AL0214_MV_REFINEMENT_FOR_TMVP
-void PU::getBMAffineMergeCand(InterPrediction* refineTmvpInterPred, const PredictionUnit &pu, AffineMergeCtx& affineBMMergeCtx, AffineMergeCtx affineMergeRMVFCtx, int mrgCandIdx)
+void PU::getBMAffineMergeCand(InterPrediction* refineTmvpInterPred, const PredictionUnit &pu, AffineMergeCtx& affineBMMergeCtx, const AffineMergeCtx& affineMergeRMVFCtx, int mrgCandIdx)
 #else
-void PU::getBMAffineMergeCand(const PredictionUnit &pu, AffineMergeCtx& affineBMMergeCtx, AffineMergeCtx affineMergeRMVFCtx, int mrgCandIdx)
+void PU::getBMAffineMergeCand(const PredictionUnit &pu, AffineMergeCtx& affineBMMergeCtx, const AffineMergeCtx& affineMergeRMVFCtx, int mrgCandIdx)
 #endif
 {
   const CodingStructure &cs = *pu.cs;
@@ -34535,7 +34535,7 @@ bool PU::getBMNonAdjCstMergeCand(const PredictionUnit &pu, AffineMergeCtx &affin
 }
 #endif
 #if AFFINE_MMVD
-uint8_t PU::getMergeIdxFromAfMmvdBaseIdx(AffineMergeCtx& affMrgCtx, uint16_t afMmvdBaseIdx)
+uint8_t PU::getMergeIdxFromAfMmvdBaseIdx(const AffineMergeCtx& affMrgCtx, uint16_t afMmvdBaseIdx)
 {
   uint8_t mergeIdx = (uint8_t)afMmvdBaseIdx;
   for (int i = 0; i < affMrgCtx.numValidMergeCand; i++)
@@ -34687,7 +34687,7 @@ int32_t PU::getAfMmvdEstBits(const PredictionUnit &pu)
 }
 #endif
 
-void PU::setAllAffineMvField( PredictionUnit &pu, MvField *mvField, RefPicList eRefList )
+void PU::setAllAffineMvField( PredictionUnit &pu, const MvField *mvField, RefPicList eRefList )
 {
   // Set Mv
   Mv mv[3];
@@ -34976,7 +34976,7 @@ void clipColPos(int& posX, int& posY, const PredictionUnit& pu)
 }
 
 #if JVET_AC0185_ENHANCED_TEMPORAL_MOTION_DERIVATION
-void PU::getTMVPCandOpt(const PredictionUnit &pu, RefPicList refList, int refIdx, MergeCtx& mrgCtx, MergeCtx mergeCtxIn, int col)
+void PU::getTMVPCandOpt(const PredictionUnit &pu, RefPicList refList, int refIdx, MergeCtx& mrgCtx, const MergeCtx& mergeCtxIn, int col)
 {
   const uint32_t maxNumMergeCand = NUM_TMVP_CANDS;
   for (uint32_t ui = 0; ui < pu.cs->sps->getMaxNumMergeCand(); ++ui)
@@ -35476,7 +35476,7 @@ bool PU::getInterMergeSubPuMvpCand(const PredictionUnit &pu, MergeCtx& mrgCtx, b
   , bool isRefined
 #endif
 #if JVET_AC0185_ENHANCED_TEMPORAL_MOTION_DERIVATION 
-  , int subIdx, MergeCtx mergeCtxIn
+  , int subIdx, const MergeCtx& mergeCtxIn
   , int col
 #if JVET_AH0119_SUBBLOCK_TM
 #if JVET_AI0183_MVP_EXTENSION
@@ -41042,7 +41042,7 @@ unsigned int PU::getSameNeigMotion(PredictionUnit &pu, MotionInfo& mi, Position 
   }
 }
 
-bool PU::identicalMvOBMC(MotionInfo curMI, MotionInfo neighMI, bool bLD)
+bool PU::identicalMvOBMC(const MotionInfo& curMI, const MotionInfo& neighMI, bool bLD)
 {
   if (curMI.interDir != neighMI.interDir)
   {
@@ -44324,7 +44324,7 @@ int buildHistogram(const Pel *pReco, int iStride, uint32_t uiHeight, uint32_t ui
 #endif
 
 #if JVET_AJ0161_OBMC_EXT_WITH_INTRA_PRED
-void calcGradForOBMC(const PredictionUnit pu, const Pel *pReco, const int iStride, const int totalUnits, const int templateSize, const int blkSize, int *modeBuf, const int isAbove, const bool isExistFirst, const bool isExistLast)
+void calcGradForOBMC(const PredictionUnit& pu, const Pel *pReco, const int iStride, const int totalUnits, const int templateSize, const int blkSize, int *modeBuf, const int isAbove, const bool isExistFirst, const bool isExistLast)
 {
   int       angTable[17]   = { 0,     2048,  4096,  6144,  8192,  12288, 16384, 20480, 24576,
                        28672, 32768, 36864, 40960, 47104, 53248, 59392, 65536 };

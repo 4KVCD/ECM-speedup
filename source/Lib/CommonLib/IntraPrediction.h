@@ -1198,7 +1198,7 @@ public:
 
 #if JVET_AJ0161_OBMC_EXT_WITH_INTRA_PRED
   const IntraPredParam* getIpaParam      () { return &m_ipaParam; };
-  bool getGradForOBMC                    (const PredictionUnit pu, const CPelBuf &recoBuf, const CompArea &area, CodingUnit &cu, const bool isAbove, const int blkSize, int* modeBuf);
+  bool getGradForOBMC                    (const PredictionUnit& pu, const CPelBuf &recoBuf, const CompArea &area, CodingUnit &cu, const bool isAbove, const int blkSize, int* modeBuf);
 #endif
 
 #if JVET_AK0059_MDIP
@@ -1260,7 +1260,7 @@ public:
   );
 #if (JVET_AG0146_DIMD_ITMP_IBC || JVET_AG0152_SGPM_ITMP_IBC || JVET_AG0151_INTRA_TMP_MERGE_MODE)
   void predTimdIbcItmp            (const ComponentID compId, const PredictionUnit& pu, Mv Bv, Pel* pPred, uint32_t uiStride, uint32_t iWidth, uint32_t iHeight, TemplateType eTempType, int32_t iTemplateWidth, int32_t iTemplateHeight, Pel* piOrg, int orgStride);
-  void predUsingBv                (Pel* piPred, unsigned int uiStride, Mv Bv, CodingUnit cu
+  void predUsingBv                (Pel* piPred, unsigned int uiStride, Mv Bv, const CodingUnit& cu
 #if JVET_AH0200_INTRA_TMP_BV_REORDER
   , bool isIntBv = true
 #endif  

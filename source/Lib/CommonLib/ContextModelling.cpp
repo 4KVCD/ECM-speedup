@@ -754,7 +754,7 @@ void MergeCtx::convertRegularMergeCandToBi(int candIdx)
 }
 #endif
 #if JVET_AC0185_ENHANCED_TEMPORAL_MOTION_DERIVATION
-void MergeCtx::saveMergeInfo(PredictionUnit& puTmp, PredictionUnit pu)
+void MergeCtx::saveMergeInfo(PredictionUnit& puTmp, const PredictionUnit& pu)
 {
   puTmp.mergeIdx = pu.mergeIdx;
 #if !JVET_Z0075_IBC_HMVP_ENLARGE
@@ -806,7 +806,7 @@ void MergeCtx::saveMergeInfo(PredictionUnit& puTmp, PredictionUnit pu)
 #endif
 }
 #endif
-void MergeCtx::setMergeInfo(PredictionUnit& pu, int candIdx)
+void MergeCtx::setMergeInfo(PredictionUnit& pu, int candIdx) const
 {
 #if JVET_X0049_ADAPT_DMVR
   pu.mergeIdx = candIdx;
@@ -1123,7 +1123,7 @@ void MergeCtx::setLICParamUsingAltLM(MergeCtxType& dst, int candIdx)
 }
 #endif
 
-void MergeCtx::setLICParamToPu         (      PredictionUnit& pu, int candIdx, bool hasLIC)                     { MergeCtx::setLICParamToPu         (*this, pu, candIdx, hasLIC);                }
+void MergeCtx::setLICParamToPu         (      PredictionUnit& pu, int candIdx, bool hasLIC)               const { MergeCtx::setLICParamToPu         (*this, pu, candIdx, hasLIC);                }
 void MergeCtx::loadLICParamFromPu      (const PredictionUnit* pu, int candIdx, bool allowAltModel, bool hasLIC) { MergeCtx::loadLICParamFromPu      (*this, pu, candIdx, allowAltModel, hasLIC); }
 void MergeCtx::loadLICParamFromMotInfo (const MotionInfo*     mi, int candIdx, bool allowAltModel, bool hasLIC) { MergeCtx::loadLICParamFromMotInfo (*this, mi, candIdx, allowAltModel, hasLIC); }
 void MergeCtx::copyLICParamFromCtx     (int candIdx, const MergeCtx& src, int candIdxSrc)                       { MergeCtx::copyLICParamFromCtx     (*this, candIdx, src, candIdxSrc);           }
@@ -1223,7 +1223,7 @@ void MergeCtx::setIbcL1Info( PredictionUnit& pu, int candIdx )
 
 #if JVET_AC0185_ENHANCED_TEMPORAL_MOTION_DERIVATION                                
 #if JVET_AH0119_SUBBLOCK_TM
-bool AffineMergeCtx::xCheckSimilarSbTMVP(PredictionUnit pu, int mergeCandIndex, uint32_t mvdSimilarityThresh) const
+bool AffineMergeCtx::xCheckSimilarSbTMVP(const PredictionUnit& pu, int mergeCandIndex, uint32_t mvdSimilarityThresh) const
 {
   if (mvFieldNeighbours[(mergeCandIndex << 1)][0].refIdx < 0 && mvFieldNeighbours[(mergeCandIndex << 1) + 1][0].refIdx < 0)
   {
@@ -2204,9 +2204,9 @@ void MergeCtx::copyMergeCtx(MergeCtx & orgMergeCtx)
 }
 #endif
 #if JVET_Y0067_ENHANCED_MMVD_MVD_SIGN_PRED
-void MergeCtx::setMmvdMergeCandiInfo(PredictionUnit& pu, int candIdx, int candIdxMaped)
+void MergeCtx::setMmvdMergeCandiInfo(PredictionUnit& pu, int candIdx, int candIdxMaped) const
 #else
-void MergeCtx::setMmvdMergeCandiInfo(PredictionUnit& pu, int candIdx)
+void MergeCtx::setMmvdMergeCandiInfo(PredictionUnit& pu, int candIdx) const
 #endif
 {
   const Slice &slice = *pu.cs->slice;
@@ -2552,7 +2552,7 @@ void MergeCtx::setGeoMrgDuplicate( const PredictionUnit& pu )
 }
 #endif
 #if JVET_AL0214_MV_REFINEMENT_FOR_TMVP
-void MergeCtx::copyRefineTmvpCtxModellingParams(MergeCtx &orgMergeCtx, uint32_t srcMrgIdxL0, uint32_t srcMrgIdxL1, uint32_t dstMrgIdxL0, uint32_t dstMrgIdxL1)
+void MergeCtx::copyRefineTmvpCtxModellingParams(const MergeCtx &orgMergeCtx, uint32_t srcMrgIdxL0, uint32_t srcMrgIdxL1, uint32_t dstMrgIdxL0, uint32_t dstMrgIdxL1)
 {
   refineTmvpParams.refineTmvpRefList    [dstMrgIdxL0]    = orgMergeCtx.refineTmvpParams.refineTmvpRefList    [srcMrgIdxL0];
   refineTmvpParams.refineTmvpRefList    [dstMrgIdxL1]    = orgMergeCtx.refineTmvpParams.refineTmvpRefList    [srcMrgIdxL1];
