@@ -283,7 +283,17 @@ private:
                  const QpParam       &cQP      );
 
   // inverse transform
+  void xGetInvTrParams( const TransformUnit &tu, const ComponentID &compID, const int width, const int height, int &trTypeHor, int &trTypeVer, int &skipWidth, int &skipHeight, bool &allowNSPT );
   void xIT     ( const TransformUnit &tu, const ComponentID &compID, const CCoeffBuf &pCoeff, PelBuf &pResidual );
+#if SIGN_PREDICTION && JVET_Y0141_SIGN_PRED_IMPROVE
+#if JVET_AJ0237_INTERNAL_12BIT
+  typedef int16_t SignPredTemplType;
+#else
+  typedef int8_t  SignPredTemplType;
+#endif
+  bool xSignPredBorderTemplate( const TransformUnit &tu, const ComponentID compID, const int width, const int height, const TCoeff amplitude,
+                                const int numPosX, const int numPosY, const int rowsPerY, SignPredTemplType *templ, const int templStride );
+#endif
 
   // inverse skipping transform
   void xITransformSkip(

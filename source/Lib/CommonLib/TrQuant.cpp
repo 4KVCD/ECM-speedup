@@ -59,6 +59,10 @@
 #include "CommonLib/CodingStatistics.h"
 #endif
 
+#ifndef SIGN_PRED_TEMPLATE_VERIFY
+#define SIGN_PRED_TEMPLATE_VERIFY 0   // 1: check xSignPredBorderTemplate against one xIT per position, and its kernels
+#endif
+
 struct coeffGroupRDStats
 {
   int    iNNZbeforePos0;
@@ -1855,20 +1859,12 @@ void TrQuant::xT( const TransformUnit &tu, const ComponentID &compID, const CPel
   }
 }
 
-void TrQuant::xIT( const TransformUnit &tu, const ComponentID &compID, const CCoeffBuf &pCoeff, PelBuf &pResidual )
+// the transform types, zero-out and NSPT permission xIT uses for a width x height block of this TU (perf: shared with the
+// sign-prediction templates, see xSignPredBorderTemplate)
+void TrQuant::xGetInvTrParams( const TransformUnit &tu, const ComponentID &compID, const int width, const int height, int &trTypeHor, int &trTypeVer, int &skipWidth, int &skipHeight, bool &allowNSPT )
 {
-  const int      width                  = pCoeff.width;
-  const int      height                 = pCoeff.height;
-  const unsigned maxLog2TrDynamicRange  = tu.cs->sps->getMaxLog2TrDynamicRange( toChannelType( compID ) );
-  const unsigned bitDepth               = tu.cs->sps->getBitDepth(              toChannelType( compID ) );
-  const int      TRANSFORM_MATRIX_SHIFT = g_transformMatrixShift[TRANSFORM_INVERSE];
-  const TCoeff   clipMinimum            = -( 1 << maxLog2TrDynamicRange );
-  const TCoeff   clipMaximum            =  ( 1 << maxLog2TrDynamicRange ) - 1;
-  const uint32_t transformWidthIndex    = floorLog2(width ) - 1;                                // nLog2WidthMinus1, since transform start from 2-point
-  const uint32_t transformHeightIndex   = floorLog2(height) - 1;                                // nLog2HeightMinus1, since transform start from 2-point
-
-  int trTypeHor = DCT2;
-  int trTypeVer = DCT2;
+  trTypeHor = DCT2;
+  trTypeVer = DCT2;
 
 #if JVET_AJ0061_TIMD_MERGE
 #if JVET_AK0187_IMPLICIT_MTS_LUT_EXTENSION
@@ -1911,21 +1907,23 @@ void TrQuant::xIT( const TransformUnit &tu, const ComponentID &compID, const CCo
   }
 #endif
 #if TU_256
-  int skipWidth  =  width  > JVET_C0024_ZERO_OUT_TH ? width  - JVET_C0024_ZERO_OUT_TH : 0;
-  int skipHeight =  height > JVET_C0024_ZERO_OUT_TH ? height - JVET_C0024_ZERO_OUT_TH : 0;
+  skipWidth  =  width  > JVET_C0024_ZERO_OUT_TH ? width  - JVET_C0024_ZERO_OUT_TH : 0;
+  skipHeight =  height > JVET_C0024_ZERO_OUT_TH ? height - JVET_C0024_ZERO_OUT_TH : 0;
 #else
-  int skipWidth  = ( trTypeHor != DCT2 && width  == 32 ) ? 16 : width  > JVET_C0024_ZERO_OUT_TH ? width  - JVET_C0024_ZERO_OUT_TH : 0;
-  int skipHeight = ( trTypeVer != DCT2 && height == 32 ) ? 16 : height > JVET_C0024_ZERO_OUT_TH ? height - JVET_C0024_ZERO_OUT_TH : 0;
+  skipWidth  = ( trTypeHor != DCT2 && width  == 32 ) ? 16 : width  > JVET_C0024_ZERO_OUT_TH ? width  - JVET_C0024_ZERO_OUT_TH : 0;
+  skipHeight = ( trTypeVer != DCT2 && height == 32 ) ? 16 : height > JVET_C0024_ZERO_OUT_TH ? height - JVET_C0024_ZERO_OUT_TH : 0;
 #endif
 
 #if JVET_AC0130_NSPT
 #if JVET_AH0103_LOW_DELAY_LFNST_NSPT
   bool spsIntraLfnstEnabled = ( ( tu.cu->slice->getSliceType() == I_SLICE && tu.cu->cs->sps->getUseIntraLFNSTISlice() ) ||
                                 ( tu.cu->slice->getSliceType() != I_SLICE && tu.cu->cs->sps->getUseIntraLFNSTPBSlice() ) );
-  bool allowNSPT = CU::isNSPTAllowed( tu, compID, width, height, spsIntraLfnstEnabled && CU::isIntra( *( tu.cu ) ) );
+  allowNSPT = CU::isNSPTAllowed( tu, compID, width, height, spsIntraLfnstEnabled && CU::isIntra( *( tu.cu ) ) );
 #else
-  const bool allowNSPT = CU::isNSPTAllowed( tu, compID, width, height, CU::isIntra( *(tu.cu) ) );
+  allowNSPT = CU::isNSPTAllowed( tu, compID, width, height, CU::isIntra( *(tu.cu) ) );
 #endif
+#else
+  allowNSPT = false;
 #endif
 
 #if EXTENDED_LFNST
@@ -1970,6 +1968,23 @@ void TrQuant::xIT( const TransformUnit &tu, const ComponentID &compID, const CCo
     }
   }
 #endif
+}
+
+void TrQuant::xIT( const TransformUnit &tu, const ComponentID &compID, const CCoeffBuf &pCoeff, PelBuf &pResidual )
+{
+  const int      width                  = pCoeff.width;
+  const int      height                 = pCoeff.height;
+  const unsigned maxLog2TrDynamicRange  = tu.cs->sps->getMaxLog2TrDynamicRange( toChannelType( compID ) );
+  const unsigned bitDepth               = tu.cs->sps->getBitDepth(              toChannelType( compID ) );
+  const int      TRANSFORM_MATRIX_SHIFT = g_transformMatrixShift[TRANSFORM_INVERSE];
+  const TCoeff   clipMinimum            = -( 1 << maxLog2TrDynamicRange );
+  const TCoeff   clipMaximum            =  ( 1 << maxLog2TrDynamicRange ) - 1;
+  const uint32_t transformWidthIndex    = floorLog2(width ) - 1;                                // nLog2WidthMinus1, since transform start from 2-point
+  const uint32_t transformHeightIndex   = floorLog2(height) - 1;                                // nLog2HeightMinus1, since transform start from 2-point
+
+  int  trTypeHor, trTypeVer, skipWidth, skipHeight;
+  bool allowNSPT;
+  xGetInvTrParams( tu, compID, width, height, trTypeHor, trTypeVer, skipWidth, skipHeight, allowNSPT );
 
   TCoeff *block = ( TCoeff * ) alloca( width * height * sizeof( TCoeff ) );
 
@@ -2839,6 +2854,141 @@ void TrQuant::xTransformSkip(const TransformUnit &tu, const ComponentID &compID,
   }
 }
 
+#if SIGN_PREDICTION && JVET_Y0141_SIGN_PRED_IMPROVE
+// perf: the sign-prediction template of predCoeffSigns() (createTemplate): for each of the numPosX x numPosY lowest-
+// frequency positions, the first column (bottom to top) and the first row of xIT's output for an impulse of the given
+// amplitude there, written to templ + templStride * (y * rowsPerY + x). createTemplate ran one complete xIT per position
+// (up to 1024 inverse transforms of up to 128x128 per template, ~6 % of a short RA decode). With an impulse the two
+// separable stages collapse: the first (vertical) stage gives the same column for every horizontal position, so it runs
+// once per impulse row; in the second (horizontal) stage each row has one non-zero input v, so each output sample is
+// clip((v * k + round) >> shift) with k the transform kernel value, which is read back from the same transform function
+// (input 2, shift 1: (2 * k + 1) >> 1 = k). The transform functions form exact int32 sums of products, rounded and
+// clipped once (TrQuantX86.h, as the scalar ones), so every sample equals xIT's. Returns false where xIT applies a
+// zero-out or NSPT; the caller then runs xIT per position as before.
+bool TrQuant::xSignPredBorderTemplate( const TransformUnit &tu, const ComponentID compID, const int width, const int height, const TCoeff amplitude,
+                                       const int numPosX, const int numPosY, const int rowsPerY, SignPredTemplType *templ, const int templStride )
+{
+  int  trTypeHor, trTypeVer, skipWidth, skipHeight;
+  bool allowNSPT;
+  xGetInvTrParams( tu, compID, width, height, trTypeHor, trTypeVer, skipWidth, skipHeight, allowNSPT );
+  if( skipWidth || skipHeight || width < 2 || height < 2 )
+  {
+    return false;
+  }
+#if JVET_AC0130_NSPT
+  if( CU::nsptApplyCond( tu, compID, allowNSPT ) )
+  {
+    return false;
+  }
+#endif
+
+  // as xIT
+  const unsigned maxLog2TrDynamicRange  = tu.cs->sps->getMaxLog2TrDynamicRange( toChannelType( compID ) );
+  const unsigned bitDepth               = tu.cs->sps->getBitDepth(              toChannelType( compID ) );
+  const int      TRANSFORM_MATRIX_SHIFT = g_transformMatrixShift[TRANSFORM_INVERSE];
+  const TCoeff   clipMinimum            = -( 1 << maxLog2TrDynamicRange );
+  const TCoeff   clipMaximum            =  ( 1 << maxLog2TrDynamicRange ) - 1;
+  const int      shift_1st              =   TRANSFORM_MATRIX_SHIFT + 1 + COM16_C806_TRANS_PREC;
+  const int      shift_2nd              = ( TRANSFORM_MATRIX_SHIFT + maxLog2TrDynamicRange - 1 ) - bitDepth + COM16_C806_TRANS_PREC;
+  if( shift_1st <= 0 || shift_2nd <= 0 )
+  {
+    return false;
+  }
+  const TCoeff   round2nd               = 1 << ( shift_2nd - 1 );
+
+  // first stage: column response colResp[y * height + i] of an impulse at row y
+  std::vector<TCoeff> impulses( std::max( width, height ) * std::max( numPosX, numPosY ), 0 );
+  std::vector<TCoeff> colResp( numPosY * height );
+  for( int y = 0; y < numPosY; y++ )
+  {
+    impulses[y * numPosY + y] = amplitude;
+  }
+  fastInvTrans[trTypeVer][floorLog2( height ) - 1]( impulses.data(), colResp.data(), shift_1st, numPosY, 0, 0, clipMinimum, clipMaximum );
+
+  // second-stage kernel kern[x * width + i] of horizontal position x
+  std::fill( impulses.begin(), impulses.end(), 0 );
+  std::vector<TCoeff> kern( numPosX * width );
+  for( int x = 0; x < numPosX; x++ )
+  {
+    impulses[x * numPosX + x] = 2;
+  }
+  fastInvTrans[trTypeHor][floorLog2( width ) - 1]( impulses.data(), kern.data(), 1, numPosX, 0, 0, std::numeric_limits<TCoeff>::min(), std::numeric_limits<TCoeff>::max() );
+
+#if SIGN_PRED_TEMPLATE_VERIFY
+  // every transform function, every impulse position: the output for a single impulse v equals
+  // clip((v * kernel + round) >> shift) for the values the two stages see
+  static bool kernelsVerified = false;
+  if( !kernelsVerified )
+  {
+    kernelsVerified = true;
+    const TCoeff values[] = { 1, -1, 2, 37, -555, amplitude, -amplitude, clipMaximum, clipMinimum };
+    for( int t = 0; t < NUM_TRANS_TYPE; t++ )
+    {
+      for( int s = 1; s < g_numTransformMatrixSizes; s++ )
+      {
+        if( !fastInvTrans[t][s] )
+        {
+          continue;
+        }
+        const int n = 2 << s;
+        std::vector<TCoeff> in( n * n, 0 ), k( n * n ), out( n * n );
+        for( int i = 0; i < n; i++ )
+        {
+          in[i * n + i] = 2;
+        }
+        fastInvTrans[t][s]( in.data(), k.data(), 1, n, 0, 0, std::numeric_limits<TCoeff>::min(), std::numeric_limits<TCoeff>::max() );
+        for( const int shift : { shift_1st, shift_2nd } )
+        {
+          for( const TCoeff v : values )
+          {
+            std::fill( in.begin(), in.end(), 0 );
+            for( int i = 0; i < n; i++ )
+            {
+              in[i * n + i] = v;
+            }
+            fastInvTrans[t][s]( in.data(), out.data(), shift, n, 0, 0, clipMinimum, clipMaximum );
+            for( int i = 0; i < n * n; i++ )
+            {
+              CHECK( out[i] != Clip3( clipMinimum, clipMaximum, ( v * k[i] + ( 1 << ( shift - 1 ) ) ) >> shift ), "sign prediction template: transform " << t << " size " << n << " is not a rounded product for an impulse" );
+            }
+          }
+        }
+      }
+    }
+  }
+#endif
+
+  auto sample = [&]( const TCoeff v, const TCoeff k ) -> SignPredTemplType
+  {
+    const Pel resi = Pel( Clip3( clipMinimum, clipMaximum, ( v * k + round2nd ) >> shift_2nd ) );
+#if JVET_AJ0237_INTERNAL_12BIT
+    return ( int16_t ) resi;
+#else
+    CHECK( resi < -128 || resi > 127, "value exceeds 8-bit range" );
+    return ( int8_t ) resi;
+#endif
+  };
+  for( int y = 0; y < numPosY; y++ )
+  {
+    const TCoeff *col = colResp.data() + y * height;
+    for( int x = 0; x < numPosX; x++ )
+    {
+      const TCoeff      *k = kern.data() + x * width;
+      SignPredTemplType *t = templ + templStride * ( y * rowsPerY + x );
+      for( int i = 0; i < height; i++ )
+      {
+        t[i] = sample( col[height - 1 - i], k[0] );
+      }
+      for( int i = 0; i < width; i++ )
+      {
+        t[height + i] = sample( col[0], k[i] );
+      }
+    }
+  }
+  return true;
+}
+#endif
+
 #if SIGN_PREDICTION
 #if JVET_AL0181_ASBT
 void TrQuant::predCoeffSigns(TransformUnit &tu, const ComponentID compID, const bool reshapeChroma, const Pel * tmpPredResiBorder)
@@ -2970,7 +3120,14 @@ void TrQuant::predCoeffSigns(TransformUnit &tu, const ComponentID compID, const 
     int8_t *templ = templateBuf.buf;
 #endif
 #if JVET_Y0141_SIGN_PRED_IMPROVE
-    for (int j = 0; j < signPredHeight*signPredWidth; ++j)
+#if JVET_AI0096_SIGN_PRED_BIT_DEPTH_FIX
+    const TCoeff amplitude = 1 << signPredShift;
+#else
+    const TCoeff amplitude = 1 << SIGN_PRED_SHIFT;
+#endif
+    // perf: the same template without one xIT per position (see xSignPredBorderTemplate); the loop is the fallback
+    const bool templateDone = xSignPredBorderTemplate( tu, comp, width, height, amplitude, signPredWidth, signPredHeight, w, templateBuf.buf, templateBuf.stride );
+    for (int j = 0; !templateDone && j < signPredHeight*signPredWidth; ++j)
     {
       Position curr(j%signPredWidth, j / signPredWidth);
       int idx = curr.y * w + curr.x;
@@ -3019,6 +3176,25 @@ void TrQuant::predCoeffSigns(TransformUnit &tu, const ComponentID compID, const 
 #endif
       prev = curr;
     }
+#if JVET_Y0141_SIGN_PRED_IMPROVE && SIGN_PRED_TEMPLATE_VERIFY
+    // the original generation, one xIT per position, must give the same template
+    for( int j = 0; templateDone && j < signPredHeight * signPredWidth; ++j )
+    {
+      Position curr( j % signPredWidth, j / signPredWidth );
+      templ = templateBuf.buf + templateBuf.stride * ( curr.y * w + curr.x );
+      coeff.fill( 0 );
+      coeff.at( curr ) = amplitude;
+      xIT( tu, comp, coeff, resi );
+      for( uint32_t i = 0; i < height; i++ )
+      {
+        CHECK( templ[i] != resi.at( 0, height - 1 - i ), "sign prediction template differs (column) " << width << "x" << height << " tr " << mtsIdx << " pos " << j );
+      }
+      for( uint32_t i = 0; i < width; i++ )
+      {
+        CHECK( templ[height + i] != resi.at( i, 0 ), "sign prediction template differs (row) " << width << "x" << height << " tr " << mtsIdx << " pos " << j );
+      }
+    }
+#endif
 
     int log2Width = floorLog2(width);
     int log2Height = floorLog2(height);
