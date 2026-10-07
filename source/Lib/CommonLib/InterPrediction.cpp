@@ -4609,25 +4609,6 @@ void InterPrediction::xPredInterBlk ( const ComponentID& compID, const Predictio
 #if JVET_AL0161_4TAP_TM
     const bool use4TapTM = (filterIdx == 1 && isLuma(compID) && !bilinearMC && !isIBC) ? true : false;
 #endif
-    // perf: reuse an identical earlier interpolation of this picture (see McCache.h); only for plain reference
-    // picture interpolation (no IBC, no BDOF-extended output, no DMVR padding buffers or sizes)
-    const bool useMcCache = m_useMcCache && !isIBC && !( bioApplied && compID == COMPONENT_Y ) && srcPadBuf == NULL && dmvrWidth == 0;
-    McCacheKey mcKey;
-    if( useMcCache )
-    {
-      m_mcCache.setPicture( pu.cs->picture, pu.cu->slice->getPOC() );
-      uint8_t flags = ( bilinearMC ? 1 : 0 ) | ( useAltHpelIf ? 2 : 0 ) | ( rndRes ? 16 : 0 );
-#if JVET_AI0094_SHARP_MC_FILTER_FOR_BIPRED
-      flags |= useBiFilter ? 4 : 0;
-#endif
-#if JVET_AL0161_4TAP_TM
-      flags |= use4TapTM ? 8 : 0;
-#endif
-      mcKey = { refBuf.buf, (int) refBuf.stride, (int16_t) backupWidth, (int16_t) backupHeight, (int16_t) xFrac, (int16_t) yFrac,
-                (int8_t) compID, (int8_t) filterIdx, (int8_t) chFmt, flags, clpRng };
-    }
-    if( !useMcCache || !m_mcCache.lookup( mcKey, dstBuf.buf, dstBuf.stride ) )
-    {
     JVET_AM0295_COND_PUSH_CACHE_ENABLE(isIBC, false);
     if( yFrac == 0 )
     {
@@ -4767,11 +4748,6 @@ void InterPrediction::xPredInterBlk ( const ComponentID& compID, const Predictio
 #endif
     }
     JVET_AM0295_COND_POP_CACHE_ENABLE(isIBC);
-    if( useMcCache )
-    {
-      m_mcCache.store( mcKey, dstBuf.buf, dstBuf.stride );
-    }
-    }
 
     if( bioApplied && compID == COMPONENT_Y )
     {

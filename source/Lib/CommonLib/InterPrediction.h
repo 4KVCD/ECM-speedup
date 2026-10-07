@@ -41,7 +41,6 @@
 
 // Include files
 #include "InterpolationFilter.h"
-#include "McCache.h"
 #include "WeightPrediction.h"
 
 #include "Buffer.h"
@@ -314,12 +313,8 @@ public:
 #if JVET_AH0119_SUBBLOCK_TM
   MotionInfo           m_sbMiBuf[3][(MAX_CU_SIZE * MAX_CU_SIZE) >> (MIN_CU_LOG2 << 1)];
 #endif
-public:
-  void                 setUseMcCache( bool b ) { m_useMcCache = b; }   // encoder only, see McCache.h
 protected:
   InterpolationFilter  m_if;
-  McBlockCache         m_mcCache;
-  bool                 m_useMcCache = false;
 
   Pel*                 m_acYuvPred            [NUM_REF_PIC_LIST_01][MAX_NUM_COMPONENT];
   Pel*                 m_filteredBlock        [LUMA_INTERPOLATION_FILTER_SUB_SAMPLE_POSITIONS_SIGNAL][LUMA_INTERPOLATION_FILTER_SUB_SAMPLE_POSITIONS_SIGNAL][MAX_NUM_COMPONENT];
