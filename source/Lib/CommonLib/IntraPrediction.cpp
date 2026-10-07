@@ -6247,6 +6247,24 @@ void IntraPrediction::xPredIntraAng(
   }
 #endif
 
+#if ANG_REF_PERSISTENT
+  // perf: persistent reference buffers that are all zero on entry (the end of this function clears what it wrote),
+  // instead of zeroing two or four arrays of ~5 KB per call
+  static_assert( ANG_REF_BUF_SIZE >= ( MAX_CU_SIZE << 3 ) + 10 + numAdditionalRefSamples + 33 * ( MAX_REF_LINE_IDX + 1 ),
+                 "reference buffers too small" );
+  Pel* const refAbove    = m_angRefBuf[0];
+  Pel* const refLeft     = m_angRefBuf[1];
+  Pel*       refMain2nd  = NULL;
+  Pel*       refSide2nd  = NULL;
+  Pel* const refAbove2nd = m_angRefBuf[2];
+  Pel* const refLeft2nd  = m_angRefBuf[3];
+  // every write below lies below this bound: the copies of top/left reference lines (lengths up to
+  // max(m_topRefLength, m_leftRefLength) + multiRefIdx + 2 padding), the extensions to the left (below the copies),
+  // the replication to the right ((multiRefIdx << s) + 10 + padding) and the OBMC samples (block width + 2)
+  const int angRefClearEnd = std::min<int>( ANG_REF_BUF_SIZE,
+    2 * ( width + height ) + std::max<int>( m_topRefLength, m_leftRefLength ) + 2 * interpFilterNumPadded
+    + 2 * ( multiRefIdx + 1 ) + ( ( multiRefIdx + 1 ) << std::abs( floorLog2( width ) - floorLog2( height ) ) ) + 16 );
+#else
 #if !INTRA_6TAP
   Pel  refAbove[2 * MAX_CU_SIZE + 3 + 33 * MAX_REF_LINE_IDX];
   Pel  refLeft [2 * MAX_CU_SIZE + 3 + 33 * MAX_REF_LINE_IDX];
@@ -6296,6 +6314,7 @@ void IntraPrediction::xPredIntraAng(
 #endif
 #endif
 #endif
+#endif // ANG_REF_PERSISTENT
 
   // Initialize the Main and Left reference array.
   if (intraPredAngle < 0)
@@ -6542,9 +6561,11 @@ void IntraPrediction::xPredIntraAng(
 #if JVET_AB0157_INTRA_FUSION
   if (!bRefL0Only)
   {
+#if !ANG_REF_PERSISTENT
     // initializing for safeguard.
     ::memset(refAbove2nd, 0, sizeof(refAbove2nd));
     ::memset(refLeft2nd, 0, sizeof(refAbove2nd));
+#endif
     // Initialize the Main and Left reference array.
     if (intraPredAngle < 0)
     {
@@ -6989,7 +7010,7 @@ void IntraPrediction::xPredIntraAng(
               pDsty[x] = ClipPel(val, clpRng);   // always clip even though not always needed
             }
           }
-#else 
+#else
 #if JVET_AK0087_INTRA_8TAP
           if ( use8TapFilter )
           {
@@ -7202,6 +7223,26 @@ void IntraPrediction::xPredIntraAng(
     int blkHeight  = pDst.height;
     bilateralFilterPredDiamond5x5Clip(cs, channelType, pDst, blkWidth, blkHeight, blkQp, clpRng, true, *pu.cu );
   }
+#endif
+#if ANG_REF_PERSISTENT
+  // leave the reference buffers all zero for the next call (the first line is filled in any case, the second one only
+  // for fusion)
+  ::memset( refAbove, 0, angRefClearEnd * sizeof( Pel ) );
+  ::memset( refLeft,  0, angRefClearEnd * sizeof( Pel ) );
+  if( !bRefL0Only )
+  {
+    ::memset( refAbove2nd, 0, angRefClearEnd * sizeof( Pel ) );
+    ::memset( refLeft2nd,  0, angRefClearEnd * sizeof( Pel ) );
+  }
+#if ECM_VERIFY_ANG_REF
+  for( int k = 0; k < 4; k++ )
+  {
+    for( int i = 0; i < ANG_REF_BUF_SIZE; i++ )
+    {
+      CHECK( m_angRefBuf[k][i] != 0, "xPredIntraAng wrote beyond angRefClearEnd" );
+    }
+  }
+#endif
 #endif
 }
 #if JVET_AH0076_OBIC
@@ -40290,6 +40331,33 @@ void CccmCovariance::ldlSolve( TCccmCoeff U[CCCM_NUM_PARAMS_MAX][CCCM_NUM_PARAMS
 }
 #endif
 
+// perf: sum over i of a[i] * b[i] (int32 products) in 64 bits, as the scalar loops accumulate them; integer sums do not
+// depend on the order. _mm_madd_epi16 adds two products in 32 bits, which can only overflow if all four inputs are
+// -32768 (sample values never are); its results are widened to 64 bits before they are accumulated.
+static inline int64_t cccmDotProduct( const Pel* a, const Pel* b, const int n )
+{
+  int     i   = 0;
+  int64_t sum = 0;
+#if defined( __SSE2__ )
+  __m128i acc = _mm_setzero_si128();
+  for( ; i + 8 <= n; i += 8 )
+  {
+    const __m128i p = _mm_madd_epi16( _mm_loadu_si128( ( const __m128i* ) ( a + i ) ), _mm_loadu_si128( ( const __m128i* ) ( b + i ) ) );
+    const __m128i s = _mm_srai_epi32( p, 31 );
+    acc             = _mm_add_epi64( acc, _mm_unpacklo_epi32( p, s ) );
+    acc             = _mm_add_epi64( acc, _mm_unpackhi_epi32( p, s ) );
+  }
+  int64_t lanes[2];
+  _mm_storeu_si128( ( __m128i* ) lanes, acc );
+  sum = lanes[0] + lanes[1];
+#endif
+  for( ; i < n; i++ )
+  {
+    sum += a[i] * b[i];
+  }
+  return sum;
+}
+
 #if JVET_AB0174_CCCM_DIV_FREE
 void CccmCovariance::solve1( const Pel A[CCCM_NUM_PARAMS_MAX][CCCM_REF_SAMPLES_MAX], const Pel* C, const int sampleNum, const int chromaOffset, CccmModel& model )
 #else
@@ -40311,24 +40379,13 @@ void CccmCovariance::solve1( const Pel A[CCCM_NUM_PARAMS_MAX][CCCM_REF_SAMPLES_M
   {
     for( int coli1 = coli0; coli1 < numParams; coli1++ )
     {
-      const Pel *col0 = A[coli0];
-      const Pel *col1 = A[coli1];
-
-      for( int rowi = 0; rowi < sampleNum; rowi++ )
-      {
-        ATA[coli0][coli1] += col0[rowi] * col1[rowi];
-      }
+      ATA[coli0][coli1] += cccmDotProduct( A[coli0], A[coli1], sampleNum );
     }
   }
 
   for( int coli = 0; coli < numParams; coli++ )
   {
-    const Pel *col = A[coli];
-
-    for( int rowi = 0; rowi < sampleNum; rowi++ )
-    {
-      ATCb[coli] += col[rowi] * C[rowi];
-    }
+    ATCb[coli] += cccmDotProduct( A[coli], C, sampleNum );
   }
 
 #if JVET_AB0174_CCCM_DIV_FREE
@@ -40434,25 +40491,14 @@ void CccmCovariance::solve2( const Pel A[CCCM_NUM_PARAMS_MAX][CCCM_REF_SAMPLES_M
   {
     for( int coli1 = coli0; coli1 < numParams; coli1++ )
     {
-      const Pel *col0 = A[coli0];
-      const Pel *col1 = A[coli1];
-
-      for( int rowi = 0; rowi < sampleNum; rowi++ )
-      {
-        ATA[coli0][coli1] += col0[rowi] * col1[rowi];
-      }
+      ATA[coli0][coli1] += cccmDotProduct( A[coli0], A[coli1], sampleNum );
     }
   }
 
   for( int coli = 0; coli < numParams; coli++ )
   {
-    const Pel *col = A[coli];
-
-    for( int rowi = 0; rowi < sampleNum; rowi++ )
-    {
-      ATCb[coli] += col[rowi] * Cb[rowi];
-      ATCr[coli] += col[rowi] * Cr[rowi];
-    }
+    ATCb[coli] += cccmDotProduct( A[coli], Cb, sampleNum );
+    ATCr[coli] += cccmDotProduct( A[coli], Cr, sampleNum );
   }
 
 #if JVET_AB0174_CCCM_DIV_FREE
