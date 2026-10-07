@@ -54,6 +54,7 @@ Benchmark suite (`perf/bench.py`)
 | 22 | AVX2 NSPT / LFNST kernels without gathers (axpy over contiguous matrix rows) | yes | +0.4 % (inverse NSPT; forward NSPT / inverse LFNST 0) | |
 | - | getCURestricted: wavefront check only when wavefronts are on | yes | 1.00x - dropped | |
 | 23 | small-object allocator behind operator new / delete (size-class free lists, 16-byte headers) | yes | +2 % CPU (every test 1.02-1.03x) | |
+| - | GPM split-mode reordering sort: carry-swap loop instead of the backward copy that GCC turns into two memmove calls per insertion | yes | 1.00x - dropped (AI 1.03-1.04x although all-intra never runs GPM, i.e. layout noise; LD 0.95x) | |
 
 Direct paired measurement stock vs current (LTO, no PGO, steps 4-22): **1.17x** (every test 1.15-1.19x, wall and
 CPU, bit-exact); with step 23: ~1.19x. PGO (+~6 %) is re-applied at the end.
@@ -94,3 +95,9 @@ lower all-core turbo, one duplicated intra frame per chunk, unequal chunk comple
 - The SADL intra-NN translation units pick implementations through `__AVX2__`/`__SSE4_2__` and are kept on the
   stock ISA whatever `ECM_MARCH` says.
 - Profile concentration (stock): 50 % of RA self time is spread over 37 functions, 90 % over 286 functions.
+- Per-test differences of up to ~4 % can come from code layout alone (the dropped GPM step sped up all-intra
+  tests, which never run GPM), so small steps are judged on the total and on the tests that run the code.
+- `bench.py` reports the CPU time of the whole process tree (a Windows job object); earlier CPU numbers of
+  segment-parallel runs counted only the parent process.
+- The allocator has a canary build for testing (`-DFASTALLOC_CANARY=1`: guard bytes, magic words, poisoning);
+  it ran the suite bit-exact without an abort.
