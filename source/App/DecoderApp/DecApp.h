@@ -72,6 +72,10 @@ private:
   bool            m_newCLVS[MAX_NUM_LAYER_IDS];   ///< used to record a new CLVSS
 #endif
 
+  // segment-parallel child: decoding-order index of the finished pictures that are not yet output
+  std::unordered_map<const Picture*, int> m_segmentDecodeIdx;
+  int             m_segmentDecodedPics = 0;
+  bool            m_segmentPicWritten  = false;
 
 private:
   bool  xIsNaluWithinTargetDecLayerIdSet( const InputNALUnit* nalu ) const; ///< check whether given Nalu is within targetDecLayerIdSet
@@ -92,6 +96,7 @@ private:
   bool  isNewAccessUnit(bool newPicture, ifstream *bitstreamFile, class InputByteStream *bytestream);  ///< check if next NAL unit will be the first NAL unit from a new access unit
 
   void  writeLineToOutputLog(Picture * pcPic);
+  bool  xSkipSegmentOverlapOutput( const Picture* pcPic );   ///< segment-parallel child: true for reference-only pictures
 
 };
 

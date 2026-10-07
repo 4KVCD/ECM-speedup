@@ -1396,6 +1396,7 @@ void DecLib::xUpdateRasInit(Slice* slice)
 
 void DecLib::xCreateLostPicture( int iLostPoc, const int layerId )
 {
+  CHECK( m_segmentChild, "segment-parallel decoding: reference picture " << iLostPoc << " is not in this segment" );
   msg( INFO, "\ninserting lost poc : %d\n",iLostPoc);
   Picture *cFillPic = xGetNewPicBuffer( *( m_parameterSetManager.getFirstSPS() ), *( m_parameterSetManager.getFirstPPS() ), 0, layerId );
 
@@ -3096,7 +3097,20 @@ bool DecLib::xDecodeSlice(InputNALUnit &nalu, int &iSkipFrame, int iPOCLastDispl
   }
 
   //Reset POC MSB when CRA or GDR has NoOutputBeforeRecoveryFlag equal to 1
-  if (!pps->getMixedNaluTypesInPicFlag() && (m_apcSlicePilot->getNalUnitType() == NAL_UNIT_CODED_SLICE_CRA || m_apcSlicePilot->getNalUnitType() == NAL_UNIT_CODED_SLICE_GDR) && m_lastNoOutputBeforeRecoveryFlag[nalu.m_nuhLayerId])
+  // (in a segment-parallel child only for the stream's first picture: its random-access point is a CRA in the middle of
+  // the stream, and the POC derived over the skipped pictures equals that of a sequential decode)
+  bool childFirstPicture = false;
+  if( m_segmentChild && !m_childPastFirstPicture )
+  {
+    const int pocLsb = m_apcSlicePilot->getPOC() & ( ( 1 << sps->getBitsForPOC() ) - 1 );
+    if( m_childFirstPocLsb < 0 )
+    {
+      m_childFirstPocLsb = pocLsb;
+    }
+    childFirstPicture       = pocLsb == m_childFirstPocLsb;   // its slices
+    m_childPastFirstPicture = !childFirstPicture;
+  }
+  if ((!m_segmentChild || childFirstPicture) && !pps->getMixedNaluTypesInPicFlag() && (m_apcSlicePilot->getNalUnitType() == NAL_UNIT_CODED_SLICE_CRA || m_apcSlicePilot->getNalUnitType() == NAL_UNIT_CODED_SLICE_GDR) && m_lastNoOutputBeforeRecoveryFlag[nalu.m_nuhLayerId])
   {
     int iMaxPOClsb = 1 << sps->getBitsForPOC();
     m_apcSlicePilot->setPOC( m_apcSlicePilot->getPOC() & (iMaxPOClsb - 1) );

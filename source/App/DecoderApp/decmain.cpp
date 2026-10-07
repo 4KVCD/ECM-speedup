@@ -39,6 +39,7 @@
 #include <stdio.h>
 #include <time.h>
 #include "DecApp.h"
+#include "DecSegmentParallel.h"
 #include "program_options_lite.h"
 
 //! \ingroup DecoderApp
@@ -83,12 +84,38 @@ int main(int argc, char* argv[])
   double dResult;
   clock_t lBefore = clock();
 
+  // segment-parallel decoding, if possible
+  bool decoded = false;
+  if( pcDecApp->getParallelSegments() > 1 )
+  {
+    std::string reason;
+    int         rc = -1;
+    if( !pcDecApp->segmentParallelBlocked( reason ) )
+    {
+      DecSegmentParallelCfg spc;
+      spc.numWorkers    = pcDecApp->getParallelSegments();
+      spc.bitstreamFile = pcDecApp->getBitstreamFileName();
+      spc.reconFile     = pcDecApp->getReconFileName();
+      spc.outputBitDepthGiven = pcDecApp->hasOutputBitDepth();
+      rc                = runDecSegmentParallel( argc, argv, spc, reason );
+    }
+    if( rc >= 0 )
+    {
+      decoded    = true;
+      returnCode = rc == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
+    else
+    {
+      printf( "\nSegment-parallel decoding: %s; decoding sequentially\n", reason.c_str() );
+    }
+  }
+
   // call decoding function
 #ifndef _DEBUG
   try
   {
 #endif // !_DEBUG
-    if( 0 != pcDecApp->decode() )
+    if( !decoded && 0 != pcDecApp->decode() )
     {
       printf( "\n\n***ERROR*** A decoding mismatch occured: signalled md5sum does not match\n" );
       returnCode = EXIT_FAILURE;

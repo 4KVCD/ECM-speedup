@@ -345,6 +345,10 @@ uint32_t DecApp::decode()
           }
         }
 #endif
+        if( m_segmentOverlapPictures > 0 && m_cDecLib.getPicture() )
+        {
+          m_segmentDecodeIdx[m_cDecLib.getPicture()] = m_segmentDecodedPics++;
+        }
         m_cDecLib.executeLoopFilters();
 #if JVET_AG0145_ADAPTIVE_CLIPPING
         m_cDecLib.adaptiveClipToRealRange();
@@ -590,10 +594,11 @@ void DecApp::xCreateDecLib()
 #endif
   );
   m_cDecLib.setDecodedPictureHashSEIEnabled(m_decodedPictureHashSEIEnabled);
+  m_cDecLib.setSegmentChild( m_segmentOverlapPictures >= 0 );
 
 #if NN_COMMON_SPS
   m_cDecLib.setNnlfModelName(m_nnlfModelName);
-#endif  
+#endif
 
 
   if (!m_outputDecodedSEIMessagesFilename.empty())
@@ -692,6 +697,7 @@ void DecApp::xWriteOutput( PicList* pcListPic, uint32_t tId )
   Picture* pcPic = *(iterPic);
   if( numPicsNotYetDisplayed>2 && pcPic->fieldPic ) //Field Decoding
   {
+    CHECK( m_segmentOverlapPictures > 0, "segment-parallel decoding does not support field coding" );
     PicList::iterator endPic   = pcListPic->end();
     endPic--;
     iterPic   = pcListPic->begin();
@@ -769,8 +775,8 @@ void DecApp::xWriteOutput( PicList* pcListPic, uint32_t tId )
           dpbFullness--;
         }
 
-
-        if (!m_reconFileName.empty())
+        const bool referenceOnly = xSkipSegmentOverlapOutput( pcPic );
+        if (!m_reconFileName.empty() && !referenceOnly)
         {
           const Window &conf = pcPic->getConformanceWindow();
           const SPS* sps = pcPic->cs->sps;
@@ -795,7 +801,10 @@ void DecApp::xWriteOutput( PicList* pcListPic, uint32_t tId )
                                         NUM_CHROMA_FORMAT, m_bClipOutputVideoToRec709Range );
           }
         }
-        writeLineToOutputLog(pcPic);
+        if( !referenceOnly )
+        {
+          writeLineToOutputLog( pcPic );
+        }
 
         // update POC of display order
         m_iPOCLastDisplay = pcPic->getPOC();
@@ -828,6 +837,7 @@ void DecApp::xFlushOutput( PicList* pcListPic, const int layerId )
 
   if (pcPic->fieldPic ) //Field Decoding
   {
+    CHECK( m_segmentOverlapPictures > 0, "segment-parallel decoding does not support field coding" );
     PicList::iterator endPic   = pcListPic->end();
     endPic--;
     Picture *pcPicTop, *pcPicBottom = NULL;
@@ -906,8 +916,8 @@ void DecApp::xFlushOutput( PicList* pcListPic, const int layerId )
       if (pcPic->neededForOutput)
       {
         // write to file
-
-        if (!m_reconFileName.empty())
+        const bool referenceOnly = xSkipSegmentOverlapOutput( pcPic );
+        if (!m_reconFileName.empty() && !referenceOnly)
         {
           const Window &conf = pcPic->getConformanceWindow();
           const SPS* sps = pcPic->cs->sps;
@@ -932,7 +942,10 @@ void DecApp::xFlushOutput( PicList* pcListPic, const int layerId )
                                         NUM_CHROMA_FORMAT, m_bClipOutputVideoToRec709Range );
             }
         }
-        writeLineToOutputLog(pcPic);
+        if( !referenceOnly )
+        {
+          writeLineToOutputLog( pcPic );
+        }
 
         // update POC of display order
         m_iPOCLastDisplay = pcPic->getPOC();
@@ -946,6 +959,7 @@ void DecApp::xFlushOutput( PicList* pcListPic, const int layerId )
       }
       if(pcPic != NULL)
       {
+        m_segmentDecodeIdx.erase( pcPic );
         pcPic->destroy();
         delete pcPic;
         pcPic = NULL;
@@ -962,6 +976,27 @@ void DecApp::xFlushOutput( PicList* pcListPic, const int layerId )
   else
   pcListPic->clear();
   m_iPOCLastDisplay = -MAX_INT;
+}
+
+/** Segment-parallel child: the first m_segmentOverlapPictures decoded pictures are references for the segment's
+    pictures only and are not written. They must all precede the segment's own pictures in output order, else the
+    segment outputs cannot be concatenated.
+ */
+bool DecApp::xSkipSegmentOverlapOutput( const Picture* pcPic )
+{
+  if( m_segmentOverlapPictures <= 0 )
+  {
+    return false;
+  }
+  const auto it            = m_segmentDecodeIdx.find( pcPic );
+  const bool referenceOnly = it != m_segmentDecodeIdx.end() && it->second < m_segmentOverlapPictures;
+  if( it != m_segmentDecodeIdx.end() )
+  {
+    m_segmentDecodeIdx.erase( it );
+  }
+  CHECK( referenceOnly && m_segmentPicWritten, "segment-parallel decoding: a reference-only picture follows the segment's pictures in output order" );
+  m_segmentPicWritten |= !referenceOnly;
+  return referenceOnly;
 }
 
 /** \param nalu Input nalu to check whether its LayerId is within targetDecLayerIdSet

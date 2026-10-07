@@ -184,6 +184,9 @@ private:
   uint32_t                m_numberOfChecksumErrorsDetected;
 
   bool                    m_warningMessageSkipPicture;
+  bool                    m_segmentChild = false;   ///< segment-parallel child: keep the POC MSB at the random-access point, a missing reference picture is an error
+  int                     m_childFirstPocLsb      = -1;      ///< segment-parallel child: POC LSB of the stream's first picture
+  bool                    m_childPastFirstPicture = false;
 
   std::list<InputNALUnit*> m_prefixSEINALUs; /// Buffered up prefix SEI NAL Units.
   int                     m_debugPOC;
@@ -250,6 +253,7 @@ public:
 #endif  
 
   void  setDecodedPictureHashSEIEnabled(int enabled) { m_decodedPictureHashSEIEnabled=enabled; }
+  void  setSegmentChild( bool b )                    { m_segmentChild = b; }
 
   void  init(
 #if JVET_J0090_MEMORY_BANDWITH_MEASURE

@@ -145,6 +145,8 @@ bool DecAppCfg::parseCfg( int argc, char* argv[] )
 #if DUMP_BEFORE_INLOOP
   ( "DumpBeforeInloop",        m_dumpBeforeInloop,                          false, "Dump YUV before inloop filters" )
 #endif
+  ("ParallelSegments",         m_parallelSegments,                          0,     "Decode in this many concurrent child processes, the stream split at CRA pictures (0, 1: off). The output is that of a sequential decode; streams that cannot be split are decoded sequentially")
+  ("SegmentOverlapPictures",   m_segmentOverlapPictures,                   -1,     "Internal, for segment-parallel child processes: the first N decoded pictures are references only and not written (-1: not a child)\n")
   ;
 
   po::setDefaults(opts);
@@ -249,6 +251,39 @@ bool DecAppCfg::parseCfg( int argc, char* argv[] )
   CabacRetrain::init(m_bitstreamFileName,m_activateDump);
 #endif
   return true;
+}
+
+bool DecAppCfg::segmentParallelBlocked( std::string& reason ) const
+{
+  const auto endsWith = []( const std::string& s, const char* suffix ) {
+    const size_t n = strlen( suffix );
+    return s.size() >= n && s.compare( s.size() - n, n, suffix ) == 0;
+  };
+  reason = m_iSkipFrame                                        ? "SkipFrames"
+           : !m_oplFilename.empty()                            ? "OplFile"
+           : !m_outputDecodedSEIMessagesFilename.empty()       ? "OutputDecodedSEIMessagesFilename"
+           : !m_colourRemapSEIFileName.empty()                 ? "SEIColourRemappingInfoFilename"
+           : m_iMaxTemporalLayer >= 0                          ? "MaxTemporalLayer"
+           : !m_targetDecLayerIdSet.empty()                    ? "TarDecLayerIdSetFile"
+           : m_targetOlsIdx >= 0                               ? "TargetOutputLayerSet"
+           : m_targetSubPicIdx                                 ? "targetSubPicIdx"
+           : m_upscaledOutput                                  ? "UpscaledOutput"
+           : endsWith( m_reconFileName, ".y4m" )               ? "Y4M output"
+#if JVET_S0257_DUMP_360SEI_MESSAGE
+           : !m_outputDecoded360SEIMessagesFilename.empty()    ? "360DumpFile"
+#endif
+#if DUMP_BEFORE_INLOOP
+           : m_dumpBeforeInloop                                ? "DumpBeforeInloop"
+#endif
+#if JVET_AG0196_CABAC_RETRAIN
+           : m_activateDump                                    ? "ActivateCABACDumping"
+#endif
+                                                               : "";
+  if( !reason.empty() )
+  {
+    reason = "not used with " + reason;
+  }
+  return !reason.empty();
 }
 
 DecAppCfg::DecAppCfg()

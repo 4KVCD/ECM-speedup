@@ -102,11 +102,19 @@ protected:
 #if JVET_AG0196_CABAC_RETRAIN
   bool          m_activateDump;
 #endif
+  int           m_parallelSegments = 0;              ///< segment-parallel decoding with this many child processes (0, 1: off)
+  int           m_segmentOverlapPictures = -1;       ///< segment-parallel child (>= 0): the first N decoded pictures are references only
 public:
   DecAppCfg();
   virtual ~DecAppCfg();
 
   bool  parseCfg        ( int argc, char* argv[] );   ///< initialize option class from configuration
+
+  int                getParallelSegments() const { return m_parallelSegments; }
+  const std::string& getBitstreamFileName() const { return m_bitstreamFileName; }
+  const std::string& getReconFileName() const    { return m_reconFileName; }
+  bool               hasOutputBitDepth() const   { return m_outputBitDepth[CHANNEL_TYPE_LUMA] != 0; }   ///< -d given (else native)
+  bool  segmentParallelBlocked( std::string& reason ) const;   ///< options that segment-parallel decoding does not support
 };
 
 //! \}
