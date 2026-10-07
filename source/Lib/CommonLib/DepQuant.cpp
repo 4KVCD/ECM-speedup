@@ -1412,6 +1412,12 @@ const CtxSet &ctxSetGt4 = isLfnst ? Ctx::GtxFlagL[6 + chType] : Ctx::GtxFlag[6 +
       196608, 196608, 229376, 229376, 229376, 229376, 229376, 229376, 229376, 229376 }
   };
 
+#if defined(__GNUC__) && !defined(__clang__)
+#define DQ_UNROLL_STATES _Pragma("GCC unroll 8")   // loops over the trellis states: fully unrolled (constant indices)
+#else
+#define DQ_UNROLL_STATES
+#endif
+
 #if JVET_AG0100_TRANSFORM_COEFFICIENT_CODING
   static const int TPL_LEVEL_CLIP = GTN_LEVEL;   // a template neighbour adds min(TPL_LEVEL_CLIP + (t & 1), t) to sumAbs1
 #else
@@ -1511,6 +1517,34 @@ const CtxSet &ctxSetGt4 = isLfnst ? Ctx::GtxFlagL[6 + chType] : Ctx::GtxFlag[6 +
     void checkRdCosts(const ScanPosType spt, const PQData &pqDataA, const PQData &pqDataB, Decision &decisionA,
                       Decision &decisionB) const
     {
+      int64_t rdCostA, rdCostB, rdCostZ;
+      calcRdCosts(spt, pqDataA, pqDataB, rdCostA, rdCostB, rdCostZ);
+      if (rdCostA < decisionA.rdCost)
+      {
+        decisionA.rdCost   = rdCostA;
+        decisionA.absLevel = pqDataA.absLevel;
+        decisionA.prevId   = m_stateId;
+      }
+      if (rdCostZ < decisionA.rdCost)
+      {
+        decisionA.rdCost   = rdCostZ;
+        decisionA.absLevel = 0;
+        decisionA.prevId   = m_stateId;
+      }
+      if (rdCostB < decisionB.rdCost)
+      {
+        decisionB.rdCost   = rdCostB;
+        decisionB.absLevel = pqDataB.absLevel;
+        decisionB.prevId   = m_stateId;
+      }
+    }
+
+    // costs of coding level A, level B or zero from this state; a zero that is not allowed (the last coefficient of a
+    // coded sub-block without other significant coefficients) gets INT64_MAX, so it never wins (the stock code
+    // compared a cost equal to the current decision, which never wins either)
+    inline void calcRdCosts(const ScanPosType spt, const PQData &pqDataA, const PQData &pqDataB, int64_t &costA,
+                            int64_t &costB, int64_t &costZ) const
+    {
       const int32_t *goRiceTab = g_goRiceBits[m_goRicePar];
       int64_t        rdCostA   = m_rdCost + pqDataA.deltaDist;
       int64_t        rdCostB   = m_rdCost + pqDataB.deltaDist;
@@ -1589,7 +1623,7 @@ const CtxSet &ctxSetGt4 = isLfnst ? Ctx::GtxFlagL[6 + chType] : Ctx::GtxFlag[6 +
         }
         else
         {
-          rdCostZ = decisionA.rdCost;
+          rdCostZ = std::numeric_limits<int64_t>::max();
         }
       }
       else
@@ -1602,28 +1636,25 @@ const CtxSet &ctxSetGt4 = isLfnst ? Ctx::GtxFlagL[6 + chType] : Ctx::GtxFlag[6 +
           + goRiceTab[absLevelB <= m_goRiceZero ? absLevelB - 1 : (absLevelB < RICEMAX ? absLevelB : RICEMAX - 1)];
         rdCostZ += goRiceTab[m_goRiceZero];
       }
-
-      if (rdCostA < decisionA.rdCost)
-      {
-        decisionA.rdCost   = rdCostA;
-        decisionA.absLevel = absLevelA;
-        decisionA.prevId   = m_stateId;
-      }
-      if (rdCostZ < decisionA.rdCost)
-      {
-        decisionA.rdCost   = rdCostZ;
-        decisionA.absLevel = 0;
-        decisionA.prevId   = m_stateId;
-      }
-      if (rdCostB < decisionB.rdCost)
-      {
-        decisionB.rdCost   = rdCostB;
-        decisionB.absLevel = absLevelB;
-        decisionB.prevId   = m_stateId;
-      }
+      costA = rdCostA;
+      costB = rdCostB;
+      costZ = rdCostZ;
     }
 
     inline void checkRdCostStart(int32_t lastOffset, const PQData &pqData, Decision &decision) const
+    {
+      const int64_t rdCost = calcRdCostStart(lastOffset, pqData);
+      if (rdCost < decision.rdCost)
+      {
+        decision.rdCost   = rdCost;
+        decision.absLevel = pqData.absLevel;
+        decision.prevId   = -1;
+      }
+    }
+
+    inline int64_t rdCostSkipSbb() const { return m_rdCost + m_sbbFracBits.intBits[0]; }
+
+    inline int64_t calcRdCostStart(int32_t lastOffset, const PQData &pqData) const
     {
       int64_t rdCost = pqData.deltaDist + lastOffset;
 #if JVET_AG0100_TRANSFORM_COEFFICIENT_CODING
@@ -1648,12 +1679,7 @@ const CtxSet &ctxSetGt4 = isLfnst ? Ctx::GtxFlagL[6 + chType] : Ctx::GtxFlag[6 +
         rdCost += m_coeffFracBits->bits[pqData.absLevel - (value << 1)]
                   + g_goRiceBits[m_goRicePar][value < RICEMAX ? value : RICEMAX - 1];
       }
-      if (rdCost < decision.rdCost)
-      {
-        decision.rdCost   = rdCost;
-        decision.absLevel = pqData.absLevel;
-        decision.prevId   = -1;
-      }
+      return rdCost;
     }
 
 #if TCQ_8STATES
@@ -1662,7 +1688,7 @@ const CtxSet &ctxSetGt4 = isLfnst ? Ctx::GtxFlagL[6 + chType] : Ctx::GtxFlag[6 +
     inline void checkRdCostSkipSbb(Decision &decision) const
 #endif
     {
-      int64_t rdCost = m_rdCost + m_sbbFracBits.intBits[0];
+      int64_t rdCost = rdCostSkipSbb();
       if (rdCost < decision.rdCost)
       {
         decision.rdCost   = rdCost;
@@ -2176,6 +2202,18 @@ const CtxSet &ctxSetGt4 = isLfnst ? Ctx::GtxFlagL[6 + chType] : Ctx::GtxFlag[6 +
 #endif
   {
 #if TCQ_8STATES
+    // For destination state j the candidates are: level A and zero from state P[j] and level B from state Q[j]
+    // (next state of P[j] for an even level / of Q[j] for an odd level), in the stock evaluation order (by source state),
+    // then skipping the sub-block (from skip state j) and starting the path (j = 0: pqData[0], j = START_B: pqData[2]).
+    // The selection is written branch-free; ties keep the earlier candidate as before (strict "<").
+    static const int8_t P[2][8]    = { { 0, 2, 1, 3, -1, -1, -1, -1 }, { 0, 2, 4, 6, 5, 1, 3, 7 } };
+    static const int8_t Q[2][8]    = { { 2, 0, 3, 1, -1, -1, -1, -1 }, { 4, 6, 0, 2, 3, 7, 5, 1 } };
+    const int           START_B    = (numStates > 4 ? 2 : 1);
+    const int8_t       *P_         = P[numStates > 4];
+    const int8_t       *Q_         = Q[numStates > 4];
+#endif
+#if !TU_256 || EXTENDED_LFNST
+#if TCQ_8STATES
     for (int k = 0; k < numStates; k++)
     {
       decisions[k] = startDec;
@@ -2183,7 +2221,6 @@ const CtxSet &ctxSetGt4 = isLfnst ? Ctx::GtxFlagL[6 + chType] : Ctx::GtxFlag[6 +
 #else
     ::memcpy(decisions, startDec, 8 * sizeof(Decision));
 #endif
-#if !TU_256 || EXTENDED_LFNST
     if (zeroOut)
     {
       if (spt == SCAN_EOCSBB)
@@ -2211,65 +2248,71 @@ const CtxSet &ctxSetGt4 = isLfnst ? Ctx::GtxFlagL[6 + chType] : Ctx::GtxFlag[6 +
     PQData pqData[4];
     m_quant.preQuantCoeff(absCoeff, pqData, quanCoeff);
 #if TCQ_8STATES
-    if (numStates > 4)
+    int64_t costA[numStates], costB[numStates], costZ[numStates];
+    DQ_UNROLL_STATES
+    for (int s = 0; s < numStates; s++)
     {
-      m_prevStates[0].checkRdCosts(spt, pqData[0], pqData[2], decisions[0], decisions[2]);
-      m_prevStates[1].checkRdCosts(spt, pqData[3], pqData[1], decisions[5], decisions[7]);
-      m_prevStates[2].checkRdCosts(spt, pqData[0], pqData[2], decisions[1], decisions[3]);
-      m_prevStates[3].checkRdCosts(spt, pqData[3], pqData[1], decisions[6], decisions[4]);
-      m_prevStates[4].checkRdCosts(spt, pqData[0], pqData[2], decisions[2], decisions[0]);
-      m_prevStates[5].checkRdCosts(spt, pqData[3], pqData[1], decisions[4], decisions[6]);
-      m_prevStates[6].checkRdCosts(spt, pqData[0], pqData[2], decisions[3], decisions[1]);
-      m_prevStates[7].checkRdCosts(spt, pqData[3], pqData[1], decisions[7], decisions[5]);
+      m_prevStates[s].calcRdCosts(spt, pqData[(s & 1) ? 3 : 0], pqData[(s & 1) ? 1 : 2], costA[s], costB[s], costZ[s]);
     }
-    else
+    const int64_t startCostA = m_startState.calcRdCostStart(lastOffset, pqData[0]);
+    const int64_t startCostB = m_startState.calcRdCostStart(lastOffset, pqData[2]);
+
+    DQ_UNROLL_STATES
+    for (int j = 0; j < numStates; j++)
     {
-      m_prevStates[0].checkRdCosts(spt, pqData[0], pqData[2], decisions[0], decisions[1]);
-      m_prevStates[1].checkRdCosts(spt, pqData[3], pqData[1], decisions[2], decisions[3]);
-      m_prevStates[2].checkRdCosts(spt, pqData[0], pqData[2], decisions[1], decisions[0]);
-      m_prevStates[3].checkRdCosts(spt, pqData[3], pqData[1], decisions[3], decisions[2]);
+      const int p = P_[j];
+      const int q = Q_[j];
+      int64_t   cost     = startDec.rdCost;
+      TCoeff    absLevel = startDec.absLevel;
+      int       prevId   = startDec.prevId;
+      auto      select   = [&](const int64_t c, const TCoeff l, const int id)
+      {
+        const bool better = c < cost;
+        cost              = better ? c : cost;
+        absLevel          = better ? l : absLevel;
+        prevId            = better ? id : prevId;
+      };
+      if (p < q)
+      {
+        select(costA[p], pqData[(p & 1) ? 3 : 0].absLevel, p);
+        select(costZ[p], 0, p);
+        select(costB[q], pqData[(q & 1) ? 1 : 2].absLevel, q);
+      }
+      else
+      {
+        select(costB[q], pqData[(q & 1) ? 1 : 2].absLevel, q);
+        select(costA[p], pqData[(p & 1) ? 3 : 0].absLevel, p);
+        select(costZ[p], 0, p);
+      }
+      if (spt == SCAN_EOCSBB)
+      {
+        select(m_skipStates[j].rdCostSkipSbb(), 0, numStates + j);
+      }
+      if (j == 0)
+      {
+        select(startCostA, pqData[0].absLevel, -1);
+      }
+      if (j == START_B)
+      {
+        select(startCostB, pqData[2].absLevel, -1);
+      }
+      decisions[j].rdCost   = cost;
+      decisions[j].absLevel = absLevel;
+      decisions[j].prevId   = prevId;
     }
 #else
+    ::memcpy(decisions, startDec, 8 * sizeof(Decision));
     m_prevStates[0].checkRdCosts(spt, pqData[0], pqData[2], decisions[0], decisions[2]);
     m_prevStates[1].checkRdCosts(spt, pqData[0], pqData[2], decisions[2], decisions[0]);
     m_prevStates[2].checkRdCosts(spt, pqData[3], pqData[1], decisions[1], decisions[3]);
     m_prevStates[3].checkRdCosts(spt, pqData[3], pqData[1], decisions[3], decisions[1]);
-#endif
     if (spt == SCAN_EOCSBB)
     {
-#if TCQ_8STATES
-      m_skipStates[0].checkRdCostSkipSbb(decisions[0], numStates);
-      m_skipStates[1].checkRdCostSkipSbb(decisions[1], numStates);
-      m_skipStates[2].checkRdCostSkipSbb(decisions[2], numStates);
-      m_skipStates[3].checkRdCostSkipSbb(decisions[3], numStates);
-      // (with 4 states the stock code also "checked" decisions[4..7], which were overwritten by the copy at the
-      // end of the sub-block; a stage now only holds numStates decisions)
-      if (numStates > 4)
-      {
-        m_skipStates[4].checkRdCostSkipSbb(decisions[4], numStates);
-        m_skipStates[5].checkRdCostSkipSbb(decisions[5], numStates);
-        m_skipStates[6].checkRdCostSkipSbb(decisions[6], numStates);
-        m_skipStates[7].checkRdCostSkipSbb(decisions[7], numStates);
-      }
-#else
       m_skipStates[0].checkRdCostSkipSbb(decisions[0]);
       m_skipStates[1].checkRdCostSkipSbb(decisions[1]);
       m_skipStates[2].checkRdCostSkipSbb(decisions[2]);
       m_skipStates[3].checkRdCostSkipSbb(decisions[3]);
-#endif
     }
-#if TCQ_8STATES
-    if (numStates > 4)
-    {
-      m_startState.checkRdCostStart(lastOffset, pqData[0], decisions[0]);
-      m_startState.checkRdCostStart(lastOffset, pqData[2], decisions[2]);
-    }
-    else
-    {
-      m_startState.checkRdCostStart(lastOffset, pqData[0], decisions[0]);
-      m_startState.checkRdCostStart(lastOffset, pqData[2], decisions[1]);
-    }
-#else
     m_startState.checkRdCostStart(lastOffset, pqData[0], decisions[0]);
     m_startState.checkRdCostStart(lastOffset, pqData[2], decisions[2]);
 #endif
