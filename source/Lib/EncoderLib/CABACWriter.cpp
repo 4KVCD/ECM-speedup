@@ -2581,6 +2581,16 @@ void CABACWriter::intra_luma_pred_mode( const PredictionUnit& pu )
     return;
   }
 #endif
+  m_reachedLumaModeMpm = true;
+  if( m_stopBeforeLumaModeMpm )
+  {
+    return;
+  }
+  intra_luma_pred_mode_mpm( pu );
+}
+
+void CABACWriter::intra_luma_pred_mode_mpm( const PredictionUnit& pu )
+{
   // prev_intra_luma_pred_flag
   if ( pu.multiRefIdx )
   {

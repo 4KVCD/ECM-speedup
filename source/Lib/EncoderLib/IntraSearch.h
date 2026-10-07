@@ -1022,6 +1022,37 @@ public:
   );
   void PLTSearch                  ( CodingStructure &cs, Partitioner& partitioner, ComponentID compBegin, uint32_t numComp);
   uint64_t xFracModeBitsIntra     (PredictionUnit &pu, const uint32_t &uiMode, const ChannelType &compID);
+  // Luma mode bits during estIntraPredLumaQT: the flags before the MPM part (all zero for regular modes) give the same
+  // bits and context updates for every mode of the same CU state, so they are coded once per state and replayed.
+  // Build with -DMODEBITS_CHECK to also code the full syntax on every replay and stop if bits or contexts differ.
+  struct LumaModeFlagsMemo
+  {
+    const PredictionUnit *pu = nullptr;
+    int      multiRefIdx    = -1;
+    int      ispMode        = -1;
+    int      lfnstIdx       = -1;
+    bool     reachedMpm     = false;
+    uint64_t bits           = 0;
+    struct CtxChange
+    {
+      unsigned         idx;
+      BinProbModel_Std before, after;
+    };
+    std::vector<CtxChange> ctxChanges;   // contexts updated by the flags
+  };
+  static const int    LUMA_MODE_FLAGS_MEMO_SIZE = 8;
+  LumaModeFlagsMemo   m_lumaModeFlagsMemo[LUMA_MODE_FLAGS_MEMO_SIZE];
+  int                 m_lumaModeFlagsMemoNum    = 0;
+  int                 m_lumaModeFlagsMemoNext   = 0;
+  bool                m_lumaModeFlagsMemoActive = false;
+  std::vector<BinProbModel_Std> m_lumaModeFlagsCtxSnapshot;
+  uint64_t xFracModeBitsLumaMemo  (PredictionUnit &pu);
+  struct LumaModeFlagsMemoScope
+  {
+    IntraSearch &s;
+    explicit LumaModeFlagsMemoScope(IntraSearch &is) : s(is) { s.m_lumaModeFlagsMemoNum = 0; s.m_lumaModeFlagsMemoNext = 0; s.m_lumaModeFlagsMemoActive = true; }
+    ~LumaModeFlagsMemoScope() { s.m_lumaModeFlagsMemoActive = false; s.m_lumaModeFlagsMemoNum = 0; }
+  };
   void invalidateBestModeCost     () { for( int i = 0; i < NUM_LFNST_NUM_PER_SET; i++ ) m_bestModeCostValid[ i ] = false; };
 
   void sortRdModeListFirstColorSpace(ModeInfo mode, double cost, char bdpcmMode, ModeInfo* rdModeList, double* rdCostList, char* bdpcmModeList, int& candNum);

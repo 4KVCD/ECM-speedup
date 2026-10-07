@@ -910,6 +910,7 @@ bool IntraSearch::estIntraPredLumaQT(CodingUnit &cu, Partitioner &partitioner, c
 #endif
 )
 {
+  LumaModeFlagsMemoScope lumaModeFlagsMemoScope(*this);   // mode bits memo valid within this search (fixed neighbours)
   CodingStructure       &cs            = *cu.cs;
   const SPS             &sps           = *cs.sps;
   const uint32_t             uiWidthBit    = floorLog2(partitioner.currArea().lwidth() );
@@ -19797,6 +19798,123 @@ ChromaCbfs IntraSearch::xRecurIntraChromaCodingQT( CodingStructure &cs, Partitio
   return cbfs;
 }
 
+// the luma mode flags are all zero (no mode coded by a flag, no early end of the syntax): the flags do not depend on
+// the mode itself
+static bool lumaModeFlagsMemoUsable(const PredictionUnit &pu)
+{
+  const CodingUnit &cu = *pu.cu;
+  return cu.intraMergeMode == 0 && !cu.obicFlag && !cu.bvgDimdFlag && cu.bdpcmMode == 0
+         && pu.intraDir[CHANNEL_TYPE_LUMA] != PNN_IDX && !cu.dimd && !cu.tmpFlag && !cu.mipFlag && !cu.timd
+         && !cu.timdMrg && !cu.eipFlag && !cu.mdip && !cu.sgpm && !cu.tmrlFlag;
+}
+
+uint64_t IntraSearch::xFracModeBitsLumaMemo(PredictionUnit &pu)
+{
+  CtxStore<BinProbModel_Std> &      store  = static_cast<CtxStore<BinProbModel_Std> &>(m_CABACEstimator->getCtx());
+  const CtxStore<BinProbModel_Std> &cstore = store;
+  const unsigned                    numCtx = Ctx::NumberOfContexts;
+  const CodingUnit &                cu     = *pu.cu;
+  const size_t                      ctxSz  = sizeof(BinProbModel_Std);
+  auto codeFlags = [&]()
+  {
+#if JVET_AL0108_BVG_DIMD
+    if (!cu.slice->getPnnMode())
+    {
+      m_CABACEstimator->cu_dimd_flag(cu);
+    }
+#endif
+    setLumaIntraPredIdx(pu);
+    m_CABACEstimator->intra_luma_pred_mode(pu);
+  };
+
+  LumaModeFlagsMemo *memo = nullptr;
+  for (int k = 0; k < m_lumaModeFlagsMemoNum && !memo; k++)
+  {
+    LumaModeFlagsMemo &m = m_lumaModeFlagsMemo[k];
+    if (m.pu == &pu && m.multiRefIdx == pu.multiRefIdx && m.ispMode == cu.ispMode && m.lfnstIdx == cu.lfnstIdx)
+    {
+      memo = &m;
+      // the contexts the flags update must still hold the values they were coded from
+      for (const auto &c: m.ctxChanges)
+      {
+        if (::memcmp(&cstore[c.idx], &c.before, ctxSz))
+        {
+          memo = nullptr;
+          break;
+        }
+      }
+    }
+  }
+  if (memo)
+  {
+#ifdef MODEBITS_CHECK
+    // reference: the full syntax from the same contexts
+    std::vector<BinProbModel_Std> before(numCtx), after(numCtx);
+    ::memcpy((void *) before.data(), &cstore[0], numCtx * ctxSz);
+    m_CABACEstimator->resetBits();
+    codeFlags();
+    const uint64_t refBits = m_CABACEstimator->getEstFracBits();
+    ::memcpy((void *) after.data(), &cstore[0], numCtx * ctxSz);
+    for (unsigned i = 0; i < numCtx; i++)
+    {
+      (void) store[i];   // marks the blocks dirty
+    }
+    ::memcpy((void *) &store[0], before.data(), numCtx * ctxSz);
+#endif
+    for (const auto &c: memo->ctxChanges)
+    {
+      ::memcpy((void *) &store[c.idx], &c.after, ctxSz);
+    }
+    m_CABACEstimator->resetBits();
+    setLumaIntraPredIdx(pu);
+    if (memo->reachedMpm)
+    {
+      m_CABACEstimator->intra_luma_pred_mode_mpm(pu);
+    }
+    const uint64_t bits = memo->bits + m_CABACEstimator->getEstFracBits();
+#ifdef MODEBITS_CHECK
+    CHECK(bits != refBits, "luma mode flags memo: bits differ");
+    CHECK(::memcmp(&cstore[0], after.data(), numCtx * ctxSz), "luma mode flags memo: contexts differ");
+#endif
+    return bits;
+  }
+
+  // code the flags, keep their bits and context updates
+  m_lumaModeFlagsCtxSnapshot.resize(numCtx);
+  ::memcpy((void *) m_lumaModeFlagsCtxSnapshot.data(), &cstore[0], numCtx * ctxSz);
+  m_CABACEstimator->resetBits();
+  m_CABACEstimator->setStopBeforeLumaModeMpm(true);
+  codeFlags();
+  const bool reachedMpm = m_CABACEstimator->reachedLumaModeMpm();
+  m_CABACEstimator->setStopBeforeLumaModeMpm(false);
+
+  LumaModeFlagsMemo &m = m_lumaModeFlagsMemo[m_lumaModeFlagsMemoNext];
+  m_lumaModeFlagsMemoNext = (m_lumaModeFlagsMemoNext + 1) % LUMA_MODE_FLAGS_MEMO_SIZE;
+  if (m_lumaModeFlagsMemoNum < LUMA_MODE_FLAGS_MEMO_SIZE)
+  {
+    m_lumaModeFlagsMemoNum++;
+  }
+  m.pu          = &pu;
+  m.multiRefIdx = pu.multiRefIdx;
+  m.ispMode     = cu.ispMode;
+  m.lfnstIdx    = cu.lfnstIdx;
+  m.reachedMpm  = reachedMpm;
+  m.bits        = m_CABACEstimator->getEstFracBits();
+  m.ctxChanges.clear();
+  for (unsigned i = 0; i < numCtx; i++)
+  {
+    if (::memcmp(&cstore[i], &m_lumaModeFlagsCtxSnapshot[i], ctxSz))
+    {
+      m.ctxChanges.push_back({ i, m_lumaModeFlagsCtxSnapshot[i], cstore[i] });
+    }
+  }
+  if (reachedMpm)
+  {
+    m_CABACEstimator->intra_luma_pred_mode_mpm(pu);
+  }
+  return m_CABACEstimator->getEstFracBits();
+}
+
 uint64_t IntraSearch::xFracModeBitsIntra(PredictionUnit &pu, const uint32_t &uiMode, const ChannelType &chType)
 {
   uint8_t orgMode = uiMode;
@@ -19809,6 +19927,7 @@ uint64_t IntraSearch::xFracModeBitsIntra(PredictionUnit &pu, const uint32_t &uiM
   std::swap(orgMode, pu.intraDir[chType]);
 
   m_CABACEstimator->resetBits();
+  uint64_t memoBits = MAX_UINT64;
 
   if( isLuma( chType ) )
   {
@@ -19818,14 +19937,21 @@ uint64_t IntraSearch::xFracModeBitsIntra(PredictionUnit &pu, const uint32_t &uiM
     if (!pu.ciipFlag)
 #endif
     {
-#if JVET_AL0108_BVG_DIMD
-      if(!(pu.cu)->slice->getPnnMode())
+      if (m_lumaModeFlagsMemoActive && lumaModeFlagsMemoUsable(pu))
       {
-        m_CABACEstimator->cu_dimd_flag(*pu.cu);
+        memoBits = xFracModeBitsLumaMemo(pu);
       }
+      else
+      {
+#if JVET_AL0108_BVG_DIMD
+        if(!(pu.cu)->slice->getPnnMode())
+        {
+          m_CABACEstimator->cu_dimd_flag(*pu.cu);
+        }
 #endif
-      setLumaIntraPredIdx(pu);
-      m_CABACEstimator->intra_luma_pred_mode(pu);
+        setLumaIntraPredIdx(pu);
+        m_CABACEstimator->intra_luma_pred_mode(pu);
+      }
     }
   }
   else
@@ -19840,7 +19966,7 @@ uint64_t IntraSearch::xFracModeBitsIntra(PredictionUnit &pu, const uint32_t &uiM
 #endif
   std::swap(orgMode, pu.intraDir[chType]);
 
-  return m_CABACEstimator->getEstFracBits();
+  return memoBits != MAX_UINT64 ? memoBits : m_CABACEstimator->getEstFracBits();
 }
 
 void IntraSearch::sortRdModeListFirstColorSpace(ModeInfo mode, double cost, char bdpcmMode, ModeInfo* rdModeList, double* rdCostList, char* bdpcmModeList, int& candNum)
