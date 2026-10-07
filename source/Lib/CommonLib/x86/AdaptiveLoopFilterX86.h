@@ -14884,6 +14884,45 @@ static inline void simdCovAccumulateTile( float* E, const int r0, const int c0, 
   }
 }
 
+// full tile of 8 rows: the accumulators in named variables, so that they stay in registers
+#define COV_ACC_ROWS( OP ) OP( 0 ) OP( 1 ) OP( 2 ) OP( 3 ) OP( 4 ) OP( 5 ) OP( 6 ) OP( 7 )
+template<bool weighted>
+static inline void simdCovAccumulateTile8( float* E, const int r0, const int c0, const bool diag, const float* sampleVec, const int vecStride,
+                                           const int* idx, const int count, const float* sampleW )
+{
+  const __m256i lane = _mm256_setr_epi32( 0, 1, 2, 3, 4, 5, 6, 7 );
+#define COV_ACC_PTR( i ) float* e##i = E + ( ( ( r0 + i ) * ( r0 + i + 1 ) ) >> 1 ) + c0;
+  COV_ACC_ROWS( COV_ACC_PTR )
+#undef COV_ACC_PTR
+  // in the diagonal tile row i has the columns c0 .. c0 + i (the others are not part of the triangle)
+#define COV_ACC_LOAD( i ) __m256 acc##i = diag ? _mm256_maskload_ps( e##i, _mm256_cmpgt_epi32( _mm256_set1_epi32( i + 1 ), lane ) ) : _mm256_loadu_ps( e##i );
+  COV_ACC_ROWS( COV_ACC_LOAD )
+#undef COV_ACC_LOAD
+  for( int n = 0; n < count; n++ )
+  {
+    const int    s = idx[n];
+    const float* a = sampleVec + (size_t) s * vecStride;
+    const __m256 x = _mm256_loadu_ps( a + c0 );
+    if( weighted )
+    {
+      const __m256 w = _mm256_set1_ps( sampleW[s] );
+#define COV_ACC_ADDW( i ) acc##i = _mm256_add_ps( acc##i, _mm256_mul_ps( w, _mm256_mul_ps( _mm256_broadcast_ss( a + r0 + i ), x ) ) );
+      COV_ACC_ROWS( COV_ACC_ADDW )
+#undef COV_ACC_ADDW
+    }
+    else
+    {
+#define COV_ACC_ADD( i ) acc##i = _mm256_add_ps( acc##i, _mm256_mul_ps( _mm256_broadcast_ss( a + r0 + i ), x ) );
+      COV_ACC_ROWS( COV_ACC_ADD )
+#undef COV_ACC_ADD
+    }
+  }
+#define COV_ACC_STORE( i ) if( diag ) { _mm256_maskstore_ps( e##i, _mm256_cmpgt_epi32( _mm256_set1_epi32( i + 1 ), lane ), acc##i ); } else { _mm256_storeu_ps( e##i, acc##i ); }
+  COV_ACC_ROWS( COV_ACC_STORE )
+#undef COV_ACC_STORE
+}
+#undef COV_ACC_ROWS
+
 template<bool weighted>
 static void simdCovAccumulateT( float* E, float* y, float* pixAcc, const float* sampleVec, int vecStride, const int* idx, int count, const float* sampleY, const float* sampleW, int N )
 {
@@ -14895,7 +14934,7 @@ static void simdCovAccumulateT( float* E, float* y, float* pixAcc, const float* 
       const bool diag = c0 == r0;
       switch( rows )
       {
-      case 8: simdCovAccumulateTile<weighted, 8>( E, r0, c0, diag, sampleVec, vecStride, idx, count, sampleW ); break;
+      case 8: simdCovAccumulateTile8<weighted>( E, r0, c0, diag, sampleVec, vecStride, idx, count, sampleW ); break;
       case 7: simdCovAccumulateTile<weighted, 7>( E, r0, c0, diag, sampleVec, vecStride, idx, count, sampleW ); break;
       case 6: simdCovAccumulateTile<weighted, 6>( E, r0, c0, diag, sampleVec, vecStride, idx, count, sampleW ); break;
       case 5: simdCovAccumulateTile<weighted, 5>( E, r0, c0, diag, sampleVec, vecStride, idx, count, sampleW ); break;
