@@ -608,13 +608,21 @@ namespace DQIntern
     }
   }
 
+  // non-virtual access to the rate tables of the context models (the per-TU setup reads ~200 of them)
+  struct StdFracBitsAccess
+  {
+    const CtxStore<BinProbModel_Std> &ctxStore;
+    BinFracBits getFracBitsArray(unsigned ctxId) const { return ctxStore[ctxId].getFracBitsArray(); }
+  };
+
   class RateEstimator
   {
   public:
     RateEstimator() {}
     ~RateEstimator() {}
+    template<class FracBitsAccessT>
     void initCtx(const TUParameters &tuPars, const TransformUnit &tu, const ComponentID compID,
-                 const FracBitsAccess &fracBitsAccess
+                 const FracBitsAccessT &fracBitsAccess
 #if JVET_AE0102_LFNST_CTX
                  ,
                  const uint32_t lfnstIdx = 0
@@ -637,15 +645,21 @@ namespace DQIntern
     }
 
   private:
-    void xSetLastCoeffOffset(const FracBitsAccess &fracBitsAccess, const TUParameters &tuPars, const TransformUnit &tu,
+    template<class FracBitsAccessT>
+    void xSetLastCoeffOffset(const FracBitsAccessT &fracBitsAccess, const TUParameters &tuPars, const TransformUnit &tu,
                              const ComponentID compID);
-    void xSetSigSbbFracBits(const FracBitsAccess &fracBitsAccess, ChannelType chType);
+    template<class FracBitsAccessT>
+    void xSetSigSbbFracBits(const FracBitsAccessT &fracBitsAccess, ChannelType chType);
 #if JVET_AE0102_LFNST_CTX
-    void xSetSigFlagBits(const FracBitsAccess &fracBitsAccess, ChannelType chType, const bool isLfnst);
-    void xSetGtxFlagBits(const FracBitsAccess &fracBitsAccess, ChannelType chType, const bool isLfnst);
+    template<class FracBitsAccessT>
+    void xSetSigFlagBits(const FracBitsAccessT &fracBitsAccess, ChannelType chType, const bool isLfnst);
+    template<class FracBitsAccessT>
+    void xSetGtxFlagBits(const FracBitsAccessT &fracBitsAccess, ChannelType chType, const bool isLfnst);
 #else
-    void xSetSigFlagBits(const FracBitsAccess &fracBitsAccess, ChannelType chType);
-    void xSetGtxFlagBits(const FracBitsAccess &fracBitsAccess, ChannelType chType);
+    template<class FracBitsAccessT>
+    void xSetSigFlagBits(const FracBitsAccessT &fracBitsAccess, ChannelType chType);
+    template<class FracBitsAccessT>
+    void xSetGtxFlagBits(const FracBitsAccessT &fracBitsAccess, ChannelType chType);
 #endif
 
   private:
@@ -672,8 +686,9 @@ namespace DQIntern
     CoeffFracBits      m_gtxFracBits[sm_maxNumGtxCtx];
   };
 
+  template<class FracBitsAccessT>
   void RateEstimator::initCtx(const TUParameters &tuPars, const TransformUnit &tu, const ComponentID compID,
-                              const FracBitsAccess &fracBitsAccess
+                              const FracBitsAccessT &fracBitsAccess
 #if JVET_AE0102_LFNST_CTX
                               ,
                               const uint32_t lfnstIdx
@@ -697,7 +712,8 @@ namespace DQIntern
     xSetLastCoeffOffset(fracBitsAccess, tuPars, tu, compID);
   }
 
-  void RateEstimator::xSetLastCoeffOffset(const FracBitsAccess &fracBitsAccess, const TUParameters &tuPars,
+  template<class FracBitsAccessT>
+  void RateEstimator::xSetLastCoeffOffset(const FracBitsAccessT &fracBitsAccess, const TUParameters &tuPars,
                                           const TransformUnit &tu, const ComponentID compID)
   {
     const ChannelType chType       = (compID == COMPONENT_Y ? CHANNEL_TYPE_LUMA : CHANNEL_TYPE_CHROMA);
@@ -780,7 +796,8 @@ namespace DQIntern
     }
   }
 
-  void RateEstimator::xSetSigSbbFracBits(const FracBitsAccess &fracBitsAccess, ChannelType chType)
+  template<class FracBitsAccessT>
+  void RateEstimator::xSetSigSbbFracBits(const FracBitsAccessT &fracBitsAccess, ChannelType chType)
   {
 #if JVET_AG0143_INTER_INTRA
     const CtxSet &ctxSet =
@@ -794,7 +811,8 @@ namespace DQIntern
       m_sigSbbFracBits[ctxId] = fracBitsAccess.getFracBitsArray(ctxSet(ctxId));
     }
   }
-  void RateEstimator::xSetSigFlagBits(const FracBitsAccess &fracBitsAccess, ChannelType chType
+  template<class FracBitsAccessT>
+  void RateEstimator::xSetSigFlagBits(const FracBitsAccessT &fracBitsAccess, ChannelType chType
 #if JVET_AE0102_LFNST_CTX
                                       ,
                                       const bool isLfnst
@@ -841,7 +859,8 @@ namespace DQIntern
     }
   }
 
-  void RateEstimator::xSetGtxFlagBits(const FracBitsAccess &fracBitsAccess, ChannelType chType
+  template<class FracBitsAccessT>
+  void RateEstimator::xSetGtxFlagBits(const FracBitsAccessT &fracBitsAccess, ChannelType chType
 #if JVET_AE0102_LFNST_CTX
                                       ,
                                       const bool isLfnst
@@ -2800,12 +2819,25 @@ const CtxSet &ctxSetGt4 = isLfnst ? Ctx::GtxFlagL[6 + chType] : Ctx::GtxFlag[6 +
     }
 
     //===== real init =====
-    RateEstimator::initCtx(tuPars, tu, compID, ctx.getFracBitsAcess()
+    if (ctx.getBPMType() == BPM_Std)
+    {
+      RateEstimator::initCtx(tuPars, tu, compID,
+                             StdFracBitsAccess{ static_cast<const CtxStore<BinProbModel_Std> &>(ctx) }
 #if JVET_AE0102_LFNST_CTX
-                                                 ,
-                           lfnstIdx
+                             ,
+                             lfnstIdx
 #endif
-    );
+      );
+    }
+    else
+    {
+      RateEstimator::initCtx(tuPars, tu, compID, ctx.getFracBitsAcess()
+#if JVET_AE0102_LFNST_CTX
+                                                   ,
+                             lfnstIdx
+#endif
+      );
+    }
 
     m_commonCtx.reset(tuPars, *this);
 #if !TCQ_8STATES
