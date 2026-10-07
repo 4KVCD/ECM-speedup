@@ -237,9 +237,11 @@ void TrQuant::fastInverseTransform_SIMD( const TCoeff *coeff, TCoeff *block, int
     const __m128i maxCoeff = _mm_set1_epi32( outputMaximum );
     const __m128i round = _mm_set1_epi32( rndFactor );
 
+    // perf: like the scalar path below, only the zoRow lines and zoCol coefficients that can be non-zero (zero-out,
+    // LFNST region) are computed; the skipped products are 0, the skipped lines give 0 (bit-exact)
     if( transType == DCT2 && !( transSize & 0xF ) )
     {
-      for( i = 0; i < line; i++, block += transSize )
+      for( i = 0; i < zoRow; i++, block += transSize )
       {
         TCoeff    splitBlockE[2048];
         const int halfSize = transSize >> 1;
@@ -248,11 +250,11 @@ void TrQuant::fastInverseTransform_SIMD( const TCoeff *coeff, TCoeff *block, int
         TCoeff  * splitBlockF = splitBlockE + quarterSize;
         TCoeff  * splitBlockG = splitBlockE + transSize;
 
-        memset( splitBlockE, 0, 3 * halfSize * sizeof( TCoeff ) );
+        memset( splitBlockE, 0, transSize * sizeof( TCoeff ) );   // E, F, O (G is written before it is read)
 
         const TCoeff *      curCoeff = coeff;
         const TMatrixCoeff *curIT = iT;
-        for( k = 0; k < transSize; k++, curCoeff += line, curIT += transSize )
+        for( k = 0; k < zoCol; k++, curCoeff += line, curIT += transSize )
         {
           const int arraySize = ( k & 1 ? halfSize : quarterSize );
           __m128i    tmpCoeff = _mm_set1_epi32( curCoeff[i] );
@@ -268,35 +270,36 @@ void TrQuant::fastInverseTransform_SIMD( const TCoeff *coeff, TCoeff *block, int
           }
         }
 
-        for( int m = 0, n = halfSize - 1; m < n; m++, n-- )
+        // perf: the butterflies four lanes at a time, the mirrored halves stored lane-reversed, and the rounding and
+        // clipping applied in the last butterfly (the same int32 operations per element as the scalar loops)
+        for( int m = 0; m < quarterSize; m += 4 )   // G[m] = E[m] + F[m], G[halfSize - 1 - m] = E[m] - F[m]
         {
-          splitBlockG[m] = splitBlockE[m] + splitBlockF[m];
-          splitBlockG[n] = splitBlockE[m] - splitBlockF[m];
+          const __m128i e = _mm_loadu_si128( ( const __m128i * )( splitBlockE + m ) );
+          const __m128i f = _mm_loadu_si128( ( const __m128i * )( splitBlockF + m ) );
+          _mm_storeu_si128( ( __m128i * )( splitBlockG + m ), _mm_add_epi32( e, f ) );
+          _mm_storeu_si128( ( __m128i * )( splitBlockG + halfSize - 4 - m ), _mm_shuffle_epi32( _mm_sub_epi32( e, f ), 0x1b ) );
         }
-        for( int m = 0, n = transSize - 1; m < n; m++, n-- )
+        for( int m = 0; m < halfSize; m += 4 )   // block[m] = G[m] + O[m], block[transSize - 1 - m] = G[m] - O[m]
         {
-          block[m] = ( splitBlockG[m] + splitBlockO[m] );
-          block[n] = ( splitBlockG[m] - splitBlockO[m] );
-        }
-
-        __m128i *tmpBlock = ( __m128i * )block;
-        for( j = 0; j < transSize; j += 4, tmpBlock++ )
-        {
-          __m128i tmp = _mm_loadu_si128( tmpBlock );
-          tmp = _mm_srai_epi32( _mm_add_epi32( tmp, round ), shift );
-          tmp = _mm_min_epi32( _mm_max_epi32( tmp, minCoeff ), maxCoeff );
-          _mm_storeu_si128( tmpBlock, tmp );
+          const __m128i g  = _mm_loadu_si128( ( const __m128i * )( splitBlockG + m ) );
+          const __m128i o  = _mm_loadu_si128( ( const __m128i * )( splitBlockO + m ) );
+          __m128i       lo = _mm_srai_epi32( _mm_add_epi32( _mm_add_epi32( g, o ), round ), shift );
+          __m128i       hi = _mm_srai_epi32( _mm_add_epi32( _mm_sub_epi32( g, o ), round ), shift );
+          lo = _mm_min_epi32( _mm_max_epi32( lo, minCoeff ), maxCoeff );
+          hi = _mm_min_epi32( _mm_max_epi32( hi, minCoeff ), maxCoeff );
+          _mm_storeu_si128( ( __m128i * )( block + m ), lo );
+          _mm_storeu_si128( ( __m128i * )( block + transSize - 4 - m ), _mm_shuffle_epi32( hi, 0x1b ) );
         }
       }
     }
     else
     {
-      for( i = 0; i < line; i++, block += transSize )
+      for( i = 0; i < zoRow; i++, block += transSize )
       {
         memset( block, 0, transSize << 2 );
         const TCoeff *      curCoeff = coeff;
         const TMatrixCoeff *curIT = iT;
-        for( k = 0; k < transSize; k++, curCoeff += line, curIT += transSize )
+        for( k = 0; k < zoCol; k++, curCoeff += line, curIT += transSize )
         {
           __m128i  tmpCoeff = _mm_set1_epi32( curCoeff[i] );
           __m128i *tmpBlock = ( __m128i * )block;
@@ -318,6 +321,10 @@ void TrQuant::fastInverseTransform_SIMD( const TCoeff *coeff, TCoeff *block, int
           _mm_storeu_si128( tmpBlock, tmp );
         }
       }
+    }
+    if( iSkipLine )
+    {
+      memset( block, 0, iSkipLine * transSize * sizeof( TCoeff ) );   // block points to line zoRow here
     }
   }
   else
