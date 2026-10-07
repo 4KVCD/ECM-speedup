@@ -3,6 +3,8 @@ set( EXE_NAME DecoderApp )
 
 # get source files
 file( GLOB SRC_FILES "*.cpp" )
+# perf: the encoder's small-object allocator replaces the global operator new / delete here as well
+list( APPEND SRC_FILES ${CMAKE_CURRENT_SOURCE_DIR}/../EncoderApp/FastAlloc.cpp )
 
 # get include files
 file( GLOB INC_FILES "*.h" )
