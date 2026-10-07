@@ -46,18 +46,45 @@ def md5(path):
     return h.hexdigest()
 
 
-def process_cpu_seconds(proc):
-    """user+kernel CPU time of a finished (not yet reaped) child process; less load-sensitive than wall time."""
-    if os.name != "nt":
-        return None
-    import ctypes
-    from ctypes import wintypes
-    ft = [wintypes.FILETIME() for _ in range(4)]
-    ok = ctypes.windll.kernel32.GetProcessTimes(wintypes.HANDLE(int(proc._handle)), *[ctypes.byref(f) for f in ft])
-    if not ok:
-        return None
-    val = lambda f: (f.dwHighDateTime << 32 | f.dwLowDateTime) / 1e7
-    return val(ft[2]) + val(ft[3])
+class CpuJob:
+    """Windows job object around one encoder run: its accounting covers the process and every process it starts
+    (segment-parallel workers), so the reported CPU time counts all of them. The process is created suspended and
+    only resumed once it is in the job, so no child can escape."""
+
+    def __init__(self):
+        import ctypes
+        self.k32 = ctypes.windll.kernel32
+        self.k32.CreateJobObjectW.restype = ctypes.c_void_p
+        self.job = self.k32.CreateJobObjectW(None, None)
+
+    def start(self, cmd, **kw):
+        import ctypes
+        CREATE_SUSPENDED = 0x4
+        proc = subprocess.Popen(cmd, creationflags=CREATE_SUSPENDED, **kw)
+        if not self.job or not self.k32.AssignProcessToJobObject(ctypes.c_void_p(self.job),
+                                                                 ctypes.c_void_p(int(proc._handle))):
+            proc.kill()
+            proc.wait()
+            raise OSError("could not put the encoder into a job object")
+        ctypes.windll.ntdll.NtResumeProcess(ctypes.c_void_p(int(proc._handle)))
+        return proc
+
+    def cpu_seconds(self):
+        import ctypes
+
+        class Accounting(ctypes.Structure):   # JOBOBJECT_BASIC_ACCOUNTING_INFORMATION
+            _fields_ = [("TotalUserTime", ctypes.c_int64), ("TotalKernelTime", ctypes.c_int64),
+                        ("ThisPeriodTotalUserTime", ctypes.c_int64), ("ThisPeriodTotalKernelTime", ctypes.c_int64),
+                        ("TotalPageFaultCount", ctypes.c_uint32), ("TotalProcesses", ctypes.c_uint32),
+                        ("ActiveProcesses", ctypes.c_uint32), ("TotalTerminatedProcesses", ctypes.c_uint32)]
+        info = Accounting()
+        ok = self.k32.QueryInformationJobObject(ctypes.c_void_p(self.job), 1, ctypes.byref(info),
+                                                ctypes.sizeof(info), None)
+        return (info.TotalUserTime + info.TotalKernelTime) / 1e7 if ok else None
+
+    def close(self):
+        import ctypes
+        self.k32.CloseHandle(ctypes.c_void_p(self.job))
 
 
 def run_test(exe, outdir, name, more_args=()):
@@ -69,9 +96,18 @@ def run_test(exe, outdir, name, more_args=()):
            "--InputBitDepth=8", "-f", str(frames), "-q", str(qp), "-b", bs, "-o", "NUL"] + extra
     t0 = time.perf_counter()
     with open(log, "w") as lf:
-        proc = subprocess.Popen(cmd, stdout=lf, stderr=subprocess.STDOUT)
-        proc.wait()
-        cpu = process_cpu_seconds(proc)
+        cpu = None
+        if os.name == "nt":
+            job = CpuJob()
+            try:
+                proc = job.start(cmd, stdout=lf, stderr=subprocess.STDOUT)
+                proc.wait()
+                cpu = job.cpu_seconds()   # the encoder and all its child processes
+            finally:
+                job.close()
+        else:
+            proc = subprocess.Popen(cmd, stdout=lf, stderr=subprocess.STDOUT)
+            proc.wait()
         rc = proc.returncode
     dt = time.perf_counter() - t0
     return name, {"time": round(dt, 2), "cpu": round(cpu, 2) if cpu else None, "rc": rc,
