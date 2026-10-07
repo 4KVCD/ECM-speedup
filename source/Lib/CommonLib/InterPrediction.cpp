@@ -56,6 +56,10 @@
 #include "CommonDefX86.h"
 #endif
 
+#ifndef OBMC_FAST_MC_VERIFY
+#define OBMC_FAST_MC_VERIFY 0   // 1: run the general chain after xSubBlockMCFast as well and check that it gives the same samples
+#endif
+
 //! \ingroup CommonLib
 //! \{
 
@@ -10838,6 +10842,29 @@ void InterPrediction::xSubBlockMotionCompensation(PredictionUnit &pu, PelUnitBuf
 #endif
 #endif
 {
+#if JVET_AK0212_GPM_OBMC_MODIFICATION
+  const bool predLuma = !chromaOnly, predChroma = !lumaOnly;
+#elif JVET_AK0076_EXTENDED_OBMC_IBC
+  const bool predLuma = true, predChroma = !lumaOnly;
+#else
+  const bool predLuma = true, predChroma = true;
+#endif
+  const bool fast = xSubBlockMCFast( pu, pcYuvPred, predLuma, predChroma );   // perf: the common case, see there
+#if OBMC_FAST_MC_VERIFY
+  std::vector<Pel> fastPred[MAX_NUM_COMPONENT];
+  for( int comp = 0; fast && comp < (int) pcYuvPred.bufs.size(); comp++ )
+  {
+    const PelBuf &b = pcYuvPred.bufs[comp];
+    for( int y = 0; y < b.height; y++ )
+    {
+      fastPred[comp].insert( fastPred[comp].end(), b.bufAt( 0, y ), b.bufAt( 0, y ) + b.width );
+    }
+  }
+  // the general prediction below must give the same samples
+#else
+  if( !fast )
+#endif
+  {
 #if JVET_AK0076_EXTENDED_OBMC_IBC
   if ((CU::isIBC(*pu.cu) && pu.interDir == 1) || xCheckIdenticalMotion(pu))
 #else
@@ -10894,6 +10921,21 @@ void InterPrediction::xSubBlockMotionCompensation(PredictionUnit &pu, PelUnitBuf
 #endif
 #endif
   }
+  }
+#if OBMC_FAST_MC_VERIFY
+  for( int comp = 0; fast && comp < (int) pcYuvPred.bufs.size(); comp++ )
+  {
+    if( ( comp == 0 && !predLuma ) || ( comp != 0 && !predChroma ) )
+    {
+      continue;
+    }
+    const PelBuf &b = pcYuvPred.bufs[comp];
+    for( int y = 0; y < b.height; y++ )
+    {
+      CHECK( memcmp( b.bufAt( 0, y ), fastPred[comp].data() + y * b.width, b.width * sizeof( Pel ) ), "OBMC fast sub-block MC differs: comp " << comp << " " << b.width << "x" << b.height << " at " << pu.lumaPos().x << "," << pu.lumaPos().y );
+    }
+  }
+#endif
 #if JVET_AK0076_EXTENDED_OBMC_IBC
   if (lmcsLut)
   {
@@ -10901,6 +10943,146 @@ void InterPrediction::xSubBlockMotionCompensation(PredictionUnit &pu, PelUnitBuf
   }
 #endif
 }
+
+#if JVET_AI0094_SHARP_MC_FILTER_FOR_BIPRED && JVET_AL0161_4TAP_TM && JVET_AK0212_GPM_OBMC_MODIFICATION
+// perf: OBMC predicts the sub-blocks at the CU and sub-block boundaries (mostly 4x4 luma, 2x2 chroma) with neighbouring
+// motion through the general chain xPredInterBi -> xPredInterUni -> xPredInterBlk; a 33-frame CIF RA decode makes ~1.3 M
+// such predictions, and about half of their time went to that chain rather than to the filters. For the common case this
+// makes the same InterpolationFilter calls as xPredInterBlk (same arguments, destinations with the same strides) and the
+// same averaging as xWeightedAverage, and leaves m_iRefListIdx, m_acYuvPred and the out-of-picture masks as the chain
+// does. Whatever it does not cover (IBC, LIC and the local illumination models, weighted prediction, RPR, wrap-around,
+// high-precision sub-block MVs, bi-prediction with out-of-picture references, other chroma formats) returns false
+// before anything is written, and the caller runs the general chain.
+bool InterPrediction::xSubBlockMCFast( const PredictionUnit &pu, PelUnitBuf &pcYuvPred, const bool luma, const bool chroma )
+{
+  const CodingUnit &cu  = *pu.cu;
+  const PPS        &pps = *pu.cs->pps;
+  if( !cu.isobmcMC || cu.affine || cu.geoFlag || cu.licFlag || CU::isIBC( cu ) || pu.mvRefine || pu.ciipFlag
+#if MULTI_PASS_DMVR
+      || pu.bdmvrRefine
+#endif
+#if JVET_AG0276_NLIC
+      || cu.altLMFlag
+#endif
+#if JVET_AJ0158_SUBBLOCK_INTER_EXTENSION
+      || m_useHighPrecMv || getDeriveOobMask()
+#endif
+#if JVET_AD0213_LIC_IMP
+      || m_storeBeforeLIC
+#endif
+      || pu.cs->sps->getRprEnabledFlag() || pps.getWrapAroundEnabledFlag() || pps.getUseWP() || pps.getWPBiPred()
+      || pu.chromaFormat != CHROMA_420 || pcYuvPred.bufs.size() != MAX_NUM_COMPONENT || m_maxCompIDToPred < COMPONENT_Cr
+      || !( luma || chroma ) )
+  {
+    return false;
+  }
+  const Slice &slice = *cu.slice;
+  const bool   same  = xCheckIdenticalMotion( pu );   // then list 0 alone, as in xSubBlockMotionCompensation
+  const bool   bi    = !same && pu.refIdx[0] >= 0 && pu.refIdx[1] >= 0;
+  if( bi )
+  {
+    // xPredInterBi: reference samples out of the picture change the averaging, those blocks are left to it
+    if( pu.interDir != 3 )
+    {
+      return false;
+    }
+    const bool oob0 = isMvOOB( pu.mv[0], pu.Y().topLeft(), pu.lumaSize(), pu.cu->slice->getSPS(), pu.cu->slice->getPPS(), pu.cs->mcMask[0], pu.cs->mcMaskChroma[0] );
+    const bool oob1 = isMvOOB( pu.mv[1], pu.Y().topLeft(), pu.lumaSize(), pu.cu->slice->getSPS(), pu.cu->slice->getPPS(), pu.cs->mcMask[1], pu.cs->mcMaskChroma[1] );
+    if( oob0 || oob1 )
+    {
+      return false;
+    }
+  }
+  const int compBeg = luma ? COMPONENT_Y : COMPONENT_Cb;
+  const int compEnd = chroma ? MAX_NUM_COMPONENT : COMPONENT_Cb;
+  for( int l = 0; l < NUM_REF_PIC_LIST_01; l++ )
+  {
+    if( pu.refIdx[l] < 0 || ( same && l == 1 ) )
+    {
+      continue;
+    }
+    Mv mv = pu.mv[l];
+    clipMv( mv, pu.lumaPos(), pu.lumaSize(), *pu.cs->sps, pps );   // as xPredInterUni
+    const Picture *refPic = slice.getRefPic( RefPicList( l ), pu.refIdx[l] )->unscaledPic;
+    m_iRefListIdx = l;
+    for( int comp = compBeg; comp < compEnd; comp++ )
+    {
+      PelBuf &dst = pcYuvPred.bufs[comp];
+      if( same )   // xPredInterUni into the destination
+      {
+        xSubBlockMCFastComp( ComponentID( comp ), pu, refPic, mv, dst, false );
+      }
+      else   // xPredInterBi: into m_acYuvPred (stride = width), then xWeightedAverage
+      {
+        PelBuf pred( m_acYuvPred[l][comp], Size( dst.width, dst.height ) );
+        xSubBlockMCFastComp( ComponentID( comp ), pu, refPic, mv, pred, bi );
+        if( !bi )
+        {
+          dst.copyClip( pred, slice.clpRng( ComponentID( comp ) ) );
+        }
+      }
+    }
+  }
+  if( bi )
+  {
+    const int8_t w0 = getBcwWeight( cu.bcwIdx, REF_PIC_LIST_0 );
+    const int8_t w1 = getBcwWeight( cu.bcwIdx, REF_PIC_LIST_1 );
+    for( int comp = compBeg; comp < compEnd; comp++ )
+    {
+      PelBuf &dst = pcYuvPred.bufs[comp];
+      g_pelBufOP.weightedAvg( m_acYuvPred[0][comp], dst.width, m_acYuvPred[1][comp], dst.width, dst.buf, dst.stride, w0, w1, dst.width, dst.height, slice.clpRng( ComponentID( comp ) ) );
+    }
+  }
+  return true;
+}
+
+// xPredInterBlk for xSubBlockMCFast's blocks (no BDOF, DMVR, LIC, RPR, IBC, wrap-around, template filters)
+void InterPrediction::xSubBlockMCFastComp( const ComponentID compID, const PredictionUnit &pu, const Picture *refPic, const Mv &mv, PelBuf &dst, const bool bi )
+{
+  const ChromaFormat chFmt        = pu.chromaFormat;
+  const ClpRng      &clpRng       = pu.cu->slice->clpRng( compID );
+  const bool         rndRes       = !bi;
+  const bool         useBiFilter  = m_geoOBMC ? false : bi;
+  const int          shiftHor     = MV_FRACTIONAL_BITS_INTERNAL + ::getComponentScaleX( compID, chFmt );
+  const int          shiftVer     = MV_FRACTIONAL_BITS_INTERNAL + ::getComponentScaleY( compID, chFmt );
+  const bool         useAltHpelIf = pu.cu->imv == IMV_HPEL;
+  const int          xFrac        = mv.getHor() & ( ( 1 << shiftHor ) - 1 );
+  const int          yFrac        = mv.getVer() & ( ( 1 << shiftVer ) - 1 );
+  const CPelBuf      refPlane     = refPic->getRecoBuf( compID );
+  const Pel         *ref          = refPlane.bufAt( pu.blocks[compID].pos().offset( mv.getHor() >> shiftHor, mv.getVer() >> shiftVer ) );
+  const int          refStride    = refPlane.stride;
+  if( yFrac == 0 )
+  {
+    m_if.filterHor( compID, ref, refStride, dst.buf, dst.stride, dst.width, dst.height, xFrac, rndRes, chFmt, clpRng, 0, false, useAltHpelIf, useBiFilter, false );
+  }
+  else if( xFrac == 0 )
+  {
+    m_if.filterVer( compID, ref, refStride, dst.buf, dst.stride, dst.width, dst.height, yFrac, true, rndRes, chFmt, clpRng, 0, false, useAltHpelIf, useBiFilter, false );
+  }
+#if SIMD_4x4_12 && defined(TARGET_SIMD_X86) && !JVET_J0090_MEMORY_BANDWITH_MEASURE
+  else if( compID == COMPONENT_Y && dst.width == 4 && dst.height == 4 && !( ( xFrac == 8 || yFrac == 8 ) && useAltHpelIf ) )
+  {
+    m_if.filter4x4( clpRng, ref, refStride, dst.buf, dst.stride, xFrac, yFrac, rndRes );
+  }
+#endif
+  else
+  {
+    const int vFilterSize = isLuma( compID ) ? NTAPS_LUMA( 0 ) : NTAPS_CHROMA;
+    Pel      *tmp         = m_filteredBlockTmp[0][compID];   // with the destination's stride, as in xPredInterBlk
+    m_if.filterHor( compID, ref - ( ( vFilterSize >> 1 ) - 1 ) * refStride, refStride, tmp, dst.stride, dst.width, dst.height + vFilterSize - 1, xFrac, false, chFmt, clpRng, 0, false, useAltHpelIf, useBiFilter, false );
+    m_if.filterVer( compID, tmp + ( ( vFilterSize >> 1 ) - 1 ) * dst.stride, dst.stride, dst.buf, dst.stride, dst.width, dst.height, yFrac, false, rndRes, chFmt, clpRng, 0, false, useAltHpelIf, useBiFilter, false );
+  }
+}
+#else
+bool InterPrediction::xSubBlockMCFast( const PredictionUnit &pu, PelUnitBuf &pcYuvPred, const bool luma, const bool chroma )
+{
+  return false;
+}
+
+void InterPrediction::xSubBlockMCFastComp( const ComponentID compID, const PredictionUnit &pu, const Picture *refPic, const Mv &mv, PelBuf &dst, const bool bi )
+{
+}
+#endif
 #endif
 
 int InterPrediction::rightShiftMSB(int numer, int denom)

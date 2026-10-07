@@ -50,6 +50,7 @@ def main():
     ap.add_argument("--callers", help="who calls functions matching this substring (inclusive)")
     ap.add_argument("--callees", help="what functions matching this substring call (inclusive)")
     ap.add_argument("--callsites", help="source lines of the calls into functions matching this substring")
+    ap.add_argument("--subtree", help="self time of the samples whose stack contains a function matching this substring")
     args = ap.parse_args()
 
     image_base, addrs, names = load_symbols(args.exe)
@@ -71,6 +72,7 @@ def main():
     callers = collections.Counter()
     callees = collections.Counter()
     callsites = collections.Counter()
+    subtree = collections.Counter()
     for line in open(args.samples):
         if line.startswith("#"):
             continue
@@ -102,6 +104,8 @@ def main():
                 if args.callees in funcs[i]:
                     callees[funcs[i - 1]] += n
                     break
+        if args.subtree and any(args.subtree in f for f in funcs):
+            subtree[funcs[0]] += n
 
     def pr(title, counter):
         print(f"\n== {title} ==")
@@ -124,6 +128,8 @@ def main():
         pr(f"callers of *{args.callers}*", callers)
     if args.callees:
         pr(f"direct callees of *{args.callees}*", callees)
+    if args.subtree:
+        pr(f"self time under *{args.subtree}* (total {100.0 * sum(subtree.values()) / total:.2f}%)", subtree)
     def by_source_line(addr_counts, inlines):
         hot = list(addr_counts.items())
         inp = "\n".join(hex(a + image_base) for a, _ in hot)

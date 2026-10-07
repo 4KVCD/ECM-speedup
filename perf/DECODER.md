@@ -27,6 +27,7 @@ intra period 32 and 64).
 | 3 | SIMD inverse transforms skip the zero-out region (as the scalar path does) and run the DCT-II butterflies vectorized with the rounding folded in | identical | 1.00x (128-point DCT-II share in RA profiles 4.05 % -> ~2 %; within the per-test noise); encoder 1.02x | ~1.17x |
 | 4 | per-picture set-up keeps the ALF picture buffers and two intra-prediction buffers instead of freeing and allocating them for every picture; everything else a fresh creation sets (TALF CTB flags, ALF flag arrays, filter shapes) is set as before | identical (also with 8 segment workers; encoder bit-exact) | 1.01x (3 paired repetitions; RA and LD streams 1.00-1.02x, AI streams 0.99-1.02x) | ~1.18x |
 | 5 | sign-prediction templates (border response of every predictable coefficient, built once per process and transform type/size) computed from one first-stage transform per row and the second-stage kernel instead of one full inverse transform per coefficient position; a verification build (SIGN_PRED_TEMPLATE_VERIFY=1) compared every template with the original method and every transform function with the formula | identical (also with 8 segment workers; encoder bit-exact) | 1.03x (3 paired repetitions; RA/LD streams 1.01-1.12x, AI 1.00-1.03x; a fixed ~0.03-0.1 s per process, so it matters most for short streams and segment workers) | ~1.21x |
+| 6 | OBMC sub-block predictions (mostly 4x4 luma / 2x2 chroma with neighbouring motion; ~1.3 M per 33-frame CIF RA decode) made with the same filter calls and averaging as the general xPredInterBi/Uni/Blk chain, without the chain; uncommon cases still use the chain; a verification build (OBMC_FAST_MC_VERIFY=1) ran both for every block | identical (also with 8 segment workers; encoder bit-exact) | 1.01x (3 paired repetitions; RA/LD streams 1.02-1.05x, AI 1.00x) | ~1.23x |
 
 ## Multithreading
 
@@ -70,3 +71,7 @@ sequentially.
   derivation with template matching (xDeriveCUMV) 31 %, OBMC 13 %, sign prediction 7.6 % (6.6 % of it the one-time
   template generation, step 5), loop filters 7.5 %. The profile is flat: half of the self time is spread over 47
   functions; the largest single one is the MC wrapper xPredInterBlk (3 %).
+- MC call counts (CIF RA, 33 frames, 2981 inter CUs): ~1040 motion-compensated predictions per inter CU, mostly
+  tiny: 953k 4x1/1x4 sub-block templates, 826k 2x2 chroma and 478k 4x4 luma OBMC predictions (OBMC runs per 4x4
+  sub-block wherever the motion inside a CU changes), 294k ARMC block templates; per-call overhead rather than
+  filtering dominates these.

@@ -679,6 +679,8 @@ protected:
   void xSubBlockMotionCompensation (PredictionUnit &pu, PelUnitBuf &pcYuvPred);
 #endif
 #endif
+  bool xSubBlockMCFast    ( const PredictionUnit &pu, PelUnitBuf &pcYuvPred, const bool luma, const bool chroma );
+  void xSubBlockMCFastComp( const ComponentID compID, const PredictionUnit &pu, const Picture *refPic, const Mv &mv, PelBuf &dst, const bool bi );
   void xSubblockOBMCBlending       (const ComponentID eComp, PredictionUnit &pu, PelUnitBuf &pcYuvPredDst, PelUnitBuf &pcYuvPredSrc1, PelUnitBuf &pcYuvPredSrc2, PelUnitBuf &pcYuvPredSrc3, PelUnitBuf &pcYuvPredSrc4, bool isAboveAvail = false, bool isLeftAvail = false, bool isBelowAvail = false, bool isRightAvail = false, bool bSubMotion = false);
 #endif
 #if !BDOF_RM_CONSTRAINTS
