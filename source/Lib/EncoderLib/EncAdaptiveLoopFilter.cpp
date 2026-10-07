@@ -5739,6 +5739,334 @@ void EncAdaptiveLoopFilter::roundFiltCoeffCCALF(int16_t *filterCoeffQuant, doubl
     filterCoeffQuant[i] = CCALF_SMALL_TAB[best_index] * sign;
   }
 }
+#if ALF_BATCHED_MERGE
+// perf: mergeClasses for filters without clipping (all clipping indices are 0) and without residual check, with the
+// same decisions and outputs:
+// - only bin 0 of the covariances enters the errors, so the class statistics and their merges are kept as compact
+//   copies of the bin-0 elements (same float additions per element as AlfCovariance::add / operator+=). The working
+//   copies in covMerged are not needed: after mergeClasses only cov and the temporary covMerged[MAX_NUM_ALF_CLASSES]
+//   are used, and the latter is reset before every use (deriveFilterCoeffs, tryImproveFilterCoeffs).
+// - the errors of all pairs that changed in a merge round are separate solves; they are solved together in the lanes
+//   of m_choleskySolveLanes before the selection of the round, which then runs in the original order.
+void EncAdaptiveLoopFilter::mergeClassesLinearBatched( AlfCovariance* cov, AlfCovariance* covMerged, int clipMerged[MAX_NUM_ALF_CLASSES][MAX_NUM_ALF_CLASSES][MAX_NUM_ALF_LUMA_COEFF], const int numClasses, short filterIndices[MAX_NUM_ALF_CLASSES][MAX_NUM_ALF_CLASSES], int mergedPair[MAX_NUM_ALF_CLASSES][2] )
+{
+  constexpr int L          = cholesky_lanes;
+  constexpr int maxBatches = 4;
+  const int     n          = cov[0].numCoeff;
+  const int     triSize    = cholesky_tri_size( n );
+  const int     matSize    = triSize * L;
+  CHECK( n > MAX_NUM_ALF_LUMA_COEFF, "Too many coefficients" );
+
+  static thread_local std::vector<float> statE, statY, matBuf, rhsBuf, xBuf;
+  statE.resize( numClasses * triSize );
+  statY.resize( numClasses * n );
+  matBuf.resize( maxBatches * matSize );
+  rhsBuf.resize( maxBatches * n * L );
+  xBuf.resize( maxBatches * n * L );
+  float  statP[MAX_NUM_ALF_CLASSES];
+  float* mat = matBuf.data();
+  float* rhs = rhsBuf.data();
+  float* x   = xBuf.data();
+
+  int     tmpClip[MAX_NUM_ALF_LUMA_COEFF];
+  int     bestMergeClip[MAX_NUM_ALF_LUMA_COEFF];
+  double  err[MAX_NUM_ALF_CLASSES];
+  double  bestMergeErr = std::numeric_limits<double>::max();
+  bool    availableClass[MAX_NUM_ALF_CLASSES];
+  uint8_t indexList[MAX_NUM_ALF_CLASSES];
+  uint8_t indexListTemp[MAX_NUM_ALF_CLASSES];
+  int     numRemaining = numClasses;
+
+  memset( filterIndices, 0, sizeof( short ) * MAX_NUM_ALF_CLASSES * MAX_NUM_ALF_CLASSES );
+
+  for( int i = 0; i < numClasses; i++ )
+  {
+    filterIndices[numRemaining - 1][i] = i;
+    indexList[i]                       = i;
+    availableClass[i]                  = true;
+    covMerged[i].numBins               = 1;
+    float* e = statE.data() + i * triSize;
+    for( int k = 0; k < n; k++ )
+    {
+      for( int l = k; l < n; l++ )
+      {
+        e[cholesky_tri_idx( k, l, n )] = cov[i].E( 0, 0, k, l );
+      }
+      statY[i * n + k] = cov[i].y( 0, k );
+    }
+    statP[i] = cov[i].pixAcc;
+  }
+
+  AlfCovariance& tmpCov = covMerged[MAX_NUM_ALF_CLASSES];
+  tmpCov.numBins        = 1;
+  if( numClasses >= 2 )
+  {
+    tmpCov.numCoeff = cov[0].numCoeff;   // as set by AlfCovariance::add
+  }
+
+  for( int i = 0; i < MAX_NUM_ALF_CLASSES; i++ )
+  {
+    for( int j = 0; j < MAX_NUM_ALF_CLASSES; j++ )
+    {
+      classChanged[i][j] = true;
+      memset( clipHistory[i][j], 0, sizeof( int ) * MAX_NUM_ALF_LUMA_COEFF );
+    }
+  }
+  memset( errorHistory, 0, sizeof( double ) * MAX_NUM_ALF_CLASSES * MAX_NUM_ALF_CLASSES );
+
+  for( int i = 0; i < numClasses; i++ )
+  {
+    std::fill_n( clipMerged[numRemaining - 1][i], MAX_NUM_ALF_LUMA_COEFF, 0 );
+  }
+
+  // errors (AlfCovariance::calculateError with all clipping indices 0) of the systems (cls1[s], cls2[s]):
+  // statistics of class cls1[s] plus those of class cls2[s] (if cls2[s] >= 0)
+  int    cls1[MAX_NUM_ALF_CLASSES * MAX_NUM_ALF_CLASSES / 2 + MAX_NUM_ALF_CLASSES];
+  int    cls2[MAX_NUM_ALF_CLASSES * MAX_NUM_ALF_CLASSES / 2 + MAX_NUM_ALF_CLASSES];
+  double sysErr[MAX_NUM_ALF_CLASSES * MAX_NUM_ALF_CLASSES / 2 + MAX_NUM_ALF_CLASSES];
+  auto   solveSystems = [&]( const int numSys ) {
+    int okMask[maxBatches];
+    for( int s0 = 0; s0 < numSys; s0 += maxBatches * L )
+    {
+      const int cnt = std::min( numSys - s0, maxBatches * L );
+      const int nb  = ( cnt + L - 1 ) / L;
+      for( int u = 0; u < nb * L; u++ )
+      {
+        const int    s  = s0 + std::min( u, cnt - 1 );   // unused lanes repeat the last system
+        const float* e1 = statE.data() + cls1[s] * triSize;
+        const float* y1 = statY.data() + cls1[s] * n;
+        float*       m  = mat + ( u / L ) * matSize + ( u % L );
+        float*       r  = rhs + ( u / L ) * n * L + ( u % L );
+        if( cls2[s] >= 0 )
+        {
+          const float* e2 = statE.data() + cls2[s] * triSize;
+          const float* y2 = statY.data() + cls2[s] * n;
+          for( int idx = 0; idx < triSize; idx++ )
+          {
+            m[idx * L] = e1[idx] + e2[idx];
+          }
+          for( int k = 0; k < n; k++ )
+          {
+            r[k * L] = y1[k] + y2[k];
+          }
+        }
+        else
+        {
+          for( int idx = 0; idx < triSize; idx++ )
+          {
+            m[idx * L] = e1[idx];
+          }
+          for( int k = 0; k < n; k++ )
+          {
+            r[k * L] = y1[k];
+          }
+        }
+      }
+
+      m_choleskySolveLanes( mat, rhs, x, n, nb, okMask );
+
+      for( int u = 0; u < cnt; u++ )
+      {
+        const int s = s0 + u;
+        const int b = u / L, t = u % L;
+        float     ySum[MAX_NUM_ALF_LUMA_COEFF];
+        AlfCovariance::Ty f;
+        const float pix = cls2[s] >= 0 ? statP[cls1[s]] + statP[cls2[s]] : statP[cls1[s]];
+        for( int k = 0; k < n; k++ )
+        {
+          ySum[k] = rhs[b * n * L + k * L + t];
+        }
+        if( ( okMask[b] >> t ) & 1 )
+        {
+          for( int k = 0; k < n; k++ )
+          {
+            f[k] = x[b * n * L + k * L + t];
+          }
+        }
+        else
+        {
+          // singular: regularized solve of AlfCovariance::gnsSolveByChol
+          AlfCovariance::TE lhs;
+          AlfCovariance::Ty rhsS;
+          const float*      e1 = statE.data() + cls1[s] * triSize;
+          const float*      e2 = cls2[s] >= 0 ? statE.data() + cls2[s] * triSize : nullptr;
+          for( int k = 0; k < n; k++ )
+          {
+            for( int l = k; l < n; l++ )
+            {
+              const int idx = cholesky_tri_idx( k, l, n );
+              lhs[k][l]     = e2 ? e1[idx] + e2[idx] : e1[idx];
+            }
+            rhsS[k] = ySum[k];
+          }
+          tmpCov.gnsSolveByChol( lhs, rhsS, f, n, false );
+        }
+        double sum = 0;   // AlfCovariance::calculateError
+        for( int k = 0; k < n; k++ )
+        {
+          sum += f[k] * ySum[k];
+        }
+        sysErr[s] = pix - sum;
+      }
+    }
+  };
+
+  for( int i = 0; i < numClasses; i++ )
+  {
+    cls1[i] = i;
+    cls2[i] = -1;
+  }
+  solveSystems( numClasses );
+  for( int i = 0; i < numClasses; i++ )
+  {
+    err[i] = sysErr[i];
+  }
+
+  while( numRemaining >= 2 )
+  {
+    double errorMin = std::numeric_limits<double>::max();
+    int bestToMergeIdx1 = 0, bestToMergeIdx2 = 1;
+
+    // errors of the pairs that changed
+    int numSys = 0;
+    for( int i = 0; i < numClasses - 1; i++ )
+    {
+      if( availableClass[i] )
+      {
+        for( int j = i + 1; j < numClasses; j++ )
+        {
+          if( availableClass[j] && classChanged[i][j] )
+          {
+            cls1[numSys]   = i;
+            cls2[numSys++] = j;
+          }
+        }
+      }
+    }
+    solveSystems( numSys );
+    for( int s = 0; s < numSys; s++ )
+    {
+      const int i = cls1[s], j = cls2[s];
+      for( int l = 0; l < MAX_NUM_ALF_LUMA_COEFF; ++l )
+      {
+        tmpClip[l] = ( clipMerged[numRemaining - 1][i][l] + clipMerged[numRemaining - 1][j][l] + 1 ) >> 1;
+        CHECKD( tmpClip[l] != 0, "clipping index of a linear filter" );
+      }
+      classChanged[i][j] = false;
+      errorHistory[i][j] = sysErr[s];
+      memcpy( clipHistory[i][j], tmpClip, sizeof( tmpClip ) );
+    }
+
+    for( int i = 0; i < numClasses - 1; i++ )
+    {
+      if( availableClass[i] )
+      {
+        for( int j = i + 1; j < numClasses; j++ )
+        {
+          if( availableClass[j] )
+          {
+            double error1 = err[i];
+            double error2 = err[j];
+            double errorMerged = errorHistory[i][j];
+            memcpy( tmpClip, clipHistory[i][j], sizeof( tmpClip ) );
+
+            double error = errorMerged - error1 - error2;
+
+            if( error < errorMin )
+            {
+              bestMergeErr = errorMerged;
+              memcpy( bestMergeClip, tmpClip, sizeof( bestMergeClip ) );
+              errorMin        = error;
+              bestToMergeIdx1 = i;
+              bestToMergeIdx2 = j;
+            }
+          }
+        }
+      }
+    }
+
+    // covMerged[bestToMergeIdx1] += covMerged[bestToMergeIdx2] (bin 0)
+    {
+      float*       e1 = statE.data() + bestToMergeIdx1 * triSize;
+      const float* e2 = statE.data() + bestToMergeIdx2 * triSize;
+      for( int idx = 0; idx < triSize; idx++ )
+      {
+        e1[idx] += e2[idx];
+      }
+      for( int k = 0; k < n; k++ )
+      {
+        statY[bestToMergeIdx1 * n + k] += statY[bestToMergeIdx2 * n + k];
+      }
+      statP[bestToMergeIdx1] += statP[bestToMergeIdx2];
+    }
+    memcpy( clipMerged[numRemaining - 2], clipMerged[numRemaining - 1], sizeof( int[MAX_NUM_ALF_CLASSES][MAX_NUM_ALF_LUMA_COEFF] ) );
+    memcpy( clipMerged[numRemaining - 2][bestToMergeIdx1], bestMergeClip, sizeof( bestMergeClip ) );
+    err[bestToMergeIdx1]            = bestMergeErr;
+    availableClass[bestToMergeIdx2] = false;
+    for( int i = 0; i < numClasses; i++ )
+    {
+      classChanged[bestToMergeIdx1][i] = classChanged[i][bestToMergeIdx1] = true;
+    }
+    mergedPair[numRemaining - 1][0] = bestToMergeIdx1;
+    mergedPair[numRemaining - 1][1] = bestToMergeIdx2;
+    if( numRemaining == 2 )
+    {
+      int ind = 0;
+      for( int i = 0; i < numClasses; i++ )
+      {
+        if( availableClass[i] )
+        {
+          mergedPair[numRemaining - 2][ind] = i;
+          ind++;
+        }
+      }
+    }
+    for( int i = 0; i < numClasses; i++ )
+    {
+      if( indexList[i] == bestToMergeIdx2 )
+      {
+        indexList[i] = bestToMergeIdx1;
+      }
+    }
+
+    numRemaining--;
+    if( numRemaining <= numClasses )
+    {
+      std::memcpy( indexListTemp, indexList, sizeof( uint8_t ) * numClasses );
+
+      bool exist = false;
+      int  ind   = 0;
+
+      for( int j = 0; j < numClasses; j++ )
+      {
+        exist = false;
+        for( int i = 0; i < numClasses; i++ )
+        {
+          if( indexListTemp[i] == j )
+          {
+            exist = true;
+            break;
+          }
+        }
+
+        if( exist )
+        {
+          for( int i = 0; i < numClasses; i++ )
+          {
+            if( indexListTemp[i] == j )
+            {
+              filterIndices[numRemaining - 1][i] = ind;
+              indexListTemp[i]                   = -1;
+            }
+          }
+          ind++;
+        }
+      }
+    }
+  }
+}
+#endif
+
 #if JVET_X0071_ALF_BAND_CLASSIFIER
 void EncAdaptiveLoopFilter::mergeClasses( const AlfFilterShape& alfShape, AlfCovariance* cov, AlfCovariance* covMerged, int clipMerged[MAX_NUM_ALF_CLASSES][MAX_NUM_ALF_CLASSES][MAX_NUM_ALF_LUMA_COEFF], const int numClasses, short filterIndices[MAX_NUM_ALF_CLASSES][MAX_NUM_ALF_CLASSES] , const int altIdx, int mergedPair[MAX_NUM_ALF_CLASSES][2] )
 #else
@@ -5749,6 +6077,13 @@ void EncAdaptiveLoopFilter::mergeClasses( const AlfFilterShape& alfShape, AlfCov
 )
 #endif
 {
+#if ALF_BATCHED_MERGE
+  if( !m_alfParamTemp.nonLinearFlag[CHANNEL_TYPE_LUMA][altIdx] && !m_encCfg->getAlfResidualCheckEnabled() )
+  {
+    mergeClassesLinearBatched( cov, covMerged, clipMerged, numClasses, filterIndices, mergedPair );
+    return;
+  }
+#endif
   int     tmpClip[MAX_NUM_ALF_LUMA_COEFF];
   int     bestMergeClip[MAX_NUM_ALF_LUMA_COEFF];
   double  err[MAX_NUM_ALF_CLASSES];

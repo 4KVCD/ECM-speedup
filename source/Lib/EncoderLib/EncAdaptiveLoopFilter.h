@@ -67,6 +67,7 @@ struct CandTALF
 #define ALF_RD_COST_BUG_FIX                               JVET_AK0123_ALF_COEFF_RESTRICTION
 #define ALF_OPT_FILTER_CACHE                              (JVET_AF0177_ALF_COV_FLOAT && JVET_AD0222_ALF_RESI_CLASS && JVET_AN0086_RESIDUAL_CHECK)
 #define ALF_BATCHED_SOLVES                                (JVET_AF0177_ALF_COV_FLOAT && JVET_AD0222_ALF_RESI_CLASS && JVET_AN0086_RESIDUAL_CHECK && ENABLE_SIMD_OPT_ALF_CHOLESKY)
+#define ALF_BATCHED_MERGE                                 (ALF_BATCHED_SOLVES && ALF_IMPROVEMENT && JVET_X0071_ALF_BAND_CLASSIFIER)
 
 struct AlfCovariance
 {
@@ -765,6 +766,9 @@ private:
 #endif
 #if JVET_X0071_ALF_BAND_CLASSIFIER
    void   mergeClasses(const AlfFilterShape& alfShape, AlfCovariance* cov, AlfCovariance* covMerged, int clipMerged[MAX_NUM_ALF_CLASSES][MAX_NUM_ALF_CLASSES][MAX_NUM_ALF_LUMA_COEFF], const int numClasses, short filterIndices[MAX_NUM_ALF_CLASSES][MAX_NUM_ALF_CLASSES], const int altIdx, int mergedPair[MAX_NUM_ALF_CLASSES][2]);
+#if ALF_BATCHED_MERGE
+   void   mergeClassesLinearBatched(AlfCovariance* cov, AlfCovariance* covMerged, int clipMerged[MAX_NUM_ALF_CLASSES][MAX_NUM_ALF_CLASSES][MAX_NUM_ALF_LUMA_COEFF], const int numClasses, short filterIndices[MAX_NUM_ALF_CLASSES][MAX_NUM_ALF_CLASSES], int mergedPair[MAX_NUM_ALF_CLASSES][2]);
+#endif
 #else
   void   mergeClasses(const AlfFilterShape& alfShape, AlfCovariance* cov, AlfCovariance* covMerged, int clipMerged[MAX_NUM_ALF_CLASSES][MAX_NUM_ALF_CLASSES][MAX_NUM_ALF_LUMA_COEFF], const int numClasses, short filterIndices[MAX_NUM_ALF_CLASSES][MAX_NUM_ALF_CLASSES]
 #if ALF_IMPROVEMENT
