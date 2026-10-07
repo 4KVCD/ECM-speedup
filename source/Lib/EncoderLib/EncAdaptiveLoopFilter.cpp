@@ -7030,6 +7030,64 @@ void EncAdaptiveLoopFilter::getBlkStats( AlfCovariance* alfCovariance, const Alf
 #endif
 #endif
 
+#if ALF_BATCHED_STATS
+  // perf: the sample statistics are buffered and added class by class with m_covAccumulate (tiles of the covariance
+  // kept in registers instead of a read-modify-write of a whole class covariance - which does not stay in the cache -
+  // per sample); every element still receives the contributions of its samples in raster order
+  constexpr int maxBuf      = 512;
+  constexpr int maxClasses  = 32;
+  const int     vecLen      = numBins * numCoeff;
+  const int     vecStride   = ( vecLen + 7 ) & ~7;
+  const bool    batched     = alfCovariance[0].stridey == numCoeff && ( !reuse || alfCovarianceNext[0].stridey == numCoeff );
+  static thread_local std::vector<float> statVec, statY, statW;
+  static thread_local std::vector<int>   statCls, statClsNext, statOrder;
+  int numBuf = 0;
+  if( batched )
+  {
+    statVec.resize( maxBuf * vecStride );
+    statY.resize( maxBuf );
+    statW.resize( maxBuf );
+    statCls.resize( maxBuf );
+    statClsNext.resize( maxBuf );
+    statOrder.resize( maxBuf );
+  }
+  auto addClasses = [&]( const int* cls, AlfCovariance* covs ) {
+    int start[maxClasses + 1] = { 0 };
+    for( int s = 0; s < numBuf; s++ )
+    {
+      CHECK( cls[s] < 0 || cls[s] >= maxClasses, "Wrong class index" );
+      start[cls[s] + 1]++;
+    }
+    for( int c = 0; c < maxClasses; c++ )
+    {
+      start[c + 1] += start[c];
+    }
+    int pos[maxClasses];
+    std::copy_n( start, maxClasses, pos );
+    for( int s = 0; s < numBuf; s++ )
+    {
+      statOrder[pos[cls[s]]++] = s;
+    }
+    for( int c = 0; c < maxClasses; c++ )
+    {
+      if( start[c + 1] > start[c] )
+      {
+        AlfCovariance& cov = covs[c];
+        m_covAccumulate( cov.data.data() + cov.offsetE, cov.data.data(), &cov.pixAcc, statVec.data(), vecStride, statOrder.data() + start[c],
+                         start[c + 1] - start[c], statY.data(), m_alfWSSD ? statW.data() : nullptr, vecLen );
+      }
+    }
+  };
+  auto flushStats = [&]() {
+    addClasses( statCls.data(), alfCovariance );
+    if( reuse )
+    {
+      addClasses( statClsNext.data(), alfCovarianceNext );
+    }
+    numBuf = 0;
+  };
+#endif
+
   for( int i = 0; i < area.height; i++ )
   {
 #if !ALF_IMPROVEMENT
@@ -7122,6 +7180,32 @@ calcCovariance( ELocal, rec + j, recStride, recBeforeDb + j, recBeforeDbStride, 
       calcCovariance( ELocal, rec + j, recStride, shape, transposeIdx, channel, vbDistance );
 #endif
 
+#if ALF_BATCHED_STATS
+      if( batched )
+      {
+        float* a = statVec.data() + numBuf * vecStride;
+        for( int b = 0; b < numBins; b++ )
+        {
+          for( int k = 0; k < numCoeff; k++ )
+          {
+            a[b * numCoeff + k] = (float) ELocal[k][b];
+          }
+        }
+        for( int v = vecLen; v < vecStride; v++ )
+        {
+          a[v] = 0;
+        }
+        statY[numBuf]       = (float) yLocal;
+        statW[numBuf]       = weight;
+        statCls[numBuf]     = classIdx;
+        statClsNext[numBuf] = reuse ? classIdxNext : 0;
+        if( ++numBuf == maxBuf )
+        {
+          flushStats();
+        }
+        continue;
+      }
+#endif
 #if JVET_AF0177_ALF_COV_FLOAT && JVET_AD0222_ALF_RESI_CLASS && JVET_R0351_HIGH_BIT_DEPTH_SUPPORT && JVET_AB0184_ALF_MORE_FIXED_FILTER_OUTPUT_TAPS
       // perf: same accumulations as the scalar loops below, vectorized over l (see alfAccumulateRow)
       {
@@ -7351,6 +7435,12 @@ calcCovariance( ELocal, rec + j, recStride, recBeforeDb + j, recBeforeDbStride, 
     resi += resiStride;
 #endif
   }
+#if ALF_BATCHED_STATS
+  if( batched && numBuf > 0 )
+  {
+    flushStats();
+  }
+#endif
 }
 
 #if JVET_R0351_HIGH_BIT_DEPTH_SUPPORT

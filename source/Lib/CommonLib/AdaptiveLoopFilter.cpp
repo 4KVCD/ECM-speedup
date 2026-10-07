@@ -192,6 +192,9 @@ AdaptiveLoopFilter::AdaptiveLoopFilter()
   m_fastCholeskyDec = fastCholeskyDec;
   m_choleskySolveLanes = choleskySolveLanes;
 #endif
+#if JVET_AF0177_ALF_COV_FLOAT
+  m_covAccumulate = covAccumulate;
+#endif
 
 #if JVET_AK0065_TALF
   m_setTAlfInput[1] = setBiInput;
@@ -10515,6 +10518,50 @@ int AdaptiveLoopFilter::fastCholeskyDec(cholesky_matrix inpMatr, cholesky_matrix
   return 1; // Signal that Cholesky factorization is successfully performed
 }
 
+#endif
+
+#if JVET_AF0177_ALF_COV_FLOAT
+void(*AdaptiveLoopFilter::m_covAccumulate)(float* E, float* y, float* pixAcc, const float* sampleVec, int vecStride, const int* idx, int count, const float* sampleY, const float* sampleW, int N);
+
+void AdaptiveLoopFilter::covAccumulate(float* E, float* y, float* pixAcc, const float* sampleVec, int vecStride, const int* idx, int count, const float* sampleY, const float* sampleW, int N)
+{
+  for( int i = 0; i < count; i++ )
+  {
+    const int    s = idx[i];
+    const float* a = sampleVec + (size_t) s * vecStride;
+    for( int v0 = 0; v0 < N; v0++ )
+    {
+      float* e = E + ( ( v0 * ( v0 + 1 ) ) >> 1 );
+      for( int v1 = 0; v1 <= v0; v1++ )
+      {
+        float p = a[v0] * a[v1];
+        if( sampleW )
+        {
+          p = sampleW[s] * p;
+        }
+        e[v1] += p;
+      }
+    }
+    for( int v = 0; v < N; v++ )
+    {
+      float p = sampleY[s] * a[v];
+      if( sampleW )
+      {
+        p = sampleW[s] * p;
+      }
+      y[v] += p;
+    }
+    float p = sampleY[s] * sampleY[s];
+    if( sampleW )
+    {
+      p = sampleW[s] * p;
+    }
+    *pixAcc += p;
+  }
+}
+#endif
+
+#if ENABLE_SIMD_OPT_ALF_CHOLESKY
 void(*AdaptiveLoopFilter::m_choleskySolveLanes)(cholesky_float_t* mat, const cholesky_float_t* rhs, cholesky_float_t* x, int numEq, int numBatches, int* okMask);
 
 void AdaptiveLoopFilter::choleskySolveLanes(cholesky_float_t* mat, const cholesky_float_t* rhs, cholesky_float_t* x, int numEq, int numBatches, int* okMask)

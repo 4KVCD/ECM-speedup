@@ -1231,6 +1231,16 @@ protected:
   static void(*m_choleskySolveLanes)(cholesky_float_t* mat, const cholesky_float_t* rhs, cholesky_float_t* x, int numEq, int numBatches, int* okMask);
   static void choleskySolveLanes(cholesky_float_t* mat, const cholesky_float_t* rhs, cholesky_float_t* x, int numEq, int numBatches, int* okMask);
 #endif
+#if JVET_AF0177_ALF_COV_FLOAT
+  // perf: encoder statistics: adds the contributions of count samples, in the order of idx, to a covariance of size N
+  // (packed lower triangle E, element (v0, v1), v1 <= v0, at v0 * (v0 + 1) / 2 + v1; vector y; pixAcc):
+  //   E[v0][v1] += w * (a[v0] * a[v1]),  y[v] += w * (yl * a[v]),  pixAcc += w * (yl * yl)
+  // with sample s = idx[i]: a = sampleVec + s * vecStride (zero-padded to a multiple of 8), yl = sampleY[s],
+  // w = sampleW[s] (no multiplication by w if sampleW is null). Every element receives the additions of the samples
+  // in the order of idx, exactly as in a loop over the samples.
+  static void(*m_covAccumulate)(float* E, float* y, float* pixAcc, const float* sampleVec, int vecStride, const int* idx, int count, const float* sampleY, const float* sampleW, int N);
+  static void covAccumulate(float* E, float* y, float* pixAcc, const float* sampleVec, int vecStride, const int* idx, int count, const float* sampleY, const float* sampleW, int N);
+#endif
 };
 
 #if JVET_AK0123_ALF_COEFF_RESTRICTION

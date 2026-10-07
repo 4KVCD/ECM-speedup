@@ -14839,6 +14839,111 @@ static void simdCholeskySolveLanes( float* mat, const float* rhs, float* x, int 
 }
 #endif
 
+#if USE_AVX2 && JVET_AF0177_ALF_COV_FLOAT
+// perf: see AdaptiveLoopFilter::covAccumulate. Tiles of R rows x 8 columns of E are kept in registers while all samples
+// are added (per element the same products and additions in the same sample order, no contraction).
+template<bool weighted, int R>
+static inline void simdCovAccumulateTile( float* E, const int r0, const int c0, const bool diag, const float* sampleVec, const int vecStride,
+                                          const int* idx, const int count, const float* sampleW )
+{
+  __m256  acc[R];
+  __m256i mask[R];
+  for( int i = 0; i < R; i++ )
+  {
+    const int v0    = r0 + i;
+    const int valid = diag ? i + 1 : 8;   // columns c0 .. c0 + valid - 1 <= v0
+    mask[i]         = _mm256_cmpgt_epi32( _mm256_set1_epi32( valid ), _mm256_setr_epi32( 0, 1, 2, 3, 4, 5, 6, 7 ) );
+    acc[i]          = _mm256_maskload_ps( E + ( ( v0 * ( v0 + 1 ) ) >> 1 ) + c0, mask[i] );
+  }
+  for( int n = 0; n < count; n++ )
+  {
+    const int    s = idx[n];
+    const float* a = sampleVec + (size_t) s * vecStride;
+    const __m256 x = _mm256_loadu_ps( a + c0 );
+    if( weighted )
+    {
+      const __m256 w = _mm256_set1_ps( sampleW[s] );
+      for( int i = 0; i < R; i++ )
+      {
+        acc[i] = _mm256_add_ps( acc[i], _mm256_mul_ps( w, _mm256_mul_ps( _mm256_broadcast_ss( a + r0 + i ), x ) ) );
+      }
+    }
+    else
+    {
+      for( int i = 0; i < R; i++ )
+      {
+        acc[i] = _mm256_add_ps( acc[i], _mm256_mul_ps( _mm256_broadcast_ss( a + r0 + i ), x ) );
+      }
+    }
+  }
+  for( int i = 0; i < R; i++ )
+  {
+    const int v0 = r0 + i;
+    _mm256_maskstore_ps( E + ( ( v0 * ( v0 + 1 ) ) >> 1 ) + c0, mask[i], acc[i] );
+  }
+}
+
+template<bool weighted>
+static void simdCovAccumulateT( float* E, float* y, float* pixAcc, const float* sampleVec, int vecStride, const int* idx, int count, const float* sampleY, const float* sampleW, int N )
+{
+  for( int r0 = 0; r0 < N; r0 += 8 )
+  {
+    const int rows = std::min( 8, N - r0 );
+    for( int c0 = 0; c0 <= r0; c0 += 8 )
+    {
+      const bool diag = c0 == r0;
+      switch( rows )
+      {
+      case 8: simdCovAccumulateTile<weighted, 8>( E, r0, c0, diag, sampleVec, vecStride, idx, count, sampleW ); break;
+      case 7: simdCovAccumulateTile<weighted, 7>( E, r0, c0, diag, sampleVec, vecStride, idx, count, sampleW ); break;
+      case 6: simdCovAccumulateTile<weighted, 6>( E, r0, c0, diag, sampleVec, vecStride, idx, count, sampleW ); break;
+      case 5: simdCovAccumulateTile<weighted, 5>( E, r0, c0, diag, sampleVec, vecStride, idx, count, sampleW ); break;
+      case 4: simdCovAccumulateTile<weighted, 4>( E, r0, c0, diag, sampleVec, vecStride, idx, count, sampleW ); break;
+      case 3: simdCovAccumulateTile<weighted, 3>( E, r0, c0, diag, sampleVec, vecStride, idx, count, sampleW ); break;
+      case 2: simdCovAccumulateTile<weighted, 2>( E, r0, c0, diag, sampleVec, vecStride, idx, count, sampleW ); break;
+      default: simdCovAccumulateTile<weighted, 1>( E, r0, c0, diag, sampleVec, vecStride, idx, count, sampleW ); break;
+      }
+    }
+  }
+  for( int c0 = 0; c0 < N; c0 += 8 )
+  {
+    const __m256i mask = _mm256_cmpgt_epi32( _mm256_set1_epi32( N - c0 ), _mm256_setr_epi32( 0, 1, 2, 3, 4, 5, 6, 7 ) );
+    __m256        acc  = _mm256_maskload_ps( y + c0, mask );
+    for( int n = 0; n < count; n++ )
+    {
+      const int    s = idx[n];
+      const __m256 p = _mm256_mul_ps( _mm256_set1_ps( sampleY[s] ), _mm256_loadu_ps( sampleVec + (size_t) s * vecStride + c0 ) );
+      acc            = _mm256_add_ps( acc, weighted ? _mm256_mul_ps( _mm256_set1_ps( sampleW[s] ), p ) : p );
+    }
+    _mm256_maskstore_ps( y + c0, mask, acc );
+  }
+  float pix = *pixAcc;
+  for( int n = 0; n < count; n++ )
+  {
+    const int s = idx[n];
+    float     p = sampleY[s] * sampleY[s];
+    if( weighted )
+    {
+      p = sampleW[s] * p;
+    }
+    pix += p;
+  }
+  *pixAcc = pix;
+}
+
+static void simdCovAccumulate( float* E, float* y, float* pixAcc, const float* sampleVec, int vecStride, const int* idx, int count, const float* sampleY, const float* sampleW, int N )
+{
+  if( sampleW )
+  {
+    simdCovAccumulateT<true>( E, y, pixAcc, sampleVec, vecStride, idx, count, sampleY, sampleW, N );
+  }
+  else
+  {
+    simdCovAccumulateT<false>( E, y, pixAcc, sampleVec, vecStride, idx, count, sampleY, sampleW, N );
+  }
+}
+#endif
+
 template <X86_VEXT vext>
 void AdaptiveLoopFilter::_initAdaptiveLoopFilterX86()
 {
@@ -14967,6 +15072,12 @@ void AdaptiveLoopFilter::_initAdaptiveLoopFilterX86()
     m_choleskySolveLanes = simdCholeskySolveLanes<vext>;
   }
 #endif
+#endif
+#if USE_AVX2 && JVET_AF0177_ALF_COV_FLOAT
+  if( vext >= AVX2 )
+  {
+    m_covAccumulate = simdCovAccumulate;
+  }
 #endif
 }
 
