@@ -13613,6 +13613,7 @@ void EncCu::xCheckRDCostMergeGeoComb2Nx2N(CodingStructure *&tempCS, CodingStruct
         pu.gpmIntraFlag = false;
       }
     }
+    m_pcInterSearch->prepareGpmPartTplCostRows(0);
     m_pcIntraSearch->deriveSgpmInterModeEncOrdered(mergeCtx[GEO_TM_OFF],
       bestCS->picture->getRecoBuf(area), area, cu, sgpmInterInfoList, sgpmInterCostList, m_pcInterSearch
       , sgpmInterIntraInfoList, sgpmInterIntraCostList

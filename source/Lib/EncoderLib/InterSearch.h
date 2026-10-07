@@ -1373,6 +1373,40 @@ public:
   uint8_t  m_gpmacsSplitModeTmSel      [GEO_ENC_MMVD_MAX_REFINE_NUM_ADJ][GEO_ENC_MMVD_MAX_REFINE_NUM_ADJ][GEO_MAX_NUM_UNI_CANDS][GEO_MAX_NUM_UNI_CANDS][GEO_NUM_PARTITION_MODE];
   uint32_t m_gpmPartTplCost            [GEO_ENC_MMVD_MAX_REFINE_NUM_ADJ][GEO_MAX_NUM_UNI_CANDS][2][GEO_NUM_PARTITION_MODE]; // [][][0][]: partition 0, [][][1][]: partition 1
 #endif
+  // perf: initGeoAngleSelection used to clear both tables (1.6 MB) for every CU; now a row is cleared when it is first
+  // used after initGeoAngleSelection (generation stamp per row), which gives the same values for every row read
+  uint32_t m_gpmRowGen = 0;
+  uint32_t m_gpmPartTplCostGen[std::extent<decltype( m_gpmPartTplCost ), 0>::value]
+                              [std::extent<decltype( m_gpmPartTplCost ), 1>::value] = {};
+  uint32_t m_gpmSelAvailGen[std::extent<decltype( m_gpmacsSplitModeTmSelAvail ), 0>::value]
+                           [std::extent<decltype( m_gpmacsSplitModeTmSelAvail ), 1>::value] = {};
+  auto gpmSelAvailRow( int idx0, int idx1 ) -> decltype( m_gpmacsSplitModeTmSelAvail[0][0] )
+  {
+    if( m_gpmSelAvailGen[idx0][idx1] != m_gpmRowGen )
+    {
+      m_gpmSelAvailGen[idx0][idx1] = m_gpmRowGen;
+      memset( m_gpmacsSplitModeTmSelAvail[idx0][idx1], 0, sizeof( m_gpmacsSplitModeTmSelAvail[idx0][idx1] ) );
+    }
+    return m_gpmacsSplitModeTmSelAvail[idx0][idx1];
+  }
+public:
+  auto gpmPartTplCostRow( int idx, int cand ) -> decltype( m_gpmPartTplCost[0][0] )
+  {
+    if( m_gpmPartTplCostGen[idx][cand] != m_gpmRowGen )
+    {
+      m_gpmPartTplCostGen[idx][cand] = m_gpmRowGen;
+      memset( m_gpmPartTplCost[idx][cand], -1, sizeof( m_gpmPartTplCost[idx][cand] ) );
+    }
+    return m_gpmPartTplCost[idx][cand];
+  }
+  // all rows m_gpmPartTplCost[idx][*] (read as a whole by deriveSgpmInterModeEncOrdered)
+  void prepareGpmPartTplCostRows( int idx )
+  {
+    for( int cand = 0; cand < (int) std::extent<decltype( m_gpmPartTplCost ), 1>::value; cand++ )
+    {
+      gpmPartTplCostRow( idx, cand );
+    }
+  }
 public:
   void initGeoAngleSelection(PredictionUnit& pu
 #if JVET_Y0065_GPM_INTRA

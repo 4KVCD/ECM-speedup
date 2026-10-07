@@ -8331,8 +8331,13 @@ void InterSearch::initGeoAngleSelection(PredictionUnit& pu
 )
 {
   xAMLGetCurBlkTemplate(pu, pu.lwidth(), pu.lheight());
-  memset(&m_gpmacsSplitModeTmSelAvail[0][0][0], 0, sizeof(m_gpmacsSplitModeTmSelAvail));
-  memset(&m_gpmPartTplCost[0][0][0][0], -1, sizeof(m_gpmPartTplCost));
+  // the rows of m_gpmacsSplitModeTmSelAvail (0) and m_gpmPartTplCost (-1) are cleared when first used
+  if( ++m_gpmRowGen == 0 )
+  {
+    memset( m_gpmPartTplCostGen, 0, sizeof( m_gpmPartTplCostGen ) );
+    memset( m_gpmSelAvailGen, 0, sizeof( m_gpmSelAvailGen ) );
+    m_gpmRowGen = 1;
+  }
 
   int16_t wIdx = floorLog2((uint32_t)pu.lwidth ()) - GEO_MIN_CU_LOG2;
   int16_t hIdx = floorLog2((uint32_t)pu.lheight()) - GEO_MIN_CU_LOG2;
@@ -8370,7 +8375,7 @@ void InterSearch::setGeoSplitModeToSyntaxTable(PredictionUnit& pu, MergeCtx& mer
   const int idx0 = mmvdCand0 + 1;
   const int idx1 = mmvdCand1 + 1;
 
-  if ((m_gpmacsSplitModeTmSelAvail[idx0][idx1][mergeCand0] & ((uint16_t)1 << mergeCand1)) == 0)
+  if ((gpmSelAvailRow(idx0, idx1)[mergeCand0] & ((uint16_t)1 << mergeCand1)) == 0)
   {
     uint8_t numValidInList = 0;
     uint8_t modeList[GEO_NUM_SIG_PARTMODE];
@@ -8384,8 +8389,8 @@ void InterSearch::setGeoSplitModeToSyntaxTable(PredictionUnit& pu, MergeCtx& mer
 #if JVET_AI0082_GPM_WITH_INTER_IBC
                       , geoBvList
 #endif
-                      , m_gpmPartTplCost[idx0][mergeCand0]
-                      , m_gpmPartTplCost[idx1][mergeCand1]
+                      , gpmPartTplCostRow(idx0, mergeCand0)
+                      , gpmPartTplCostRow(idx1, mergeCand1)
                       , mergeCtx0
                       , mergeCand0
 #if JVET_Y0065_GPM_INTRA
@@ -8419,7 +8424,7 @@ void InterSearch::setGeoSplitModeToSyntaxTable(PredictionUnit& pu, MergeCtx& mer
     );
 
     xSetGpmModeToSyntaxModeTable(numValidInList, modeList, m_gpmacsSplitModeTmSel[idx0][idx1][mergeCand0][mergeCand1]);
-    m_gpmacsSplitModeTmSelAvail[idx0][idx1][mergeCand0] |= ((uint16_t)1 << mergeCand1);
+    gpmSelAvailRow(idx0, idx1)[mergeCand0] |= ((uint16_t)1 << mergeCand1);
   }
 }
 
@@ -8433,13 +8438,13 @@ void InterSearch::setGeoTMSplitModeToSyntaxTable(PredictionUnit& pu, MergeCtx(&m
   const int idx0 = mmvdCand0 + 1;
   const int idx1 = mmvdCand1 + 1;
 
-  if ((m_gpmacsSplitModeTmSelAvail[idx0][idx1][mergeCand0] & ((uint16_t)1 << mergeCand1)) == 0)
+  if ((gpmSelAvailRow(idx0, idx1)[mergeCand0] & ((uint16_t)1 << mergeCand1)) == 0)
   {
     uint8_t numValidInList = 0;
     uint8_t modeList[GEO_NUM_SIG_PARTMODE];
     selectGeoTMSplitModes(pu
-                        , m_gpmPartTplCost[idx0][mergeCand0]
-                        , m_gpmPartTplCost[idx1][mergeCand1]
+                        , gpmPartTplCostRow(idx0, mergeCand0)
+                        , gpmPartTplCostRow(idx1, mergeCand1)
                         , mergeCtx
 #if JVET_AJ0274_GPM_AFFINE_TM
                         , affMergeCtx
@@ -8451,7 +8456,7 @@ void InterSearch::setGeoTMSplitModeToSyntaxTable(PredictionUnit& pu, MergeCtx(&m
     );
 
     xSetGpmModeToSyntaxModeTable(numValidInList, modeList, m_gpmacsSplitModeTmSel[idx0][idx1][mergeCand0][mergeCand1]);
-    m_gpmacsSplitModeTmSelAvail[idx0][idx1][mergeCand0] |= ((uint16_t)1 << mergeCand1);
+    gpmSelAvailRow(idx0, idx1)[mergeCand0] |= ((uint16_t)1 << mergeCand1);
   }
 }
 #endif
