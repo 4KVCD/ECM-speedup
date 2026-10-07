@@ -41,6 +41,14 @@ Benchmark suite (`perf/bench.py`)
 | - | clang 23 + ThinLTO instead of GCC: AI +1.5 %, but inter coding crashes (UB-sensitive) - dropped | - | - | |
 | 13 | AVX2 paths for 12-tap luma interpolation (horizontal 8 columns per iteration, vertical 16) - same arithmetic as the 4-wide SSE kernels | yes | +0.8 % (RA +1.0-1.3 %) | |
 | 14 | 8-wide 12-tap vertical interpolation via the generic AVX2 M8 kernel | yes | +0.5 % (CPU 1.00x: noise level) | |
+| 15 | CABAC context store copies skip unchanged 32-context blocks (per-block version stamps, dirty marking on write) | yes | +2 % CPU (+4 % wall), RA +3 % | |
+| - | CU/PU position lookups through a cached parent chain - **reverted**: walks are short, the bookkeeping cost more (0.98x) | yes | -2 % | |
+| 16 | forward-transform (256 KB) and angular-prediction (128 KB) work buffers moved off the stack: every call probed all those stack pages | yes | +1 % (CPU 1.01x on every test) | |
+| 17 | SSE2 sign-prediction hypothesis costs; inline copies of small context sets | yes | AI +1 %, RA/LD ~0 | |
+| 18 | lazy clearing of the per-CU affine AMVP buffer; inline copies of 8-64 byte rows | yes | +0.5 % | |
+
+Steps 15-18 were measured on builds without LTO (perf/build.ps1 did not enable it; it does now), both sides of each
+comparison built the same way.
 
 Paired totals (both builds run each test at the same time):
 - code steps 4-12 on top of PGO: `pgo` -> `best`: **+5.8 %** (every test 1.05-1.07x)
@@ -61,7 +69,7 @@ Paired totals (both builds run each test at the same time):
 |---|---|---|---|---|---|
 | ra_long (foreman 128x128 crop, RA, QP 32, intra period 32) | 257 | 6011 s (5929 s CPU) | 1090.6 s (best, 8 chunks) | **5.51x** | yes |
 | ai_long (foreman 128x128 crop, AI, QP 32, 257 input frames, TemporalSubsampleRatio 8), first version: overlapping chunks, 8 workers | 33 | 579.2 s | 152.2 s (best2) | 3.80x | yes |
-| ai_long, disjoint chunks, 8 workers | 33 | 579.2 s | 133.2 s (dev = LTO, no PGO) | 4.35x | yes |
+| ai_long, disjoint chunks, 8 workers | 33 | 579.2 s | 133.2 s (dev = steps 4-14 without LTO/PGO) | 4.35x | yes |
 | ai_long, 1-picture chunks, 16 workers (hyperthreads) | 33 | 579.2 s | 87.0 s (dev) | **6.66x** | yes |
 
 RA parallel efficiency is ~60 % (1.15x single-thread x 8 workers would be 9.2x): shared L3/DRAM bandwidth,
