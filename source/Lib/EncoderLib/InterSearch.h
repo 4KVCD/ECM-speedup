@@ -244,7 +244,7 @@ struct ModeInfo
     , isOBMC(false)
 #endif
   {}
-  ModeInfo(const CodingUnit cu, const PredictionUnit pu)
+  ModeInfo(const CodingUnit& cu, const PredictionUnit& pu)
   {
 #if AFFINE_MMVD
 #if JVET_Y0067_ENHANCED_MMVD_MVD_SIGN_PRED
@@ -330,7 +330,7 @@ struct ModeIbcInfo
   ) :
     mergeCand(mergeCand), isCIIP(isCIIP), dirIdx(dirIdx), isIbcGpm(isIbcGpm), mergeIdx0(mergeIdx0), mergeIdx1(mergeIdx1), splitDir(splitDir), bldIdx(bldIdx), combIdx(combIdx)
   {}
-  ModeIbcInfo(const CodingUnit cu, const PredictionUnit pu)
+  ModeIbcInfo(const CodingUnit& cu, const PredictionUnit& pu)
   {
     mergeCand = pu.mergeIdx;
     isCIIP = pu.ibcCiipFlag;
@@ -351,7 +351,7 @@ struct ModeIbcInfo
   ) :
     mergeCand(mergeCand), isCIIP(isCIIP), dirIdx(dirIdx)
   {}
-  ModeIbcInfo(const CodingUnit cu, const PredictionUnit pu)
+  ModeIbcInfo(const CodingUnit& cu, const PredictionUnit& pu)
   {
     mergeCand = pu.mergeIdx;
     isCIIP = pu.ibcCiipFlag;
@@ -377,7 +377,7 @@ struct ModeIbcInfo
   ) :
     mergeCand(mergeCand), isIbcGpm(isIbcGpm), mergeIdx0(mergeIdx0), mergeIdx1(mergeIdx1), splitDir(splitDir), bldIdx(bldIdx), combIdx(combIdx)
   {}
-  ModeIbcInfo(const CodingUnit cu, const PredictionUnit pu)
+  ModeIbcInfo(const CodingUnit& cu, const PredictionUnit& pu)
   {
     mergeCand = pu.mergeIdx;
     isIbcGpm = pu.ibcGpmFlag;
@@ -944,7 +944,7 @@ public:
   {
     m_mhpMrgTempBufSet = setId;
   }
-  void             setGeoTmpBuffer(MergeCtx geoMrgCtx, int setId)
+  void             setGeoTmpBuffer(const MergeCtx& geoMrgCtx, int setId)
   {
     m_mhpMrgTempBufSet = setId;
     m_geoMrgCtx = geoMrgCtx;
@@ -954,7 +954,7 @@ public:
   {
     m_mhpMrgTempBufSet = true;
   }
-  void             setGeoTmpBuffer(MergeCtx geoMrgCtx)
+  void             setGeoTmpBuffer(const MergeCtx& geoMrgCtx)
   {
     m_mhpMrgTempBufSet = true;
     m_geoMrgCtx = geoMrgCtx;
