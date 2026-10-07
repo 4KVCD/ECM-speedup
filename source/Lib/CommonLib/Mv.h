@@ -82,8 +82,10 @@ public:
   // constructors
   // ------------------------------------------------------------------------------------------------------------------
 
-  Mv(                    ) : hor( 0    ), ver( 0    ) {}
-  Mv( int iHor, int iVer ) : hor( iHor ), ver( iVer ) {}
+  // constexpr: global Mv arrays (g_reusedUniMVs, g_reusedUniMVsLIC: 2 x 175 MB with 256x256 CTUs) are then
+  // zero-initialized at compile time (.bss) instead of being written by every process at start-up
+  constexpr Mv(                    ) : hor( 0    ), ver( 0    ) {}
+  constexpr Mv( int iHor, int iVer ) : hor( iHor ), ver( iVer ) {}
 
   // ------------------------------------------------------------------------------------------------------------------
   // set
