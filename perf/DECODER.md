@@ -28,6 +28,10 @@ intra period 32 and 64).
 | 4 | per-picture set-up keeps the ALF picture buffers and two intra-prediction buffers instead of freeing and allocating them for every picture; everything else a fresh creation sets (TALF CTB flags, ALF flag arrays, filter shapes) is set as before | identical (also with 8 segment workers; encoder bit-exact) | 1.01x (3 paired repetitions; RA and LD streams 1.00-1.02x, AI streams 0.99-1.02x) | ~1.18x |
 | 5 | sign-prediction templates (border response of every predictable coefficient, built once per process and transform type/size) computed from one first-stage transform per row and the second-stage kernel instead of one full inverse transform per coefficient position; a verification build (SIGN_PRED_TEMPLATE_VERIFY=1) compared every template with the original method and every transform function with the formula | identical (also with 8 segment workers; encoder bit-exact) | 1.03x (3 paired repetitions; RA/LD streams 1.01-1.12x, AI 1.00-1.03x; a fixed ~0.03-0.1 s per process, so it matters most for short streams and segment workers) | ~1.21x |
 | 6 | OBMC sub-block predictions (mostly 4x4 luma / 2x2 chroma with neighbouring motion; ~1.3 M per 33-frame CIF RA decode) made with the same filter calls and averaging as the general xPredInterBi/Uni/Blk chain, without the chain; uncommon cases still use the chain; a verification build (OBMC_FAST_MC_VERIFY=1) ran both for every block | identical (also with 8 segment workers; encoder bit-exact) | 1.01x (3 paired repetitions; RA/LD streams 1.02-1.05x, AI 1.00x) | ~1.23x |
+| 7 | profile-guided build (`perf/pgo_dec.ps1`: instrumented build, training decodes of 9 of the 18 test streams, -fprofile-use rebuild), same source as step 6 | identical (also with 8 segment workers) | 1.06x (3 paired repetitions; RA/LD 1.08-1.11x, AI 1.00-1.13x; streams not in the training set gained as much as the trained ones, e.g. ra_long 1.10x, ld_cif33 1.10x, ai720 1.13x) | ~1.31x |
+
+Steps after 7 are measured against non-PGO builds (each PGO build takes ~20 min); the cumulative figure assumes the
+PGO gain carries over, and is re-measured with a PGO build from time to time.
 
 ## Multithreading
 
