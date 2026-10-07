@@ -3970,6 +3970,179 @@ int EncSampleAdaptiveOffset::calcEdgeStatIndex(const int ctuRsAddr, const int mo
 }
 #endif
 
+#if JVET_AE0151_CCSAO_HISTORY_OFFSETS_AND_EXT_EO && JVET_Z0105_LOOP_FILTER_VIRTUAL_BOUNDARY
+// perf: CCSAO edge statistics of one (CTU, edge component, edge direction) pass. Per sample, the original loops add the
+// difference to 16 thresholds x up to 16 band classifications per edge type (scattered over ~5 MB of statistics per
+// CTU). Here a sample is added once per (edge type, threshold) and band component to a small histogram over
+// (band key, edge class): the band key of a sample value is its index in the common refinement of all band partitions
+// (value * bandNum) >> bitDepth that the edge type uses with that component, so the class of every band
+// classification follows from the key. flush() adds the histograms to the statistics. Sums and counts are integers:
+// the results are identical.
+struct CcSaoEdgeStatsAcc
+{
+  int                   bitDepth = -1, maxBitDepth = -1, edgeIdcNum = 0, bdShift = 0;
+  int                   thrVal[MAX_CCSAO_EDGE_IDC][MAX_CCSAO_EDGE_THR];
+  std::vector<uint16_t> key[MAX_CCSAO_EDGE_IDC][MAX_NUM_COMPONENT];       // key of a sample value
+  int                   numKeys[MAX_CCSAO_EDGE_IDC][MAX_NUM_COMPONENT];
+  std::vector<uint8_t>  keyBand[MAX_CCSAO_EDGE_IDC][MAX_CCSAO_BAND_IDC];   // band index of a key, if the band
+                                                                          // classification is used with the edge type
+  int                   histOff[MAX_CCSAO_EDGE_IDC][MAX_NUM_COMPONENT];   // histograms [thr][key][edge class]
+  std::vector<int64_t>  diff;
+  std::vector<uint32_t> count;
+
+  void init( const int bd, const int maxBd, const int idcNum, const int shift )
+  {
+    if( bd == bitDepth && maxBd == maxBitDepth && idcNum == edgeIdcNum && shift == bdShift )
+    {
+      return;
+    }
+    bitDepth = bd, maxBitDepth = maxBd, edgeIdcNum = idcNum, bdShift = shift;
+    const int numValues = 1 << maxBd;
+    int       size      = 0;
+    for( int idc = 0; idc < MAX_CCSAO_EDGE_IDC; idc++ )
+    {
+      const int edgeNum = g_ccSaoEdgeNum[idc][0];
+      for( int bandIdc = 0; bandIdc < MAX_CCSAO_BAND_IDC; bandIdc++ )
+      {
+        keyBand[idc][bandIdc].clear();
+      }
+      for( int thr = 0; thr < MAX_CCSAO_EDGE_THR; thr++ )
+      {
+#if JVET_AJ0237_INTERNAL_12BIT
+        thrVal[idc][thr] = g_ccSaoEdgeThr[idc][thr] << shift;
+#else
+        thrVal[idc][thr] = g_ccSaoEdgeThr[idc][thr];
+#endif
+      }
+      for( int cmp = 0; cmp < MAX_NUM_COMPONENT; cmp++ )
+      {
+        // band classifications of this component used with this edge type
+        std::vector<int> bands;
+        for( int bandIdc = 0; bandIdc < MAX_CCSAO_BAND_IDC; bandIdc++ )
+        {
+          if( g_ccSaoBandTab[bandIdc][0] == cmp && g_ccSaoBandTab[bandIdc][1] * edgeNum <= MAX_CCSAO_CLASS_NUM )
+          {
+            bands.push_back( bandIdc );
+          }
+        }
+        key[idc][cmp].assign( numValues, 0 );
+        numKeys[idc][cmp] = 0;
+        if( bands.empty() )
+        {
+          continue;
+        }
+        // values with equal band indices in all these classifications share a key (keys increase with the value)
+        std::vector<int> prev( bands.size(), -1 );
+        for( int v = 0; v < numValues; v++ )
+        {
+          bool newKey = v == 0;
+          for( size_t i = 0; i < bands.size(); i++ )
+          {
+            const int band = ( v * g_ccSaoBandTab[bands[i]][1] ) >> bd;
+            newKey |= band != prev[i];
+            prev[i] = band;
+          }
+          if( newKey )
+          {
+            numKeys[idc][cmp]++;
+            for( size_t i = 0; i < bands.size(); i++ )
+            {
+              keyBand[idc][bands[i]].push_back( (uint8_t) prev[i] );
+            }
+          }
+          key[idc][cmp][v] = (uint16_t) ( numKeys[idc][cmp] - 1 );
+        }
+        histOff[idc][cmp] = size;
+        size += MAX_CCSAO_EDGE_THR * numKeys[idc][cmp] * edgeNum;
+      }
+    }
+    diff.assign( size, 0 );
+    count.assign( size, 0 );
+  }
+
+  // the inner loops of the original code for one sample: edge value e, neighbours a, b, luma / chroma values at the
+  // sample position, difference d
+  inline void add( const int e, const int a, const int b, const Pel* val, const int d )
+  {
+    const int dA = e - a, dB = e - b;
+    for( int idc = 0; idc < edgeIdcNum; idc++ )
+    {
+      const int edgeNum = g_ccSaoEdgeNum[idc][0];
+      int       off[MAX_NUM_COMPONENT], nk[MAX_NUM_COMPONENT], numCmp = 0;
+      for( int cmp = 0; cmp < MAX_NUM_COMPONENT; cmp++ )
+      {
+        if( numKeys[idc][cmp] )
+        {
+          nk[numCmp]    = numKeys[idc][cmp] * edgeNum;
+          off[numCmp++] = histOff[idc][cmp] + key[idc][cmp][val[cmp]] * edgeNum;
+        }
+      }
+      for( int thr = 0; thr < MAX_CCSAO_EDGE_THR; thr++ )
+      {
+        const int t = thrVal[idc][thr];
+        int       edgeIdx;
+        if( idc == 0 )
+        {
+          const int eA = dA < 0 ? ( dA < -t ? 0 : 1 ) : ( dA < t ? 2 : 3 );
+          const int eB = dB < 0 ? ( dB < -t ? 0 : 1 ) : ( dB < t ? 2 : 3 );
+          edgeIdx      = eA * g_ccSaoEdgeNum[0][1] + eB;
+        }
+        else
+        {
+          edgeIdx = ( dA < t ? 0 : 1 ) * g_ccSaoEdgeNum[1][1] + ( dB < t ? 0 : 1 );
+        }
+        for( int c = 0; c < numCmp; c++ )
+        {
+          const int i = off[c] + thr * nk[c] + edgeIdx;
+          diff[i] += d;
+          count[i]++;
+        }
+      }
+    }
+  }
+
+  // adds the histograms to the statistics (statIdx(bandIdc, edgeIdc, edgeThr) gives the statistics index) and clears them
+  template<class StatIdx> void flush( CcSaoStatData* stats, StatIdx statIdx )
+  {
+    for( int idc = 0; idc < edgeIdcNum; idc++ )
+    {
+      const int edgeNum = g_ccSaoEdgeNum[idc][0];
+      for( int bandIdc = 0; bandIdc < MAX_CCSAO_BAND_IDC; bandIdc++ )
+      {
+        if( keyBand[idc][bandIdc].empty() )
+        {
+          continue;
+        }
+        const int cmp = g_ccSaoBandTab[bandIdc][0];
+        const int nk  = numKeys[idc][cmp];
+        for( int thr = 0; thr < MAX_CCSAO_EDGE_THR; thr++ )
+        {
+          CcSaoStatData&  st = stats[statIdx( bandIdc, idc, thr )];
+          const int64_t*  hd = diff.data() + histOff[idc][cmp] + thr * nk * edgeNum;
+          const uint32_t* hc = count.data() + histOff[idc][cmp] + thr * nk * edgeNum;
+          for( int k = 0; k < nk; k++ )
+          {
+            const int classOff = keyBand[idc][bandIdc][k] * edgeNum;
+            for( int e = 0; e < edgeNum; e++ )
+            {
+              if( hc[k * edgeNum + e] )
+              {
+                CHECK( classOff + e >= MAX_CCSAO_CLASS_NUM, "Wrong CCSAO class" );
+                st.diff[classOff + e] += hd[k * edgeNum + e];
+                st.count[classOff + e] += hc[k * edgeNum + e];
+              }
+            }
+          }
+        }
+      }
+    }
+    std::fill( diff.begin(), diff.end(), 0 );
+    std::fill( count.begin(), count.end(), 0 );
+  }
+};
+static thread_local CcSaoEdgeStatsAcc g_ccSaoEdgeAcc;
+#endif
+
 #if JVET_AE0151_CCSAO_HISTORY_OFFSETS_AND_EXT_EO
 void EncSampleAdaptiveOffset::getCcSaoBlkStatsEdgePre(CodingStructure& cs, const ComponentID compID, const ChromaFormat chromaFormat, const int bitDepth
                                                     , CcSaoStatData *blkStatsEdge, const int ctuRsAddr
@@ -4004,6 +4177,14 @@ void EncSampleAdaptiveOffset::getCcSaoBlkStatsEdgeNew(const ComponentID compID, 
 
 #if JVET_AJ0237_INTERNAL_12BIT
   const int bdShift = std::max(0, bitDepth - 10);
+#endif
+
+#if JVET_Z0105_LOOP_FILTER_VIRTUAL_BOUNDARY
+#if JVET_AJ0237_INTERNAL_12BIT
+  g_ccSaoEdgeAcc.init( bitDepth, std::max( { bitDepth, cs.sps->getBitDepth( CHANNEL_TYPE_LUMA ), cs.sps->getBitDepth( CHANNEL_TYPE_CHROMA ) } ), edgeIdcNum, bdShift );
+#else
+  g_ccSaoEdgeAcc.init( bitDepth, std::max( { bitDepth, cs.sps->getBitDepth( CHANNEL_TYPE_LUMA ), cs.sps->getBitDepth( CHANNEL_TYPE_CHROMA ) } ), edgeIdcNum, 0 );
+#endif
 #endif
 
 #if JVET_Z0105_LOOP_FILTER_VIRTUAL_BOUNDARY
@@ -4056,42 +4237,8 @@ void EncSampleAdaptiveOffset::getCcSaoBlkStatsEdgeNew(const ComponentID compID, 
               const Pel *colA = colE + srcStrideE * edgePosYA + edgePosXA;
               const Pel *colB = colE + srcStrideE * edgePosYB + edgePosXB;
 
-              for (int edgeIdc = 0; edgeIdc < edgeIdcNum; edgeIdc++)
-              {
-                const int edgeNum    = g_ccSaoEdgeNum[edgeIdc][0];
-                const int edgeNumUni = g_ccSaoEdgeNum[edgeIdc][1];
-                for (int edgeThr = 0; edgeThr < MAX_CCSAO_EDGE_THR; edgeThr++)
-                {
-#if JVET_AJ0237_INTERNAL_12BIT
-                  const int edgeThrVal = g_ccSaoEdgeThr[edgeIdc][edgeThr] << bdShift;
-#else
-                  const int edgeThrVal = g_ccSaoEdgeThr[edgeIdc][edgeThr];
-#endif
-                  const int edgeIdxA = getCcSaoEdgeIdx(*colE, *colA, edgeThrVal, edgeIdc);
-                  const int edgeIdxB = getCcSaoEdgeIdx(*colE, *colB, edgeThrVal, edgeIdc);
-                  const int edgeIdx  = edgeIdxA * edgeNumUni + edgeIdxB;
-                  for (int bandIdc = 0; bandIdc < MAX_CCSAO_BAND_IDC; bandIdc++)
-                  {
-                    const int bandCmp = g_ccSaoBandTab[bandIdc][0];
-                    const int bandNum = g_ccSaoBandTab[bandIdc][1];
-                    if (bandNum * edgeNum > MAX_CCSAO_CLASS_NUM)
-                    {
-                      continue;
-                    }
-
-                    const int bandIdx  = (*col[bandCmp] * bandNum) >> bitDepth;
-                    const int classIdx = bandIdx * edgeNum + edgeIdx;
-
-                    int idx = getCcSaoEdgeStatIdx(ctuRsAddr, bandIdc
-                                                , edgeCmp, edgeIdc
-                                                , edgeDir, edgeThr
-                                                 );
-
-                    blkStatsEdge[idx].diff [classIdx] += org[x] - dst[x];
-                    blkStatsEdge[idx].count[classIdx]++;
-                  }
-                }
-              }
+              const Pel ccVal[MAX_NUM_COMPONENT] = { *col[COMPONENT_Y], *col[COMPONENT_Cb], *col[COMPONENT_Cr] };
+              g_ccSaoEdgeAcc.add( *colE, *colA, *colB, ccVal, org[x] - dst[x] );
             }
             srcY += srcStrideY;
             srcU += srcStrideU * ((y & 0x1) | chromaScaleYM1);
@@ -4130,42 +4277,8 @@ void EncSampleAdaptiveOffset::getCcSaoBlkStatsEdgeNew(const ComponentID compID, 
               const Pel *colA = colE + srcStrideE * edgePosYA + edgePosXA;
               const Pel *colB = colE + srcStrideE * edgePosYB + edgePosXB;
 
-              for (int edgeIdc = 0; edgeIdc < edgeIdcNum; edgeIdc++)
-              {
-                const int edgeNum    = g_ccSaoEdgeNum[edgeIdc][0];
-                const int edgeNumUni = g_ccSaoEdgeNum[edgeIdc][1];
-                for (int edgeThr = 0; edgeThr < MAX_CCSAO_EDGE_THR; edgeThr++)
-                {
-#if JVET_AJ0237_INTERNAL_12BIT
-                  const int edgeThrVal = g_ccSaoEdgeThr[edgeIdc][edgeThr] << bdShift;
-#else
-                  const int edgeThrVal = g_ccSaoEdgeThr[edgeIdc][edgeThr];
-#endif
-                  const int edgeIdxA = getCcSaoEdgeIdx(*colE, *colA, edgeThrVal, edgeIdc);
-                  const int edgeIdxB = getCcSaoEdgeIdx(*colE, *colB, edgeThrVal, edgeIdc);
-                  const int edgeIdx  = edgeIdxA * edgeNumUni + edgeIdxB;
-                  for (int bandIdc = 0; bandIdc < MAX_CCSAO_BAND_IDC; bandIdc++)
-                  {
-                    const int bandCmp = g_ccSaoBandTab[bandIdc][0];
-                    const int bandNum = g_ccSaoBandTab[bandIdc][1];
-                    if (bandNum * edgeNum > MAX_CCSAO_CLASS_NUM)
-                    {
-                      continue;
-                    }
-
-                    const int bandIdx  = (*col[bandCmp] * bandNum) >> bitDepth;
-                    const int classIdx = bandIdx * edgeNum + edgeIdx;
-
-                    int idx = getCcSaoEdgeStatIdx(ctuRsAddr, bandIdc
-                                                , edgeCmp, edgeIdc
-                                                , edgeDir, edgeThr
-                                                 );
-
-                    blkStatsEdge[idx].diff [classIdx] += org[x] - dst[x];
-                    blkStatsEdge[idx].count[classIdx]++;
-                  }
-                }
-              }
+              const Pel ccVal[MAX_NUM_COMPONENT] = { *col[COMPONENT_Y], *col[COMPONENT_Cb], *col[COMPONENT_Cr] };
+              g_ccSaoEdgeAcc.add( *colE, *colA, *colB, ccVal, org[x] - dst[x] );
             }
             srcY += srcStrideY;
             srcU += srcStrideU * ((y & 0x1) | chromaScaleYM1);
@@ -4198,42 +4311,8 @@ void EncSampleAdaptiveOffset::getCcSaoBlkStatsEdgeNew(const ComponentID compID, 
             const Pel *colA = colE + srcStrideE * edgePosYA + edgePosXA;
             const Pel *colB = colE + srcStrideE * edgePosYB + edgePosXB;
 
-            for (int edgeIdc = 0; edgeIdc < edgeIdcNum; edgeIdc++)
-            {
-              const int edgeNum    = g_ccSaoEdgeNum[edgeIdc][0];
-              const int edgeNumUni = g_ccSaoEdgeNum[edgeIdc][1];
-              for (int edgeThr = 0; edgeThr < MAX_CCSAO_EDGE_THR; edgeThr++)
-              {
-#if JVET_AJ0237_INTERNAL_12BIT
-                const int edgeThrVal = g_ccSaoEdgeThr[edgeIdc][edgeThr] << bdShift;
-#else
-                const int edgeThrVal = g_ccSaoEdgeThr[edgeIdc][edgeThr];
-#endif
-                const int edgeIdxA = getCcSaoEdgeIdx(*colE, *colA, edgeThrVal, edgeIdc);
-                const int edgeIdxB = getCcSaoEdgeIdx(*colE, *colB, edgeThrVal, edgeIdc);
-                const int edgeIdx  = edgeIdxA * edgeNumUni + edgeIdxB;
-                for (int bandIdc = 0; bandIdc < MAX_CCSAO_BAND_IDC; bandIdc++)
-                {
-                  const int bandCmp = g_ccSaoBandTab[bandIdc][0];
-                  const int bandNum = g_ccSaoBandTab[bandIdc][1];
-                  if (bandNum * edgeNum > MAX_CCSAO_CLASS_NUM)
-                  {
-                    continue;
-                  }
-
-                  const int bandIdx  = (*col[bandCmp] * bandNum) >> bitDepth;
-                  const int classIdx = bandIdx * edgeNum + edgeIdx;
-
-                  int idx = getCcSaoEdgeStatIdx(ctuRsAddr, bandIdc
-                                              , edgeCmp, edgeIdc
-                                              , edgeDir, edgeThr
-                                               );
-
-                  blkStatsEdge[idx].diff [classIdx] += org[x] - dst[x];
-                  blkStatsEdge[idx].count[classIdx]++;
-                }
-              }
-            }
+            const Pel ccVal[MAX_NUM_COMPONENT] = { *col[COMPONENT_Y], *col[COMPONENT_Cb], *col[COMPONENT_Cr] };
+            g_ccSaoEdgeAcc.add( *colE, *colA, *colB, ccVal, org[x] - dst[x] );
           }
           srcY += srcStrideY;
           srcU += srcStrideU * chromaScaleYM1;
@@ -4259,42 +4338,8 @@ void EncSampleAdaptiveOffset::getCcSaoBlkStatsEdgeNew(const ComponentID compID, 
               const Pel *colA = colE + srcStrideE * edgePosYA + edgePosXA;
               const Pel *colB = colE + srcStrideE * edgePosYB + edgePosXB;
 
-              for (int edgeIdc = 0; edgeIdc < edgeIdcNum; edgeIdc++)
-              {
-                const int edgeNum    = g_ccSaoEdgeNum[edgeIdc][0];
-                const int edgeNumUni = g_ccSaoEdgeNum[edgeIdc][1];
-                for (int edgeThr = 0; edgeThr < MAX_CCSAO_EDGE_THR; edgeThr++)
-                {
-#if JVET_AJ0237_INTERNAL_12BIT
-                  const int edgeThrVal = g_ccSaoEdgeThr[edgeIdc][edgeThr] << bdShift;
-#else
-                  const int edgeThrVal = g_ccSaoEdgeThr[edgeIdc][edgeThr];
-#endif
-                  const int edgeIdxA = getCcSaoEdgeIdx(*colE, *colA, edgeThrVal, edgeIdc);
-                  const int edgeIdxB = getCcSaoEdgeIdx(*colE, *colB, edgeThrVal, edgeIdc);
-                  const int edgeIdx  = edgeIdxA * edgeNumUni + edgeIdxB;
-                  for (int bandIdc = 0; bandIdc < MAX_CCSAO_BAND_IDC; bandIdc++)
-                  {
-                    const int bandCmp = g_ccSaoBandTab[bandIdc][0];
-                    const int bandNum = g_ccSaoBandTab[bandIdc][1];
-                    if (bandNum * edgeNum > MAX_CCSAO_CLASS_NUM)
-                    {
-                      continue;
-                    }
-
-                    const int bandIdx  = (*col[bandCmp] * bandNum) >> bitDepth;
-                    const int classIdx = bandIdx * edgeNum + edgeIdx;
-
-                    int idx = getCcSaoEdgeStatIdx(ctuRsAddr, bandIdc
-                                                , edgeCmp, edgeIdc
-                                                , edgeDir, edgeThr
-                                                 );
-
-                    blkStatsEdge[idx].diff [classIdx] += org[x] - dst[x];
-                    blkStatsEdge[idx].count[classIdx]++;
-                  }
-                }
-              }
+              const Pel ccVal[MAX_NUM_COMPONENT] = { *col[COMPONENT_Y], *col[COMPONENT_Cb], *col[COMPONENT_Cr] };
+              g_ccSaoEdgeAcc.add( *colE, *colA, *colB, ccVal, org[x] - dst[x] );
             }
             srcY += srcStrideY;
             srcU += srcStrideU * ((y & 0x1) | chromaScaleYM1);
@@ -4327,42 +4372,8 @@ void EncSampleAdaptiveOffset::getCcSaoBlkStatsEdgeNew(const ComponentID compID, 
             const Pel *colA = colE + srcStrideE * edgePosYA + edgePosXA;
             const Pel *colB = colE + srcStrideE * edgePosYB + edgePosXB;
 
-            for (int edgeIdc = 0; edgeIdc < edgeIdcNum; edgeIdc++)
-            {
-              const int edgeNum    = g_ccSaoEdgeNum[edgeIdc][0];
-              const int edgeNumUni = g_ccSaoEdgeNum[edgeIdc][1];
-              for (int edgeThr = 0; edgeThr < MAX_CCSAO_EDGE_THR; edgeThr++)
-              {
-#if JVET_AJ0237_INTERNAL_12BIT
-                const int edgeThrVal = g_ccSaoEdgeThr[edgeIdc][edgeThr] << bdShift;
-#else
-                const int edgeThrVal = g_ccSaoEdgeThr[edgeIdc][edgeThr];
-#endif
-                const int edgeIdxA = getCcSaoEdgeIdx(*colE, *colA, edgeThrVal, edgeIdc);
-                const int edgeIdxB = getCcSaoEdgeIdx(*colE, *colB, edgeThrVal, edgeIdc);
-                const int edgeIdx  = edgeIdxA * edgeNumUni + edgeIdxB;
-                for (int bandIdc = 0; bandIdc < MAX_CCSAO_BAND_IDC; bandIdc++)
-                {
-                  const int bandCmp = g_ccSaoBandTab[bandIdc][0];
-                  const int bandNum = g_ccSaoBandTab[bandIdc][1];
-                  if (bandNum * edgeNum > MAX_CCSAO_CLASS_NUM)
-                  {
-                    continue;
-                  }
-
-                  const int bandIdx  = (*col[bandCmp] * bandNum) >> bitDepth;
-                  const int classIdx = bandIdx * edgeNum + edgeIdx;
-
-                  int idx = getCcSaoEdgeStatIdx(ctuRsAddr, bandIdc
-                                              , edgeCmp, edgeIdc
-                                              , edgeDir, edgeThr
-                                               );
-
-                  blkStatsEdge[idx].diff [classIdx] += org[x] - dst[x];
-                  blkStatsEdge[idx].count[classIdx]++;
-                }
-              }
-            }
+            const Pel ccVal[MAX_NUM_COMPONENT] = { *col[COMPONENT_Y], *col[COMPONENT_Cb], *col[COMPONENT_Cr] };
+            g_ccSaoEdgeAcc.add( *colE, *colA, *colB, ccVal, org[x] - dst[x] );
           }
           srcY += srcStrideY;
           srcU += srcStrideU * chromaScaleYM1;
@@ -4388,42 +4399,8 @@ void EncSampleAdaptiveOffset::getCcSaoBlkStatsEdgeNew(const ComponentID compID, 
               const Pel *colA = colE + srcStrideE * edgePosYA + edgePosXA;
               const Pel *colB = colE + srcStrideE * edgePosYB + edgePosXB;
 
-              for (int edgeIdc = 0; edgeIdc < edgeIdcNum; edgeIdc++)
-              {
-                const int edgeNum    = g_ccSaoEdgeNum[edgeIdc][0];
-                const int edgeNumUni = g_ccSaoEdgeNum[edgeIdc][1];
-                for (int edgeThr = 0; edgeThr < MAX_CCSAO_EDGE_THR; edgeThr++)
-                {
-#if JVET_AJ0237_INTERNAL_12BIT
-                  const int edgeThrVal = g_ccSaoEdgeThr[edgeIdc][edgeThr] << bdShift;
-#else
-                  const int edgeThrVal = g_ccSaoEdgeThr[edgeIdc][edgeThr];
-#endif
-                  const int edgeIdxA = getCcSaoEdgeIdx(*colE, *colA, edgeThrVal, edgeIdc);
-                  const int edgeIdxB = getCcSaoEdgeIdx(*colE, *colB, edgeThrVal, edgeIdc);
-                  const int edgeIdx  = edgeIdxA * edgeNumUni + edgeIdxB;
-                  for (int bandIdc = 0; bandIdc < MAX_CCSAO_BAND_IDC; bandIdc++)
-                  {
-                    const int bandCmp = g_ccSaoBandTab[bandIdc][0];
-                    const int bandNum = g_ccSaoBandTab[bandIdc][1];
-                    if (bandNum * edgeNum > MAX_CCSAO_CLASS_NUM)
-                    {
-                      continue;
-                    }
-
-                    const int bandIdx  = (*col[bandCmp] * bandNum) >> bitDepth;
-                    const int classIdx = bandIdx * edgeNum + edgeIdx;
-
-                    int idx = getCcSaoEdgeStatIdx(ctuRsAddr, bandIdc
-                                                , edgeCmp, edgeIdc
-                                                , edgeDir, edgeThr
-                                                 );
-
-                    blkStatsEdge[idx].diff [classIdx] += org[x] - dst[x];
-                    blkStatsEdge[idx].count[classIdx]++;
-                  }
-                }
-              }
+              const Pel ccVal[MAX_NUM_COMPONENT] = { *col[COMPONENT_Y], *col[COMPONENT_Cb], *col[COMPONENT_Cr] };
+              g_ccSaoEdgeAcc.add( *colE, *colA, *colB, ccVal, org[x] - dst[x] );
             }
             srcY += srcStrideY;
             srcU += srcStrideU * ((y & 0x1) | chromaScaleYM1);
@@ -4434,6 +4411,7 @@ void EncSampleAdaptiveOffset::getCcSaoBlkStatsEdgeNew(const ComponentID compID, 
         }
         break;
         }
+        g_ccSaoEdgeAcc.flush( blkStatsEdge, [&]( int bandIdc, int edgeIdc, int edgeThr ) { return getCcSaoEdgeStatIdx( ctuRsAddr, bandIdc, edgeCmp, edgeIdc, edgeDir, edgeThr ); } );
       }
     }
 #else
@@ -4862,42 +4840,8 @@ void EncSampleAdaptiveOffset::getCcSaoBlkStatsEdgeNew(const ComponentID compID, 
               const Pel *colA = colE + srcStrideE * edgePosYA + edgePosXA;
               const Pel *colB = colE + srcStrideE * edgePosYB + edgePosXB;
 
-              for (int edgeIdc = 0; edgeIdc < edgeIdcNum; edgeIdc++)
-              {
-                const int edgeNum    = g_ccSaoEdgeNum[edgeIdc][0];
-                const int edgeNumUni = g_ccSaoEdgeNum[edgeIdc][1];
-                for (int edgeThr = 0; edgeThr < MAX_CCSAO_EDGE_THR; edgeThr++)
-                {
-#if JVET_AJ0237_INTERNAL_12BIT
-                  const int edgeThrVal = g_ccSaoEdgeThr[edgeIdc][edgeThr] << bdShift;
-#else
-                  const int edgeThrVal = g_ccSaoEdgeThr[edgeIdc][edgeThr];
-#endif
-                  const int edgeIdxA = getCcSaoEdgeIdx(*colE, *colA, edgeThrVal, edgeIdc);
-                  const int edgeIdxB = getCcSaoEdgeIdx(*colE, *colB, edgeThrVal, edgeIdc);
-                  const int edgeIdx  = edgeIdxA * edgeNumUni + edgeIdxB;
-                  for (int bandIdc = 0; bandIdc < MAX_CCSAO_BAND_IDC; bandIdc++)
-                  {
-                    const int bandCmp = g_ccSaoBandTab[bandIdc][0];
-                    const int bandNum = g_ccSaoBandTab[bandIdc][1];
-                    if (bandNum * edgeNum > MAX_CCSAO_CLASS_NUM)
-                    {
-                      continue;
-                    }
-
-                    const int bandIdx  = (*col[bandCmp] * bandNum) >> bitDepth;
-                    const int classIdx = bandIdx * edgeNum + edgeIdx;
-
-                    int idx = getCcSaoEdgeStatIdx(ctuRsAddr, bandIdc
-                                                , edgeCmp, edgeIdc
-                                                , edgeDir, edgeThr
-                                                );
-
-                    blkStatsEdge[idx].diff [classIdx] += org[x] - dst[x];
-                    blkStatsEdge[idx].count[classIdx]++;
-                  }
-                }
-              }
+              const Pel ccVal[MAX_NUM_COMPONENT] = { *col[COMPONENT_Y], *col[COMPONENT_Cb], *col[COMPONENT_Cr] };
+              g_ccSaoEdgeAcc.add( *colE, *colA, *colB, ccVal, org[x] - dst[x] );
             }
             srcY += srcStrideY << chromaScaleY;
             srcU += srcStrideU;
@@ -4936,42 +4880,8 @@ void EncSampleAdaptiveOffset::getCcSaoBlkStatsEdgeNew(const ComponentID compID, 
               const Pel *colA = colE + srcStrideE * edgePosYA + edgePosXA;
               const Pel *colB = colE + srcStrideE * edgePosYB + edgePosXB;
 
-              for (int edgeIdc = 0; edgeIdc < edgeIdcNum; edgeIdc++)
-              {
-                const int edgeNum    = g_ccSaoEdgeNum[edgeIdc][0];
-                const int edgeNumUni = g_ccSaoEdgeNum[edgeIdc][1];
-                for (int edgeThr = 0; edgeThr < MAX_CCSAO_EDGE_THR; edgeThr++)
-                {
-#if JVET_AJ0237_INTERNAL_12BIT
-                  const int edgeThrVal = g_ccSaoEdgeThr[edgeIdc][edgeThr] << bdShift;
-#else
-                  const int edgeThrVal = g_ccSaoEdgeThr[edgeIdc][edgeThr];
-#endif
-                  const int edgeIdxA = getCcSaoEdgeIdx(*colE, *colA, edgeThrVal, edgeIdc);
-                  const int edgeIdxB = getCcSaoEdgeIdx(*colE, *colB, edgeThrVal, edgeIdc);
-                  const int edgeIdx  = edgeIdxA * edgeNumUni + edgeIdxB;
-                  for (int bandIdc = 0; bandIdc < MAX_CCSAO_BAND_IDC; bandIdc++)
-                  {
-                    const int bandCmp = g_ccSaoBandTab[bandIdc][0];
-                    const int bandNum = g_ccSaoBandTab[bandIdc][1];
-                    if (bandNum * edgeNum > MAX_CCSAO_CLASS_NUM)
-                    {
-                      continue;
-                    }
-
-                    const int bandIdx  = (*col[bandCmp] * bandNum) >> bitDepth;
-                    const int classIdx = bandIdx * edgeNum + edgeIdx;
-
-                    int idx = getCcSaoEdgeStatIdx(ctuRsAddr, bandIdc
-                                                , edgeCmp, edgeIdc
-                                                , edgeDir, edgeThr
-                                                );
-
-                    blkStatsEdge[idx].diff [classIdx] += org[x] - dst[x];
-                    blkStatsEdge[idx].count[classIdx]++;
-                  }
-                }
-              }
+              const Pel ccVal[MAX_NUM_COMPONENT] = { *col[COMPONENT_Y], *col[COMPONENT_Cb], *col[COMPONENT_Cr] };
+              g_ccSaoEdgeAcc.add( *colE, *colA, *colB, ccVal, org[x] - dst[x] );
             }
             srcY += srcStrideY << chromaScaleY;
             srcU += srcStrideU;
@@ -5004,42 +4914,8 @@ void EncSampleAdaptiveOffset::getCcSaoBlkStatsEdgeNew(const ComponentID compID, 
             const Pel *colA = colE + srcStrideE * edgePosYA + edgePosXA;
             const Pel *colB = colE + srcStrideE * edgePosYB + edgePosXB;
 
-            for (int edgeIdc = 0; edgeIdc < edgeIdcNum; edgeIdc++)
-            {
-              const int edgeNum    = g_ccSaoEdgeNum[edgeIdc][0];
-              const int edgeNumUni = g_ccSaoEdgeNum[edgeIdc][1];
-              for (int edgeThr = 0; edgeThr < MAX_CCSAO_EDGE_THR; edgeThr++)
-              {
-#if JVET_AJ0237_INTERNAL_12BIT
-                const int edgeThrVal = g_ccSaoEdgeThr[edgeIdc][edgeThr] << bdShift;
-#else
-                const int edgeThrVal = g_ccSaoEdgeThr[edgeIdc][edgeThr];
-#endif
-                const int edgeIdxA = getCcSaoEdgeIdx(*colE, *colA, edgeThrVal, edgeIdc);
-                const int edgeIdxB = getCcSaoEdgeIdx(*colE, *colB, edgeThrVal, edgeIdc);
-                const int edgeIdx  = edgeIdxA * edgeNumUni + edgeIdxB;
-                for (int bandIdc = 0; bandIdc < MAX_CCSAO_BAND_IDC; bandIdc++)
-                {
-                  const int bandCmp = g_ccSaoBandTab[bandIdc][0];
-                  const int bandNum = g_ccSaoBandTab[bandIdc][1];
-                  if (bandNum * edgeNum > MAX_CCSAO_CLASS_NUM)
-                  {
-                    continue;
-                  }
-
-                  const int bandIdx  = (*col[bandCmp] * bandNum) >> bitDepth;
-                  const int classIdx = bandIdx * edgeNum + edgeIdx;
-
-                  int idx = getCcSaoEdgeStatIdx(ctuRsAddr, bandIdc
-                                              , edgeCmp, edgeIdc
-                                              , edgeDir, edgeThr
-                                              );
-
-                  blkStatsEdge[idx].diff [classIdx] += org[x] - dst[x];
-                  blkStatsEdge[idx].count[classIdx]++;
-                }
-              }
-            }
+            const Pel ccVal[MAX_NUM_COMPONENT] = { *col[COMPONENT_Y], *col[COMPONENT_Cb], *col[COMPONENT_Cr] };
+            g_ccSaoEdgeAcc.add( *colE, *colA, *colB, ccVal, org[x] - dst[x] );
           }
           srcY += srcStrideY << chromaScaleY;
           srcU += srcStrideU;
@@ -5065,42 +4941,8 @@ void EncSampleAdaptiveOffset::getCcSaoBlkStatsEdgeNew(const ComponentID compID, 
               const Pel *colA = colE + srcStrideE * edgePosYA + edgePosXA;
               const Pel *colB = colE + srcStrideE * edgePosYB + edgePosXB;
 
-              for (int edgeIdc = 0; edgeIdc < edgeIdcNum; edgeIdc++)
-              {
-                const int edgeNum    = g_ccSaoEdgeNum[edgeIdc][0];
-                const int edgeNumUni = g_ccSaoEdgeNum[edgeIdc][1];
-                for (int edgeThr = 0; edgeThr < MAX_CCSAO_EDGE_THR; edgeThr++)
-                {
-#if JVET_AJ0237_INTERNAL_12BIT
-                  const int edgeThrVal = g_ccSaoEdgeThr[edgeIdc][edgeThr] << bdShift;
-#else
-                  const int edgeThrVal = g_ccSaoEdgeThr[edgeIdc][edgeThr];
-#endif
-                  const int edgeIdxA = getCcSaoEdgeIdx(*colE, *colA, edgeThrVal, edgeIdc);
-                  const int edgeIdxB = getCcSaoEdgeIdx(*colE, *colB, edgeThrVal, edgeIdc);
-                  const int edgeIdx  = edgeIdxA * edgeNumUni + edgeIdxB;
-                  for (int bandIdc = 0; bandIdc < MAX_CCSAO_BAND_IDC; bandIdc++)
-                  {
-                    const int bandCmp = g_ccSaoBandTab[bandIdc][0];
-                    const int bandNum = g_ccSaoBandTab[bandIdc][1];
-                    if (bandNum * edgeNum > MAX_CCSAO_CLASS_NUM)
-                    {
-                      continue;
-                    }
-
-                    const int bandIdx  = (*col[bandCmp] * bandNum) >> bitDepth;
-                    const int classIdx = bandIdx * edgeNum + edgeIdx;
-
-                    int idx = getCcSaoEdgeStatIdx(ctuRsAddr, bandIdc
-                                                , edgeCmp, edgeIdc
-                                                , edgeDir, edgeThr
-                                                );
-
-                    blkStatsEdge[idx].diff [classIdx] += org[x] - dst[x];
-                    blkStatsEdge[idx].count[classIdx]++;
-                  }
-                }
-              }
+              const Pel ccVal[MAX_NUM_COMPONENT] = { *col[COMPONENT_Y], *col[COMPONENT_Cb], *col[COMPONENT_Cr] };
+              g_ccSaoEdgeAcc.add( *colE, *colA, *colB, ccVal, org[x] - dst[x] );
             }
             srcY += srcStrideY << chromaScaleY;
             srcU += srcStrideU;
@@ -5133,42 +4975,8 @@ void EncSampleAdaptiveOffset::getCcSaoBlkStatsEdgeNew(const ComponentID compID, 
             const Pel *colA = colE + srcStrideE * edgePosYA + edgePosXA;
             const Pel *colB = colE + srcStrideE * edgePosYB + edgePosXB;
 
-            for (int edgeIdc = 0; edgeIdc < edgeIdcNum; edgeIdc++)
-            {
-              const int edgeNum    = g_ccSaoEdgeNum[edgeIdc][0];
-              const int edgeNumUni = g_ccSaoEdgeNum[edgeIdc][1];
-              for (int edgeThr = 0; edgeThr < MAX_CCSAO_EDGE_THR; edgeThr++)
-              {
-#if JVET_AJ0237_INTERNAL_12BIT
-                const int edgeThrVal = g_ccSaoEdgeThr[edgeIdc][edgeThr] << bdShift;
-#else
-                const int edgeThrVal = g_ccSaoEdgeThr[edgeIdc][edgeThr];
-#endif
-                const int edgeIdxA = getCcSaoEdgeIdx(*colE, *colA, edgeThrVal, edgeIdc);
-                const int edgeIdxB = getCcSaoEdgeIdx(*colE, *colB, edgeThrVal, edgeIdc);
-                const int edgeIdx  = edgeIdxA * edgeNumUni + edgeIdxB;
-                for (int bandIdc = 0; bandIdc < MAX_CCSAO_BAND_IDC; bandIdc++)
-                {
-                  const int bandCmp = g_ccSaoBandTab[bandIdc][0];
-                  const int bandNum = g_ccSaoBandTab[bandIdc][1];
-                  if (bandNum * edgeNum > MAX_CCSAO_CLASS_NUM)
-                  {
-                    continue;
-                  }
-
-                  const int bandIdx  = (*col[bandCmp] * bandNum) >> bitDepth;
-                  const int classIdx = bandIdx * edgeNum + edgeIdx;
-
-                  int idx = getCcSaoEdgeStatIdx(ctuRsAddr, bandIdc
-                                              , edgeCmp, edgeIdc
-                                              , edgeDir, edgeThr
-                                              );
-
-                  blkStatsEdge[idx].diff [classIdx] += org[x] - dst[x];
-                  blkStatsEdge[idx].count[classIdx]++;
-                }
-              }
-            }
+            const Pel ccVal[MAX_NUM_COMPONENT] = { *col[COMPONENT_Y], *col[COMPONENT_Cb], *col[COMPONENT_Cr] };
+            g_ccSaoEdgeAcc.add( *colE, *colA, *colB, ccVal, org[x] - dst[x] );
           }
           srcY += srcStrideY << chromaScaleY;
           srcU += srcStrideU;
@@ -5194,43 +5002,8 @@ void EncSampleAdaptiveOffset::getCcSaoBlkStatsEdgeNew(const ComponentID compID, 
               const Pel *colA = colE + srcStrideE * edgePosYA + edgePosXA;
               const Pel *colB = colE + srcStrideE * edgePosYB + edgePosXB;
 
-              for (int edgeIdc = 0; edgeIdc < edgeIdcNum; edgeIdc++)
-              {
-                const int edgeNum    = g_ccSaoEdgeNum[edgeIdc][0];
-                const int edgeNumUni = g_ccSaoEdgeNum[edgeIdc][1];
-                for (int edgeThr = 0; edgeThr < MAX_CCSAO_EDGE_THR; edgeThr++)
-                {
-#if JVET_AJ0237_INTERNAL_12BIT
-                  const int edgeThrVal = g_ccSaoEdgeThr[edgeIdc][edgeThr] << bdShift;
-#else
-                  const int edgeThrVal = g_ccSaoEdgeThr[edgeIdc][edgeThr];
-#endif
-                  const int edgeIdxA = getCcSaoEdgeIdx(*colE, *colA, edgeThrVal, edgeIdc);
-                  const int edgeIdxB = getCcSaoEdgeIdx(*colE, *colB, edgeThrVal, edgeIdc);
-                  const int edgeIdx  = edgeIdxA * edgeNumUni + edgeIdxB;
-
-                  for (int bandIdc = 0; bandIdc < MAX_CCSAO_BAND_IDC; bandIdc++)
-                  {
-                    const int bandCmp = g_ccSaoBandTab[bandIdc][0];
-                    const int bandNum = g_ccSaoBandTab[bandIdc][1];
-                    if (bandNum * edgeNum > MAX_CCSAO_CLASS_NUM)
-                    {
-                      continue;
-                    }
-
-                    const int bandIdx  = (*col[bandCmp] * bandNum) >> bitDepth;
-                    const int classIdx = bandIdx * edgeNum + edgeIdx;
-
-                    int idx = getCcSaoEdgeStatIdx(ctuRsAddr, bandIdc
-                                                , edgeCmp, edgeIdc
-                                                , edgeDir, edgeThr
-                                                );
-
-                    blkStatsEdge[idx].diff [classIdx] += org[x] - dst[x];
-                    blkStatsEdge[idx].count[classIdx]++;
-                  }
-                }
-              }
+              const Pel ccVal[MAX_NUM_COMPONENT] = { *col[COMPONENT_Y], *col[COMPONENT_Cb], *col[COMPONENT_Cr] };
+              g_ccSaoEdgeAcc.add( *colE, *colA, *colB, ccVal, org[x] - dst[x] );
             }
             srcY += srcStrideY << chromaScaleY;
             srcU += srcStrideU;
@@ -5241,6 +5014,7 @@ void EncSampleAdaptiveOffset::getCcSaoBlkStatsEdgeNew(const ComponentID compID, 
         }
         break;
         }
+        g_ccSaoEdgeAcc.flush( blkStatsEdge, [&]( int bandIdc, int edgeIdc, int edgeThr ) { return getCcSaoEdgeStatIdx( ctuRsAddr, bandIdc, edgeCmp, edgeIdc, edgeDir, edgeThr ); } );
       }
     }
 #else
