@@ -1652,7 +1652,7 @@ bool InterPrediction::xGetSubPuGroupAreaStartPos(PredictionUnit& pu, Position& s
   }
   return false;
 }
-bool InterPrediction::xCheckIdenticalMotionInfo(MotionInfo orgMotionInfo, MotionInfo targetMotionInfo, MergeType puMergeType)
+bool InterPrediction::xCheckIdenticalMotionInfo(const MotionInfo& orgMotionInfo, const MotionInfo& targetMotionInfo, MergeType puMergeType)
 {
   if (puMergeType == MRG_TYPE_SUBPU_ATMVP)
   {
@@ -8560,7 +8560,7 @@ bool InterPrediction::xPredAffineTpl(const PredictionUnit& pu, const RefPicList&
 void InterPrediction::xPredAffineTpl(const PredictionUnit &pu, const RefPicList &eRefPicList, int* numTemplate, Pel* refLeftTemplate, Pel* refAboveTemplate
 #endif
 #if JVET_AC0185_ENHANCED_TEMPORAL_MOTION_DERIVATION
-  , AffineMergeCtx affMrgCtx, bool isBilinear
+  , const AffineMergeCtx& affMrgCtx, bool isBilinear
 #endif
 #if JVET_AF0190_RPR_TMP_REORDER_LIC
   , bool           enableRpr
@@ -19723,7 +19723,7 @@ void InterPrediction::updateCandInMultiCandidateGroups(uint32_t* rdCandList, uin
   }
 }
 #else
-void InterPrediction::updateCandInThreeCandidateGroups(MergeCtx& mrgCtx, MergeCtx mrgCtx2, MergeCtx mrgCtx3, uint32_t* rdCandList, uint32_t* rdCandGrpList, int numCandInCategory)
+void InterPrediction::updateCandInThreeCandidateGroups(MergeCtx& mrgCtx, const MergeCtx& mrgCtx2, const MergeCtx& mrgCtx3, uint32_t* rdCandList, uint32_t* rdCandGrpList, int numCandInCategory)
 {
   MergeCtx mrgCtxTmp;
   for (uint32_t uiMergeCand = 0; uiMergeCand < mrgCtx.numValidMergeCand; uiMergeCand++)
@@ -19813,7 +19813,7 @@ void InterPrediction::updateCandInThreeCandidateGroups(MergeCtx& mrgCtx, MergeCt
 #endif
 
 #if JVET_AA0093_DIVERSITY_CRITERION_FOR_ARMC
-void  InterPrediction::updateCandInTwoCandidateGroups(MergeCtx& mrgCtx, uint32_t* rdCandList, int numCandInCategory, MergeCtx mrgCtx2)
+void  InterPrediction::updateCandInTwoCandidateGroups(MergeCtx& mrgCtx, uint32_t* rdCandList, int numCandInCategory, const MergeCtx& mrgCtx2)
 {
   MergeCtx mrgCtxTmp;
   for (uint32_t uiMergeCand = 0; uiMergeCand < mrgCtx.numValidMergeCand; uiMergeCand++)
@@ -22722,7 +22722,7 @@ void InterPrediction::xGetSublkAMLTemplate(const CodingUnit& cu,
 #if JVET_AD0140_MVD_PREDICTION
 bool InterPrediction::fillAffAMLRefTemplateCache( PredictionUnit& pu, int refList, const int candIdx, const Size& topSize, const Size& leftSize
 #if JVET_AC0185_ENHANCED_TEMPORAL_MOTION_DERIVATION
-                                                , bool isBilinear, AffineMergeCtx affMrgCtx
+                                                , bool isBilinear, const AffineMergeCtx& affMrgCtx
 #endif
                                                 )
 {
@@ -22818,7 +22818,7 @@ bool InterPrediction::fillAffAMLRefTemplateCache( PredictionUnit& pu, int refLis
 template <int iAbove1Left2All3>
 bool InterPrediction::getAffAMLRefTemplateMvdPredUni( PredictionUnit& pu, PelUnitBuf& pcBufPredRefTop, PelUnitBuf& pcBufPredRefLeft,
 #if JVET_AC0185_ENHANCED_TEMPORAL_MOTION_DERIVATION
-                                                      bool isBilinear, AffineMergeCtx affMrgCtx
+                                                      bool isBilinear, const AffineMergeCtx& affMrgCtx
 #endif
                                                     )
 {
@@ -22880,13 +22880,13 @@ bool InterPrediction::getAffAMLRefTemplate(PredictionUnit& pu, PelUnitBuf& pcBuf
 void InterPrediction::getAffAMLRefTemplate(PredictionUnit& pu, PelUnitBuf& pcBufPredRefTop, PelUnitBuf& pcBufPredRefLeft,
 #endif
 #if JVET_AC0185_ENHANCED_TEMPORAL_MOTION_DERIVATION
-  bool isBilinear, AffineMergeCtx affMrgCtx,
+  bool isBilinear, const AffineMergeCtx& affMrgCtx,
 #endif
   int8_t posList0, int8_t posList1, bool load0, bool load1)
 #else
 void InterPrediction::getAffAMLRefTemplate(PredictionUnit &pu, PelUnitBuf &pcBufPredRefTop, PelUnitBuf &pcBufPredRefLeft
 #if JVET_AC0185_ENHANCED_TEMPORAL_MOTION_DERIVATION
-  AffineMergeCtx affMrgCtx,
+  const AffineMergeCtx& affMrgCtx,
 #endif
 )
 #endif
@@ -23452,7 +23452,7 @@ template bool InterPrediction::getAffAMLRefTemplate<false>( PredictionUnit& pu, 
 void InterPrediction::getAffAMLRefTemplate( PredictionUnit& pu, PelUnitBuf& pcBufPredRefTop, PelUnitBuf& pcBufPredRefLeft,
 #endif
 #if JVET_AC0185_ENHANCED_TEMPORAL_MOTION_DERIVATION
-  bool isBilinear, AffineMergeCtx affMrgCtx,
+  bool isBilinear, const AffineMergeCtx& affMrgCtx,
 #endif
   int8_t posList0, int8_t posList1, bool load0, bool load1 );
 #endif
@@ -23460,7 +23460,7 @@ void InterPrediction::getAffAMLRefTemplate( PredictionUnit& pu, PelUnitBuf& pcBu
 #if JVET_AG0164_AFFINE_GPM
 bool InterPrediction::getAffAMLRefTemplateImp(PredictionUnit &pu, PelUnitBuf &pcBufPredRefTop, PelUnitBuf &pcBufPredRefLeft
 #if JVET_AC0185_ENHANCED_TEMPORAL_MOTION_DERIVATION
-                            ,bool isBilinear, AffineMergeCtx affMrgCtx
+                            ,bool isBilinear, const AffineMergeCtx& affMrgCtx
 #endif
   )
 {
@@ -23472,7 +23472,7 @@ bool InterPrediction::getAffAMLRefTemplateImp(PredictionUnit &pu, PelUnitBuf &pc
 }
 #endif
 #if JVET_AH0119_SUBBLOCK_TM
-void InterPrediction::getAffAndSbtmvpRefTemplate(PredictionUnit& pu, PelUnitBuf& pcBufPredRefTop, PelUnitBuf& pcBufPredRefLeft, bool isBilinear, AffineMergeCtx affMrgCtx, int interpolationIdx, bool isStore, Mv mvOffset, int targetList)
+void InterPrediction::getAffAndSbtmvpRefTemplate(PredictionUnit& pu, PelUnitBuf& pcBufPredRefTop, PelUnitBuf& pcBufPredRefLeft, bool isBilinear, const AffineMergeCtx& affMrgCtx, int interpolationIdx, bool isStore, Mv mvOffset, int targetList)
 {
 #if INTER_LIC
   int LICshift[2] = { 0 };
@@ -23951,7 +23951,7 @@ void InterPrediction::getAffAndSbtmvpRefTemplate(PredictionUnit& pu, PelUnitBuf&
 #if JVET_AD0213_LIC_IMP
 void InterPrediction::getAffAMLRefTemplateAlt(PredictionUnit &pu, PelUnitBuf &pcBufPredRefTop, PelUnitBuf &pcBufPredRefLeft,
 #if JVET_AC0185_ENHANCED_TEMPORAL_MOTION_DERIVATION
-  bool isBilinear, AffineMergeCtx affMrgCtx,
+  bool isBilinear, const AffineMergeCtx& affMrgCtx,
 #endif        
   int8_t posList0, int8_t posList1, bool load0, bool load1)
 {
@@ -24891,7 +24891,7 @@ Distortion InterPrediction::getTempCost(const PredictionUnit &pu, const PelBuf &
 #if JVET_Z0061_TM_OBMC
 void InterPrediction::xOBMCWeightedAverageY(const PredictionUnit &pu, const CPelUnitBuf &pcYuvSrc0,
                                             const CPelUnitBuf &pcYuvSrc1, PelUnitBuf &pcYuvDst,
-                                            const BitDepths &clipBitDepths, const ClpRngs &clpRngs, MotionInfo currMi)
+                                            const BitDepths &clipBitDepths, const ClpRngs &clpRngs, const MotionInfo& currMi)
 {
   const int iRefIdx0 = currMi.refIdx[0];
   const int iRefIdx1 = currMi.refIdx[1];
@@ -25174,7 +25174,7 @@ int InterPrediction::selectOBMCmode(PredictionUnit &pu, PredictionUnit &subblock
     return 0;
   }
 }
-bool InterPrediction::xCheckIdenticalMotionOBMC(PredictionUnit &pu, MotionInfo tryMi)
+bool InterPrediction::xCheckIdenticalMotionOBMC(PredictionUnit &pu, const MotionInfo& tryMi)
 {
   const Slice &slice = *pu.cs->slice;
 
@@ -25210,7 +25210,7 @@ bool InterPrediction::xCheckIdenticalMotionOBMC(PredictionUnit &pu, MotionInfo t
   return false;
 }
 void InterPrediction::getBlkOBMCRefTemplate(PredictionUnit &subblockPu, PelUnitBuf &pcBufPredRef, bool isAbove,
-                                            MotionInfo tryMi)
+                                            const MotionInfo& tryMi)
 {
   Mv        mvCurr;
   const int lumaShift = 2 + MV_FRACTIONAL_BITS_DIFF;

@@ -620,7 +620,7 @@ protected:
   void xPredAffineTpl           (const PredictionUnit &pu, const RefPicList &eRefPicList, int* numTemplate, Pel* refLeftTemplate, Pel* refAboveTemplate
 #endif
 #if JVET_AC0185_ENHANCED_TEMPORAL_MOTION_DERIVATION
-    , AffineMergeCtx affMrgCtx, bool isBilinear
+    , const AffineMergeCtx& affMrgCtx, bool isBilinear
 #endif
 #if JVET_AF0190_RPR_TMP_REORDER_LIC
     , bool           enableRpr = false
@@ -647,7 +647,7 @@ protected:
 #if JVET_AF0159_AFFINE_SUBPU_BDOF_REFINEMENT
   bool xGetSubPuGroupArea2D        (PredictionUnit& pu, PredictionUnit& subPu, uint8_t* sbtmvpSubPuDerivedPtr, Position& subPuStartPos);
   bool xGetSubPuGroupAreaStartPos  (PredictionUnit& pu, Position& subPuStartPos, uint8_t* sbtmvpSubPuDerivedPtr);
-  bool xCheckIdenticalMotionInfo   (MotionInfo orgMotionInfo, MotionInfo targetMotionInfo, MergeType puMergeType);
+  bool xCheckIdenticalMotionInfo   (const MotionInfo& orgMotionInfo, const MotionInfo& targetMotionInfo, MergeType puMergeType);
 #endif
 #if ENABLE_OBMC
 #if JVET_AJ0161_OBMC_EXT_WITH_INTRA_PRED
@@ -1204,10 +1204,10 @@ public:
 #endif
 #if JVET_Z0061_TM_OBMC
   void xOBMCWeightedAverageY    (const PredictionUnit &pu, const CPelUnitBuf &pcYuvSrc0, const CPelUnitBuf &pcYuvSrc1,
-                                 PelUnitBuf &pcYuvDst, const BitDepths &clipBitDepths, const ClpRngs &clpRngs, MotionInfo currMi);
+                                 PelUnitBuf &pcYuvDst, const BitDepths &clipBitDepths, const ClpRngs &clpRngs, const MotionInfo& currMi);
   int  selectOBMCmode           (PredictionUnit &curPu, PredictionUnit &neigPu, bool isAbove, int nLength, uint32_t minCUW, Position curOffset);
-  void getBlkOBMCRefTemplate    (PredictionUnit &subblockPu, PelUnitBuf &pcBufPredRef, bool isAbove, MotionInfo currMi);
-  bool xCheckIdenticalMotionOBMC(PredictionUnit &pu, MotionInfo tryMi);
+  void getBlkOBMCRefTemplate    (PredictionUnit &subblockPu, PelUnitBuf &pcBufPredRef, bool isAbove, const MotionInfo& currMi);
+  bool xCheckIdenticalMotionOBMC(PredictionUnit &pu, const MotionInfo& tryMi);
   void xSubblockOBMCCopy        (const ComponentID eComp, PredictionUnit &pu, PelUnitBuf &pcYuvPredDst, PelUnitBuf &pcYuvPredSrc, int iDir);
   void xSubblockTMOBMC          (const ComponentID eComp, PredictionUnit &pu, PelUnitBuf &pcYuvPredDst, PelUnitBuf &pcYuvPredSrc,
 #if JVET_AJ0161_OBMC_EXT_WITH_INTRA_PRED
@@ -1288,7 +1288,7 @@ public:
 #if JVET_AD0140_MVD_PREDICTION
   bool fillAffAMLRefTemplateCache( PredictionUnit& pu, int refList, const int candIdx, const Size& topSize, const Size& leftSize
 #if JVET_AC0185_ENHANCED_TEMPORAL_MOTION_DERIVATION
-                                  , bool isBilinear, AffineMergeCtx affMrgCtx
+                                  , bool isBilinear, const AffineMergeCtx& affMrgCtx
 #endif
                                   );
   bool fillAMLRefTemplateCache   (PredictionUnit& pu, int refList, const int candIdx, const Size& topSize, const Size& leftSize );
@@ -1303,7 +1303,7 @@ public:
   void    getAffAMLRefTemplate(PredictionUnit &pu, PelUnitBuf &pcBufPredRefTop, PelUnitBuf &pcBufPredRefLeft,
 #endif
 #if JVET_AC0185_ENHANCED_TEMPORAL_MOTION_DERIVATION
-    bool isBilinear, AffineMergeCtx affMrgCtx,
+    bool isBilinear, const AffineMergeCtx& affMrgCtx,
 #endif
     int8_t posList0 = -1, int8_t posList1 = -1, bool loadSave0 = false, bool loadSave1 = false);
 #else
@@ -1313,25 +1313,25 @@ public:
 #if JVET_AG0164_AFFINE_GPM
   bool getAffAMLRefTemplateImp          (PredictionUnit &pu, PelUnitBuf &pcBufPredRefTop, PelUnitBuf &pcBufPredRefLeft
 #if JVET_AC0185_ENHANCED_TEMPORAL_MOTION_DERIVATION
-                            ,bool isBilinear, AffineMergeCtx affMrgCtx
+                            ,bool isBilinear, const AffineMergeCtx& affMrgCtx
 #endif
 );
 #endif
-#if JVET_AH0119_SUBBLOCK_TM 
-  void getAffAndSbtmvpRefTemplate       (PredictionUnit& pu, PelUnitBuf& pcBufPredRefTop, PelUnitBuf& pcBufPredRefLeft,bool isBilinear, AffineMergeCtx affMrgCtx, int interpolationIdx = 2, bool isStore = false, Mv mvOffset = Mv(0, 0), int targetList = 0);
+#if JVET_AH0119_SUBBLOCK_TM
+  void getAffAndSbtmvpRefTemplate       (PredictionUnit& pu, PelUnitBuf& pcBufPredRefTop, PelUnitBuf& pcBufPredRefLeft,bool isBilinear, const AffineMergeCtx& affMrgCtx, int interpolationIdx = 2, bool isStore = false, Mv mvOffset = Mv(0, 0), int targetList = 0);
 #endif
 #if JVET_AD0140_MVD_PREDICTION
   template <int iAbove1Left2All3 = 3>
   bool    getAffAMLRefTemplateMvdPredUni(PredictionUnit& pu, PelUnitBuf& pcBufPredRefTop, PelUnitBuf& pcBufPredRefLeft,
 #if JVET_AC0185_ENHANCED_TEMPORAL_MOTION_DERIVATION
-                                         bool isBilinear, AffineMergeCtx affMrgCtx
-#endif                               
+                                         bool isBilinear, const AffineMergeCtx& affMrgCtx
+#endif
                                         );
 #endif
 #if JVET_AD0213_LIC_IMP
   void    getAffAMLRefTemplateAlt       (PredictionUnit &pu, PelUnitBuf &pcBufPredRefTop, PelUnitBuf &pcBufPredRefLeft,
 #if JVET_AC0185_ENHANCED_TEMPORAL_MOTION_DERIVATION
-    bool isBilinear, AffineMergeCtx affMrgCtx,
+    bool isBilinear, const AffineMergeCtx& affMrgCtx,
 #endif
     int8_t posList0 = -1, int8_t posList1 = -1, bool loadSave0 = false, bool loadSave1 = false);
 #endif
@@ -1383,7 +1383,7 @@ public:
 #endif
   void    updateCandInOneCandidateGroup(MergeCtx& mrgCtx, uint32_t* RdCandList, int numCandInCategory = -1);
 #if JVET_AA0093_DIVERSITY_CRITERION_FOR_ARMC
-  void    updateCandInTwoCandidateGroups(MergeCtx& mrgCtx, uint32_t* rdCandList, int numCandInCategory, MergeCtx mrgCtx2);
+  void    updateCandInTwoCandidateGroups(MergeCtx& mrgCtx, uint32_t* rdCandList, int numCandInCategory, const MergeCtx& mrgCtx2);
 #endif
 #endif
 #if JVET_AG0276_NLIC || JVET_AH0314_LIC_INHERITANCE_FOR_MRG
@@ -1391,7 +1391,7 @@ public:
 #if JVET_AH0314_LIC_INHERITANCE_FOR_MRG
   void    updateCandInMultiCandidateGroups(uint32_t* rdCandList, uint32_t* rdCandGrpList, int numCandInCategory, MergeCtx& mrgCtx, const MergeCtx** mrgCtx2toN = nullptr, int N = 1);
 #else
-  void    updateCandInThreeCandidateGroups(MergeCtx& mrgCtx, MergeCtx mrgCtx2, MergeCtx mrgCtx3, uint32_t* rdCandList, uint32_t* rdCandGrpList, int numCandInCategory);
+  void    updateCandInThreeCandidateGroups(MergeCtx& mrgCtx, const MergeCtx& mrgCtx2, const MergeCtx& mrgCtx3, uint32_t* rdCandList, uint32_t* rdCandGrpList, int numCandInCategory);
 #endif
 #endif
 #if JVET_AA0093_REFINED_MOTION_FOR_ARMC

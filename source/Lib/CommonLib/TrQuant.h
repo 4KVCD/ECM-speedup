@@ -79,7 +79,7 @@ public:
 #endif
                     const bool bEnc
   );
-  void getTrTypes(const TransformUnit tu, const ComponentID compID, int &trTypeHor, int &trTypeVer);
+  void getTrTypes(const TransformUnit& tu, const ComponentID compID, int &trTypeHor, int &trTypeVer);
 
 #if AHG7_LN_TOOLOFF_CFG
 #if JVET_R0351_HIGH_BIT_DEPTH_SUPPORT

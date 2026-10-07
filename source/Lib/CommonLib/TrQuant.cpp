@@ -1118,7 +1118,7 @@ std::vector<int> TrQuant::selectICTCandidates( const TransformUnit &tu, CompStor
 // Logical transform
 // ------------------------------------------------------------------------------------------------
 
-void TrQuant::getTrTypes(const TransformUnit tu, const ComponentID compID, int &trTypeHor, int &trTypeVer)
+void TrQuant::getTrTypes(const TransformUnit& tu, const ComponentID compID, int &trTypeHor, int &trTypeVer)
 {
   const bool isExplicitMTS = (CU::isIntra(*tu.cu) ? tu.cs->sps->getUseIntraMTS() : tu.cs->sps->getUseInterMTS() && CU::isInter(*tu.cu)) && isLuma(compID);
 #if JVET_AJ0257_IMPLICIT_MTS_LUT

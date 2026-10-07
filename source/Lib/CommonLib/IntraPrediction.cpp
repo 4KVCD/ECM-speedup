@@ -10779,7 +10779,7 @@ Pel IntraPrediction::xGetPredTimdValDc( const CPelBuf &pSrc, const Size &dstSize
 }
 
 #if (JVET_AG0146_DIMD_ITMP_IBC || JVET_AG0152_SGPM_ITMP_IBC || JVET_AG0151_INTRA_TMP_MERGE_MODE)
-void IntraPrediction::predUsingBv(Pel* piPred, unsigned int uiStride, Mv Bv, CodingUnit cu
+void IntraPrediction::predUsingBv(Pel* piPred, unsigned int uiStride, Mv Bv, const CodingUnit& cu
 #if JVET_AH0200_INTRA_TMP_BV_REORDER
   , bool isIntBv
 #endif
@@ -18833,7 +18833,7 @@ void IntraPrediction::ibcCiipBlending(Pel *pDst, int strideDst, const Pel *pSrc0
 #endif
 
 #if JVET_AJ0161_OBMC_EXT_WITH_INTRA_PRED
-bool IntraPrediction::getGradForOBMC(const PredictionUnit pu, const CPelBuf &recoBuf, const CompArea &area, CodingUnit &cu, const bool isAbove, const int blkSize, int* modeBuf)
+bool IntraPrediction::getGradForOBMC(const PredictionUnit& pu, const CPelBuf &recoBuf, const CompArea &area, CodingUnit &cu, const bool isAbove, const int blkSize, int* modeBuf)
 {
 #if JVET_AK0076_EXTENDED_OBMC_IBC
   if ((CU::isIBC(*pu.cu) || PU::isTmp(pu)) && !cu.slice->getSPS()->getUseDimd())

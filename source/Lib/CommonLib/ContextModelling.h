@@ -878,9 +878,9 @@ public:
 
   MvField mmvdBaseMv[MMVD_BASE_MV_NUM][2];
 #if JVET_Y0067_ENHANCED_MMVD_MVD_SIGN_PRED
-  void setMmvdMergeCandiInfo(PredictionUnit& pu, int candIdx, int candIdxMaped = -1);
+  void setMmvdMergeCandiInfo(PredictionUnit& pu, int candIdx, int candIdxMaped = -1) const;
 #else
-  void setMmvdMergeCandiInfo(PredictionUnit& pu, int candIdx);
+  void setMmvdMergeCandiInfo(PredictionUnit& pu, int candIdx) const;
 #endif
 #if JVET_AA0061_IBC_MBVD
   MvField ibcMbvdBaseBv[IBC_MBVD_BASE_NUM][2];
@@ -890,7 +890,7 @@ public:
 #endif
 #if JVET_AL0214_MV_REFINEMENT_FOR_TMVP
   RefineTmvpCtxModellingParams refineTmvpParams;
-  void copyRefineTmvpCtxModellingParams(MergeCtx &orgMergeCtx, uint32_t srcMrgIdxL0, uint32_t srcMrgIdxL1, uint32_t dstMrgIdxL0, uint32_t dstMrgIdxL1);
+  void copyRefineTmvpCtxModellingParams(const MergeCtx &orgMergeCtx, uint32_t srcMrgIdxL0, uint32_t srcMrgIdxL1, uint32_t dstMrgIdxL0, uint32_t dstMrgIdxL1);
 #endif
   bool setIbcMbvdMergeCandiInfo(PredictionUnit& pu, int candIdx, int candIdxMaped = -1, int candIdx1 = -1, int candIdxMaped1 = -1);
 #else
@@ -904,9 +904,9 @@ public:
   bool          useAltHpelIf      [ MRG_MAX_NUM_CANDS ];
 #endif
 #if JVET_AC0185_ENHANCED_TEMPORAL_MOTION_DERIVATION
-  void saveMergeInfo(PredictionUnit& puTmp, PredictionUnit pu);
+  void saveMergeInfo(PredictionUnit& puTmp, const PredictionUnit& pu);
 #endif
-  void setMergeInfo( PredictionUnit& pu, int candIdx );
+  void setMergeInfo( PredictionUnit& pu, int candIdx ) const;
 #if JVET_AH0314_LIC_INHERITANCE_FOR_MRG
   template <typename MergeCtxType> static void setLICParamToPu         (const MergeCtxType& src,       PredictionUnit& pu, int candIdx, bool hasLIC);
   template <typename MergeCtxType> static void loadLICParamFromPu      (      MergeCtxType& dst, const PredictionUnit* pu, int candIdx, bool allowAltModel, bool hasLIC);
@@ -918,7 +918,7 @@ public:
   template <typename MergeCtxType> static void setLICParamUsingAltLM   (      MergeCtxType& dst, int candIdx);
 #endif
 
-  void setLICParamToPu         (      PredictionUnit& pu, int candIdx, bool hasLIC);
+  void setLICParamToPu         (      PredictionUnit& pu, int candIdx, bool hasLIC) const;
   void loadLICParamFromPu      (const PredictionUnit* pu, int candIdx, bool allowAltModel, bool hasLIC);
   void loadLICParamFromMotInfo (const MotionInfo*     mi, int candIdx, bool allowAltModel, bool hasLIC);
   void copyLICParamFromCtx     (int candIdx, const MergeCtx& src, int candIdxSrc);
@@ -1085,7 +1085,7 @@ public:
   bool xCheckSimilarMotion1(int mergeCandIndex, uint32_t mvdSimilarityThresh = 1, bool isAltLM = false) const;
 #endif
 #if JVET_AH0119_SUBBLOCK_TM
-  bool xCheckSimilarSbTMVP(PredictionUnit pu, int mergeCandIndex, uint32_t mvdSimilarityThresh = 1) const;
+  bool xCheckSimilarSbTMVP(const PredictionUnit& pu, int mergeCandIndex, uint32_t mvdSimilarityThresh = 1) const;
 #endif
 #if JVET_AH0314_LIC_INHERITANCE_FOR_MRG
   void setLICParamToPu(PredictionUnit &pu, int candIdx, bool hasLIC);
@@ -1153,7 +1153,7 @@ public:
   bool          xCheckSimilarMotion1(int mergeCandIndex, uint32_t mvdSimilarityThresh = 1, bool isAltLM = false) const;
 #endif
 #if JVET_AH0119_SUBBLOCK_TM
-  bool          xCheckSimilarSbTMVP(PredictionUnit pu, int mergeCandIndex, uint32_t mvdSimilarityThresh = 1) const;
+  bool          xCheckSimilarSbTMVP(const PredictionUnit& pu, int mergeCandIndex, uint32_t mvdSimilarityThresh = 1) const;
 #endif
 #if JVET_AH0314_LIC_INHERITANCE_FOR_MRG
   void          setLICParamToPu         (      PredictionUnit& pu, int candIdx, bool hasLIC);
