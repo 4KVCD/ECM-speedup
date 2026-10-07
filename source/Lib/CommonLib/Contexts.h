@@ -966,8 +966,24 @@ public:
   void copyFrom(const CtxStore<BinProbModel>& src, const CtxSet& ctxSet)
   {
     checkInit();
-    std::copy_n(reinterpret_cast<const char*>(src.m_ctx + ctxSet.Offset), sizeof(BinProbModel) * ctxSet.Size,
-      reinterpret_cast<char*>(m_ctx + ctxSet.Offset));
+    const BinProbModel* s = src.m_ctx + ctxSet.Offset;
+    BinProbModel*       d = m_ctx + ctxSet.Offset;
+    // perf: the RD search restores many small context sets (1-8 contexts); copy those inline instead of calling memmove
+    switch( ctxSet.Size )
+    {
+    case 8: d[7] = s[7]; // fall through
+    case 7: d[6] = s[6]; // fall through
+    case 6: d[5] = s[5]; // fall through
+    case 5: d[4] = s[4]; // fall through
+    case 4: d[3] = s[3]; // fall through
+    case 3: d[2] = s[2]; // fall through
+    case 2: d[1] = s[1]; // fall through
+    case 1: d[0] = s[0]; // fall through
+    case 0: break;
+    default:
+      std::copy_n( reinterpret_cast<const char*>( s ), sizeof( BinProbModel ) * ctxSet.Size, reinterpret_cast<char*>( d ) );
+      break;
+    }
     if( ctxSet.Size )
     {
       markDirty( ctxSet.Offset, ctxSet.Offset + ctxSet.Size );

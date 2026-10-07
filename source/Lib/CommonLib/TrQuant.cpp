@@ -48,6 +48,9 @@
 #include <stdlib.h>
 #include <limits>
 #include <memory.h>
+#if defined( __SSE2__ )
+#include <emmintrin.h>
+#endif
 
 #include "QuantRDOQ.h"
 #include "DepQuant.h"
@@ -3513,7 +3516,27 @@ void TrQuant::predCoeffSigns(TransformUnit &tu, const ComponentID compID, const 
     }
     else
     {
-      for (uint32_t i = first; i < last; i++)
+      uint32_t i = first;
+#if defined( __SSE2__ )
+      // perf: 8 samples per step, same results: the update wraps to 16 bits like the store to Pel, and
+      // max - min of two int16 is the exact |difference| as an unsigned 16-bit value
+      const __m128i vScale = _mm_set1_epi16( scale );
+      const __m128i vZero  = _mm_setzero_si128();
+      __m128i       vCost  = _mm_setzero_si128();
+      for( ; i + 8 <= (uint32_t) last; i += 8 )
+      {
+        __m128i p = _mm_loadu_si128( ( const __m128i* ) ( predResiTemplate + i ) );
+        p         = _mm_add_epi16( p, _mm_mullo_epi16( _mm_loadu_si128( ( const __m128i* ) ( templ + i ) ), vScale ) );
+        _mm_storeu_si128( ( __m128i* ) ( predResiTemplate + i ), p );
+        const __m128i b = _mm_loadu_si128( ( const __m128i* ) ( predResiBorder + i ) );
+        const __m128i d = _mm_sub_epi16( _mm_max_epi16( b, p ), _mm_min_epi16( b, p ) );
+        vCost = _mm_add_epi32( vCost, _mm_add_epi32( _mm_unpacklo_epi16( d, vZero ), _mm_unpackhi_epi16( d, vZero ) ) );
+      }
+      vCost = _mm_add_epi32( vCost, _mm_shuffle_epi32( vCost, 0x4e ) );
+      vCost = _mm_add_epi32( vCost, _mm_shuffle_epi32( vCost, 0xb1 ) );
+      cost += (uint32_t) _mm_cvtsi128_si32( vCost );
+#endif
+      for (; i < last; i++)
       {
         predResiTemplate[i] += templ[i] * scale;
         cost += abs(predResiBorder[i] - predResiTemplate[i]);
