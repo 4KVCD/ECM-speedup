@@ -56,6 +56,8 @@
 #include "alf_gauss.spv.h"
 #include "alf_luma.spv.h"
 
+#include <atomic>
+#include <condition_variable>
 #include <cstdio>
 #include <cstring>
 #include <map>
@@ -267,45 +269,91 @@ struct GpuAlf::Shared
 
 const GpuAlf::Shared& GpuAlf::shared( gpu::Context& ctx )
 {
-  // destroyed at exit, before the context (created after it)
-  static std::once_flag          once;
-  static std::unique_ptr<Shared> s;
-  std::call_once( once, [&ctx] { s.reset( new Shared( ctx ) ); } );
+  // lives until the process ends, like the device
+  static std::once_flag once;
+  static Shared*        s = nullptr;
+  std::call_once( once, [&ctx] { s = new Shared( ctx ); } );
   return *s;
 }
 
-void GpuAlf::prefetch()
+// pictures compared with the CPU (GpuAlf::VERIFY), reported when the process ends
+static std::atomic<long> s_verifiedPictures( 0 ), s_failedPictures( 0 );
+static struct VerifyReport
 {
-  gpu::Context::prefetch( []( gpu::Context& ctx ) { shared( ctx ); } );
+  ~VerifyReport()
+  {
+    if( s_verifiedPictures )
+    {
+      fprintf( stderr, "GPU loop filter verification: %ld pictures, %ld with differences\n", s_verifiedPictures.load(),
+               s_failedPictures.load() );
+    }
+  }
+} s_verifyReport;
+
+/// the GpuAlf objects of the process, used by one picture at a time; they live until the process ends
+struct GpuAlfPool
+{
+  static constexpr size_t              maxSize = 2;   ///< a picture holds one for a few ms, decoding it takes far longer
+  std::mutex                           mutex;
+  std::condition_variable              freed;
+  std::vector<std::unique_ptr<GpuAlf>> all;
+  std::vector<GpuAlf*>                 available;
+
+  static GpuAlfPool& get()
+  {
+    static GpuAlfPool* pool = new GpuAlfPool;
+    return *pool;
+  }
+
+  GpuAlf* acquire( gpu::Context& ctx, int mode )
+  {
+    std::unique_lock<std::mutex> lock( mutex );
+    for( ;; )
+    {
+      if( !available.empty() )
+      {
+        GpuAlf* alf = available.back();
+        available.pop_back();
+        alf->m_mode = mode;
+        return alf;
+      }
+      if( all.size() < maxSize )
+      {
+        all.emplace_back( new GpuAlf( ctx, GpuAlf::shared( ctx ), mode ) );
+        return all.back().get();
+      }
+      freed.wait( lock );
+    }
+  }
+
+  void release( GpuAlf* alf )
+  {
+    {
+      std::lock_guard<std::mutex> lock( mutex );
+      available.push_back( alf );
+    }
+    freed.notify_one();
+  }
+};
+
+void GpuAlf::prefetch( int mode, int width, int height, int ctuSize )
+{
+  gpu::Context::prefetch( [=]( gpu::Context& ctx ) {
+    shared( ctx );
+    if( width > 0 )
+    {
+      // the buffers of the first picture
+      GpuAlfPool& pool = GpuAlfPool::get();
+      GpuAlf*     alf  = pool.acquire( ctx, mode );
+      alf->layout( width, height, ctuSize );
+      pool.release( alf );
+    }
+  } );
 }
 
 bool GpuAlf::ready()
 {
   return gpu::Context::prefetchDone();
-}
-
-GpuAlf* GpuAlf::create( int mode )
-{
-  gpu::Context*         ctx = gpu::Context::get();
-  static std::once_flag reported;
-  if( !ctx )
-  {
-    std::call_once( reported, [] {
-      fprintf( stderr, "GPU loop filter not available: %s\n", gpu::Context::lastError().c_str() );
-    } );
-    return nullptr;
-  }
-  try
-  {
-    GpuAlf* alf = new GpuAlf( *ctx, shared( *ctx ), mode );
-    std::call_once( reported, [ctx] { fprintf( stderr, "GPU loop filter: %s\n", ctx->deviceName() ); } );
-    return alf;
-  }
-  catch( const std::exception& e )
-  {
-    std::call_once( reported, [&e] { fprintf( stderr, "GPU loop filter not available: %s\n", e.what() ); } );
-    return nullptr;
-  }
 }
 
 GpuAlf::GpuAlf( gpu::Context& ctx, const Shared& shared, int mode ) : m_ctx( ctx ), m_k( shared ), m_mode( mode )
@@ -320,11 +368,48 @@ GpuAlf::~GpuAlf()
   {
     b->destroy( m_ctx );
   }
-  if( m_mode == VERIFY )
+}
+
+GpuAlfHook* GpuAlfHook::create( int mode )
+{
+  gpu::Context*         ctx = gpu::Context::get();
+  static std::once_flag reported;
+  if( !ctx )
   {
-    fprintf( stderr, "GPU loop filter verification: %ld pictures, %ld with differences\n", m_verifiedPictures,
-             m_failedPictures );
+    std::call_once( reported, [] {
+      fprintf( stderr, "GPU loop filter not available: %s\n", gpu::Context::lastError().c_str() );
+    } );
+    return nullptr;
   }
+  try
+  {
+    GpuAlf::shared( *ctx );
+    std::call_once( reported, [ctx] { fprintf( stderr, "GPU loop filter: %s\n", ctx->deviceName() ); } );
+    return new GpuAlfHook( *ctx, mode );
+  }
+  catch( const std::exception& e )
+  {
+    std::call_once( reported, [&e] { fprintf( stderr, "GPU loop filter not available: %s\n", e.what() ); } );
+    return nullptr;
+  }
+}
+
+bool GpuAlfHook::process( AdaptiveLoopFilter& alf, CodingStructure& cs )
+{
+  GpuAlfPool& pool = GpuAlfPool::get();
+  GpuAlf*     gpu  = pool.acquire( m_ctx, m_mode );
+  bool        done;
+  try
+  {
+    done = gpu->process( alf, cs );
+  }
+  catch( ... )
+  {
+    pool.release( gpu );
+    throw;
+  }
+  pool.release( gpu );
+  return done;
 }
 
 // ====================================================================================================================
@@ -658,16 +743,15 @@ bool GpuAlf::gather( const AdaptiveLoopFilter& alf, const CodingStructure& cs )
   return true;
 }
 
-void GpuAlf::layout( const CodingStructure& cs )
+void GpuAlf::layout( int width, int height, int ctuSize )
 {
-  const PreCalcValues& pcv = *cs.pcv;
-  if( (int) pcv.lumaWidth == m_width && (int) pcv.lumaHeight == m_height && (int) pcv.maxCUWidth == m_ctuSize )
+  if( width == m_width && height == m_height && ctuSize == m_ctuSize )
   {
     return;
   }
-  m_width      = pcv.lumaWidth;
-  m_height     = pcv.lumaHeight;
-  m_ctuSize    = pcv.maxCUWidth;
+  m_width      = width;
+  m_height     = height;
+  m_ctuSize    = ctuSize;
   m_ctusPerRow = ( m_width + m_ctuSize - 1 ) / m_ctuSize;
   m_numCtus    = m_ctusPerRow * ( ( m_height + m_ctuSize - 1 ) / m_ctuSize );
   m_wBlk       = m_width / 2;
@@ -1151,7 +1235,7 @@ bool GpuAlf::verify( const AdaptiveLoopFilter& alf, const CodingStructure& cs )
     }
   }
 
-  m_verifiedPictures++;
+  s_verifiedPictures++;
   bool ok = true;
   for( const Check& c: checks )
   {
@@ -1163,7 +1247,7 @@ bool GpuAlf::verify( const AdaptiveLoopFilter& alf, const CodingStructure& cs )
   }
   if( !ok )
   {
-    m_failedPictures++;
+    s_failedPictures++;
   }
   return ok;
 }
@@ -1174,13 +1258,18 @@ bool GpuAlf::process( AdaptiveLoopFilter& alf, CodingStructure& cs )
   {
     return false;
   }
-  layout( cs );
+  layout( cs.pcv->lumaWidth, cs.pcv->lumaHeight, cs.pcv->maxCUWidth );
+  // ALFProcess without the hook: all of it on the CPU
+  auto cpuAlf = [&alf, &cs]() {
+    AlfProcessHook* hook = alf.m_processHook;
+    alf.m_processHook    = nullptr;
+    alf.ALFProcess( cs );
+    alf.m_processHook = hook;
+  };
   if( m_mode == VERIFY )
   {
     // the CPU result is kept; the GPU works on the inputs ALFProcess prepared and is compared with it
-    alf.m_processHook = nullptr;
-    alf.ALFProcess( cs );
-    alf.m_processHook = this;
+    cpuAlf();
     if( gather( alf, cs ) )
     {
       upload( alf, cs );
@@ -1194,9 +1283,7 @@ bool GpuAlf::process( AdaptiveLoopFilter& alf, CodingStructure& cs )
   if( !gather( alf, cs ) )
   {
     // something the kernels do not implement: ALFProcess does it all (its state work again, which is idempotent)
-    alf.m_processHook = nullptr;
-    alf.ALFProcess( cs );
-    alf.m_processHook = this;
+    cpuAlf();
     return true;
   }
   const Params& p = m_params;

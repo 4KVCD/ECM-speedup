@@ -73,7 +73,7 @@ class InputNALUnit;
 struct DecPicJob;
 class  DecFrameThreads;
 #if ECM_VULKAN
-class  GpuAlf;
+class  GpuAlfHook;
 #endif
 
 //! \ingroup DecoderLib
@@ -269,7 +269,7 @@ private:
   // loop filters on a Vulkan compute device (source/Lib/GpuLib), created by the context that filters a picture
   int                     m_gpuLoopFilter = 0;      ///< GpuAlf::Mode
   bool                    m_gpuUnavailable = false;
-  std::unique_ptr<GpuAlf> m_gpuAlf;
+  std::unique_ptr<GpuAlfHook> m_gpuAlf;
 #endif
 
 public:

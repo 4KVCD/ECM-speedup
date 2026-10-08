@@ -659,7 +659,7 @@ void DecLib::setGpuLoopFilter( int mode )
   m_gpuLoopFilter = mode;
   if( mode == GpuAlf::VERIFY )
   {
-    GpuAlf::prefetch();   // every picture is verified
+    GpuAlf::prefetch( mode );   // every picture is verified
   }
 }
 #endif
@@ -1166,7 +1166,7 @@ void DecLib::xExecuteLoopFilters( LfCtrlState* lf )
     // pictures filtered before the device is ready take the CPU path (verification waits for it)
     if( m_gpuLoopFilter && !m_gpuAlf && !m_gpuUnavailable && ( m_gpuLoopFilter == GpuAlf::VERIFY || GpuAlf::ready() ) )
     {
-      m_gpuAlf.reset( GpuAlf::create( m_gpuLoopFilter ) );
+      m_gpuAlf.reset( GpuAlfHook::create( m_gpuLoopFilter ) );
       m_gpuUnavailable = !m_gpuAlf;
       m_cALF.setProcessHook( m_gpuAlf.get() );
     }
@@ -2731,7 +2731,7 @@ void DecLib::xActivateParameterSets( const InputNALUnit nalu )
     if( m_gpuLoopFilter && sps->getALFEnabledFlag()
         && GpuAlf::worthwhile( pps->getPicWidthInLumaSamples(), pps->getPicHeightInLumaSamples() ) )
     {
-      GpuAlf::prefetch();
+      GpuAlf::prefetch( m_gpuLoopFilter, pps->getPicWidthInLumaSamples(), pps->getPicHeightInLumaSamples(), sps->getMaxCUWidth() );
     }
 #endif
 

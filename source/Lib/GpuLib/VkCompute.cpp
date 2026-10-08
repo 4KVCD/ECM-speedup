@@ -90,21 +90,22 @@ const std::string& Context::lastError()
 
 Context* Context::get()
 {
-  static std::once_flag           s_once;
-  static std::unique_ptr<Context> s_ctx;
+  // the device lives until the process ends: destroying it at exit takes ~45 ms, and the system frees it anyway
+  static std::once_flag s_once;
+  static Context*       s_ctx = nullptr;
   std::call_once( s_once, []() {
     std::unique_ptr<Context> ctx( new Context );
     try
     {
       ctx->init();
-      s_ctx = std::move( ctx );
+      s_ctx = ctx.release();
     }
     catch( const std::exception& e )
     {
       errorText() = e.what();
     }
   } );
-  return s_ctx.get();
+  return s_ctx;
 }
 
 static std::mutex        s_prefetchMutex;

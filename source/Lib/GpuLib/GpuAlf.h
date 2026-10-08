@@ -44,7 +44,8 @@
 #include <memory>
 #include <vector>
 
-class GpuAlf : public AlfProcessHook
+/// the GPU resources to filter one picture at a time (command stream, buffers); see GpuAlfHook
+class GpuAlf
 {
 public:
   enum Mode
@@ -54,20 +55,21 @@ public:
     VERIFY = 2    ///< the CPU filters every picture, the GPU result is compared with it
   };
 
-  /// nullptr when there is no usable Vulkan device (the reason is reported once); waits for prefetch()
-  static GpuAlf* create( int mode );
-  ~GpuAlf() override;
-
   /// smaller pictures are filtered on the CPU: the fixed costs of the device exceed what it saves
   static bool    worthwhile( int width, int height ) { return width * height >= 640 * 360; }
-  /// starts creating the device and the kernels in a background thread
-  static void    prefetch();
-  /// prefetch() has finished: create() does not wait
+  /// starts creating the device, the kernels and (width > 0) a first GpuAlf with buffers for pictures of this size
+  /// in a background thread
+  static void    prefetch( int mode, int width = 0, int height = 0, int ctuSize = 0 );
+  /// prefetch() has finished: GpuAlfHook::create() does not wait
   static bool    ready();
 
-  bool process( AdaptiveLoopFilter& alf, CodingStructure& cs ) override;
+  ~GpuAlf();
+  bool process( AdaptiveLoopFilter& alf, CodingStructure& cs );
 
 private:
+  friend class GpuAlfHook;
+  friend struct GpuAlfPool;
+
   /// a 16-bit plane in a buffer: width x height samples and `pad` samples of margin on every side
   struct PlaneDesc
   {
@@ -104,7 +106,7 @@ private:
   void stateAfter( AdaptiveLoopFilter& alf, CodingStructure& cs ) const;
   /// false when the filter state uses what the kernels do not implement
   bool gather( const AdaptiveLoopFilter& alf, const CodingStructure& cs );
-  void layout( const CodingStructure& cs );
+  void layout( int width, int height, int ctuSize );
   void upload( const AdaptiveLoopFilter& alf, const CodingStructure& cs );
   void run( const AdaptiveLoopFilter& alf, const CodingStructure& cs );
   void output( CodingStructure& cs ) const;
@@ -136,8 +138,23 @@ private:
   PlaneDesc                    m_out[3];
   gpu::Buffer                  m_outDev, m_download, m_workDownload;
 
-  long                         m_verifiedPictures = 0;
-  long                         m_failedPictures   = 0;
+};
+
+/// ALFProcess on the GPU for a decoder context: every picture is filtered with a GpuAlf of a pool that all decoder
+/// contexts of the process share (a picture holds one for a few milliseconds)
+class GpuAlfHook : public AlfProcessHook
+{
+public:
+  /// nullptr when there is no usable Vulkan device (the reason is reported once); waits for GpuAlf::prefetch()
+  static GpuAlfHook* create( int mode );
+
+  bool process( AdaptiveLoopFilter& alf, CodingStructure& cs ) override;
+
+private:
+  GpuAlfHook( gpu::Context& ctx, int mode ) : m_ctx( ctx ), m_mode( mode ) {}
+
+  gpu::Context& m_ctx;
+  int           m_mode;
 };
 
 #endif

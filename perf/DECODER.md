@@ -133,6 +133,14 @@ LTO builds, paired, 3 repetitions, single thread: 720p AI FourPeople 1.10x, Park
 the 1- and 3-picture 720p streams 0.95x / 0.97x (device set-up and tear-down), smaller streams unchanged; all 19
 streams 1.04x. With 8 frame threads 0.94-1.03x: every worker context allocates its buffers at its first picture.
 
+G2: the decoder contexts share a pool of at most two GPU filter instances (stream and buffers; a picture holds one
+for a few ms), the first one allocated for the stream's picture size by the background thread; the device, kernels
+and pool live until the process ends (destroying the device at exit took ~45 ms). Device memory at 720p: ~26 MB per
+instance, so 52 MB instead of 26 MB per decoder context (210 MB with 8 frame threads). Single thread: 720p AI
+1.11x / 1.09x, RA ParkJoy 1.06x, ra720 (3 pictures) 1.01x, ai720 (1 picture) 0.98x, all 19 streams 1.05x; 8 frame
+threads 1.00x / 1.01x / 1.04x, 0.97x / 0.96x on the 3- and 1-picture streams: on these short streams creating the
+device (~0.3 s of a core) costs about what the GPU saves (~40 ms of CPU per 720p picture).
+
 ## Fixes found on the way
 
 - Decoding that starts at a CRA in the middle of an RA stream (`-s`, random access) crashed the stock decoder:
