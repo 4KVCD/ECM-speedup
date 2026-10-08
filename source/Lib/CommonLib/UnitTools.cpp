@@ -44297,15 +44297,7 @@ int buildHistogram(const Pel *pReco, int iStride, uint32_t uiHeight, uint32_t ui
         int ratio = static_cast<int>(fRatioScaled);
 #endif
         // get ang_idx
-        int idx = 16;
-        for (int i = 1; i < 17; i++)
-        {
-          if (ratio <= angTable[i])
-          {
-            idx = ratio - angTable[i - 1] < angTable[i] - ratio ? i - 1 : i;
-            break;
-          }
-        }
+        const int idx = gradAngleIdx(ratio, angTable);
 
         iAngUneven = offsets[region] + dirs[region] * idx;
         // iAngUneven = offsets[region - 1] + dirs[region - 1] * idx;
@@ -44511,15 +44503,7 @@ void calcGradForOBMC(const PredictionUnit& pu, const Pel *pReco, const int iStri
           float fRatioScaled = fRatio * (1 << 16);
           int ratio = static_cast<int>(fRatioScaled);
 #endif
-          int idx = 16;
-          for (int i = 1; i < 17; i++)
-          {
-            if (ratio <= angTable[i])
-            {
-              idx = ratio - angTable[i - 1] < angTable[i] - ratio ? i - 1 : i;
-              break;
-            }
-          }
+          const int idx = gradAngleIdx(ratio, angTable);
 
           iAngUneven = offsets[region] + dirs[region] * idx;
         }
