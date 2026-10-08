@@ -3550,6 +3550,146 @@ static void simdFilterNarrow( const ClpRng& clpRng, const Pel* src, int srcStrid
   }
 }
 
+// perf: one-call separable 2-D filters for the most frequent tiny blocks (see InterpolationFilter::m_filter2DChroma2x2):
+// the horizontal stage, its conversion to Pel, and the vertical stage with the shifts, offsets, conversion and clipping
+// of InterpolationFilter::filter; the loads cover exactly the filter taps.
+
+// shift and offset of one filtering stage (InterpolationFilter::filter / simdFilter, biMCForDMVR = false)
+static inline void simdFilterShiftOffset( const ClpRng &clpRng, const bool isFirst, const bool isLast, int &shift, int &offset )
+{
+#if JVET_R0351_HIGH_BIT_DEPTH_SUPPORT
+  const int headRoom = IF_INTERNAL_FRAC_BITS( clpRng.bd );
+#else
+  const int headRoom = std::max<int>( 2, ( IF_INTERNAL_PREC - clpRng.bd ) );
+#endif
+  shift = IF_FILTER_PREC;
+  if( isLast )
+  {
+    shift += isFirst ? 0 : headRoom;
+    offset = 1 << ( shift - 1 );
+    offset += isFirst ? 0 : IF_INTERNAL_OFFS << IF_FILTER_PREC;
+  }
+  else
+  {
+    shift -= isFirst ? headRoom : 0;
+    offset = isFirst ? -IF_INTERNAL_OFFS << shift : 0;
+  }
+}
+
+// (v + offset) >> shift per int32 lane, converted to Pel (low 16 bits, sign-extended) and, if isLast, clipped
+template<bool isLast>
+static inline __m128i simdFilterRoundPel( const __m128i v, const __m128i offset, const __m128i shift, const ClpRng &clpRng )
+{
+  __m128i r = _mm_srai_epi32( _mm_slli_epi32( _mm_sra_epi32( _mm_add_epi32( v, offset ), shift ), 16 ), 16 );
+  if( isLast )
+  {
+    r = _mm_min_epi32( _mm_max_epi32( r, _mm_set1_epi32( clpRng.min ) ), _mm_set1_epi32( clpRng.max ) );
+  }
+  return r;
+}
+
+#if JVET_Z0117_CHROMA_IF
+// 2x2 block, 6 taps (chroma): rows -2..4 of the horizontal stage, columns -2..4 of src
+template<X86_VEXT vext, bool isLast>
+static void simdFilter2DChroma2x2( const ClpRng &clpRng, const Pel *src, int srcStride, Pel *dst, int dstStride, const TFilterCoeff *coeffH, const TFilterCoeff *coeffV )
+{
+  int shift1, offset1, shift2, offset2;
+  simdFilterShiftOffset( clpRng, true, false, shift1, offset1 );
+  simdFilterShiftOffset( clpRng, false, isLast, shift2, offset2 );
+  // a row loaded as s-2 s-1 s0 s1 | s1 s2 s3 s4: column 0 = sum of madd( row, cA ), column 1 = sum of madd( row, cB )
+  const __m128i cA = _mm_setr_epi16( coeffH[0], coeffH[1], coeffH[2], coeffH[3], 0, coeffH[4], coeffH[5], 0 );
+  const __m128i cB = _mm_setr_epi16( 0, coeffH[0], coeffH[1], coeffH[2], 0, coeffH[3], coeffH[4], coeffH[5] );
+  const __m128i vOffset1 = _mm_set1_epi32( offset1 ), vShift1 = _mm_cvtsi32_si128( shift1 );
+  const Pel    *s        = src - 2 * srcStride - 2;
+  __m128i       h[4];   // h[k] = row 2k-2 (columns 0, 1), row 2k-1 (columns 0, 1); the last row duplicated in h[3]
+  for( int k = 0; k < 4; k++ )
+  {
+    const Pel    *s0 = s + 2 * k * srcStride;
+    const Pel    *s1 = k < 3 ? s0 + srcStride : s0;
+    const __m128i r0 = _mm_unpacklo_epi64( _mm_loadl_epi64( ( const __m128i * ) s0 ), _mm_loadl_epi64( ( const __m128i * ) ( s0 + 3 ) ) );
+    const __m128i r1 = _mm_unpacklo_epi64( _mm_loadl_epi64( ( const __m128i * ) s1 ), _mm_loadl_epi64( ( const __m128i * ) ( s1 + 3 ) ) );
+    const __m128i h0 = _mm_hadd_epi32( _mm_madd_epi16( r0, cA ), _mm_madd_epi16( r0, cB ) );
+    const __m128i h1 = _mm_hadd_epi32( _mm_madd_epi16( r1, cA ), _mm_madd_epi16( r1, cB ) );
+    h[k]             = simdFilterRoundPel<false>( _mm_hadd_epi32( h0, h1 ), vOffset1, vShift1, clpRng );
+  }
+  // vertical stage: lanes (row 0, column 0), (0, 1), (1, 0), (1, 1); w_k holds rows k-2 and k-1
+  __m128i acc = _mm_mullo_epi32( h[0], _mm_set1_epi32( coeffV[0] ) );
+  acc = _mm_add_epi32( acc, _mm_mullo_epi32( _mm_alignr_epi8( h[1], h[0], 8 ), _mm_set1_epi32( coeffV[1] ) ) );
+  acc = _mm_add_epi32( acc, _mm_mullo_epi32( h[1], _mm_set1_epi32( coeffV[2] ) ) );
+  acc = _mm_add_epi32( acc, _mm_mullo_epi32( _mm_alignr_epi8( h[2], h[1], 8 ), _mm_set1_epi32( coeffV[3] ) ) );
+  acc = _mm_add_epi32( acc, _mm_mullo_epi32( h[2], _mm_set1_epi32( coeffV[4] ) ) );
+  acc = _mm_add_epi32( acc, _mm_mullo_epi32( _mm_alignr_epi8( h[3], h[2], 8 ), _mm_set1_epi32( coeffV[5] ) ) );
+  const __m128i res = simdFilterRoundPel<isLast>( acc, _mm_set1_epi32( offset2 ), _mm_cvtsi32_si128( shift2 ), clpRng );
+  const __m128i out = _mm_packs_epi32( res, res );   // values are in the Pel range
+  const int32_t row0 = _mm_cvtsi128_si32( out ), row1 = _mm_extract_epi32( out, 1 );
+  memcpy( dst, &row0, sizeof( row0 ) );
+  memcpy( dst + dstStride, &row1, sizeof( row1 ) );
+}
+#endif
+
+#if JVET_AL0161_4TAP_TM
+// 4x1 template row, 4 taps, isLast: rows -1..2 of the horizontal stage, columns -1..5 of src
+template<X86_VEXT vext>
+static void simdFilter2DTplRow4( const ClpRng &clpRng, const Pel *src, int srcStride, Pel *dst, int dstStride, const TFilterCoeff *coeffH, const TFilterCoeff *coeffV )
+{
+  int shift1, offset1, shift2, offset2;
+  simdFilterShiftOffset( clpRng, true, false, shift1, offset1 );
+  simdFilterShiftOffset( clpRng, false, true, shift2, offset2 );
+  const __m128i c01      = _mm_set1_epi32( ( int ) ( ( uint32_t ) ( uint16_t ) coeffH[1] << 16 | ( uint16_t ) coeffH[0] ) );
+  const __m128i c23      = _mm_set1_epi32( ( int ) ( ( uint32_t ) ( uint16_t ) coeffH[3] << 16 | ( uint16_t ) coeffH[2] ) );
+  const __m128i vOffset1 = _mm_set1_epi32( offset1 ), vShift1 = _mm_cvtsi32_si128( shift1 );
+  __m128i       acc      = _mm_setzero_si128();
+  for( int k = 0; k < 4; k++ )
+  {
+    // columns x-1, x, x+1, x+2 of output column x = 0..3, as interleaved pairs
+    const Pel    *s   = src + ( k - 1 ) * srcStride - 1;
+    const __m128i p01 = _mm_unpacklo_epi16( _mm_loadl_epi64( ( const __m128i * ) s ), _mm_loadl_epi64( ( const __m128i * ) ( s + 1 ) ) );
+    const __m128i p23 = _mm_unpacklo_epi16( _mm_loadl_epi64( ( const __m128i * ) ( s + 2 ) ), _mm_loadl_epi64( ( const __m128i * ) ( s + 3 ) ) );
+    const __m128i row = simdFilterRoundPel<false>( _mm_add_epi32( _mm_madd_epi16( p01, c01 ), _mm_madd_epi16( p23, c23 ) ), vOffset1, vShift1, clpRng );
+    acc = _mm_add_epi32( acc, _mm_mullo_epi32( row, _mm_set1_epi32( coeffV[k] ) ) );
+  }
+  const __m128i res = simdFilterRoundPel<true>( acc, _mm_set1_epi32( offset2 ), _mm_cvtsi32_si128( shift2 ), clpRng );
+  _mm_storel_epi64( ( __m128i * ) dst, _mm_packs_epi32( res, res ) );
+}
+
+// 1x4 template column, 4 taps, isLast: rows -1..5 of the horizontal stage, columns -1..2 of src
+template<X86_VEXT vext>
+static void simdFilter2DTplCol4( const ClpRng &clpRng, const Pel *src, int srcStride, Pel *dst, int dstStride, const TFilterCoeff *coeffH, const TFilterCoeff *coeffV )
+{
+  int shift1, offset1, shift2, offset2;
+  simdFilterShiftOffset( clpRng, true, false, shift1, offset1 );
+  simdFilterShiftOffset( clpRng, false, true, shift2, offset2 );
+  const __m128i c        = _mm_setr_epi16( coeffH[0], coeffH[1], coeffH[2], coeffH[3], coeffH[0], coeffH[1], coeffH[2], coeffH[3] );
+  const __m128i vOffset1 = _mm_set1_epi32( offset1 ), vShift1 = _mm_cvtsi32_si128( shift1 );
+  const Pel    *s        = src - srcStride - 1;
+  __m128i       m[4];   // m[k]: rows 2k-1 and 2k (the last row duplicated in m[3])
+  for( int k = 0; k < 4; k++ )
+  {
+    const Pel *s0 = s + 2 * k * srcStride;
+    const Pel *s1 = k < 3 ? s0 + srcStride : s0;
+    m[k] = _mm_madd_epi16( _mm_unpacklo_epi64( _mm_loadl_epi64( ( const __m128i * ) s0 ), _mm_loadl_epi64( ( const __m128i * ) s1 ) ), c );
+  }
+  const __m128i a = simdFilterRoundPel<false>( _mm_hadd_epi32( m[0], m[1] ), vOffset1, vShift1, clpRng );   // rows -1..2
+  const __m128i b = simdFilterRoundPel<false>( _mm_hadd_epi32( m[2], m[3] ), vOffset1, vShift1, clpRng );   // rows 3..5, 5
+  __m128i       acc = _mm_mullo_epi32( a, _mm_set1_epi32( coeffV[0] ) );
+  acc = _mm_add_epi32( acc, _mm_mullo_epi32( _mm_alignr_epi8( b, a, 4 ), _mm_set1_epi32( coeffV[1] ) ) );
+  acc = _mm_add_epi32( acc, _mm_mullo_epi32( _mm_alignr_epi8( b, a, 8 ), _mm_set1_epi32( coeffV[2] ) ) );
+  acc = _mm_add_epi32( acc, _mm_mullo_epi32( _mm_alignr_epi8( b, a, 12 ), _mm_set1_epi32( coeffV[3] ) ) );
+  const __m128i res = _mm_packs_epi32( simdFilterRoundPel<true>( acc, _mm_set1_epi32( offset2 ), _mm_cvtsi32_si128( shift2 ), clpRng ), _mm_setzero_si128() );
+  if( dstStride == 1 )
+  {
+    _mm_storel_epi64( ( __m128i * ) dst, res );
+  }
+  else
+  {
+    dst[0]             = _mm_extract_epi16( res, 0 );
+    dst[dstStride]     = _mm_extract_epi16( res, 1 );
+    dst[2 * dstStride] = _mm_extract_epi16( res, 2 );
+    dst[3 * dstStride] = _mm_extract_epi16( res, 3 );
+  }
+}
+#endif
+
 template<X86_VEXT vext, int N, bool isVertical, bool isFirst, bool isLast>
 static void simdFilter( const ClpRng& clpRng, Pel const *src, int srcStride, Pel *dst, int dstStride, int width, int height, TFilterCoeff const *coeff, bool biMCForDMVR)
 {
@@ -6117,6 +6257,14 @@ void  xWeightObmcInnerBoundary_SSE(const ComponentID comp, Pel* pOrgDst, Pel* pO
 template <X86_VEXT vext>
 void InterpolationFilter::_initInterpolationFilterX86()
 {
+#if JVET_Z0117_CHROMA_IF
+  m_filter2DChroma2x2[0] = simdFilter2DChroma2x2<vext, false>;
+  m_filter2DChroma2x2[1] = simdFilter2DChroma2x2<vext, true>;
+#endif
+#if JVET_AL0161_4TAP_TM
+  m_filter2DTplRow4 = simdFilter2DTplRow4<vext>;
+  m_filter2DTplCol4 = simdFilter2DTplCol4<vext>;
+#endif
 #if IF_12TAP_SIMD
 #if SIMD_4x4_12
   m_filter4x4[0] = simdInterpolate4x4_12tap<false>;

@@ -1974,6 +1974,22 @@ InterpolationFilter::InterpolationFilter()
   m_weightObmcBoundary      = xWeightObmcBoundary;
   m_weightObmcInnerBoundary = xWeightObmcInnerBoundary;
 #endif
+#if JVET_Z0117_CHROMA_IF
+  m_filter2DChroma2x2[0] = filter2DSmall<NTAPS_CHROMA, 2, 2, false>;
+  m_filter2DChroma2x2[1] = filter2DSmall<NTAPS_CHROMA, 2, 2, true>;
+#endif
+#if JVET_AL0161_4TAP_TM
+  m_filter2DTplRow4 = filter2DSmall<NTAPS_TM, 4, 1, true>;
+  m_filter2DTplCol4 = filter2DSmall<NTAPS_TM, 1, 4, true>;
+#endif
+}
+
+template<int N, int W, int H, bool isLast>
+void InterpolationFilter::filter2DSmall( const ClpRng &clpRng, const Pel *src, int srcStride, Pel *dst, int dstStride, const TFilterCoeff *coeffH, const TFilterCoeff *coeffV )
+{
+  Pel tmp[W * ( H + N - 1 )];
+  filter<N, false, true, false>( clpRng, src - ( N / 2 - 1 ) * srcStride, srcStride, tmp, W, W, H + N - 1, coeffH, false );
+  filter<N, true, false, isLast>( clpRng, tmp + ( N / 2 - 1 ) * W, W, dst, dstStride, W, H, coeffV, false );
 }
 
 

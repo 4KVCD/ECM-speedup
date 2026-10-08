@@ -255,6 +255,22 @@ public:
 #if SIMD_4x4_12 && defined(TARGET_SIMD_X86)
   void(*m_filter4x4[2])(const int16_t* src, int srcStride, int16_t *dst, int dstStride, int shiftH, int offsetH, int shiftV, int offsetV, int16_t const *coeffH, int16_t const *coeffV, int ibdimin, int ibdimax); //kolya
 #endif
+#endif
+  // perf: one call for the separable 2-D filtering of the most frequent tiny blocks, with the results of filterHor into a
+  // temporary block followed by filterVer (src: the block's first sample; biMCForDMVR = false; bit depths up to 12):
+  // 2x2 chroma blocks with 6 taps (OBMC sub-blocks), [isLast], and the 4x1 / 1x4 luma template rows and columns of the
+  // sub-block template matching with the 4-tap TM filter (isLast)
+  typedef void ( *Filter2DSmallFunc )( const ClpRng &clpRng, const Pel *src, int srcStride, Pel *dst, int dstStride, const TFilterCoeff *coeffH, const TFilterCoeff *coeffV );
+#if JVET_Z0117_CHROMA_IF
+  Filter2DSmallFunc m_filter2DChroma2x2[2];
+#endif
+#if JVET_AL0161_4TAP_TM
+  Filter2DSmallFunc m_filter2DTplRow4;
+  Filter2DSmallFunc m_filter2DTplCol4;
+#endif
+  template<int N, int W, int H, bool isLast>
+  static void filter2DSmall( const ClpRng &clpRng, const Pel *src, int srcStride, Pel *dst, int dstStride, const TFilterCoeff *coeffH, const TFilterCoeff *coeffV );
+#if IF_12TAP
 
 #if JVET_Z0117_CHROMA_IF
   void(*m_filterHor[5][2][2])(const ClpRng& clpRng, Pel const *src, int srcStride, Pel *dst, int dstStride, int width, int height, TFilterCoeff const *coeff, bool biMCForDMVR);

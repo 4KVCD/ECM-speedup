@@ -59,6 +59,9 @@
 #ifndef OBMC_FAST_MC_VERIFY
 #define OBMC_FAST_MC_VERIFY 0   // 1: run the general chain after xSubBlockMCFast as well and check that it gives the same samples
 #endif
+#ifndef SMALL_MC_VERIFY
+#define SMALL_MC_VERIFY 0   // 1: run filterHor + filterVer after each one-call 2-D filter of tiny blocks and check that they give the same samples
+#endif
 
 //! \ingroup CommonLib
 //! \{
@@ -10944,6 +10947,31 @@ void InterPrediction::xSubBlockMotionCompensation(PredictionUnit &pu, PelUnitBuf
 #endif
 }
 
+#if SMALL_MC_VERIFY && JVET_AI0094_SHARP_MC_FILTER_FOR_BIPRED && JVET_AL0161_4TAP_TM
+// the general filterHor + filterVer filtering that InterpolationFilter's one-call 2-D filters replace: stops if dst differs
+static void verifySmallMC2D( InterpolationFilter &ifl, const ComponentID compID, const Pel *ref, const int refStride, const Pel *dst, const int dstStride,
+                             const int w, const int h, const int xFrac, const int yFrac, const bool isLast, const ChromaFormat chFmt, const ClpRng &clpRng,
+                             const int nFilterIdx, const bool useAltHpelIf, const bool useBiFilter, const bool use4TapTM, const int vFilterSize )
+{
+  static struct Count
+  {
+    uint64_t n[3] = { 0, 0, 0 };
+    ~Count() { fprintf( stderr, "SMALL_MC_VERIFY: checked %llu 2x2 chroma, %llu 4x1 and %llu 1x4 template blocks\n", ( unsigned long long ) n[0], ( unsigned long long ) n[1], ( unsigned long long ) n[2] ); }
+  } count;
+  count.n[w == 2 ? 0 : w == 4 ? 1 : 2]++;
+  Pel tmp[8 * 16], out[8 * 8];
+  ifl.filterHor( compID, ref - ( ( vFilterSize >> 1 ) - 1 ) * refStride, refStride, tmp, w, w, h + vFilterSize - 1, xFrac, false, chFmt, clpRng, nFilterIdx, false, useAltHpelIf, useBiFilter, use4TapTM );
+  ifl.filterVer( compID, tmp + ( ( vFilterSize >> 1 ) - 1 ) * w, w, out, w, w, h, yFrac, false, isLast, chFmt, clpRng, nFilterIdx, false, useAltHpelIf, useBiFilter, use4TapTM );
+  for( int y = 0; y < h; y++ )
+  {
+    for( int x = 0; x < w; x++ )
+    {
+      CHECK( out[y * w + x] != dst[y * dstStride + x], "SMALL_MC_VERIFY: one-call 2-D filter differs (comp " << compID << " " << w << "x" << h << " frac " << xFrac << "," << yFrac << ")" );
+    }
+  }
+}
+#endif
+
 #if JVET_AI0094_SHARP_MC_FILTER_FOR_BIPRED && JVET_AL0161_4TAP_TM && JVET_AK0212_GPM_OBMC_MODIFICATION
 // perf: OBMC predicts the sub-blocks at the CU and sub-block boundaries (mostly 4x4 luma, 2x2 chroma) with neighbouring
 // motion through the general chain xPredInterBi -> xPredInterUni -> xPredInterBlk; a 33-frame CIF RA decode makes ~1.3 M
@@ -11063,6 +11091,17 @@ void InterPrediction::xSubBlockMCFastComp( const ComponentID compID, const Predi
   else if( compID == COMPONENT_Y && dst.width == 4 && dst.height == 4 && !( ( xFrac == 8 || yFrac == 8 ) && useAltHpelIf ) )
   {
     m_if.filter4x4( clpRng, ref, refStride, dst.buf, dst.stride, xFrac, yFrac, rndRes );
+  }
+#endif
+#if JVET_Z0117_CHROMA_IF && !JVET_J0090_MEMORY_BANDWITH_MEASURE
+  else if( compID != COMPONENT_Y && dst.width == 2 && dst.height == 2 && clpRng.bd <= 12 )
+  {
+    // the two calls below in one (the chroma filters of filterHor / filterVer for nFilterIdx 0)
+    m_if.m_filter2DChroma2x2[rndRes]( clpRng, ref, refStride, dst.buf, dst.stride, InterpolationFilter::m_chromaFilter[xFrac << ( 1 - ::getComponentScaleX( compID, chFmt ) )],
+                                      InterpolationFilter::m_chromaFilter[yFrac << ( 1 - ::getComponentScaleY( compID, chFmt ) )] );
+#if SMALL_MC_VERIFY
+    verifySmallMC2D( m_if, compID, ref, refStride, dst.buf, dst.stride, 2, 2, xFrac, yFrac, rndRes, chFmt, clpRng, 0, useAltHpelIf, useBiFilter, false, NTAPS_CHROMA );
+#endif
   }
 #endif
   else
@@ -28034,6 +28073,20 @@ void InterPrediction::xGetPredBlkTpl(const CodingUnit& cu, const ComponentID com
 #else
     const int vFilterSize = isLuma(compID) ? NTAPS_LUMA : NTAPS_CHROMA;
 #endif
+#endif
+#if JVET_AL0161_4TAP_TM && !JVET_J0090_MEMORY_BANDWITH_MEASURE
+    if( use4TapTM && tplSize == 4 && cu.slice->clpRng( compID ).bd <= 12 )
+    {
+      // perf: the sub-block template rows / columns (4x1, 1x4): the two calls below in one (the 4-tap TM filters of
+      // filterHor / filterVer)
+      ( trueAfalseL ? m_if.m_filter2DTplRow4 : m_if.m_filter2DTplCol4 )( cu.slice->clpRng( compID ), ref, refStride, dst, dstStride,
+                                                                        InterpolationFilter::getExtIntraCubicFilter( xFrac << 2 ),
+                                                                        InterpolationFilter::getExtIntraCubicFilter( yFrac << 2 ) );
+#if SMALL_MC_VERIFY && JVET_AI0094_SHARP_MC_FILTER_FOR_BIPRED
+      verifySmallMC2D( m_if, compID, ref, refStride, dst, dstStride, bw, bh, xFrac, yFrac, true, cu.chromaFormat, cu.slice->clpRng( compID ), nFilterIdx, useAltHpelIf, false, use4TapTM, vFilterSize );
+#endif
+      return;
+    }
 #endif
     PelBuf tmpBuf = PelBuf(m_filteredBlockTmp[0][compID], Size(bw, bh+vFilterSize-1));
 
