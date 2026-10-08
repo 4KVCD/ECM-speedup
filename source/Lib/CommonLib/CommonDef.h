@@ -62,6 +62,9 @@
 
 #include <intrin.h>
 #endif
+#if defined( __AVX2__ )
+#include <immintrin.h>
+#endif
 
 //! \ingroup CommonLib
 //! \{
@@ -2557,16 +2560,49 @@ static inline uint32_t getIndexMappingTableToSortedArray1D(InputValueType (&in)[
     const uint32_t  numRef = getIndexMappingTableToSortedArray1DInsert(in, ref);
     CHECK(numRef != numValid, "GPM mode ranking: count differs");
 #endif
-    for (uint32_t i = 0; i < inputValueArraySize; i++)
+#if defined( __AVX2__ )
+    if constexpr (inputValueArraySize % 8 == 0)
     {
-      uint32_t rank = 0;
-      for (uint32_t j = 0; j < inputValueArraySize; j++)
+      // 4 keys per comparison, the counts kept in 64-bit lanes (two counters per key)
+      constexpr uint32_t numVec = inputValueArraySize / 4;
+      __m256i            kv[numVec];
+      for (uint32_t v = 0; v < numVec; v++)
       {
-        rank += key[j] < key[i];
+        kv[v] = _mm256_loadu_si256((const __m256i *) (key + 4 * v));
       }
-      if (rank < numValid)
+      for (uint32_t i = 0; i < inputValueArraySize; i++)
       {
-        tbl[rank] = (OutputIndexType) i;
+        const __m256i ki = _mm256_set1_epi64x(key[i]);
+        __m256i       c0 = _mm256_setzero_si256();
+        __m256i       c1 = _mm256_setzero_si256();
+        for (uint32_t v = 0; v < numVec; v += 2)
+        {
+          c0 = _mm256_sub_epi64(c0, _mm256_cmpgt_epi64(ki, kv[v]));       // key[j] < key[i]
+          c1 = _mm256_sub_epi64(c1, _mm256_cmpgt_epi64(ki, kv[v + 1]));
+        }
+        const __m256i  c    = _mm256_add_epi64(c0, c1);
+        const __m128i  c2   = _mm_add_epi64(_mm256_castsi256_si128(c), _mm256_extracti128_si256(c, 1));
+        const uint32_t rank = (uint32_t) (_mm_cvtsi128_si64(c2) + _mm_extract_epi64(c2, 1));
+        if (rank < numValid)
+        {
+          tbl[rank] = (OutputIndexType) i;
+        }
+      }
+    }
+    else
+#endif
+    {
+      for (uint32_t i = 0; i < inputValueArraySize; i++)
+      {
+        uint32_t rank = 0;
+        for (uint32_t j = 0; j < inputValueArraySize; j++)
+        {
+          rank += key[j] < key[i];
+        }
+        if (rank < numValid)
+        {
+          tbl[rank] = (OutputIndexType) i;
+        }
       }
     }
 #ifdef GEOSORT_CHECK
