@@ -3652,6 +3652,33 @@ void DepQuant::quant(TransformUnit &tu, const ComponentID &compID, const CCoeffB
 
 #if SIGN_PREDICTION
 #if JVET_Y0141_SIGN_PRED_IMPROVE
+// perf: the order of the stable sort by level, descending, for more than 32 entries: std::sort of unique
+// (level, index) keys instead of std::stable_sort and its temporary buffer. The levels are positive (at least
+// 2 |level| - 1). Not inlined, so that the 16 KB of buffers stay out of the caller's stack frame.
+static void __attribute__((noinline)) sortByLevelDescending(static_vector<PositionWithLevel, 32 * 32> &list)
+{
+  const int         n = (int) list.size();
+  uint64_t          key[32 * 32];
+  PositionWithLevel src[32 * 32];
+  for (int i = 0; i < n; i++)
+  {
+    key[i] = ((uint64_t) (0xffffffffu - (uint32_t) list[i].level) << 32) | (uint32_t) i;
+    src[i] = list[i];
+  }
+  std::sort(key, key + n);
+  for (int i = 0; i < n; i++)
+  {
+    list[i] = src[(uint32_t) key[i]];
+  }
+#ifdef SIGNSORT_CHECK
+  std::stable_sort(src, src + n, [](const PositionWithLevel &a, const PositionWithLevel &b) { return a.level > b.level; });
+  for (int i = 0; i < n; i++)
+  {
+    CHECK(src[i].x != list[i].x || src[i].y != list[i].y || src[i].level != list[i].level, "sign position order differs");
+  }
+#endif
+}
+
 void DepQuant::getPredictedSigns(TransformUnit &tu, const ComponentID compID,
                                  static_vector<Position, SIGN_PRED_MAX_NUM> &predSignsXY, uint8_t *signBuf,
                                  bool isDecoder)
@@ -3755,8 +3782,15 @@ void DepQuant::getPredictedSigns(TransformUnit &tu, const ComponentID compID,
       }
       state = int((stateTransTab >> (4 * (2 * state + (level & 1)))) & 15);
     }
-    stableSortSmall(predSignsXYLevel.begin(), predSignsXYLevel.end(),
-                    [](const PositionWithLevel &a, const PositionWithLevel &b) { return a.level > b.level; });
+    if (predSignsXYLevel.size() <= 32)
+    {
+      stableSortSmall(predSignsXYLevel.begin(), predSignsXYLevel.end(),
+                      [](const PositionWithLevel &a, const PositionWithLevel &b) { return a.level > b.level; });
+    }
+    else
+    {
+      sortByLevelDescending(predSignsXYLevel);
+    }
 
     IdxBuf bufSignsScanIdx = tu.getCoeffSignsScanIdx(compID);
 
