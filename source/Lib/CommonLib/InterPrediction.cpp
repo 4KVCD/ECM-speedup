@@ -11348,7 +11348,7 @@ void InterPrediction::deriveGpmSplitMode(PredictionUnit& pu, MergeCtx &geoMrgCtx
 #if JVET_AG0112_REGRESSION_BASED_GPM_BLENDING
 std::pair<int8_t,int8_t> InterPrediction::getGeoBlendCandIndexes( const int idxCand, std::vector<int8_t>& listMergeCand0, std::vector<int8_t>& listMergeCand1, int8_t* nbZscanPairList )
 {
-  static std::vector< std::pair<int8_t, int8_t> > zscanPairList;
+  static thread_local std::vector< std::pair<int8_t, int8_t> > zscanPairList;
   std::pair<int8_t, int8_t>  pair = { NOT_VALID, NOT_VALID };
 
   int8_t numMergeCand0 = (int8_t)listMergeCand0.size();
@@ -11660,7 +11660,7 @@ bool InterPrediction::getGeoBlendCand( const CodingUnit& cu, MergeCtx& geoMrgCtx
 #if JVET_AK0101_REGRESSION_GPM_INTRA
 std::pair<int8_t, int8_t> InterPrediction::getGeoBlendIntraCandIndexes(const int idxCand, std::vector<int8_t>& intraCandList, std::vector<int8_t>& interCandList, int8_t* nbZscanPairList)
 {
-  static std::vector< std::pair<int8_t, int8_t> > zscanIntraPairList;
+  static thread_local std::vector< std::pair<int8_t, int8_t> > zscanIntraPairList;
   std::pair<int8_t, int8_t>  pair = { NOT_VALID, NOT_VALID };
 
   int8_t numMergeCand0 = (int8_t)intraCandList.size();
@@ -16944,7 +16944,7 @@ Distortion InterPrediction::deriveBcwBlending( PredictionUnit& pu, bool bUniDir[
 
 
   Pel(*A)[CCCM_REF_SAMPLES_MAX] = m_pcIntraPred->m_a;
-  static Pel Y[BCW_MAX_REF_SAMPLES];
+  static thread_local Pel Y[BCW_MAX_REF_SAMPLES];
 
   int iTempFirst  = m_bAMLTemplateAvailabe[0] ? 0 : 1;
   int iTempLast   = m_bAMLTemplateAvailabe[1] ? 2 : 1;
@@ -26641,7 +26641,7 @@ void InterPrediction::xLocalIlluComp(const PredictionUnit& pu,
 #endif
   int numTemplate[2] = { 0 , 0 }; // 0:Above, 1:Left
 #if JVET_AG0276_NLIC
-  static int shift_s, scale_s, offset_s;
+  static thread_local int shift_s, scale_s, offset_s;
   if (!m_skipDoLic)
 #endif
 #if JVET_AA0146_WRAP_AROUND_FIX
@@ -43696,7 +43696,7 @@ std::vector<Mv> InterPrediction::deriveMVDFromMVSDIdxAffineSI(PredictionUnit& pu
     TplMatchingCtrl tplCtrl(pu, interRes, recPic, true, COMPONENT_Y, false, 0, m_pcCurTplAbove, m_pcCurTplLeft, m_pcRefTplAbove, m_pcRefTplLeft, Mv(0, 0), nullptr, 0, 1, true);
 #endif
 #if JVET_AD0208_IBC_ADAPT_FOR_CAM_CAPTURED_CONTENTS
-    static std::vector<std::pair<Mv, Distortion>> aMvCostVec;
+    static thread_local std::vector<std::pair<Mv, Distortion>> aMvCostVec;
     aMvCostVec.resize(patternsNum);
 #else
     std::vector<std::pair<Mv, Distortion>> aMvCostVec(patternsNum);
@@ -44069,7 +44069,7 @@ std::vector<Mv> InterPrediction::deriveMVDFromMVSDIdxAffineSI(PredictionUnit& pu
 
     //filter cMvdDerived to contain only elements with matching signs
 #if JVET_AD0208_IBC_ADAPT_FOR_CAM_CAPTURED_CONTENTS
-    static std::vector<Mv> cMvdFiltered;
+    static thread_local std::vector<Mv> cMvdFiltered;
     cMvdFiltered.resize(0);
 #else
     std::vector<Mv> cMvdFiltered;

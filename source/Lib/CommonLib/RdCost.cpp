@@ -157,6 +157,11 @@ void RdCost::lambdaAdjustColorTrans(bool forward, ComponentID componentID)
 // Initialize Function Pointer by [eDFunc]
 void RdCost::init()
 {
+  // the static function table is set up once, by the first RdCost: later ones are created while others are in use
+  // (decoder threads), and its scalar entries, written before the SIMD ones, do not all give the same results
+  static bool s_distortFuncsSet = false;
+  if( !s_distortFuncsSet )
+  {
   m_afpDistortFunc[DF_SSE    ] = RdCost::xGetSSE;
   m_afpDistortFunc[DF_SSE2   ] = RdCost::xGetSSE;
   m_afpDistortFunc[DF_SSE4   ] = RdCost::xGetSSE4;
@@ -244,6 +249,8 @@ void RdCost::init()
   initRdCostX86();
 #endif
 #endif
+  s_distortFuncsSet = true;
+  }
 
   m_costMode                   = COST_STANDARD_LOSSY;
 
@@ -3929,10 +3936,11 @@ Distortion RdCost::xGetSSE64_WTD( const DistParam &rcDtParam )
 #endif
 
 
-Pel orgCopy[MAX_CU_SIZE * MAX_CU_SIZE];
-
 #if _OPENMP
+Pel orgCopy[MAX_CU_SIZE * MAX_CU_SIZE];
 #pragma omp threadprivate(orgCopy)
+#else
+static thread_local Pel orgCopy[MAX_CU_SIZE * MAX_CU_SIZE];   // per thread: pictures are decoded in parallel
 #endif
 
 Distortion RdCost::xGetMRHADs( const DistParam &rcDtParam )

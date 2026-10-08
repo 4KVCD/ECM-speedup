@@ -102,6 +102,7 @@ struct Picture : public UnitArea
 {
   uint32_t margin;
   Picture();
+  ~Picture();
 
 void create(
     const bool rprEnabled,
@@ -377,6 +378,8 @@ public:
   CodingStructure*   cs;
   std::deque<Slice*> slices;
   SEIMessages        SEIs;
+  XUCache*           unitCache = nullptr;   ///< CU / PU / TU cache of cs, owned (null: g_globalUnitCache); the decoder gives each
+                                            ///< picture its own, pictures being decoded in parallel threads
 
   uint32_t           getPicWidthInLumaSamples() const                                { return  getRecoBuf( COMPONENT_Y ).width; }
   uint32_t           getPicHeightInLumaSamples() const                               { return  getRecoBuf( COMPONENT_Y ).height; }

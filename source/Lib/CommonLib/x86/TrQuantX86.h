@@ -800,6 +800,12 @@ void TrQuant::_initTrQuantX86()
   m_computeInvNspt = computeInvNspt_SIMD<vext>;
 #endif
 #if TRANSFORM_SIMD_OPT
+  // the kernel tables are static: written once, as the decoder initializes its transforms for every picture while
+  // other pictures are decoded in other threads
+  static bool s_kernelsSet = false;
+  if( !s_kernelsSet )
+  {
+  s_kernelsSet = true;
 #if TU_256
   m_forwardTransformKernels =
   { {
@@ -834,7 +840,8 @@ void TrQuant::_initTrQuantX86()
 #endif
 #endif
   } };
-  
+  }
+
   fastFwdTrans[0][0] = fastForwardTransform_SIMD<DCT2, 2>;
   fastFwdTrans[0][1] = fastForwardTransform_SIMD<DCT2, 4>;
   fastFwdTrans[0][2] = fastForwardTransform_SIMD<DCT2, 8>;
@@ -1016,6 +1023,7 @@ void TrQuant::_initTrQuantX86()
     { nullptr,                              g_trCoreDCT8P4[TRANSFORM_INVERSE][0], g_trCoreDCT8P8[TRANSFORM_INVERSE][0], g_trCoreDCT8P16[TRANSFORM_INVERSE][0], g_trCoreDCT8P32[TRANSFORM_INVERSE][0], nullptr },
     { nullptr,                              g_trCoreDST7P4[TRANSFORM_INVERSE][0], g_trCoreDST7P8[TRANSFORM_INVERSE][0], g_trCoreDST7P16[TRANSFORM_INVERSE][0], g_trCoreDST7P32[TRANSFORM_INVERSE][0], nullptr },
   } };
+  }
 
   fastFwdTrans[0][0] = fastForwardTransform_SIMD<DCT2, 2>;
   fastFwdTrans[0][1] = fastForwardTransform_SIMD<DCT2, 4>;

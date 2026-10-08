@@ -1251,7 +1251,7 @@ bool IntraPrediction::xFillIntraGPMRefTemplate(PredictionUnit& pu, TemplateType 
   m_abFilledIntraGPMRefTpl[intraMode] = true;
 
   const uint32_t uiPredStride = MAX_CU_SIZE + DIMD_MAX_TEMP_SIZE;
-  static Pel predLuma[uiPredStride * uiPredStride];
+  static thread_local Pel predLuma[uiPredStride * uiPredStride];
   
   int iTempWidth  = GEO_MODE_SEL_TM_SIZE;
   int iTempHeight = GEO_MODE_SEL_TM_SIZE;
@@ -8240,9 +8240,9 @@ void IntraPrediction::geneChromaFusionPred(const ComponentID compId, PelBuf &piP
     if (pu.cs->slice->isIntra())
     {
       const int  bitDepth = pu.cu->slice->getSPS()->getBitDepth(CHANNEL_TYPE_LUMA);
-      static int                        modelThr       = 0;
-      static CccmModel cccmModelCb[2] = { CccmModel( CCCM_NUM_PARAMS, bitDepth), CccmModel( CCCM_NUM_PARAMS, bitDepth) };
-      static CccmModel cccmModelCr[2] = { CccmModel( CCCM_NUM_PARAMS, bitDepth), CccmModel( CCCM_NUM_PARAMS, bitDepth) };
+      static thread_local int                        modelThr       = 0;
+      static thread_local CccmModel cccmModelCb[2] = { CccmModel( CCCM_NUM_PARAMS, bitDepth), CccmModel( CCCM_NUM_PARAMS, bitDepth) };
+      static thread_local CccmModel cccmModelCr[2] = { CccmModel( CCCM_NUM_PARAMS, bitDepth), CccmModel( CCCM_NUM_PARAMS, bitDepth) };
 
       if (compId == COMPONENT_Cb)
       {
@@ -8297,8 +8297,8 @@ void IntraPrediction::geneChromaFusionPred(const ComponentID compId, PelBuf &piP
   }
 #else
 #if JVET_AD0120_LBCCP
-  static int cclmSAD  = MAX_INT;
-  static int cccmSAD  = MAX_INT;
+  static thread_local int cclmSAD  = MAX_INT;
+  static thread_local int cccmSAD  = MAX_INT;
 #if JVET_AA0057_CCCM
 #if JVET_AE0174_NONINTER_TM_TOOLS_CONTROL
   if (pu.cs->slice->isIntra() && PU::cccmMultiModeAvail(pu, MMLM_CHROMA_IDX) && pu.cs->sps->getTMnoninterToolsEnableFlag())
@@ -8311,11 +8311,11 @@ void IntraPrediction::geneChromaFusionPred(const ComponentID compId, PelBuf &piP
     const int  bitDepth = pu.cu->slice->getSPS()->getBitDepth(CHANNEL_TYPE_LUMA);
     const CompArea                   &areaCb = pu2.blocks[COMPONENT_Cb];
     const CompArea                   &areaCr = pu2.blocks[COMPONENT_Cr];
-    static CclmModel                  cclmModelCb;
-    static CclmModel                  cclmModelCr;
-    static int                        modelThr       = 0;
-    static CccmModel cccmModelCb[2] = { CccmModel( CCCM_NUM_PARAMS, bitDepth), CccmModel( CCCM_NUM_PARAMS, bitDepth) };
-    static CccmModel cccmModelCr[2] = { CccmModel( CCCM_NUM_PARAMS, bitDepth), CccmModel( CCCM_NUM_PARAMS, bitDepth) };
+    static thread_local CclmModel                  cclmModelCb;
+    static thread_local CclmModel                  cclmModelCr;
+    static thread_local int                        modelThr       = 0;
+    static thread_local CccmModel cccmModelCb[2] = { CccmModel( CCCM_NUM_PARAMS, bitDepth), CccmModel( CCCM_NUM_PARAMS, bitDepth) };
+    static thread_local CccmModel cccmModelCr[2] = { CccmModel( CCCM_NUM_PARAMS, bitDepth), CccmModel( CCCM_NUM_PARAMS, bitDepth) };
 
     if (compId == COMPONENT_Cb)
     {
@@ -11017,9 +11017,9 @@ void IntraPrediction::predTimdIntraAng( const ComponentID compId, const Predicti
 void IntraPrediction::xPredTimdIntraPlanar( const CPelBuf &pSrc, Pel* rpDst, int iDstStride, int width, int height, TemplateType eTempType, int iTemplateWidth, int iTemplateHeight )
 {
 #if JVET_AJ0146_TIMDSAD
-  static int leftColumn[MAX_CU_SIZE+TIMDDIFF_MAX_TEMP_SIZE+1] = {0}, topRow[MAX_CU_SIZE+TIMDDIFF_MAX_TEMP_SIZE+1] ={0}, bottomRow[MAX_CU_SIZE+TIMDDIFF_MAX_TEMP_SIZE] = {0}, rightColumn[MAX_CU_SIZE+TIMDDIFF_MAX_TEMP_SIZE]={0};
+  static thread_local int leftColumn[MAX_CU_SIZE+TIMDDIFF_MAX_TEMP_SIZE+1] = {0}, topRow[MAX_CU_SIZE+TIMDDIFF_MAX_TEMP_SIZE+1] ={0}, bottomRow[MAX_CU_SIZE+TIMDDIFF_MAX_TEMP_SIZE] = {0}, rightColumn[MAX_CU_SIZE+TIMDDIFF_MAX_TEMP_SIZE]={0};
 #else
-  static int leftColumn[MAX_CU_SIZE+DIMD_MAX_TEMP_SIZE+1] = {0}, topRow[MAX_CU_SIZE+DIMD_MAX_TEMP_SIZE+1] ={0}, bottomRow[MAX_CU_SIZE+DIMD_MAX_TEMP_SIZE] = {0}, rightColumn[MAX_CU_SIZE+DIMD_MAX_TEMP_SIZE]={0};
+  static thread_local int leftColumn[MAX_CU_SIZE+DIMD_MAX_TEMP_SIZE+1] = {0}, topRow[MAX_CU_SIZE+DIMD_MAX_TEMP_SIZE+1] ={0}, bottomRow[MAX_CU_SIZE+DIMD_MAX_TEMP_SIZE] = {0}, rightColumn[MAX_CU_SIZE+DIMD_MAX_TEMP_SIZE]={0};
 #endif
   if(eTempType == LEFT_ABOVE_NEIGHBOR)
   {
@@ -11338,8 +11338,8 @@ void IntraPrediction::xPredTimdIntraAng( const CPelBuf &pSrc, const ClpRng& clpR
   Pel * refAbove = m_tempRefAbove;
   Pel * refLeft  = m_tempRefLeft;
 #else
-  static Pel  refAbove[2 * MAX_CU_SIZE + 5 + 33 * MAX_REF_LINE_IDX];
-  static Pel  refLeft[2 * MAX_CU_SIZE + 5 + 33 * MAX_REF_LINE_IDX];
+  static thread_local Pel  refAbove[2 * MAX_CU_SIZE + 5 + 33 * MAX_REF_LINE_IDX];
+  static thread_local Pel  refLeft[2 * MAX_CU_SIZE + 5 + 33 * MAX_REF_LINE_IDX];
 #endif
 
   // Initialize the Main and Left reference array.
@@ -11388,10 +11388,10 @@ void IntraPrediction::xPredTimdIntraAng( const CPelBuf &pSrc, const ClpRng& clpR
 
   // swap width/height if we are doing a horizontal mode:
 #if JVET_AJ0146_TIMDSAD
-  static Pel tempArray[(MAX_CU_SIZE+TIMDDIFF_MAX_TEMP_SIZE)*(MAX_CU_SIZE+TIMDDIFF_MAX_TEMP_SIZE)];  ///< buffer size may not be big enough
+  static thread_local Pel tempArray[(MAX_CU_SIZE+TIMDDIFF_MAX_TEMP_SIZE)*(MAX_CU_SIZE+TIMDDIFF_MAX_TEMP_SIZE)];  ///< buffer size may not be big enough
   const int dstStride = bIsModeVer ? iDstStride : (MAX_CU_SIZE+TIMDDIFF_MAX_TEMP_SIZE);
 #else
-  static Pel tempArray[(MAX_CU_SIZE+DIMD_MAX_TEMP_SIZE)*(MAX_CU_SIZE+DIMD_MAX_TEMP_SIZE)];  ///< buffer size may not be big enough
+  static thread_local Pel tempArray[(MAX_CU_SIZE+DIMD_MAX_TEMP_SIZE)*(MAX_CU_SIZE+DIMD_MAX_TEMP_SIZE)];  ///< buffer size may not be big enough
   const int dstStride = bIsModeVer ? iDstStride : (MAX_CU_SIZE+DIMD_MAX_TEMP_SIZE);
 #endif
   Pel *pDst = bIsModeVer ? pTrueDst : tempArray;
@@ -12870,7 +12870,7 @@ int IntraPrediction::deriveSgpmBlending(PredictionUnit& pu, PelBuf &predBuf0, Pe
   const int channelBitDepth = pu.cs->sps->getBitDepth(CHANNEL_TYPE_LUMA);
 
   Pel(*A)[CCCM_REF_SAMPLES_MAX] = m_a;
-  static Pel Y[BCW_MAX_REF_SAMPLES];
+  static thread_local Pel Y[BCW_MAX_REF_SAMPLES];
 
   int sampleNum = 0;
   const int iTempWidth = SGPM_TEMPLATE_SIZE, iTempHeight = SGPM_TEMPLATE_SIZE;
@@ -14666,7 +14666,7 @@ int IntraPrediction::getBestNonAnglularMode(const CPelBuf& recoBuf, const CompAr
   SizeType uiWidth = cu.lwidth();
   SizeType uiHeight = cu.lheight();
 
-  static Pel predLuma[(MAX_CU_SIZE + DIMD_MAX_TEMP_SIZE) * (MAX_CU_SIZE + DIMD_MAX_TEMP_SIZE)];
+  static thread_local Pel predLuma[(MAX_CU_SIZE + DIMD_MAX_TEMP_SIZE) * (MAX_CU_SIZE + DIMD_MAX_TEMP_SIZE)];
   memset(predLuma, 0, (MAX_CU_SIZE + DIMD_MAX_TEMP_SIZE) * (MAX_CU_SIZE + DIMD_MAX_TEMP_SIZE) * sizeof(Pel));
   Pel* piPred = predLuma;
   uint32_t uiPredStride = MAX_CU_SIZE + DIMD_MAX_TEMP_SIZE;
@@ -17368,7 +17368,7 @@ int IntraPrediction::deriveTimdMode( const CPelBuf &recoBuf, const CompArea &are
   SizeType uiWidth = cu.lwidth();
   SizeType uiHeight = cu.lheight();
 
-  static Pel predLuma[(MAX_CU_SIZE + DIMD_MAX_TEMP_SIZE) * (MAX_CU_SIZE + DIMD_MAX_TEMP_SIZE)];
+  static thread_local Pel predLuma[(MAX_CU_SIZE + DIMD_MAX_TEMP_SIZE) * (MAX_CU_SIZE + DIMD_MAX_TEMP_SIZE)];
   memset(predLuma, 0, (MAX_CU_SIZE + DIMD_MAX_TEMP_SIZE) * (MAX_CU_SIZE + DIMD_MAX_TEMP_SIZE) * sizeof(Pel));
   Pel* piPred = predLuma;
   uint32_t uiPredStride = MAX_CU_SIZE + DIMD_MAX_TEMP_SIZE;
@@ -19206,7 +19206,7 @@ void IntraPrediction::reorderIntraMergeCand(const CompArea& area, CodingUnit& cu
   SizeType uiWidth = cu.lwidth();
   SizeType uiHeight = cu.lheight();
 
-  static Pel predLuma[(MAX_CU_SIZE + DIMD_MAX_TEMP_SIZE) * (MAX_CU_SIZE + DIMD_MAX_TEMP_SIZE)];
+  static thread_local Pel predLuma[(MAX_CU_SIZE + DIMD_MAX_TEMP_SIZE) * (MAX_CU_SIZE + DIMD_MAX_TEMP_SIZE)];
   Pel* piPred = predLuma;
   int iCurX = cu.lx();
   int iCurY = cu.ly();
@@ -23057,7 +23057,7 @@ void IntraPrediction::deriveBvgDimdMode(const CPelBuf &recoBuf, const CompArea &
   }
 
   const int foundCandNum = m_bvDimdNum;
-  static int iDiff[BVG_DIMD_BV_LIST_SIZE];
+  static thread_local int iDiff[BVG_DIMD_BV_LIST_SIZE];
   for (int i = 0; i < foundCandNum; i++)
   {
     iDiff[i] = m_bvDimdWeight[i];
@@ -29001,7 +29001,7 @@ void IntraPrediction::xTMPBuildFusionCandidate(CodingUnit &cu, RefTemplateType t
       if (isConversionNeeded)
       {
 #endif
-      static int iDiff[TMP_FUSION_NUM];
+      static thread_local int iDiff[TMP_FUSION_NUM];
 #if JVET_AG0136_INTRA_TMP_LIC
 #if JVET_AM0229_INTRATMP_SUBMODES_DEPENDING
       const int offset = tmpFusionInfo.tmpFusionIdx;
@@ -33107,7 +33107,7 @@ int IntraPrediction::xComputeBlendFusionModelJoint( const PredictionUnit& pu, co
   PelBuf predBuf1Cr( ccpFusionTempCr[1], maxSize, Size(maxSize, 2) );
 
   Pel(*A)[CCCM_REF_SAMPLES_MAX] = m_a;
-  static Pel Y[BCW_MAX_REF_SAMPLES];
+  static thread_local Pel Y[BCW_MAX_REF_SAMPLES];
 
   int sampleNum = 0;
   for (int iComp = 0; iComp < 2; iComp++)
@@ -34916,8 +34916,8 @@ void IntraPrediction::predCCPCandidate(PredictionUnit &pu, PelBuf &predCb, PelBu
       if (pu.ccpMergeFusionType == 0)
       {
         const int                         bitDepth = pu.cu->slice->getSPS()->getBitDepth(CHANNEL_TYPE_LUMA);
-        static CccmModel cccmModelCb[2] = { CccmModel(CCCM_NUM_PARAMS, bitDepth), CccmModel(CCCM_NUM_PARAMS, bitDepth) };
-        static CccmModel cccmModelCr[2] = { CccmModel(CCCM_NUM_PARAMS, bitDepth), CccmModel(CCCM_NUM_PARAMS, bitDepth) };
+        static thread_local CccmModel cccmModelCb[2] = { CccmModel(CCCM_NUM_PARAMS, bitDepth), CccmModel(CCCM_NUM_PARAMS, bitDepth) };
+        static thread_local CccmModel cccmModelCr[2] = { CccmModel(CCCM_NUM_PARAMS, bitDepth), CccmModel(CCCM_NUM_PARAMS, bitDepth) };
 
         pu2.cccmFlag = 1;
 #if JVET_AC0054_GLCCCM
@@ -34929,7 +34929,7 @@ void IntraPrediction::predCCPCandidate(PredictionUnit &pu, PelBuf &predCb, PelBu
 #if MMLM
         pu2.intraDir[1] = MMLM_CHROMA_IDX;
 
-        static int modelThr = 0;
+        static thread_local int modelThr = 0;
 
         modelThr = xCccmCalcRefAver(pu2);
         xCccmCalcModels(pu2, cccmModelCb[0], cccmModelCr[0], 1, modelThr);
@@ -35740,7 +35740,7 @@ void IntraPrediction::adjustCCPCandidates(PredictionUnit &pu, CCPModelCandidate 
   PelBuf chromaRecoCb = cs.picture->getRecoBuf(pu.Cb());
   PelBuf chromaRecoCr = cs.picture->getRecoBuf(pu.Cr());
   const int bitDepth = pu.cu->slice->getSPS()->getBitDepth(CHANNEL_TYPE_LUMA);
-  static CccmModel cccmModel[2][5][2] = {
+  static thread_local CccmModel cccmModel[2][5][2] = {
             { { CccmModel( CCCM_NUM_PARAMS, bitDepth ), CccmModel( CCCM_NUM_PARAMS, bitDepth ) },
               { CccmModel( INTER_CCCM_NUM_PARAMS, bitDepth ), CccmModel( INTER_CCCM_NUM_PARAMS, bitDepth ) },
               { CccmModel( CCCM_MULTI_PRED_FILTER_NUM_PARAMS, bitDepth ), CccmModel( CCCM_MULTI_PRED_FILTER_NUM_PARAMS, bitDepth) },
@@ -35986,7 +35986,7 @@ void IntraPrediction::xInterCccmApplyModelOffset(const PredictionUnit& pu, const
   CHECK(!pu.cccmNoSubFlag, "cccmNoSubFlag shall be enabled");
 
   const ClpRng& clpRng(pu.cu->cs->slice->clpRng(compId));
-  static Pel    samples[INTER_CCCM_NUM_PARAMS];
+  static thread_local Pel    samples[INTER_CCCM_NUM_PARAMS];
 
   const PelBuf  refLumaBlk = xCccmGetLumaPuBuf(pu);
   const int chromaScaleX = getChannelTypeScaleX(CHANNEL_TYPE_CHROMA, pu.cu->slice->getSPS()->getChromaFormatIdc());
@@ -36022,7 +36022,7 @@ int IntraPrediction::xGetCostInterCccm(const PredictionUnit& pu, const Component
 {
   CHECK(!pu.cccmNoSubFlag, "cccmNoSubFlag shall be enabled");
   const ClpRng& clpRng(pu.cu->cs->slice->clpRng(compID));
-  static Pel samples[INTER_CCCM_NUM_PARAMS];
+  static thread_local Pel samples[INTER_CCCM_NUM_PARAMS];
 
   CPelBuf   refLumaBlk = xCccmGetLumaPuBuf(pu);
   const int chromaScaleX = getChannelTypeScaleX(CHANNEL_TYPE_CHROMA, pu.cu->slice->getSPS()->getChromaFormatIdc());
@@ -36388,12 +36388,12 @@ uint32_t IntraPrediction::xCalculateCCLMcost(const PredictionUnit &pu, const Com
   const ChannelType chType = toChannelType(compID);
   DistParam cDistParam;
   cDistParam.applyWeight = false;
-  static Pel predChromaA[MAX_CU_SIZE];
-  static Pel predChromaL[MAX_CU_SIZE];
+  static thread_local Pel predChromaA[MAX_CU_SIZE];
+  static thread_local Pel predChromaL[MAX_CU_SIZE];
   PelBuf predTop(predChromaA, cWidth, 1);
   PelBuf predLeft(predChromaL, 1, cHeight);
-  static Pel reconChromaA[MAX_CU_SIZE];
-  static Pel reconChromaL[MAX_CU_SIZE];
+  static thread_local Pel reconChromaA[MAX_CU_SIZE];
+  static thread_local Pel reconChromaL[MAX_CU_SIZE];
   PelBuf reconTop(reconChromaA, cWidth, 1);
   PelBuf reconLeft(reconChromaL, 1, cHeight);
 #endif
@@ -36604,12 +36604,12 @@ uint32_t IntraPrediction::xCalculateCCCMcost(const PredictionUnit &pu, const Com
   const ChannelType chType = toChannelType(compID);
   DistParam cDistParam;
   cDistParam.applyWeight = false;
-  static Pel predChromaA[MAX_CU_SIZE];
-  static Pel predChromaL[MAX_CU_SIZE];
+  static thread_local Pel predChromaA[MAX_CU_SIZE];
+  static thread_local Pel predChromaL[MAX_CU_SIZE];
   PelBuf predTop(predChromaA, cWidth, 1);
   PelBuf predLeft(predChromaL, 1, cHeight);
-  static Pel reconChromaA[MAX_CU_SIZE];
-  static Pel reconChromaL[MAX_CU_SIZE];
+  static thread_local Pel reconChromaA[MAX_CU_SIZE];
+  static thread_local Pel reconChromaL[MAX_CU_SIZE];
   PelBuf reconTop(reconChromaA, cWidth, 1);
   PelBuf reconLeft(reconChromaL, 1, cHeight);
 #endif
@@ -38953,7 +38953,7 @@ void IntraPrediction::xCccmCalcRefArea(const PredictionUnit& pu, CompArea chroma
   const int  numAboveRightUnits = totalAboveUnits - numAboveUnits;
   const int  numLeftBelowUnits  = totalLeftUnits - numLeftUnits;
 
-  static bool neighborFlags[4 * MAX_NUM_PART_IDXS_IN_CTU_WIDTH + 1] = { false }; // Just a dummy array here, content not used
+  static thread_local bool neighborFlags[4 * MAX_NUM_PART_IDXS_IN_CTU_WIDTH + 1] = { false }; // Just a dummy array here, content not used
 
   int avaiAboveRightUnits = isAboveRightAvailable( cu, chType, chromaArea.topRight(),   numAboveRightUnits, unitWidth,  (neighborFlags + totalLeftUnits + 1 + numAboveUnits) );
   int avaiLeftBelowUnits  = isBelowLeftAvailable ( cu, chType, chromaArea.bottomLeft(), numLeftBelowUnits,  unitHeight, (neighborFlags + totalLeftUnits - 1 - numLeftUnits) );
@@ -39571,7 +39571,7 @@ void IntraPrediction::xCflmCalcRefArea(const PredictionUnit& pu, const CompArea&
   const int  numAboveRightUnits = totalAboveUnits - numAboveUnits;
   const int  numLeftBelowUnits = totalLeftUnits - numLeftUnits;
 
-  static bool neighborFlags[4 * MAX_NUM_PART_IDXS_IN_CTU_WIDTH + 1] = { false }; // Just a dummy array here, content not used
+  static thread_local bool neighborFlags[4 * MAX_NUM_PART_IDXS_IN_CTU_WIDTH + 1] = { false }; // Just a dummy array here, content not used
 
   int avaiAboveRightUnits = isAboveRightAvailable(cu, chType, chromaArea.topRight(), numAboveRightUnits, unitWidth, (neighborFlags + totalLeftUnits + 1 + numAboveUnits));
   int avaiLeftBelowUnits = isBelowLeftAvailable(cu, chType, chromaArea.bottomLeft(), numLeftBelowUnits, unitHeight, (neighborFlags + totalLeftUnits - 1 - numLeftUnits));
@@ -41041,7 +41041,7 @@ void IntraPrediction::xGlmCalcRefArea(const PredictionUnit& pu, CompArea chromaA
   const int  numAboveRightUnits = totalAboveUnits - numAboveUnits;
   const int  numLeftBelowUnits = totalLeftUnits - numLeftUnits;
 
-  static bool neighborFlags[4 * MAX_NUM_PART_IDXS_IN_CTU_WIDTH + 1] = { false }; // Just a dummy array here, content not used
+  static thread_local bool neighborFlags[4 * MAX_NUM_PART_IDXS_IN_CTU_WIDTH + 1] = { false }; // Just a dummy array here, content not used
 
   int avaiAboveRightUnits = isAboveRightAvailable(cu, chType, chromaArea.topRight(), numAboveRightUnits, unitWidth, (neighborFlags + totalLeftUnits + 1 + numAboveUnits));
   int avaiLeftBelowUnits = isBelowLeftAvailable(cu, chType, chromaArea.bottomLeft(), numLeftBelowUnits, unitHeight, (neighborFlags + totalLeftUnits - 1 - numLeftUnits));
@@ -42212,7 +42212,7 @@ void IntraPrediction::xPredTmrlIntraAng(const CPelBuf& pSrc, const ClpRng& clpRn
     std::swap(uiTemplateAbove, uiTemplateLeft);
   }
   const int iAreaSize = MAX_CU_SIZE + TMRL_TPL_SIZE;
-  static Pel tempArray[iAreaSize * iAreaSize];
+  static thread_local Pel tempArray[iAreaSize * iAreaSize];
   const int dstStride = iDstStride;
   Pel* pDstBuf = bIsModeVer ? pTrueDst : tempArray;
 
@@ -43294,7 +43294,7 @@ void IntraPrediction::initEipParams(const PredictionUnit& pu, const ComponentID 
   const int  numAboveRightUnits = totalAboveUnits - numAboveUnits;
   const int  numLeftBelowUnits = totalLeftUnits - numLeftUnits;
 
-  static bool neighborFlags[4 * MAX_NUM_PART_IDXS_IN_CTU_WIDTH + 1] = { false }; // Just a dummy array here, content not used
+  static thread_local bool neighborFlags[4 * MAX_NUM_PART_IDXS_IN_CTU_WIDTH + 1] = { false }; // Just a dummy array here, content not used
   int avaiAboveRightUnits = isAboveRightAvailable(cu, chType, area.topRight(), numAboveRightUnits, unitWidth, (neighborFlags + totalLeftUnits + 1 + numAboveUnits));
   int avaiLeftBelowUnits = isBelowLeftAvailable(cu, chType, area.bottomLeft(), numLeftBelowUnits, unitHeight, (neighborFlags + totalLeftUnits - 1 - numLeftUnits));
 

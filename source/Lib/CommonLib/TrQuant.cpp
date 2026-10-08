@@ -46,8 +46,10 @@
 #include "dtrace_buffer.h"
 
 #include <stdlib.h>
+#include <atomic>
 #include <limits>
 #include <memory.h>
+#include <mutex>
 #if defined( __SSE2__ )
 #include <emmintrin.h>
 #endif
@@ -62,6 +64,10 @@
 #ifndef SIGN_PRED_TEMPLATE_VERIFY
 #define SIGN_PRED_TEMPLATE_VERIFY 0   // 1: check xSignPredBorderTemplate against one xIT per position, and its kernels
 #endif
+
+// the sign prediction templates (g_resiBorderTemplate) are created when a picture first needs them; pictures are
+// decoded in parallel, so one thread creates each template
+static std::mutex s_signPredTemplateMutex;
 
 struct coeffGroupRDStats
 {
@@ -3198,6 +3204,7 @@ void TrQuant::predCoeffSigns(TransformUnit &tu, const ComponentID compID, const 
 
     int log2Width = floorLog2(width);
     int log2Height = floorLog2(height);
+    std::atomic_thread_fence( std::memory_order_release );   // the template before its pointer (read without the lock)
     g_resiBorderTemplate[log2Width-2][log2Height-2][mtsIdx] = templateBuf.buf;
 
     xFree(memCoeff);
@@ -3287,8 +3294,10 @@ void TrQuant::predCoeffSigns(TransformUnit &tu, const ComponentID compID, const 
     int  nsptBucketIdx = allowNSPT ? PU::getNSPTBucket(tu) : 0;
 #endif
 #endif
+    std::atomic_thread_fence( std::memory_order_release );   // the template before its pointer (read without the lock)
     g_resiBorderTemplateLFNST[nsptBucketIdx][log2Width - 2][log2Height - 2][lfnstIdx] = templateBuf.buf;
 #else
+    std::atomic_thread_fence( std::memory_order_release );
     g_resiBorderTemplateLFNST[log2Width - 2][log2Height - 2][lfnstIdx] = templateBuf.buf;
 #endif
 
@@ -3352,12 +3361,20 @@ void TrQuant::predCoeffSigns(TransformUnit &tu, const ComponentID compID, const 
 #endif
     if (!g_resiBorderTemplateLFNST[nsptBucketIdx][log2Width - 2][log2Height - 2][actualLfnstIdx])
     {
-      createTemplateLFNST(residCompID, uiWidth, uiHeight, actualLfnstIdx);
+      std::lock_guard<std::mutex> lock( s_signPredTemplateMutex );
+      if (!g_resiBorderTemplateLFNST[nsptBucketIdx][log2Width - 2][log2Height - 2][actualLfnstIdx])
+      {
+        createTemplateLFNST(residCompID, uiWidth, uiHeight, actualLfnstIdx);
+      }
     }
 #else
     if (!g_resiBorderTemplateLFNST[log2Width - 2][log2Height - 2][actualLfnstIdx])
     {
-      createTemplateLFNST(residCompID, uiWidth, uiHeight, actualLfnstIdx);
+      std::lock_guard<std::mutex> lock( s_signPredTemplateMutex );
+      if (!g_resiBorderTemplateLFNST[log2Width - 2][log2Height - 2][actualLfnstIdx])
+      {
+        createTemplateLFNST(residCompID, uiWidth, uiHeight, actualLfnstIdx);
+      }
     }
 #endif
   }
@@ -3411,7 +3428,11 @@ void TrQuant::predCoeffSigns(TransformUnit &tu, const ComponentID compID, const 
 #endif
     if (!g_resiBorderTemplate[log2Width - 2][log2Height - 2][actualTrIdx])
     {
-      createTemplate(residCompID, uiWidth, uiHeight, actualTrIdx);
+      std::lock_guard<std::mutex> lock( s_signPredTemplateMutex );
+      if (!g_resiBorderTemplate[log2Width - 2][log2Height - 2][actualTrIdx])
+      {
+        createTemplate(residCompID, uiWidth, uiHeight, actualTrIdx);
+      }
     }
   }
 #else
@@ -3426,7 +3447,11 @@ void TrQuant::predCoeffSigns(TransformUnit &tu, const ComponentID compID, const 
   int log2Height = floorLog2(uiHeight);
   if(!g_resiBorderTemplate[log2Width-2][log2Height-2][actualTrIdx])
   {
-    createTemplate(residCompID, uiWidth, uiHeight, actualTrIdx);
+    std::lock_guard<std::mutex> lock( s_signPredTemplateMutex );
+    if(!g_resiBorderTemplate[log2Width-2][log2Height-2][actualTrIdx])
+    {
+      createTemplate(residCompID, uiWidth, uiHeight, actualTrIdx);
+    }
   }
 #endif
 #if JVET_Y0141_SIGN_PRED_IMPROVE

@@ -717,6 +717,7 @@ Picture* DecLib::xGetNewPicBuffer( const SPS &sps, const PPS &pps, const uint32_
   if (m_cListPic.size() < (uint32_t)m_iMaxRefPicNum)
   {
     pcPic = new Picture();
+    pcPic->unitCache = new XUCache;   // own CU / PU / TU cache: pictures may be decoded in parallel threads
 
 
     pcPic->create(
@@ -762,6 +763,7 @@ Picture* DecLib::xGetNewPicBuffer( const SPS &sps, const PPS &pps, const uint32_
     m_iMaxRefPicNum++;
 
     pcPic = new Picture();
+    pcPic->unitCache = new XUCache;
 
     m_cListPic.push_back( pcPic );
 

@@ -5356,7 +5356,7 @@ int PU::getIntraMPMs(const PredictionUnit &pu, unsigned* mpm, const ChannelType 
 #if JVET_Z0056_GPM_SPLIT_MODE_REORDERING
 void PU::getGeoIntraMPMs(const PredictionUnit &pu, uint8_t* mpm, uint8_t splitDir, uint8_t shape, bool doInit, bool doInitAL, bool doInitA, bool doInitL)
 {
-  static uint8_t  partialMPMsAll[GEO_NUM_TM_MV_CAND - 1][GEO_MAX_NUM_INTRA_CANDS]; // [0] for above-left, [1] for above [1] for left
+  static thread_local uint8_t  partialMPMsAll[GEO_NUM_TM_MV_CAND - 1][GEO_MAX_NUM_INTRA_CANDS]; // [0] for above-left, [1] for above [1] for left
   if (doInit)
   {
     if (doInitAL)

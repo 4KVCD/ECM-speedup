@@ -217,6 +217,11 @@ Picture::Picture()
 #endif
 }
 
+Picture::~Picture()
+{
+  delete unitCache;   // after cs (destroy()), which returns its units to the cache
+}
+
 void Picture::create(
   const bool rprEnabled,
 #if JVET_Z0118_GDR
@@ -578,7 +583,8 @@ void Picture::finalInit( const VPS* vps, const SPS& sps, const PPS& pps, PicHead
 
   if (cs == nullptr)
   {
-    cs = new CodingStructure( g_globalUnitCache.cuCache, g_globalUnitCache.puCache, g_globalUnitCache.tuCache );
+    XUCache& uc = unitCache ? *unitCache : g_globalUnitCache;
+    cs = new CodingStructure( uc.cuCache, uc.puCache, uc.tuCache );
 #if JVET_Z0118_GDR
     cs->create(chromaFormatIDC, Area(0, 0, iWidth, iHeight), true, (bool)sps.getPLTMode(), sps.getGDREnabledFlag());
 #else

@@ -197,7 +197,11 @@ namespace
   int fillMapHeightWidthTargetModel(std::map<WidthHeight, int16_t> &mapHeightWidthTargetModelIndex, std::vector<PnnModel> &pnnModels)
   {
 #ifdef TARGET_SIMD_X86
-    ::vext = read_x86_extension_flags();
+    const X86_VEXT ext = read_x86_extension_flags();
+    if( ::vext != ext )   // written once: the models of other IntraPrediction objects may run in other threads
+    {
+      ::vext = ext;
+    }
 #endif
     for (auto &param: g_pnnModelParams)
     {

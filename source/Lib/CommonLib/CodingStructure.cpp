@@ -3663,7 +3663,7 @@ const CIpmBuf CodingStructure::getIpmBuf(const Area& _area, PictureType pt) cons
 uint8_t& CodingStructure::getIpmInfo(const Position& pos, PictureType pt)
 {
 #if JVET_Z0118_GDR
-  static uint8_t constIpm = 0;
+  static thread_local uint8_t constIpm = 0;
   
   if (!picContain(pos))
   {

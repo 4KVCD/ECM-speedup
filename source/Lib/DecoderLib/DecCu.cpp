@@ -1425,7 +1425,7 @@ void DecCu::xIntraRecBlk( TransformUnit& tu, const ComponentID compID )
       int candIdx = pu.idxNonLocalCCP - 1;
 
 #if JVET_AL0126_CCP_MERGE_WITH_ADJUST
-      static CCPModelCandidate cand[MAX_NUM_DERIVED_CCP_ADJUST_CAND];
+      static thread_local CCPModelCandidate cand[MAX_NUM_DERIVED_CCP_ADJUST_CAND];
       int candFlyNum = 0;
       int candNum = PU::getCCPModelCandidateList(pu, candList, false, 0, NULL, -1, &cand[0], candFlyNum);
       if (pu.ccpMergeAdjustFlag && candNum < MAX_CCP_CAND_LIST_INIT_SIZE)
@@ -7170,7 +7170,7 @@ void DecCu::xDeriveCUMV(CodingUnit &cu)
 #endif
             pu.bvdSuffixInfo.initPrefixes(mvd, pu.cu->imv, true);
 #if JVET_AD0208_IBC_ADAPT_FOR_CAM_CAPTURED_CONTENTS
-            static std::vector<Mv> cMvdDerivedVec;
+            static thread_local std::vector<Mv> cMvdDerivedVec;
             cMvdDerivedVec.resize(0);
 #else
             std::vector<Mv> cMvdDerivedVec;
