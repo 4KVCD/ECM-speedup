@@ -31792,7 +31792,30 @@ void EncCu::xCheckRDCostInterMultiHyp2Nx2N(CodingStructure *&tempCS, CodingStruc
   m_bestModeUpdated = tempCS->useDbCost = bestCS->useDbCost = false;
 
   MEResultVec mhResults;
-  const auto RDCostComp = [](const MEResult &x, const MEResult &y) { return x.cost < y.cost; };
+  // perf: the order of a stable sort by cost, found on (cost, index) pairs: the results themselves (each a CodingUnit
+  // and a PredictionUnit) are then copied once, and only the ones that are kept, instead of being moved by the sort
+  const auto costOrder = [](const MEResultVec &v)
+  {
+    std::vector<std::pair<Distortion, uint32_t>> order(v.size());
+    for (uint32_t i = 0; i < (uint32_t) v.size(); i++)
+    {
+      order[i] = { v[i].cost, i };
+    }
+    std::sort(order.begin(), order.end());
+    return order;
+  };
+  // the `keep` cheapest results of v, in stable cost order
+  const auto bestResults = [&costOrder](const MEResultVec &v, const size_t keep)
+  {
+    const auto  order = costOrder(v);
+    MEResultVec best;
+    best.reserve(std::min(keep, order.size()));
+    for (size_t i = 0; i < order.size() && i < keep; i++)
+    {
+      best.push_back(v[order[i].second]);
+    }
+    return best;
+  };
 
   MergeCtx mrgCtx;
   if (sps.getSbTMVPEnabledFlag())
@@ -31820,32 +31843,26 @@ void EncCu::xCheckRDCostInterMultiHyp2Nx2N(CodingStructure *&tempCS, CodingStruc
 
   // Hadamard-based pre-search
   {
-    MEResultVec base = m_baseResultsForMH;
-
-    if (base.empty())
+    if (m_baseResultsForMH.empty())
       return;
 
     tempCS->initStructData(encTestMode.qp);
     CodingUnit &cu = tempCS->addCU(tempCS->area, partitioner.chType);
     PredictionUnit &pu = tempCS->addPU(cu, partitioner.chType);
 
-    int iter = 0;
+    // the best base results, then repeatedly the 2 best of the previous round's results
+    // (a negative count kept every result, as the size_t comparison of the former resize did)
+    MEResultVec base = bestResults(m_baseResultsForMH, (size_t) m_pcEncCfg->getNumMHPCandsToTest());
     do
     {
       MEResultVec out;
-      const auto survivors = iter > 0 ? 2 : m_pcEncCfg->getNumMHPCandsToTest();
-      iter++;
-
-      stableSortSmall(base.begin(), base.end(), RDCostComp);
-      if (base.size() > survivors)
-        base.resize(survivors);
       predInterSearchAdditionalHypothesisMulti(base, out, pu, mrgCtx);
       mhResults.insert(mhResults.end(), out.begin(), out.end());
-      base = out;
+      base = bestResults(out, 2);
     } while (!base.empty());
   }
 
-  stableSortSmall(mhResults.begin(), mhResults.end(), RDCostComp);
+  const auto mhOrder = costOrder(mhResults);
 
   // actual testing with "true" RD costs
   for (int i = 0; i < std::min((int)mhResults.size(), m_pcEncCfg->getAddHypTries()); ++i)
@@ -31854,8 +31871,8 @@ void EncCu::xCheckRDCostInterMultiHyp2Nx2N(CodingStructure *&tempCS, CodingStruc
     CodingUnit &cu = tempCS->addCU(tempCS->area, partitioner.chType);
     PredictionUnit &pu = tempCS->addPU(cu, partitioner.chType);
 
-    pu = mhResults[i].pu;
-    cu = mhResults[i].cu;
+    pu = mhResults[mhOrder[i].second].pu;
+    cu = mhResults[mhOrder[i].second].cu;
 #if JVET_AD0213_LIC_IMP && !JVET_AF0190_RPR_TMP_REORDER_LIC
     if (cu.licFlag && !PU::checkRprLicCondition(pu))
     {
