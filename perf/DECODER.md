@@ -190,6 +190,17 @@ picture, index 0 / 1 alternating) found no difference and reports a wrong index-
 use it on most pictures (~2.2-2.6 ms on the CPU): single thread 1.14x (G4: 1.12x) and 1.17x (1.15x); all 19 streams
 1.08x.
 
+G6: the LF-CCCM kernel runs with 32-invocation workgroups instead of 64 (one subgroup on NVIDIA: cheaper barriers
+between its many steps, fewer idle invocations on the 4x4 windows): GPU time of the phase with the fixed filters and
+LF-CCCM 2.34 -> 1.88 ms per 720p RA ParkJoy picture; wall time unchanged (below the noise). The bilateral filter
+kernel stays at 64: with 32 it took 0.70 -> 1.28 ms per 720p AI FourPeople picture (Ampere runs at most 16 workgroups
+per SM, so 32-invocation groups halve its occupancy). Only raodd and ra_long use the 10- and 11-parameter models;
+a stress test (TEMP: random LF-CCCM parameters per CTU) covers them on all 9 streams with LF-CCCM. Verification:
+779 pictures, no difference; all 19 streams identical, also with 8 frame threads. LTO builds vs the CPU-only build,
+single thread: AI FourPeople 1.16x, AI ParkJoy 1.14x, RA ParkJoy 1.16x, all 19 streams 1.09x; vs the stock decoder
+(paired, 3 repetitions) AI FourPeople 1.32x, AI ParkJoy 1.32x, RA ParkJoy 1.47x, all 19 streams 1.47x wall time and
+1.42x CPU time (the short streams gain most from the faster start-up).
+
 ## Fixes found on the way
 
 - Decoding that starts at a CRA in the middle of an RA stream (`-s`, random access) crashed the stock decoder:

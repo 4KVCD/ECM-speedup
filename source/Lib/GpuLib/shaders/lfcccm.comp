@@ -15,7 +15,8 @@
 #extension GL_GOOGLE_include_directive : require
 #include "common.glsl"
 
-layout( local_size_x = 64 ) in;
+const int WG = 32;   // one subgroup on most devices: cheap barriers for the many small windows
+layout( local_size_x = WG ) in;
 
 layout( buffer_reference, std430, buffer_reference_align = 16 ) readonly buffer CtuList { uvec4 v[]; };
 
@@ -71,12 +72,12 @@ const int DECIM_BITS  = 16;   // DECIM_BITS( bit depth <= 10 )
 const int MATRIX_BITS = 28;   // solve3 with interCccmMode
 const int V_STRIDE    = 14;
 
-shared int     sV[64 * V_STRIDE];   // a chunk of sample vectors: features of the model, Cb, Cr
+shared int     sV[WG * V_STRIDE];   // a chunk of sample vectors: features of the model, Cb, Cr
 shared int64_t sAcc[90];            // ATA (upper triangle), ATCb, ATCr, row by row
 shared int64_t sRow[13];
 shared int64_t sMat[11 * 13];
 shared int64_t sParam[22];          // Cb, Cr
-shared int     sRed[64];
+shared int     sRed[WG];
 shared int     sFlag;
 
 int tid;
@@ -108,7 +109,7 @@ int sumAll( int v )
 {
   sRed[tid] = v;
   barrier();
-  for( int s = 32; s > 0; s >>= 1 )
+  for( int s = WG / 2; s > 0; s >>= 1 )
   {
     if( tid < s )
     {
@@ -175,21 +176,24 @@ void entryOf( int e, int m, out int i, out int j )
 }
 
 // lfCccmSumStatisticsDecoder + calcAeipGroupSum: ATA, ATCb, ATCr of the class samples of the regression window
+const int PER = ( 88 + WG - 1 ) / WG;   // entries per invocation (88 for 11 parameters)
+
 void accumulate( int type, int m, ivec4 r, int k, int s, int thr, int thrSR )
 {
   const int E = numEntries( m );
-  int       i0 = 0, j0 = 0, i1 = 0, j1 = 0;
-  if( tid < E )
+  int       ei[PER], ej[PER];
+  int64_t   acc[PER];
+  for( int q = 0; q < PER; q++ )
   {
-    entryOf( tid, m, i0, j0 );
+    ei[q] = ej[q] = 0;
+    acc[q]        = 0;
+    if( tid + q * WG < E )
+    {
+      entryOf( tid + q * WG, m, ei[q], ej[q] );
+    }
   }
-  if( tid + 64 < E )
-  {
-    entryOf( tid + 64, m, i1, j1 );
-  }
-  int64_t   acc0 = 0, acc1 = 0;
   const int area = r.z * r.w;
-  for( int base = 0; base < area; base += 64 )
+  for( int base = 0; base < area; base += WG )
   {
     const int idx = base + tid;
     bool      use = false;
@@ -208,34 +212,27 @@ void accumulate( int type, int m, ivec4 r, int k, int s, int thr, int thrSR )
     sV[tid * V_STRIDE + m]     = use ? ld( pc.cb, x, y ) : 0;
     sV[tid * V_STRIDE + m + 1] = use ? ld( pc.cr, x, y ) : 0;
     barrier();
-    const int cnt = min( 64, area - base );
-    if( tid < E )
+    const int cnt = min( WG, area - base );
+    for( int e = 0; e < PER; e++ )
     {
-      int sum = 0;   // at most 64 products below 2^20
-      for( int q = 0; q < cnt; q++ )
+      if( tid + e * WG < E )
       {
-        sum += sV[q * V_STRIDE + i0] * sV[q * V_STRIDE + j0];
+        int sum = 0;   // at most WG products below 2^20
+        for( int q = 0; q < cnt; q++ )
+        {
+          sum += sV[q * V_STRIDE + ei[e]] * sV[q * V_STRIDE + ej[e]];
+        }
+        acc[e] += sum;
       }
-      acc0 += sum;
-    }
-    if( tid + 64 < E )
-    {
-      int sum = 0;
-      for( int q = 0; q < cnt; q++ )
-      {
-        sum += sV[q * V_STRIDE + i1] * sV[q * V_STRIDE + j1];
-      }
-      acc1 += sum;
     }
     barrier();
   }
-  if( tid < E )
+  for( int e = 0; e < PER; e++ )
   {
-    sAcc[tid] = acc0;
-  }
-  if( tid + 64 < E )
-  {
-    sAcc[tid + 64] = acc1;
+    if( tid + e * WG < E )
+    {
+      sAcc[tid + e * WG] = acc[e];
+    }
   }
   barrier();
 }
@@ -359,7 +356,7 @@ bool applyModel( int type, int m, ivec4 w, int k, int s, int thr, int thrSR, int
   }
   barrier();
   bool bad = false;
-  for( int idx = tid; idx < w.z * w.w; idx += 64 )
+  for( int idx = tid; idx < w.z * w.w; idx += WG )
   {
     const int x = w.x + idx % w.z;
     const int y = w.y + idx / w.z;
@@ -423,7 +420,7 @@ bool applyModel( int type, int m, ivec4 w, int k, int s, int thr, int thrSR, int
 // the class samples of the window keep the reconstruction (lfCccmDealWithBadWindow)
 void keep( ivec4 w, int k, int s, int thr, int thrSR )
 {
-  for( int idx = tid; idx < w.z * w.w; idx += 64 )
+  for( int idx = tid; idx < w.z * w.w; idx += WG )
   {
     const int x = w.x + idx % w.z;
     const int y = w.y + idx / w.z;
@@ -533,7 +530,7 @@ void main()
 
   // lfCccmSetMultiModelParameters: the rounded average of the regression window
   int sum = 0;
-  for( int idx = tid; idx < r.z * r.w; idx += 64 )
+  for( int idx = tid; idx < r.z * r.w; idx += WG )
   {
     sum += ld( pc.ds, r.x + idx % r.z, r.y + idx / r.z );
   }
@@ -555,7 +552,7 @@ void main()
     }
     // lfCccmSetMultiModelParametersSR: the rounded average of the class in the regression window
     int classSum = 0, classCnt = 0;
-    for( int idx = tid; idx < area; idx += 64 )
+    for( int idx = tid; idx < area; idx += WG )
     {
       const int d = ld( pc.ds, r.x + idx % r.z, r.y + idx / r.z );
       if( inClass( d, k, 0, thr, 0 ) )
