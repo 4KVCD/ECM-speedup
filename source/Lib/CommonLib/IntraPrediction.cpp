@@ -87,6 +87,127 @@ const uint8_t IntraPrediction::m_aucIntraFilterExt[MAX_INTRA_FILTER_DEPTHS] =
 #endif
 
 // ====================================================================================================================
+// perf: AVX2 application of cross-shaped linear models (CccmModel)
+// ====================================================================================================================
+
+#if defined( __AVX2__ ) && JVET_AJ0237_INTERNAL_12BIT
+#define CCCM_MODEL_AVX2 1
+#else
+#define CCCM_MODEL_AVX2 0
+#endif
+// the CCCM model application with AVX2 also needs these CCCM variants' flags
+#if CCCM_MODEL_AVX2 && JVET_AD0202_CCCM_MDF && JVET_AC0147_CCCM_NO_SUBSAMPLING
+#define CCCM_APPLY_AVX2 ( JVET_AC0054_GLCCCM || JVET_AG0154_DECODER_DERIVED_CCP_FUSION )
+#else
+#define CCCM_APPLY_AVX2 0
+#endif
+
+#if CCCM_MODEL_AVX2
+// whether all model parameters fit in 32 bits (cccmApplyCrossRowAvx2 multiplies them with _mm256_mul_epi32)
+static bool cccmParamsFit32( const CccmModel& model )
+{
+  for( const TCccmCoeff p: model.params )
+  {
+    if( p < INT32_MIN || p > INT32_MAX )
+    {
+      return false;
+    }
+  }
+  return true;
+}
+
+#ifdef CCCMAPPLY_CHECK
+static struct CccmApplyCheckStat
+{
+  unsigned long long rows[3] = {}, samples[3] = {};
+  ~CccmApplyCheckStat()
+  {
+    fprintf( stderr, "CCCMAPPLY_CHECK rows/samples compared: plain %llu/%llu, offset %llu/%llu, TMP filter %llu/%llu\n",
+             rows[0], samples[0], rows[1], samples[1], rows[2], samples[2] );
+  }
+} g_cccmApplyCheckStat;
+#endif
+
+// perf: the cross-shaped model (C, N, S, W, E, with NL nonlinear(C), bias: 7 or 6 parameters) for 4 samples of a row
+// per step, with the int64 products and sums of CccmModel::convolve: _mm256_mul_epi32 multiplies the parameters
+// (they must fit in 32 bits) by the sign-extended 16-bit samples. The Pel the scalar code makes of the rounded sum is
+// its low 16 bits, which a logical shift leaves as the arithmetic one does. With OFFSET, the luma samples are
+// Pel(luma + lumaOffset) (the model threshold compares the int sum) and the result is Pel(result + outOffset), as in
+// xCccmApplyModelOffset. Samples the model threshold excludes keep their value. Returns the number of samples done
+// (a multiple of 4).
+template<bool OFFSET, bool NL>
+static int cccmApplyCrossRowAvx2( const Pel* lumaRow, const ptrdiff_t lumaStride, const int width, const CccmModel& model,
+                                  const int lumaOffset, const int outOffset, const int modelId, const int modelThr,
+                                  const ClpRng& clp, Pel* pred )
+{
+  const TCccmCoeff* prm   = model.params.data();
+  const __m256i     p0    = _mm256_set1_epi64x( prm[0] );
+  const __m256i     p1    = _mm256_set1_epi64x( prm[1] );
+  const __m256i     p2    = _mm256_set1_epi64x( prm[2] );
+  const __m256i     p3    = _mm256_set1_epi64x( prm[3] );
+  const __m256i     p4    = _mm256_set1_epi64x( prm[4] );
+  const __m256i     p5    = _mm256_set1_epi64x( NL ? prm[5] : 0 );
+  // bias term and rounding offset
+  const __m256i     base  = _mm256_set1_epi64x( prm[NL ? 6 : 5] * model.bias() + model.decimRound );
+  const __m128i     mid   = _mm_set1_epi32( model.midVal );
+  const __m128i     lOff  = _mm_set1_epi32( lumaOffset );
+  const __m128i     oOff  = _mm_set1_epi32( outOffset );
+  const __m128i     thr   = _mm_set1_epi32( modelThr );
+  const __m128i     vMin  = _mm_set1_epi16( ( Pel ) clp.min );
+  const __m128i     vMax  = _mm_set1_epi16( ( Pel ) clp.max );
+  const __m256i     lowDw = _mm256_setr_epi32( 0, 2, 4, 6, 0, 2, 4, 6 );
+  const int         bd    = model.bd;
+  const int         bits  = model.decimBits;
+  // 4 luma samples as int32 (the int sums with the luma offset) and as the int64 Pel values the model multiplies
+  auto pel32 = []( const __m128i v ) { return _mm_srai_epi32( _mm_slli_epi32( v, 16 ), 16 ); };
+  auto luma  = [&]( const Pel* p ) {
+    const __m128i v = _mm_cvtepi16_epi32( _mm_loadl_epi64( ( const __m128i* ) p ) );
+    return OFFSET ? _mm_add_epi32( v, lOff ) : v;
+  };
+  auto term = [&]( const __m256i prmK, const __m128i v32 ) {
+    return _mm256_mul_epi32( prmK, _mm256_cvtepi32_epi64( OFFSET ? pel32( v32 ) : v32 ) );
+  };
+  int x = 0;
+  for( ; x + 4 <= width; x += 4 )
+  {
+    const Pel*    r0  = lumaRow + x;
+    const __m128i c   = luma( r0 );
+    const __m128i cP  = OFFSET ? pel32( c ) : c;
+    __m256i       sum = _mm256_add_epi64( base, term( p0, c ) );
+    sum               = _mm256_add_epi64( sum, term( p1, luma( r0 - lumaStride ) ) );
+    sum               = _mm256_add_epi64( sum, term( p2, luma( r0 + lumaStride ) ) );
+    sum               = _mm256_add_epi64( sum, term( p3, luma( r0 - 1 ) ) );
+    sum               = _mm256_add_epi64( sum, term( p4, luma( r0 + 1 ) ) );
+    if( NL )
+    {
+      const __m128i nl = pel32( _mm_srai_epi32( _mm_add_epi32( _mm_mullo_epi32( cP, cP ), mid ), bd ) );
+      sum              = _mm256_add_epi64( sum, _mm256_mul_epi32( p5, _mm256_cvtepi32_epi64( nl ) ) );
+    }
+    __m128i v = pel32( _mm256_castsi256_si128( _mm256_permutevar8x32_epi32( _mm256_srli_epi64( sum, bits ), lowDw ) ) );
+    if( OFFSET )
+    {
+      v = pel32( _mm_add_epi32( v, oOff ) );
+    }
+    v = _mm_packs_epi32( v, v );
+    v = _mm_min_epi16( _mm_max_epi16( v, vMin ), vMax );
+    if( modelId )
+    {
+      // model 1 takes the samples at or below the threshold, model 2 those above it
+      __m128i keep = _mm_cmpgt_epi32( c, thr );
+      if( modelId == 1 )
+      {
+        keep = _mm_xor_si128( keep, _mm_set1_epi32( -1 ) );
+      }
+      keep = _mm_packs_epi32( keep, keep );
+      v    = _mm_blendv_epi8( _mm_loadl_epi64( ( const __m128i* ) ( pred + x ) ), v, keep );
+    }
+    _mm_storel_epi64( ( __m128i* ) ( pred + x ), v );
+  }
+  return x;
+}
+#endif
+
+// ====================================================================================================================
 // Constructor / destructor / initialize
 // ====================================================================================================================
 
@@ -30077,9 +30198,31 @@ void IntraPrediction::xGenerateTmpFlmPred(PelBuf &piPred, unsigned int uiBlkWidt
   int refOrigin = refStride * (m_tmpRefArea[cu->tmpIdx].y + TMP_FILTER_PADDING) + m_tmpRefArea[cu->tmpIdx].x + TMP_FILTER_PADDING;
   PelBuf tmpRefBuf = PelBuf(m_tmpRefBuf[cu->tmpIdx] + refOrigin, refStride, uiBlkWidth, uiBlkHeight);
 
+#if CCCM_MODEL_AVX2
+  // perf: 4 samples per step (cccmApplyCrossRowAvx2, the 6-parameter model without a nonlinear term), the loop below
+  // does the rest of each row
+  static_assert( TMP_FLM_PARAMS == 6, "the TMP linear filter is the 6-parameter cross model" );
+  const bool simd = cccmParamsFit32( tmpModel );
+#endif
   for (int y = 0; y < tmpRefBuf.height; y++)
   {
-    for (int x = 0; x < tmpRefBuf.width; x++)
+    int xStart = 0;
+#if CCCM_MODEL_AVX2
+    if( simd )
+    {
+      xStart = cccmApplyCrossRowAvx2<false, false>( tmpRefBuf.bufAt( 0, y ), tmpRefBuf.stride, tmpRefBuf.width, tmpModel, 0, 0,
+                                                    0, 0, clpRng, piPred.bufAt( 0, y ) );
+    }
+#ifdef CCCMAPPLY_CHECK
+    const int simdEnd = xStart;
+    g_cccmApplyCheckStat.rows[2] += simdEnd > 0;
+    g_cccmApplyCheckStat.samples[2] += simdEnd;
+    Pel       simdRow[MAX_CU_SIZE];
+    std::copy_n( piPred.bufAt( 0, y ), simdEnd, simdRow );
+    xStart = 0;
+#endif
+#endif
+    for (int x = xStart; x < tmpRefBuf.width; x++)
     {
       samples[0] = tmpRefBuf.at(x, y);       // C
       samples[1] = tmpRefBuf.at(x, y - 1);   // N
@@ -30090,6 +30233,13 @@ void IntraPrediction::xGenerateTmpFlmPred(PelBuf &piPred, unsigned int uiBlkWidt
 
       piPred.at(x, y) = ClipPel<Pel>(tmpModel.convolve(samples), clpRng);
     }
+#if CCCM_MODEL_AVX2 && defined( CCCMAPPLY_CHECK )
+    if( !std::equal( simdRow, simdRow + simdEnd, piPred.bufAt( 0, y ) ) )
+    {
+      fprintf( stderr, "CCCMAPPLY_CHECK mismatch (TMP linear filter)\n" );
+      abort();
+    }
+#endif
   }
   int pX = m_tmpXdisp[cu->tmpIdx];
   int pY = m_tmpYdisp[cu->tmpIdx];
@@ -32826,113 +32976,6 @@ void IntraPrediction::xGlmApplyModelOffset(const PredictionUnit &pu, const Compo
   }
 }
 
-// the CCCM model application with AVX2 below needs these CCCM variants' flags
-#if defined( __AVX2__ ) && JVET_AJ0237_INTERNAL_12BIT && JVET_AD0202_CCCM_MDF && JVET_AC0147_CCCM_NO_SUBSAMPLING
-#define CCCM_APPLY_AVX2 ( JVET_AC0054_GLCCCM || JVET_AG0154_DECODER_DERIVED_CCP_FUSION )
-#else
-#define CCCM_APPLY_AVX2 0
-#endif
-
-#if CCCM_APPLY_AVX2
-// whether all model parameters fit in 32 bits (cccmApply7TapRowAvx2 multiplies them with _mm256_mul_epi32)
-static bool cccmParamsFit32( const CccmModel& model )
-{
-  for( const TCccmCoeff p: model.params )
-  {
-    if( p < INT32_MIN || p > INT32_MAX )
-    {
-      return false;
-    }
-  }
-  return true;
-}
-
-#ifdef CCCMAPPLY_CHECK
-static struct CccmApplyCheckStat
-{
-  unsigned long long rows[2] = {}, samples[2] = {};
-  ~CccmApplyCheckStat()
-  {
-    fprintf( stderr, "CCCMAPPLY_CHECK rows/samples compared: plain %llu/%llu, offset %llu/%llu\n", rows[0], samples[0],
-             rows[1], samples[1] );
-  }
-} g_cccmApplyCheckStat;
-#endif
-
-// perf: the 7-tap cross CCCM model (C, N, S, W, E, nonlinear(C), bias) for 4 samples of a row per step, with the int64
-// products and sums of CccmModel::convolve: _mm256_mul_epi32 multiplies the parameters (they must fit in 32 bits) by
-// the sign-extended 16-bit samples. The Pel the scalar code makes of the rounded sum is its low 16 bits, which a
-// logical shift leaves as the arithmetic one does. With OFFSET, the luma samples are Pel(luma + lumaOffset) (the model
-// threshold compares the int sum) and the result is Pel(result + outOffset), as in xCccmApplyModelOffset. Samples the
-// model threshold excludes keep their value. Returns the number of samples done (a multiple of 4).
-template<bool OFFSET>
-static int cccmApply7TapRowAvx2( const Pel* lumaRow, const ptrdiff_t lumaStride, const int width, const CccmModel& model,
-                                 const int lumaOffset, const int outOffset, const int modelId, const int modelThr,
-                                 const ClpRng& clp, Pel* pred )
-{
-  const TCccmCoeff* prm   = model.params.data();
-  const __m256i     p0    = _mm256_set1_epi64x( prm[0] );
-  const __m256i     p1    = _mm256_set1_epi64x( prm[1] );
-  const __m256i     p2    = _mm256_set1_epi64x( prm[2] );
-  const __m256i     p3    = _mm256_set1_epi64x( prm[3] );
-  const __m256i     p4    = _mm256_set1_epi64x( prm[4] );
-  const __m256i     p5    = _mm256_set1_epi64x( prm[5] );
-  const __m256i     base  = _mm256_set1_epi64x( prm[6] * model.bias() + model.decimRound );   // bias term, rounding
-  const __m128i     mid   = _mm_set1_epi32( model.midVal );
-  const __m128i     lOff  = _mm_set1_epi32( lumaOffset );
-  const __m128i     oOff  = _mm_set1_epi32( outOffset );
-  const __m128i     thr   = _mm_set1_epi32( modelThr );
-  const __m128i     vMin  = _mm_set1_epi16( ( Pel ) clp.min );
-  const __m128i     vMax  = _mm_set1_epi16( ( Pel ) clp.max );
-  const __m256i     lowDw = _mm256_setr_epi32( 0, 2, 4, 6, 0, 2, 4, 6 );
-  const int         bd    = model.bd;
-  const int         bits  = model.decimBits;
-  // 4 luma samples as int32 (the int sums with the luma offset) and as the int64 Pel values the model multiplies
-  auto pel32 = []( const __m128i v ) { return _mm_srai_epi32( _mm_slli_epi32( v, 16 ), 16 ); };
-  auto luma  = [&]( const Pel* p ) {
-    const __m128i v = _mm_cvtepi16_epi32( _mm_loadl_epi64( ( const __m128i* ) p ) );
-    return OFFSET ? _mm_add_epi32( v, lOff ) : v;
-  };
-  auto term = [&]( const __m256i prmK, const __m128i v32 ) {
-    return _mm256_mul_epi32( prmK, _mm256_cvtepi32_epi64( OFFSET ? pel32( v32 ) : v32 ) );
-  };
-  int x = 0;
-  for( ; x + 4 <= width; x += 4 )
-  {
-    const Pel*    r0  = lumaRow + x;
-    const __m128i c   = luma( r0 );
-    const __m128i cP  = OFFSET ? pel32( c ) : c;
-    const __m128i nl  = pel32( _mm_srai_epi32( _mm_add_epi32( _mm_mullo_epi32( cP, cP ), mid ), bd ) );
-    __m256i       sum = _mm256_add_epi64( base, term( p0, c ) );
-    sum               = _mm256_add_epi64( sum, term( p1, luma( r0 - lumaStride ) ) );
-    sum               = _mm256_add_epi64( sum, term( p2, luma( r0 + lumaStride ) ) );
-    sum               = _mm256_add_epi64( sum, term( p3, luma( r0 - 1 ) ) );
-    sum               = _mm256_add_epi64( sum, term( p4, luma( r0 + 1 ) ) );
-    sum               = _mm256_add_epi64( sum, _mm256_mul_epi32( p5, _mm256_cvtepi32_epi64( nl ) ) );
-    __m128i v = pel32( _mm256_castsi256_si128( _mm256_permutevar8x32_epi32( _mm256_srli_epi64( sum, bits ), lowDw ) ) );
-    if( OFFSET )
-    {
-      v = pel32( _mm_add_epi32( v, oOff ) );
-    }
-    v = _mm_packs_epi32( v, v );
-    v = _mm_min_epi16( _mm_max_epi16( v, vMin ), vMax );
-    if( modelId )
-    {
-      // model 1 takes the samples at or below the threshold, model 2 those above it
-      __m128i keep = _mm_cmpgt_epi32( c, thr );
-      if( modelId == 1 )
-      {
-        keep = _mm_xor_si128( keep, _mm_set1_epi32( -1 ) );
-      }
-      keep = _mm_packs_epi32( keep, keep );
-      v    = _mm_blendv_epi8( _mm_loadl_epi64( ( const __m128i* ) ( pred + x ) ), v, keep );
-    }
-    _mm_storel_epi64( ( __m128i* ) ( pred + x ), v );
-  }
-  return x;
-}
-#endif
-
 void IntraPrediction::xCccmApplyModelOffset(const PredictionUnit &pu, const ComponentID compId,
                                             CccmModel& cccmModel, int modelId, int modelThr,
                                             PelBuf &piPred, int lumaOffset, int chromaOffset[2], int type, int refSizeX, int refSizeY)
@@ -32986,7 +33029,7 @@ void IntraPrediction::xCccmApplyModelOffset(const PredictionUnit &pu, const Comp
   if (type & CCP_TYPE_CCCM)
   {
 #if CCCM_APPLY_AVX2
-    // perf: 4 samples per step (cccmApply7TapRowAvx2), the loop below does the rest of each row
+    // perf: 4 samples per step (cccmApplyCrossRowAvx2), the loop below does the rest of each row
     const bool simd = stepX == 1 && stepY == 1 && cccmModel.getNumParams() == 7 && cccmParamsFit32( cccmModel );
 #endif
     for (int y = 0; y < refLumaBlk.height; y += stepY )
@@ -32995,8 +33038,8 @@ void IntraPrediction::xCccmApplyModelOffset(const PredictionUnit &pu, const Comp
 #if CCCM_APPLY_AVX2
       if( simd )
       {
-        xStart = cccmApply7TapRowAvx2<true>( refLumaBlk.bufAt( 0, y ), refLumaBlk.stride, refLumaBlk.width, cccmModel,
-                                             lumaOffset, offset, modelId, modelThr, clpRngToBeUsed, piPred.bufAt( 0, y ) );
+        xStart = cccmApplyCrossRowAvx2<true, true>( refLumaBlk.bufAt( 0, y ), refLumaBlk.stride, refLumaBlk.width, cccmModel,
+                                                    lumaOffset, offset, modelId, modelThr, clpRngToBeUsed, piPred.bufAt( 0, y ) );
       }
 #ifdef CCCMAPPLY_CHECK
       const int simdEnd = xStart;
@@ -37908,7 +37951,7 @@ void IntraPrediction::xCccmApplyModel(const PredictionUnit& pu, const ComponentI
 #endif
 
 #if CCCM_APPLY_AVX2
-  // perf: the 7-tap cross model (the last branch below) 4 samples per step (cccmApply7TapRowAvx2), the loop below
+  // perf: the 7-tap cross model (the last branch below) 4 samples per step (cccmApplyCrossRowAvx2), the loop below
   // does the rest of each row
   const bool simd = !pu.glCccmFlag && !pu.cccmNoSubFlag && pu.cccmMultiFilterIdx == 0 && cccmModel.getNumParams() == 7
                     && cccmParamsFit32( cccmModel );
@@ -37920,8 +37963,8 @@ void IntraPrediction::xCccmApplyModel(const PredictionUnit& pu, const ComponentI
 #if CCCM_APPLY_AVX2
     if( simd )
     {
-      xStart = cccmApply7TapRowAvx2<false>( refLumaBlk.bufAt( 0, y ), refLumaBlk.stride, refLumaBlk.width, cccmModel, 0, 0,
-                                            modelId, modelThr, clpRngToBeUsed, piPred.bufAt( 0, y ) );
+      xStart = cccmApplyCrossRowAvx2<false, true>( refLumaBlk.bufAt( 0, y ), refLumaBlk.stride, refLumaBlk.width, cccmModel,
+                                                   0, 0, modelId, modelThr, clpRngToBeUsed, piPred.bufAt( 0, y ) );
     }
 #ifdef CCCMAPPLY_CHECK
     const int simdEnd = xStart;
