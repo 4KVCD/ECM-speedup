@@ -60,6 +60,7 @@
 #include "alf_luma.spv.h"
 #include "lfcccm.spv.h"
 #include "lfcccm_ds.spv.h"
+#include "offset_refine.spv.h"
 #include "sao_apply.spv.h"
 #include "sao_bif.spv.h"
 #include "sao_pad.spv.h"
@@ -180,6 +181,13 @@ struct PushSaoApply
 };
 static_assert( sizeof( PushSaoApply ) == 144, "push constants" );
 
+struct PushOffsetRefine
+{
+  GpuPlane pic, before, codingInfo;
+  int32_t  width, height, bitDepth, refineIdx, useDiffTh, paramA, pad0, pad1;
+};
+static_assert( sizeof( PushOffsetRefine ) == 80, "push constants" );
+
 struct PushSaoPad
 {
   GpuPlane plane;
@@ -253,7 +261,7 @@ struct GpuAlf::Shared
 {
   gpu::Context& ctx;
   gpu::Kernel   ciClass, fixClass, class12, fix0, fix1, fixResi, gauss, luma, chClass, chroma, lfDs, lfCccm;
-  gpu::Kernel   saoBif, saoApply, saoPad;
+  gpu::Kernel   saoBif, saoApply, saoPad, offsetRefine;
   // the fixed-filter tables (AlfFixedFilters.h), the bilateral filter's tables
   gpu::Buffer   tables;
   VkDeviceSize  classIdn9 = 0, coeff9 = 0, clip9 = 0, classIdn13 = 0, coeff13 = 0, clip13 = 0, bif = 0;
@@ -276,6 +284,7 @@ struct GpuAlf::Shared
     GPU_KERNEL( saoBif, sao_bif, PushSaoBif );
     GPU_KERNEL( saoApply, sao_apply, PushSaoApply );
     GPU_KERNEL( saoPad, sao_pad, PushSaoPad );
+    GPU_KERNEL( offsetRefine, offset_refine, PushOffsetRefine );
 #undef GPU_KERNEL
 
     const AdaptiveLoopFilter::FixedFilterTables t = AdaptiveLoopFilter::fixedFilterTables();
@@ -860,8 +869,9 @@ bool GpuAlf::gatherLfCccm( const CodingStructure& cs )
   return true;
 }
 
-bool GpuAlf::gatherSao( CodingStructure& cs, SampleAdaptiveOffset& sao, bool reconstruct )
+bool GpuAlf::gatherSao( CodingStructure& cs, const GpuSaoJob& job, bool reconstruct )
 {
+  SampleAdaptiveOffset& sao = *job.sao;
   Params&    p         = m_params;
   const SPS& sps       = *cs.sps;
   const PPS& pps       = *cs.pps;
@@ -870,9 +880,10 @@ bool GpuAlf::gatherSao( CodingStructure& cs, SampleAdaptiveOffset& sao, bool rec
   const bool bifChroma = pps.getUseChromaBIF();
   const bool ccsaoOn   = sps.getCCSAOEnabledFlag();
   p.sao                = false;
+  p.offsetRefinement   = job.offsetRefinement;
   // the offset steps, the bilateral filter and the CCSAO thresholds of bit depths up to 10
-  if( ( !saoOn && !bifLuma && !bifChroma && !ccsaoOn ) || sps.getBitDepth( CHANNEL_TYPE_LUMA ) > 10
-      || sps.getBitDepth( CHANNEL_TYPE_CHROMA ) > 10 )
+  if( ( !saoOn && !bifLuma && !bifChroma && !ccsaoOn && !job.offsetRefinement )
+      || sps.getBitDepth( CHANNEL_TYPE_LUMA ) > 10 || sps.getBitDepth( CHANNEL_TYPE_CHROMA ) > 10 )
   {
     return false;
   }
@@ -1260,9 +1271,28 @@ void GpuAlf::run( const AdaptiveLoopFilter& alf, const CodingStructure& cs )
   }
   s.barrier();
 
-  // SAO, the bilateral filter and CCSAO: the picture after SAO in m_inRec, mirror-padded as ALFProcess pads it
+  // the offset refinement after deblocking, SAO, the bilateral filter and CCSAO: the picture after SAO in m_inRec,
+  // mirror-padded as ALFProcess pads it
   if( prm.sao )
   {
+#if JVET_AK0121_LOOPFILTER_OFFSET_REFINEMENT
+    if( prm.offsetRefinement )
+    {
+      PushOffsetRefine r;
+      r.pic        = gp( m_in, m_inDeblocked[0] );
+      r.before     = gp( m_in, m_inDb[0] );
+      r.codingInfo = gp( m_in, m_inCi );
+      r.width      = m_width;
+      r.height     = m_height;
+      r.bitDepth   = bitDepth;
+      r.refineIdx  = cs.slice->getOffsetRefinementDbfIdx();
+      r.useDiffTh  = !cs.sps->getInloopOffsetRefineFlag() && !intra;
+      r.paramA     = cs.sps->getInloopOffsetRefineFunc() ? 5 : 6;
+      r.pad0 = r.pad1 = 0;
+      s.dispatch( m_k.offsetRefine, &r, divUp( m_width, 16 ), divUp( m_height, 8 ) );
+      s.barrier();
+    }
+#endif
     if( !prm.bifBlocks.empty() )
     {
       PushSaoBif bif;
@@ -1864,7 +1894,7 @@ bool GpuAlf::process( AdaptiveLoopFilter& alf, CodingStructure& cs, GpuSaoJob* s
       }
       if( sao )
       {
-        gatherSao( cs, *sao->sao, false );   // SAOProcess resolved the merges
+        gatherSao( cs, *sao, false );   // SAOProcess resolved the merges
       }
       upload( alf, cs, m_verifyDeblocked );
       run( alf, cs );
@@ -1884,7 +1914,7 @@ bool GpuAlf::process( AdaptiveLoopFilter& alf, CodingStructure& cs, GpuSaoJob* s
   }
   // SAO on the GPU when the LF-CCCM correction is too: the CPU derives it from the picture after SAO
   const bool lfCccmGpu = lfCccm && gatherLfCccm( cs );
-  if( sao && !( ( !lfCccm || lfCccmGpu ) && gatherSao( cs, *sao->sao, true ) ) )
+  if( sao && !( ( !lfCccm || lfCccmGpu ) && gatherSao( cs, *sao, true ) ) )
   {
     cpuSao();
   }

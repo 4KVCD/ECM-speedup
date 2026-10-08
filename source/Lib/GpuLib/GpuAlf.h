@@ -46,13 +46,14 @@
 #include <memory>
 #include <vector>
 
-/// SAO, the bilateral filter and CCSAO (SampleAdaptiveOffset::SAOProcess, CCSAOProcess, jointClipSaoBifCcSao) of the
-/// picture that ALFProcess filters next: the decoder defers them to ALFProcess, which runs them on the GPU from the
-/// deblocked picture, or on the CPU first
+/// the offset refinement after deblocking, SAO, the bilateral filter and CCSAO (AdaptiveLoopFilter::calcOffsetRefinement,
+/// SampleAdaptiveOffset::SAOProcess, CCSAOProcess, jointClipSaoBifCcSao) of the picture that ALFProcess filters next:
+/// the decoder defers them to ALFProcess, which runs them on the GPU from the deblocked picture, or on the CPU first
 struct GpuSaoJob
 {
-  std::function<void()> cpu;              ///< runs them on the CPU, on the picture
-  SampleAdaptiveOffset* sao = nullptr;
+  std::function<void()> cpu;                       ///< runs them on the CPU, on the picture
+  SampleAdaptiveOffset* sao              = nullptr;
+  bool                  offsetRefinement = false;  ///< the offset refinement after deblocking is part of it
 };
 
 /// LF-CCCM (JVET-AL0153) of the picture that ALFProcess filters next: the chroma correction that the decoder derives
@@ -120,6 +121,7 @@ private:
     std::vector<uint32_t> lfCtus;
     int                   lfWindows  = 0;       ///< windows of all these CTUs
     bool                  sao        = false;   ///< the kernels do SAO, the bilateral filter and CCSAO
+    bool                  offsetRefinement = false;   ///< and the offset refinement after deblocking first
     std::vector<uint32_t> saoInfo;              ///< [4] per CTU: word c: SAO type + 1 | CCSAO set << 4 (sao_apply.comp)
     std::vector<int16_t>  saoOffsets;           ///< [CTU][3][32]
     std::vector<int16_t>  ccsao;                ///< [3][4 sets][72] (sao_apply.comp)
@@ -145,7 +147,7 @@ private:
   bool gatherLfCccm( const CodingStructure& cs );
   /// the SAO, bilateral filter and CCSAO parameters (reconstruct: the SAO merges, which SAOProcess resolves); false
   /// when the picture uses none of them or what the kernels do not implement
-  bool gatherSao( CodingStructure& cs, SampleAdaptiveOffset& sao, bool reconstruct );
+  bool gatherSao( CodingStructure& cs, const GpuSaoJob& job, bool reconstruct );
   void layout( int width, int height, int ctuSize );
   /// deblocked: the picture before SAO when the kernels do it
   void upload( const AdaptiveLoopFilter& alf, const CodingStructure& cs, const CPelUnitBuf& deblocked );

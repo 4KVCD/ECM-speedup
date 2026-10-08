@@ -1,0 +1,45 @@
+#version 460
+// AdaptiveLoopFilter::calcOffsetRefinement + copyOffsetRefinement after deblocking (stage 0, every CTU): per luma
+// sample an offset from the change the deblocking made, smaller at coding-block boundaries (coding information > 0)
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+layout( local_size_x = 16, local_size_y = 8 ) in;
+
+layout( push_constant ) uniform Push
+{
+  Plane pic;          // in / out: the luma after deblocking
+  Plane before;       // the luma before deblocking
+  Plane codingInfo;
+  int   width;
+  int   height;
+  int   bitDepth;
+  int   refineIdx;    // the slice's offset refinement index
+  int   useDiffTh;    // !sps.getInloopOffsetRefineFlag() && !intra
+  int   paramA;       // 6, or 5 with sps.getInloopOffsetRefineFunc()
+  int   pad0;
+  int   pad1;
+} pc;
+
+void main()
+{
+  const int x = int( gl_GlobalInvocationID.x );
+  const int y = int( gl_GlobalInvocationID.y );
+  if( x >= pc.width || y >= pc.height )
+  {
+    return;
+  }
+  const int cur     = ld( pc.pic, x, y );
+  const int diff    = cur - ld( pc.before, x, y );
+  const int bdScale = max( 0, pc.bitDepth - 10 );
+  int       a       = min( abs( diff ), ( 1 << pc.bitDepth ) - 1 ) >> bdScale;
+  if( ld( pc.codingInfo, x, y ) > 0 )
+  {
+    // the thresholds of stage 0 (refineIdx0BoundThA / B, refineIdx1BoundThA / B)
+    const int thr = pc.refineIdx == 1 ? ( pc.useDiffTh != 0 ? 9 : 12 ) : ( pc.useDiffTh != 0 ? 3 : 1 );
+    a             = a > thr ? a : 0;
+  }
+  const int log2a  = a == 0 ? 0 : findMSB( uint( a ) );   // log2Map
+  const int refine = ( pc.paramA * log2a + 31 ) >> 5;
+  st( pc.pic, x, y, cur + ( ( diff < 0 ? refine : -refine ) << bdScale ) );
+}

@@ -182,6 +182,14 @@ FourPeople 1.16x (G3: 1.11x), AI ParkJoy 1.12x (1.09x), RA ParkJoy 1.15x (1.13x)
 8 frame threads: AI ParkJoy 1.07x, RA ParkJoy 1.09x, AI FourPeople 0.98x (its 8 pictures finish together and wait
 for the two pool instances), the six larger streams 1.05x; CPU time 1.06-1.16x less on the 720p streams.
 
+G5: the offset refinement after deblocking (AdaptiveLoopFilter::calcOffsetRefinement stage 0, every CTU; C only) is
+deferred with SAO (unless the NN loop filter reads the picture in between) and is the first GPU stage: per luma
+sample a log2-table offset from the deblocking's change, with the thresholds at coding-block boundaries. Its input
+planes were already uploaded for ALF. The streams use refinement index 1; a stress test (TEMP: the refinement on every
+picture, index 0 / 1 alternating) found no difference and reports a wrong index-0 threshold. pj720_ai and ra720_pj17
+use it on most pictures (~2.2-2.6 ms on the CPU): single thread 1.14x (G4: 1.12x) and 1.17x (1.15x); all 19 streams
+1.08x.
+
 ## Fixes found on the way
 
 - Decoding that starts at a CRA in the middle of an RA stream (`-s`, random access) crashed the stock decoder:

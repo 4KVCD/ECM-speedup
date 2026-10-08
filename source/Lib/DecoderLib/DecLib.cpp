@@ -983,12 +983,27 @@ void DecLib::xExecuteLoopFilters( LfCtrlState* lf )
   m_cLoopFilter.loopFilterPic( cs );
 #endif
 
-#if JVET_AK0121_LOOPFILTER_OFFSET_REFINEMENT
-  if( cs.sps->getALFEnabledFlag() )
+#if ECM_VULKAN
+  // pictures filtered before the device is ready take the CPU path (verification waits for it)
+  if( cs.sps->getALFEnabledFlag() && m_gpuLoopFilter && !m_gpuAlf && !m_gpuUnavailable
+      && ( m_gpuLoopFilter == GpuAlf::VERIFY || GpuAlf::ready() ) )
   {
-    bool sliceTypeCondition = true;
-    if( sliceTypeCondition && cs.slice->getOffsetRefinementDbf() )
-    {
+    m_gpuAlf.reset( GpuAlfHook::create( m_gpuLoopFilter ) );
+    m_gpuUnavailable = !m_gpuAlf;
+    m_cALF.setProcessHook( m_gpuAlf.get() );
+  }
+  // with ALF on the GPU, the steps up to it are deferred to ALFProcess when no step in between reads the picture
+#if NN_LF_UNIFIED
+  const bool gpuDeferred = m_gpuAlf && cs.sps->getALFEnabledFlag() && !cs.sps->getNnlfUnifiedEnabledFlag();
+#else
+  const bool gpuDeferred = m_gpuAlf && cs.sps->getALFEnabledFlag();
+#endif
+#endif
+#if JVET_AK0121_LOOPFILTER_OFFSET_REFINEMENT
+  bool sliceTypeCondition = true;
+  const bool offsetRefinementDbf = cs.sps->getALFEnabledFlag() && sliceTypeCondition && cs.slice->getOffsetRefinementDbf();
+  auto refineDbf = [&]()
+  {
       PelUnitBuf dbfInput = m_cALF.callRecBeforeDbfBuf();
       PelUnitBuf dbfOutput = cs.getRecoBuf();
 
@@ -998,7 +1013,14 @@ void DecLib::xExecuteLoopFilters( LfCtrlState* lf )
       int refineIdx = cs.slice->getOffsetRefinementDbfIdx();
       m_cALF.calcOffsetRefinement(cs, dbfInput, dbfOutput, dbfOffsetRefine, stageIdx, refineIdx );
       m_cALF.copyOffsetRefinement(cs, dbfOffsetRefine, dbfOutput);
-    }
+  };
+#if ECM_VULKAN
+  if( offsetRefinementDbf && !gpuDeferred )
+#else
+  if( offsetRefinementDbf )
+#endif
+  {
+    refineDbf();
   }
 #endif
 
@@ -1058,19 +1080,15 @@ void DecLib::xExecuteLoopFilters( LfCtrlState* lf )
   }
 #endif
 
-#if ECM_VULKAN
-  // pictures filtered before the device is ready take the CPU path (verification waits for it)
-  if( cs.sps->getALFEnabledFlag() && m_gpuLoopFilter && !m_gpuAlf && !m_gpuUnavailable
-      && ( m_gpuLoopFilter == GpuAlf::VERIFY || GpuAlf::ready() ) )
-  {
-    m_gpuAlf.reset( GpuAlfHook::create( m_gpuLoopFilter ) );
-    m_gpuUnavailable = !m_gpuAlf;
-    m_cALF.setProcessHook( m_gpuAlf.get() );
-  }
-#endif
   // SAO, the bilateral filter and CCSAO
   auto saoProcess = [&]()
   {
+#if ECM_VULKAN && JVET_AK0121_LOOPFILTER_OFFSET_REFINEMENT
+  if( offsetRefinementDbf && gpuDeferred )
+  {
+    refineDbf();   // deferred with SAO
+  }
+#endif
 #if JVET_W0066_CCSAO
   if (cs.sps->getCCSAOEnabledFlag())
   {
@@ -1107,10 +1125,13 @@ void DecLib::xExecuteLoopFilters( LfCtrlState* lf )
 #if ECM_VULKAN
   // ALF on the GPU starts from the deblocked picture (or calls saoProcess before it filters on the CPU)
   GpuSaoJob saoGpu;
-  if( m_gpuAlf && cs.sps->getALFEnabledFlag() )
+  if( gpuDeferred )
   {
     saoGpu.cpu = saoProcess;
     saoGpu.sao = &m_cSAO;
+#if JVET_AK0121_LOOPFILTER_OFFSET_REFINEMENT
+    saoGpu.offsetRefinement = offsetRefinementDbf;
+#endif
     m_gpuAlf->setSao( &saoGpu );
   }
   else
