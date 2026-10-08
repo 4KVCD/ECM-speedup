@@ -7,7 +7,8 @@ $ErrorActionPreference = 'Continue'   # native-command stderr must not be fatal 
 $src   = Resolve-Path "$PSScriptRoot\.."
 $build = "C:\Code\build\$Name"
 $out   = "C:\Code\bin\$Name"
-$lto   = if( $NoLto ) { @( "-DCMAKE_INTERPROCEDURAL_OPTIMIZATION=OFF" ) } else { @( "-DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON", "-DCMAKE_POLICY_DEFAULT_CMP0069=NEW" ) }
+# [string[]]: a one-element array would otherwise become a string, and @lto would pass its characters one by one
+[string[]]$lto = if( $NoLto ) { @( "-DCMAKE_INTERPROCEDURAL_OPTIMIZATION=OFF" ) } else { @( "-DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON", "-DCMAKE_POLICY_DEFAULT_CMP0069=NEW" ) }
 cmake -G Ninja -S $src -B $build -DCMAKE_BUILD_TYPE=Release -DBUILD_STATIC=ON -Wno-deprecated @lto @CMakeArgs 2>&1 | Out-Null
 if( $LASTEXITCODE ) { throw "configure failed" }
 cmake --build $build --target EncoderApp DecoderApp -j 16 2>&1 | Select-String -Pattern 'error|FAILED' | Select-Object -First 30
