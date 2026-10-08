@@ -7646,7 +7646,7 @@ void InterSearch::predInterSearch(CodingUnit& cu, Partitioner& partitioner)
 
     PelUnitBuf predBuf = pu.cs->getPredBuf(pu);
     DistParam distParam;
-    m_pcRdCost->setDistParam(distParam, cs.getOrgBuf().Y(), predBuf.Y(), cs.sps->getBitDepth(CHANNEL_TYPE_LUMA), COMPONENT_Y, true);
+    m_pcRdCost->setDistParam(distParam, cs.getOrgBuf(COMPONENT_Y), predBuf.Y(), cs.sps->getBitDepth(CHANNEL_TYPE_LUMA), COMPONENT_Y, true);
     Distortion distLicOn = distParam.distFunc(distParam);
 
 #if JVET_AD0213_LIC_IMP
@@ -7657,7 +7657,7 @@ void InterSearch::predInterSearch(CodingUnit& cu, Partitioner& partitioner)
       pu.cu->licFlag = true;
     }
 #endif
-    m_pcRdCost->setDistParam(distParam, cs.getOrgBuf().Y(), m_predictionBeforeLIC.Y(), cs.sps->getBitDepth(CHANNEL_TYPE_LUMA), COMPONENT_Y, true);
+    m_pcRdCost->setDistParam(distParam, cs.getOrgBuf(COMPONENT_Y), m_predictionBeforeLIC.Y(), cs.sps->getBitDepth(CHANNEL_TYPE_LUMA), COMPONENT_Y, true);
     Distortion distLicOff = distParam.distFunc(distParam);
     if (distLicOn >= distLicOff)
     {
@@ -8194,7 +8194,7 @@ void InterSearch::predInterSearchAdditionalHypothesis(PredictionUnit& pu, const 
           // store MHP MC result for next additonal hypothesis test
           if (pu.addHypData.size() < sps.getMaxNumAddHyps() && m_mhpTempBufCounter < GEO_MAX_TRY_WEIGHTED_SAD)
           {
-            result.predBuf = &m_mhpTempBuf[m_mhpTempBufCounter];
+            result.predBuf = xMhpTempBuf(m_mhpTempBufCounter);
             result.predBufIdx = m_mhpTempBufCounter;
             m_mhpTempBufCounter++;
             result.predBuf->copyFrom(tempOrigBuf, true);
@@ -17339,7 +17339,7 @@ void InterSearch::checkEncLicOff(CodingUnit& cu, MergeCtx& mergeCtx)
 
   PelUnitBuf predBuf = pu.cs->getPredBuf(pu);
   DistParam distParam;
-  m_pcRdCost->setDistParam(distParam, cs.getOrgBuf().Y(), predBuf.Y(), cs.sps->getBitDepth(CHANNEL_TYPE_LUMA), COMPONENT_Y, true);
+  m_pcRdCost->setDistParam(distParam, cs.getOrgBuf(COMPONENT_Y), predBuf.Y(), cs.sps->getBitDepth(CHANNEL_TYPE_LUMA), COMPONENT_Y, true);
   Distortion distLicOn = distParam.distFunc(distParam);
 
   const double  sqrtLambdaForFirstPassIntra = m_pcRdCost->getMotionLambda() * FRAC_BITS_SCALE;
@@ -17420,7 +17420,7 @@ void InterSearch::checkEncLicOff(CodingUnit& cu, MergeCtx& mergeCtx)
     motionCompensation(pu, m_predictionBeforeLIC, REF_PIC_LIST_X);
   }
 #endif
-  m_pcRdCost->setDistParam(distParam, cs.getOrgBuf().Y(), m_predictionBeforeLIC.Y(), cs.sps->getBitDepth(CHANNEL_TYPE_LUMA), COMPONENT_Y, true);
+  m_pcRdCost->setDistParam(distParam, cs.getOrgBuf(COMPONENT_Y), m_predictionBeforeLIC.Y(), cs.sps->getBitDepth(CHANNEL_TYPE_LUMA), COMPONENT_Y, true);
   Distortion distLicOff = distParam.distFunc(distParam);
   m_CABACEstimator->getCtx() = ctxStart;
   uint64_t licOffFracBits = xCalcExpPuBits(pu);
@@ -17501,7 +17501,7 @@ void InterSearch::checkEncLicOn(CodingUnit& cu, MergeCtx& mergeCtx)
 
   PelUnitBuf predBuf = pu.cs->getPredBuf(pu);
   DistParam distParam;
-  m_pcRdCost->setDistParam(distParam, cs.getOrgBuf().Y(), predBuf.Y(), cs.sps->getBitDepth(CHANNEL_TYPE_LUMA), COMPONENT_Y, true);
+  m_pcRdCost->setDistParam(distParam, cs.getOrgBuf(COMPONENT_Y), predBuf.Y(), cs.sps->getBitDepth(CHANNEL_TYPE_LUMA), COMPONENT_Y, true);
   Distortion distLicOff = distParam.distFunc(distParam);
 
   const double  sqrtLambdaForFirstPassIntra = m_pcRdCost->getMotionLambda() * FRAC_BITS_SCALE;
@@ -17576,7 +17576,7 @@ void InterSearch::checkEncLicOn(CodingUnit& cu, MergeCtx& mergeCtx)
     }
   }
 #endif
-  m_pcRdCost->setDistParam(distParam, cs.getOrgBuf().Y(), m_predictionBeforeLIC.Y(), cs.sps->getBitDepth(CHANNEL_TYPE_LUMA), COMPONENT_Y, true);
+  m_pcRdCost->setDistParam(distParam, cs.getOrgBuf(COMPONENT_Y), m_predictionBeforeLIC.Y(), cs.sps->getBitDepth(CHANNEL_TYPE_LUMA), COMPONENT_Y, true);
   Distortion distLicOn = distParam.distFunc(distParam);
   m_CABACEstimator->getCtx() = ctxStart;
   uint64_t licOnFracBits = xCalcExpPuBits(pu);

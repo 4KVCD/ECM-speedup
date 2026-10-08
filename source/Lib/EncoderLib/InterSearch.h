@@ -772,6 +772,10 @@ private:
 #endif
   PelUnitBuf      m_mhpTempBuf[GEO_MAX_TRY_WEIGHTED_SAD];
   int             m_mhpTempBufCounter;
+  PelStorage*     m_mhpTmpStorage   = nullptr;   // the buffers and the area of the views of m_mhpTempBuf
+  UnitArea        m_mhpTmpArea;
+  int             m_mhpTmpNumStored = 0;
+  int             m_mhpTempBufReady = 0;         // m_mhpTempBuf[0 .. m_mhpTempBufReady - 1] are made
 #endif
 
   CodingStructure ****m_pSplitCS;
@@ -933,11 +937,26 @@ public:
       m_mhpMrgTempBufLic[mergeCand] = mergeTmpBuffer2[mergeCand].getBuf(localUnitArea);
 #endif
     }
-    for (uint8_t i = 0; i < maxNumStoredMhpCandidates; i++)
-    {
-      m_mhpTempBuf[i] = mhpTmpBuffer[i].getBuf(localUnitArea);
-    }
+    // perf: the views of the stored-hypothesis buffers are made when a buffer is first handed out (xMhpTempBuf)
+    m_mhpTmpStorage     = mhpTmpBuffer;
+    m_mhpTmpArea        = localUnitArea;
+    m_mhpTmpNumStored   = maxNumStoredMhpCandidates;
+    m_mhpTempBufReady   = 0;
     m_mhpTempBufCounter = 0;
+  }
+  // the view of stored-hypothesis buffer idx as initMHPTmpBuffer set them all: the buffers are handed out in order
+  // (m_mhpTempBufCounter), and the recycling in predInterSearchAdditionalHypothesis only moves views below the counter, so
+  // a view not yet made has not been touched since initMHPTmpBuffer
+  PelUnitBuf*      xMhpTempBuf(const int idx)
+  {
+    for (; m_mhpTempBufReady <= idx; m_mhpTempBufReady++)
+    {
+      if (m_mhpTempBufReady < m_mhpTmpNumStored)
+      {
+        m_mhpTempBuf[m_mhpTempBufReady] = m_mhpTmpStorage[m_mhpTempBufReady].getBuf(m_mhpTmpArea);
+      }
+    }
+    return &m_mhpTempBuf[idx];
   }
 #if JVET_AD0213_LIC_IMP
   void             setGeoTmpBuffer(int setId)
