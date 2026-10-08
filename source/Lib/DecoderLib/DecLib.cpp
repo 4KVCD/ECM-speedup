@@ -1058,6 +1058,19 @@ void DecLib::xExecuteLoopFilters( LfCtrlState* lf )
   }
 #endif
 
+#if ECM_VULKAN
+  // pictures filtered before the device is ready take the CPU path (verification waits for it)
+  if( cs.sps->getALFEnabledFlag() && m_gpuLoopFilter && !m_gpuAlf && !m_gpuUnavailable
+      && ( m_gpuLoopFilter == GpuAlf::VERIFY || GpuAlf::ready() ) )
+  {
+    m_gpuAlf.reset( GpuAlfHook::create( m_gpuLoopFilter ) );
+    m_gpuUnavailable = !m_gpuAlf;
+    m_cALF.setProcessHook( m_gpuAlf.get() );
+  }
+#endif
+  // SAO, the bilateral filter and CCSAO
+  auto saoProcess = [&]()
+  {
 #if JVET_W0066_CCSAO
   if (cs.sps->getCCSAOEnabledFlag())
   {
@@ -1090,17 +1103,20 @@ void DecLib::xExecuteLoopFilters( LfCtrlState* lf )
   }
   m_cSAO.jointClipSaoBifCcSao( cs );
 #endif
-
+  };
 #if ECM_VULKAN
-  // pictures filtered before the device is ready take the CPU path (verification waits for it)
-  if( cs.sps->getALFEnabledFlag() && m_gpuLoopFilter && !m_gpuAlf && !m_gpuUnavailable
-      && ( m_gpuLoopFilter == GpuAlf::VERIFY || GpuAlf::ready() ) )
+  // ALF on the GPU starts from the deblocked picture (or calls saoProcess before it filters on the CPU)
+  GpuSaoJob saoGpu;
+  if( m_gpuAlf && cs.sps->getALFEnabledFlag() )
   {
-    m_gpuAlf.reset( GpuAlfHook::create( m_gpuLoopFilter ) );
-    m_gpuUnavailable = !m_gpuAlf;
-    m_cALF.setProcessHook( m_gpuAlf.get() );
+    saoGpu.cpu = saoProcess;
+    saoGpu.sao = &m_cSAO;
+    m_gpuAlf->setSao( &saoGpu );
   }
+  else
 #endif
+  saoProcess();
+
 #if JVET_AL0153_ALF_CCCM
   PelStorage cccmCorrection;
   m_cLoopFilterCccm.lfCccmSetFrameLevelInheritedParameters(cs);
@@ -1197,6 +1213,7 @@ void DecLib::xExecuteLoopFilters( LfCtrlState* lf )
 #if ECM_VULKAN
     if( m_gpuAlf )
     {
+      m_gpuAlf->setSao( nullptr );
       m_gpuAlf->setLfCccm( nullptr );
     }
 #endif

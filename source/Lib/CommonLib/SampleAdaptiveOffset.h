@@ -96,6 +96,7 @@ public:
 #endif
 #endif
 protected:
+  friend class GpuAlf;   // perf: the GPU loop filter reads the SAO / CCSAO state and does SAOProcess's work
   void deriveLoopFilterBoundaryAvailibility(CodingStructure& cs, const Position &pos,
     bool& isLeftAvail,
     bool& isRightAvail,

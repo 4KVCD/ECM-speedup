@@ -160,6 +160,28 @@ has lowered its clock between pictures); +1.4 MB device memory per instance. Sin
 ParkJoy 1.13x (G2: 1.06x), AI streams unchanged (no LF-CCCM), all 19 streams 1.06x; 8 frame threads: RA ParkJoy
 1.09x (1.04x), the six larger streams 1.05x.
 
+G4: SAO, the bilateral filter and CCSAO (with their joint clipping) on the GPU. The decoder defers them to the ALF
+hook, which runs them from the deblocked picture (uploaded instead of the picture after SAO), so they share ALF's
+upload and submission; when the picture's ALF takes the CPU path, the hook runs them on the CPU first. Kernels: the
+bilateral filter per transform block (one workgroup: the strength from the block's mean absolute deviation, then the
+5x5 diamond with the CPU's padding of the block: rows / columns beyond the picture replaced, and the row one sample
+beyond a CTU's top / bottom read instead of the second; the C filter equals the SIMD one, checked on all 19
+streams); SAO + CCSAO + the bilateral offsets + clipping per sample (the samples the CPU's loops reach: the CTU's
+availability flags with each class position's own rows and columns; two ECM quirks reproduced: the band classifier's
+below-left position reads chroma row (y + 1) >> 1 for luma samples, its above position reads luma and chroma one row
+higher for chroma samples in the top CTU row); then the mirror padding ALF reads. The CPU keeps the parameter work
+(SAO merges, the transform blocks the bilateral filter applies to) and gets the luma after SAO back when TALF or the
+offset refinement after ALF reads it. The streams use luma SAO of every type, the bilateral filter, CCSAO edge
+classes on luma and some band positions; a stress test (TEMP: random SAO and CCSAO parameters of every kind per CTU
+on intra pictures) found no difference either, and reports both quirks when they are left out.
+
+Verification: 779 pictures, all with SAO on the GPU, no difference; output identical on all 19 streams, with 8 frame
+threads, and from the CPU-only build; encoder suite bit-exact (CommonLib: a friend declaration). +5.5 MB device
+memory per instance at 720p (deblocked planes, bilateral offsets). Single thread vs the CPU-only build: AI
+FourPeople 1.16x (G3: 1.11x), AI ParkJoy 1.12x (1.09x), RA ParkJoy 1.15x (1.13x), all 19 streams 1.08x (1.06x);
+8 frame threads: AI ParkJoy 1.07x, RA ParkJoy 1.09x, AI FourPeople 0.98x (its 8 pictures finish together and wait
+for the two pool instances), the six larger streams 1.05x; CPU time 1.06-1.16x less on the 720p streams.
+
 ## Fixes found on the way
 
 - Decoding that starts at a CRA in the middle of an RA stream (`-s`, random access) crashed the stock decoder:

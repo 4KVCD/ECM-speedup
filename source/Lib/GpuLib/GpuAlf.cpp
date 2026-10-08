@@ -41,9 +41,12 @@
 
 #include "GpuAlf.h"
 
+#include "CommonLib/BilateralFilter.h"
 #include "CommonLib/CodingStructure.h"
 #include "CommonLib/Picture.h"
+#include "CommonLib/Rom.h"
 #include "CommonLib/Slice.h"
+#include "CommonLib/UnitTools.h"
 
 #include "alf_chclass.spv.h"
 #include "alf_chroma.spv.h"
@@ -57,6 +60,9 @@
 #include "alf_luma.spv.h"
 #include "lfcccm.spv.h"
 #include "lfcccm_ds.spv.h"
+#include "sao_apply.spv.h"
+#include "sao_bif.spv.h"
+#include "sao_pad.spv.h"
 
 #include <atomic>
 #include <condition_variable>
@@ -158,6 +164,35 @@ struct PushLfCccm
 };
 static_assert( sizeof( PushLfCccm ) == 160, "push constants" );
 
+struct PushSaoBif
+{
+  GpuPlane src[3], dst[3];
+  uint64_t blocks, tables;
+  int32_t  numBlocks, groupsX, width, height, ctuSize, roundAdd, roundShift, pad0;
+};
+static_assert( sizeof( PushSaoBif ) == 144, "push constants" );
+
+struct PushSaoApply
+{
+  GpuPlane srcY, srcCb, srcCr, bif, dst;
+  uint64_t ctuInfo, saoOffsets, ccsao;
+  int32_t  comp, width, height, ctuSizeLog2, ctusPerRow, bitDepth, outMin, outMax, ccsaoShift, pad0;
+};
+static_assert( sizeof( PushSaoApply ) == 144, "push constants" );
+
+struct PushSaoPad
+{
+  GpuPlane plane;
+  int32_t  width, height, pad, pad0;
+};
+static_assert( sizeof( PushSaoPad ) == 32, "push constants" );
+
+// the bilateral filter's tables (sao_bif.comp): LUT [luma, chroma][26][48], MAD factor [luma, chroma][2][16]
+constexpr int BIF_LUT_BYTES   = 26 * 48;
+constexpr int BIF_TABLE_BYTES = 2 * BIF_LUT_BYTES + 2 * 2 * 16;
+// CCSAO set parameters and offsets (sao_apply.comp)
+constexpr int CCSAO_STRIDE = 72;
+
 // coefficient-set layouts, as in alf_luma.comp and alf_chroma.comp
 constexpr int NUM_COEFF       = MAX_NUM_ALF_LUMA_COEFF;
 constexpr int SET_CLIP        = MAX_NUM_ALF_CLASSES * NUM_COEFF;
@@ -218,9 +253,10 @@ struct GpuAlf::Shared
 {
   gpu::Context& ctx;
   gpu::Kernel   ciClass, fixClass, class12, fix0, fix1, fixResi, gauss, luma, chClass, chroma, lfDs, lfCccm;
-  // the fixed-filter tables (AlfFixedFilters.h)
+  gpu::Kernel   saoBif, saoApply, saoPad;
+  // the fixed-filter tables (AlfFixedFilters.h), the bilateral filter's tables
   gpu::Buffer   tables;
-  VkDeviceSize  classIdn9 = 0, coeff9 = 0, clip9 = 0, classIdn13 = 0, coeff13 = 0, clip13 = 0;
+  VkDeviceSize  classIdn9 = 0, coeff9 = 0, clip9 = 0, classIdn13 = 0, coeff13 = 0, clip13 = 0, bif = 0;
 
   explicit Shared( gpu::Context& c ) : ctx( c )
   {
@@ -237,6 +273,9 @@ struct GpuAlf::Shared
     GPU_KERNEL( chroma, alf_chroma, PushChroma );
     GPU_KERNEL( lfDs, lfcccm_ds, PushLfDs );
     GPU_KERNEL( lfCccm, lfcccm, PushLfCccm );
+    GPU_KERNEL( saoBif, sao_bif, PushSaoBif );
+    GPU_KERNEL( saoApply, sao_apply, PushSaoApply );
+    GPU_KERNEL( saoPad, sao_pad, PushSaoPad );
 #undef GPU_KERNEL
 
     const AdaptiveLoopFilter::FixedFilterTables t = AdaptiveLoopFilter::fixedFilterTables();
@@ -254,6 +293,7 @@ struct GpuAlf::Shared
     place( classIdn13, classIdnBytes );
     place( coeff13, coeff13Bytes );
     place( clip13, coeff13Bytes );
+    place( bif, BIF_TABLE_BYTES );
     gpu::Buffer staging;
     staging.create( ctx, bytes, gpu::Buffer::UPLOAD );
     uint8_t* p = (uint8_t*) staging.mapped;
@@ -263,6 +303,13 @@ struct GpuAlf::Shared
     memcpy( p + classIdn13, t.classIdn13Db9, classIdnBytes );
     memcpy( p + coeff13, t.coeff13Db9, coeff13Bytes );
     memcpy( p + clip13, t.clip13Db9, coeff13Bytes );
+    std::unique_ptr<BilateralFilter> bf( new BilateralFilter );   // BilateralFilter::create derives the LUTs
+    bf->create();
+    memcpy( p + bif, bf->m_lut, BIF_LUT_BYTES );
+    memcpy( p + bif + BIF_LUT_BYTES, bf->m_lutChroma, BIF_LUT_BYTES );
+    memcpy( p + bif + 2 * BIF_LUT_BYTES, bf->m_tuMADFactor, 2 * 16 );
+    memcpy( p + bif + 2 * BIF_LUT_BYTES + 2 * 16, bf->m_tuMADFactorChroma, 2 * 16 );
+    static_assert( sizeof( bf->m_lut ) == BIF_LUT_BYTES && sizeof( bf->m_tuMADFactor ) == 2 * 16, "sao_bif.comp" );
     tables.create( ctx, bytes, gpu::Buffer::DEVICE );
     gpu::Stream s( ctx, 0 );
     s.begin();
@@ -297,15 +344,15 @@ const GpuAlf::Shared& GpuAlf::shared( gpu::Context& ctx )
 }
 
 // pictures compared with the CPU (GpuAlf::VERIFY), reported when the process ends
-static std::atomic<long> s_verifiedPictures( 0 ), s_verifiedLfCccm( 0 ), s_failedPictures( 0 );
+static std::atomic<long> s_verifiedPictures( 0 ), s_verifiedLfCccm( 0 ), s_verifiedSao( 0 ), s_failedPictures( 0 );
 static struct VerifyReport
 {
   ~VerifyReport()
   {
     if( s_verifiedPictures )
     {
-      fprintf( stderr, "GPU loop filter verification: %ld pictures (%ld with LF-CCCM), %ld with differences\n",
-               s_verifiedPictures.load(), s_verifiedLfCccm.load(), s_failedPictures.load() );
+      fprintf( stderr, "GPU loop filter verification: %ld pictures (%ld with SAO, %ld with LF-CCCM), %ld with differences\n",
+               s_verifiedPictures.load(), s_verifiedSao.load(), s_verifiedLfCccm.load(), s_failedPictures.load() );
     }
   }
 } s_verifyReport;
@@ -384,7 +431,8 @@ GpuAlf::GpuAlf( gpu::Context& ctx, const Shared& shared, int mode ) : m_ctx( ctx
 GpuAlf::~GpuAlf()
 {
   m_stream.reset();
-  for( gpu::Buffer* b: { &m_in, &m_inUpload, &m_work, &m_outDev, &m_download, &m_workDownload } )
+  for( gpu::Buffer* b: { &m_in, &m_inUpload, &m_inDownload, &m_bifBlocks, &m_bifBlocksUpload, &m_work, &m_outDev,
+                         &m_download, &m_workDownload, &m_saoDownload } )
   {
     b->destroy( m_ctx );
   }
@@ -418,12 +466,14 @@ bool GpuAlfHook::process( AdaptiveLoopFilter& alf, CodingStructure& cs )
 {
   GpuAlfPool& pool = GpuAlfPool::get();
   GpuAlf*       gpu    = pool.acquire( m_ctx, m_mode );
+  GpuSaoJob*    sao    = m_sao;
   GpuLfCccmJob* lfCccm = m_lfCccm;
+  m_sao                = nullptr;
   m_lfCccm             = nullptr;
   bool          done;
   try
   {
-    done = gpu->process( alf, cs, lfCccm );
+    done = gpu->process( alf, cs, sao, lfCccm );
   }
   catch( ... )
   {
@@ -524,22 +574,11 @@ void GpuAlf::stateBefore( AdaptiveLoopFilter& alf, CodingStructure& cs ) const
     }
   }
 #endif
-  // the copies and their padding are the inputs of the kernels; later stages read some of them
-  if( cs.slice->getAlfScaleChroma( COMPONENT_Cb ) || cs.slice->getAlfScaleChroma( COMPONENT_Cr ) )
-  {
-    alf.m_tempBuf3.copyFrom( cs.getRecoBuf(), false, true );
-  }
-  PelUnitBuf recYuv = cs.getRecoBuf();
-  alf.m_tempBuf.copyFrom( recYuv );
-  PelUnitBuf tmpYuv = alf.m_tempBuf.getBuf( cs.area );
-  alf.mirroredPaddingForAlf( cs, tmpYuv, MAX_FILTER_LENGTH_FIXED >> 1, true, true );
+  // the padding of the inputs of the kernels (copiesBefore: the copies of the picture)
   PelUnitBuf tmpYuvBeforeDb = alf.m_tempBufBeforeDb.getBuf( cs.area );
   alf.mirroredPaddingForAlf( cs, tmpYuvBeforeDb, NUM_DB_PAD, true, true );
   PelUnitBuf tmpYuvResi = alf.m_tempBufResi.getBuf( cs.area );
   alf.mirroredPaddingForAlf( cs, tmpYuvResi, MAX_FILTER_LENGTH_FIXED >> 1, true, false );
-  alf.m_tempBufSAO.copyFrom( recYuv );
-  PelUnitBuf tmpYuvSAO = alf.m_tempBufSAO.getBuf( cs.area );
-  alf.mirroredPaddingForAlf( cs, tmpYuvSAO, MAX_FILTER_LENGTH_FIXED >> 1, false, true );
   alf.m_isFixedFilterPaddedPerCtu = cs.picHeader->getVirtualBoundariesPresentFlag() || cs.slice->getCuQpDeltaSubdiv();
   memset( alf.m_ctuEnableOnlineLumaFlag, 0, sizeof( uint8_t ) * alf.m_numCTUsInPic );
   memset( alf.m_ctuPadFlag, 0, sizeof( uint8_t ) * alf.m_numCTUsInPic );
@@ -590,6 +629,22 @@ void GpuAlf::stateBefore( AdaptiveLoopFilter& alf, CodingStructure& cs ) const
       }
     }
   }
+}
+
+void GpuAlf::copiesBefore( AdaptiveLoopFilter& alf, CodingStructure& cs ) const
+{
+  // ALFProcess's copies of the picture before ALF: the kernels' input, later stages read some of them
+  if( cs.slice->getAlfScaleChroma( COMPONENT_Cb ) || cs.slice->getAlfScaleChroma( COMPONENT_Cr ) )
+  {
+    alf.m_tempBuf3.copyFrom( cs.getRecoBuf(), false, true );
+  }
+  PelUnitBuf recYuv = cs.getRecoBuf();
+  alf.m_tempBuf.copyFrom( recYuv );
+  PelUnitBuf tmpYuv = alf.m_tempBuf.getBuf( cs.area );
+  alf.mirroredPaddingForAlf( cs, tmpYuv, MAX_FILTER_LENGTH_FIXED >> 1, true, true );
+  alf.m_tempBufSAO.copyFrom( recYuv );
+  PelUnitBuf tmpYuvSAO = alf.m_tempBufSAO.getBuf( cs.area );
+  alf.mirroredPaddingForAlf( cs, tmpYuvSAO, MAX_FILTER_LENGTH_FIXED >> 1, false, true );
 }
 
 void GpuAlf::stateAfter( AdaptiveLoopFilter& alf, CodingStructure& cs ) const
@@ -805,6 +860,196 @@ bool GpuAlf::gatherLfCccm( const CodingStructure& cs )
   return true;
 }
 
+bool GpuAlf::gatherSao( CodingStructure& cs, SampleAdaptiveOffset& sao, bool reconstruct )
+{
+  Params&    p         = m_params;
+  const SPS& sps       = *cs.sps;
+  const PPS& pps       = *cs.pps;
+  const bool saoOn     = sps.getSAOEnabledFlag();
+  const bool bifLuma   = pps.getUseBIF();
+  const bool bifChroma = pps.getUseChromaBIF();
+  const bool ccsaoOn   = sps.getCCSAOEnabledFlag();
+  p.sao                = false;
+  // the offset steps, the bilateral filter and the CCSAO thresholds of bit depths up to 10
+  if( ( !saoOn && !bifLuma && !bifChroma && !ccsaoOn ) || sps.getBitDepth( CHANNEL_TYPE_LUMA ) > 10
+      || sps.getBitDepth( CHANNEL_TYPE_CHROMA ) > 10 )
+  {
+    return false;
+  }
+
+  // CCSAO (CCSAOProcess): the sets of each component and the set of each CTU
+  p.saoInfo.assign( 4 * m_numCtus, 0 );
+  p.ccsao.assign( 3 * MAX_CCSAO_SET_NUM * CCSAO_STRIDE, 0 );
+  if( ccsaoOn )
+  {
+    const CcSaoComParam& cc = cs.slice->m_ccSaoComParam;
+    for( int comp = 0; comp < 3; comp++ )
+    {
+      if( !cc.enabled[comp] )
+      {
+        continue;
+      }
+      for( int s = 0; s < MAX_CCSAO_SET_NUM; s++ )
+      {
+        int16_t* d = &p.ccsao[( comp * MAX_CCSAO_SET_NUM + s ) * CCSAO_STRIDE];
+        int      classes;
+        if( cc.setType[comp][s] == CCSAO_SET_TYPE_EDGE )
+        {
+          // offsetBlockCcSaoNoClipEdge
+          const int edgeDir = cc.candPos[comp][s][COMPONENT_Y], edgeCmp = cc.candPos[comp][s][COMPONENT_Cb];
+          const int bandIdc = cc.bandNum[comp][s][COMPONENT_Y], edgeIdc = cc.bandNum[comp][s][COMPONENT_Cr];
+          const int edgeThr = cc.bandNum[comp][s][COMPONENT_Cb];
+          if( edgeDir >= MAX_CCSAO_EDGE_DIR || edgeCmp > 2 || bandIdc >= MAX_CCSAO_BAND_IDC || edgeIdc >= MAX_CCSAO_EDGE_IDC
+              || edgeThr >= MAX_CCSAO_EDGE_THR )
+          {
+            return false;
+          }
+          d[0]    = 1;
+          d[1]    = edgeDir;
+          d[2]    = edgeCmp;
+          d[3]    = g_ccSaoBandTab[bandIdc][0];
+          d[4]    = g_ccSaoBandTab[bandIdc][1];
+          d[5]    = edgeIdc;
+          d[6]    = g_ccSaoEdgeThr[edgeIdc][edgeThr];   // << max(0, bit depth - 10)
+          classes = g_ccSaoBandTab[bandIdc][1] * g_ccSaoEdgeNum[edgeIdc][0];
+        }
+        else
+        {
+          // offsetBlockCcSaoNoClip
+          d[0]    = 0;
+          d[1]    = cc.candPos[comp][s][COMPONENT_Y];
+          d[2]    = cc.bandNum[comp][s][COMPONENT_Y];
+          d[3]    = cc.bandNum[comp][s][COMPONENT_Cb];
+          d[4]    = cc.bandNum[comp][s][COMPONENT_Cr];
+          classes = d[2] * d[3] * d[4];
+          if( d[1] >= MAX_CCSAO_CAND_POS_Y )
+          {
+            return false;
+          }
+        }
+        if( classes > MAX_CCSAO_CLASS_NUM )
+        {
+          return false;   // the CPU would read beyond the offsets
+        }
+        for( int i = 0; i < MAX_CCSAO_CLASS_NUM; i++ )
+        {
+          d[8 + i] = cc.offset[comp][s][i];
+        }
+      }
+      const uint8_t* control = sao.m_ccSaoControl[comp];
+      for( int ctu = 0; ctu < m_numCtus; ctu++ )
+      {
+        if( control[ctu] > MAX_CCSAO_SET_NUM )
+        {
+          return false;
+        }
+        p.saoInfo[4 * ctu + comp] |= uint32_t( control[ctu] ) << 4;
+      }
+    }
+  }
+
+  // the bilateral filter (SAOProcess): the transform blocks it filters
+  p.bifBlocks.clear();
+  p.bif[0] = p.bif[1] = p.bif[2] = false;
+  p.bifRoundAdd   = BIF_ROUND_ADD >> pps.getBIFStrength();
+  p.bifRoundShift = BIF_ROUND_SHIFT - pps.getBIFStrength();
+  BilateralFilter& bf = sao.m_bilateralFilter;
+  auto block = [&]( const TransformUnit& tu, ComponentID comp, int qp ) {
+    const CompArea& a  = tu.blocks[comp];
+    int             ws = a.width, hs = a.height;   // the size the strength derives from
+    if( comp != COMPONENT_Y && tu.blocks[COMPONENT_Y].valid() )
+    {
+      ws = tu.blocks[COMPONENT_Y].width;
+      hs = tu.blocks[COMPONENT_Y].height;
+    }
+    const int  inter  = tu.cu->predMode == MODE_INTER;
+    const int  sizeIx = std::min( floorLog2( ws ), 7 ) * 8 + std::min( floorLog2( hs ), 7 );
+    const int  factor = comp == COMPONENT_Y ? bf.m_tuSizeFactor[inter][sizeIx] : bf.m_tuSizeFactorChroma[inter][sizeIx];
+    const int  sqp    = std::min( std::max( qp - 17, 0 ), 25 );
+    p.bifBlocks.insert( p.bifBlocks.end(), { uint32_t( a.x | ( a.y << 16 ) ), uint32_t( a.width | ( a.height << 16 ) ),
+                                             uint32_t( comp | ( inter << 2 ) | ( sqp << 3 ) | ( factor << 8 ) ), 0u } );
+    p.bif[comp] = true;
+  };
+  if( bifLuma || bifChroma )
+  {
+    const PreCalcValues& pcv        = *cs.pcv;
+    const bool           dualTree   = CS::isDualITree( cs );
+    const ChannelType    chromaType = dualTree ? CH_C : CH_L;
+    int                  ctu        = 0;
+    for( int yPos = 0; yPos < pcv.lumaHeight; yPos += pcv.maxCUHeight )
+    {
+      for( int xPos = 0; xPos < pcv.lumaWidth; xPos += pcv.maxCUWidth, ctu++ )
+      {
+        const UnitArea area( cs.area.chromaFormat, Area( xPos, yPos, std::min<int>( pcv.maxCUWidth, pcv.lumaWidth - xPos ),
+                                                         std::min<int>( pcv.maxCUHeight, pcv.lumaHeight - yPos ) ) );
+        if( bifLuma && cs.picture->getBifParam( COMPONENT_Y ).ctuOn[ctu] )
+        {
+          for( auto& cu: cs.traverseCUs( CS::getArea( cs, area, CH_L ), CH_L ) )
+          {
+            for( auto& tu: CU::traverseTUs( cu ) )
+            {
+              if( bf.getApplyBIF( tu, COMPONENT_Y ) )
+              {
+                block( tu, COMPONENT_Y, tu.cu->qp + pps.getBIFQPOffset() );
+              }
+            }
+          }
+        }
+        if( bifChroma && ( cs.picture->getBifParam( COMPONENT_Cb ).ctuOn[ctu] || cs.picture->getBifParam( COMPONENT_Cr ).ctuOn[ctu] ) )
+        {
+          for( auto& cu: cs.traverseCUs( CS::getArea( cs, area, chromaType ), chromaType ) )
+          {
+            if( !cu.Cb().valid() || !cu.Cr().valid() )
+            {
+              continue;
+            }
+            for( auto& tu: CU::traverseTUs( cu ) )
+            {
+              for( int comp = COMPONENT_Cb; comp <= COMPONENT_Cr; comp++ )
+              {
+                const ComponentID compID = ComponentID( comp );
+                if( cs.picture->getBifParam( compID ).ctuOn[ctu] && bf.getApplyBIF( tu, compID ) )
+                {
+                  block( tu, compID, tu.cu->qp + pps.getChromaBIFQPOffset() );
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // SAO (SAOProcess): the type and offsets of each CTU, after resolving the merges
+  p.saoOffsets.assign( m_numCtus * 3 * 32, 0 );
+  if( saoOn )
+  {
+    if( reconstruct )
+    {
+      sao.xReconstructBlkSAOParams( cs, cs.picture->getSAO() );
+    }
+    const SAOBlkParam* prm = cs.picture->getSAO();
+    for( int ctu = 0; ctu < m_numCtus; ctu++ )
+    {
+      for( int comp = 0; comp < 3; comp++ )
+      {
+        const SAOOffset& o = prm[ctu][comp];
+        if( o.modeIdc == SAO_MODE_OFF )
+        {
+          continue;
+        }
+        p.saoInfo[4 * ctu + comp] |= uint32_t( o.typeIdc + 1 );   // EO 1..4, BO 5
+        for( int i = 0; i < 32; i++ )
+        {
+          p.saoOffsets[( ctu * 3 + comp ) * 32 + i] = int16_t( o.offset[i] );
+        }
+      }
+    }
+  }
+  p.sao = true;
+  return true;
+}
+
 void GpuAlf::layout( int width, int height, int ctuSize )
 {
   if( width == m_width && height == m_height && ctuSize == m_ctuSize )
@@ -835,10 +1080,18 @@ void GpuAlf::layout( int width, int height, int ctuSize )
     total += align256( bytes );
   };
 
+  // the deblocked picture first and then the picture after SAO, so that either is left out of the upload
   VkDeviceSize in = 0;
   for( int c = 0; c < 3; c++ )
   {
+    plane( m_inDeblocked[c], c ? wC : m_width, c ? hC : m_height, 0, in );
+  }
+  for( int c = 0; c < 3; c++ )
+  {
     plane( m_inRec[c], c ? wC : m_width, c ? hC : m_height, 8, in );
+  }
+  for( int c = 0; c < 3; c++ )
+  {
     plane( m_inDb[c], c ? wC : m_width, c ? hC : m_height, 8, in );
   }
   plane( m_inResi, m_width, m_height, 8, in );
@@ -849,9 +1102,16 @@ void GpuAlf::layout( int width, int height, int ctuSize )
   place( m_inCcalf[0], sizeof( int16_t ) * CCALF_STRIDE * MAX_NUM_CC_ALF_FILTERS, in );
   place( m_inCcalf[1], sizeof( int16_t ) * CCALF_STRIDE * MAX_NUM_CC_ALF_FILTERS, in );
   place( m_inLfCtus, sizeof( uint32_t ) * 4 * m_numCtus, in );
+  place( m_inSaoInfo, sizeof( uint32_t ) * 4 * m_numCtus, in );
+  place( m_inSaoOffsets, sizeof( int16_t ) * m_numCtus * 3 * 32, in );
+  place( m_inCcsao, sizeof( int16_t ) * 3 * MAX_CCSAO_SET_NUM * CCSAO_STRIDE, in );
   m_inBytes = in;
   m_in.ensure( m_ctx, in, gpu::Buffer::DEVICE );
   m_inUpload.ensure( m_ctx, in, gpu::Buffer::UPLOAD );
+  if( m_mode == VERIFY )
+  {
+    m_inDownload.ensure( m_ctx, in, gpu::Buffer::DOWNLOAD );
+  }
 
   const VkDeviceSize blocks = VkDeviceSize( m_wBlk ) * m_hBlk, blocksC = VkDeviceSize( m_wBlkC ) * m_hBlkC;
   VkDeviceSize       work   = 0;
@@ -877,6 +1137,10 @@ void GpuAlf::layout( int width, int height, int ctuSize )
   {
     plane( m_lfCorr[c], wC, hC, 0, work );
   }
+  for( int c = 0; c < 3; c++ )
+  {
+    plane( m_bifOffsets[c], c ? wC : m_width, c ? hC : m_height, 0, work );
+  }
   m_work.ensure( m_ctx, work, gpu::Buffer::DEVICE );
   if( m_mode == VERIFY )
   {
@@ -890,9 +1154,10 @@ void GpuAlf::layout( int width, int height, int ctuSize )
   }
   m_outDev.ensure( m_ctx, out, gpu::Buffer::DEVICE );
   m_download.ensure( m_ctx, out, gpu::Buffer::DOWNLOAD );
+  m_saoDownload.ensure( m_ctx, m_inRec[0].bytes(), gpu::Buffer::DOWNLOAD );
 }
 
-void GpuAlf::upload( const AdaptiveLoopFilter& alf, const CodingStructure& cs )
+void GpuAlf::upload( const AdaptiveLoopFilter& alf, const CodingStructure& cs, const CPelUnitBuf& deblocked )
 {
   uint8_t* base = (uint8_t*) m_inUpload.mapped;
   // a plane with its margin, from a buffer whose margin is at least as wide
@@ -904,15 +1169,23 @@ void GpuAlf::upload( const AdaptiveLoopFilter& alf, const CodingStructure& cs )
               sizeof( int16_t ) * ( p.width + 2 * p.pad ) );
     }
   };
+  const Params& p = m_params;
   for( int c = 0; c < 3; c++ )
   {
-    put( m_inRec[c], alf.m_tempBuf.get( ComponentID( c ) ) );
-    put( m_inDb[c], alf.m_tempBufBeforeDb.get( ComponentID( c ) ) );
+    const ComponentID comp = ComponentID( c );
+    if( p.sao )
+    {
+      put( m_inDeblocked[c], deblocked.get( comp ) );
+    }
+    else
+    {
+      put( m_inRec[c], alf.m_tempBuf.get( comp ) );
+    }
+    put( m_inDb[c], alf.m_tempBufBeforeDb.get( comp ) );
   }
   put( m_inResi, alf.m_tempBufResi.get( COMPONENT_Y ) );
   put( m_inCi, alf.m_tempBufCodingInfo.get( COMPONENT_Y ) );
 
-  const Params& p = m_params;
   memcpy( base + m_inCtuInfo, p.ctuInfo.data(), sizeof( uint32_t ) * p.ctuInfo.size() );
   memcpy( base + m_inLumaSets, p.lumaSets.data(), sizeof( int16_t ) * p.lumaSets.size() );
   memcpy( base + m_inChroma, p.chroma.data(), sizeof( int16_t ) * p.chroma.size() );
@@ -921,6 +1194,19 @@ void GpuAlf::upload( const AdaptiveLoopFilter& alf, const CodingStructure& cs )
     memcpy( base + m_inCcalf[c], p.ccalfCoeff[c].data(), sizeof( int16_t ) * p.ccalfCoeff[c].size() );
   }
   memcpy( base + m_inLfCtus, p.lfCtus.data(), sizeof( uint32_t ) * p.lfCtus.size() );
+  if( p.sao )
+  {
+    memcpy( base + m_inSaoInfo, p.saoInfo.data(), sizeof( uint32_t ) * p.saoInfo.size() );
+    memcpy( base + m_inSaoOffsets, p.saoOffsets.data(), sizeof( int16_t ) * p.saoOffsets.size() );
+    memcpy( base + m_inCcsao, p.ccsao.data(), sizeof( int16_t ) * p.ccsao.size() );
+    if( !p.bifBlocks.empty() )
+    {
+      const VkDeviceSize bytes = sizeof( uint32_t ) * p.bifBlocks.size();
+      m_bifBlocks.ensure( m_ctx, bytes, gpu::Buffer::DEVICE );
+      m_bifBlocksUpload.ensure( m_ctx, bytes, gpu::Buffer::UPLOAD );
+      memcpy( m_bifBlocksUpload.mapped, p.bifBlocks.data(), bytes );
+    }
+  }
 }
 
 void GpuAlf::run( const AdaptiveLoopFilter& alf, const CodingStructure& cs )
@@ -947,7 +1233,24 @@ void GpuAlf::run( const AdaptiveLoopFilter& alf, const CodingStructure& cs )
 
   gpu::Stream& s = *m_stream;
   s.begin();
-  s.copy( m_inUpload, 0, m_in, 0, m_inBytes );
+  if( prm.sao )
+  {
+    // the deblocked picture instead of the one after SAO
+    s.copy( m_inUpload, m_inDeblocked[0].offset, m_in, m_inDeblocked[0].offset, m_inRec[0].offset - m_inDeblocked[0].offset );
+    s.copy( m_inUpload, m_inDb[0].offset, m_in, m_inDb[0].offset, m_inBytes - m_inDb[0].offset );
+    s.copy( m_bifBlocksUpload, 0, m_bifBlocks, 0, sizeof( uint32_t ) * prm.bifBlocks.size() );
+    for( int c = 0; c < 3; c++ )
+    {
+      if( prm.bif[c] )
+      {
+        s.fill( m_work, m_bifOffsets[c].offset, m_bifOffsets[c].bytes(), 0 );   // no offset outside the blocks
+      }
+    }
+  }
+  else
+  {
+    s.copy( m_inUpload, m_inRec[0].offset, m_in, m_inRec[0].offset, m_inBytes - m_inRec[0].offset );
+  }
   if( prm.lfCccm )
   {
     for( int c = 0; c < 2; c++ )
@@ -956,6 +1259,69 @@ void GpuAlf::run( const AdaptiveLoopFilter& alf, const CodingStructure& cs )
     }
   }
   s.barrier();
+
+  // SAO, the bilateral filter and CCSAO: the picture after SAO in m_inRec, mirror-padded as ALFProcess pads it
+  if( prm.sao )
+  {
+    if( !prm.bifBlocks.empty() )
+    {
+      PushSaoBif bif;
+      memset( &bif, 0, sizeof( bif ) );
+      for( int c = 0; c < 3; c++ )
+      {
+        bif.src[c] = gp( m_in, m_inDeblocked[c] );
+        bif.dst[c] = gp( m_work, m_bifOffsets[c] );
+      }
+      bif.blocks     = m_bifBlocks.addr;
+      bif.tables     = m_k.tables.addr + m_k.bif;
+      bif.numBlocks  = int( prm.bifBlocks.size() / 4 );
+      bif.groupsX    = std::min( bif.numBlocks, 65535 );
+      bif.width      = m_width;
+      bif.height     = m_height;
+      bif.ctuSize    = m_ctuSize;
+      bif.roundAdd   = prm.bifRoundAdd;
+      bif.roundShift = prm.bifRoundShift;
+      s.dispatch( m_k.saoBif, &bif, bif.groupsX, divUp( bif.numBlocks, bif.groupsX ) );
+      s.barrier();
+    }
+    for( int c = 0; c < 3; c++ )
+    {
+      const ComponentID comp = ComponentID( c );
+      const ClpRng&     rng  = cs.slice->clpRng( comp );
+      PushSaoApply      sa;
+      memset( &sa, 0, sizeof( sa ) );
+      sa.srcY        = gp( m_in, m_inDeblocked[0] );
+      sa.srcCb       = gp( m_in, m_inDeblocked[1] );
+      sa.srcCr       = gp( m_in, m_inDeblocked[2] );
+      sa.bif         = prm.bif[c] ? gp( m_work, m_bifOffsets[c] ) : GpuPlane{ 0, 0, 0 };
+      sa.dst         = gp( m_in, m_inRec[c] );
+      sa.ctuInfo     = m_in.addr + m_inSaoInfo;
+      sa.saoOffsets  = m_in.addr + m_inSaoOffsets;
+      sa.ccsao       = m_in.addr + m_inCcsao;
+      sa.comp        = c;
+      sa.width       = m_width;
+      sa.height      = m_height;
+      sa.ctuSizeLog2 = log2Of( m_ctuSize );
+      sa.ctusPerRow  = m_ctusPerRow;
+      sa.bitDepth    = cs.sps->getBitDepth( toChannelType( comp ) );
+      sa.outMin      = rng.min;
+      sa.outMax      = rng.max;
+      sa.ccsaoShift  = std::max( 0, sa.bitDepth - MAX_SAO_TRUNCATED_BITDEPTH );   // m_offsetStepLog2
+      s.dispatch( m_k.saoApply, &sa, divUp( c ? wC : m_width, 16 ), divUp( c ? hC : m_height, 8 ) );
+    }
+    s.barrier();
+    for( int c = 0; c < 3; c++ )
+    {
+      PushSaoPad pad;
+      pad.plane  = gp( m_in, m_inRec[c] );
+      pad.width  = c ? wC : m_width;
+      pad.height = c ? hC : m_height;
+      pad.pad    = MAX_FILTER_LENGTH_FIXED >> 1;
+      pad.pad0   = 0;
+      s.dispatch( m_k.saoPad, &pad, divUp( pad.width + 2 * pad.pad, 16 ), divUp( pad.height + 2 * pad.pad, 8 ) );
+    }
+    s.barrier();
+  }
 
   // classes
   PushCiClass ciClass;
@@ -1220,22 +1586,45 @@ void GpuAlf::run( const AdaptiveLoopFilter& alf, const CodingStructure& cs )
   if( m_mode == VERIFY )
   {
     s.copy( m_work, 0, m_workDownload, 0, m_work.size );
+    s.copy( m_in, 0, m_inDownload, 0, m_in.size );
+  }
+  // the luma after SAO for the CPU stages after ALF that read it: TAlfProcess, the offset refinement after ALF
+  m_saoLumaDownloaded = false;
+#if JVET_AK0065_TALF
+  m_saoLumaDownloaded |= cs.sps->getUseTAlf();
+#endif
+#if JVET_AK0121_LOOPFILTER_OFFSET_REFINEMENT
+  m_saoLumaDownloaded |= cs.slice->getOffsetRefinementAlf() && !cs.slice->isIntra();
+#endif
+  m_saoLumaDownloaded = m_saoLumaDownloaded && prm.sao;
+  if( m_saoLumaDownloaded )
+  {
+    s.copy( m_in, m_inRec[0].offset, m_saoDownload, 0, m_inRec[0].bytes() );
   }
   s.submitAndWait();
 }
 
-void GpuAlf::output( CodingStructure& cs ) const
+void GpuAlf::output( AdaptiveLoopFilter& alf, CodingStructure& cs ) const
 {
-  PelUnitBuf rec = cs.getRecoBuf();
-  for( int c = 0; c < 3; c++ )
-  {
-    const PlaneDesc& p   = m_out[c];
-    const int16_t*   src = (const int16_t*) ( (const uint8_t*) m_download.mapped + p.offset );
-    PelBuf           dst = rec.get( ComponentID( c ) );
+  auto get = []( const gpu::Buffer& b, const PlaneDesc& p, PelBuf dst ) {
+    const int16_t* src = (const int16_t*) ( (const uint8_t*) b.mapped + p.offset ) + p.origin();
     for( int y = 0; y < p.height; y++ )
     {
       memcpy( dst.buf + y * dst.stride, src + y * p.stride, sizeof( int16_t ) * p.width );
     }
+  };
+  PelUnitBuf rec = cs.getRecoBuf();
+  for( int c = 0; c < 3; c++ )
+  {
+    get( m_download, m_out[c], rec.get( ComponentID( c ) ) );
+  }
+  if( m_saoLumaDownloaded )
+  {
+    // where ALFProcess leaves the picture before ALF (m_saoDownload holds m_inRec[0] alone)
+    PlaneDesc p = m_inRec[0];
+    p.offset    = 0;
+    get( m_saoDownload, p, alf.m_tempBuf.get( COMPONENT_Y ) );
+    get( m_saoDownload, p, alf.m_tempBufSAO.get( COMPONENT_Y ) );
   }
 }
 
@@ -1264,7 +1653,8 @@ bool GpuAlf::verify( const AdaptiveLoopFilter& alf, const CodingStructure& cs, c
                  { "fixed filter 2" },     { "residual filter" },      { "classifier class" },
                  { "Gauss image" },        { "Laplacian image" },      { "chroma fixed filter" },
                  { "luma output" },        { "Cb output" },            { "Cr output" },
-                 { "LF-CCCM Cb correction" }, { "LF-CCCM Cr correction" } };
+                 { "LF-CCCM Cb correction" }, { "LF-CCCM Cr correction" },
+                 { "luma after SAO" },     { "Cb after SAO" },         { "Cr after SAO" } };
   auto check = [&cs]( Check& c, int x, int y, int cpu, int gpu ) {
     c.compared++;
     if( cpu != gpu && c.differ++ < 3 )
@@ -1362,6 +1752,27 @@ bool GpuAlf::verify( const AdaptiveLoopFilter& alf, const CodingStructure& cs, c
     }
   }
 
+  // the picture after SAO: the CPU's in ALFProcess's copy (the margin the ALF kernels read included)
+  if( m_params.sao )
+  {
+    s_verifiedSao++;
+    const uint8_t* dlIn = (const uint8_t*) m_inDownload.mapped;
+    for( int c = 0; c < 3; c++ )
+    {
+      const PlaneDesc& p   = m_inRec[c];
+      const int16_t*   gpu = (const int16_t*) ( dlIn + p.offset ) + p.origin();
+      const CPelBuf    cpu = alf.m_tempBuf.get( ComponentID( c ) );
+      const int        m   = MAX_FILTER_LENGTH_FIXED >> 1;
+      for( int y = -m; y < p.height + m; y++ )
+      {
+        for( int x = -m; x < p.width + m; x++ )
+        {
+          check( checks[14 + c], x, y, cpu.at( x, y ), gpu[y * p.stride + x] );
+        }
+      }
+    }
+  }
+
   // the LF-CCCM correction the decoder adds after ALFProcess
   if( lfCccm && m_params.lfCccm )
   {
@@ -1398,9 +1809,15 @@ bool GpuAlf::verify( const AdaptiveLoopFilter& alf, const CodingStructure& cs, c
   return ok;
 }
 
-bool GpuAlf::process( AdaptiveLoopFilter& alf, CodingStructure& cs, GpuLfCccmJob* lfCccm )
+bool GpuAlf::process( AdaptiveLoopFilter& alf, CodingStructure& cs, GpuSaoJob* sao, GpuLfCccmJob* lfCccm )
 {
-  // the CPU derives the LF-CCCM correction from the picture before ALF, so before it filters
+  // on the CPU, SAO comes first, then the LF-CCCM correction from the picture after SAO, then ALF
+  auto cpuSao = [sao]() {
+    if( sao )
+    {
+      sao->cpu();
+    }
+  };
   auto cpuLfCccm = [lfCccm]() {
     if( lfCccm )
     {
@@ -1408,8 +1825,10 @@ bool GpuAlf::process( AdaptiveLoopFilter& alf, CodingStructure& cs, GpuLfCccmJob
     }
   };
   m_params.lfCccm = false;
+  m_params.sao    = false;
   if( !accept( alf, cs ) )
   {
+    cpuSao();
     cpuLfCccm();
     return false;
   }
@@ -1423,7 +1842,18 @@ bool GpuAlf::process( AdaptiveLoopFilter& alf, CodingStructure& cs, GpuLfCccmJob
   };
   if( m_mode == VERIFY )
   {
-    // the CPU result is kept; the GPU works on the inputs ALFProcess prepared and is compared with it
+    // the CPU results are kept; the GPU works on the inputs the CPU stages prepared and is compared with them
+    if( sao )
+    {
+      if( m_verifyDeblocked.bufs.empty() || m_verifyDeblocked.Y().width != cs.area.lwidth()
+          || m_verifyDeblocked.Y().height != cs.area.lheight() )
+      {
+        m_verifyDeblocked.destroy();
+        m_verifyDeblocked.create( cs.area );
+      }
+      m_verifyDeblocked.copyFrom( cs.getRecoBuf() );
+    }
+    cpuSao();
     cpuLfCccm();
     cpuAlf();
     if( gather( alf, cs ) )
@@ -1432,7 +1862,11 @@ bool GpuAlf::process( AdaptiveLoopFilter& alf, CodingStructure& cs, GpuLfCccmJob
       {
         gatherLfCccm( cs );
       }
-      upload( alf, cs );
+      if( sao )
+      {
+        gatherSao( cs, *sao->sao, false );   // SAOProcess resolved the merges
+      }
+      upload( alf, cs, m_verifyDeblocked );
       run( alf, cs );
       verify( alf, cs, lfCccm );
     }
@@ -1443,21 +1877,32 @@ bool GpuAlf::process( AdaptiveLoopFilter& alf, CodingStructure& cs, GpuLfCccmJob
   if( !gather( alf, cs ) )
   {
     // something the kernels do not implement: ALFProcess does it all (its state work again, which is idempotent)
+    cpuSao();
     cpuLfCccm();
     cpuAlf();
     return true;
   }
-  if( lfCccm && !gatherLfCccm( cs ) )
+  // SAO on the GPU when the LF-CCCM correction is too: the CPU derives it from the picture after SAO
+  const bool lfCccmGpu = lfCccm && gatherLfCccm( cs );
+  if( sao && !( ( !lfCccm || lfCccmGpu ) && gatherSao( cs, *sao->sao, true ) ) )
+  {
+    cpuSao();
+  }
+  if( lfCccm && !lfCccmGpu )
   {
     cpuLfCccm();
   }
   const Params& p = m_params;
-  if( p.luma || p.chromaAlf[0] || p.chromaAlf[1] || p.ccalf[0] || p.ccalf[1] || p.scaleCorr[0] || p.scaleCorr[1]
-      || p.lfCccm )
+  if( !p.sao )
   {
-    upload( alf, cs );
+    copiesBefore( alf, cs );
+  }
+  if( p.luma || p.chromaAlf[0] || p.chromaAlf[1] || p.ccalf[0] || p.ccalf[1] || p.scaleCorr[0] || p.scaleCorr[1]
+      || p.lfCccm || p.sao )
+  {
+    upload( alf, cs, cs.getRecoBuf() );
     run( alf, cs );
-    output( cs );
+    output( alf, cs );
   }
   if( p.lfCccm )
   {

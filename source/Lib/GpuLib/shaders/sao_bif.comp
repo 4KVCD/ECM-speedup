@@ -1,0 +1,204 @@
+#version 460
+// the bilateral filter of SampleAdaptiveOffset::SAOProcess (BilateralFilter::bilateralFilterDiamond5x5 with the C
+// filter blockBilateralFilterDiamond5x5, which the SIMD one equals) for one transform block per workgroup: the
+// block's strength from its mean absolute deviation, then per sample the 5x5 diamond on the deblocked picture,
+// with the CPU's padding of the block (its rows / columns where the picture ends within two samples, and the row one
+// sample beyond a CTU's top / bottom in place of the second one). Output: the offset per sample, which the SAO
+// kernel adds.
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+layout( local_size_x = 64 ) in;
+
+layout( buffer_reference, std430, buffer_reference_align = 16 ) readonly buffer BlockList { uvec4 v[]; };
+layout( buffer_reference, std430, buffer_reference_align = 1 ) readonly buffer I8 { int8_t v[]; };
+
+layout( push_constant ) uniform Push
+{
+  Plane    src0;       // deblocked picture: Y, Cb, Cr (read inside the picture only)
+  Plane    src1;
+  Plane    src2;
+  Plane    dst0;       // out: offsets
+  Plane    dst1;
+  Plane    dst2;
+  uint64_t blocks;     // [4] per block: x | y << 16, w | h << 16, comp | inter << 2 | sqp << 3 | size factor << 8
+  uint64_t tables;     // int8: LUT [luma, chroma][26 QPs][48], MAD factor [luma, chroma][intra, inter][16]
+  int      numBlocks;
+  int      groupsX;    // workgroups per row of the dispatch
+  int      width;      // luma
+  int      height;
+  int      ctuSize;    // luma
+  int      roundAdd;   // BIF_ROUND_ADD >> strength
+  int      roundShift; // BIF_ROUND_SHIFT - strength
+  int      pad0;
+} pc;
+
+shared int sRed[64];
+
+int tid;
+int comp, x0, y0, w, h, picW, picH;
+bool allAvail, topAlt, bottomAlt, leftAlt, rightAlt, ctuTop, ctuBottom;
+
+int sumAll( int v )
+{
+  sRed[tid] = v;
+  barrier();
+  for( int s = 32; s > 0; s >>= 1 )
+  {
+    if( tid < s )
+    {
+      sRed[tid] += sRed[tid + s];
+    }
+    barrier();
+  }
+  const int r = sRed[0];
+  barrier();
+  return r;
+}
+
+int src( int x, int y )
+{
+  return comp == 0 ? ld( pc.src0, x, y ) : comp == 1 ? ld( pc.src1, x, y ) : ld( pc.src2, x, y );
+}
+
+// the sample (tx, ty) of the CPU's padded block, (0, 0) the block's top left
+int fetch( int tx, int ty )
+{
+  if( allAvail )
+  {
+    int sy = ty;
+    if( ty == -2 && ctuTop )
+    {
+      sy = -1;
+    }
+    else if( ty == h + 1 && ctuBottom )
+    {
+      sy = h;
+    }
+    return src( x0 + tx, y0 + sy );
+  }
+  const bool inX = tx >= 0 && tx < w;
+  const bool inY = ty >= 0 && ty < h;
+  if( inX && inY )
+  {
+    return src( x0 + tx, y0 + ty );
+  }
+  if( inX )
+  {
+    if( ty < 0 )
+    {
+      return topAlt ? src( x0 + tx, y0 + ty ) : src( x0 + tx, y0 );
+    }
+    return bottomAlt ? src( x0 + tx, y0 + ty ) : src( x0 + tx, y0 + h - 1 );
+  }
+  if( inY )
+  {
+    if( tx < 0 )
+    {
+      return leftAlt ? src( x0 + tx, y0 + ty ) : src( x0, y0 + ty );
+    }
+    return rightAlt ? src( x0 + tx, y0 + ty ) : src( x0 + w - 1, y0 + ty );
+  }
+  // the corners (only the ones next to the block are read)
+  if( ty < 0 )
+  {
+    if( tx < 0 )
+    {
+      return topAlt && leftAlt ? src( x0 + tx, y0 + ty ) : src( x0, y0 );
+    }
+    return topAlt && rightAlt ? src( x0 + tx, y0 + ty ) : src( x0 + w - 1, y0 );
+  }
+  if( tx < 0 )
+  {
+    return bottomAlt && leftAlt ? src( x0 + tx, y0 + ty ) : src( x0, y0 + h - 1 );
+  }
+  return bottomAlt && rightAlt ? src( x0 + tx, y0 + ty ) : src( x0 + w - 1, y0 + h - 1 );
+}
+
+// bifApplyLut (JVET_AF0112_BIF_DYNAMIC_SCALING), an odd function of the difference
+int lut( int diff, int lutBase, int cutBits )
+{
+  const int bitsRound  = 1 << ( cutBits - 2 );
+  const int bitsRound2 = bitsRound + ( 1 << ( cutBits - 1 ) );
+  const int v          = abs( diff );
+  const int idx        = min( ( v + bitsRound ) >> cutBits, 15 );
+  const int idx2       = min( ( v + bitsRound2 ) >> cutBits, 15 );
+  I8        t          = I8( pc.tables );
+  const int w0         = ( int( t.v[lutBase + idx] ) + int( t.v[lutBase + idx2] ) + 1 ) >> 1;
+  return diff < 0 ? -w0 : w0;
+}
+
+void main()
+{
+  tid         = int( gl_LocalInvocationID.x );
+  const int g = int( gl_WorkGroupID.y ) * pc.groupsX + int( gl_WorkGroupID.x );
+  if( g >= pc.numBlocks )
+  {
+    return;
+  }
+  const uvec4 b = BlockList( pc.blocks ).v[g];
+  x0             = int( b.x & 0xFFFFu );
+  y0             = int( b.x >> 16 );
+  w              = int( b.y & 0xFFFFu );
+  h              = int( b.y >> 16 );
+  comp           = int( b.z & 3u );
+  const int inter      = int( ( b.z >> 2 ) & 1u );
+  const int sqp        = int( ( b.z >> 3 ) & 31u );
+  const int sizeFactor = int( ( b.z >> 8 ) & 255u );
+  const int scale      = comp == 0 ? 0 : 1;
+  picW                 = pc.width >> scale;
+  picH                 = pc.height >> scale;
+
+  // getFilterLutParameters / getFilterLutParametersChroma: the strength from the mean absolute deviation
+  const int whLog2 = findMSB( uint( w ) ) + findMSB( uint( h ) );
+  int       sum    = 0;
+  for( int i = tid; i < w * h; i += 64 )
+  {
+    sum += src( x0 + i % w, y0 + i / w );
+  }
+  sum             = sumAll( sum );
+  const int avg   = ( sum + ( 1 << ( whLog2 - 1 ) ) ) >> whLog2;
+  int       dev   = 0;
+  for( int i = tid; i < w * h; i += 64 )
+  {
+    dev += abs( src( x0 + i % w, y0 + i / w ) - avg );
+  }
+  dev             = sumAll( dev );
+  const int mad   = min( ( ( dev + ( 1 << ( whLog2 - 1 ) ) ) >> whLog2 ) >> 4, 15 );
+  const int lumaC = comp == 0 ? 0 : 1;
+  const int bfac  = sizeFactor + int( I8( pc.tables ).v[2 * 26 * 48 + ( lumaC * 2 + inter ) * 16 + mad] );
+  const int lutBase = ( lumaC * 26 + sqp ) * 48;
+  const int cutBits = comp == 0 ? 3 : 2;
+
+  // the padding of the block
+  topAlt    = y0 - 2 >= 0;
+  leftAlt   = x0 - 2 >= 0;
+  bottomAlt = y0 + h + 1 < picH;
+  rightAlt  = x0 + w + 1 < picW;
+  allAvail  = topAlt && bottomAlt && leftAlt && rightAlt;
+  const int ctuSize = pc.ctuSize >> scale;
+  ctuTop    = y0 % ctuSize == 0;
+  ctuBottom = ( y0 + h ) % ctuSize == 0;
+
+  Plane dst = comp == 0 ? pc.dst0 : comp == 1 ? pc.dst1 : pc.dst2;
+  for( int i = tid; i < w * h; i += 64 )
+  {
+    const int tx  = i % w;
+    const int ty  = i / w;
+    const int cur = fetch( tx, ty );
+    int       mod = 0;
+    mod += lut( fetch( tx, ty - 1 ) - cur, lutBase, cutBits );
+    mod += lut( fetch( tx - 1, ty ) - cur, lutBase, cutBits );
+    mod += lut( fetch( tx + 1, ty ) - cur, lutBase, cutBits );
+    mod += lut( fetch( tx, ty + 1 ) - cur, lutBase, cutBits );
+    mod += lut( fetch( tx + 1, ty - 1 ) - cur, lutBase + 16, cutBits );
+    mod += lut( fetch( tx - 1, ty - 1 ) - cur, lutBase + 16, cutBits );
+    mod += lut( fetch( tx - 1, ty + 1 ) - cur, lutBase + 16, cutBits );
+    mod += lut( fetch( tx + 1, ty + 1 ) - cur, lutBase + 16, cutBits );
+    mod += lut( fetch( tx, ty - 2 ) - cur, lutBase + 32, cutBits );
+    mod += lut( fetch( tx, ty + 2 ) - cur, lutBase + 32, cutBits );
+    mod += lut( fetch( tx - 2, ty ) - cur, lutBase + 32, cutBits );
+    mod += lut( fetch( tx + 2, ty ) - cur, lutBase + 32, cutBits );
+    st( dst, x0 + tx, y0 + ty, ( mod * bfac + ( pc.roundAdd << 3 ) ) >> ( pc.roundShift + 3 ) );
+  }
+}

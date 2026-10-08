@@ -1,0 +1,36 @@
+#version 460
+// AdaptiveLoopFilter::mirroredPaddingForAlf of the picture after SAO, which the ALF kernels read: `pad` samples on
+// every side, mirrored at the boundary (sample -1 is sample 0, sample w is sample w - 1)
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+layout( local_size_x = 16, local_size_y = 8 ) in;
+
+layout( push_constant ) uniform Push
+{
+  Plane plane;
+  int   width;
+  int   height;
+  int   pad;
+  int   pad0;
+} pc;
+
+int mirror( int v, int n )
+{
+  return v < 0 ? -v - 1 : v >= n ? 2 * n - 1 - v : v;
+}
+
+void main()
+{
+  const int x = int( gl_GlobalInvocationID.x ) - pc.pad;
+  const int y = int( gl_GlobalInvocationID.y ) - pc.pad;
+  if( x >= pc.width + pc.pad || y >= pc.height + pc.pad )
+  {
+    return;
+  }
+  if( x >= 0 && x < pc.width && y >= 0 && y < pc.height )
+  {
+    return;
+  }
+  st( pc.plane, x, y, ld( pc.plane, mirror( x, pc.width ), mirror( y, pc.height ) ) );
+}

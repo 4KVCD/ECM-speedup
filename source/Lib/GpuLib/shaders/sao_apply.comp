@@ -1,0 +1,242 @@
+#version 460
+// SampleAdaptiveOffset::SAOProcess, CCSAOProcess and jointClipSaoBifCcSao for one component: on the deblocked
+// picture, per CTU the SAO offset (offsetBlockNoClip), the bilateral filter offset (sao_bif.comp) and the CCSAO
+// offset (offsetBlockCcSaoNoClipEdge / offsetBlockCcSaoNoClip), then the clipping. A sample gets an offset where the
+// CPU's loops reach it: those skip the samples whose neighbours lie beyond the picture (the CTU's availability flags),
+// with the CPU's particular rows and columns for each class position. The CCSAO source is the deblocked picture
+// extended by its boundary samples (m_ccSaoBuf), so its reads are clamped to the picture.
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+layout( local_size_x = 16, local_size_y = 8 ) in;
+
+layout( push_constant ) uniform Push
+{
+  Plane    srcY;          // deblocked picture
+  Plane    srcCb;
+  Plane    srcCr;
+  Plane    bif;           // bilateral filter offsets of this component (address 0: none)
+  Plane    dst;           // out: this component after SAO
+  uint64_t ctuInfo;       // uint32 [4] per CTU: word comp: SAO type + 1 (0 off, 5: band offset) | CCSAO set << 4
+  uint64_t saoOffsets;    // int16 [CTU][3][32]
+  uint64_t ccsao;         // int16 [3][4 sets][72]: see GpuAlf::gatherSao
+  int      comp;
+  int      width;         // luma
+  int      height;
+  int      ctuSizeLog2;   // luma
+  int      ctusPerRow;
+  int      bitDepth;      // of this component
+  int      outMin;
+  int      outMax;
+  int      ccsaoShift;    // m_offsetStepLog2 of this component
+  int      pad0;
+} pc;
+
+const ivec2 EDGE_A[4] = ivec2[]( ivec2( -1, 0 ), ivec2( 0, -1 ), ivec2( -1, -1 ), ivec2( 1, -1 ) );
+const ivec2 EDGE_B[4] = ivec2[]( ivec2( 1, 0 ), ivec2( 0, 1 ), ivec2( 1, 1 ), ivec2( -1, 1 ) );
+const ivec2 CAND[9]   = ivec2[]( ivec2( -1, -1 ), ivec2( 0, -1 ), ivec2( 1, -1 ), ivec2( -1, 0 ), ivec2( 0, 0 ),
+                               ivec2( 1, 0 ), ivec2( -1, 1 ), ivec2( 0, 1 ), ivec2( 1, 1 ) );
+
+bool left, right, above, below;
+
+// a sample of a component, the picture extended by its boundary samples
+int pix( int c, int x, int y )
+{
+  const int s = c == 0 ? 0 : 1;
+  x           = clamp( x, 0, ( pc.width >> s ) - 1 );
+  y           = clamp( y, 0, ( pc.height >> s ) - 1 );
+  return c == 0 ? ld( pc.srcY, x, y ) : c == 1 ? ld( pc.srcCb, x, y ) : ld( pc.srcCr, x, y );
+}
+
+// the samples of an edge-offset class that offsetBlockNoClip / offsetBlockCcSaoNoClipEdge reach
+bool edgeProcessed( int dir, int lx, int ly, int w, int h )
+{
+  const int startX = left ? 0 : 1;
+  const int endX   = right ? w : w - 1;
+  switch( dir )
+  {
+  case 0: return lx >= startX && lx < endX;
+  case 1: return ly >= ( above ? 0 : 1 ) && ly < ( below ? h : h - 1 );
+  case 2:   // 135 degrees
+    if( ly == 0 )
+    {
+      return lx >= ( left && above ? 0 : 1 ) && lx < ( above ? endX : 1 );
+    }
+    if( ly == h - 1 )
+    {
+      return lx >= ( below ? startX : w - 1 ) && lx < ( right && below ? w : w - 1 );
+    }
+    return lx >= startX && lx < endX;
+  default:   // 45 degrees
+    if( ly == 0 )
+    {
+      return lx >= ( above ? startX : w - 1 ) && lx < ( right && above ? w : w - 1 );
+    }
+    if( ly == h - 1 )
+    {
+      return lx >= ( left && below ? 0 : 1 ) && lx < ( below ? endX : 1 );
+    }
+    return lx >= startX && lx < endX;
+  }
+}
+
+// the samples of a band-offset class position that offsetBlockCcSaoNoClip reaches
+bool bandProcessed( int cand, int lx, int ly, int w, int h )
+{
+  const int startX = left ? 0 : 1;
+  switch( cand )
+  {
+  case 0:
+    if( ly == 0 )
+    {
+      return lx >= ( left && above ? 0 : 1 ) && lx < ( above ? w : 1 );
+    }
+    return lx >= startX;
+  case 1: return ly >= ( above ? 0 : 1 );
+  case 2:   // the left boundary applies here too
+    if( ly == 0 )
+    {
+      return lx >= ( above ? startX : w - 1 ) && lx < ( right && above ? w : w - 1 );
+    }
+    return lx >= startX;
+  case 3: return lx >= startX;
+  case 4: return true;
+  case 5: return lx < ( right ? w : w - 1 );
+  case 6:
+    if( ly < h - 1 )
+    {
+      return lx >= startX;
+    }
+    return lx >= ( left && below ? 0 : 1 ) && lx < ( below ? w : 1 );
+  case 7: return ly < ( below ? h : h - 1 );
+  default:
+    if( ly < h - 1 )
+    {
+      return lx < ( right ? w : w - 1 );
+    }
+    return lx >= ( below ? 0 : w - 1 ) && lx < ( right && below ? w : w - 1 );
+  }
+}
+
+// SampleAdaptiveOffset::getCcSaoEdgeIdx
+int edgeIdx( int c, int a, int t, int edgeIdc )
+{
+  const int d = c - a;
+  if( edgeIdc == 0 )
+  {
+    return d < 0 ? ( d < -t ? 0 : 1 ) : ( d < t ? 2 : 3 );
+  }
+  return d < t ? 0 : 1;
+}
+
+void main()
+{
+  const int x     = int( gl_GlobalInvocationID.x );
+  const int y     = int( gl_GlobalInvocationID.y );
+  const int s     = pc.comp == 0 ? 0 : 1;
+  const int width = pc.width >> s, height = pc.height >> s;
+  if( x >= width || y >= height )
+  {
+    return;
+  }
+  const int ctuLog2 = pc.ctuSizeLog2 - s;
+  const int ctu     = ( y >> ctuLog2 ) * pc.ctusPerRow + ( x >> ctuLog2 );
+  const int bx      = ( x >> ctuLog2 ) << ctuLog2;
+  const int by      = ( y >> ctuLog2 ) << ctuLog2;
+  const int bw      = min( 1 << ctuLog2, width - bx );
+  const int bh      = min( 1 << ctuLog2, height - by );
+  const int lx      = x - bx;
+  const int ly      = y - by;
+  // deriveLoopFilterBoundaryAvailibility for one slice and tile: the neighbouring CTUs inside the picture
+  left  = bx > 0;
+  right = bx + bw < width;
+  above = by > 0;
+  below = by + bh < height;
+
+  const int  cur  = pix( pc.comp, x, y );
+  int        res  = cur;
+  const uint info = BufI32( pc.ctuInfo ).v[4 * ctu + pc.comp];
+
+  // SAO
+  const int saoType = int( info & 15u );
+  if( saoType != 0 )
+  {
+    BufI16    off  = BufI16( pc.saoOffsets );
+    const int base = ( ctu * 3 + pc.comp ) * 32;
+    if( saoType == 5 )
+    {
+      res += int( off.v[base + ( cur >> ( pc.bitDepth - 5 ) )] );
+    }
+    else if( edgeProcessed( saoType - 1, lx, ly, bw, bh ) )
+    {
+      const ivec2 a = ivec2( x, y ) + EDGE_A[saoType - 1];
+      const ivec2 b = ivec2( x, y ) + EDGE_B[saoType - 1];
+      const int   e = sign( cur - pix( pc.comp, a.x, a.y ) ) + sign( cur - pix( pc.comp, b.x, b.y ) );
+      res += int( off.v[base + 2 + e] );
+    }
+  }
+
+  // CCSAO
+  const int set = int( ( info >> 4 ) & 7u );
+  if( set != 0 )
+  {
+    BufI16    p    = BufI16( pc.ccsao );
+    const int base = ( pc.comp * 4 + set - 1 ) * 72;
+    // the collocated luma and chroma positions
+    ivec2     posL = pc.comp == 0 ? ivec2( x, y ) : ivec2( x << 1, y << 1 );
+    ivec2     posC = pc.comp == 0 ? ivec2( x >> 1, y >> 1 ) : ivec2( x, y );
+    if( int( p.v[base] ) != 0 )
+    {
+      // edge classifier: edge direction, edge component, band component, band number, edge idc, edge threshold
+      const int dir     = int( p.v[base + 1] );
+      const int edgeCmp = int( p.v[base + 2] );
+      if( edgeProcessed( dir, lx, ly, bw, bh ) )
+      {
+        const int   bandCmp = int( p.v[base + 3] );
+        const int   bandNum = int( p.v[base + 4] );
+        const int   edgeIdc = int( p.v[base + 5] );
+        const int   thr     = int( p.v[base + 6] );
+        const ivec2 posE    = edgeCmp == 0 ? posL : posC;
+        const int   valE    = pix( edgeCmp, posE.x, posE.y );
+        const ivec2 a       = posE + EDGE_A[dir];
+        const ivec2 b       = posE + EDGE_B[dir];
+        const int   edgeNumUni = edgeIdc == 0 ? 4 : 2;
+        const int   edgeNum    = edgeIdc == 0 ? 16 : 4;
+        const int   eIdx = edgeIdx( valE, pix( edgeCmp, a.x, a.y ), thr, edgeIdc ) * edgeNumUni
+                         + edgeIdx( valE, pix( edgeCmp, b.x, b.y ), thr, edgeIdc );
+        const ivec2 posB = bandCmp == 0 ? posL : posC;
+        const int   bIdx = ( pix( bandCmp, posB.x, posB.y ) * bandNum ) >> pc.bitDepth;
+        res += int( p.v[base + 8 + bIdx * edgeNum + eIdx] ) << pc.ccsaoShift;
+      }
+    }
+    else
+    {
+      // band classifier: class position of the luma sample, band numbers of Y, Cb, Cr
+      const int cand = int( p.v[base + 1] );
+      if( bandProcessed( cand, lx, ly, bw, bh ) )
+      {
+        const int bandY = int( p.v[base + 2] ), bandU = int( p.v[base + 3] ), bandV = int( p.v[base + 4] );
+        if( pc.comp == 0 && cand == 6 )
+        {
+          posC.y = ( y + 1 ) >> 1;   // the CPU's chroma rows run one luma row ahead here
+        }
+        if( pc.comp != 0 && cand == 1 && !above )
+        {
+          posL.y -= 1;   // here its luma and chroma rows lag by one row
+          posC.y -= 1;
+        }
+        posL += CAND[cand];
+        const int classIdx = ( ( pix( 0, posL.x, posL.y ) * bandY ) >> pc.bitDepth ) * bandU * bandV
+                             + ( ( pix( 1, posC.x, posC.y ) * bandU ) >> pc.bitDepth ) * bandV
+                             + ( ( pix( 2, posC.x, posC.y ) * bandV ) >> pc.bitDepth );
+        res += int( p.v[base + 8 + classIdx] ) << pc.ccsaoShift;
+      }
+    }
+  }
+
+  if( pc.bif.addr != 0ul )
+  {
+    res += ld( pc.bif, x, y );
+  }
+  st( pc.dst, x, y, clamp( res, pc.outMin, pc.outMax ) );
+}

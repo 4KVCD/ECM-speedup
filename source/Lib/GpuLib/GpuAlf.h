@@ -39,11 +39,21 @@
 #define __GPUALF__
 
 #include "CommonLib/AdaptiveLoopFilter.h"
+#include "CommonLib/SampleAdaptiveOffset.h"
 #include "VkCompute.h"
 
 #include <functional>
 #include <memory>
 #include <vector>
+
+/// SAO, the bilateral filter and CCSAO (SampleAdaptiveOffset::SAOProcess, CCSAOProcess, jointClipSaoBifCcSao) of the
+/// picture that ALFProcess filters next: the decoder defers them to ALFProcess, which runs them on the GPU from the
+/// deblocked picture, or on the CPU first
+struct GpuSaoJob
+{
+  std::function<void()> cpu;              ///< runs them on the CPU, on the picture
+  SampleAdaptiveOffset* sao = nullptr;
+};
 
 /// LF-CCCM (JVET-AL0153) of the picture that ALFProcess filters next: the chroma correction that the decoder derives
 /// from the picture before ALF and adds to the picture after ALF
@@ -74,8 +84,9 @@ public:
   static bool    ready();
 
   ~GpuAlf();
-  /// with `lfCccm`, also the LF-CCCM correction (the GPU adds it, or lfCccm->cpu() derives it before the CPU filters)
-  bool process( AdaptiveLoopFilter& alf, CodingStructure& cs, GpuLfCccmJob* lfCccm );
+  /// with `sao`, SAO first; with `lfCccm`, also the LF-CCCM correction (the GPU adds it, or lfCccm->cpu() derives it
+  /// before the CPU filters)
+  bool process( AdaptiveLoopFilter& alf, CodingStructure& cs, GpuSaoJob* sao, GpuLfCccmJob* lfCccm );
 
 private:
   friend class GpuAlfHook;
@@ -108,6 +119,13 @@ private:
     /// [4] per CTU with LF-CCCM: address, model type | window size index << 8, first window
     std::vector<uint32_t> lfCtus;
     int                   lfWindows  = 0;       ///< windows of all these CTUs
+    bool                  sao        = false;   ///< the kernels do SAO, the bilateral filter and CCSAO
+    std::vector<uint32_t> saoInfo;              ///< [4] per CTU: word c: SAO type + 1 | CCSAO set << 4 (sao_apply.comp)
+    std::vector<int16_t>  saoOffsets;           ///< [CTU][3][32]
+    std::vector<int16_t>  ccsao;                ///< [3][4 sets][72] (sao_apply.comp)
+    std::vector<uint32_t> bifBlocks;            ///< [4] per block with the bilateral filter (sao_bif.comp)
+    bool                  bif[3]     = { false, false, false };   ///< blocks of the component
+    int                   bifRoundAdd = 0, bifRoundShift = 0;
   };
 
   struct Shared;   ///< kernels and fixed-filter tables, one set for every GpuAlf of the process
@@ -116,17 +134,23 @@ private:
   static const Shared& shared( gpu::Context& ctx );
 
   bool accept( const AdaptiveLoopFilter& alf, const CodingStructure& cs ) const;
-  /// what ALFProcess does besides filtering, before and after the filtering of the CTUs
+  /// what ALFProcess does besides filtering, before and after the filtering of the CTUs; copies: the picture copies
+  /// (not needed when the kernels do SAO)
   void stateBefore( AdaptiveLoopFilter& alf, CodingStructure& cs ) const;
+  void copiesBefore( AdaptiveLoopFilter& alf, CodingStructure& cs ) const;
   void stateAfter( AdaptiveLoopFilter& alf, CodingStructure& cs ) const;
   /// false when the filter state uses what the kernels do not implement
   bool gather( const AdaptiveLoopFilter& alf, const CodingStructure& cs );
   /// the windows of the CTUs with LF-CCCM; false when the picture uses what the kernels do not implement
   bool gatherLfCccm( const CodingStructure& cs );
+  /// the SAO, bilateral filter and CCSAO parameters (reconstruct: the SAO merges, which SAOProcess resolves); false
+  /// when the picture uses none of them or what the kernels do not implement
+  bool gatherSao( CodingStructure& cs, SampleAdaptiveOffset& sao, bool reconstruct );
   void layout( int width, int height, int ctuSize );
-  void upload( const AdaptiveLoopFilter& alf, const CodingStructure& cs );
+  /// deblocked: the picture before SAO when the kernels do it
+  void upload( const AdaptiveLoopFilter& alf, const CodingStructure& cs, const CPelUnitBuf& deblocked );
   void run( const AdaptiveLoopFilter& alf, const CodingStructure& cs );
-  void output( CodingStructure& cs ) const;
+  void output( AdaptiveLoopFilter& alf, CodingStructure& cs ) const;
   bool verify( const AdaptiveLoopFilter& alf, const CodingStructure& cs, const GpuLfCccmJob* lfCccm );
 
   gpu::Context&                m_ctx;
@@ -141,22 +165,26 @@ private:
 
   Params                       m_params;
 
-  // inputs and parameters: device buffer and an upload buffer with the same layout
-  PlaneDesc                    m_inRec[3], m_inDb[3], m_inResi, m_inCi;
+  // inputs and parameters: device buffer and an upload buffer with the same layout; m_inRec (the picture after SAO,
+  // mirror-padded) is uploaded, or the SAO kernels write it from m_inDeblocked
+  PlaneDesc                    m_inDeblocked[3], m_inRec[3], m_inDb[3], m_inResi, m_inCi;
   VkDeviceSize                 m_inCtuInfo = 0, m_inLumaSets = 0, m_inChroma = 0, m_inCcalf[2] = { 0, 0 };
-  VkDeviceSize                 m_inLfCtus = 0;
+  VkDeviceSize                 m_inLfCtus = 0, m_inSaoInfo = 0, m_inSaoOffsets = 0, m_inCcsao = 0;
   VkDeviceSize                 m_inBytes = 0;
-  gpu::Buffer                  m_in, m_inUpload;
+  gpu::Buffer                  m_in, m_inUpload, m_inDownload;
+  gpu::Buffer                  m_bifBlocks, m_bifBlocksUpload;   ///< the bilateral filter blocks (size varies)
   // intermediate results: classes per 2x2 block, filter outputs (picture size, mirrored when read)
   VkDeviceSize                 m_ciClass = 0, m_fixClass0 = 0, m_fixClass1 = 0, m_mainClass[3] = { 0, 0, 0 };
   VkDeviceSize                 m_chClass[2] = { 0, 0 };
   PlaneDesc                    m_fix0, m_fix1, m_fixResi, m_gauss, m_lapl, m_chFix[2];
   PlaneDesc                    m_lfDs, m_lfCorr[2];   ///< LF-CCCM: downsampled luma, Cb and Cr corrections
+  PlaneDesc                    m_bifOffsets[3];       ///< the bilateral filter's offsets
   gpu::Buffer                  m_work;
-  // outputs, read back
+  // outputs, read back; m_saoDownload: the luma after SAO, for the CPU stages after ALF that read it
   PlaneDesc                    m_out[3];
-  gpu::Buffer                  m_outDev, m_download, m_workDownload;
-
+  gpu::Buffer                  m_outDev, m_download, m_workDownload, m_saoDownload;
+  bool                         m_saoLumaDownloaded = false;
+  PelStorage                   m_verifyDeblocked;   ///< the verification's copy of the picture before SAO
 };
 
 /// ALFProcess on the GPU for a decoder context: every picture is filtered with a GpuAlf of a pool that all decoder
@@ -167,7 +195,8 @@ public:
   /// nullptr when there is no usable Vulkan device (the reason is reported once); waits for GpuAlf::prefetch()
   static GpuAlfHook* create( int mode );
 
-  /// the LF-CCCM correction of the next picture, nullptr when it has none (process() takes it)
+  /// the deferred SAO and the LF-CCCM correction of the next picture, nullptr when it has none (process() takes them)
+  void setSao( GpuSaoJob* job ) { m_sao = job; }
   void setLfCccm( GpuLfCccmJob* job ) { m_lfCccm = job; }
   bool process( AdaptiveLoopFilter& alf, CodingStructure& cs ) override;
 
@@ -176,6 +205,7 @@ private:
 
   gpu::Context& m_ctx;
   int           m_mode;
+  GpuSaoJob*    m_sao    = nullptr;
   GpuLfCccmJob* m_lfCccm = nullptr;
 };
 
