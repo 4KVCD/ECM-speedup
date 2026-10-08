@@ -90,7 +90,7 @@ const uint8_t IntraPrediction::m_aucIntraFilterExt[MAX_INTRA_FILTER_DEPTHS] =
 // perf: AVX2 application of cross-shaped linear models (CccmModel)
 // ====================================================================================================================
 
-#if defined( __AVX2__ ) && JVET_AJ0237_INTERNAL_12BIT
+#if ENABLE_SIMD_OPT && defined( __AVX2__ ) && JVET_AJ0237_INTERNAL_12BIT   // 16-bit Pel
 #define CCCM_MODEL_AVX2 1
 #else
 #define CCCM_MODEL_AVX2 0
@@ -5706,7 +5706,7 @@ template <int N> int convolve(Pel* const p, const TFilterCoeff* const f)
   return res;
 }
 
-#if defined( __SSE4_1__ )
+#if ENABLE_SIMD_OPT && defined( __SSE4_1__ )   // 16-bit Pel
 // perf: convolve<N>( p + k, f ) for k = 0..7 in 32-bit lanes (lo: k = 0..3, hi: k = 4..7). _mm_madd_epi16 multiplies
 // the same 16-bit samples and coefficients and adds two products in 32 bits, as convolve<N> does in int; integer sums
 // do not depend on the order. Reads p[0 .. N + 6], the samples convolve<N>( p + 7, f ) reads last.
@@ -5739,7 +5739,7 @@ static void angLongTapRow( Pel* const pDsty, const int width, const int weightMo
   constexpr int numExtraSamplesForIf = N / 2 - 2;
 
   int xStart = 0;
-#if defined( __SSE4_1__ )
+#if ENABLE_SIMD_OPT && defined( __SSE4_1__ )   // 16-bit Pel
   {
     const __m128i vMin = _mm_set1_epi32( clpRng.min );
     const __m128i vMax = _mm_set1_epi32( clpRng.max );
@@ -40664,7 +40664,7 @@ static inline int64_t cccmDotProduct( const Pel* a, const Pel* b, const int n )
 {
   int     i   = 0;
   int64_t sum = 0;
-#if defined( __AVX2__ )
+#if ENABLE_SIMD_OPT && defined( __AVX2__ )   // 16-bit Pel
   // 16 products per step, the pair sums sign-extended to 64 bits as below
   __m256i acc16 = _mm256_setzero_si256();
   for( ; i + 16 <= n; i += 16 )
@@ -40674,10 +40674,10 @@ static inline int64_t cccmDotProduct( const Pel* a, const Pel* b, const int n )
     acc16           = _mm256_add_epi64( acc16, _mm256_cvtepi32_epi64( _mm256_extracti128_si256( p, 1 ) ) );
   }
   __m128i acc = _mm_add_epi64( _mm256_castsi256_si128( acc16 ), _mm256_extracti128_si256( acc16, 1 ) );
-#elif defined( __SSE2__ )
+#elif ENABLE_SIMD_OPT && defined( __SSE2__ )
   __m128i acc = _mm_setzero_si128();
 #endif
-#if defined( __SSE2__ )
+#if ENABLE_SIMD_OPT && defined( __SSE2__ )
   for( ; i + 8 <= n; i += 8 )
   {
     const __m128i p = _mm_madd_epi16( _mm_loadu_si128( ( const __m128i* ) ( a + i ) ), _mm_loadu_si128( ( const __m128i* ) ( b + i ) ) );

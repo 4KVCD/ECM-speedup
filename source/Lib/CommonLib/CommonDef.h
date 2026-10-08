@@ -2339,6 +2339,14 @@ T* aligned_malloc(size_t len, size_t alignement) {
 #    define ALWAYS_INLINE
 #endif
 
+#ifdef __GNUC__
+#    define NO_INLINE __attribute__((noinline))
+#elif defined _MSC_VER
+#    define NO_INLINE __declspec(noinline)
+#else
+#    define NO_INLINE
+#endif
+
 #if ENABLE_SIMD_OPT
 
 #if defined(__i386__) || defined(i386) || defined(__x86_64__) || defined(_M_X64) || defined (_WIN32) || defined (_MSC_VER)
@@ -2560,7 +2568,7 @@ static inline uint32_t getIndexMappingTableToSortedArray1D(InputValueType (&in)[
     const uint32_t  numRef = getIndexMappingTableToSortedArray1DInsert(in, ref);
     CHECK(numRef != numValid, "GPM mode ranking: count differs");
 #endif
-#if defined( __AVX2__ )
+#if defined( __AVX2__ ) && ( defined( __x86_64__ ) || defined( _M_X64 ) )   // _mm_extract_epi64, _mm_cvtsi128_si64
     if constexpr (inputValueArraySize % 8 == 0)
     {
       // 4 keys per comparison, the counts kept in 64-bit lanes (two counters per key)

@@ -81,7 +81,7 @@ static inline void clipMvInl( Mv& rcMv, const Position& pos, const Size& size, c
 }
 
 #if JVET_AL0079_AFFINE_MC
-#if defined( __SSE2__ )
+#if ENABLE_SIMD_OPT_MCIF && defined( __SSE2__ )
 #include <emmintrin.h>
 #endif
 // perf: 12-tap 2-D luma interpolation of a block at most 2 samples wide (pixel / 2-sample affine sub-blocks) in one
@@ -91,7 +91,7 @@ static inline void clipMvInl( Mv& rcMv, const Position& pos, const Size& size, c
 // (Before, every sample went through two indirect filter calls with their per-call setup.)
 static inline int xDot12Taps( const Pel* s, const TFilterCoeff* c )
 {
-#if defined( __SSE2__ )
+#if ENABLE_SIMD_OPT_MCIF && defined( __SSE2__ )   // 16-bit Pel
   __m128i v = _mm_add_epi32( _mm_madd_epi16( _mm_loadu_si128( ( const __m128i* ) s ), _mm_loadu_si128( ( const __m128i* ) c ) ),
                              _mm_madd_epi16( _mm_loadl_epi64( ( const __m128i* ) ( s + 8 ) ), _mm_loadl_epi64( ( const __m128i* ) ( c + 8 ) ) ) );
   v = _mm_add_epi32( v, _mm_shuffle_epi32( v, 0x4e ) );
@@ -6389,7 +6389,7 @@ void InterPrediction::xPredAffineBlk(const ComponentID &compID, const Prediction
           {
             m_if.m_filterVer[0][1][isLast](clpRng, ref, refStride, dst, dstStride, bw, bh, InterpolationFilter::m_lumaFilter64[yFrac], false);
           }
-          else if (bw <= 2)
+          else if (bw <= 2 && !JVET_J0090_MEMORY_BANDWITH_MEASURE)   // the bandwidth measurement counts the reads of m_if
           {
             xFilter12Tap2DNarrow(clpRng, ref, refStride, dst, dstStride, bw, bh, InterpolationFilter::m_lumaFilter64[xFrac],
                                  InterpolationFilter::m_lumaFilter64[yFrac], isLast);

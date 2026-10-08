@@ -1976,7 +1976,6 @@ bool isMvTAlf(const int tAlfMode);
 bool isFwdTAlf(const int tAlfMode);
 #endif
 
-#if JVET_AG0061_INTER_LFNST_NSPT
 // perf: the index of the gradient angle table entry for ratio, as the search loop of the DIMD histograms computes it
 // (the first of entries 1..16 not below ratio, or the entry before it when that one is strictly nearer; 16 when all
 // are below), from the number of entries below ratio instead of a loop whose exit branch mispredicts. The table is
@@ -2008,6 +2007,7 @@ static inline int gradAngleIdx(const int ratio, const int *angTable)
 #endif
   return idx;
 }
+#if JVET_AG0061_INTER_LFNST_NSPT
 int buildHistogram(const Pel *pReco, int iStride, uint32_t uiHeight, uint32_t uiWidth, int *piHistogram, int direction, int bw, int bh
 #if JVET_AJ0203_DIMD_2X2_EDGE_OP
                   , const int filterSizeIdx = 0// 0 - default, 1 - small

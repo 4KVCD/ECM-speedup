@@ -44192,7 +44192,7 @@ void fillNonMPMList(uint8_t* mpm, uint8_t* nonMpm
 }
 #endif
 #if JVET_AG0061_INTER_LFNST_NSPT
-#if defined( __AVX2__ ) && JVET_AJ0203_DIMD_2X2_EDGE_OP && JVET_X0149_TIMD_DIMD_LUT
+#if ENABLE_SIMD_OPT && defined( __AVX2__ ) && JVET_AJ0203_DIMD_2X2_EDGE_OP && JVET_X0149_TIMD_DIMD_LUT   // 16-bit Pel
 #define DIMD_HIST_SIMD 1
 // perf: the histogram contributions of 8 pixels of a row at once: the gradients (3x3 Sobel, or the 2x2 operator for
 // filterSizeIdx 1), the amplitude and the angle index of each pixel in 32-bit lanes with the integer arithmetic of the
@@ -44324,11 +44324,13 @@ static int buildHistogramImpl(const Pel *pReco, int iStride, uint32_t uiHeight, 
   {
     uint32_t xStart = 0;
 #if DIMD_HIST_SIMD
-    // perf: groups of 8 pixels in AVX2 (dimdHistogramRow8) while they read no further than the scalar loop (up to
-    // x = uiWidth); the rest of the row, and the filterSizeIdx 2 variant, as before
+    // perf: groups of 8 pixels in AVX2 (dimdHistogramRow8) while they read no further than the scalar loop: with
+    // step 1 up to x = uiWidth (the right neighbour of its last pixel), with step 2 up to x = uiWidth - 1 (the loads
+    // of a group end at x0 + 16, and the scalar loop reads that column only if it has pixel x0 + 16 as well); the
+    // rest of the row, and the filterSizeIdx 2 variant, as before
     if (useSimd && filterSizeIdx < 2 && wStep <= 2)
     {
-      const uint32_t maxRead = wStep == 1 ? 8 : 16;
+      const uint32_t maxRead = wStep == 1 ? 8 : 17;
       for (; xStart + maxRead <= uiWidth; xStart += 8 * wStep)
       {
         int lastPixel = -1;   // the scalar loop leaves out the last pixel of the last row for direction 3

@@ -3702,7 +3702,7 @@ void DepQuant::quant(TransformUnit &tu, const ComponentID &compID, const CCoeffB
 // perf: the order of the stable sort by level, descending, for more than 32 entries: std::sort of unique
 // (level, index) keys instead of std::stable_sort and its temporary buffer. The levels are positive (at least
 // 2 |level| - 1). Not inlined, so that the 16 KB of buffers stay out of the caller's stack frame.
-static void __attribute__((noinline)) sortByLevelDescending(static_vector<PositionWithLevel, 32 * 32> &list)
+static NO_INLINE void sortByLevelDescending(static_vector<PositionWithLevel, 32 * 32> &list)
 {
   const int         n = (int) list.size();
   uint64_t          key[32 * 32];
