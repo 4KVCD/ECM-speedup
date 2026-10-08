@@ -254,6 +254,11 @@ void TrQuant::fastInverseTransform_SIMD( const TCoeff *coeff, TCoeff *block, int
         const TMatrixCoeff *curIT = iT;
         for( k = 0; k < transSize; k++, curCoeff += line, curIT += transSize )
         {
+          // perf: a zero coefficient adds nothing (most of them are zero after quantization / zero-out)
+          if( curCoeff[i] == 0 )
+          {
+            continue;
+          }
           const int arraySize = ( k & 1 ? halfSize : quarterSize );
           __m128i    tmpCoeff = _mm_set1_epi32( curCoeff[i] );
           __m128i  * tmpBlock = ( __m128i * )( k & 1 ? splitBlockO : ( k & 2 ? splitBlockF : splitBlockE ) );
@@ -298,6 +303,10 @@ void TrQuant::fastInverseTransform_SIMD( const TCoeff *coeff, TCoeff *block, int
         const TMatrixCoeff *curIT = iT;
         for( k = 0; k < transSize; k++, curCoeff += line, curIT += transSize )
         {
+          if( curCoeff[i] == 0 )   // perf: adds nothing
+          {
+            continue;
+          }
           __m128i  tmpCoeff = _mm_set1_epi32( curCoeff[i] );
           __m128i *tmpBlock = ( __m128i * )block;
           for( j = 0; j < transSize; j += 4, tmpBlock++ )
