@@ -7783,6 +7783,12 @@ void HLSyntaxReader::parseCcSao( Slice* pcSlice, PicHeader* picHeader, const SPS
     g_ccSaoPrvParam[COMPONENT_Y ].clear();
     g_ccSaoPrvParam[COMPONENT_Cb].clear();
     g_ccSaoPrvParam[COMPONENT_Cr].clear();
+#if JVET_AL0142_CCSAO_REUSE_CTU
+    for( int comp = 0; comp < MAX_NUM_COMPONENT; comp++ )
+    {
+      m_ccSaoPrvCtrl[comp].clear();
+    }
+#endif
   }
 
   // loadCcSaoPrvParam
@@ -7792,6 +7798,13 @@ void HLSyntaxReader::parseCcSao( Slice* pcSlice, PicHeader* picHeader, const SPS
     {
       int prvId = ccSaoParam.reusePrvId[compIdx];
 
+#if JVET_AL0142_CCSAO_REUSE_CTU
+      if( ccSaoParam.reusePrv[compIdx] == CCSAO_REUSE_PARAM_CTU )
+      {
+        CHECK( prvId >= (int) m_ccSaoPrvCtrl[compIdx].size(), "CCSAO control entry to reuse does not exist" );
+        m_ccSaoRead[compIdx] = m_ccSaoPrvCtrl[compIdx][prvId];
+      }
+#endif
       CcSaoPrvParam prvParam = g_ccSaoPrvParam[compIdx][prvId];
       ccSaoParam.setNum[compIdx] = prvParam.setNum;
       std::memcpy( ccSaoParam.setEnabled[compIdx], prvParam.setEnabled, sizeof( ccSaoParam.setEnabled[compIdx] ) );
@@ -7814,7 +7827,19 @@ void HLSyntaxReader::parseCcSao( Slice* pcSlice, PicHeader* picHeader, const SPS
       if (g_ccSaoPrvParam[compIdx].size() == MAX_CCSAO_PRV_NUM)
       {
         g_ccSaoPrvParam[compIdx].pop_back();
+#if JVET_AL0142_CCSAO_REUSE_CTU
+        m_ccSaoPrvCtrl[compIdx].pop_back();
+#endif
       }
+#if JVET_AL0142_CCSAO_REUSE_CTU
+      // the CTU control the slice's CTUs fill (zero for CTUs of other slices, as in the stock entry)
+      const int ctuSize   = sps->getMaxCUWidth();
+      const int numCtus   = ( ( sps->getMaxPicWidthInLumaSamples() + ctuSize - 1 ) / ctuSize ) * ( ( sps->getMaxPicHeightInLumaSamples() + ctuSize - 1 ) / ctuSize );
+      auto      ctrl      = std::make_shared<DecCtrlSlot>();
+      ctrl->a.assign( std::max( numCtus, MAX_CCSAO_CTU_NUM ), 0 );
+      m_ccSaoPrvCtrl[compIdx].insert( m_ccSaoPrvCtrl[compIdx].begin(), ctrl );
+      m_ccSaoWrite[compIdx] = ctrl;
+#endif
 
       CcSaoPrvParam prvParam;
       prvParam.temporalId = pcSlice->getTLayer();

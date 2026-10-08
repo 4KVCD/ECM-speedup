@@ -36,6 +36,7 @@
  */
 
 #include "CABACReader.h"
+#include "DecPicState.h"
 
 #include "CommonLib/CodingStructure.h"
 #include "CommonLib/TrQuant.h"
@@ -69,7 +70,7 @@ namespace CabacRetrain
 }
 #endif
 #if JVET_AI0136_ADAPTIVE_DUAL_TREE
-Partitioner *g_decPartitionerSST;
+thread_local Partitioner *g_decPartitionerSST;   // per CTU; thread_local: pictures are decoded in parallel threads
 #endif
 
 void CABACReader::initCtxModels( Slice& slice )
@@ -105,9 +106,13 @@ void CABACReader::initCtxModels( Slice& slice )
   slice.setCabacInitSliceType( sliceType );
 #endif
 #if JVET_Z0135_TEMP_CABAC_WIN_WEIGHT
-  if( slice.getSPS()->getTempCabacInitMode() )
+  if( slice.getSPS()->getTempCabacInitMode() && m_ctxLoadSlot )
   {
-    m_CABACDataStore->loadCtxStates( &slice, getCtx() );
+    // CtxStateStore::loadCtx: the slot is that of the slice's key (non-intra slices only)
+#if JVET_AG0196_CABAC_RETRAIN
+    slice.setCabacInitSliceType( m_ctxLoadSlot->sliceType );
+#endif
+    m_ctxLoadSlot->state.getIfValid( getCtx() );
   }
 #endif
 #if JVET_AG0196_CABAC_RETRAIN
@@ -246,16 +251,21 @@ void CABACReader::coding_tree_unit( CodingStructure& cs, const UnitArea& area, i
 
         ccSaoControlIdc(cs, ComponentID(compIdx), ctuRsAddr, cs.slice->m_ccSaoControl[compIdx], lumaPos, setNum);
 #if JVET_AL0142_CCSAO_REUSE_CTU
-        // Allocated ccSaoControl in ParseCcSao, assigned here
-        g_ccSaoPrvParam[compIdx][0].ccSaoControl[ctuRsAddr] = cs.slice->m_ccSaoControl[compIdx][ctuRsAddr];
+        // kept with the entry the slice header added (g_ccSaoPrvParam[compIdx][0]) for later pictures
+        CHECK( !m_ccSaoPrvWrite[compIdx], "no CCSAO control entry for the slice" );
+        m_ccSaoPrvWrite[compIdx][ctuRsAddr] = cs.slice->m_ccSaoControl[compIdx][ctuRsAddr];
+        if( m_ccSaoPrvMirror && !g_ccSaoPrvParam[compIdx].empty() )
+        {
+          g_ccSaoPrvParam[compIdx][0].ccSaoControl[ctuRsAddr] = cs.slice->m_ccSaoControl[compIdx][ctuRsAddr];
+        }
 #endif
       }
 #if JVET_AL0142_CCSAO_REUSE_CTU
       else if (cs.slice->m_ccSaoComParam.enabled[compIdx])  // && CCSAO_REUSE_PARAM_CTU
       {
-        // load ccSaoControl
-        int prvId = cs.slice->m_ccSaoComParam.reusePrvId[compIdx];
-        cs.slice->m_ccSaoControl[compIdx][ctuRsAddr] = g_ccSaoPrvParam[compIdx][prvId].ccSaoControl[ctuRsAddr];
+        // load ccSaoControl of entry g_ccSaoPrvParam[compIdx][reusePrvId]
+        CHECK( !m_ccSaoPrvRead[compIdx], "no CCSAO control entry to reuse" );
+        cs.slice->m_ccSaoControl[compIdx][ctuRsAddr] = m_ccSaoPrvRead[compIdx][ctuRsAddr];
       }
       else
       {
@@ -5520,7 +5530,7 @@ void CABACReader::amvpSbTmvpFlag(PredictionUnit& pu)
     }
     pu.refIdx[colRefList] = pu.colIdx == 0 ? pu.cs->slice->getColRefIdx() : pu.cs->slice->getColRefIdx2nd();
     pu.cu->smvdMode = 0;
-    g_picAmvpSbTmvpEnabledArea += pu.lwidth() * pu.lheight();
+    m_amvpSbTmvpEnabledArea += pu.lwidth() * pu.lheight();
   }
   DTRACE(g_trace_ctx, D_SYNTAX, "amvpSbTmvpFlag() amvpSbTmvpFlag=%d colIdx:%d pos=(%d,%d) size=%dx%d\n", pu.amvpSbTmvpFlag ? 1 : 0, pu.colIdx ? 1 : 0, pu.lumaPos().x, pu.lumaPos().y, pu.lumaSize().width, pu.lumaSize().height);
 }

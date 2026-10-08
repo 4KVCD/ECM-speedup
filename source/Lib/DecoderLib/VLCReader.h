@@ -47,6 +47,7 @@
 #endif
 #include "CommonLib/ParameterSetManager.h"
 #include "CABACReader.h"
+#include "DecPicState.h"
 
 #if ENABLE_TRACING
 
@@ -240,7 +241,28 @@ public:
   void dpb_parameters(int maxSubLayersMinus1, bool subLayerInfoFlag, SPS *pcSPS);
   void parseExtraPHBitsStruct( SPS *sps, int numBytes );
   void parseExtraSHBitsStruct( SPS *sps, int numBytes );
+#if JVET_AL0142_CCSAO_REUSE_CTU
+  /// hands over (and forgets) the CCSAO CTU control entries of the last parsed slice header: the entry it added,
+  /// which its CTUs fill, and the entry it reuses
+  void takeCcSaoCtrl( std::shared_ptr<DecCtrlSlot> ( &write )[MAX_NUM_COMPONENT], std::shared_ptr<DecCtrlSlot> ( &read )[MAX_NUM_COMPONENT] )
+  {
+    for( int comp = 0; comp < MAX_NUM_COMPONENT; comp++ )
+    {
+      write[comp] = std::move( m_ccSaoWrite[comp] );
+      read [comp] = std::move( m_ccSaoRead [comp] );
+      m_ccSaoWrite[comp].reset();
+      m_ccSaoRead [comp].reset();
+    }
+  }
+#endif
 private:
+#if JVET_AL0142_CCSAO_REUSE_CTU
+  // the CTU control of the entries of g_ccSaoPrvParam: the stock decoder keeps it in the entries themselves and fills
+  // it while the CTUs are parsed; kept here in shared slots, so that a picture decoded later still fills its own entry
+  std::vector<std::shared_ptr<DecCtrlSlot>> m_ccSaoPrvCtrl[MAX_NUM_COMPONENT];
+  std::shared_ptr<DecCtrlSlot>              m_ccSaoWrite  [MAX_NUM_COMPONENT];
+  std::shared_ptr<DecCtrlSlot>              m_ccSaoRead   [MAX_NUM_COMPONENT];
+#endif
 
 protected:
   bool  xMoreRbspData();

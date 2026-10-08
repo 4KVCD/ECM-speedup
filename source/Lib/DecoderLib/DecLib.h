@@ -43,6 +43,7 @@
 #include "VLCReader.h"
 #include "SEIread.h"
 #include "CacheModel.h"
+#include "DecPicState.h"
 
 #include "CommonLib/CommonDef.h"
 #include "CommonLib/Picture.h"
@@ -231,6 +232,29 @@ private:
   int                     m_maxDecSliceAddrInSubPic;
   int                     m_clsVPSid;
 
+  // decode-order state handed from picture to picture (see DecPicState.h)
+  DecWaitHub              m_ownWaitHub;
+  DecWaitHub*             m_waitHub = &m_ownWaitHub;
+  DecOrderState           m_orderState;           ///< main thread: the state as the next slice sees it
+#if JVET_AM0209_CHROMA_ALF_CCALF_REUSE_CTU
+  FrameCtrlInfo           m_ctrlInfo[ALF_CTB_MAX_NUM_APS];   ///< reused ALF / CCALF CTU control of the picture being filtered
+#endif
+
+  /// chroma ALF and CCALF CTU control a picture reuses and stores (g_pictureControlInfo)
+  struct LfCtrlState
+  {
+#if JVET_AM0209_CHROMA_ALF_CCALF_REUSE_CTU
+    int                          alfReadAps   [MAX_NUM_COMPONENT] = { -1, -1, -1 };
+    int                          ccAlfReadAps [MAX_NUM_COMPONENT] = { -1, -1, -1 };
+    std::shared_ptr<DecCtrlSlot> alfRead      [MAX_NUM_COMPONENT];
+    std::shared_ptr<DecCtrlSlot> ccAlfRead    [MAX_NUM_COMPONENT];
+    int                          alfStoreAps  [MAX_NUM_COMPONENT] = { -1, -1, -1 };
+    int                          ccAlfStoreAps[MAX_NUM_COMPONENT] = { -1, -1, -1 };
+    std::shared_ptr<DecCtrlSlot> alfStore     [MAX_NUM_COMPONENT];
+    std::shared_ptr<DecCtrlSlot> ccAlfStore   [MAX_NUM_COMPONENT];
+#endif
+  };
+
 public:
   int                     m_targetSubPicIdx;
 
@@ -358,6 +382,16 @@ protected:
   void  xCheckParameterSetConstraints( const int layerId );
   void      xDecodePicHeader( InputNALUnit& nalu );
   bool      xDecodeSlice(InputNALUnit &nalu, int &iSkipFrame, int iPOCLastDisplay);
+  // decoding of a slice / picture, split in the decode-order bookkeeping of the main thread and the work of the
+  // decoding context (which may be another DecLib, see DecPicState.h)
+  void      xSetupSliceState    ( Slice* slice, DecSliceState& state );   ///< main thread, decoding order
+  void      xSetupSliceTools    ( Slice* slice );                         ///< scaling list and LMCS of the slice
+  void      xDecodeSliceData    ( Slice* slice, InputBitstream* bitstream, DecSliceState& state );
+  void      xExecuteLoopFilters ( LfCtrlState* lf );                      ///< lf: null -> set up from m_orderState here
+  void      xSetupLfReads       ( const Slice* slice, LfCtrlState& lf );  ///< main thread, decoding order
+  void      xSetupLfStores      ( const Slice* slice, LfCtrlState& lf );  ///< main thread, decoding order
+  void      xLoadLfCtrl         ( const LfCtrlState& lf );
+  void      xStoreLfCtrl        ( const LfCtrlState& lf );
   void      xDecodeVPS( InputNALUnit& nalu );
   void      xDecodeDCI( InputNALUnit& nalu );
   void      xDecodeSPS( InputNALUnit& nalu );

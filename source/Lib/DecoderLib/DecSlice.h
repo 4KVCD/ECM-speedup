@@ -46,6 +46,7 @@
 #include "CommonLib/BitStream.h"
 #include "DecCu.h"
 #include "CABACReader.h"
+#include "DecPicState.h"
 #if JVET_AH0066_JVET_AH0202_CCP_MERGE_LUMACBF0
 using namespace std;
 #endif
@@ -70,6 +71,9 @@ private:
 #if JVET_AG0117_CABAC_SPATIAL_TUNING
   std::vector<BinStoreVector> m_binVectors;
 #endif
+#if JVET_Z0135_TEMP_CABAC_WIN_WEIGHT
+  Ctx             m_storedCtx;                          ///< contexts at the CTU where they are stored for later pictures
+#endif
 
 public:
   DecSlice();
@@ -84,30 +88,15 @@ public:
 #endif
   void  destroy           ();
 
-  void  decompressSlice   ( Slice* slice, InputBitstream* bitstream, int debugCTU );
+  /// decodes the CTUs of a slice; the decode-order state it reads and fills comes in the slots of \p state
+  void  decompressSlice   ( Slice* slice, InputBitstream* bitstream, int debugCTU, DecSliceState& state, DecWaitHub& hub );
+
+  /// selects the global MV clipping functions for the slice (they change only with subpictures)
+  static void selectClipMv( const Slice* slice );
 
 #if JVET_AG0098_AMVP_WITH_SBTMVP
-  std::map<int, uint32_t> m_amvpSbTmvpArea;
-  void clearAmvpSbTmvpStatArea(const Slice* slice)
-  {
-    if (slice->getPendingRasInit() || slice->isInterGDR())
-    {
-      m_amvpSbTmvpArea.clear();
-    }
-  }
-  void storeAmvpSbTmvpStatArea(const int Tlayer, const uint32_t enabledArea)
-  {
-    m_amvpSbTmvpArea[Tlayer] = enabledArea;
-  }
-  bool loadAmvpSbTmvpStatArea(const int Tlayer, uint32_t& enabledArea)
-  {
-    if (m_amvpSbTmvpArea.find(Tlayer) != m_amvpSbTmvpArea.end())
-    {
-      enabledArea = m_amvpSbTmvpArea[Tlayer];
-      return true;
-    }
-    return false;
-  }
+  /// AMVP-SbTMVP enabled for the slice, as derived in decompressSlice (main thread: to set up the slots)
+  static bool isAmvpSbTmvpEnabled( const Slice* slice );
 #endif
 };
 

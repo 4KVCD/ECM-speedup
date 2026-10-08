@@ -85,7 +85,64 @@ void DecSlice::init( CABACDecoder* cabacDecoder, DecCu* pcCuDecoder )
   m_pcCuDecoder     = pcCuDecoder;
 }
 
-void DecSlice::decompressSlice( Slice* slice, InputBitstream* bitstream, int debugCTU )
+void DecSlice::selectClipMv( const Slice* slice )
+{
+  // global function pointers, written only when they change: the main thread selects them when it sets up a slice,
+  // so pictures decoded at the same time only read them
+#if JVET_S0258_SUBPIC_CONSTRAINTS
+  if( slice->getSliceType() != I_SLICE && slice->getRefPic( REF_PIC_LIST_0, 0 )->subPictures.size() > 1 )
+#else
+  if (slice->getSliceType() != I_SLICE && slice->getRefPic(REF_PIC_LIST_0, 0)->numSubpics > 1)
+#endif
+  {
+    if( clipMv != clipMvInSubpic )
+    {
+      clipMv = clipMvInSubpic;
+    }
+#if JVET_AJ0158_SUBBLOCK_INTER_EXTENSION
+    if( clipMv2 != clipMvInSubpic2 )
+    {
+      clipMv2 = clipMvInSubpic2;
+    }
+#endif
+  }
+  else
+  {
+    if( clipMv != clipMvInPic )
+    {
+      clipMv = clipMvInPic;
+    }
+#if JVET_AJ0158_SUBBLOCK_INTER_EXTENSION
+    if( clipMv2 != clipMvInPic2 )
+    {
+      clipMv2 = clipMvInPic2;
+    }
+#endif
+  }
+}
+
+#if JVET_AG0098_AMVP_WITH_SBTMVP
+bool DecSlice::isAmvpSbTmvpEnabled( const Slice* slice )
+{
+#if JVET_Y0134_TMVP_NAMVP_CAND_REORDERING
+  if( !slice->getPicHeader()->getEnableTMVPFlag() || slice->isIntra() )
+  {
+    return false;
+  }
+  int minPoc = abs( slice->getRefPic( RefPicList( 1 - slice->getColFromL0Flag() ), slice->getColRefIdx() )->getPOC() - slice->getPOC() );
+  if( slice->isInterB() && slice->getCheckLDC() )
+  {
+    int min2ndPoc = abs( slice->getRefPic( RefPicList( 1 - slice->getColFromL0Flag2nd() ), slice->getColRefIdx2nd() )->getPOC() - slice->getPOC() );
+    minPoc = std::min( minPoc, min2ndPoc );
+  }
+  return minPoc <= 4;
+#else
+  return false;
+#endif
+}
+#endif
+
+void DecSlice::decompressSlice( Slice* slice, InputBitstream* bitstream, int debugCTU, DecSliceState& state, DecWaitHub& hub )
 {
   //-- For time output for each slice
   slice->startProcessingTimer();
@@ -93,11 +150,24 @@ void DecSlice::decompressSlice( Slice* slice, InputBitstream* bitstream, int deb
   const SPS*     sps          = slice->getSPS();
   Picture*       pic          = slice->getPic();
   CABACReader&   cabacReader  = *m_CABACDecoder->getCABACReader( 0 );
+  // decode-order state of earlier pictures: the stores were cleared / looked up when the slice was set up
 #if JVET_Z0135_TEMP_CABAC_WIN_WEIGHT
-  cabacReader.m_CABACDataStore->updateBufferState( slice );
+  if( state.ctxLoad )
+  {
+    hub.wait( *state.ctxLoad );
+  }
+  cabacReader.setCtxLoadSlot( state.ctxLoad.get() );
 #endif
-#if JVET_AG0098_AMVP_WITH_SBTMVP
-  clearAmvpSbTmvpStatArea(slice);
+#if JVET_AL0142_CCSAO_REUSE_CTU
+  for( int comp = 0; comp < MAX_NUM_COMPONENT; comp++ )
+  {
+    if( state.ccSaoRead[comp] )
+    {
+      hub.wait( *state.ccSaoRead[comp] );
+    }
+    cabacReader.setCcSaoPrvCtrl( comp, state.ccSaoWrite[comp] ? state.ccSaoWrite[comp]->a.data() : nullptr,
+                                       state.ccSaoRead [comp] ? state.ccSaoRead [comp]->a.data() : nullptr );
+  }
 #endif
 
   if ( slice->getSliceID() == 0 )
@@ -186,24 +256,7 @@ void DecSlice::decompressSlice( Slice* slice, InputBitstream* bitstream, int deb
   DTRACE( g_trace_ctx, D_HEADER, "=========== POC: %d ===========\n", slice->getPOC() );
 
 
-#if JVET_S0258_SUBPIC_CONSTRAINTS
-  if( slice->getSliceType() != I_SLICE && slice->getRefPic( REF_PIC_LIST_0, 0 )->subPictures.size() > 1 )
-#else
-  if (slice->getSliceType() != I_SLICE && slice->getRefPic(REF_PIC_LIST_0, 0)->numSubpics > 1)
-#endif
-  {
-    clipMv = clipMvInSubpic;
-#if JVET_AJ0158_SUBBLOCK_INTER_EXTENSION
-    clipMv2 = clipMvInSubpic2;
-#endif
-  }
-  else
-  {
-    clipMv = clipMvInPic;
-#if JVET_AJ0158_SUBBLOCK_INTER_EXTENSION
-    clipMv2 = clipMvInPic2;
-#endif
-  }
+  selectClipMv( slice );
 
 #if JVET_Y0134_TMVP_NAMVP_CAND_REORDERING
   if (slice->getPicHeader()->getEnableTMVPFlag())
@@ -484,9 +537,14 @@ void DecSlice::decompressSlice( Slice* slice, InputBitstream* bitstream, int deb
     else
     {
       slice->setAmvpSbTmvpEnabledFlag(true);
-      g_picAmvpSbTmvpEnabledArea = 0;
-      uint32_t prevEnabledArea;
-      bool isExist = loadAmvpSbTmvpStatArea(slice->getTLayer(), prevEnabledArea);
+      cabacReader.m_amvpSbTmvpEnabledArea = 0;
+      uint32_t prevEnabledArea = 0;
+      bool isExist = state.sbTmvpLoad != nullptr;   // area stored for the temporal layer by an earlier slice
+      if( isExist )
+      {
+        hub.wait( *state.sbTmvpLoad );
+        prevEnabledArea = state.sbTmvpLoad->area;
+      }
       if (isExist)
       {
         int ratio = int(prevEnabledArea * 100.0 / (slice->getPic()->getPicWidthInLumaSamples() * slice->getPic()->getPicHeightInLumaSamples()));
@@ -539,6 +597,10 @@ void DecSlice::decompressSlice( Slice* slice, InputBitstream* bitstream, int deb
 #endif
 #endif
 
+#if JVET_AG0098_AMVP_WITH_SBTMVP && JVET_Y0134_TMVP_NAMVP_CAND_REORDERING
+  CHECK( slice->getAmvpSbTmvpEnabledFlag() != state.sbTmvpEnabled, "AMVP-SbTMVP enabling differs from the slice set-up" );
+#endif
+
 #if JVET_AJ0126_INTER_AMVP_ENHANCEMENT
   if (!slice->isIntra())
   {
@@ -549,9 +611,6 @@ void DecSlice::decompressSlice( Slice* slice, InputBitstream* bitstream, int deb
 
   // for every CTU in the slice segment...
 
-#if JVET_Z0135_TEMP_CABAC_WIN_WEIGHT
-  static Ctx storedCtx;
-#endif
 #if JVET_AD0188_CCP_MERGE
   {
 #if JVET_Z0118_GDR
@@ -776,7 +835,7 @@ void DecSlice::decompressSlice( Slice* slice, InputBitstream* bitstream, int deb
     // store CABAC context to be used in next frames
     if( storeContexts( slice, ctuXPosInCtus, ctuYPosInCtus ) )
     {
-      storedCtx = cabacReader.getCtx();
+      m_storedCtx = cabacReader.getCtx();
     }
 #endif
 
@@ -840,17 +899,33 @@ void DecSlice::decompressSlice( Slice* slice, InputBitstream* bitstream, int deb
 #endif
 #endif
 
+  // decode-order state for later pictures (the slots were entered in the stores when the slice was set up)
 #if JVET_Z0135_TEMP_CABAC_WIN_WEIGHT
-  // store CABAC context to be used in next frames when the last CTU in a picture is processed
-  if( slice->getPPS()->pcv->sizeInCtus - 1 == slice->getCtuAddrInSlice( slice->getNumCtuInSlice() - 1 ) )
+  // CABAC contexts stored when the last CTU in a picture is processed
+  if( state.ctxStore )
   {
-    cabacReader.m_CABACDataStore->storeCtxStates( slice, storedCtx );
+    CHECK( slice->getPPS()->pcv->sizeInCtus - 1 != slice->getCtuAddrInSlice( slice->getNumCtuInSlice() - 1 ), "stored CABAC contexts without the last CTU" );
+    state.ctxStore->state.store( m_storedCtx );
+#if JVET_AG0196_CABAC_RETRAIN
+    state.ctxStore->sliceType = slice->getCabacInitSliceType();
+#endif
+    hub.publish( *state.ctxStore );
   }
 #endif
 #if JVET_AG0098_AMVP_WITH_SBTMVP
-  if (!slice->isIntra())
+  if( state.sbTmvpArea )
   {
-    storeAmvpSbTmvpStatArea(slice->getTLayer(), g_picAmvpSbTmvpEnabledArea);
+    state.sbTmvpArea->area = cabacReader.m_amvpSbTmvpEnabledArea;
+    hub.publish( *state.sbTmvpArea );
+  }
+#endif
+#if JVET_AL0142_CCSAO_REUSE_CTU
+  for( int comp = 0; comp < MAX_NUM_COMPONENT; comp++ )
+  {
+    if( state.ccSaoWrite[comp] )
+    {
+      hub.publish( *state.ccSaoWrite[comp] );
+    }
   }
 #endif
 

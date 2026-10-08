@@ -44,6 +44,7 @@
 #include "CommonLib/MotionInfo.h"
 #include "CommonLib/UnitPartitioner.h"
 
+struct DecCtxSlot;
 
 class CABACReader
 {
@@ -481,12 +482,33 @@ void          interAsbt                 ( TransformUnit& tu );
 #endif 
 #if JVET_Z0135_TEMP_CABAC_WIN_WEIGHT
   CABACDataStore*         m_CABACDataStore;
+  /// contexts stored by an earlier picture for this slice (null: none), loaded by initCtxModels
+  void        setCtxLoadSlot            ( const DecCtxSlot* slot )                            { m_ctxLoadSlot = slot; }
+#endif
+#if JVET_AL0142_CCSAO_REUSE_CTU
+  /// CCSAO CTU control kept for later pictures: the entry this slice fills and the one it reuses (null: none)
+  void        setCcSaoPrvCtrl           ( int comp, uint8_t* write, const uint8_t* read )     { m_ccSaoPrvWrite[comp] = write; m_ccSaoPrvRead[comp] = read; }
+  /// also into the entry the slice header added (g_ccSaoPrvParam[comp][0]), as the stock decoder does: the encoder's
+  /// DecodeBitstream mode reads it there; not when pictures are decoded in threads (the entries are those of later
+  /// pictures there)
+  void        setCcSaoPrvMirror         ( bool mirror )                                         { m_ccSaoPrvMirror = mirror; }
+#endif
+#if JVET_AG0098_AMVP_WITH_SBTMVP
+  uint32_t                m_amvpSbTmvpEnabledArea = 0;   ///< area of the slice's AMVP-SbTMVP blocks (was g_picAmvpSbTmvpEnabledArea)
 #endif
 
 private:
   BinDecoderBase& m_BinDecoder;
   InputBitstream* m_Bitstream;
   ScanElement*    m_scanOrder;
+#if JVET_Z0135_TEMP_CABAC_WIN_WEIGHT
+  const DecCtxSlot* m_ctxLoadSlot = nullptr;
+#endif
+#if JVET_AL0142_CCSAO_REUSE_CTU
+  uint8_t*          m_ccSaoPrvWrite[MAX_NUM_COMPONENT] = { nullptr, nullptr, nullptr };
+  const uint8_t*    m_ccSaoPrvRead [MAX_NUM_COMPONENT] = { nullptr, nullptr, nullptr };
+  bool              m_ccSaoPrvMirror = true;
+#endif
 };
 
 

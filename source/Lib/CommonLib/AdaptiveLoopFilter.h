@@ -603,6 +603,10 @@ public:
   void    getAlfScalePrev( CodingStructure& cs, Slice& slice );
   std::vector<int>&  getAlfScalePrev( const int apsIdx, const int alt ) { return m_idxCorrPrev[apsIdx][alt]; }
   void    resetAlfScalePrev( Slice& slice );
+  bool    m_alfScalePrevExternal = false;   ///< decoder threads: the scales of earlier pictures were resolved in decoding order before ALFProcess
+#endif
+#if JVET_AM0209_CHROMA_ALF_CCALF_REUSE_CTU
+  FrameCtrlInfo* m_pictureControlInfo = g_pictureControlInfo;   ///< reused CTU control (decoder threads: a per-picture copy)
 #endif
   void (*m_filter9x9Blk)(AlfClassifier **classifier, const PelUnitBuf &recDst, const PelUnitBuf &recBeforeDb, const PelUnitBuf &resi, const CPelUnitBuf &recSrc, const Area &blkDst, const Area &blk, const ComponentID compId, const short *filterSet, const Pel *fClipSet, const ClpRng &clpRng, CodingStructure &cs, Pel ***fixedFilterResults, Pel ***fixedFilterResiResults, int fixedFilterSetIdx
 #if JVET_AB0184_ALF_MORE_FIXED_FILTER_OUTPUT_TAPS

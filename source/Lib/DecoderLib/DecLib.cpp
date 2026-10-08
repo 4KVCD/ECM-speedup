@@ -620,6 +620,10 @@ DecLib::DecLib()
     memset(m_prevIRAPSubpicDecOrderNo[i], 0, sizeof(int)*MAX_NUM_SUB_PICS);
     std::fill_n(m_prevIRAPSubpicType[i], MAX_NUM_SUB_PICS, NAL_UNIT_INVALID);
   }
+#if JVET_AG0098_AMVP_WITH_SBTMVP
+  m_orderState.sbTmvpLast = std::make_shared<DecAreaSlot>();   // g_picAmvpSbTmvpEnabledArea starts at 0
+  m_orderState.sbTmvpLast->ready = true;
+#endif
 }
 
 DecLib::~DecLib()
@@ -814,6 +818,11 @@ Picture* DecLib::xGetNewPicBuffer( const SPS &sps, const PPS &pps, const uint32_
 
 
 void DecLib::executeLoopFilters()
+{
+  xExecuteLoopFilters( nullptr );
+}
+
+void DecLib::xExecuteLoopFilters( LfCtrlState* lf )
 {
   if( !m_pcPic )
   {
@@ -1080,10 +1089,28 @@ void DecLib::executeLoopFilters()
   if( cs.sps->getALFEnabledFlag() )
   {
     m_cALF.getCcAlfFilterParam() = cs.slice->m_ccAlfFilterParam;
+#if JVET_AM0209_CHROMA_ALF_CCALF_REUSE_CTU
+    // CTU control of earlier pictures that this one reuses (decided by the slice ALFProcess starts with)
+    LfCtrlState lfNow;
+    if( !lf )
+    {
+      xSetupLfReads( cs.slice, lfNow );
+    }
+    xLoadLfCtrl( lf ? *lf : lfNow );
+    m_cALF.m_pictureControlInfo = m_ctrlInfo;
+#endif
     // ALF decodes the differentially coded coefficients and stores them in the parameters structure.
     // Code could be restructured to do directly after parsing. So far we just pass a fresh non-const
     // copy in case the APS gets used more than once.
     m_cALF.ALFProcess(cs);
+#if JVET_AM0209_CHROMA_ALF_CCALF_REUSE_CTU
+    // CTU control kept for later pictures (decided by the slice ALFProcess ends with)
+    if( !lf )
+    {
+      xSetupLfStores( cs.slice, lfNow );
+    }
+    xStoreLfCtrl( lf ? *lf : lfNow );
+#endif
   }
 
 #if JVET_AL0153_ALF_CCCM
@@ -1143,6 +1170,272 @@ void DecLib::executeLoopFilters()
   }
 
   m_pcPic->cs->slice->stopProcessingTimer();
+}
+
+#if JVET_AM0209_CHROMA_ALF_CCALF_REUSE_CTU
+void DecLib::xSetupLfReads( const Slice* slice, LfCtrlState& lf )
+{
+  // ALFProcess: CTU control of the APS the slice names, stored by the last picture that signalled it
+  Slice& s = const_cast<Slice&>( *slice );
+  for( int comp = COMPONENT_Cb; comp < MAX_NUM_COMPONENT; comp++ )
+  {
+    const ComponentID compID = ComponentID( comp );
+    if( s.getTileGroupAlfEnabledFlag( compID ) && s.getTileGroupAlfReuseFlag( compID ) )
+    {
+      lf.alfReadAps[comp] = s.getTileGroupApsIdChroma();
+      lf.alfRead   [comp] = m_orderState.alfCtrl[lf.alfReadAps[comp]][comp];
+    }
+    if( s.m_ccAlfFilterParam.ccAlfFilterEnabled[comp - 1] && s.getTileGroupCcalfReuseFlag( compID ) )
+    {
+      lf.ccAlfReadAps[comp] = compID == COMPONENT_Cb ? s.getTileGroupCcAlfCbApsId() : s.getTileGroupCcAlfCrApsId();
+      lf.ccAlfRead   [comp] = m_orderState.ccAlfCtrl[lf.ccAlfReadAps[comp]][comp];
+    }
+  }
+}
+
+void DecLib::xSetupLfStores( const Slice* slice, LfCtrlState& lf )
+{
+  Slice& s = const_cast<Slice&>( *slice );
+  for( int comp = COMPONENT_Cb; comp < MAX_NUM_COMPONENT; comp++ )
+  {
+    const ComponentID compID = ComponentID( comp );
+    if( s.getTileGroupAlfEnabledFlag( compID ) && !s.getTileGroupAlfReuseFlag( compID ) )
+    {
+      lf.alfStoreAps[comp] = s.getTileGroupApsIdChroma();
+      lf.alfStore   [comp] = std::make_shared<DecCtrlSlot>();
+      m_orderState.alfCtrl[lf.alfStoreAps[comp]][comp] = lf.alfStore[comp];
+    }
+    if( s.m_ccAlfFilterParam.ccAlfFilterEnabled[comp - 1] && !s.getTileGroupCcalfReuseFlag( compID ) )
+    {
+      lf.ccAlfStoreAps[comp] = compID == COMPONENT_Cb ? s.getTileGroupCcAlfCbApsId() : s.getTileGroupCcAlfCrApsId();
+      lf.ccAlfStore   [comp] = std::make_shared<DecCtrlSlot>();
+      m_orderState.ccAlfCtrl[lf.ccAlfStoreAps[comp]][comp] = lf.ccAlfStore[comp];
+    }
+  }
+}
+
+void DecLib::xLoadLfCtrl( const LfCtrlState& lf )
+{
+  // same sizes as g_pictureControlInfo (xDecodeSPS); entries never stored are zero
+  const size_t numCtus = g_pictureControlInfo[0].bufAlfFlag[COMPONENT_Cb].size();
+  if( m_ctrlInfo[0].bufAlfFlag[COMPONENT_Cb].size() != numCtus )
+  {
+    for( auto& ci: m_ctrlInfo )
+    {
+      ci.resize( (int) numCtus );
+    }
+  }
+  for( int comp = COMPONENT_Cb; comp < MAX_NUM_COMPONENT; comp++ )
+  {
+    if( lf.alfReadAps[comp] >= 0 )
+    {
+      FrameCtrlInfo& ci = m_ctrlInfo[lf.alfReadAps[comp]];
+      if( lf.alfRead[comp] )
+      {
+        m_waitHub->wait( *lf.alfRead[comp] );
+        std::copy( lf.alfRead[comp]->a.begin(), lf.alfRead[comp]->a.end(), ci.bufAlfFlag  [comp].begin() );
+        std::copy( lf.alfRead[comp]->b.begin(), lf.alfRead[comp]->b.end(), ci.bufAlfFilter[comp].begin() );
+      }
+      else
+      {
+        std::fill( ci.bufAlfFlag  [comp].begin(), ci.bufAlfFlag  [comp].end(), 0 );
+        std::fill( ci.bufAlfFilter[comp].begin(), ci.bufAlfFilter[comp].end(), 0 );
+      }
+    }
+    if( lf.ccAlfReadAps[comp] >= 0 )
+    {
+      FrameCtrlInfo& ci = m_ctrlInfo[lf.ccAlfReadAps[comp]];
+      if( lf.ccAlfRead[comp] )
+      {
+        m_waitHub->wait( *lf.ccAlfRead[comp] );
+        std::copy( lf.ccAlfRead[comp]->a.begin(), lf.ccAlfRead[comp]->a.end(), ci.bufCcalfFilter[comp].begin() );
+      }
+      else
+      {
+        std::fill( ci.bufCcalfFilter[comp].begin(), ci.bufCcalfFilter[comp].end(), 0 );
+      }
+    }
+  }
+}
+
+void DecLib::xStoreLfCtrl( const LfCtrlState& lf )
+{
+  for( int comp = COMPONENT_Cb; comp < MAX_NUM_COMPONENT; comp++ )
+  {
+    if( lf.alfStore[comp] )
+    {
+      const FrameCtrlInfo& ci = m_ctrlInfo[lf.alfStoreAps[comp]];
+      lf.alfStore[comp]->a = ci.bufAlfFlag  [comp];
+      lf.alfStore[comp]->b = ci.bufAlfFilter[comp];
+      m_waitHub->publish( *lf.alfStore[comp] );
+    }
+    if( lf.ccAlfStore[comp] )
+    {
+      lf.ccAlfStore[comp]->a = m_ctrlInfo[lf.ccAlfStoreAps[comp]].bufCcalfFilter[comp];
+      m_waitHub->publish( *lf.ccAlfStore[comp] );
+    }
+  }
+}
+#endif
+
+void DecLib::xSetupSliceState( Slice* slice, DecSliceState& state )
+{
+  // the stores of DecSlice::decompressSlice, walked in decoding order: clear, look up, then enter what the slice
+  // stores at its end
+#if JVET_Z0135_TEMP_CABAC_WIN_WEIGHT
+  // CABACDataStore::updateBufferState, CtxStateStore::loadCtx / storeCtx
+#if JVET_Z0118_GDR && JVET_AD0206_CABAC_INIT_AT_GDR
+  if( slice->getPendingRasInit() || slice->isInterGDR() )
+#else
+  if( slice->getPendingRasInit() )
+#endif
+  {
+    m_orderState.ctx[0].clear();
+    m_orderState.ctx[1].clear();
+  }
+  if( slice->getSliceType() != I_SLICE && slice->getSPS()->getTempCabacInitMode() )
+  {
+#if JVET_AH0176_LOW_DELAY_B_CTX
+    auto& buf = m_orderState.ctx[slice->getSliceType() == P_SLICE ? 1 : 0];
+#else
+    auto& buf = m_orderState.ctx[slice->getSliceType()];
+#endif
+    const std::pair<int, int> key( slice->getTLayer(), slice->getSliceQp() );
+    const auto it = buf.find( key );
+    if( it != buf.end() )
+    {
+      state.ctxLoad = it->second;
+    }
+    // stored when the slice contains the last CTU of the picture (storeContexts)
+    if( slice->getPPS()->pcv->sizeInCtus - 1 == slice->getCtuAddrInSlice( slice->getNumCtuInSlice() - 1 ) )
+    {
+      if( it == buf.end() && buf.size() == TEMP_CABAC_BUFFER_SIZE )
+      {
+        buf.erase( buf.begin() );
+      }
+      state.ctxStore = std::make_shared<DecCtxSlot>();
+      buf[key]       = state.ctxStore;
+    }
+  }
+#endif
+#if JVET_AG0098_AMVP_WITH_SBTMVP
+  // clearAmvpSbTmvpStatArea, loadAmvpSbTmvpStatArea, storeAmvpSbTmvpStatArea( tid, g_picAmvpSbTmvpEnabledArea ):
+  // the area is reset and counted only in slices with AMVP-SbTMVP enabled, other slices store the last count
+  if( slice->getPendingRasInit() || slice->isInterGDR() )
+  {
+    m_orderState.sbTmvp.clear();
+  }
+  state.sbTmvpEnabled = DecSlice::isAmvpSbTmvpEnabled( slice );
+  if( state.sbTmvpEnabled )
+  {
+    const auto it = m_orderState.sbTmvp.find( slice->getTLayer() );
+    if( it != m_orderState.sbTmvp.end() )
+    {
+      state.sbTmvpLoad = it->second;
+    }
+    state.sbTmvpArea         = std::make_shared<DecAreaSlot>();
+    m_orderState.sbTmvpLast  = state.sbTmvpArea;
+  }
+  if( !slice->isIntra() )
+  {
+    m_orderState.sbTmvp[slice->getTLayer()] = m_orderState.sbTmvpLast;
+  }
+#endif
+  DecSlice::selectClipMv( slice );
+}
+
+void DecLib::xSetupSliceTools( Slice* pcSlice )
+{
+  Quant *quant = m_cTrQuant.getQuant();
+
+  if (pcSlice->getExplicitScalingListUsed())
+  {
+    APS* scalingListAPS = pcSlice->getPicHeader()->getScalingListAPS();
+    ScalingList scalingList = scalingListAPS->getScalingList();
+    quant->setScalingListDec(scalingList);
+    quant->setUseScalingList(true);
+  }
+  else
+  {
+    quant->setUseScalingList( false );
+  }
+
+  if (pcSlice->getSPS()->getUseLmcs())
+  {
+    if (pcSlice->getLmcsEnabledFlag())
+    {
+      APS* lmcsAPS = pcSlice->getPicHeader()->getLmcsAPS();
+      SliceReshapeInfo& sInfo = lmcsAPS->getReshaperAPSInfo();
+      SliceReshapeInfo& tInfo = m_cReshaper.getSliceReshaperInfo();
+      tInfo.reshaperModelMaxBinIdx = sInfo.reshaperModelMaxBinIdx;
+      tInfo.reshaperModelMinBinIdx = sInfo.reshaperModelMinBinIdx;
+      memcpy(tInfo.reshaperModelBinCWDelta, sInfo.reshaperModelBinCWDelta, sizeof(int)*(PIC_CODE_CW_BINS));
+      tInfo.maxNbitsNeededDeltaCW = sInfo.maxNbitsNeededDeltaCW;
+      tInfo.chrResScalingOffset = sInfo.chrResScalingOffset;
+      tInfo.setUseSliceReshaper(pcSlice->getLmcsEnabledFlag());
+      tInfo.setSliceReshapeChromaAdj(pcSlice->getPicHeader()->getLmcsChromaResidualScaleFlag());
+      tInfo.setSliceReshapeModelPresentFlag(true);
+    }
+    else
+    {
+      SliceReshapeInfo& tInfo = m_cReshaper.getSliceReshaperInfo();
+      tInfo.setUseSliceReshaper(false);
+      tInfo.setSliceReshapeChromaAdj(false);
+      tInfo.setSliceReshapeModelPresentFlag(false);
+    }
+    if (pcSlice->getLmcsEnabledFlag())
+    {
+      m_cReshaper.constructReshaper();
+    }
+    else
+    {
+      m_cReshaper.setReshapeFlag(false);
+    }
+    if ((pcSlice->getSliceType() == I_SLICE) && m_cReshaper.getSliceReshaperInfo().getUseSliceReshaper())
+    {
+      m_cReshaper.setCTUFlag(false);
+      m_cReshaper.setRecReshaped(true);
+    }
+    else
+    {
+      if (m_cReshaper.getSliceReshaperInfo().getUseSliceReshaper())
+      {
+        m_cReshaper.setCTUFlag(true);
+        m_cReshaper.setRecReshaped(true);
+      }
+      else
+      {
+        m_cReshaper.setCTUFlag(false);
+        m_cReshaper.setRecReshaped(false);
+      }
+    }
+#if !LMCS_CHROMA_CALC_CU
+#if JVET_Z0118_GDR
+    m_cReshaper.setVPDULoc(-1, -1, PIC_RECONSTRUCTION_0);
+#else
+    m_cReshaper.setVPDULoc(-1, -1);
+#endif
+#endif
+  }
+  else
+  {
+    m_cReshaper.setCTUFlag(false);
+    m_cReshaper.setRecReshaped(false);
+  }
+}
+
+void DecLib::xDecodeSliceData( Slice* pcSlice, InputBitstream* bitstream, DecSliceState& state )
+{
+  xSetupSliceTools( pcSlice );
+#if JVET_AI0183_MVP_EXTENSION
+  pcSlice->generateIntersectingMv();   // reads the motion of the reference pictures
+#endif
+#if JVET_Z0118_GDR
+  m_pcPic->initCleanCurPicture();
+#endif
+
+  //  Decode a picture
+  m_cSliceDecoder.decompressSlice( pcSlice, bitstream, ( m_pcPic->poc == getDebugPOC() ? getDebugCTU() : -1 ), state, *m_waitHub );
 }
 
 void DecLib::finishPictureLight(int& poc, PicList*& rpcListPic )
@@ -2860,6 +3153,27 @@ bool DecLib::xDecodeSlice(InputNALUnit &nalu, int &iSkipFrame, int iPOCLastDispl
 #else
   m_HLSReader.parseSliceHeader( m_apcSlicePilot, &m_picHeader, &m_parameterSetManager, m_prevTid0POC, m_prevPicPOC );
 #endif
+#if JVET_AL0142_CCSAO_REUSE_CTU
+  // CCSAO CTU control entries of the slice header: the entries it added are filled by its CTUs and stay zero when
+  // the slice is not decoded
+  struct CcSaoCtrl
+  {
+    DecWaitHub&                  hub;
+    std::shared_ptr<DecCtrlSlot> write[MAX_NUM_COMPONENT];
+    std::shared_ptr<DecCtrlSlot> read [MAX_NUM_COMPONENT];
+    ~CcSaoCtrl()
+    {
+      for( auto& w: write )
+      {
+        if( w )
+        {
+          hub.publish( *w );
+        }
+      }
+    }
+  } ccSaoCtrl{ *m_waitHub };
+  m_HLSReader.takeCcSaoCtrl( ccSaoCtrl.write, ccSaoCtrl.read );
+#endif
 
   if (m_picHeader.getGdrOrIrapPicFlag() && m_bFirstSliceInPicture)
   {
@@ -3649,9 +3963,7 @@ bool DecLib::xDecodeSlice(InputNALUnit &nalu, int &iSkipFrame, int iPOCLastDispl
 #if JVET_AF0159_AFFINE_SUBPU_BDOF_REFINEMENT
     pcSlice->generateEqualPocDist();
 #endif
-#if JVET_AI0183_MVP_EXTENSION
-    pcSlice->generateIntersectingMv();
-#endif
+    // (generateIntersectingMv: xDecodeSliceData)
 
     NalUnitInfo naluInfo;
     naluInfo.m_nalUnitType = nalu.m_nalUnitType;
@@ -3669,8 +3981,7 @@ bool DecLib::xDecodeSlice(InputNALUnit &nalu, int &iSkipFrame, int iPOCLastDispl
     }
     pcSlice->checkConformanceForDRAP(nalu.m_temporalId);
 
-  Quant *quant = m_cTrQuant.getQuant();
-
+  // conformance checks of the scaling list and LMCS APS; the tools are set up in xSetupSliceTools
   if (pcSlice->getExplicitScalingListUsed())
   {
     APS* scalingListAPS = pcSlice->getPicHeader()->getScalingListAPS();
@@ -3696,13 +4007,6 @@ bool DecLib::xDecodeSlice(InputNALUnit &nalu, int &iSkipFrame, int iPOCLastDispl
         CHECK( isCurrLayerInOls && !isRefLayerInOls, "When VCL NAl unit in layer A refers to APS in layer B, all OLS that contains layer A shall also contains layer B" );
       }
     }
-    ScalingList scalingList = scalingListAPS->getScalingList();
-    quant->setScalingListDec(scalingList);
-    quant->setUseScalingList(true);
-  }
-  else
-  {
-    quant->setUseScalingList( false );
   }
 
   if (pcSlice->getSPS()->getUseLmcs())
@@ -3742,62 +4046,7 @@ bool DecLib::xDecodeSlice(InputNALUnit &nalu, int &iSkipFrame, int iPOCLastDispl
           CHECK( isCurrLayerInOls && !isRefLayerInOls, "When VCL NAl unit in layer A refers to APS in layer B, all OLS that contains layer A shall also contains layer B" );
         }
       }
-      SliceReshapeInfo& sInfo = lmcsAPS->getReshaperAPSInfo();
-      SliceReshapeInfo& tInfo = m_cReshaper.getSliceReshaperInfo();
-      tInfo.reshaperModelMaxBinIdx = sInfo.reshaperModelMaxBinIdx;
-      tInfo.reshaperModelMinBinIdx = sInfo.reshaperModelMinBinIdx;
-      memcpy(tInfo.reshaperModelBinCWDelta, sInfo.reshaperModelBinCWDelta, sizeof(int)*(PIC_CODE_CW_BINS));
-      tInfo.maxNbitsNeededDeltaCW = sInfo.maxNbitsNeededDeltaCW;
-      tInfo.chrResScalingOffset = sInfo.chrResScalingOffset;
-      tInfo.setUseSliceReshaper(pcSlice->getLmcsEnabledFlag());
-      tInfo.setSliceReshapeChromaAdj(pcSlice->getPicHeader()->getLmcsChromaResidualScaleFlag());
-      tInfo.setSliceReshapeModelPresentFlag(true);
     }
-    else
-    {
-      SliceReshapeInfo& tInfo = m_cReshaper.getSliceReshaperInfo();
-      tInfo.setUseSliceReshaper(false);
-      tInfo.setSliceReshapeChromaAdj(false);
-      tInfo.setSliceReshapeModelPresentFlag(false);
-    }
-    if (pcSlice->getLmcsEnabledFlag())
-    {
-      m_cReshaper.constructReshaper();
-    }
-    else
-    {
-      m_cReshaper.setReshapeFlag(false);
-    }
-    if ((pcSlice->getSliceType() == I_SLICE) && m_cReshaper.getSliceReshaperInfo().getUseSliceReshaper())
-    {
-      m_cReshaper.setCTUFlag(false);
-      m_cReshaper.setRecReshaped(true);
-    }
-    else
-    {
-      if (m_cReshaper.getSliceReshaperInfo().getUseSliceReshaper())
-      {
-        m_cReshaper.setCTUFlag(true);
-        m_cReshaper.setRecReshaped(true);
-      }
-      else
-      {
-        m_cReshaper.setCTUFlag(false);
-        m_cReshaper.setRecReshaped(false);
-      }
-    }
-#if !LMCS_CHROMA_CALC_CU
-#if JVET_Z0118_GDR
-    m_cReshaper.setVPDULoc(-1, -1, PIC_RECONSTRUCTION_0);
-#else
-    m_cReshaper.setVPDULoc(-1, -1);
-#endif
-#endif
-  }
-  else
-  {
-    m_cReshaper.setCTUFlag(false);
-    m_cReshaper.setRecReshaped(false);
   }
 
 #if GDR_LEAK_TEST
@@ -3826,13 +4075,19 @@ bool DecLib::xDecodeSlice(InputNALUnit &nalu, int &iSkipFrame, int iPOCLastDispl
     }
   }
 #endif
-  
-#if JVET_Z0118_GDR
-    m_pcPic->initCleanCurPicture();
-#endif
 
-  //  Decode a picture
-  m_cSliceDecoder.decompressSlice( pcSlice, &( nalu.getBitstream() ), ( m_pcPic->poc == getDebugPOC() ? getDebugCTU() : -1 ) );
+  // decode-order state of the slice, then its CTUs
+  DecSliceState sliceState;
+#if JVET_AL0142_CCSAO_REUSE_CTU
+  for( int comp = 0; comp < MAX_NUM_COMPONENT; comp++ )
+  {
+    sliceState.ccSaoWrite[comp] = std::move( ccSaoCtrl.write[comp] );
+    sliceState.ccSaoRead [comp] = std::move( ccSaoCtrl.read [comp] );
+    ccSaoCtrl.write[comp].reset();
+  }
+#endif
+  xSetupSliceState( pcSlice, sliceState );
+  xDecodeSliceData( pcSlice, &( nalu.getBitstream() ), sliceState );
 
   m_bFirstSliceInPicture = false;
   m_uiSliceSegmentIdx++;

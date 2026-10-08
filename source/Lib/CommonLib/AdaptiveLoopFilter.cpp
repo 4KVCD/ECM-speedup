@@ -689,14 +689,14 @@ void AdaptiveLoopFilter::ALFProcess(CodingStructure& cs)
     if (cs.slice->getTileGroupAlfEnabledFlag(compID) && cs.slice->getTileGroupAlfReuseFlag(compID))
     {
       int apsIdxChroma = cs.slice->getTileGroupApsIdChroma();
-      memcpy(m_ctuEnableFlag[compID], g_pictureControlInfo[apsIdxChroma].bufAlfFlag[compID].data(), sizeof(uint8_t) * m_numCTUsInPic);
-      std::copy_n(g_pictureControlInfo[apsIdxChroma].bufAlfFilter[compID].data(), m_numCTUsInPic, m_ctuAlternative[compID]);
+      memcpy(m_ctuEnableFlag[compID], m_pictureControlInfo[apsIdxChroma].bufAlfFlag[compID].data(), sizeof(uint8_t) * m_numCTUsInPic);
+      std::copy_n(m_pictureControlInfo[apsIdxChroma].bufAlfFilter[compID].data(), m_numCTUsInPic, m_ctuAlternative[compID]);
     }
 
     if (cs.slice->m_ccAlfFilterParam.ccAlfFilterEnabled[compIdx - 1] && cs.slice->getTileGroupCcalfReuseFlag(compID))
     {
       int apsIdxCcalf = compID == COMPONENT_Cb ? cs.slice->getTileGroupCcAlfCbApsId() : cs.slice->getTileGroupCcAlfCrApsId();
-      memcpy(m_ccAlfFilterControl[compIdx - 1], g_pictureControlInfo[apsIdxCcalf].bufCcalfFilter[compIdx].data(), sizeof(uint8_t) * m_numCTUsInPic);
+      memcpy(m_ccAlfFilterControl[compIdx - 1], m_pictureControlInfo[apsIdxCcalf].bufCcalfFilter[compIdx].data(), sizeof(uint8_t) * m_numCTUsInPic);
     }
   }
 #endif
@@ -783,8 +783,11 @@ void AdaptiveLoopFilter::ALFProcess(CodingStructure& cs)
 
 #if JVET_AI0084_ALF_RESIDUALS_SCALING
   setAlfScaleMode( cs.sps->getAlfScaleMode() );
-  resetAlfScalePrev( *cs.slice );
-  getAlfScalePrev( cs, *cs.slice );
+  if( !m_alfScalePrevExternal )
+  {
+    resetAlfScalePrev( *cs.slice );
+    getAlfScalePrev( cs, *cs.slice );
+  }
 #endif
 
   for( int yPos = 0; yPos < pcv.lumaHeight; yPos += pcv.maxCUHeight )
@@ -1803,7 +1806,7 @@ void AdaptiveLoopFilter::ALFProcess(CodingStructure& cs)
 
 
 #if JVET_AI0084_ALF_RESIDUALS_SCALING
-  if ( cs.slice->getUseAlfScale() && cs.slice->getTileGroupAlfEnabledFlag(COMPONENT_Y) )
+  if ( cs.slice->getUseAlfScale() && cs.slice->getTileGroupAlfEnabledFlag(COMPONENT_Y) && !m_alfScalePrevExternal )
   {
     storeAlfScalePrev( cs, *cs.slice );
   }
@@ -1821,9 +1824,9 @@ void AdaptiveLoopFilter::ALFProcess(CodingStructure& cs)
     {
       int apsIdxChroma = cs.slice->getTileGroupApsIdChroma();
       {
-        memcpy(g_pictureControlInfo[apsIdxChroma].bufAlfFlag[compID].data(), m_ctuEnableFlag[compID], sizeof(uint8_t)* m_numCTUsInPic);
-        memcpy(g_pictureControlInfo[apsIdxChroma].bufAlfFilter[compID].data(), m_ctuAlternative[compID], sizeof(uint8_t)* m_numCTUsInPic);
-        g_pictureControlInfo[apsIdxChroma].alfTemporalLayer[compID] = cs.slice->getTLayer();
+        memcpy(m_pictureControlInfo[apsIdxChroma].bufAlfFlag[compID].data(), m_ctuEnableFlag[compID], sizeof(uint8_t)* m_numCTUsInPic);
+        memcpy(m_pictureControlInfo[apsIdxChroma].bufAlfFilter[compID].data(), m_ctuAlternative[compID], sizeof(uint8_t)* m_numCTUsInPic);
+        m_pictureControlInfo[apsIdxChroma].alfTemporalLayer[compID] = cs.slice->getTLayer();
       }
     }
   }
@@ -1836,8 +1839,8 @@ void AdaptiveLoopFilter::ALFProcess(CodingStructure& cs)
     {
       int apsIdxCcalf = compID == COMPONENT_Cb ? cs.slice->getTileGroupCcAlfCbApsId() : cs.slice->getTileGroupCcAlfCrApsId();
       {
-        memcpy(g_pictureControlInfo[apsIdxCcalf].bufCcalfFilter[compIdx].data(), m_ccAlfFilterControl[compIdx - 1], sizeof(uint8_t)* m_numCTUsInPic);
-        g_pictureControlInfo[apsIdxCcalf].ccalfTemporalLayer[compID] = cs.slice->getTLayer();
+        memcpy(m_pictureControlInfo[apsIdxCcalf].bufCcalfFilter[compIdx].data(), m_ccAlfFilterControl[compIdx - 1], sizeof(uint8_t)* m_numCTUsInPic);
+        m_pictureControlInfo[apsIdxCcalf].ccalfTemporalLayer[compID] = cs.slice->getTLayer();
       }
     }
   }
