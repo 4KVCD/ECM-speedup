@@ -207,6 +207,11 @@ int main(int argc, char* argv[])
       spc.bitstreamFile     = pcEncApp[0]->getBitstreamFileName();
       spc.reconFile         = pcEncApp[0]->getReconFileName();
       spc.pocOffsetChunks   = pcEncApp[0]->getPocOffsetChunksSupported();
+      spc.inputFile         = pcEncApp[0]->getInputFileName();
+      spc.inputWidth        = pcEncApp[0]->getInputFileWidth();
+      spc.inputHeight       = pcEncApp[0]->getInputFileHeight();
+      spc.inputBitDepth     = pcEncApp[0]->getInputFileBitDepth();
+      spc.inputChromaFormat = (int) pcEncApp[0]->getInputChromaFormat();
       std::string reason;
       if( segmentParallelSupported( spc, pcEncApp[0]->getDecodingRefreshType(), pcEncApp[0]->getMaxLayers(), reason ) )
       {

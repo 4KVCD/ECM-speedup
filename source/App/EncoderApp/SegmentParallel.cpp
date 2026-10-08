@@ -41,6 +41,7 @@
 #include "DecoderLib/NALread.h"
 #include "DecoderLib/VLCReader.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -75,6 +76,7 @@ struct Segment
   std::string recon;
   std::string log;
   int         exitCode = -1;
+  double      cost     = 0;   // estimated encoding cost
 };
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -507,6 +509,97 @@ std::string rebasePocLine( const std::string& line, int base, int& poc, bool& ok
   return os.str();
 }
 
+// ---------------------------------------------------------------------------------------------------------------------
+// estimated encoding cost of the chunks, used to start the expensive chunks first
+
+// sum of absolute horizontal and vertical luma differences on every other row and column
+double lumaActivity( const std::vector<uint16_t>& y, int w, int h )
+{
+  double a = 0;
+  for( int r = 0; r + 1 < h; r += 2 )
+  {
+    const uint16_t* p = &y[r * w];
+    const uint16_t* q = p + w;
+    for( int x = 0; x + 1 < w; x += 2 )
+    {
+      a += std::abs( p[x + 1] - p[x] ) + std::abs( q[x] - p[x] );
+    }
+  }
+  return a;
+}
+
+// Cost of a chunk: the luma activity of its coded pictures (for all-intra coding this follows the encoding time of a
+// picture closely, correlation 0.95 over the 33 pictures of the bench test ai_long), plus for inter coding the
+// absolute difference between consecutive sampled pictures. Long chunks are sampled at every fourth coded picture.
+// Returns false if the input cannot be read as raw YUV (the chunks then run in order).
+bool estimateCosts( const SegmentParallelCfg& cfg, std::vector<Segment>& segs )
+{
+  const int w = cfg.inputWidth, h = cfg.inputHeight;
+  if( cfg.inputFile.empty() || w <= 0 || h <= 0 || cfg.inputChromaFormat < CHROMA_400 || cfg.inputChromaFormat > CHROMA_444 )
+  {
+    return false;
+  }
+  std::ifstream f( cfg.inputFile, std::ios::binary );
+  if( !f )
+  {
+    return false;
+  }
+  char sig[10] = {};
+  f.read( sig, sizeof( sig ) );
+  if( !f || std::string( sig, sizeof( sig ) ) == "YUV4MPEG2 " )
+  {
+    return false;
+  }
+  const int     bytes      = cfg.inputBitDepth > 8 ? 2 : 1;
+  const int     cw         = cfg.inputChromaFormat == CHROMA_444 ? w : ( w + 1 ) / 2;
+  const int     ch         = cfg.inputChromaFormat == CHROMA_420 ? ( h + 1 ) / 2 : h;
+  const int64_t lumaBytes  = int64_t( w ) * h * bytes;
+  const int64_t frameBytes = lumaBytes + ( cfg.inputChromaFormat == CHROMA_400 ? 0 : 2 * int64_t( cw ) * ch * bytes );
+
+  std::vector<uint8_t>  raw( lumaBytes );
+  std::vector<uint16_t> cur( int64_t( w ) * h ), prev( int64_t( w ) * h );
+  auto readLuma = [&]( int codedFrame, std::vector<uint16_t>& y ) {
+    const int64_t frame = int64_t( cfg.frameSkip ) + int64_t( codedFrame ) * cfg.temporalSubsampleRatio;
+    f.clear();
+    f.seekg( frame * frameBytes );
+    f.read( reinterpret_cast<char*>( raw.data() ), lumaBytes );
+    if( !f )
+    {
+      return false;
+    }
+    for( size_t i = 0; i < y.size(); i++ )
+    {
+      y[i] = bytes == 2 ? uint16_t( raw[2 * i] | ( raw[2 * i + 1] << 8 ) ) : raw[i];
+    }
+    return true;
+  };
+
+  for( Segment& seg: segs )
+  {
+    const int step  = seg.frames > 8 ? 4 : 1;
+    bool      first = true;
+    seg.cost        = 0;
+    for( int i = seg.start; i < seg.start + seg.frames; i += step )
+    {
+      if( !readLuma( i, cur ) )
+      {
+        return false;
+      }
+      seg.cost += lumaActivity( cur, w, h );
+      if( !cfg.pocOffsetChunks && !first )
+      {
+        for( size_t k = 0; k < cur.size(); k += 2 )
+        {
+          seg.cost += std::abs( cur[k] - prev[k] );
+        }
+      }
+      std::swap( cur, prev );
+      first = false;
+    }
+  }
+  return true;
+}
+
 }   // namespace
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -580,12 +673,27 @@ int runSegmentParallel( int argc, char* argv[], const SegmentParallelCfg& cfg )
           (int) segs.size(), concat ? "disjoint" : "overlapping", L + overlap, cfg.numWorkers );
   fflush( stdout );
 
+  // with more chunks than workers, start the expensive chunks first: chunks in input order put a run of complex
+  // pictures at the end, where it runs long after the other workers have finished
+  std::vector<int> order( segs.size() );
+  for( size_t k = 0; k < segs.size(); k++ )
+  {
+    order[k] = (int) k;
+  }
+  if( (int) segs.size() > cfg.numWorkers && estimateCosts( cfg, segs ) )
+  {
+    std::stable_sort( order.begin(), order.end(), [&]( int a, int b ) { return segs[a].cost > segs[b].cost; } );
+    printf( "Chunks are started in order of decreasing estimated cost (input luma activity)\n" );
+    fflush( stdout );
+  }
+
   const std::string exe = selfExecutable( argv[0] );
   std::atomic<int>  next( 0 );
   std::mutex        ioMutex;
   auto worker = [&]() {
-    for( int k = next++; k < (int) segs.size(); k = next++ )
+    for( int j = next++; j < (int) segs.size(); j = next++ )
     {
+      const int                k   = order[j];
       Segment&                 seg = segs[k];
       std::vector<std::string> args( argv, argv + argc );
       args[0] = exe;
