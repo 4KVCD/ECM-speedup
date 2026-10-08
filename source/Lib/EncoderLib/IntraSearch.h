@@ -998,7 +998,7 @@ public:
       unsigned         idx;
       BinProbModel_Std before, after;
     };
-    std::vector<CtxChange> ctxChanges;   // contexts updated by the flags
+    std::vector<CtxChange> ctxChanges;   // every context the flags coded a bin with: value before and after
   };
   static const int    LUMA_MODE_FLAGS_MEMO_SIZE = 8;
   LumaModeFlagsMemo   m_lumaModeFlagsMemo[LUMA_MODE_FLAGS_MEMO_SIZE];
@@ -1006,6 +1006,7 @@ public:
   int                 m_lumaModeFlagsMemoNext   = 0;
   bool                m_lumaModeFlagsMemoActive = false;
   std::vector<BinProbModel_Std> m_lumaModeFlagsCtxSnapshot;
+  BinStoreVector      m_lumaModeFlagsBinLog;   // contexts the flags being recorded code bins with
   uint64_t xFracModeBitsLumaMemo  (PredictionUnit &pu);
   struct LumaModeFlagsMemoScope
   {

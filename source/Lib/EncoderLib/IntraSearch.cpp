@@ -19834,7 +19834,8 @@ uint64_t IntraSearch::xFracModeBitsLumaMemo(PredictionUnit &pu)
     if (m.pu == &pu && m.multiRefIdx == pu.multiRefIdx && m.ispMode == cu.ispMode && m.lfnstIdx == cu.lfnstIdx)
     {
       memo = &m;
-      // the contexts the flags update must still hold the values they were coded from
+      // every context the flags code a bin with must still hold the value it was coded from (also the ones the
+      // bin left unchanged: their value still sets the bin's cost)
       for (const auto &c: m.ctxChanges)
       {
         if (::memcmp(&cstore[c.idx], &c.before, ctxSz))
@@ -19879,33 +19880,46 @@ uint64_t IntraSearch::xFracModeBitsLumaMemo(PredictionUnit &pu)
     return bits;
   }
 
-  // code the flags, keep their bits and context updates
+  // code the flags, keep their bits and every context they code a bin with, which the CABAC spatial-tuning bin buffer
+  // of the estimator logs (one entry per context; that buffer is not set during the search)
   m_lumaModeFlagsCtxSnapshot.resize(numCtx);
   ::memcpy((void *) m_lumaModeFlagsCtxSnapshot.data(), &cstore[0], numCtx * ctxSz);
+  const bool canLog = m_CABACEstimator->getBinBuffer() == nullptr;
+  if (canLog)
+  {
+    m_CABACEstimator->setBinBuffer(&m_lumaModeFlagsBinLog);
+    m_CABACEstimator->setBinBufferActive(true);
+  }
   m_CABACEstimator->resetBits();
   m_CABACEstimator->setStopBeforeLumaModeMpm(true);
   codeFlags();
   const bool reachedMpm = m_CABACEstimator->reachedLumaModeMpm();
   m_CABACEstimator->setStopBeforeLumaModeMpm(false);
-
-  LumaModeFlagsMemo &m = m_lumaModeFlagsMemo[m_lumaModeFlagsMemoNext];
-  m_lumaModeFlagsMemoNext = (m_lumaModeFlagsMemoNext + 1) % LUMA_MODE_FLAGS_MEMO_SIZE;
-  if (m_lumaModeFlagsMemoNum < LUMA_MODE_FLAGS_MEMO_SIZE)
+  if (canLog)
   {
-    m_lumaModeFlagsMemoNum++;
+    m_CABACEstimator->setBinBufferActive(false);
+    m_CABACEstimator->setBinBuffer(nullptr);
   }
-  m.pu          = &pu;
-  m.multiRefIdx = pu.multiRefIdx;
-  m.ispMode     = cu.ispMode;
-  m.lfnstIdx    = cu.lfnstIdx;
-  m.reachedMpm  = reachedMpm;
-  m.bits        = m_CABACEstimator->getEstFracBits();
-  m.ctxChanges.clear();
-  for (unsigned i = 0; i < numCtx; i++)
+
+  // a full log may have missed contexts: no entry then
+  if (canLog && m_lumaModeFlagsBinLog.size() < CABAC_SPATIAL_MAX_BINS)
   {
-    if (::memcmp(&cstore[i], &m_lumaModeFlagsCtxSnapshot[i], ctxSz))
+    LumaModeFlagsMemo &m = m_lumaModeFlagsMemo[m_lumaModeFlagsMemoNext];
+    m_lumaModeFlagsMemoNext = (m_lumaModeFlagsMemoNext + 1) % LUMA_MODE_FLAGS_MEMO_SIZE;
+    if (m_lumaModeFlagsMemoNum < LUMA_MODE_FLAGS_MEMO_SIZE)
     {
-      m.ctxChanges.push_back({ i, m_lumaModeFlagsCtxSnapshot[i], cstore[i] });
+      m_lumaModeFlagsMemoNum++;
+    }
+    m.pu          = &pu;
+    m.multiRefIdx = pu.multiRefIdx;
+    m.ispMode     = cu.ispMode;
+    m.lfnstIdx    = cu.lfnstIdx;
+    m.reachedMpm  = reachedMpm;
+    m.bits        = m_CABACEstimator->getEstFracBits();
+    m.ctxChanges.clear();
+    for (const BinStoreElem &e: m_lumaModeFlagsBinLog)
+    {
+      m.ctxChanges.push_back({ e.ctxId, m_lumaModeFlagsCtxSnapshot[e.ctxId], cstore[e.ctxId] });
     }
   }
   if (reachedMpm)
