@@ -32,6 +32,10 @@ intra period 32 and 64).
 
 | 8 | the most frequent tiny interpolations in one call each instead of a horizontal and a vertical filter call through the general dispatch: 2x2 chroma OBMC sub-blocks (6 taps) and the 4x1 / 1x4 luma template rows and columns of the sub-block template matching (4-tap TM filter); ~1.35 M such blocks per 33-frame CIF RA decode; a verification build (SMALL_MC_VERIFY=1) ran the original calls after every one and compared | identical (also with 8 segment workers; encoder bit-exact) | 1.01x CPU, 1.02x wall (3 paired repetitions; RA streams 1.04-1.06x wall, LD 1.02-1.03x, AI 1.00x) | ~1.33x |
 
+| 9 | the two 13x13 ALF luma kernels (256-bit paths) keep the class-dependent coefficient and clipping vectors of each 16-sample segment, which depend only on its 16 class values and the filter set, and reuse them when the next row has the same class values (the classification is per 2x2 block; 77 % of the segments of 720p RA hit, 65 % of 720p AI); a verification build (ALF_PARAM_CACHE_VERIFY=1) rebuilt them for every segment and compared | identical (also with 8 segment workers; encoder bit-exact) | 1.02x (3 paired repetitions; 720p streams 1.02-1.03x, CIF and smaller 1.00-1.02x) | ~1.36x |
+
+Timing set from step 9 on also includes ra720_pj17 (720p ParkJoy RA, 17 frames; stock decoder 6.00 s).
+
 Steps after 7 are measured against non-PGO builds (each PGO build takes ~20 min); the cumulative figure assumes the
 PGO gain carries over, and is re-measured with a PGO build from time to time.
 
@@ -89,6 +93,10 @@ sequentially.
   saturation of 8 outputs done at once and the dense output layer loading each input vector once for 8 outputs;
   verified equal on every call, but 1.00x: each model has 0.4-0.6 MB of int16 weights (full 16-bit range, so no exact
   narrower storage), more than the 256 KB L2, so an inference is bound by streaming the weights from L3.
+- Tried and dropped: a 12-tap horizontal interpolation kernel without shuffles (even and odd output columns from plain
+  loads and pmaddwd, ~2 shuffles instead of ~15 per 8 outputs), verified equal on every call: 1.00-1.01x (6 paired
+  repetitions on the RA/LD streams), although the replaced kernel had 2.4 % of the 720p RA profile; the filters seem
+  to wait on the reference samples rather than on the shuffle port.
 - Interpolation work repeated within a CU (same reference samples, filter and size; CIF RA): 20 % of the horizontal
   first-pass and 11 % of the vertical filter work, so a cache could save at most ~3-4 % of the decoding time. The
   filters are called ~6 M times per 33-frame CIF RA decode, mostly for 1-4 sample wide templates, 4x4 luma and 2x2

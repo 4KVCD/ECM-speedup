@@ -51,6 +51,23 @@ constexpr uint16_t sh(int x)
   return 0x0202 * (x & 7) + 0x0100 + 0x1010 * (x & 8);
 }
 
+// perf: 1 builds the class-dependent parameters of the 13x13 ALF kernels for every segment and checks that the
+// per-segment cache would have given the same bytes (and counts the hits)
+#ifndef ALF_PARAM_CACHE_VERIFY
+#define ALF_PARAM_CACHE_VERIFY 0
+#endif
+#if ALF_PARAM_CACHE_VERIFY
+static inline void alfParamCacheCount( const bool hit )
+{
+  static struct Count
+  {
+    uint64_t n[2] = { 0, 0 };
+    ~Count() { fprintf( stderr, "ALF_PARAM_CACHE_VERIFY: %llu segments, %llu cache hits\n", ( unsigned long long ) ( n[0] + n[1] ), ( unsigned long long ) n[1] ); }
+  } count;
+  count.n[hit]++;
+}
+#endif
+
 #if ALF_IMPROVEMENT
 static const uint16_t shuffleTab5[4][8] = {
   {
@@ -4574,27 +4591,61 @@ static void simdFilter13x13BlkExtDbResiDirect(
     const __m256i curBase  = _mm256_set1_epi16(currBase);
 #endif
 
+    // perf: the class-dependent coefficient and clipping vectors (params, scaleFactor) of a 16-sample segment depend
+    // only on its 16 class values (class and transpose index) and on the filter set of this call; the classification
+    // is made per 2x2 block, so the second row of each pair finds them here instead of building them again
+    struct ParamCache
+    {
+#if JVET_AB0184_ALF_MORE_FIXED_FILTER_OUTPUT_TAPS
+#if JVET_AD0222_ALF_LONG_FIXFILTER && JVET_AD0222_ADDITONAL_ALF_FIXFILTER
+      __m256i params[2][2][20];
+#elif JVET_AD0222_ALF_LONG_FIXFILTER
+      __m256i params[2][2][17];
+#elif JVET_AD0222_ADDITONAL_ALF_FIXFILTER
+      __m256i params[2][2][19];
+#else
+      __m256i params[2][2][16];
+#endif
+#else
+      __m256i params[2][2][13];
+#endif
+#if JVET_AK0123_ALF_COEFF_RESTRICTION
+      int32_t scaleFactor[16];
+#endif
+      __m256i key;
+      bool    valid;
+    };
+    static thread_local std::vector<ParamCache> paramCache;
+    if( paramCache.size() < ( width + 15 ) / 16 )
+    {
+      paramCache.resize( ( width + 15 ) / 16 );
+    }
+    for( size_t seg = 0; seg < ( width + 15 ) / 16; seg++ )
+    {
+      paramCache[seg].valid = false;
+    }
     for (size_t i = 0; i < height; i += stepY)
     {
       const AlfClassifier *pClass = classifier[blkDst.y + i] + blkDst.x;
       for (size_t j = 0; j < width; j += stepX * 2)
       {
-#if JVET_AB0184_ALF_MORE_FIXED_FILTER_OUTPUT_TAPS
-#if JVET_AD0222_ALF_LONG_FIXFILTER && JVET_AD0222_ADDITONAL_ALF_FIXFILTER
-        __m256i params[2][2][20];
-#elif JVET_AD0222_ALF_LONG_FIXFILTER
-        __m256i params[2][2][17];
-#elif JVET_AD0222_ADDITONAL_ALF_FIXFILTER
-        __m256i params[2][2][19];
-#else
-        __m256i params[2][2][16];
-#endif
-#else
-        __m256i params[2][2][13];
-#endif
+        ParamCache &cache = paramCache[j >> 4];
+        auto       &params = cache.params;
 #if JVET_AK0123_ALF_COEFF_RESTRICTION
-        int32_t scaleFactor[16];
+        auto       &scaleFactor = cache.scaleFactor;
 #endif
+        const __m256i classKey = _mm256_loadu_si256( ( const __m256i * ) ( pClass + j ) );
+        const bool    hit      = cache.valid && _mm256_movemask_epi8( _mm256_cmpeq_epi8( classKey, cache.key ) ) == -1;
+#if ALF_PARAM_CACHE_VERIFY
+        const ParamCache prev = cache;
+        memset( cache.params, 0, sizeof( cache.params ) );
+        if( true )
+#else
+        if( !hit )
+#endif
+        {
+        cache.key   = classKey;
+        cache.valid = true;
         for (int k = 0; k < 2; k++)
         {
 #if JVET_AD0222_ALF_LONG_FIXFILTER || JVET_AD0222_ADDITONAL_ALF_FIXFILTER
@@ -4805,6 +4856,14 @@ static void simdFilter13x13BlkExtDbResiDirect(
 #endif
           }   // for l
         }     // for k
+        }
+#if ALF_PARAM_CACHE_VERIFY
+        CHECK( hit && memcmp( prev.params, cache.params, sizeof( cache.params ) ), "ALF_PARAM_CACHE_VERIFY: cached ALF parameters differ" );
+        alfParamCacheCount( hit );
+#if JVET_AK0123_ALF_COEFF_RESTRICTION
+        CHECK( hit && memcmp( prev.scaleFactor, cache.scaleFactor, sizeof( cache.scaleFactor ) ), "ALF_PARAM_CACHE_VERIFY: cached ALF scale factors differ" );
+#endif
+#endif
 
         const Pel *pImg0, *pImg1, *pImg2, *pImg3, *pImg4, *pImg5, *pImg6, *pImg7, *pImg8;
 #if !JVET_AD0222_ALF_LONG_FIXFILTER
@@ -5842,27 +5901,61 @@ static void simdFilter13x13BlkExtDbResi(
 #if JVET_AI0084_ALF_RESIDUALS_SCALING
     const __m256i curBase  = _mm256_set1_epi16(currBase);
 #endif
+    // perf: the class-dependent coefficient and clipping vectors (params, scaleFactor) of a 16-sample segment depend
+    // only on its 16 class values (class and transpose index) and on the filter set of this call; the classification
+    // is made per 2x2 block, so the second row of each pair finds them here instead of building them again
+    struct ParamCache
+    {
+#if JVET_AB0184_ALF_MORE_FIXED_FILTER_OUTPUT_TAPS
+#if JVET_AD0222_ALF_LONG_FIXFILTER
+#if JVET_AK0091_LAPLACIAN_INFO_IN_ALF
+      __m256i params[2][2][21];
+#else
+      __m256i params[2][2][18];
+#endif
+#else
+      __m256i params[2][2][17];
+#endif
+#else
+      __m256i params[2][2][13];
+#endif
+#if JVET_AK0123_ALF_COEFF_RESTRICTION
+      int32_t scaleFactor[16];
+#endif
+      __m256i key;
+      bool    valid;
+    };
+    static thread_local std::vector<ParamCache> paramCache;
+    if( paramCache.size() < ( width + 15 ) / 16 )
+    {
+      paramCache.resize( ( width + 15 ) / 16 );
+    }
+    for( size_t seg = 0; seg < ( width + 15 ) / 16; seg++ )
+    {
+      paramCache[seg].valid = false;
+    }
     for (size_t i = 0; i < height; i += stepY)
     {
       const AlfClassifier *pClass = classifier[blkDst.y + i] + blkDst.x;
       for (size_t j = 0; j < width; j += stepX * 2)
       {
-#if JVET_AB0184_ALF_MORE_FIXED_FILTER_OUTPUT_TAPS
-#if JVET_AD0222_ALF_LONG_FIXFILTER
-#if JVET_AK0091_LAPLACIAN_INFO_IN_ALF
-        __m256i params[2][2][21];
-#else
-        __m256i params[2][2][18];
-#endif
-#else
-        __m256i params[2][2][17];
-#endif
-#else
-        __m256i params[2][2][13];
-#endif
+        ParamCache &cache = paramCache[j >> 4];
+        auto       &params = cache.params;
 #if JVET_AK0123_ALF_COEFF_RESTRICTION
-        int32_t scaleFactor[16];
+        auto       &scaleFactor = cache.scaleFactor;
 #endif
+        const __m256i classKey = _mm256_loadu_si256( ( const __m256i * ) ( pClass + j ) );
+        const bool    hit      = cache.valid && _mm256_movemask_epi8( _mm256_cmpeq_epi8( classKey, cache.key ) ) == -1;
+#if ALF_PARAM_CACHE_VERIFY
+        const ParamCache prev = cache;
+        memset( cache.params, 0, sizeof( cache.params ) );
+        if( true )
+#else
+        if( !hit )
+#endif
+        {
+        cache.key   = classKey;
+        cache.valid = true;
         for (int k = 0; k < 2; k++)
         {
 #if JVET_AK0091_LAPLACIAN_INFO_IN_ALF
@@ -6094,6 +6187,14 @@ static void simdFilter13x13BlkExtDbResi(
 #endif
           }   // for l
         } // for k
+        }
+#if ALF_PARAM_CACHE_VERIFY
+        CHECK( hit && memcmp( prev.params, cache.params, sizeof( cache.params ) ), "ALF_PARAM_CACHE_VERIFY: cached ALF parameters differ" );
+        alfParamCacheCount( hit );
+#if JVET_AK0123_ALF_COEFF_RESTRICTION
+        CHECK( hit && memcmp( prev.scaleFactor, cache.scaleFactor, sizeof( cache.scaleFactor ) ), "ALF_PARAM_CACHE_VERIFY: cached ALF scale factors differ" );
+#endif
+#endif
 
         const Pel *pImg0, *pImg1, *pImg2, *pImg3, *pImg4, *pImg5, *pImg6, *pImg7, *pImg8;
 #if !JVET_AD0222_ALF_LONG_FIXFILTER
