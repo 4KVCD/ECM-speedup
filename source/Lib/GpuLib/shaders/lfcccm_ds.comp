@@ -1,0 +1,53 @@
+#version 460
+// LF-CCCM: the downsampled luma of LoopFilterCccm::lfCccmFillDownsampledLumaBuffers for the whole picture (chroma size,
+// minus the luma offset), and its margin of one sample with the values at the picture boundary (the CPU's padding)
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+layout( local_size_x = 16, local_size_y = 8 ) in;
+
+layout( push_constant ) uniform Push
+{
+  Plane luma;        // luma before ALF
+  Plane ds;          // out: margin of at least 1
+  int   width;       // chroma
+  int   height;
+  int   lumaOffset;
+  int   filterType;  // 0: lfCccmDownsampleType0 (6 taps), 1: Type1 (2x2 average), 2: Type2 (5 taps)
+} pc;
+
+void main()
+{
+  const int xo = int( gl_GlobalInvocationID.x ) - 1;
+  const int yo = int( gl_GlobalInvocationID.y ) - 1;
+  if( xo > pc.width || yo > pc.height )
+  {
+    return;
+  }
+  const int x = clamp( xo, 0, pc.width - 1 );
+  const int y = clamp( yo, 0, pc.height - 1 );
+  const int offLeft = x > 0 ? -1 : 0;
+  int       v;
+  if( pc.filterType == 1 )
+  {
+    const int s = 2 + ld( pc.luma, 2 * x, 2 * y ) + ld( pc.luma, 2 * x + 1, 2 * y ) + ld( pc.luma, 2 * x, 2 * y + 1 )
+                  + ld( pc.luma, 2 * x + 1, 2 * y + 1 );
+    v = ( s >> 2 ) - pc.lumaOffset;
+  }
+  else if( pc.filterType == 2 )
+  {
+    const int offAbove = y > 0 ? -1 : 0;
+    const int s = 4 + 4 * ld( pc.luma, 2 * x, 2 * y ) + ld( pc.luma, 2 * x + offLeft, 2 * y )
+                  + ld( pc.luma, 2 * x + 1, 2 * y ) + ld( pc.luma, 2 * x, 2 * y + 1 )
+                  + ld( pc.luma, 2 * x, 2 * y + offAbove );
+    v = ( s >> 3 ) - pc.lumaOffset;
+  }
+  else
+  {
+    const int s = 4 + 2 * ld( pc.luma, 2 * x, 2 * y ) + ld( pc.luma, 2 * x + offLeft, 2 * y )
+                  + ld( pc.luma, 2 * x + 1, 2 * y ) + 2 * ld( pc.luma, 2 * x, 2 * y + 1 )
+                  + ld( pc.luma, 2 * x + offLeft, 2 * y + 1 ) + ld( pc.luma, 2 * x + 1, 2 * y + 1 );
+    v = ( s >> 3 ) - pc.lumaOffset;
+  }
+  st( pc.ds, xo, yo, v );
+}

@@ -55,6 +55,8 @@
 #include "alf_fixresi.spv.h"
 #include "alf_gauss.spv.h"
 #include "alf_luma.spv.h"
+#include "lfcccm.spv.h"
+#include "lfcccm_ds.spv.h"
 
 #include <atomic>
 #include <condition_variable>
@@ -133,12 +135,28 @@ static_assert( sizeof( PushChClass ) == 40, "push constants" );
 
 struct PushChroma
 {
-  GpuPlane rec, fix, lumaRec, lumaResi, crossDb, dst;
+  GpuPlane rec, fix, lumaRec, lumaResi, crossDb, dst, lfCccm;
   uint64_t ctuInfo, chromaCoeff, ccalfCoeff;
   int32_t  comp, width, height, ctuSizeLog2, ctusPerRow, withFixed, ccalfPrec, ccalfClip, scaleCorr, outMin, outMax,
     bitDepth;
 };
-static_assert( sizeof( PushChroma ) == 168, "push constants" );
+static_assert( sizeof( PushChroma ) == 184, "push constants" );
+
+struct PushLfDs
+{
+  GpuPlane luma, ds;
+  int32_t  width, height, lumaOffset, filterType;
+};
+static_assert( sizeof( PushLfDs ) == 48, "push constants" );
+
+struct PushLfCccm
+{
+  GpuPlane ds, cb, cr, corrCb, corrCr;
+  uint64_t ctuList;
+  int32_t  numCtus, numWindows, groupsX, ctusPerRow, ctuSize, width, height, impMode, lumaOffset, bitDepth, badThr,
+    badThrReg, minCb, maxCb, minCr, maxCr, lumaOffsetLog2, pad0;
+};
+static_assert( sizeof( PushLfCccm ) == 160, "push constants" );
 
 // coefficient-set layouts, as in alf_luma.comp and alf_chroma.comp
 constexpr int NUM_COEFF       = MAX_NUM_ALF_LUMA_COEFF;
@@ -199,7 +217,7 @@ void fixedFilterQpSets( int qp, int& minSet, int& maxSet )
 struct GpuAlf::Shared
 {
   gpu::Context& ctx;
-  gpu::Kernel   ciClass, fixClass, class12, fix0, fix1, fixResi, gauss, luma, chClass, chroma;
+  gpu::Kernel   ciClass, fixClass, class12, fix0, fix1, fixResi, gauss, luma, chClass, chroma, lfDs, lfCccm;
   // the fixed-filter tables (AlfFixedFilters.h)
   gpu::Buffer   tables;
   VkDeviceSize  classIdn9 = 0, coeff9 = 0, clip9 = 0, classIdn13 = 0, coeff13 = 0, clip13 = 0;
@@ -217,6 +235,8 @@ struct GpuAlf::Shared
     GPU_KERNEL( luma, alf_luma, PushLuma );
     GPU_KERNEL( chClass, alf_chclass, PushChClass );
     GPU_KERNEL( chroma, alf_chroma, PushChroma );
+    GPU_KERNEL( lfDs, lfcccm_ds, PushLfDs );
+    GPU_KERNEL( lfCccm, lfcccm, PushLfCccm );
 #undef GPU_KERNEL
 
     const AdaptiveLoopFilter::FixedFilterTables t = AdaptiveLoopFilter::fixedFilterTables();
@@ -277,15 +297,15 @@ const GpuAlf::Shared& GpuAlf::shared( gpu::Context& ctx )
 }
 
 // pictures compared with the CPU (GpuAlf::VERIFY), reported when the process ends
-static std::atomic<long> s_verifiedPictures( 0 ), s_failedPictures( 0 );
+static std::atomic<long> s_verifiedPictures( 0 ), s_verifiedLfCccm( 0 ), s_failedPictures( 0 );
 static struct VerifyReport
 {
   ~VerifyReport()
   {
     if( s_verifiedPictures )
     {
-      fprintf( stderr, "GPU loop filter verification: %ld pictures, %ld with differences\n", s_verifiedPictures.load(),
-               s_failedPictures.load() );
+      fprintf( stderr, "GPU loop filter verification: %ld pictures (%ld with LF-CCCM), %ld with differences\n",
+               s_verifiedPictures.load(), s_verifiedLfCccm.load(), s_failedPictures.load() );
     }
   }
 } s_verifyReport;
@@ -397,11 +417,13 @@ GpuAlfHook* GpuAlfHook::create( int mode )
 bool GpuAlfHook::process( AdaptiveLoopFilter& alf, CodingStructure& cs )
 {
   GpuAlfPool& pool = GpuAlfPool::get();
-  GpuAlf*     gpu  = pool.acquire( m_ctx, m_mode );
-  bool        done;
+  GpuAlf*       gpu    = pool.acquire( m_ctx, m_mode );
+  GpuLfCccmJob* lfCccm = m_lfCccm;
+  m_lfCccm             = nullptr;
+  bool          done;
   try
   {
-    done = gpu->process( alf, cs );
+    done = gpu->process( alf, cs, lfCccm );
   }
   catch( ... )
   {
@@ -743,6 +765,46 @@ bool GpuAlf::gather( const AdaptiveLoopFilter& alf, const CodingStructure& cs )
   return true;
 }
 
+bool GpuAlf::gatherLfCccm( const CodingStructure& cs )
+{
+  Params& p = m_params;
+  p.lfCccm  = false;
+  p.lfCtus.clear();
+  p.lfWindows = 0;
+  // the kernel implements the decimal and matrix precision of bit depths up to 10 (DECIM_BITS, solve3)
+  const Slice& slice     = *cs.slice;
+  const int    impFactor = slice.getLfCccmImpEnabledFlag() ? slice.getLfCccmImpFactorIdx() : 0;
+  if( cs.sps->getBitDepth( CHANNEL_TYPE_LUMA ) > 10 || cs.sps->getBitDepth( CHANNEL_TYPE_CHROMA ) > 10 || impFactor < 0
+      || impFactor > 3 )
+  {
+    return false;
+  }
+  // LoopFilterCccm::m_lfCccmWindowSizes, in chroma samples
+  static const int winW[8] = { 4, 8, 2, 8, 16, 32, 64, 128 };
+  static const int winH[8] = { 4, 2, 8, 8, 16, 32, 64, 128 };
+  const int        ctuSizeC = m_ctuSize / 2, wC = m_width / 2, hC = m_height / 2;
+  for( int ctu = 0; ctu < m_numCtus; ctu++ )
+  {
+    if( !slice.m_lfCccmEnabled.at( ctu ) )
+    {
+      continue;
+    }
+    const int type = slice.m_lfCccmModelType.at( ctu );
+    const int win  = slice.m_lfCccmWindowSizeIndex.at( ctu );
+    if( type < 0 || type > 7 || win < 0 || win > 7 )
+    {
+      return false;
+    }
+    const int px = ( ctu % m_ctusPerRow ) * ctuSizeC, py = ( ctu / m_ctusPerRow ) * ctuSizeC;
+    const int pw = std::min( ctuSizeC, wC - px ), ph = std::min( ctuSizeC, hC - py );
+    p.lfCtus.insert( p.lfCtus.end(),
+                     { uint32_t( ctu ), uint32_t( type | ( win << 8 ) ), uint32_t( p.lfWindows ), 0u } );
+    p.lfWindows += ( ( pw + winW[win] - 1 ) / winW[win] ) * ( ( ph + winH[win] - 1 ) / winH[win] );
+  }
+  p.lfCccm = true;
+  return true;
+}
+
 void GpuAlf::layout( int width, int height, int ctuSize )
 {
   if( width == m_width && height == m_height && ctuSize == m_ctuSize )
@@ -786,6 +848,7 @@ void GpuAlf::layout( int width, int height, int ctuSize )
   place( m_inChroma, sizeof( int16_t ) * CHROMA_STRIDE * MAX_NUM_ALF_ALTERNATIVES_CHROMA, in );
   place( m_inCcalf[0], sizeof( int16_t ) * CCALF_STRIDE * MAX_NUM_CC_ALF_FILTERS, in );
   place( m_inCcalf[1], sizeof( int16_t ) * CCALF_STRIDE * MAX_NUM_CC_ALF_FILTERS, in );
+  place( m_inLfCtus, sizeof( uint32_t ) * 4 * m_numCtus, in );
   m_inBytes = in;
   m_in.ensure( m_ctx, in, gpu::Buffer::DEVICE );
   m_inUpload.ensure( m_ctx, in, gpu::Buffer::UPLOAD );
@@ -808,6 +871,11 @@ void GpuAlf::layout( int width, int height, int ctuSize )
   {
     place( m_chClass[c], blocksC * 2, work );
     plane( m_chFix[c], wC, hC, 0, work );
+  }
+  plane( m_lfDs, wC, hC, 1, work );
+  for( int c = 0; c < 2; c++ )
+  {
+    plane( m_lfCorr[c], wC, hC, 0, work );
   }
   m_work.ensure( m_ctx, work, gpu::Buffer::DEVICE );
   if( m_mode == VERIFY )
@@ -852,6 +920,7 @@ void GpuAlf::upload( const AdaptiveLoopFilter& alf, const CodingStructure& cs )
   {
     memcpy( base + m_inCcalf[c], p.ccalfCoeff[c].data(), sizeof( int16_t ) * p.ccalfCoeff[c].size() );
   }
+  memcpy( base + m_inLfCtus, p.lfCtus.data(), sizeof( uint32_t ) * p.lfCtus.size() );
 }
 
 void GpuAlf::run( const AdaptiveLoopFilter& alf, const CodingStructure& cs )
@@ -879,6 +948,13 @@ void GpuAlf::run( const AdaptiveLoopFilter& alf, const CodingStructure& cs )
   gpu::Stream& s = *m_stream;
   s.begin();
   s.copy( m_inUpload, 0, m_in, 0, m_inBytes );
+  if( prm.lfCccm )
+  {
+    for( int c = 0; c < 2; c++ )
+    {
+      s.fill( m_work, m_lfCorr[c].offset, m_lfCorr[c].bytes(), 0 );   // no correction outside the windows
+    }
+  }
   s.barrier();
 
   // classes
@@ -928,6 +1004,22 @@ void GpuAlf::run( const AdaptiveLoopFilter& alf, const CodingStructure& cs )
     chClass.hBlk      = m_hBlkC;
     chClass.bitDepth  = bdChroma;
     s.dispatch( m_k.chClass, &chClass, divUp( m_wBlkC, 16 ), divUp( m_hBlkC, 8 ) );
+  }
+
+  // LF-CCCM: the downsampled luma (LoopFilterCccm::lfCccmFillDownsampledLumaBuffers)
+  const SPS& sps = *cs.sps;
+  if( prm.lfCccm )
+  {
+    PushLfDs ds;
+    ds.luma       = gp( m_in, m_inRec[0] );
+    ds.ds         = gp( m_work, m_lfDs );
+    ds.width      = wC;
+    ds.height     = hC;
+    ds.lumaOffset = 1 << ( bitDepth - 1 );
+    ds.filterType = sps.getCclmVerCollocatedChromaFlag() && sps.getCclmHorCollocatedChromaFlag()     ? 2
+                    : !sps.getCclmVerCollocatedChromaFlag() && !sps.getCclmHorCollocatedChromaFlag() ? 1
+                                                                                                       : 0;
+    s.dispatch( m_k.lfDs, &ds, divUp( wC + 2, 16 ), divUp( hC + 2, 8 ) );
   }
   s.barrier();
 
@@ -1024,6 +1116,38 @@ void GpuAlf::run( const AdaptiveLoopFilter& alf, const CodingStructure& cs )
     tables9( chFix, cs.slice->getTileGroupAlfFixedFilterSetIdx( comp ) == 0 ? setMin : setMax );
     s.dispatch( m_k.fix0, &chFix, divUp( wC, 16 ), divUp( hC, 8 ) );
   }
+
+  // LF-CCCM: the corrections of the windows (LoopFilterCccm::lfCccmCtuProcess)
+  if( prm.lfCccm && prm.lfWindows )
+  {
+    const Slice& slice = *cs.slice;
+    PushLfCccm   lf;
+    memset( &lf, 0, sizeof( lf ) );
+    lf.ds             = gp( m_work, m_lfDs );
+    lf.cb             = gp( m_in, m_inRec[1] );
+    lf.cr             = gp( m_in, m_inRec[2] );
+    lf.corrCb         = gp( m_work, m_lfCorr[0] );
+    lf.corrCr         = gp( m_work, m_lfCorr[1] );
+    lf.ctuList        = m_in.addr + m_inLfCtus;
+    lf.numCtus        = int( prm.lfCtus.size() / 4 );
+    lf.numWindows     = prm.lfWindows;
+    lf.groupsX        = std::min( prm.lfWindows, 65535 );
+    lf.ctusPerRow     = m_ctusPerRow;
+    lf.ctuSize        = m_ctuSize / 2;
+    lf.width          = wC;
+    lf.height         = hC;
+    lf.impMode        = slice.getLfCccmImpEnabledFlag() ? 1 + slice.getLfCccmImpFactorIdx() : 0;
+    lf.lumaOffset     = 1 << ( bitDepth - 1 );
+    lf.lumaOffsetLog2 = bitDepth - 1;
+    lf.bitDepth       = bdChroma;
+    lf.badThr         = 32 << std::max( 0, bitDepth - 10 );   // LoopFilterCccm::lfCccmInitBd
+    lf.badThrReg      = 28 << std::max( 0, bitDepth - 10 );
+    lf.minCb          = slice.clpRng( COMPONENT_Cb ).min;
+    lf.maxCb          = slice.clpRng( COMPONENT_Cb ).max;
+    lf.minCr          = slice.clpRng( COMPONENT_Cr ).min;
+    lf.maxCr          = slice.clpRng( COMPONENT_Cr ).max;
+    s.dispatch( m_k.lfCccm, &lf, lf.groupsX, divUp( prm.lfWindows, lf.groupsX ) );
+  }
   s.barrier();
 
   PushFixFilter fix1 = fix;
@@ -1071,6 +1195,8 @@ void GpuAlf::run( const AdaptiveLoopFilter& alf, const CodingStructure& cs )
     ch.lumaResi    = gp( m_in, m_inResi );
     ch.crossDb     = gp( m_in, m_inDb[2 - c] );
     ch.dst         = gp( m_outDev, m_out[1 + c] );
+    // the verification compares the correction separately
+    ch.lfCccm      = prm.lfCccm && m_mode != VERIFY ? gp( m_work, m_lfCorr[c] ) : GpuPlane{ 0, 0, 0 };
     ch.ctuInfo     = m_in.addr + m_inCtuInfo;
     ch.chromaCoeff = m_in.addr + m_inChroma;
     ch.ccalfCoeff  = m_in.addr + m_inCcalf[c];
@@ -1113,7 +1239,7 @@ void GpuAlf::output( CodingStructure& cs ) const
   }
 }
 
-bool GpuAlf::verify( const AdaptiveLoopFilter& alf, const CodingStructure& cs )
+bool GpuAlf::verify( const AdaptiveLoopFilter& alf, const CodingStructure& cs, const GpuLfCccmJob* lfCccm )
 {
   const uint8_t*  dl        = (const uint8_t*) m_workDownload.mapped;
   const uint8_t*  ciClass   = dl + m_ciClass;
@@ -1137,7 +1263,8 @@ bool GpuAlf::verify( const AdaptiveLoopFilter& alf, const CodingStructure& cs )
   } checks[] = { { "coding-info class" },  { "fixed filter 1" },       { "fixed filter 2 class" },
                  { "fixed filter 2" },     { "residual filter" },      { "classifier class" },
                  { "Gauss image" },        { "Laplacian image" },      { "chroma fixed filter" },
-                 { "luma output" },        { "Cb output" },            { "Cr output" } };
+                 { "luma output" },        { "Cb output" },            { "Cr output" },
+                 { "LF-CCCM Cb correction" }, { "LF-CCCM Cr correction" } };
   auto check = [&cs]( Check& c, int x, int y, int cpu, int gpu ) {
     c.compared++;
     if( cpu != gpu && c.differ++ < 3 )
@@ -1235,6 +1362,25 @@ bool GpuAlf::verify( const AdaptiveLoopFilter& alf, const CodingStructure& cs )
     }
   }
 
+  // the LF-CCCM correction the decoder adds after ALFProcess
+  if( lfCccm && m_params.lfCccm )
+  {
+    s_verifiedLfCccm++;
+    for( int c = 0; c < 2; c++ )
+    {
+      const PlaneDesc& p   = m_lfCorr[c];
+      const int16_t*   gpu = plane( p );
+      const CPelBuf    cpu = lfCccm->correction->get( ComponentID( COMPONENT_Cb + c ) );
+      for( int y = 0; y < p.height; y++ )
+      {
+        for( int x = 0; x < p.width; x++ )
+        {
+          check( checks[12 + c], x, y, cpu.at( x, y ), gpu[y * p.stride + x] );
+        }
+      }
+    }
+  }
+
   s_verifiedPictures++;
   bool ok = true;
   for( const Check& c: checks )
@@ -1252,10 +1398,19 @@ bool GpuAlf::verify( const AdaptiveLoopFilter& alf, const CodingStructure& cs )
   return ok;
 }
 
-bool GpuAlf::process( AdaptiveLoopFilter& alf, CodingStructure& cs )
+bool GpuAlf::process( AdaptiveLoopFilter& alf, CodingStructure& cs, GpuLfCccmJob* lfCccm )
 {
+  // the CPU derives the LF-CCCM correction from the picture before ALF, so before it filters
+  auto cpuLfCccm = [lfCccm]() {
+    if( lfCccm )
+    {
+      lfCccm->cpu();
+    }
+  };
+  m_params.lfCccm = false;
   if( !accept( alf, cs ) )
   {
+    cpuLfCccm();
     return false;
   }
   layout( cs.pcv->lumaWidth, cs.pcv->lumaHeight, cs.pcv->maxCUWidth );
@@ -1269,12 +1424,17 @@ bool GpuAlf::process( AdaptiveLoopFilter& alf, CodingStructure& cs )
   if( m_mode == VERIFY )
   {
     // the CPU result is kept; the GPU works on the inputs ALFProcess prepared and is compared with it
+    cpuLfCccm();
     cpuAlf();
     if( gather( alf, cs ) )
     {
+      if( lfCccm )
+      {
+        gatherLfCccm( cs );
+      }
       upload( alf, cs );
       run( alf, cs );
-      verify( alf, cs );
+      verify( alf, cs, lfCccm );
     }
     return true;
   }
@@ -1283,15 +1443,25 @@ bool GpuAlf::process( AdaptiveLoopFilter& alf, CodingStructure& cs )
   if( !gather( alf, cs ) )
   {
     // something the kernels do not implement: ALFProcess does it all (its state work again, which is idempotent)
+    cpuLfCccm();
     cpuAlf();
     return true;
   }
+  if( lfCccm && !gatherLfCccm( cs ) )
+  {
+    cpuLfCccm();
+  }
   const Params& p = m_params;
-  if( p.luma || p.chromaAlf[0] || p.chromaAlf[1] || p.ccalf[0] || p.ccalf[1] || p.scaleCorr[0] || p.scaleCorr[1] )
+  if( p.luma || p.chromaAlf[0] || p.chromaAlf[1] || p.ccalf[0] || p.ccalf[1] || p.scaleCorr[0] || p.scaleCorr[1]
+      || p.lfCccm )
   {
     upload( alf, cs );
     run( alf, cs );
     output( cs );
+  }
+  if( p.lfCccm )
+  {
+    lfCccm->applied = true;
   }
   stateAfter( alf, cs );
   return true;

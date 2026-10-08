@@ -1091,10 +1091,21 @@ void DecLib::xExecuteLoopFilters( LfCtrlState* lf )
   m_cSAO.jointClipSaoBifCcSao( cs );
 #endif
 
+#if ECM_VULKAN
+  // pictures filtered before the device is ready take the CPU path (verification waits for it)
+  if( cs.sps->getALFEnabledFlag() && m_gpuLoopFilter && !m_gpuAlf && !m_gpuUnavailable
+      && ( m_gpuLoopFilter == GpuAlf::VERIFY || GpuAlf::ready() ) )
+  {
+    m_gpuAlf.reset( GpuAlfHook::create( m_gpuLoopFilter ) );
+    m_gpuUnavailable = !m_gpuAlf;
+    m_cALF.setProcessHook( m_gpuAlf.get() );
+  }
+#endif
 #if JVET_AL0153_ALF_CCCM
   PelStorage cccmCorrection;
   m_cLoopFilterCccm.lfCccmSetFrameLevelInheritedParameters(cs);
-  if(cs.slice->getLfCccmEnabledFlag())
+  // the correction of the chroma after ALF, derived from the picture before ALF
+  auto lfCccmCorrection = [&]()
   {
     m_cLoopFilterCccm.lfCccmInitIntraPred(&m_cIntraPred);
     cccmCorrection.create(CHROMA_ONLY_420, Area(0, 0, cs.picture->lwidth(), cs.picture->lheight()));
@@ -1126,6 +1137,23 @@ void DecLib::xExecuteLoopFilters( LfCtrlState* lf )
       cccmCorrectionImpPtr[factorIdx] = nullptr;
     }
 #endif
+  };
+#if ECM_VULKAN
+  GpuLfCccmJob lfCccmGpu;
+#endif
+  if(cs.slice->getLfCccmEnabledFlag())
+  {
+#if ECM_VULKAN
+    // ALF on the GPU derives it from the picture it uploads (or calls lfCccmCorrection before it filters on the CPU)
+    if( m_gpuAlf && cs.sps->getALFEnabledFlag() )
+    {
+      lfCccmGpu.cpu        = lfCccmCorrection;
+      lfCccmGpu.correction = &cccmCorrection;
+      m_gpuAlf->setLfCccm( &lfCccmGpu );
+    }
+    else
+#endif
+    lfCccmCorrection();
   }
 #endif
   if( cs.sps->getALFEnabledFlag() )
@@ -1162,19 +1190,16 @@ void DecLib::xExecuteLoopFilters( LfCtrlState* lf )
       }
     }
 #endif
-#if ECM_VULKAN
-    // pictures filtered before the device is ready take the CPU path (verification waits for it)
-    if( m_gpuLoopFilter && !m_gpuAlf && !m_gpuUnavailable && ( m_gpuLoopFilter == GpuAlf::VERIFY || GpuAlf::ready() ) )
-    {
-      m_gpuAlf.reset( GpuAlfHook::create( m_gpuLoopFilter ) );
-      m_gpuUnavailable = !m_gpuAlf;
-      m_cALF.setProcessHook( m_gpuAlf.get() );
-    }
-#endif
     // ALF decodes the differentially coded coefficients and stores them in the parameters structure.
     // Code could be restructured to do directly after parsing. So far we just pass a fresh non-const
     // copy in case the APS gets used more than once.
     m_cALF.ALFProcess(cs);
+#if ECM_VULKAN
+    if( m_gpuAlf )
+    {
+      m_gpuAlf->setLfCccm( nullptr );
+    }
+#endif
     CHECK( lf && lf->slice != cs.slice, "ALFProcess ended with another slice than the loop filter state was set up for" );
 #if JVET_AM0209_CHROMA_ALF_CCALF_REUSE_CTU
     // CTU control kept for later pictures (decided by the slice ALFProcess ends with)
@@ -1198,7 +1223,11 @@ void DecLib::xExecuteLoopFilters( LfCtrlState* lf )
   }
 
 #if JVET_AL0153_ALF_CCCM
+#if ECM_VULKAN
+  if( cs.slice->getLfCccmEnabledFlag() && !lfCccmGpu.applied )
+#else
   if(cs.slice->getLfCccmEnabledFlag())
+#endif
   {
     cs.getRecoBuf(COMPONENT_Cb).reconstruct(cs.getRecoBuf(COMPONENT_Cb), cccmCorrection.getBuf(COMPONENT_Cb), cs.slice->clpRng(COMPONENT_Cb));
     cs.getRecoBuf(COMPONENT_Cr).reconstruct(cs.getRecoBuf(COMPONENT_Cr), cccmCorrection.getBuf(COMPONENT_Cr), cs.slice->clpRng(COMPONENT_Cr));

@@ -1,0 +1,579 @@
+#version 460
+// LF-CCCM (JVET-AL0153), LoopFilterCccm::lfCccmCtuProcess of the decoder for one window of a CTU per workgroup.
+//
+// The window's samples fall in two classes, downsampled luma below the rounded average of the regression window or
+// not. For each class a model is derived from the class samples of the regression window (the window grown by one
+// sample, inside the CTU) and applied to the class samples of the window. A class whose model fails (too few samples,
+// a coefficient out of range, a sample whose output differs too much from the reconstruction) takes two sub-class
+// models split at the average of the class (when the CTU allows it); a failed (sub-)class keeps the reconstruction.
+// The CPU writes outputs up to the failing sample of a failed model, which the reconstruction then overwrites, so the
+// outcome of every class is that of its last model. The statistics are exact integer sums in any order; the chroma
+// sums of the offsets and the class sums of the sub-class threshold wrap at 16 bits as the CPU's Pel accumulators do.
+//
+// Output: the correction update - reconstruction (the CPU's cccmCorrection after its subtraction), zero where the
+// window keeps the reconstruction. The correction planes are cleared beforehand.
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+layout( local_size_x = 64 ) in;
+
+layout( buffer_reference, std430, buffer_reference_align = 16 ) readonly buffer CtuList { uvec4 v[]; };
+
+layout( push_constant ) uniform Push
+{
+  Plane    ds;          // downsampled luma minus the luma offset (chroma size), margin of 1 with the boundary values
+  Plane    cb;          // chroma before ALF
+  Plane    cr;
+  Plane    corrCb;      // out
+  Plane    corrCr;
+  uint64_t ctuList;     // per CTU with LF-CCCM: CTU address, model type | window size index << 8, first window
+  int      numCtus;
+  int      numWindows;
+  int      groupsX;     // workgroups per row of the dispatch
+  int      ctusPerRow;
+  int      ctuSize;     // chroma
+  int      width;       // chroma
+  int      height;
+  int      impMode;     // 0, or 1 + the factor index
+  int      lumaOffset;
+  int      bitDepth;    // chroma
+  int      badThr;      // m_lfCccmBadPointThreshold[0], without regularization
+  int      badThrReg;   // m_lfCccmBadPointThreshold[2]
+  int      minCb;
+  int      maxCb;
+  int      minCr;
+  int      maxCr;
+  int      lumaOffsetLog2;
+  int      pad0;
+} pc;
+
+// LoopFilterCccm::m_lfCccmModelMap: the features of each model type (C N S W E NW NE SW SE nonlinear bias)
+const int MODEL_SIZE[8] = int[]( 7, 2, 3, 6, 5, 5, 11, 10 );
+const int MODEL_MAP[88] = int[]( 0, 1, 2, 3, 4, 9, 10, 0, 0, 0, 0,
+                                 0, 10, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                                 0, 9, 10, 0, 0, 0, 0, 0, 0, 0, 0,
+                                 0, 1, 2, 3, 4, 10, 0, 0, 0, 0, 0,
+                                 0, 3, 4, 9, 10, 0, 0, 0, 0, 0, 0,
+                                 0, 1, 2, 9, 10, 0, 0, 0, 0, 0, 0,
+                                 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
+                                 0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 0 );
+const ivec2 WINDOW_SIZE[8] = ivec2[]( ivec2( 4, 4 ), ivec2( 8, 2 ), ivec2( 2, 8 ), ivec2( 8, 8 ), ivec2( 16, 16 ),
+                                      ivec2( 32, 32 ), ivec2( 64, 64 ), ivec2( 128, 128 ) );
+// L2_ALF_CCCM_SAMPLE_NUM / L2_ALF_CCCM_REG_PARAM
+const int REG_SAMPLES[5] = int[]( 16, 32, 64, 256, 1024 );
+const int REG_PARAM[6]   = int[]( 192, 160, 128, 96, 64, 32 );
+// xGetDivScaleRoundShift
+const int POW2W[8] = int[]( 214, 153, 113, 86, 67, 53, 43, 35 );
+const int POW2O[8] = int[]( 4822, 5952, 6624, 6792, 6408, 5424, 3792, 1466 );
+const int POW2B[8] = int[]( 12784, 12054, 11670, 11583, 11764, 12195, 12870, 13782 );
+
+const int DECIM_BITS  = 16;   // DECIM_BITS( bit depth <= 10 )
+const int MATRIX_BITS = 28;   // solve3 with interCccmMode
+const int V_STRIDE    = 14;
+
+shared int     sV[64 * V_STRIDE];   // a chunk of sample vectors: features of the model, Cb, Cr
+shared int64_t sAcc[90];            // ATA (upper triangle), ATCb, ATCr, row by row
+shared int64_t sRow[13];
+shared int64_t sMat[11 * 13];
+shared int64_t sParam[22];          // Cb, Cr
+shared int     sRed[64];
+shared int     sFlag;
+
+int tid;
+
+int wrap16( int v )
+{
+  return ( ( v & 0xFFFF ) ^ 0x8000 ) - 0x8000;
+}
+
+// C++ integer division (truncation toward zero), positive divisor
+int divTrunc( int a, int b )
+{
+  const int q = abs( a ) / b;
+  return a < 0 ? -q : q;
+}
+
+int floorLog2U64( int64_t v )   // v > 0
+{
+  const uint hi = uint( uint64_t( v ) >> 32 );
+  return hi != 0u ? 32 + findMSB( hi ) : findMSB( uint( v ) );
+}
+
+int ceilLog2( int n )   // n > 0
+{
+  return n == 1 ? 0 : findMSB( uint( n - 1 ) ) + 1;
+}
+
+int sumAll( int v )
+{
+  sRed[tid] = v;
+  barrier();
+  for( int s = 32; s > 0; s >>= 1 )
+  {
+    if( tid < s )
+    {
+      sRed[tid] += sRed[tid + s];
+    }
+    barrier();
+  }
+  const int r = sRed[0];
+  barrier();
+  return r;
+}
+
+bool inClass( int d, int k, int s, int thr, int thrSR )
+{
+  bool in_ = k == 1 ? d < thr : d >= thr;
+  if( s == 1 )
+  {
+    in_ = in_ && d < thrSR;
+  }
+  else if( s == 2 )
+  {
+    in_ = in_ && d >= thrSR;
+  }
+  return in_;
+}
+
+int feature( int f, int x, int y, int d )
+{
+  switch( f )
+  {
+  case 0: return d;
+  case 1: return ld( pc.ds, x, y - 1 );
+  case 2: return ld( pc.ds, x, y + 1 );
+  case 3: return ld( pc.ds, x - 1, y );
+  case 4: return ld( pc.ds, x + 1, y );
+  case 5: return ld( pc.ds, x - 1, y - 1 );
+  case 6: return ld( pc.ds, x + 1, y - 1 );
+  case 7: return ld( pc.ds, x - 1, y + 1 );
+  case 8: return ld( pc.ds, x + 1, y + 1 );
+  case 9: return wrap16( ( d * d + ( 1 << ( pc.bitDepth - 1 ) ) ) >> pc.bitDepth );   // CccmModel::nonlinear
+  default: return pc.lumaOffset;
+  }
+}
+
+int numEntries( int m )
+{
+  return m * ( m + 2 ) - ( ( m * ( m - 1 ) ) >> 1 );
+}
+
+int entryIndex( int i, int j, int m )   // i <= j
+{
+  return i * ( m + 2 ) - ( ( i * ( i - 1 ) ) >> 1 ) + j - i;
+}
+
+void entryOf( int e, int m, out int i, out int j )
+{
+  i = 0;
+  while( e >= m + 2 - i )
+  {
+    e -= m + 2 - i;
+    i++;
+  }
+  j = i + e;
+}
+
+// lfCccmSumStatisticsDecoder + calcAeipGroupSum: ATA, ATCb, ATCr of the class samples of the regression window
+void accumulate( int type, int m, ivec4 r, int k, int s, int thr, int thrSR )
+{
+  const int E = numEntries( m );
+  int       i0 = 0, j0 = 0, i1 = 0, j1 = 0;
+  if( tid < E )
+  {
+    entryOf( tid, m, i0, j0 );
+  }
+  if( tid + 64 < E )
+  {
+    entryOf( tid + 64, m, i1, j1 );
+  }
+  int64_t   acc0 = 0, acc1 = 0;
+  const int area = r.z * r.w;
+  for( int base = 0; base < area; base += 64 )
+  {
+    const int idx = base + tid;
+    bool      use = false;
+    int       x = 0, y = 0, d = 0;
+    if( idx < area )
+    {
+      x   = r.x + idx % r.z;
+      y   = r.y + idx / r.z;
+      d   = ld( pc.ds, x, y );
+      use = inClass( d, k, s, thr, thrSR );
+    }
+    for( int c = 0; c < m; c++ )
+    {
+      sV[tid * V_STRIDE + c] = use ? feature( MODEL_MAP[type * 11 + c], x, y, d ) : 0;
+    }
+    sV[tid * V_STRIDE + m]     = use ? ld( pc.cb, x, y ) : 0;
+    sV[tid * V_STRIDE + m + 1] = use ? ld( pc.cr, x, y ) : 0;
+    barrier();
+    const int cnt = min( 64, area - base );
+    if( tid < E )
+    {
+      int sum = 0;   // at most 64 products below 2^20
+      for( int q = 0; q < cnt; q++ )
+      {
+        sum += sV[q * V_STRIDE + i0] * sV[q * V_STRIDE + j0];
+      }
+      acc0 += sum;
+    }
+    if( tid + 64 < E )
+    {
+      int sum = 0;
+      for( int q = 0; q < cnt; q++ )
+      {
+        sum += sV[q * V_STRIDE + i1] * sV[q * V_STRIDE + j1];
+      }
+      acc1 += sum;
+    }
+    barrier();
+  }
+  if( tid < E )
+  {
+    sAcc[tid] = acc0;
+  }
+  if( tid + 64 < E )
+  {
+    sAcc[tid + 64] = acc1;
+  }
+  barrier();
+}
+
+// xGetDivScaleRoundShift
+void divScale( int64_t denom, out int scale, out int round, out int shift )
+{
+  shift               = floorLog2U64( denom );
+  round               = int( 1u << ( uint( shift ) & 31u ) ) >> 1;   // int shift of the CPU (count modulo 32)
+  const int normDiff  = int( ( ( ( denom << 14 ) + int64_t( round ) ) >> shift ) & int64_t( 16383 ) );
+  const int diffFull  = normDiff >> 11;
+  const int normDiff2 = normDiff - POW2O[diffFull];
+  scale = ( ( POW2W[diffFull] * ( ( normDiff2 * normDiff2 ) >> 14 ) ) >> 8 ) - ( normDiff2 >> 1 ) + POW2B[diffFull];
+  scale <<= DECIM_BITS - 14;
+}
+
+// CccmCovariance::solve3 (interCccmMode, regularization) with gaussElimination: one row per invocation; false when a
+// coefficient is out of range (CccmModel::valid)
+bool solve( int m, int n, int offCb, int offCr, bool doReg, bool hasNonLinear )
+{
+  const int bd = pc.bitDepth;
+  int64_t   a[13];
+  if( tid < m )
+  {
+    for( int j = 0; j < m + 2; j++ )
+    {
+      a[j] = sAcc[j >= tid ? entryIndex( tid, j, m ) : entryIndex( j, tid, m )];
+    }
+    if( doReg )
+    {
+      int cnt = 0;
+      while( cnt < 5 && n > REG_SAMPLES[cnt] )
+      {
+        cnt++;
+      }
+      if( tid < ( hasNonLinear ? m - 2 : m - 1 ) )
+      {
+        a[tid] += int64_t( REG_PARAM[cnt] * m );
+      }
+    }
+    // remove the chroma offsets from the cross-correlation (ATA[i][m - 1] is not regularized)
+    const int64_t last = sAcc[entryIndex( tid, m - 1, m )];
+    a[m] -= ( last * int64_t( offCb ) ) >> ( bd - 1 );
+    a[m + 1] -= ( last * int64_t( offCr ) ) >> ( bd - 1 );
+    const int shift = MATRIX_BITS - 2 * bd - ceilLog2( n );
+    for( int j = 0; j < m + 2; j++ )
+    {
+      a[j] = shift > 0 ? a[j] << shift : a[j] >> -shift;
+    }
+    a[tid] += int64_t( 1 );   // gaussElimination: reg = 1 with interCccmMode
+  }
+  for( int piv = 0; piv < m; piv++ )
+  {
+    if( tid == piv )
+    {
+      int scale, round, shift;
+      divScale( a[piv] < int64_t( 1 ) ? int64_t( 1 ) : a[piv], scale, round, shift );
+      for( int j = piv + 1; j < m + 2; j++ )
+      {
+        a[j]    = ( a[j] * int64_t( scale ) + int64_t( round ) ) >> shift;
+        sRow[j] = a[j];
+      }
+    }
+    barrier();
+    if( tid > piv && tid < m )
+    {
+      const int64_t f = a[piv];
+      for( int j = piv + 1; j < m + 2; j++ )
+      {
+        a[j] -= ( f * sRow[j] + int64_t( 1 << ( DECIM_BITS - 1 ) ) ) >> DECIM_BITS;
+      }
+    }
+    barrier();
+  }
+  if( tid < m )
+  {
+    for( int j = 0; j < m + 2; j++ )
+    {
+      sMat[tid * 13 + j] = a[j];
+    }
+  }
+  barrier();
+  if( tid == 0 )
+  {
+    bool valid = true;
+    for( int f = 0; f < 2; f++ )
+    {
+      const int col = m + f;
+      int64_t   x[11];
+      for( int i = m - 1; i >= 0; i-- )
+      {
+        int64_t v = sMat[i * 13 + col];
+        for( int j = i + 1; j < m; j++ )
+        {
+          v -= ( sMat[i * 13 + j] * x[j] + int64_t( 1 << ( DECIM_BITS - 1 ) ) ) >> DECIM_BITS;
+        }
+        x[i] = v;
+      }
+      x[m - 1] += int64_t( f == 0 ? offCb : offCr ) << ( DECIM_BITS - ( bd - 1 ) );
+      for( int i = 0; i < m; i++ )
+      {
+        sParam[11 * f + i] = x[i];
+        valid = valid && abs( x[i] ) <= int64_t( 4 << DECIM_BITS );
+      }
+    }
+    sFlag = valid ? 1 : 0;
+  }
+  barrier();
+  const bool valid = sFlag != 0;
+  barrier();
+  return valid;
+}
+
+// applies the model to the class samples of the window (writing their corrections) and returns whether a sample
+// failed (lfCccmFiltersConvolution)
+bool applyModel( int type, int m, ivec4 w, int k, int s, int thr, int thrSR, int badThr )
+{
+  if( tid == 0 )
+  {
+    sFlag = 0;
+  }
+  barrier();
+  bool bad = false;
+  for( int idx = tid; idx < w.z * w.w; idx += 64 )
+  {
+    const int x = w.x + idx % w.z;
+    const int y = w.y + idx / w.z;
+    const int d = ld( pc.ds, x, y );
+    if( !inClass( d, k, s, thr, thrSR ) )
+    {
+      continue;
+    }
+    int64_t sumCb = 0, sumCr = 0;
+    for( int c = 0; c < m; c++ )
+    {
+      const int64_t f = int64_t( feature( MODEL_MAP[type * 11 + c], x, y, d ) );
+      sumCb += sParam[c] * f;
+      sumCr += sParam[11 + c] * f;
+    }
+    const int round = 1 << ( DECIM_BITS - 1 );
+    const int outCb = clamp( wrap16( int( ( ( sumCb + int64_t( round ) ) >> DECIM_BITS ) & int64_t( 0xFFFF ) ) ),
+                             pc.minCb, pc.maxCb );
+    const int outCr = clamp( wrap16( int( ( ( sumCr + int64_t( round ) ) >> DECIM_BITS ) & int64_t( 0xFFFF ) ) ),
+                             pc.minCr, pc.maxCr );
+    const int curCb = ld( pc.cb, x, y );
+    const int curCr = ld( pc.cr, x, y );
+    bad = bad || abs( curCb - outCb ) > badThr || abs( curCr - outCr ) > badThr;
+    int updCb, updCr;
+    switch( pc.impMode )
+    {
+    case 1:
+      updCb = ( curCb + 3 * outCb + 2 ) >> 2;
+      updCr = ( curCr + 3 * outCr + 2 ) >> 2;
+      break;
+    case 2:
+      updCb = ( 3 * curCb + 5 * outCb + 4 ) >> 3;
+      updCr = ( 3 * curCr + 5 * outCr + 4 ) >> 3;
+      break;
+    case 3:
+      updCb = ( 5 * curCb + 3 * outCb + 4 ) >> 3;
+      updCr = ( 5 * curCr + 3 * outCr + 4 ) >> 3;
+      break;
+    case 4:
+      updCb = ( 3 * curCb + outCb + 2 ) >> 2;
+      updCr = ( 3 * curCr + outCr + 2 ) >> 2;
+      break;
+    default:
+      updCb = ( curCb + outCb + 1 ) >> 1;
+      updCr = ( curCr + outCr + 1 ) >> 1;
+      break;
+    }
+    st( pc.corrCb, x, y, updCb - curCb );
+    st( pc.corrCr, x, y, updCr - curCr );
+  }
+  if( bad )
+  {
+    atomicOr( sFlag, 1 );
+  }
+  barrier();
+  const bool anyBad = sFlag != 0;
+  barrier();
+  return anyBad;
+}
+
+// the class samples of the window keep the reconstruction (lfCccmDealWithBadWindow)
+void keep( ivec4 w, int k, int s, int thr, int thrSR )
+{
+  for( int idx = tid; idx < w.z * w.w; idx += 64 )
+  {
+    const int x = w.x + idx % w.z;
+    const int y = w.y + idx / w.z;
+    if( inClass( ld( pc.ds, x, y ), k, s, thr, thrSR ) )
+    {
+      st( pc.corrCb, x, y, 0 );
+      st( pc.corrCr, x, y, 0 );
+    }
+  }
+}
+
+// one model of a class or sub-class: true when it succeeded; lessThan: the class had fewer samples than the model
+// has parameters (no sub-class models then)
+bool runModel( int ctuType, ivec4 w, ivec4 r, int k, int s, int thr, int thrSR, bool doReg, bool hasNonLinear,
+               int badThr, out bool lessThan )
+{
+  int type = ctuType;
+  int m    = MODEL_SIZE[type];
+  accumulate( type, m, r, k, s, thr, thrSR );
+  const int lumaBits = pc.lumaOffsetLog2;
+  int       n        = int( sAcc[entryIndex( m - 1, m - 1, m )] >> ( 2 * lumaBits ) );
+  const int sumCb    = int( sAcc[entryIndex( m - 1, m, m )] >> lumaBits );
+  const int sumCr    = int( sAcc[entryIndex( m - 1, m + 1, m )] >> lumaBits );
+  lessThan           = n < m;
+  if( lessThan )
+  {
+    // lfCccmUpdateStatus: a smaller model for this one
+    if( n >= 7 )
+    {
+      type = 0;
+    }
+    else if( n >= 3 )
+    {
+      type = 2;
+    }
+    else
+    {
+      return false;
+    }
+    m = MODEL_SIZE[type];
+    accumulate( type, m, r, k, s, thr, thrSR );
+  }
+  const int offCb = divTrunc( wrap16( sumCb ) + ( n >> 1 ), n );
+  const int offCr = divTrunc( wrap16( sumCr ) + ( n >> 1 ), n );
+  if( !solve( m, n, offCb, offCr, doReg, hasNonLinear ) )
+  {
+    return false;
+  }
+  return !applyModel( type, m, w, k, s, thr, thrSR, badThr );
+}
+
+void main()
+{
+  tid         = int( gl_LocalInvocationID.x );
+  const int g = int( gl_WorkGroupID.y ) * pc.groupsX + int( gl_WorkGroupID.x );
+  if( g >= pc.numWindows )
+  {
+    return;
+  }
+  // the CTU of the window: the last one whose first window is not after it
+  CtuList list = CtuList( pc.ctuList );
+  int     lo = 0, hi = pc.numCtus - 1;
+  while( lo < hi )
+  {
+    const int mid = ( lo + hi + 1 ) >> 1;
+    if( int( list.v[mid].z ) <= g )
+    {
+      lo = mid;
+    }
+    else
+    {
+      hi = mid - 1;
+    }
+  }
+  const uvec4 info    = list.v[lo];
+  const int   ctu     = int( info.x );
+  const int   ctuType = int( info.y & 255u );
+  const int   winIdx  = int( info.y >> 8 );
+  const int   px      = ( ctu % pc.ctusPerRow ) * pc.ctuSize;
+  const int   py      = ( ctu / pc.ctusPerRow ) * pc.ctuSize;
+  const int   pw      = min( pc.ctuSize, pc.width - px );
+  const int   ph      = min( pc.ctuSize, pc.height - py );
+  const ivec2 wsize   = WINDOW_SIZE[winIdx];
+  const int   nx      = ( pw + wsize.x - 1 ) / wsize.x;
+  const int   local   = g - int( info.z );
+
+  // lfCccmSetWindows: the window and the regression window (one sample more on every side, the left / top one
+  // replaced by one more on the right / bottom at the CTU's left / top boundary, inside the CTU)
+  ivec4 w;
+  w.x = px + ( local % nx ) * wsize.x;
+  w.y = py + ( local / nx ) * wsize.y;
+  w.z = min( wsize.x, px + pw - w.x );
+  w.w = min( wsize.y, py + ph - w.y );
+  ivec4 r;
+  r.x = max( px, w.x - 1 );
+  r.y = max( py, w.y - 1 );
+  r.z = min( w.z + 2, px + pw - r.x );
+  r.w = min( w.w + 2, py + ph - r.y );
+  if( r.z * r.w < MODEL_SIZE[ctuType] )
+  {
+    return;
+  }
+  const bool doReg        = r.z * r.w <= 4096;
+  const int  badThr       = doReg ? pc.badThrReg : pc.badThr;
+  const bool skipSR       = winIdx > 4;
+  const bool hasNonLinear = ctuType != 1 && ctuType != 3 && ctuType != 7;
+
+  // lfCccmSetMultiModelParameters: the rounded average of the regression window
+  int sum = 0;
+  for( int idx = tid; idx < r.z * r.w; idx += 64 )
+  {
+    sum += ld( pc.ds, r.x + idx % r.z, r.y + idx / r.z );
+  }
+  sum            = sumAll( sum );
+  const int area = r.z * r.w;
+  const int thr  = divTrunc( sum + ( area >> 1 ), area );
+
+  for( int k = 1; k <= 2; k++ )
+  {
+    bool lessThan;
+    if( runModel( ctuType, w, r, k, 0, thr, 0, doReg, hasNonLinear, badThr, lessThan ) )
+    {
+      continue;
+    }
+    if( skipSR || lessThan )
+    {
+      keep( w, k, 0, thr, 0 );
+      continue;
+    }
+    // lfCccmSetMultiModelParametersSR: the rounded average of the class in the regression window
+    int classSum = 0, classCnt = 0;
+    for( int idx = tid; idx < area; idx += 64 )
+    {
+      const int d = ld( pc.ds, r.x + idx % r.z, r.y + idx / r.z );
+      if( inClass( d, k, 0, thr, 0 ) )
+      {
+        classSum += d;
+        classCnt++;
+      }
+    }
+    classSum        = sumAll( classSum );
+    classCnt        = sumAll( classCnt );
+    const int thrSR = classCnt == 0 ? 0 : wrap16( divTrunc( wrap16( classSum ) + ( classCnt >> 1 ), classCnt ) );
+    for( int s = 1; s <= 2; s++ )
+    {
+      bool unused;
+      if( !runModel( ctuType, w, r, k, s, thr, thrSR, doReg, hasNonLinear, badThr, unused ) )
+      {
+        keep( w, k, s, thr, thrSR );
+      }
+    }
+  }
+}

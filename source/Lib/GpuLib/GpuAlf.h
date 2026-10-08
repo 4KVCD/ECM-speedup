@@ -41,8 +41,18 @@
 #include "CommonLib/AdaptiveLoopFilter.h"
 #include "VkCompute.h"
 
+#include <functional>
 #include <memory>
 #include <vector>
+
+/// LF-CCCM (JVET-AL0153) of the picture that ALFProcess filters next: the chroma correction that the decoder derives
+/// from the picture before ALF and adds to the picture after ALF
+struct GpuLfCccmJob
+{
+  std::function<void()> cpu;                    ///< derives the correction on the CPU, into `correction`
+  const PelStorage*     correction = nullptr;   ///< Cb, Cr: the correction cpu() derived
+  bool                  applied    = false;     ///< the GPU added the correction to the filtered picture
+};
 
 /// the GPU resources to filter one picture at a time (command stream, buffers); see GpuAlfHook
 class GpuAlf
@@ -64,7 +74,8 @@ public:
   static bool    ready();
 
   ~GpuAlf();
-  bool process( AdaptiveLoopFilter& alf, CodingStructure& cs );
+  /// with `lfCccm`, also the LF-CCCM correction (the GPU adds it, or lfCccm->cpu() derives it before the CPU filters)
+  bool process( AdaptiveLoopFilter& alf, CodingStructure& cs, GpuLfCccmJob* lfCccm );
 
 private:
   friend class GpuAlfHook;
@@ -93,6 +104,10 @@ private:
     bool                  chromaFixed = false;  ///< chroma ALF with the taps on the fixed-filter output
     int                   ccalfPrec[2] = { 0, 0 };
     int                   scaleCorr[2] = { 0, 0 };
+    bool                  lfCccm     = false;   ///< the kernels derive the LF-CCCM correction
+    /// [4] per CTU with LF-CCCM: address, model type | window size index << 8, first window
+    std::vector<uint32_t> lfCtus;
+    int                   lfWindows  = 0;       ///< windows of all these CTUs
   };
 
   struct Shared;   ///< kernels and fixed-filter tables, one set for every GpuAlf of the process
@@ -106,11 +121,13 @@ private:
   void stateAfter( AdaptiveLoopFilter& alf, CodingStructure& cs ) const;
   /// false when the filter state uses what the kernels do not implement
   bool gather( const AdaptiveLoopFilter& alf, const CodingStructure& cs );
+  /// the windows of the CTUs with LF-CCCM; false when the picture uses what the kernels do not implement
+  bool gatherLfCccm( const CodingStructure& cs );
   void layout( int width, int height, int ctuSize );
   void upload( const AdaptiveLoopFilter& alf, const CodingStructure& cs );
   void run( const AdaptiveLoopFilter& alf, const CodingStructure& cs );
   void output( CodingStructure& cs ) const;
-  bool verify( const AdaptiveLoopFilter& alf, const CodingStructure& cs );
+  bool verify( const AdaptiveLoopFilter& alf, const CodingStructure& cs, const GpuLfCccmJob* lfCccm );
 
   gpu::Context&                m_ctx;
   const Shared&                m_k;
@@ -127,12 +144,14 @@ private:
   // inputs and parameters: device buffer and an upload buffer with the same layout
   PlaneDesc                    m_inRec[3], m_inDb[3], m_inResi, m_inCi;
   VkDeviceSize                 m_inCtuInfo = 0, m_inLumaSets = 0, m_inChroma = 0, m_inCcalf[2] = { 0, 0 };
+  VkDeviceSize                 m_inLfCtus = 0;
   VkDeviceSize                 m_inBytes = 0;
   gpu::Buffer                  m_in, m_inUpload;
   // intermediate results: classes per 2x2 block, filter outputs (picture size, mirrored when read)
   VkDeviceSize                 m_ciClass = 0, m_fixClass0 = 0, m_fixClass1 = 0, m_mainClass[3] = { 0, 0, 0 };
   VkDeviceSize                 m_chClass[2] = { 0, 0 };
   PlaneDesc                    m_fix0, m_fix1, m_fixResi, m_gauss, m_lapl, m_chFix[2];
+  PlaneDesc                    m_lfDs, m_lfCorr[2];   ///< LF-CCCM: downsampled luma, Cb and Cr corrections
   gpu::Buffer                  m_work;
   // outputs, read back
   PlaneDesc                    m_out[3];
@@ -148,6 +167,8 @@ public:
   /// nullptr when there is no usable Vulkan device (the reason is reported once); waits for GpuAlf::prefetch()
   static GpuAlfHook* create( int mode );
 
+  /// the LF-CCCM correction of the next picture, nullptr when it has none (process() takes it)
+  void setLfCccm( GpuLfCccmJob* job ) { m_lfCccm = job; }
   bool process( AdaptiveLoopFilter& alf, CodingStructure& cs ) override;
 
 private:
@@ -155,6 +176,7 @@ private:
 
   gpu::Context& m_ctx;
   int           m_mode;
+  GpuLfCccmJob* m_lfCccm = nullptr;
 };
 
 #endif

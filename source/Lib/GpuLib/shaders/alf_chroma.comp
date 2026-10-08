@@ -1,7 +1,7 @@
 #version 460
 // the chroma part of AdaptiveLoopFilter::ALFProcess for one component: per CTU the 9x9 chroma ALF (filterBlk with
 // ALF_FILTER_9 or ALF_FILTER_9_NO_FIX), then the cross-component ALF (filterBlkCcAlf), then over the whole picture
-// the chroma residual scaling (alfAddCorrectChroma)
+// the chroma residual scaling (alfAddCorrectChroma); then the LF-CCCM correction the decoder adds after ALFProcess
 #extension GL_GOOGLE_include_directive : require
 #include "common.glsl"
 #include "alf_common.glsl"
@@ -16,6 +16,7 @@ layout( push_constant ) uniform Push
   Plane    lumaResi;     // luma residual
   Plane    crossDb;      // the other chroma component before deblocking, mirror-padded by at least 1
   Plane    dst;
+  Plane    lfCccm;       // address 0, or the LF-CCCM correction added at the end (lfcccm.comp)
   uint64_t ctuInfo;      // uint32 [4] per CTU: word 1 + component: ALF on | alternative << 4 | CCALF filter << 8
   uint64_t chromaCoeff;  // int16 [8 alternatives][64]: coefficients [26], clipping values [26], scale factor
   uint64_t ccalfCoeff;   // int16 [16 filters][MAX_NUM_CC_ALF_CHROMA_COEFF] of this component
@@ -102,6 +103,10 @@ void main()
   {
     const int corr = res - curr;
     res = clamp( curr + ( ( corr * pc.scaleCorr + ( corr > 0 ? 3 : 4 ) ) >> 3 ), pc.outMin, pc.outMax );
+  }
+  if( pc.lfCccm.addr != 0ul )
+  {
+    res = clamp( res + ld( pc.lfCccm, x, y ), pc.outMin, pc.outMax );
   }
   st( pc.dst, x, y, res );
 }

@@ -136,10 +136,29 @@ streams 1.04x. With 8 frame threads 0.94-1.03x: every worker context allocates i
 G2: the decoder contexts share a pool of at most two GPU filter instances (stream and buffers; a picture holds one
 for a few ms), the first one allocated for the stream's picture size by the background thread; the device, kernels
 and pool live until the process ends (destroying the device at exit took ~45 ms). Device memory at 720p: ~26 MB per
-instance, so 52 MB instead of 26 MB per decoder context (210 MB with 8 frame threads). Single thread: 720p AI
-1.11x / 1.09x, RA ParkJoy 1.06x, ra720 (3 pictures) 1.01x, ai720 (1 picture) 0.98x, all 19 streams 1.05x; 8 frame
-threads 1.00x / 1.01x / 1.04x, 0.97x / 0.96x on the 3- and 1-picture streams: on these short streams creating the
-device (~0.3 s of a core) costs about what the GPU saves (~40 ms of CPU per 720p picture).
+instance, so at most 52 MB for all decoder contexts instead of 26 MB per context (210 MB with 8 frame threads).
+Single thread: 720p AI 1.11x / 1.09x, RA ParkJoy 1.06x, ra720 (3 pictures) 1.01x, ai720 (1 picture) 0.98x, all 19
+streams 1.05x; 8 frame threads 1.00x / 1.01x / 1.04x, 0.97x / 0.96x on the 3- and 1-picture streams: on these short
+streams creating the device (~0.3 s of a core) costs about what the GPU saves (~40 ms of CPU per 720p picture).
+
+G3: LF-CCCM (JVET-AL0153: per window of a CTU a least-squares cross-component model of the chroma, derived from the
+picture before ALF and added to the chroma after ALF) on the GPU, from the picture the ALF kernels upload. One kernel
+derives the downsampled luma of the whole picture (the CPU's per-CTU buffer depends only on the position; its padding
+is the boundary value); one workgroup per window computes the statistics (exact integer sums, so in any order), runs
+the Gaussian elimination with the CPU's division-free fixed-point arithmetic (one row per invocation), applies the
+model and takes the CPU's fallbacks for failed models; the ALF chroma kernel adds the correction. The CPU writes the
+outputs of a failed model up to its failing sample and then overwrites them with the reconstruction, so only the final
+outcome of each class matters. Reproduced: the 16-bit wrap of the CPU's Pel accumulators (chroma-offset sums,
+sub-class threshold sums), the regression window that extends one sample further right / down at the CTU's left / top
+boundary, the regularization with the CTU's nonlinear-term flag when a smaller model replaces the CTU's. Pictures
+whose ALF takes the CPU path derive the correction on the CPU (the hook calls the CPU code before ALF).
+
+Verification: 779 pictures, 171 with LF-CCCM (CIF to 720p, odd sizes), no difference; output identical on all 19
+streams, also with 8 frame threads; the CPU-only build too. 720p RA ParkJoy (LF-CCCM on 16 of 17 pictures, 14144
+windows of 4x4 each): ~17.4 ms per picture on the CPU, 0.7 ms on the GPU at full clock (up to ~3.8 ms when the GPU
+has lowered its clock between pictures); +1.4 MB device memory per instance. Single thread vs the CPU-only build: RA
+ParkJoy 1.13x (G2: 1.06x), AI streams unchanged (no LF-CCCM), all 19 streams 1.06x; 8 frame threads: RA ParkJoy
+1.09x (1.04x), the six larger streams 1.05x.
 
 ## Fixes found on the way
 
