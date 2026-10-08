@@ -5582,8 +5582,29 @@ template <int N> int convolve(Pel* const p, const TFilterCoeff* const f)
   return res;
 }
 
+#if defined( __SSE4_1__ )
+// perf: convolve<N>( p + k, f ) for k = 0..7 in 32-bit lanes (lo: k = 0..3, hi: k = 4..7). _mm_madd_epi16 multiplies
+// the same 16-bit samples and coefficients and adds two products in 32 bits, as convolve<N> does in int; integer sums
+// do not depend on the order. Reads p[0 .. N + 6], the samples convolve<N>( p + 7, f ) reads last.
+template <int N>
+static inline void angConvolve8( const Pel* const p, const TFilterCoeff* const f, __m128i& lo, __m128i& hi )
+{
+  lo = _mm_setzero_si128();
+  hi = _mm_setzero_si128();
+  for( int i = 0; i < N; i += 2 )
+  {
+    const __m128i r0 = _mm_loadu_si128( ( const __m128i* ) ( p + i ) );
+    const __m128i r1 = _mm_loadu_si128( ( const __m128i* ) ( p + i + 1 ) );
+    const __m128i c  = _mm_set1_epi32( ( int ) ( uint16_t ) f[i] | ( ( int ) ( uint16_t ) f[i + 1] << 16 ) );
+    lo               = _mm_add_epi32( lo, _mm_madd_epi16( _mm_unpacklo_epi16( r0, r1 ), c ) );
+    hi               = _mm_add_epi32( hi, _mm_madd_epi16( _mm_unpackhi_epi16( r0, r1 ), c ) );
+  }
+}
+#endif
+
 // perf: one row of the long-tap angular interpolation of xPredIntraAng() with the tap count known at compile time,
-// so that convolve<N> is inlined instead of a call with a switch per sample; the arithmetic is unchanged
+// so that convolve<N> is inlined instead of a call with a switch per sample; the arithmetic is unchanged. With SSE4.1
+// 8 samples at a time (angConvolve8), the remainder of the row as before.
 template <int N>
 static void angLongTapRow( Pel* const pDsty, const int width, const int weightMode, Pel* const refMain, const int deltaInt,
                            const TFilterCoeff* const f, Pel* const refMain2nd, const int deltaInt2nd,
@@ -5593,9 +5614,51 @@ static void angLongTapRow( Pel* const pDsty, const int width, const int weightMo
   constexpr int bitShift             = 8;
   constexpr int numExtraSamplesForIf = N / 2 - 2;
 
+  int xStart = 0;
+#if defined( __SSE4_1__ )
+  {
+    const __m128i vMin = _mm_set1_epi32( clpRng.min );
+    const __m128i vMax = _mm_set1_epi32( clpRng.max );
+    for( ; xStart + 8 <= width; xStart += 8 )
+    {
+      __m128i lo, hi;
+      if( weightMode == 0 || weightMode == 4 )
+      {
+        const Pel* const          p  = weightMode == 0 ? refMain2nd + deltaInt2nd : refMain + deltaInt;
+        const TFilterCoeff* const fc = weightMode == 0 ? fRL : f;
+        angConvolve8<N>( p + xStart - numExtraSamplesForIf, fc, lo, hi );
+        const __m128i rnd = _mm_set1_epi32( normNum );
+        lo                = _mm_srai_epi32( _mm_add_epi32( lo, rnd ), bitShift );
+        hi                = _mm_srai_epi32( _mm_add_epi32( hi, rnd ), bitShift );
+      }
+      else
+      {
+        __m128i lo2, hi2;
+        angConvolve8<N>( refMain + deltaInt + xStart - numExtraSamplesForIf, f, lo, hi );
+        angConvolve8<N>( refMain2nd + deltaInt2nd + xStart - numExtraSamplesForIf, fRL, lo2, hi2 );
+        const __m128i w0  = _mm_set1_epi32( weightMode );
+        const __m128i w1  = _mm_set1_epi32( 4 - weightMode );
+        const __m128i rnd = _mm_set1_epi32( normNum * 4 );
+        lo = _mm_srai_epi32( _mm_add_epi32( _mm_add_epi32( _mm_mullo_epi32( w0, lo ), _mm_mullo_epi32( w1, lo2 ) ), rnd ), bitShift + 2 );
+        hi = _mm_srai_epi32( _mm_add_epi32( _mm_add_epi32( _mm_mullo_epi32( w0, hi ), _mm_mullo_epi32( w1, hi2 ) ), rnd ), bitShift + 2 );
+      }
+      // ClipPel, then the 16-bit sample (exact: the clipped values fit)
+      lo = _mm_min_epi32( _mm_max_epi32( lo, vMin ), vMax );
+      hi = _mm_min_epi32( _mm_max_epi32( hi, vMin ), vMax );
+      _mm_storeu_si128( ( __m128i* ) ( pDsty + xStart ), _mm_packs_epi32( lo, hi ) );
+    }
+  }
+#endif
+#ifdef ANGLT_CHECK
+  Pel simd[MAX_CU_SIZE];
+  std::copy( pDsty, pDsty + xStart, simd );
+  const int xSimd = xStart;
+  xStart          = 0;
+#endif
+
   if( weightMode == 0 )
   {
-    for( int x = 0; x < width; x++ )
+    for( int x = xStart; x < width; x++ )
     {
       const int val32 = ( convolve<N>( refMain2nd + deltaInt2nd + x - numExtraSamplesForIf, fRL ) + normNum ) >> bitShift;
       const Pel val   = (Pel) ClipPel( val32, clpRng );
@@ -5604,7 +5667,7 @@ static void angLongTapRow( Pel* const pDsty, const int width, const int weightMo
   }
   else if( weightMode == 4 )
   {
-    for( int x = 0; x < width; x++ )
+    for( int x = xStart; x < width; x++ )
     {
       const int val32 = ( convolve<N>( refMain + deltaInt + x - numExtraSamplesForIf, f ) + normNum ) >> bitShift;
       const Pel val   = (Pel) ClipPel( val32, clpRng );
@@ -5615,7 +5678,7 @@ static void angLongTapRow( Pel* const pDsty, const int width, const int weightMo
   {
     const int w0 = weightMode;
     const int w1 = 4 - weightMode;
-    for( int x = 0; x < width; x++ )
+    for( int x = xStart; x < width; x++ )
     {
       const int val32 = ( w0 * convolve<N>( refMain + deltaInt + x - numExtraSamplesForIf, f )
                           + w1 * convolve<N>( refMain2nd + deltaInt2nd + x - numExtraSamplesForIf, fRL ) + normNum * 4 )
@@ -5624,6 +5687,12 @@ static void angLongTapRow( Pel* const pDsty, const int width, const int weightMo
       pDsty[x]        = ClipPel( val, clpRng );
     }
   }
+#ifdef ANGLT_CHECK
+  for( int x = 0; x < xSimd; x++ )
+  {
+    CHECK( simd[x] != pDsty[x], "long-tap angular row differs" );
+  }
+#endif
 }
 int convolve(const int N,  Pel * const p, const TFilterCoeff * const f)
 {
