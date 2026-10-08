@@ -60,6 +60,46 @@ pictures it needs as references; clocks are lower with all cores busy. Longer an
 LD streams (one intra picture) and streams with a single random-access point cannot be split; they are decoded
 sequentially.
 
+D2: frame-level threading (`--FrameThreads=N`): the main thread parses the high-level syntax, manages the picture
+buffers and the output, and hands each picture (once its slices are parsed) to one of N worker contexts (each a
+DecLib with its own prediction, transform, CABAC and loop-filter objects). A worker waits for the reference pictures
+it uses and for the decode-order state it reads (temporal CABAC contexts, AMVP-SbTMVP area, CCSAO / chroma ALF /
+CCALF CTU control, ALF residual scales: explicit slots, commit e44a65e1), then decodes the CTUs, runs the loop
+filters and pads the picture. Pictures with more than one slice and tools that change other pictures while a picture
+is decoded (long-term references, subpictures, GDR, NN loop filter, multi-layer) are decoded by the main thread as
+before. The POC lines and the output keep the sequential order. Output identical on all 19 streams sequentially,
+with one picture at a time on 8 contexts (`--FrameThreadsSerial=1`) and with 2, 4, 8 and 16 threads (3 repetitions
+each, the 4 random-access streams with the most overlap 20 more times).
+
+The first parallel runs differed on a few RA streams in about half of the runs: RdCost::xGetMRHADs (mean-removed
+Hadamard, used by the DMVR bilateral search) works on a copy of the block in the global `orgCopy`, which two threads
+overwrote (ECM marks it threadprivate for OpenMP builds only); now thread_local, with the other statics and
+lazily created tables (commit 14f272bb). Found by locating the first diverging prediction unit (per-PU motion and
+per-CU reconstruction dumps of parallel vs sequential decodes) and then the first diverging bilateral-search cost.
+
+Single thread, LTO builds, 5 paired repetitions: the thread-safety changes 0.99x (per stream 0.95-1.07x, noise),
+the threaded decoder run sequentially 0.99x wall, 1.00x CPU.
+
+Wall time, one decode at a time on the idle machine, best of 3 (LTO, no PGO):
+
+| stream | sequential | 2 threads | 4 threads | 8 threads | 16 threads |
+|---|---|---|---|---|---|
+| 720p AI FourPeople, 8 frames | 2.78 s | 1.57 s (1.77x) | 1.06 s (2.62x) | 0.93 s (2.99x) | 1.07 s (2.60x) |
+| 720p AI ParkJoy, 8 frames | 3.59 s | 2.08 s (1.73x) | 1.37 s (2.62x) | 1.19 s (3.02x) | 1.32 s (2.72x) |
+| 720p RA ParkJoy, 17 frames | 4.70 s | 4.05 s (1.16x) | 3.61 s (1.30x) | 3.49 s (1.35x) | 3.75 s (1.25x) |
+| CIF RA, 33 frames | 1.25 s | 1.06 s (1.18x) | 0.98 s (1.28x) | 0.96 s (1.30x) | 1.15 s (1.09x) |
+| 128x128 RA, 257 frames, intra period 32 | 1.59 s | 1.36 s (1.17x) | 1.13 s (1.41x) | 1.00 s (1.59x) | 1.06 s (1.50x) |
+| 128x128 RA, 257 frames, intra period 64 | 1.22 s | 1.03 s (1.18x) | 0.89 s (1.37x) | 0.85 s (1.44x) | 0.97 s (1.26x) |
+| CIF LD, 33 frames | 0.98 s | 1.00 s (0.98x) | 1.07 s (0.92x) | 1.19 s (0.82x) | 1.43 s (0.69x) |
+| 1-frame streams (AI 128x128 - 352x288) | 0.12-0.13 s | +0.04 s | +0.08 s | +0.15 s | +0.30 s |
+| all 19 streams | 19.30 s | 15.69 s (1.23x) | 14.11 s (1.37x) | 14.60 s (1.32x) | 17.82 s (1.08x) |
+
+Limits of this first version: every worker context is created at start-up (~20 ms each, which dominates short
+streams), a worker takes the oldest queued picture and waits for its references, and a picture waits for its
+reference pictures to be completely decoded and filtered, so RA gains are bounded by the dependency chains and LD
+(each picture references the previous one) only pays the overhead. CPU time with 8 threads is 1.40x the sequential
+one (start-up, lower clocks with all cores busy).
+
 ## Fixes found on the way
 
 - Decoding that starts at a CRA in the middle of an RA stream (`-s`, random access) crashed the stock decoder:
@@ -97,6 +137,17 @@ sequentially.
   loads and pmaddwd, ~2 shuffles instead of ~15 per 8 outputs), verified equal on every call: 1.00-1.01x (6 paired
   repetitions on the RA/LD streams), although the replaced kernel had 2.4 % of the 720p RA profile; the filters seem
   to wait on the reference samples rather than on the shuffle port.
+- Tried and dropped: a per-CU cache of the merge-candidate template predictions (getBlkAMLRefTemplate, keyed by
+  reference picture, MV, size, bi and filter-selecting flags; LIC/GPM/IBC/OBMC cases excluded), verified equal on
+  every hit: 19-25 % hits but 0.97-0.99x, because one template prediction costs only ~600 cycles and the lookup and
+  copies cost about as much as the hits save.
+- Tried and dropped: IntraTMP search with the first template row's SAD checked before the cost call (exact: that row is
+  a lower bound of the cost): 1.00x - the search loop's own time was only ~1.9 % of 720p AI decoding (6 % was its
+  inclusive time).
+- Tried and dropped (measured with time-stamp counters around the sections, ra720_pj17): the CCCM loop filter's sample
+  collection without branches (lfCccmSumStatisticsDecoder, 230 -> 152 M ticks) and its regression sums four at a time
+  (171 -> 193 M ticks, slower); net 0.4 % of the decoding time, below what paired wall-clock runs resolve. The whole
+  lfCccmFiltersConvolution is ~740 M ticks (~5 % of the decode).
 - Interpolation work repeated within a CU (same reference samples, filter and size; CIF RA): 20 % of the horizontal
   first-pass and 11 % of the vertical filter work, so a cache could save at most ~3-4 % of the decoding time. The
   filters are called ~6 M times per 33-frame CIF RA decode, mostly for 1-4 sample wide templates, 4x4 luma and 2x2

@@ -65,7 +65,13 @@
 #if JVET_AL0153_ALF_CCCM
 #include "CommonLib/LoopFilterCccm.h"
 #endif
+#include <deque>
+#include <memory>
+#include <unordered_map>
+
 class InputNALUnit;
+struct DecPicJob;
+class  DecFrameThreads;
 
 //! \ingroup DecoderLib
 //! \{
@@ -240,20 +246,21 @@ private:
   FrameCtrlInfo           m_ctrlInfo[ALF_CTB_MAX_NUM_APS];   ///< reused ALF / CCALF CTU control of the picture being filtered
 #endif
 
-  /// chroma ALF and CCALF CTU control a picture reuses and stores (g_pictureControlInfo)
-  struct LfCtrlState
-  {
-#if JVET_AM0209_CHROMA_ALF_CCALF_REUSE_CTU
-    int                          alfReadAps   [MAX_NUM_COMPONENT] = { -1, -1, -1 };
-    int                          ccAlfReadAps [MAX_NUM_COMPONENT] = { -1, -1, -1 };
-    std::shared_ptr<DecCtrlSlot> alfRead      [MAX_NUM_COMPONENT];
-    std::shared_ptr<DecCtrlSlot> ccAlfRead    [MAX_NUM_COMPONENT];
-    int                          alfStoreAps  [MAX_NUM_COMPONENT] = { -1, -1, -1 };
-    int                          ccAlfStoreAps[MAX_NUM_COMPONENT] = { -1, -1, -1 };
-    std::shared_ptr<DecCtrlSlot> alfStore     [MAX_NUM_COMPONENT];
-    std::shared_ptr<DecCtrlSlot> ccAlfStore   [MAX_NUM_COMPONENT];
-#endif
-  };
+  // frame-level threading (DecFrameThreads.cpp): pictures are decoded by worker contexts (other DecLib objects)
+  friend class DecFrameThreads;
+  std::unique_ptr<DecFrameThreads>                               m_frameThreads;
+  // generation of each SPS ID (counts the SPSs that replaced a different one), and per PPS ID the SPS generation its
+  // PreCalcValues were made from (decoding in threads keeps them while it does not change)
+  std::unordered_map<int, uint32_t>                              m_spsGeneration;
+  std::unordered_map<int, uint32_t>                              m_pcvSpsGeneration;
+  std::shared_ptr<DecPicJob>                                     m_pendingJob;          ///< picture being parsed
+  bool                                                           m_syncPicture = false; ///< decoded by this context, in step with the parsing
+  std::deque<std::shared_ptr<DecPicJob>>                         m_jobs;                ///< dispatched and not yet reported, in decoding order
+  std::unordered_map<const Picture*, std::shared_ptr<DecPicJob>> m_jobOfPic;            ///< latest job of a picture buffer
+  std::unordered_map<const Picture*, int>                        m_picUse;              ///< jobs / pending output using a picture buffer
+  std::vector<Picture*>                                          m_retiredPics;         ///< out of the picture list, deleted when unused
+
+  typedef DecLfCtrlState LfCtrlState;
 
 public:
   int                     m_targetSubPicIdx;
@@ -307,6 +314,20 @@ public:
 #if JVET_Z0118_GDR
   bool  getGDRRecoveryPocReached()          { return ( m_pcPic->getPOC() >= m_prevGDRInSameLayerRecoveryPOC[m_pcPic->layerId] ); }
 #endif
+
+  // frame-level threading
+  void  setFrameThreads         ( int numThreads, bool serial );   ///< numThreads > 1: decode pictures in parallel threads
+  bool  isFrameThreaded         () const { return m_frameThreads != nullptr; }
+  /// the end of a picture when decoding in threads: what executeLoopFilters, adaptiveClipToRealRange and
+  /// finishPicture do, the decoding itself in a worker context
+  void  dispatchPicture         ( int& poc, PicList*& rpcListPic, bool associatedWithNewClvs );
+  void  processFinishedPictures ( bool waitAll );           ///< reports (POC lines) of decoded pictures, decoding order
+  bool  isPictureDecoded        ( const Picture* pic );
+  void  waitPictureDecoded      ( const Picture* pic );
+  void  holdPicture             ( const Picture* pic )   { m_picUse[pic]++; }   ///< e.g. output pending
+  void  releasePicture          ( const Picture* pic );
+  void  retirePicture           ( Picture* pic );           ///< taken out of the picture list; deleted when unused
+  void  drainFrameThreads       ();                         ///< waits for every dispatched picture
 
   bool  getNoOutputPriorPicsFlag () const   { return m_isNoOutputPriorPics; }
   void  setNoOutputPriorPicsFlag (bool val) { m_isNoOutputPriorPics = val; }
@@ -385,6 +406,8 @@ protected:
   // decoding of a slice / picture, split in the decode-order bookkeeping of the main thread and the work of the
   // decoding context (which may be another DecLib, see DecPicState.h)
   void      xSetupSliceState    ( Slice* slice, DecSliceState& state );   ///< main thread, decoding order
+  void      xInitPictureTools   ( const SPS* sps, const PPS* pps );       ///< tools of this context for a picture
+  void      xBindSliceToTools   ( Slice* slice );                         ///< CTU control buffers of this context
   void      xSetupSliceTools    ( Slice* slice );                         ///< scaling list and LMCS of the slice
   void      xDecodeSliceData    ( Slice* slice, InputBitstream* bitstream, DecSliceState& state );
   void      xExecuteLoopFilters ( LfCtrlState* lf );                      ///< lf: null -> set up from m_orderState here
@@ -392,6 +415,17 @@ protected:
   void      xSetupLfStores      ( const Slice* slice, LfCtrlState& lf );  ///< main thread, decoding order
   void      xLoadLfCtrl         ( const LfCtrlState& lf );
   void      xStoreLfCtrl        ( const LfCtrlState& lf );
+  void      xSetupAlfScale      ( Slice* slice, LfCtrlState& lf );      ///< main thread, decoding order
+  // frame-level threading (DecFrameThreads.cpp)
+  bool      xPictureNeedsDrain  ( const SPS* sps, const PPS* pps ) const;   ///< tools not decoded in threads
+  void      xMakeSyncPicture    ();                                       ///< decode the pending slices now
+  void      xWaitRefPictures    ( const Slice* slice );
+  void      xRunPicJob          ( DecPicJob& job );                       ///< worker context
+  void      xClipToRealRange    ();                                       ///< samples of adaptiveClipToRealRange
+  void      xFinishPictureData  ();                                       ///< picture data part of finishPicture
+  void      xReportPicture      ( DecPicJob& job );                       ///< POC line of finishPicture
+  void      xSnapshotParameters ( DecPicJob& job );
+  void      xFreeRetired        ();
   void      xDecodeVPS( InputNALUnit& nalu );
   void      xDecodeDCI( InputNALUnit& nalu );
   void      xDecodeSPS( InputNALUnit& nalu );

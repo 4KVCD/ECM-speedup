@@ -138,6 +138,19 @@ public:
     }
   }
 
+  /// storePS would replace (delete) the parameter set stored with this id
+  bool wouldReplace( int psId, const std::vector<uint8_t>& naluData ) const
+  {
+    const auto it = m_paramsetMap.find( psId );
+    if( it == m_paramsetMap.end() )
+    {
+      return false;
+    }
+    bool changed = it->second.bChanged;
+    calculateParameterSetChangedFlag( changed, it->second.pNaluData, &naluData );
+    return changed;
+  }
+
   void checkAuApsContent( APS *aps, std::vector<int>& accessUnitApsNals )
   {
     int apsId = ( aps->getAPSId() << NUM_APS_TYPE_LEN ) + aps->getAPSType();
@@ -241,6 +254,10 @@ public:
   // store video parameter set and take ownership of it
   // warning: vps object cannot be used after storing (repeated parameter sets are directly deleted)
   void           storeVPS(VPS *vps, const std::vector<uint8_t> &naluData)    { m_vpsMap.storePS(vps->getVPSId(), vps, &naluData); }
+  // storing would replace an existing parameter set with this id
+  bool           wouldReplaceVPS( int vpsId, const std::vector<uint8_t>& naluData ) const { return m_vpsMap.wouldReplace( vpsId, naluData ); }
+  bool           wouldReplaceSPS( int spsId, const std::vector<uint8_t>& naluData ) const { return m_spsMap.wouldReplace( spsId, naluData ); }
+  bool           wouldReplacePPS( int ppsId, const std::vector<uint8_t>& naluData ) const { return m_ppsMap.wouldReplace( ppsId, naluData ); }
   VPS*           getVPS( int vpsId )                                         { return m_vpsMap.getPS( vpsId ); };
 
   // store sequence parameter set and take ownership of it

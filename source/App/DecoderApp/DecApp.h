@@ -77,6 +77,15 @@ private:
   int             m_segmentDecodedPics = 0;
   bool            m_segmentPicWritten  = false;
 
+  // decoding in threads: pictures to write, in output order, once they are decoded
+  struct OutputEntry
+  {
+    Picture* pic;
+    Picture* bottom;          ///< field pair
+    bool     referenceOnly;   ///< segment-parallel child
+  };
+  std::deque<OutputEntry> m_outputQueue;
+
 private:
   bool  xIsNaluWithinTargetDecLayerIdSet( const InputNALUnit* nalu ) const; ///< check whether given Nalu is within targetDecLayerIdSet
   bool  xIsNaluWithinTargetOutputLayerIdSet( const InputNALUnit* nalu ) const; ///< check whether given Nalu is within targetOutputLayerIdSet
@@ -97,6 +106,10 @@ private:
 
   void  writeLineToOutputLog(Picture * pcPic);
   bool  xSkipSegmentOverlapOutput( const Picture* pcPic );   ///< segment-parallel child: true for reference-only pictures
+  void  xOutputPicture      ( Picture* pcPic, Picture* pcPicBottom, bool referenceOnly );   ///< now, or queued when decoding in threads
+  void  xWritePicture       ( Picture* pcPic, Picture* pcPicBottom, bool referenceOnly );
+  void  xProcessOutputQueue ( bool wait );
+  void  xDeletePicture      ( Picture* pcPic );
 
 };
 

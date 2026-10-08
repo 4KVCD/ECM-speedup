@@ -147,6 +147,8 @@ bool DecAppCfg::parseCfg( int argc, char* argv[] )
 #endif
   ("ParallelSegments",         m_parallelSegments,                          0,     "Decode in this many concurrent child processes, the stream split at CRA pictures (0, 1: off). The output is that of a sequential decode; streams that cannot be split are decoded sequentially")
   ("SegmentOverlapPictures",   m_segmentOverlapPictures,                   -1,     "Internal, for segment-parallel child processes: the first N decoded pictures are references only and not written (-1: not a child)\n")
+  ("FrameThreads",             m_frameThreads,                              0,     "Decode pictures in this many threads, as far as reference pictures allow (0, 1: off). The output is that of a sequential decode")
+  ("FrameThreadsSerial",       m_frameThreadsSerial,                    false,     "Test: decode one picture at a time on the frame threads\n")
   ;
 
   po::setDefaults(opts);
@@ -279,6 +281,32 @@ bool DecAppCfg::segmentParallelBlocked( std::string& reason ) const
            : m_activateDump                                    ? "ActivateCABACDumping"
 #endif
                                                                : "";
+  if( !reason.empty() )
+  {
+    reason = "not used with " + reason;
+  }
+  return !reason.empty();
+}
+
+bool DecAppCfg::frameThreadsBlocked( std::string& reason ) const
+{
+  // options that write out data from inside the decoding of a picture, in decoding order
+  reason.clear();
+#if ENABLE_TRACING
+  reason = "tracing";
+#endif
+#if DUMP_BEFORE_INLOOP
+  if( reason.empty() && m_dumpBeforeInloop )
+  {
+    reason = "DumpBeforeInloop";
+  }
+#endif
+#if JVET_AG0196_CABAC_RETRAIN
+  if( reason.empty() && m_activateDump )
+  {
+    reason = "ActivateCABACDumping";
+  }
+#endif
   if( !reason.empty() )
   {
     reason = "not used with " + reason;

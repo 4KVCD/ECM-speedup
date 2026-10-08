@@ -56,6 +56,8 @@
 #include <mutex>
 #include <vector>
 
+class Slice;
+
 //! \ingroup DecoderLib
 //! \{
 
@@ -86,6 +88,14 @@ struct DecCtrlSlot : DecSlot
   std::vector<uint8_t> a;
   std::vector<uint8_t> b;
 };
+
+#if JVET_AI0084_ALF_RESIDUALS_SCALING
+/// ALF residual scales of an APS alternative (AdaptiveLoopFilter::m_idxCorrPrev), filled while a picture is filtered
+struct DecIdxCorrSlot : DecSlot
+{
+  std::vector<int> idxCorr;
+};
+#endif
 
 /// one mutex and condition variable for every wait of a decoder; waits are rare (a few per picture)
 class DecWaitHub
@@ -138,6 +148,35 @@ struct DecSliceState
 #endif
 };
 
+/// chroma ALF and CCALF CTU control a picture reuses and stores (g_pictureControlInfo)
+struct DecLfCtrlState
+{
+#if JVET_AM0209_CHROMA_ALF_CCALF_REUSE_CTU
+  int                          alfReadAps   [MAX_NUM_COMPONENT] = { -1, -1, -1 };
+  int                          ccAlfReadAps [MAX_NUM_COMPONENT] = { -1, -1, -1 };
+  std::shared_ptr<DecCtrlSlot> alfRead      [MAX_NUM_COMPONENT];
+  std::shared_ptr<DecCtrlSlot> ccAlfRead    [MAX_NUM_COMPONENT];
+  int                          alfStoreAps  [MAX_NUM_COMPONENT] = { -1, -1, -1 };
+  int                          ccAlfStoreAps[MAX_NUM_COMPONENT] = { -1, -1, -1 };
+  std::shared_ptr<DecCtrlSlot> alfStore     [MAX_NUM_COMPONENT];
+  std::shared_ptr<DecCtrlSlot> ccAlfStore   [MAX_NUM_COMPONENT];
+#endif
+  const Slice*                 slice = nullptr;   ///< the slice the state was derived from (ALFProcess starts and ends with it)
+#if JVET_AI0084_ALF_RESIDUALS_SCALING
+  /// residual scales of earlier pictures the picture reuses (getAlfScalePrev) and the ones it keeps (storeAlfScalePrev),
+  /// by index in the slice's luma APS list and alternative; a null slot reads as no scales stored yet
+  struct ScaleRef
+  {
+    int                             f;
+    int                             alt;
+    std::shared_ptr<DecIdxCorrSlot> slot;
+  };
+  bool                  alfScaleResolved = false;
+  std::vector<ScaleRef> alfScaleGets;
+  std::vector<ScaleRef> alfScaleStores;
+#endif
+};
+
 /// decode-order state as the next slice will see it (main thread)
 struct DecOrderState
 {
@@ -151,6 +190,11 @@ struct DecOrderState
 #if JVET_AM0209_CHROMA_ALF_CCALF_REUSE_CTU
   std::shared_ptr<DecCtrlSlot> alfCtrl  [ALF_CTB_MAX_NUM_APS][MAX_NUM_COMPONENT];   ///< g_pictureControlInfo flags + filters
   std::shared_ptr<DecCtrlSlot> ccAlfCtrl[ALF_CTB_MAX_NUM_APS][MAX_NUM_COMPONENT];   ///< g_pictureControlInfo CCALF filters
+#endif
+#if JVET_AI0084_ALF_RESIDUALS_SCALING
+  std::shared_ptr<DecIdxCorrSlot> alfScalePrev[ALF_CTB_MAX_NUM_APS][MAX_NUM_ALF_ALTERNATIVES_LUMA];   ///< m_idxCorrPrev
+  bool                            alfScaleIrapResetToBeDone = true;   ///< statics of resetAlfScalePrev
+  int                             alfScalePocLastIRAP       = 0;
 #endif
 };
 
