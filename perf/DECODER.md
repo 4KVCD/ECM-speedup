@@ -208,6 +208,9 @@ single thread: AI FourPeople 1.16x, AI ParkJoy 1.14x, RA ParkJoy 1.16x, all 19 s
   76b70fb45f (nullptr for missing pictures, the RPL checks skip them).
 - `IntraPrediction::ANG_REF_BUF_SIZE` (encoder step 19) was odr-used without a definition: unoptimized builds did
   not link. Now `constexpr`.
+- Tooling: `perf/build.ps1 -NoLto` never configured (the one-element cmake argument list became a plain string, which
+  was splatted character by character); `pgo.ps1` / `pgo_dec.ps1` deleted `C:\Code\build\<name>` without checking
+  the name (`..` would have deleted `C:\Code`). Both scripts and `build.ps1` now accept plain names only.
 
 ## Profile notes
 

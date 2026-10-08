@@ -1,7 +1,7 @@
 # Profile-guided build: instrumented build -> training encodes -> optimized rebuild in the same tree.
 #   perf\pgo.ps1 <name> [extra cmake -D args...]
 # Training content (FourPeople crops) is deliberately different from the benchmark sequences.
-param( [Parameter(Mandatory=$true)][string]$Name, [Parameter(ValueFromRemainingArguments=$true)][string[]]$CMakeArgs )
+param( [Parameter(Mandatory=$true)][ValidatePattern('^[A-Za-z0-9_-]+$')][string]$Name, [Parameter(ValueFromRemainingArguments=$true)][string[]]$CMakeArgs )   # Name: a plain name, the build directory is deleted
 $ErrorActionPreference = 'Continue'
 . "$PSScriptRoot\..\..\tools\env.ps1"
 $env:CCACHE_DISABLE = "1"   # profile flags + ccache: don't risk stale objects
