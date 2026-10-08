@@ -1,0 +1,107 @@
+#version 460
+// the chroma part of AdaptiveLoopFilter::ALFProcess for one component: per CTU the 9x9 chroma ALF (filterBlk with
+// ALF_FILTER_9 or ALF_FILTER_9_NO_FIX), then the cross-component ALF (filterBlkCcAlf), then over the whole picture
+// the chroma residual scaling (alfAddCorrectChroma)
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+#include "alf_common.glsl"
+
+layout( local_size_x = 16, local_size_y = 8 ) in;
+
+layout( push_constant ) uniform Push
+{
+  Plane    rec;          // chroma reconstruction (this component), mirror-padded by at least 4
+  Plane    fix;          // its fixed-filter output, chroma picture size (mirrored when read)
+  Plane    lumaRec;      // luma reconstruction, mirror-padded by at least 4
+  Plane    lumaResi;     // luma residual
+  Plane    crossDb;      // the other chroma component before deblocking, mirror-padded by at least 1
+  Plane    dst;
+  uint64_t ctuInfo;      // uint32 [4] per CTU: word 1 + component: ALF on | alternative << 4 | CCALF filter << 8
+  uint64_t chromaCoeff;  // int16 [8 alternatives][64]: coefficients [26], clipping values [26], scale factor
+  uint64_t ccalfCoeff;   // int16 [16 filters][MAX_NUM_CC_ALF_CHROMA_COEFF] of this component
+  int      comp;         // 0: Cb, 1: Cr
+  int      width;
+  int      height;
+  int      ctuSizeLog2;  // chroma
+  int      ctusPerRow;
+  int      withFixed;    // ALF_FILTER_9 (with the taps on the fixed-filter output)
+  int      ccalfPrec;
+  int      ccalfClip;    // AdaptiveLoopFilter::m_alfClippingValues[luma][1]
+  int      scaleCorr;    // 0: no residual scaling, else m_scaleCorrChroma[]
+  int      outMin;
+  int      outMax;
+  int      bitDepth;
+} pc;
+
+const int CHROMA_STRIDE = 64;
+const int CCALF_STRIDE  = 34;
+
+void main()
+{
+  const int x = int( gl_GlobalInvocationID.x );
+  const int y = int( gl_GlobalInvocationID.y );
+  if( x >= pc.width || y >= pc.height )
+  {
+    return;
+  }
+  const int  ctu  = ( y >> pc.ctuSizeLog2 ) * pc.ctusPerRow + ( x >> pc.ctuSizeLog2 );
+  const uint info = BufI32( pc.ctuInfo ).v[4 * ctu + 1 + pc.comp];
+  const int  curr = ld( pc.rec, x, y );
+  int        res  = curr;
+
+  if( ( info & 1u ) != 0u )
+  {
+    const int base = int( ( info >> 4 ) & 15u ) * CHROMA_STRIDE;
+    BufI16    p    = BufI16( pc.chromaCoeff );
+    int       c[26], cl[26];
+    for( int k = 0; k < 26; k++ )
+    {
+      c[k]  = int( p.v[base + k] );
+      cl[k] = int( p.v[base + 26 + k] );
+    }
+    int sum = 0;
+#define MAIN( dx, dy ) ld( pc.rec, x + ( dx ), y + ( dy ) )
+#define FIXA( dx, dy ) ldMirror( pc.fix, x + ( dx ), y + ( dy ), pc.width, pc.height )
+#include "alf_gen_filter9.glsl"
+    if( pc.withFixed != 0 )
+    {
+#include "alf_gen_filter9fix.glsl"
+    }
+    sum *= int( p.v[base + 52] );
+    sum = ( sum + ( 1 << 10 ) ) >> 11;
+    res = clamp( curr + sum, pc.outMin, pc.outMax );
+  }
+
+  const int ccalfFilter = int( ( info >> 8 ) & 31u );
+  if( ccalfFilter != 0 )
+  {
+    BufI16    p    = BufI16( pc.ccalfCoeff );
+    const int base = ( ccalfFilter - 1 ) * CCALF_STRIDE;
+    int       c[33];
+    for( int k = 0; k < 33; k++ )
+    {
+      c[k] = int( p.v[base + k] );
+    }
+    const int clipValue = pc.ccalfClip;
+#define LUM( dx, dy ) ld( pc.lumaRec, 2 * x + ( dx ), 2 * y + ( dy ) )
+#define RES( dx, dy ) ld( pc.lumaResi, 2 * x + ( dx ), 2 * y + ( dy ) )
+#define SAO( dx, dy ) ld( pc.rec, x + ( dx ), y + ( dy ) )
+#define XC( dx, dy ) ld( pc.crossDb, x + ( dx ), y + ( dy ) )
+    const int curL = LUM( 0, 0 );
+    const int curS = curr;
+    const int curX = XC( 0, 0 );
+    int       sum  = 0;
+#include "alf_gen_ccalf.glsl"
+    sum              = ( sum + ( ( 1 << pc.ccalfPrec ) >> 1 ) ) >> pc.ccalfPrec;
+    const int offset = ( 1 << pc.bitDepth ) >> 1;
+    sum              = clamp( sum + offset, pc.outMin, pc.outMax ) - offset;
+    res              = clamp( sum + res, pc.outMin, pc.outMax );
+  }
+
+  if( pc.scaleCorr != 0 )
+  {
+    const int corr = res - curr;
+    res = clamp( curr + ( ( corr * pc.scaleCorr + ( corr > 0 ? 3 : 4 ) ) >> 3 ), pc.outMin, pc.outMax );
+  }
+  st( pc.dst, x, y, res );
+}

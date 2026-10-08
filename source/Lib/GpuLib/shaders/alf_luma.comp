@@ -1,0 +1,133 @@
+#version 460
+// the luma ALF of a picture (the luma part of AdaptiveLoopFilter::ALFProcess): per CTU no filtering, the output of a
+// fixed-filter pass (fixed filter sets), or the 13x13 filter of the residual filter types (filterBlk with
+// ALF_FILTER_13_EXT_DB_RESI_DIRECT / ALF_FILTER_13_EXT_DB_RESI) followed by the residual scaling (alfAddCorrect)
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+#include "alf_common.glsl"
+#include "alf_gen_perm.glsl"
+
+layout( local_size_x = 16, local_size_y = 8 ) in;
+
+layout( push_constant ) uniform Push
+{
+  Plane    rec;          // reconstruction, mirror-padded by at least 4
+  Plane    db;           // reconstruction before deblocking, mirror-padded by at least 1
+  Plane    resi;         // residual
+  Plane    fix0;         // fixed-filter outputs, picture size (mirrored when read)
+  Plane    fix1;
+  Plane    fixResi;
+  Plane    gauss;
+  Plane    lapl;
+  Plane    dst;
+  uint64_t ctuInfo;      // uint32 [4] per CTU: word 0 luma mode | classifier << 4 | coefficient set << 8
+  uint64_t params;       // int16: coefficient sets (LUMA_SET_STRIDE each)
+  uint64_t mainClass0;   // uint16 per 2x2 block, classifiers 0..2
+  uint64_t mainClass1;
+  uint64_t mainClass2;
+  int      width;
+  int      height;
+  int      blkStride;
+  int      ctuSizeLog2;
+  int      ctusPerRow;
+  int      outMin;
+  int      outMax;
+  int      currBase;     // 1 << (bit depth - 1)
+} pc;
+
+// coefficient set layout (int16): coefficients [24][47], clipping values [24][47], scale factor [24],
+// residual scale [24], shift, scaling flag
+const int NUM_COEFF        = 47;
+const int SET_CLIP         = 24 * NUM_COEFF;
+const int SET_SCALE        = 2 * 24 * NUM_COEFF;
+const int SET_CORR         = SET_SCALE + 24;
+const int SET_SHIFT        = SET_CORR + 24;
+const int SET_SCALING      = SET_SHIFT + 1;
+const int LUMA_SET_STRIDE  = SET_SCALING + 7;
+
+void main()
+{
+  const int x = int( gl_GlobalInvocationID.x );
+  const int y = int( gl_GlobalInvocationID.y );
+  if( x >= pc.width || y >= pc.height )
+  {
+    return;
+  }
+  const int  ctu  = ( y >> pc.ctuSizeLog2 ) * pc.ctusPerRow + ( x >> pc.ctuSizeLog2 );
+  const uint info = BufI32( pc.ctuInfo ).v[4 * ctu];
+  const int  mode = int( info & 15u );
+  const int  curr = ld( pc.rec, x, y );
+  int        res  = curr;
+  if( mode == 1 )
+  {
+    res = ld( pc.fix0, x, y );
+  }
+  else if( mode == 2 )
+  {
+    res = ld( pc.fix1, x, y );
+  }
+  else if( mode >= 3 )
+  {
+    const int  classifier = int( ( info >> 4 ) & 15u );
+    const int  set        = int( ( info >> 8 ) & 255u );
+    const int  bi         = ( y >> 1 ) * pc.blkStride + ( x >> 1 );
+    const int  cls        = int( classifier == 0   ? BufU16( pc.mainClass0 ).v[bi]
+                                 : classifier == 1 ? BufU16( pc.mainClass1 ).v[bi]
+                                                   : BufU16( pc.mainClass2 ).v[bi] );
+    const int  transposeIdx = cls & 3;
+    const int  classIdx     = cls >> 2;
+    const int  setBase      = set * LUMA_SET_STRIDE;
+    const int  base         = setBase + classIdx * NUM_COEFF;
+    BufI16     p            = BufI16( pc.params );
+
+    int c[11], cl[11];
+    for( int k = 0; k < 11; k++ )
+    {
+      c[k]  = int( p.v[base + MAIN13_PERM[transposeIdx][k]] );
+      cl[k] = int( p.v[base + SET_CLIP + MAIN13_PERM[transposeIdx][k]] );
+    }
+    int coef[NUM_COEFF], clip[NUM_COEFF];
+    for( int k = 10; k < 41; k++ )
+    {
+      coef[k] = int( p.v[base + k] );
+      clip[k] = int( p.v[base + SET_CLIP + k] );
+    }
+
+    int sum = 0;
+#define MAIN( dx, dy ) ld( pc.rec, x + ( dx ), y + ( dy ) )
+#define FIX( dx, dy ) ldMirror( pc.fix1, x + ( dx ), y + ( dy ), pc.width, pc.height )
+#define FIXA( dx, dy ) ldMirror( pc.fix0, x + ( dx ), y + ( dy ), pc.width, pc.height )
+#define FIXB( dx, dy ) ldMirror( pc.fix1, x + ( dx ), y + ( dy ), pc.width, pc.height )
+#define FIXRESI( dx, dy ) ld( pc.fixResi, x + ( dx ), y + ( dy ) )
+#define DBF( dx, dy ) ld( pc.db, x + ( dx ), y + ( dy ) )
+#define RESI( dx, dy ) ld( pc.resi, x + ( dx ), y + ( dy ) )
+#define GAUSS( dx, dy ) ldMirror( pc.gauss, x + ( dx ), y + ( dy ), pc.width, pc.height )
+#define LAPL( dx, dy ) ldMirror( pc.lapl, x + ( dx ), y + ( dy ), pc.width, pc.height )
+#include "alf_gen_main13.glsl"
+#include "alf_gen_fixbased.glsl"
+    if( mode == 3 )
+    {
+#include "alf_gen_type9.glsl"
+    }
+    else
+    {
+#include "alf_gen_type10.glsl"
+    }
+    sum *= int( p.v[setBase + SET_SCALE + classIdx] );
+    const int shift = int( p.v[setBase + SET_SHIFT] );
+    sum             = ( sum + ( 1 << ( shift - 1 ) ) ) >> shift;
+    if( int( p.v[setBase + SET_SCALING] ) != 0 )
+    {
+      // the filter output is a correction around the mid value, scaled per class (alfAddCorrect)
+      const int corr  = clamp( pc.currBase + sum, pc.outMin, pc.outMax ) - pc.currBase;
+      const int sCorr = int( p.v[setBase + SET_CORR + classIdx] );
+      res             = curr + ( ( corr * sCorr + ( corr > 0 ? 31 : 32 ) ) >> 6 );
+    }
+    else
+    {
+      res = curr + sum;
+    }
+    res = clamp( res, pc.outMin, pc.outMax );
+  }
+  st( pc.dst, x, y, res );
+}

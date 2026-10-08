@@ -1,0 +1,143 @@
+/* The copyright in this software is being made available under the BSD
+ * License, included below. This software may be subject to other third party
+ * and contributor rights, including patent rights, and no such rights are
+ * granted under this license.
+ *
+ * Copyright (c) 2010-2023, ITU/ISO/IEC
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ *  * Redistributions of source code must retain the above copyright notice,
+ *    this list of conditions and the following disclaimer.
+ *  * Redistributions in binary form must reproduce the above copyright notice,
+ *    this list of conditions and the following disclaimer in the documentation
+ *    and/or other materials provided with the distribution.
+ *  * Neither the name of the ITU/ISO/IEC nor the names of its contributors may
+ *    be used to endorse or promote products derived from this software without
+ *    specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS
+ * BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF
+ * THE POSSIBILITY OF SUCH DAMAGE.
+ */
+
+/** \file     GpuAlf.h
+    \brief    adaptive loop filter (ALFProcess) on a Vulkan compute device, bit-exact with the CPU version
+*/
+
+#ifndef __GPUALF__
+#define __GPUALF__
+
+#include "CommonLib/AdaptiveLoopFilter.h"
+#include "VkCompute.h"
+
+#include <memory>
+#include <vector>
+
+class GpuAlf : public AlfProcessHook
+{
+public:
+  enum Mode
+  {
+    OFF    = 0,
+    ON     = 1,   ///< the GPU filters the pictures it supports
+    VERIFY = 2    ///< the CPU filters every picture, the GPU result is compared with it
+  };
+
+  /// nullptr when there is no usable Vulkan device (the reason is reported once); waits for prefetch()
+  static GpuAlf* create( int mode );
+  ~GpuAlf() override;
+
+  /// smaller pictures are filtered on the CPU: the fixed costs of the device exceed what it saves
+  static bool    worthwhile( int width, int height ) { return width * height >= 640 * 360; }
+  /// starts creating the device and the kernels in a background thread
+  static void    prefetch();
+  /// prefetch() has finished: create() does not wait
+  static bool    ready();
+
+  bool process( AdaptiveLoopFilter& alf, CodingStructure& cs ) override;
+
+private:
+  /// a 16-bit plane in a buffer: width x height samples and `pad` samples of margin on every side
+  struct PlaneDesc
+  {
+    int          width = 0, height = 0, pad = 0, stride = 0;
+    VkDeviceSize offset = 0;
+    int          origin() const { return pad * stride + pad; }
+    VkDeviceSize bytes() const { return VkDeviceSize( stride ) * ( height + 2 * pad ) * sizeof( int16_t ); }
+  };
+
+  /// what the kernels need of the filter state of a picture
+  struct Params
+  {
+    std::vector<uint32_t> ctuInfo;       ///< [4] per CTU: luma mode, Cb, Cr (see alf_luma.comp, alf_chroma.comp)
+    std::vector<int16_t>  lumaSets;      ///< coefficient sets of the luma CTUs
+    std::vector<int16_t>  chroma;        ///< [8 alternatives][64]
+    std::vector<int16_t>  ccalfCoeff[2]; ///< [16 filters][34] per chroma component
+    bool                  luma       = false;   ///< any luma CTU filtered
+    bool                  lumaFixed  = false;   ///< fixed-filter outputs needed
+    bool                  chromaAlf[2] = { false, false };
+    bool                  ccalf[2]   = { false, false };   ///< any CTU with CCALF
+    bool                  chromaFixed = false;  ///< chroma ALF with the taps on the fixed-filter output
+    int                   ccalfPrec[2] = { 0, 0 };
+    int                   scaleCorr[2] = { 0, 0 };
+  };
+
+  struct Shared;   ///< kernels and fixed-filter tables, one set for every GpuAlf of the process
+
+  GpuAlf( gpu::Context& ctx, const Shared& shared, int mode );
+  static const Shared& shared( gpu::Context& ctx );
+
+  bool accept( const AdaptiveLoopFilter& alf, const CodingStructure& cs ) const;
+  /// what ALFProcess does besides filtering, before and after the filtering of the CTUs
+  void stateBefore( AdaptiveLoopFilter& alf, CodingStructure& cs ) const;
+  void stateAfter( AdaptiveLoopFilter& alf, CodingStructure& cs ) const;
+  /// false when the filter state uses what the kernels do not implement
+  bool gather( const AdaptiveLoopFilter& alf, const CodingStructure& cs );
+  void layout( const CodingStructure& cs );
+  void upload( const AdaptiveLoopFilter& alf, const CodingStructure& cs );
+  void run( const AdaptiveLoopFilter& alf, const CodingStructure& cs );
+  void output( CodingStructure& cs ) const;
+  bool verify( const AdaptiveLoopFilter& alf, const CodingStructure& cs );
+
+  gpu::Context&                m_ctx;
+  const Shared&                m_k;
+  int                          m_mode;
+  std::unique_ptr<gpu::Stream> m_stream;
+
+  // picture geometry of the current layout
+  int                          m_width = 0, m_height = 0, m_ctuSize = 0, m_ctusPerRow = 0, m_numCtus = 0;
+  int                          m_wBlk = 0, m_hBlk = 0;   ///< 2x2 luma blocks
+  int                          m_wBlkC = 0, m_hBlkC = 0; ///< 2x2 chroma blocks
+
+  Params                       m_params;
+
+  // inputs and parameters: device buffer and an upload buffer with the same layout
+  PlaneDesc                    m_inRec[3], m_inDb[3], m_inResi, m_inCi;
+  VkDeviceSize                 m_inCtuInfo = 0, m_inLumaSets = 0, m_inChroma = 0, m_inCcalf[2] = { 0, 0 };
+  VkDeviceSize                 m_inBytes = 0;
+  gpu::Buffer                  m_in, m_inUpload;
+  // intermediate results: classes per 2x2 block, filter outputs (picture size, mirrored when read)
+  VkDeviceSize                 m_ciClass = 0, m_fixClass0 = 0, m_fixClass1 = 0, m_mainClass[3] = { 0, 0, 0 };
+  VkDeviceSize                 m_chClass[2] = { 0, 0 };
+  PlaneDesc                    m_fix0, m_fix1, m_fixResi, m_gauss, m_lapl, m_chFix[2];
+  gpu::Buffer                  m_work;
+  // outputs, read back
+  PlaneDesc                    m_out[3];
+  gpu::Buffer                  m_outDev, m_download, m_workDownload;
+
+  long                         m_verifiedPictures = 0;
+  long                         m_failedPictures   = 0;
+};
+
+#endif

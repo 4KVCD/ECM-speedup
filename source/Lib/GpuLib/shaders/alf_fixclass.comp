@@ -1,0 +1,73 @@
+#version 460
+// classes of every 2x2 luma block: the two fixed-filter classes (AdaptiveLoopFilter::calcClass0Var with the
+// 4x4 and the 12x12 gradient windows and the 10x10 variance) and the class of classifier 0 (calcClass with the
+// 12x12 window, then textureClassMapping)
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+#include "alf_common.glsl"
+
+layout( local_size_x = 16, local_size_y = 8 ) in;
+
+layout( push_constant ) uniform Push
+{
+  Plane    rec;          // mirror-padded by at least 6
+  uint64_t ciClass;      // uint8 per block
+  uint64_t fixClass0;    // uint16 per block
+  uint64_t fixClass1;
+  uint64_t mainClass0;
+  int      blkStride;
+  int      wBlk;
+  int      hBlk;
+  int      bitDepth;
+} pc;
+
+const int BS_MAP[25] = int[25]( 0, 1, 1, 2, 2, 3, 4, 4, 5, 5, 3, 4, 4, 5, 5, 6, 7, 7, 8, 8, 9, 10, 10, 11, 11 );
+
+void main()
+{
+  const int bx = int( gl_GlobalInvocationID.x );
+  const int by = int( gl_GlobalInvocationID.y );
+  if( bx >= pc.wBlk || by >= pc.hBlk )
+  {
+    return;
+  }
+  const int x = bx * 2;
+  const int y = by * 2;
+
+  // variance of the 10x10 window (AdaptiveLoopFilter::deriveVariance)
+  int64_t sum = 0, sumSq = 0;
+  for( int dy = -4; dy <= 5; dy++ )
+  {
+    for( int dx = -4; dx <= 5; dx++ )
+    {
+      const int64_t v = int64_t( ld( pc.rec, x + dx, y + dy ) );
+      sum += v;
+      sumSq += v * v;
+    }
+  }
+  const int  bdShift  = 2 * max( 0, pc.bitDepth - 10 );
+  const uint variance = uint( ( 13l * ( ( 100l * sumSq - sum * sum + 8192l ) >> 3 ) ) >> ( 14 + bdShift ) );
+
+  // gradient sums of the 4x4 window starting at (-1,-1) and of the 12x12 window starting at (-5,-5)
+  uvec4 g4 = uvec4( 0 ), g12 = uvec4( 0 );
+  for( int dy = -5; dy <= 6; dy++ )
+  {
+    for( int dx = -5; dx <= 6; dx++ )
+    {
+      const uvec4 g = gradients( pc.rec, x + dx, y + dy );
+      g12 += g;
+      if( dx >= -1 && dx <= 2 && dy >= -1 && dy <= 2 )
+      {
+        g4 += g;
+      }
+    }
+  }
+
+  const int i = by * pc.blkStride + bx;
+  BufU16( pc.fixClass0 ).v[i] = uint16_t( classFixed( g4, ALF_MULT[1], pc.bitDepth, variance ) );
+  BufU16( pc.fixClass1 ).v[i] = uint16_t( classFixed( g12, ALF_MULT[5], pc.bitDepth, variance ) );
+
+  const int cls    = classBand( g12, ALF_MULT[5], pc.bitDepth );
+  const int bsUnit = int( BufU8( pc.ciClass ).v[i] ) >> 1;
+  BufU16( pc.mainClass0 ).v[i] = uint16_t( ( ( BS_MAP[cls >> 2] + bsUnit * 12 ) << 2 ) + ( cls & 3 ) );
+}

@@ -29,6 +29,12 @@ endif()
 set( EXTENSION_NNLF OFF CACHE BOOL "If EXTENSION_NNLF is on, NNLF interfaces are added. Please use git submodule init/update to get SADL library." )
 
 set( EXTENSION_360_VIDEO OFF CACHE BOOL "If EXTENSION_360_VIDEO is on, 360Lib will be added" )
+
+# perf: Vulkan compute backend of the decoder (GpuLib); needs the Vulkan headers and glslang at build time, the Vulkan
+# loader (vulkan-1.dll / libvulkan.so.1) at run time, and falls back to the CPU without a usable device
+set( ECM_VULKAN OFF CACHE BOOL "Build the decoder's Vulkan compute backend (source/Lib/GpuLib)" )
+set( ECM_VULKAN_HEADERS "" CACHE PATH "Include directory of the Vulkan headers (contains vulkan/vulkan.h)" )
+set( ECM_GLSLANG "" CACHE FILEPATH "glslang executable (GLSL to SPIR-V compiler)" )
 set( EXTENSION_HDRTOOLS OFF CACHE BOOL "If EXTENSION_HDRTOOLS is on, HDRLib will be added" )
 
 if (DEFINED ENABLE_TRACING)
@@ -157,6 +163,9 @@ if ( EXTENSION_HDRTOOLS )
   add_subdirectory( "source/Lib/HDRLib")
 endif()
 add_subdirectory( "source/Lib/DecoderAnalyserLib" )
+if( ECM_VULKAN )
+  add_subdirectory( "source/Lib/GpuLib" )
+endif()
 add_subdirectory( "source/Lib/DecoderLib" )
 add_subdirectory( "source/Lib/EncoderLib" )
 add_subdirectory( "source/Lib/Utilities" )

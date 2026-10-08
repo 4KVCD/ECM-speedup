@@ -72,6 +72,9 @@
 class InputNALUnit;
 struct DecPicJob;
 class  DecFrameThreads;
+#if ECM_VULKAN
+class  GpuAlf;
+#endif
 
 //! \ingroup DecoderLib
 //! \{
@@ -262,6 +265,13 @@ private:
 
   typedef DecLfCtrlState LfCtrlState;
 
+#if ECM_VULKAN
+  // loop filters on a Vulkan compute device (source/Lib/GpuLib), created by the context that filters a picture
+  int                     m_gpuLoopFilter = 0;      ///< GpuAlf::Mode
+  bool                    m_gpuUnavailable = false;
+  std::unique_ptr<GpuAlf> m_gpuAlf;
+#endif
+
 public:
   int                     m_targetSubPicIdx;
 
@@ -313,6 +323,10 @@ public:
   void  updatePrevIRAPAndGDRSubpic();
 #if JVET_Z0118_GDR
   bool  getGDRRecoveryPocReached()          { return ( m_pcPic->getPOC() >= m_prevGDRInSameLayerRecoveryPOC[m_pcPic->layerId] ); }
+#endif
+
+#if ECM_VULKAN
+  void  setGpuLoopFilter        ( int mode );   ///< GpuAlf::Mode; before setFrameThreads
 #endif
 
   // frame-level threading

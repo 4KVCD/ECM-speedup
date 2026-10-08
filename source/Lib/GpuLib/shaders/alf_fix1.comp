@@ -1,0 +1,5 @@
+#version 460
+// second fixed-filter pass of the luma ALF: 13x13 on the first pass output + 9x9 before deblocking
+#define FIX_KIND 1
+#extension GL_GOOGLE_include_directive : require
+#include "alf_fixfilter.glsl"

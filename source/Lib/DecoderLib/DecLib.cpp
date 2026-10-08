@@ -38,6 +38,9 @@
 #include "NALread.h"
 #include "DecLib.h"
 #include "DecFrameThreads.h"
+#if ECM_VULKAN
+#include "GpuAlf.h"
+#endif
 
 #include "CommonLib/dtrace_next.h"
 #include "CommonLib/dtrace_buffer.h"
@@ -640,7 +643,26 @@ DecLib::~DecLib()
     delete m_pictureSeiNalus.front();
     m_pictureSeiNalus.pop_front();
   }
+#if ECM_VULKAN
+  m_cALF.setProcessHook( nullptr );
+  m_gpuAlf.reset();
+  if( m_gpuLoopFilter )
+  {
+    gpu::Context::joinPrefetch();
+  }
+#endif
 }
+
+#if ECM_VULKAN
+void DecLib::setGpuLoopFilter( int mode )
+{
+  m_gpuLoopFilter = mode;
+  if( mode == GpuAlf::VERIFY )
+  {
+    GpuAlf::prefetch();   // every picture is verified
+  }
+}
+#endif
 
 void DecLib::create()
 {
@@ -1138,6 +1160,15 @@ void DecLib::xExecuteLoopFilters( LfCtrlState* lf )
           s.idxCorr.clear();   // m_idxCorrPrev before the first reset
         }
       }
+    }
+#endif
+#if ECM_VULKAN
+    // pictures filtered before the device is ready take the CPU path (verification waits for it)
+    if( m_gpuLoopFilter && !m_gpuAlf && !m_gpuUnavailable && ( m_gpuLoopFilter == GpuAlf::VERIFY || GpuAlf::ready() ) )
+    {
+      m_gpuAlf.reset( GpuAlf::create( m_gpuLoopFilter ) );
+      m_gpuUnavailable = !m_gpuAlf;
+      m_cALF.setProcessHook( m_gpuAlf.get() );
     }
 #endif
     // ALF decodes the differentially coded coefficients and stores them in the parameters structure.
@@ -2695,6 +2726,14 @@ void DecLib::xActivateParameterSets( const InputNALUnit nalu )
     {
       THROW("Parameter set activation failed!");
     }
+#if ECM_VULKAN
+    // the device is created while the first pictures are decoded
+    if( m_gpuLoopFilter && sps->getALFEnabledFlag()
+        && GpuAlf::worthwhile( pps->getPicWidthInLumaSamples(), pps->getPicHeightInLumaSamples() ) )
+    {
+      GpuAlf::prefetch();
+    }
+#endif
 
 
     m_parameterSetManager.getApsMap()->clear();

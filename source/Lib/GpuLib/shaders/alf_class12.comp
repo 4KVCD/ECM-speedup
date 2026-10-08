@@ -1,0 +1,49 @@
+#version 460
+// classes of the luma classifiers 1 and 2 of every 2x2 block (AdaptiveLoopFilter::calcClassNew): band of the block
+// mean, and residual activity of the 8x8 window starting at (-3,-3); both split by the coding-information class
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+layout( local_size_x = 16, local_size_y = 8 ) in;
+
+layout( push_constant ) uniform Push
+{
+  Plane    rec;          // reconstruction
+  Plane    resi;         // residual, mirror-padded by at least 4
+  uint64_t ciClass;      // uint8 per block
+  uint64_t mainClass1;   // uint16 per block
+  uint64_t mainClass2;
+  int      blkStride;
+  int      wBlk;
+  int      hBlk;
+  int      bitDepth;
+} pc;
+
+void main()
+{
+  const int bx = int( gl_GlobalInvocationID.x );
+  const int by = int( gl_GlobalInvocationID.y );
+  if( bx >= pc.wBlk || by >= pc.hBlk )
+  {
+    return;
+  }
+  const int x      = bx * 2;
+  const int y      = by * 2;
+  const int i      = by * pc.blkStride + bx;
+  const int bound  = int( BufU8( pc.ciClass ).v[i] ) >> 1;
+
+  const int sum   = ld( pc.rec, x, y ) + ld( pc.rec, x + 1, y ) + ld( pc.rec, x, y + 1 ) + ld( pc.rec, x + 1, y + 1 );
+  const int band  = ( ( sum * 12 ) >> ( pc.bitDepth + 2 ) ) + ( bound != 0 ? 12 : 0 );
+  BufU16( pc.mainClass1 ).v[i] = uint16_t( band << 2 );
+
+  int resiSum = 0;
+  for( int dy = -3; dy <= 4; dy++ )
+  {
+    for( int dx = -3; dx <= 4; dx++ )
+    {
+      resiSum += abs( ld( pc.resi, x + dx, y + dy ) );
+    }
+  }
+  int resiClass = min( ( resiSum >> ( pc.bitDepth - 4 ) ) >> 1, 11 ) + ( bound != 0 ? 12 : 0 );
+  BufU16( pc.mainClass2 ).v[i] = uint16_t( resiClass << 2 );
+}

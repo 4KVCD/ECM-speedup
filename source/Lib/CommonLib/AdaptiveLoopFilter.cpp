@@ -671,8 +671,24 @@ void AdaptiveLoopFilter::applyCcAlfFilter(CodingStructure &cs, ComponentID compI
   }
 }
 
+AdaptiveLoopFilter::FixedFilterTables AdaptiveLoopFilter::fixedFilterTables()
+{
+  FixedFilterTables t;
+  t.classIdn9Db9  = &m_classIdnFixedFilter9Db9[0][0];
+  t.coeff9Db9     = &m_filterCoeffFixed9Db9[0][0][0];
+  t.clip9Db9      = &m_clippingFixed9Db9[0][0][0];
+  t.classIdn13Db9 = &m_classIdnFixedFilter13Db9[0][0];
+  t.coeff13Db9    = &m_filterCoeffFixed13Db9[0][0][0];
+  t.clip13Db9     = &m_clippingFixed13Db9[0][0][0];
+  return t;
+}
+
 void AdaptiveLoopFilter::ALFProcess(CodingStructure& cs)
 {
+  if( m_processHook && m_processHook->process( *this, cs ) )
+  {
+    return;
+  }
   // set clipping range
   m_clpRngs = cs.slice->getClpRngs();
 

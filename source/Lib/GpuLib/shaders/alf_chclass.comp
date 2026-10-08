@@ -1,0 +1,53 @@
+#version 460
+// fixed-filter class of every 2x2 chroma block (AdaptiveLoopFilter::deriveFixFilterResultsBlkChroma: the 10x10
+// variance and the 4x4 gradient window starting at (-1,-1), calcClass0Var with window index 11)
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+#include "alf_common.glsl"
+
+layout( local_size_x = 16, local_size_y = 8 ) in;
+
+layout( push_constant ) uniform Push
+{
+  Plane    rec;          // chroma reconstruction, mirror-padded by at least 5
+  uint64_t fixClass;     // uint16 per 2x2 block
+  int      blkStride;
+  int      wBlk;
+  int      hBlk;
+  int      bitDepth;
+} pc;
+
+void main()
+{
+  const int bx = int( gl_GlobalInvocationID.x );
+  const int by = int( gl_GlobalInvocationID.y );
+  if( bx >= pc.wBlk || by >= pc.hBlk )
+  {
+    return;
+  }
+  const int x = bx * 2;
+  const int y = by * 2;
+
+  int64_t sum = 0, sumSq = 0;
+  for( int dy = -4; dy <= 5; dy++ )
+  {
+    for( int dx = -4; dx <= 5; dx++ )
+    {
+      const int64_t v = int64_t( ld( pc.rec, x + dx, y + dy ) );
+      sum += v;
+      sumSq += v * v;
+    }
+  }
+  const int  bdShift  = 2 * max( 0, pc.bitDepth - 10 );
+  const uint variance = uint( ( 13l * ( ( 100l * sumSq - sum * sum + 8192l ) >> 3 ) ) >> ( 14 + bdShift ) );
+
+  uvec4 g4 = uvec4( 0 );
+  for( int dy = -1; dy <= 2; dy++ )
+  {
+    for( int dx = -1; dx <= 2; dx++ )
+    {
+      g4 += gradients( pc.rec, x + dx, y + dy );
+    }
+  }
+  BufU16( pc.fixClass ).v[by * pc.blkStride + bx] = uint16_t( classFixed( g4, ALF_MULT[1], pc.bitDepth, variance ) );
+}

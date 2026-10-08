@@ -42,6 +42,10 @@ endif()
 
 target_include_directories( ${LIB_NAME} PUBLIC . )
 target_link_libraries( ${LIB_NAME} CommonLib )
+if( ECM_VULKAN )
+  target_compile_definitions( ${LIB_NAME} PUBLIC ECM_VULKAN=1 )
+  target_link_libraries( ${LIB_NAME} GpuLib )
+endif()
 
 # example: place header files in different folders
 source_group( "Natvis Files" FILES ${NATVIS_FILES} )

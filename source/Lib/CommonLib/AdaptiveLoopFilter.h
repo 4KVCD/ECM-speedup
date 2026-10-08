@@ -44,7 +44,7 @@
 #include "UnitTools.h"
 
 #if ALF_IMPROVEMENT
-typedef       short           AlfClassifier;         
+typedef       short           AlfClassifier;
 #else
 struct AlfClassifier
 {
@@ -57,6 +57,17 @@ struct AlfClassifier
   uint8_t transposeIdx;
 };
 #endif
+
+class AdaptiveLoopFilter;
+
+/// perf: replacement of ALFProcess for a picture (the decoder's GPU loop filter, source/Lib/GpuLib); process()
+/// returns false when it does not handle the picture, which then takes the normal path
+class AlfProcessHook
+{
+public:
+  virtual ~AlfProcessHook() = default;
+  virtual bool process( AdaptiveLoopFilter& alf, CodingStructure& cs ) = 0;
+};
 
 enum Direction
 {
@@ -163,6 +174,20 @@ public:
   void reconstructCoeffAPSs(CodingStructure& cs, bool luma, bool chroma, bool isRdo);
   void reconstructCoeff(AlfParam& alfParam, ChannelType channel, const bool isRdo, const bool isRedo = false);
   void ALFProcess(CodingStructure& cs);
+  // perf: ALFProcess hands each picture to the hook first (the decoder's GPU loop filter)
+  void setProcessHook( AlfProcessHook* hook ) { m_processHook = hook; }
+  AlfProcessHook* getProcessHook() const { return m_processHook; }
+  // perf: the fixed-filter tables (AlfFixedFilters.h), for the GPU loop filter
+  struct FixedFilterTables
+  {
+    const short* classIdn9Db9;    // [NUM_SETS_FIXED_FILTERS][NUM_CLASSES_FIX]
+    const short* coeff9Db9;       // [NUM_SETS_FIXED_FILTERS][NUM_FIXED_FILTERS][FIX_FILTER_NUM_COEFF_9_DB_9]
+    const short* clip9Db9;
+    const short* classIdn13Db9;   // [NUM_SETS_FIXED_FILTERS][NUM_CLASSES_FIX]
+    const short* coeff13Db9;      // [NUM_SETS_FIXED_FILTERS][NUM_FIXED_FILTERS][FIX_FILTER_NUM_COEFF_13_DB_9]
+    const short* clip13Db9;
+  };
+  static FixedFilterTables fixedFilterTables();
 #if FIXFILTER_CFG 
   void create(const int picWidth, const int picHeight, const ChromaFormat format, const int maxCUWidth, const int maxCUHeight, const int maxCUDepth, const int inputBitDepth[MAX_NUM_CHANNEL_TYPE], bool useFixedFilter = true);
 #else
@@ -1034,6 +1059,8 @@ public:
 #endif
 
 protected:
+  friend class GpuAlf;   // perf: the GPU loop filter reads the filter state and does ALFProcess's work
+  AlfProcessHook*        m_processHook = nullptr;
   bool isCrossedByVirtualBoundaries( const CodingStructure& cs, const int xPos, const int yPos, const int width, const int height, bool& clipTop, bool& clipBottom, bool& clipLeft, bool& clipRight, int& numHorVirBndry, int& numVerVirBndry, int horVirBndryPos[], int verVirBndryPos[], int& rasterSliceAlfPad );
 #if !JVET_AH0057_CCALF_COEFF_PRECISION
   static constexpr int   m_scaleBits = 7; // 8-bits

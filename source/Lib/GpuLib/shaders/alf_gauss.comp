@@ -1,0 +1,105 @@
+#version 460
+// Gaussian-filtered luma before deblocking (AdaptiveLoopFilter::gaussFiltering) and the Laplacian of the
+// reconstruction (laplacianFiltering): one sample per invocation, gl_GlobalInvocationID.z selects the output
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+#include "alf_common.glsl"
+
+layout( local_size_x = 16, local_size_y = 8 ) in;
+
+layout( push_constant ) uniform Push
+{
+  Plane    db;           // reconstruction before deblocking, mirror-padded by at least 3
+  Plane    rec;          // reconstruction, mirror-padded by at least 4
+  Plane    ci;           // coding information
+  Plane    gauss;        // outputs, picture size
+  Plane    lapl;
+  ivec4    clipValues;   // AdaptiveLoopFilter::m_alfClippingValues (luma)
+  uint64_t ciClass;      // uint8 per 2x2 block
+  int      width;
+  int      height;
+  int      blkStride;
+  int      useBound;     // coding-information condition of gaussFiltering
+  int      bsFactor;
+  int      offsetClip;
+  int      diffGauss;    // gaussFiltering: largest change
+  int      diffLapl;     // laplacianFiltering: largest value
+  int      diffLocal;    // localGaussianFiltering: largest change
+  int      outMin;
+  int      outMax;
+} pc;
+
+const int GAUSS_COEFF[12] = int[12]( 8, 22, 30, 22, 22, 60, 85, 60, 22, 8, 30, 85 );
+const int GAUSS_CLIP[12]  = int[12]( 3, 2, 1, 2, 2, 1, 0, 1, 2, 3, 1, 0 );
+
+// the 12 symmetric tap pairs of the 7x7 diamond around (x,y) of plane p, weighted (shift 10 left to the caller)
+int gaussSum( Plane p, int x, int y, int curr )
+{
+  int r[12];
+  r[0]  = clipAlf2( pc.clipValues[GAUSS_CLIP[0]], curr, ld( p, x, y - 3 ), ld( p, x, y + 3 ) );
+  r[1]  = clipAlf2( pc.clipValues[GAUSS_CLIP[1]], curr, ld( p, x - 1, y - 2 ), ld( p, x + 1, y + 2 ) );
+  r[2]  = clipAlf2( pc.clipValues[GAUSS_CLIP[2]], curr, ld( p, x, y - 2 ), ld( p, x, y + 2 ) );
+  r[3]  = clipAlf2( pc.clipValues[GAUSS_CLIP[3]], curr, ld( p, x + 1, y - 2 ), ld( p, x - 1, y + 2 ) );
+  r[4]  = clipAlf2( pc.clipValues[GAUSS_CLIP[4]], curr, ld( p, x - 2, y - 1 ), ld( p, x + 2, y + 1 ) );
+  r[5]  = clipAlf2( pc.clipValues[GAUSS_CLIP[5]], curr, ld( p, x - 1, y - 1 ), ld( p, x + 1, y + 1 ) );
+  r[6]  = clipAlf2( pc.clipValues[GAUSS_CLIP[6]], curr, ld( p, x, y - 1 ), ld( p, x, y + 1 ) );
+  r[7]  = clipAlf2( pc.clipValues[GAUSS_CLIP[7]], curr, ld( p, x + 1, y - 1 ), ld( p, x - 1, y + 1 ) );
+  r[8]  = clipAlf2( pc.clipValues[GAUSS_CLIP[8]], curr, ld( p, x + 2, y - 1 ), ld( p, x - 2, y + 1 ) );
+  r[9]  = clipAlf2( pc.clipValues[GAUSS_CLIP[9]], curr, ld( p, x - 3, y ), ld( p, x + 3, y ) );
+  r[10] = clipAlf2( pc.clipValues[GAUSS_CLIP[10]], curr, ld( p, x - 2, y ), ld( p, x + 2, y ) );
+  r[11] = clipAlf2( pc.clipValues[GAUSS_CLIP[11]], curr, ld( p, x - 1, y ), ld( p, x + 1, y ) );
+  int sum = 0;
+  for( int c = 0; c < 12; c++ )
+  {
+    sum += r[c] * GAUSS_COEFF[c];
+  }
+  return ( sum + ( 1 << 9 ) ) >> 10;
+}
+
+// AdaptiveLoopFilter::localGaussianFiltering
+int localGauss( int x, int y )
+{
+  const int curr = ld( pc.rec, x, y );
+  return clamp( curr + clamp( gaussSum( pc.rec, x, y, curr ), -pc.diffLocal, pc.diffLocal ), pc.outMin, pc.outMax );
+}
+
+void main()
+{
+  const int x = int( gl_GlobalInvocationID.x );
+  const int y = int( gl_GlobalInvocationID.y );
+  if( x >= pc.width || y >= pc.height )
+  {
+    return;
+  }
+  if( gl_GlobalInvocationID.z == 0 )
+  {
+    const int curr = ld( pc.db, x, y );
+    int       sum  = gaussSum( pc.db, x, y, curr );
+    if( pc.useBound != 0 )
+    {
+      sum            = clamp( sum, -pc.offsetClip, pc.offsetClip );
+      const int sign = sum < 0 ? -1 : 1;
+      const int cls  = int( BufU8( pc.ciClass ).v[( y >> 1 ) * pc.blkStride + ( x >> 1 )] );
+      sum            = ( cls >> 1 ) != 0 ? sign * ( ( abs( sum ) * ( 16 + pc.bsFactor ) + 8 ) >> 4 ) : sum;
+    }
+    st( pc.gauss, x, y, clamp( curr + clamp( sum, -pc.diffGauss, pc.diffGauss ), pc.outMin, pc.outMax ) );
+  }
+  else
+  {
+    const int clip0 = pc.clipValues[0];
+    int       ref0, ref1;
+    if( ld( pc.ci, x, y ) == 0 )
+    {
+      const int curr = ld( pc.rec, x, y );
+      ref0           = clipAlf2( clip0, curr, ld( pc.rec, x, y - 1 ), ld( pc.rec, x, y + 1 ) );
+      ref1           = clipAlf2( clip0, curr, ld( pc.rec, x - 1, y ), ld( pc.rec, x + 1, y ) );
+    }
+    else
+    {
+      const int g2 = localGauss( x, y );
+      ref0         = clipAlf2( clip0, g2, localGauss( x, y - 1 ), localGauss( x, y + 1 ) );
+      ref1         = clipAlf2( clip0, g2, localGauss( x - 1, y ), localGauss( x + 1, y ) );
+    }
+    st( pc.lapl, x, y, clamp( ref0 + ref1, -pc.diffLapl, pc.diffLapl ) );
+  }
+}

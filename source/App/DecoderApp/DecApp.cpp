@@ -645,6 +645,9 @@ void DecApp::xCreateDecLib()
 #if GDR_LEAK_TEST
   m_cDecLib.m_gdrPocRandomAccess = this->m_gdrPocRandomAccess;
 #endif
+#if ECM_VULKAN
+  m_cDecLib.setGpuLoopFilter( m_gpuLoopFilter );
+#endif
   int         frameThreads = m_frameThreads;
   std::string reason;
   if( frameThreads > 1 && frameThreadsBlocked( reason ) )

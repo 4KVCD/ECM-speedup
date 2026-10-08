@@ -149,6 +149,9 @@ bool DecAppCfg::parseCfg( int argc, char* argv[] )
   ("SegmentOverlapPictures",   m_segmentOverlapPictures,                   -1,     "Internal, for segment-parallel child processes: the first N decoded pictures are references only and not written (-1: not a child)\n")
   ("FrameThreads",             m_frameThreads,                              0,     "Decode pictures in this many threads, as far as reference pictures allow (0, 1: off). The output is that of a sequential decode")
   ("FrameThreadsSerial",       m_frameThreadsSerial,                    false,     "Test: decode one picture at a time on the frame threads\n")
+#if ECM_VULKAN
+  ("GpuLoopFilter",            m_gpuLoopFilter,                             0,     "Loop filters on the Vulkan compute device: 0 off, 1 on, 2 verify (the CPU filters, the GPU result is compared). Without a usable device the CPU filters\n")
+#endif
   ;
 
   po::setDefaults(opts);

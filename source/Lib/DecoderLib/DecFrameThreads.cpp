@@ -74,6 +74,9 @@ DecFrameThreads::DecFrameThreads( DecLib& main, int numThreads, bool serial )
     ctx.initScalingList();
     ctx.m_waitHub         = main.m_waitHub;
     ctx.m_targetSubPicIdx = main.m_targetSubPicIdx;
+#if ECM_VULKAN
+    ctx.m_gpuLoopFilter   = main.m_gpuLoopFilter;
+#endif
 #if JVET_AL0142_CCSAO_REUSE_CTU
     ctx.m_CABACDecoder.getCABACReader( 0 )->setCcSaoPrvMirror( false );
 #endif

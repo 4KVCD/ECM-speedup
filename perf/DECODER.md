@@ -100,6 +100,39 @@ reference pictures to be completely decoded and filtered, so RA gains are bounde
 (each picture references the previous one) only pays the overhead. CPU time with 8 threads is 1.40x the sequential
 one (start-up, lower clocks with all cores busy).
 
+## GPU (Vulkan)
+
+Bit-exact GPU work is limited to what does not depend on CTU-by-CTU parsing and reconstruction: the in-loop
+filters and picture-level steps. `source/Lib/GpuLib` (built with `-DECM_VULKAN=ON -DECM_VULKAN_HEADERS=<Vulkan-Headers
+include dir> -DECM_GLSLANG=<glslang.exe>`; default off) is a small Vulkan compute runtime (`VkCompute`: the loader
+`vulkan-1.dll` / `libvulkan.so.1` is opened at run time, buffers are addressed through buffer device addresses passed in
+push constants, one command stream per decoder context) and the kernels, GLSL compiled to embedded SPIR-V at build
+time. `--GpuLoopFilter=1` filters on the GPU, `=2` filters on the CPU and compares every GPU intermediate result and
+the output with it; without a usable device the CPU filters.
+
+G1: ALF (luma with the fixed filters, classifiers, Gaussian / Laplacian / residual inputs and residual scaling;
+chroma ALF with its fixed filter; CCALF; chroma residual scaling) on the GPU. The CPU filters CTU by CTU and derives
+the intermediate results of each CTU and its surroundings (classes, fixed-filter outputs, Gaussian and Laplacian
+images); these depend only on the sample position (the CPU recomputes them per CTU with the same arithmetic; the
+picture boundary is mirror-padded), so the kernels derive each one for the whole picture and then filter every CTU.
+The tap geometries and coefficient orders are extracted from the C++ by `GpuLib/tools/gen_alf_glsl.py`. The CPU keeps
+ALFProcess's state work (APS reconstruction, residual-scale state, CTU-control reuse, the copies later stages read).
+Checked first that the scalar C filters give the same output as the SIMD ones (all 19 streams), so the kernels follow
+the C code. Pictures that use what the kernels do not implement (virtual boundaries, several slices / tiles /
+sub-pictures, CU QP classification, other filter types or chroma formats) take the CPU path.
+
+Output identical on all 19 streams with `--GpuLoopFilter=1`, with 8 frame threads, and the verification mode found
+no difference in any intermediate result (779 pictures); encoder suite bit-exact (CommonLib: the hook only).
+ALF of a 720p picture: ~46 ms on the CPU, ~4.5 ms with the GPU (RTX 3070: ~2.6 ms GPU time, the rest the
+copies to the upload buffer, the state work and the read-back). Creating the Vulkan device costs ~0.3 s (instance
+0.17 s, device 0.11 s; implicit layers are not the cause), so it runs in a background thread started at the first
+SPS with pictures of at least 640x360 (smaller pictures stay on the CPU: the fixed costs exceed what the GPU saves),
+and pictures filtered before it is ready take the CPU path.
+
+LTO builds, paired, 3 repetitions, single thread: 720p AI FourPeople 1.10x, ParkJoy 1.09x, 720p RA ParkJoy 1.06x,
+the 1- and 3-picture 720p streams 0.95x / 0.97x (device set-up and tear-down), smaller streams unchanged; all 19
+streams 1.04x. With 8 frame threads 0.94-1.03x: every worker context allocates its buffers at its first picture.
+
 ## Fixes found on the way
 
 - Decoding that starts at a CRA in the middle of an RA stream (`-s`, random access) crashed the stock decoder:

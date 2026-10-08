@@ -1,0 +1,47 @@
+#version 460
+// ALF coding-information class of every 2x2 luma block (AdaptiveLoopFilter::calcAlfLumaCodingInfoBlk):
+// 2 * (any coding-info sample of the block set) + (residual activity of the 4x4 window above the threshold)
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+layout( local_size_x = 16, local_size_y = 8 ) in;
+
+layout( push_constant ) uniform Push
+{
+  Plane    resi;        // luma residual, mirror-padded
+  Plane    ci;          // coding information, luma resolution
+  uint64_t outAddr;     // uint8 per 2x2 block
+  int      outStride;
+  int      wBlk;
+  int      hBlk;
+  int      calcResi;    // inter slice
+  int      bitDepth;
+} pc;
+
+void main()
+{
+  const int bx = int( gl_GlobalInvocationID.x );
+  const int by = int( gl_GlobalInvocationID.y );
+  if( bx >= pc.wBlk || by >= pc.hBlk )
+  {
+    return;
+  }
+  const int x = bx * 2;
+  const int y = by * 2;
+
+  int classIdxResi = 0;
+  if( pc.calcResi != 0 )
+  {
+    int sum = 0;
+    for( int dy = -1; dy <= 2; dy++ )
+    {
+      for( int dx = -1; dx <= 2; dx++ )
+      {
+        sum += abs( ld( pc.resi, x + dx, y + dy ) );
+      }
+    }
+    classIdxResi = ( sum >> ( pc.bitDepth - 6 ) ) > 4 ? 1 : 0;
+  }
+  const int ciSum = ld( pc.ci, x, y ) + ld( pc.ci, x + 1, y ) + ld( pc.ci, x, y + 1 ) + ld( pc.ci, x + 1, y + 1 );
+  BufU8( pc.outAddr ).v[by * pc.outStride + bx] = uint8_t( ( ciSum > 0 ? 2 : 0 ) + classIdxResi );
+}

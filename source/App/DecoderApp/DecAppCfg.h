@@ -106,6 +106,7 @@ protected:
   int           m_segmentOverlapPictures = -1;       ///< segment-parallel child (>= 0): the first N decoded pictures are references only
   int           m_frameThreads = 0;                  ///< decode pictures in this many threads (0, 1: off)
   bool          m_frameThreadsSerial = false;        ///< test: one picture at a time on the frame threads
+  int           m_gpuLoopFilter = 0;                 ///< loop filters on the Vulkan device (GpuAlf::Mode)
 public:
   DecAppCfg();
   virtual ~DecAppCfg();

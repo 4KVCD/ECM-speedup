@@ -1,0 +1,5 @@
+#version 460
+// first fixed-filter pass of the luma ALF: 9x9 on the reconstruction + 9x9 before deblocking
+#define FIX_KIND 0
+#extension GL_GOOGLE_include_directive : require
+#include "alf_fixfilter.glsl"
