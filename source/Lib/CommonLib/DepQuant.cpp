@@ -738,6 +738,12 @@ namespace DQIntern
     int     m_tabKey = -1;   // channel type, LFNST and inter/intra switch of the current tables
     uint8_t m_tabModels[(sm_maxNumSigSbbCtx + sm_numCtxSetsSig * sm_maxNumSigCtx + 4 * sm_maxNumGtxCtx)
                         * sizeof(BinProbModel_Std)];   // the context models they were computed from (raw bytes)
+    // perf: version stamps (CtxStore::blockStamp) of the context blocks those models were read from, when they all
+    // had one; while the blocks still have the same stamps the models are the same and need no comparison
+    static const int m_maxTabBlocks = 32;
+    unsigned         m_tabBlock[m_maxTabBlocks];
+    uint64_t         m_tabStamp[m_maxTabBlocks];
+    int              m_tabNumBlocks = -1;   // -1: no valid stamps
 #endif
   private:
     const ScanElement *m_scanId2Pos;
@@ -779,6 +785,29 @@ namespace DQIntern
                                      : Ctx::GtxFlag[gtxSet[k] + chType]);
       sizes[4 + k] = numGtx;
     }
+    const CtxStore<BinProbModel_Std> &store = fracBitsAccess.ctxStore;
+    // same key and every block the models are in still has the stamp it had when they were compared: same models
+    if (key == m_tabKey && m_tabNumBlocks >= 0)
+    {
+      bool stampsSame = true;
+      for (int i = 0; i < m_tabNumBlocks && stampsSame; i++)
+      {
+        stampsSame = store.blockStamp(m_tabBlock[i] << CTX_BLOCK_LOG2) == m_tabStamp[i];
+      }
+      if (stampsSame)
+      {
+#ifdef DQSTAMP_CHECK
+        const uint8_t *chk = m_tabModels;
+        for (int i = 0; i < 8; i++)
+        {
+          const size_t bytes = sizes[i] * sizeof(BinProbModel_Std);
+          CHECK(::memcmp(chk, &store[sets[i]->Offset], bytes), "DepQuant rate tables: models changed under equal stamps");
+          chk += bytes;
+        }
+#endif
+        return true;
+      }
+    }
     bool     same  = (key == m_tabKey);
     uint8_t *saved = m_tabModels;
     for (int i = 0; i < 8; i++)
@@ -796,6 +825,24 @@ namespace DQIntern
       saved += bytes;
     }
     m_tabKey = key;
+    // the stamps of the blocks of the models just compared or saved (none valid if a block was written since its stamp)
+    m_tabNumBlocks = 0;
+    for (int i = 0; i < 8 && m_tabNumBlocks >= 0; i++)
+    {
+      const unsigned first = sets[i]->Offset >> CTX_BLOCK_LOG2;
+      const unsigned last  = (sets[i]->Offset + sizes[i] - 1) >> CTX_BLOCK_LOG2;
+      for (unsigned b = first; b <= last; b++)
+      {
+        const uint64_t stamp = store.blockStamp(b << CTX_BLOCK_LOG2);
+        if (stamp == 0 || m_tabNumBlocks == m_maxTabBlocks)
+        {
+          m_tabNumBlocks = -1;
+          break;
+        }
+        m_tabBlock[m_tabNumBlocks]   = b;
+        m_tabStamp[m_tabNumBlocks++] = stamp;
+      }
+    }
     return same;
   }
 #endif

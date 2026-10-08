@@ -1043,6 +1043,13 @@ public:
                                         unsigned  ctxId  )  const { return m_ctx[ctxId].estFracBits(bin); }
 
   BinFracBits         getFracBitsArray( unsigned  ctxId  )  const { return m_ctx[ctxId].getFracBitsArray(); }
+  // perf: the version stamp of the block that holds context ctxId -- equal non-zero stamps name equal block contents,
+  // in any store -- or 0 while the block has been written since it got its stamp
+  uint64_t            blockStamp      ( unsigned  ctxId  )  const
+  {
+    const unsigned b = ctxId >> CTX_BLOCK_LOG2;
+    return m_dirty[b] ? 0 : m_ver[b];
+  }
 
 private:
   inline void checkInit()
