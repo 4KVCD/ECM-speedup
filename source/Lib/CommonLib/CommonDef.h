@@ -2485,7 +2485,7 @@ static inline int getMSB(unsigned x)
 
 #if JVET_Z0056_GPM_SPLIT_MODE_REORDERING
 template <typename InputValueType, uint32_t inputValueArraySize, typename OutputIndexType, uint32_t outputIndexArraySize>
-static inline uint32_t getIndexMappingTableToSortedArray1D(InputValueType (&in)[inputValueArraySize], OutputIndexType (&tbl)[outputIndexArraySize])
+static inline uint32_t getIndexMappingTableToSortedArray1DInsert(InputValueType (&in)[inputValueArraySize], OutputIndexType (&tbl)[outputIndexArraySize])
 {
   uint32_t numValidInList = 1;
   InputValueType sortedlist[outputIndexArraySize];
@@ -2535,6 +2535,52 @@ static inline uint32_t getIndexMappingTableToSortedArray1D(InputValueType (&in)[
   }
 
   return numValidInList;
+}
+
+// The indices of the outputIndexArraySize smallest values of in[], in ascending order of value, equal values in index
+// order (a stable sort); returns how many there are. Entries of tbl[] past that are not written.
+template <typename InputValueType, uint32_t inputValueArraySize, typename OutputIndexType, uint32_t outputIndexArraySize>
+static inline uint32_t getIndexMappingTableToSortedArray1D(InputValueType (&in)[inputValueArraySize], OutputIndexType (&tbl)[outputIndexArraySize])
+{
+  if constexpr (std::is_same<InputValueType, uint32_t>::value && inputValueArraySize <= 256)
+  {
+    // perf: the same list from the rank of each (value, index) pair, counted without branches; the insertion
+    // above spends most of its time in mispredicted binary-search branches (64 GPM split modes per call)
+    int64_t key[inputValueArraySize];
+    for (uint32_t i = 0; i < inputValueArraySize; i++)
+    {
+      key[i] = ((int64_t) in[i] << 8) | i;   // distinct keys: the value, then the index
+    }
+    const uint32_t numValid = std::min(inputValueArraySize, outputIndexArraySize);
+#ifdef GEOSORT_CHECK
+    OutputIndexType ref[outputIndexArraySize];
+    const uint32_t  numRef = getIndexMappingTableToSortedArray1DInsert(in, ref);
+    CHECK(numRef != numValid, "GPM mode ranking: count differs");
+#endif
+    for (uint32_t i = 0; i < inputValueArraySize; i++)
+    {
+      uint32_t rank = 0;
+      for (uint32_t j = 0; j < inputValueArraySize; j++)
+      {
+        rank += key[j] < key[i];
+      }
+      if (rank < numValid)
+      {
+        tbl[rank] = (OutputIndexType) i;
+      }
+    }
+#ifdef GEOSORT_CHECK
+    for (uint32_t i = 0; i < numValid; i++)
+    {
+      CHECK(tbl[i] != ref[i], "GPM mode ranking: order differs");
+    }
+#endif
+    return numValid;
+  }
+  else
+  {
+    return getIndexMappingTableToSortedArray1DInsert(in, tbl);
+  }
 }
 #endif
 
