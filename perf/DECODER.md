@@ -201,6 +201,26 @@ single thread: AI FourPeople 1.16x, AI ParkJoy 1.14x, RA ParkJoy 1.16x, all 19 s
 (paired, 3 repetitions) AI FourPeople 1.32x, AI ParkJoy 1.32x, RA ParkJoy 1.47x, all 19 streams 1.47x wall time and
 1.42x CPU time (the short streams gain most from the faster start-up).
 
+Checks before the first push of this work (2026-10-08): a review of every commit; all 19 streams on the CPU-only build,
+the GPU build (on, verification, 8 and 16 frame threads, one picture at a time on 8 contexts, 8 segment workers,
+verification with 8 frame threads) and a build with libstdc++ assertions; 8- and 12-bit streams and CTU sizes 64 and
+256 in verification mode (identical to the stock decoder; ECM-20.0 itself crashes on the CTU-64 AI stream, the stock
+decoder as well); the CPU fallback without a usable device; the encoder suite, also in its decode-bitstream mode.
+The review of the threading and segment code found nine defects that only rare inputs reach; each fix is part of the
+commit that caused it:
+- frame threads: a second PPS of an SPS that changed kept PreCalcValues of the old SPS (now per SPS generation);
+  after an error the workers decoded the queued pictures while main() freed the PDP / MIP tables, and a failed picture
+  could be written before the error was reported; pictures waiting to be written could read a replaced SPS / PPS
+  (they are written before a parameter set NAL unit is decoded);
+- segments: a prefix SEI / APS between two slices of a picture became the start of the next picture unit (a segment
+  could end in the middle of a picture); temporary file names were the same for concurrent decodes of a stream and
+  were left behind when writing one failed; without -d children could write different bit depths (streams whose
+  SPSs differ are no longer split then); children did not reset the POC MSB of the stream's first CRA; a CRA whose
+  leading pictures are RADL was a direct split point although ECM resets its decode-order state only at the first
+  trailing picture;
+- the encoder's decode-bitstream mode read CCSAO CTU control from the shared entries, which the decoder no longer
+  filled (it does again when it does not decode in threads).
+
 ## Fixes found on the way
 
 - Decoding that starts at a CRA in the middle of an RA stream (`-s`, random access) crashed the stock decoder:
