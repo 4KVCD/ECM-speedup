@@ -223,10 +223,16 @@ uint32_t DecApp::decode()
               bPicSkipped = false;
             }
           }
-          // the pictures waiting to be written read their SPS and PPS, which a new parameter set may replace
+          // the pictures waiting to be written read their SPS and PPS, which a new parameter set may replace; a
+          // repetition of the last SPS / PPS (all-intra streams repeat them before every picture) replaces nothing
           if( m_cDecLib.isFrameThreaded() && ( nalu.m_nalUnitType == NAL_UNIT_SPS || nalu.m_nalUnitType == NAL_UNIT_PPS ) )
           {
-            xProcessOutputQueue( true );
+            std::vector<uint8_t>& last = m_lastParamSetNal[nalu.m_nalUnitType == NAL_UNIT_SPS ? 0 : 1];
+            if( nalu.getBitstream().getFifo() != last )
+            {
+              xProcessOutputQueue( true );
+              last = nalu.getBitstream().getFifo();
+            }
           }
 
 #if JVET_Z0118_GDR

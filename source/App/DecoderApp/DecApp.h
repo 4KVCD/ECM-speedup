@@ -76,6 +76,7 @@ private:
   std::unordered_map<const Picture*, int> m_segmentDecodeIdx;
   int             m_segmentDecodedPics = 0;
   bool            m_segmentPicWritten  = false;
+  std::vector<uint8_t> m_lastParamSetNal[2];   ///< frame threading: the last SPS / PPS NAL (a repeated one needs no drain)
 
   // decoding in threads: pictures to write, in output order, once they are decoded
   struct OutputEntry
