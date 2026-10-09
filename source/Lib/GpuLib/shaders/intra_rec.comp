@@ -5,6 +5,8 @@
 // reconstruction, map update. Every step follows the C++ of IntraPrediction / Quant / TrQuant / DecCu.
 // Not yet: MRL, ISP, MIP, the intra bilateral filter, LFNST / MTS / transform skip, decoder-side intra modes.
 #extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
 #include "common.glsl"
 
 layout( local_size_x = 256 ) in;
@@ -115,176 +117,150 @@ int asPel( int v )   // the int16 Pel the CPU stores
   return int( int16_t( v ) );
 }
 
-// isAboveAvailable & co.: units from (px, py) in steps (dx, dy), flags from flagIdx in direction flagDir; stops at
-// the first unit that is not decoded
-int scanUnits( int ch, int px, int py, int dx, int dy, int num, int flagIdx, int flagDir )
-{
-  int n = 0;
-  for( int k = 0; k < num; k++ )
-  {
-    if( !isDecomp( ch, px + k * dx, py + k * dy ) )
-    {
-      break;
-    }
-    s_flags[flagIdx + k * flagDir] = 1;
-    n++;
-  }
-  return n;
-}
+// xFillReferenceSamples, all invocations (multiRefIdx 0 or 1, so no MRL units: lMU = aMU = 0). The CPU's padding is
+// "an unavailable unit takes the scan-order nearest available sample before it (the bottom-left unit first, up the
+// left column, the corner, along the top), units before the first available one take its first sample"; the units
+// are checked in parallel (with the early stop of isAboveAvailable & co. per group), the nearest available unit
+// before each unit comes from a subgroup prefix maximum, and every sample is then fetched by its own invocation.
+shared int s_avail[2 * 256 + 4];   // per unit: 1 available
+shared int s_prev[2 * 256 + 4];    // per unit: the nearest available unit at or before it, -1 if none
+shared int s_carry[64];
+shared int s_fail[4];
+shared int s_firstAvail;
 
-// IntraPrediction::xFillReferenceSamples into reference line `line` with multiRefIdx mrl (thread 0)
-void fillReference( Tu t, int line, int mrl )
+void fillReferencePar( Tu t, int line, int mrl, int lid, int NT )
 {
   const int ch        = t.comp == 0 ? 0 : 1;
   const int predSize  = t.w << 3, predHSize = t.h << 3;
   const int predStride = predSize + 1 + mrl;
   const int uW = t.unitW, uH = t.unitH;
-  const int lMU = mrl / uH, aMU = mrl / uW;
-  const int tAU = ( predSize + ( uW - 1 ) ) / uW;
-  const int tLU = ( predHSize + ( uH - 1 ) ) / uH;
-  const int totalUnits = tAU + tLU + 1 + lMU + aMU;
-  const int numAboveUnits = max( t.w / uW, 1 ), numLeftUnits = max( t.h / uH, 1 );
-  const int numAboveRightUnits = tAU - numAboveUnits, numLeftBelowUnits = tLU - numLeftUnits;
-  for( int i = 0; i < totalUnits; i++ )
-  {
-    s_flags[i] = 0;
-  }
-  int n = 0;
-  if( isDecomp( ch, t.x - mrl - 1, t.y - mrl - 1 ) )
-  {
-    s_flags[tLU + lMU] = 1;
-    n++;
-  }
-  n += scanUnits( ch, t.x - aMU * uW, t.y - mrl - 1, uW, 0, aMU, tLU + 1 + lMU, 1 );
-  n += scanUnits( ch, t.x - mrl - 1, t.y - lMU * uH, 0, uH, lMU, tLU - 1 + lMU, -1 );
-  n += scanUnits( ch, t.x, t.y - mrl - 1, uW, 0, numAboveUnits, tLU + 1 + lMU + aMU, 1 );
-  n += scanUnits( ch, t.x + t.w - 1 + uW, t.y - mrl - 1, uW, 0, numAboveRightUnits, tLU + 1 + lMU + aMU + numAboveUnits, 1 );
-  n += scanUnits( ch, t.x - mrl - 1, t.y, 0, uH, numLeftUnits, tLU - 1, -1 );
-  n += scanUnits( ch, t.x - mrl - 1, t.y + t.h - 1 + uH, 0, uH, numLeftBelowUnits, tLU - 1 - numLeftUnits, -1 );
+  const int tAU = predSize / uW, tLU = predHSize / uH;   // multiples (8x the block size)
+  const int totalUnits = tAU + tLU + 1;
+  const int numAbove = max( t.w / uW, 1 ), numLeft = max( t.h / uH, 1 );
+  const int numAboveRight = tAU - numAbove, numBelowLeft = tLU - numLeft;
+  const int x0 = t.x - 1 - mrl, y0 = t.y - 1 - mrl;
 
-  const int x0 = t.x - 1 - mrl, y0 = t.y - 1 - mrl;   // ptrSrc
+  if( lid < 4 )
+  {
+    s_fail[lid] = 1 << 20;
+  }
+  if( lid == 0 )
+  {
+    s_firstAvail = 1 << 20;
+  }
+  barrier();
+  // decoded flags per unit; group g: 0 above, 1 above-right, 2 left, 3 below-left; k = position in the group
+  for( int u = lid; u < totalUnits; u += NT )
+  {
+    int px, py, g = -1, k = 0;
+    if( u == tLU )
+    {
+      px = x0; py = y0;
+    }
+    else if( u > tLU )
+    {
+      int a = u - tLU - 1;
+      if( a < numAbove ) { g = 0; k = a; px = t.x + a * uW; }
+      else { g = 1; k = a - numAbove; px = t.x + t.w - 1 + uW + k * uW; }
+      py = y0;
+    }
+    else
+    {
+      int l = tLU - 1 - u;
+      if( l < numLeft ) { g = 2; k = l; py = t.y + l * uH; }
+      else { g = 3; k = l - numLeft; py = t.y + t.h - 1 + uH + k * uH; }
+      px = x0;
+    }
+    const bool d = isDecomp( ch, px, py );
+    s_avail[u] = ( d ? 1 : 0 ) | ( ( g + 1 ) << 1 ) | ( k << 4 );
+    if( !d && g >= 0 )
+    {
+      atomicMin( s_fail[g], k );
+    }
+  }
+  barrier();
+  // early stop per group; prefix maximum of the available unit indices (per subgroup, then across subgroups)
+  const int numChunks = ( totalUnits + int( gl_SubgroupSize ) - 1 ) / int( gl_SubgroupSize );
+  for( int base = 0; base < numChunks * int( gl_SubgroupSize ); base += NT )
+  {
+    const int u = base + lid;
+    int a = 0;
+    if( u < totalUnits )
+    {
+      const int v = s_avail[u], g = ( ( v >> 1 ) & 7 ) - 1, k = v >> 4;
+      a = ( v & 1 ) != 0 && ( g < 0 || k < s_fail[g] ) ? 1 : 0;
+    }
+    const int m = subgroupInclusiveMax( a != 0 ? u : -1 );
+    if( u < totalUnits )
+    {
+      s_prev[u] = m;
+      if( a != 0 ) atomicMin( s_firstAvail, u );
+    }
+    if( gl_SubgroupInvocationID == gl_SubgroupSize - 1 && u / int( gl_SubgroupSize ) < 64 )
+    {
+      s_carry[u / int( gl_SubgroupSize )] = m;
+    }
+  }
+  barrier();
+  if( lid == 0 )
+  {
+    int c = -1;
+    for( int i = 0; i < numChunks; i++ )
+    {
+      const int m = s_carry[i];
+      s_carry[i] = c;   // the maximum before chunk i
+      c = max( c, m );
+    }
+  }
+  barrier();
+  const int firstAvail = s_firstAvail;
   const int valueDC = 1 << ( t.bitDepth - 1 );
-  if( n == 0 )
+  // samples: top j in [0, predSize + mrl], then left i in [0, predHSize + mrl]
+  const int numTop = predSize + mrl + 1;
+  for( int e = lid; e < numTop + predHSize + mrl + 1; e += NT )
   {
-    for( int j = 0; j <= predSize + mrl; j++ ) s_ref[line][j] = int16_t( valueDC );
-    for( int i = 0; i <= predHSize + mrl; i++ ) s_ref[line][i + predStride] = int16_t( valueDC );
-  }
-  else if( n == totalUnits )
-  {
-    for( int j = 0; j <= predSize + mrl; j++ ) s_ref[line][j] = int16_t( recoAt( t.comp, x0 + j, y0 ) );
-    for( int i = 0; i <= predHSize + mrl; i++ ) s_ref[line][i + predStride] = int16_t( recoAt( t.comp, x0, y0 + i ) );
-  }
-  else
-  {
-    if( s_flags[tLU + lMU] != 0 )
+    const bool top = e < numTop;
+    const int idx = top ? e : e - numTop;
+    int u = idx <= mrl ? tLU : top ? tLU + 1 + ( idx - 1 - mrl ) / uW : tLU - 1 - ( idx - 1 - mrl ) / uH;
+    int v;
+    if( firstAvail >= totalUnits )
     {
-      s_ref[line][0]          = int16_t( recoAt( t.comp, x0, y0 ) );
-      s_ref[line][predStride] = s_ref[line][0];
-      for( int i = 1; i <= mrl - lMU * uH; i++ )
-      {
-        s_ref[line][i]              = int16_t( recoAt( t.comp, x0 + i, y0 ) );
-        s_ref[line][i + predStride] = int16_t( recoAt( t.comp, x0, y0 + i ) );
-      }
+      v = valueDC;
     }
+    else
     {
-      int sy = y0 + 1 + mrl - lMU * uH;
-      int d  = ( 1 + mrl - lMU * uH ) + predStride;
-      for( int unitIdx = tLU + lMU - 1; unitIdx > 0; unitIdx-- )
+      const int pm = max( s_prev[u], s_carry[u / int( gl_SubgroupSize )] );
+      int sx, sy;
+      if( pm == u )   // available: its own sample
       {
-        if( s_flags[unitIdx] != 0 )
-        {
-          for( int i = 0; i < uH; i++ ) s_ref[line][d + i] = int16_t( recoAt( t.comp, x0, sy + i ) );
-        }
-        sy += uH;
-        d += uH;
-      }
-      if( s_flags[0] != 0 )
-      {
-        int lastSample = ( predHSize % uH == 0 ) ? uH : predHSize % uH;
-        for( int i = 0; i < lastSample; i++ ) s_ref[line][d + i] = int16_t( recoAt( t.comp, x0, sy + i ) );
-      }
-    }
-    {
-      int sx = t.x - aMU * uW;
-      int d  = 1 + mrl - aMU * uW;
-      for( int unitIdx = tLU + lMU + 1; unitIdx < totalUnits - 1; unitIdx++ )
-      {
-        if( s_flags[unitIdx] != 0 )
-        {
-          for( int j = 0; j < uW; j++ ) s_ref[line][d + j] = int16_t( recoAt( t.comp, sx + j, y0 ) );
-        }
-        sx += uW;
-        d += uW;
-      }
-      if( s_flags[totalUnits - 1] != 0 )
-      {
-        int lastSample = ( predSize % uW == 0 ) ? uW : predSize % uW;
-        for( int j = 0; j < lastSample; j++ ) s_ref[line][d + j] = int16_t( recoAt( t.comp, sx + j, y0 ) );
-      }
-    }
-    int lastAvailUnit = 0;
-    if( s_flags[0] == 0 )
-    {
-      int firstAvailUnit = 1;
-      while( firstAvailUnit < totalUnits && s_flags[firstAvailUnit] == 0 ) firstAvailUnit++;
-      int firstAvailRow = -1, firstAvailCol = 0;
-      if( firstAvailUnit < tLU + lMU )
-      {
-        firstAvailRow = ( tLU + lMU - firstAvailUnit ) * uH + mrl - lMU * uH;
-      }
-      else if( firstAvailUnit == tLU + lMU )
-      {
-        firstAvailRow = mrl - lMU * uH;
+        sx = top ? x0 + idx : x0;
+        sy = top ? y0 : y0 + idx;
       }
       else
       {
-        firstAvailCol = ( firstAvailUnit - tLU - lMU - 1 ) * uW + 1 + mrl - aMU * uW;
-      }
-      const int16_t firstAvailSample = s_ref[line][firstAvailRow < 0 ? firstAvailCol : firstAvailRow + predStride];
-      for( int i = predHSize + mrl; i > firstAvailRow; i-- ) s_ref[line][i + predStride] = firstAvailSample;
-      if( firstAvailCol > 0 )
-      {
-        for( int j = 0; j < firstAvailCol; j++ ) s_ref[line][j] = firstAvailSample;
-      }
-      lastAvailUnit = firstAvailUnit;
-    }
-    int currUnit = lastAvailUnit + 1;
-    while( currUnit < totalUnits )
-    {
-      if( s_flags[currUnit] == 0 )
-      {
-        int lastAvailRow = -1, lastAvailCol = 0;
-        if( lastAvailUnit < tLU + lMU )
+        const bool before = pm >= 0;    // the last sample of the unit before, else the first of the first available
+        const int s = before ? pm : firstAvail;
+        if( s == tLU )
         {
-          lastAvailRow = ( tLU + lMU - lastAvailUnit - 1 ) * uH + mrl - lMU * uH + 1;
+          sx = before ? x0 + mrl : x0;
+          sy = before ? y0 : y0 + mrl;
         }
-        else if( lastAvailUnit == tLU + lMU )
+        else if( s > tLU )
         {
-          lastAvailCol = mrl - lMU * uH;
+          const int j = before ? ( s - tLU ) * uW + mrl : ( s - tLU - 1 ) * uW + 1 + mrl;
+          sx = x0 + j;
+          sy = y0;
         }
         else
         {
-          lastAvailCol = ( lastAvailUnit - tLU - lMU ) * uW + mrl - aMU * uW;
-        }
-        const int16_t lastAvailSample = s_ref[line][lastAvailRow < 0 ? lastAvailCol : lastAvailRow + predStride];
-        if( currUnit < tLU + lMU )
-        {
-          for( int i = lastAvailRow - 1; i >= lastAvailRow - uH; i-- ) s_ref[line][i + predStride] = lastAvailSample;
-        }
-        else if( currUnit == tLU + lMU )
-        {
-          for( int i = 0; i < mrl - lMU * uH + 1; i++ ) s_ref[line][i + predStride] = lastAvailSample;
-          for( int j = 0; j < mrl - aMU * uW + 1; j++ ) s_ref[line][j] = lastAvailSample;
-        }
-        else
-        {
-          int nsu = ( currUnit == totalUnits - 1 ) ? ( ( predSize % uW == 0 ) ? uW : predSize % uW ) : uW;
-          for( int j = lastAvailCol + 1; j <= lastAvailCol + nsu; j++ ) s_ref[line][j] = lastAvailSample;
+          const int i = before ? ( tLU - s - 1 ) * uH + 1 + mrl : ( tLU - s ) * uH + mrl;
+          sx = x0;
+          sy = y0 + i;
         }
       }
-      lastAvailUnit = currUnit;
-      currUnit++;
+      v = recoAt( t.comp, sx, sy );
     }
+    s_ref[line][top ? idx : idx + predStride] = int16_t( v );
   }
 }
 
@@ -335,13 +311,11 @@ void main()
     const bool fusion = t.fusion != 0;
 
     // ----- reference samples (and the second line of intra fusion)
-    if( lid == 0 )
+    fillReferencePar( t, 0, 0, lid, NT );
+    if( fusion )
     {
-      fillReference( t, 0, 0 );
-      if( fusion )
-      {
-        fillReference( t, 1, 1 );
-      }
+      barrier();
+      fillReferencePar( t, 1, 1, lid, NT );
     }
     barrier();
     if( t.refFilter != 0 )   // xFilterReferenceSamples (multiRefIdx 0), in place
