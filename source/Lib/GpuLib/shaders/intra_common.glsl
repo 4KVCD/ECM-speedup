@@ -38,7 +38,7 @@ struct Params
   uint64_t depOffset;   // int32 per block + 1: its dependents in depList
   uint64_t depList;     // int32: the blocks reading samples of a block
   uint64_t queue;       // int32 per position: the ready blocks in the order they became ready (-1: not yet)
-  uint64_t counter;     // int32 [2]: the next queue position to take, the next queue position to fill
+  uint64_t counter;     // int32 [3]: the next queue position to take, the next to fill, the reconstructed blocks
   int      origin[3];
   int      stride[3];
   int      width[3];

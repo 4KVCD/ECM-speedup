@@ -35,6 +35,8 @@ shared int16_t s_angA[2][ANG];                // refAbove, refAbove2nd
 shared int16_t s_angL[2][ANG];                // refLeft, refLeft2nd
 shared int     s_dc;
 shared int     s_ti;
+shared int     s_next;                        // a dependent this workgroup released and continues with (-1: none)
+shared int     s_deps[256];                   // the first dependents of the block (prefetched)
 
 Params P;      // the parameter block (loaded once)
 int    g_ti;   // the block being reconstructed
@@ -199,20 +201,40 @@ void main()
     s_angA[0][i] = int16_t( 0 ); s_angL[0][i] = int16_t( 0 );
     s_angA[1][i] = int16_t( 0 ); s_angL[1][i] = int16_t( 0 );
   }
+  if( lid == 0 )
+  {
+    s_next = -1;
+  }
   for( ;; )
   {
-    // the next ready block: a queue position, then (once filled) the block at it
+    // the next block: the dependent this workgroup released last, else a queue position and (once filled) the
+    // block at it; blocks handed over directly never enter the queue, so a position may stay empty: the workgroup
+    // stops when all blocks are reconstructed
     SYNC();
     if( lid == 0 )
     {
-      const int pos = atomicAdd( CBufI32( P.counter ).v[0], 1 );
-      int b = pc.numTus;
-      if( pos < pc.numTus )
+      int b = s_next;
+      s_next = -1;
+      if( b < 0 )
       {
-        do
+        b = pc.numTus;
+        const int pos = atomicAdd( CBufI32( P.counter ).v[0], 1 );
+        if( pos < pc.numTus )
         {
-          b = atomicLoad( CBufI32( P.queue ).v[pos], gl_ScopeQueueFamily, gl_StorageSemanticsBuffer, gl_SemanticsAcquire );
-        } while( b < 0 );
+          for( ;; )
+          {
+            const int q = atomicLoad( CBufI32( P.queue ).v[pos], gl_ScopeQueueFamily, gl_StorageSemanticsBuffer, gl_SemanticsAcquire );
+            if( q >= 0 )
+            {
+              b = q;
+              break;
+            }
+            if( atomicLoad( CBufI32( P.counter ).v[2], gl_ScopeQueueFamily, 0, gl_SemanticsRelaxed ) >= pc.numTus )
+            {
+              break;
+            }
+          }
+        }
       }
       s_ti = b;
     }
@@ -223,6 +245,12 @@ void main()
       break;
     }
     Tu t = BufTu( P.tus ).v[g_ti];
+    // the dependents, prefetched (their release ends the block)
+    const int d0 = BufI32( P.depOffset ).v[g_ti], d1 = BufI32( P.depOffset ).v[g_ti + 1];
+    if( lid < d1 - d0 )
+    {
+      s_deps[lid] = BufI32( P.depList ).v[d0 + lid];
+    }
     int  angClear  = 0;
     bool angClear2 = false;
     const int W = t.w, H = t.h, N = W * H;
@@ -508,19 +536,24 @@ void main()
     SYNC();
 
     // the block's samples (device-coherent stores of all invocations) happen before its dependents are released:
-    // the last dependency of a block to finish queues it
+    // the last dependency of a block to finish takes it over (one per block, the workgroup continues with it) or
+    // queues it
     controlBarrier( gl_ScopeWorkgroup, gl_ScopeQueueFamily, gl_StorageSemanticsBuffer, gl_SemanticsAcquireRelease );
+    for( int k = lid; k < d1 - d0; k += NT )
     {
-      const int d0 = BufI32( P.depOffset ).v[g_ti], d1 = BufI32( P.depOffset ).v[g_ti + 1];
-      for( int k = d0 + lid; k < d1; k += NT )
+      const int d = k < 256 ? s_deps[k] : BufI32( P.depList ).v[d0 + k];
+      if( atomicAdd( CBufI32( P.depCount ).v[d], -1, gl_ScopeQueueFamily, gl_StorageSemanticsBuffer, gl_SemanticsAcquireRelease ) == 1 )
       {
-        const int d = BufI32( P.depList ).v[k];
-        if( atomicAdd( CBufI32( P.depCount ).v[d], -1, gl_ScopeQueueFamily, gl_StorageSemanticsBuffer, gl_SemanticsAcquireRelease ) == 1 )
+        if( atomicCompSwap( s_next, -1, d ) != -1 )
         {
           const int pos = atomicAdd( CBufI32( P.counter ).v[1], 1 );
           atomicStore( CBufI32( P.queue ).v[pos], d, gl_ScopeQueueFamily, gl_StorageSemanticsBuffer, gl_SemanticsRelease );
         }
       }
+    }
+    if( lid == 0 )
+    {
+      atomicAdd( CBufI32( P.counter ).v[2], 1 );   // reconstructed blocks
     }
     for( int i = lid; i < angClear; i += NT )
     {

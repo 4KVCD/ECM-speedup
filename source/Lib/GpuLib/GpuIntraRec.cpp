@@ -602,19 +602,19 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
     }
   }
   // the scheduling data: pending counts, the dependents of each block (CSR), the queue seeded with the blocks
-  // without dependencies, the two queue counters
+  // without dependencies, the queue counters and the count of reconstructed blocks
   std::vector<int32_t> sched;
   {
     std::vector<int32_t> numDependents( numTus + 1, 0 );
     for( int i = 0; i < numTus; i++ ) for( int d: deps[i] ) numDependents[d + 1]++;
-    sched.resize( size_t( numTus ) * 3 + 1 + numDependents.size() + 2 );
+    sched.resize( size_t( numTus ) * 3 + 1 + numDependents.size() + 3 );
     int32_t* depCount = sched.data();
     int32_t* depOffset = depCount + numTus;
     for( int i = 0; i < numTus; i++ ) depCount[i] = (int32_t) deps[i].size();
     depOffset[0] = 0;
     for( int i = 0; i < numTus; i++ ) depOffset[i + 1] = depOffset[i] + numDependents[i + 1];
     const int numEdges = depOffset[numTus];
-    sched.resize( size_t( numTus ) * 2 + 1 + numEdges + numTus + 2 );
+    sched.resize( size_t( numTus ) * 2 + 1 + numEdges + numTus + 3 );
     depCount  = sched.data();
     depOffset = depCount + numTus;
     int32_t* depList = depOffset + numTus + 1;
@@ -627,6 +627,7 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
     for( int i = 0; i < numTus; i++ ) if( depCount[i] == 0 ) queue[numReady++] = i;
     counter[0] = 0;
     counter[1] = numReady;
+    counter[2] = 0;
   }
   const size_t schedBytes = sched.size() * 4;
   const size_t tuBytes = m.rec.size() * sizeof( Tu ), coefBytes = m.coef.size() * 4, dbgBytes = m.cpuPred.size() * 2;
@@ -644,7 +645,7 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
   P.dbgPred  = m.dbgPred.addr;
   P.dbgResi  = m.dbgResi.addr;
   {
-    size_t numEdges = sched.size() - ( size_t( numTus ) * 3 + 1 + 2 );
+    size_t numEdges = sched.size() - ( size_t( numTus ) * 3 + 1 + 3 );
     P.depCount  = m.sched.addr;
     P.depOffset = P.depCount + size_t( numTus ) * 4;
     P.depList   = P.depOffset + ( size_t( numTus ) + 1 ) * 4;
