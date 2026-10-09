@@ -38,6 +38,7 @@
 #include "GpuIntraRec.h"
 #include "VkCompute.h"
 
+#include <algorithm>
 #include <mutex>
 
 #include "CommonLib/CodingStructure.h"
@@ -51,6 +52,8 @@
 
 #include "intra_rec.spv.h"
 #include "intra_resi.spv.h"
+#include "intra_deps.spv.h"
+#include "scan.spv.h"
 
 #include <cstddef>
 #include <cstdio>
@@ -99,6 +102,9 @@ struct Params
   uint64_t depList;
   uint64_t queue;
   uint64_t counter;
+  uint64_t depStart;
+  uint64_t depTmp;
+  uint64_t numDep;
   int32_t  origin[3];
   int32_t  stride[3];
   int32_t  width[3];
@@ -108,15 +114,24 @@ struct Params
   int32_t  unitLog2X[2];
   int32_t  unitLog2Y[2];
   int32_t  matrixOffset[8];
+  int32_t  edgeCap;
+  int32_t  pad;
 };
-static_assert( offsetof( Params, origin ) == 144 && offsetof( Params, matrixOffset ) == 224 && sizeof( Params ) == 256,
+static_assert( offsetof( Params, origin ) == 168 && offsetof( Params, matrixOffset ) == 248 && sizeof( Params ) == 288,
                "Params layout" );
 
 struct Push
 {
   uint64_t params;
   int32_t  numTus;
-  int32_t  verify;
+  int32_t  verify;   // intra_deps: the pass
+};
+
+struct PushScan
+{
+  uint64_t src, dst;
+  int32_t  n;
+  int32_t  pad;
 };
 
 constexpr int FILTER_TAPS[5] = { 6, 8, 10, 12, 16 };
@@ -127,7 +142,7 @@ constexpr int RESI_GROUPS    = 256;
 // threads); never destroyed, like the device
 struct Shared
 {
-  gpu::Kernel                      kernel, kernelResi;
+  gpu::Kernel                      kernel, kernelResi, kernelDeps, kernelScan;
   gpu::Buffer                      filters, matrices;
   int32_t                          matrixOffset[8] = {};
   std::unique_ptr<BilateralFilter> bif;   // the intra prediction bilateral filter's tables
@@ -138,6 +153,8 @@ Shared* createShared( gpu::Context& ctx )
   Shared* sh = new Shared;
   sh->kernel.create( ctx, spv_intra_rec, sizeof( spv_intra_rec ), sizeof( Push ), "intra_rec" );
   sh->kernelResi.create( ctx, spv_intra_resi, sizeof( spv_intra_resi ), sizeof( Push ), "intra_resi" );
+  sh->kernelDeps.create( ctx, spv_intra_deps, sizeof( spv_intra_deps ), sizeof( Push ), "intra_deps" );
+  sh->kernelScan.create( ctx, spv_scan, sizeof( spv_scan ), sizeof( PushScan ), "scan" );
 
   // tables, from the C++ tables themselves
   sh->bif.reset( new BilateralFilter );   // BilateralFilter::create derives the LUTs
@@ -213,6 +230,7 @@ struct GpuIntraRec::Impl
   gpu::Buffer                 scratch;
   gpu::Buffer                 params, tus, coeffs, planes[3], owner[3], sched, dbgPred, dbgResi;
   int                         numGroups = 0;
+  size_t                      edgeCap   = 0;   // dependency edges per picture the scheduling buffer holds
   gpu::Buffer                 upload, download;
 
   // the picture being recorded
@@ -577,12 +595,15 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
     P.ownerW[ch]    = ( P.width[ch] + ( 1 << sx ) - 1 ) >> sx;
     P.ownerH[ch]    = ( P.height[ch] + ( 1 << sy ) - 1 ) >> sy;
   }
-  for( int c = 0; c < numComp; c++ )
+  // with the reconstruction on, intra_deps computes the owner maps and the scheduling data on the GPU; verification
+  // computes them here too and compares
+  const bool hostDeps = !m.on;
+  for( int c = 0; c < numComp && hostDeps; c++ )
   {
     const int ch = c == 0 ? 0 : 1;
     ownerMap[c].assign( size_t( P.ownerW[ch] ) * P.ownerH[ch], -1 );
   }
-  for( size_t r = 0; r < m.rec.size(); r++ )
+  for( size_t r = 0; r < m.rec.size() && hostDeps; r++ )
   {
     const Tu& t  = m.rec[r];
     const int ch = t.comp == 0 ? 0 : 1;
@@ -596,7 +617,8 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
   }
   for( int c = 0; c < numComp; c++ )
   {
-    ownerBytes[c] = ownerMap[c].size() * 4;
+    const int ch  = c == 0 ? 0 : 1;
+    ownerBytes[c] = size_t( P.ownerW[ch] ) * P.ownerH[ch] * 4;
     m.owner[c].ensure( ctx, ownerBytes[c], gpu::Buffer::DEVICE );
     P.owner[c] = m.owner[c].addr;
   }
@@ -609,7 +631,7 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
   {
     constexpr int PAD = 6;   // interpFilterNumPadded
     std::vector<int> mark( numTus, -1 );
-    for( int i = 0; i < numTus; i++ )
+    for( int i = 0; i < numTus && hostDeps; i++ )
     {
       Tu&       t  = m.rec[i];
       const int ch = t.comp == 0 ? 0 : 1;
@@ -823,39 +845,19 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
       }
     }
   }
-  // the scheduling data: pending counts, the dependents of each block (CSR), the queue seeded with the blocks
-  // without dependencies, the queue counters and the count of reconstructed blocks
-  std::vector<int32_t> sched;
-  {
-    std::vector<int32_t> numDependents( numTus + 1, 0 );
-    for( int i = 0; i < numTus; i++ ) for( int d: deps[i] ) numDependents[d + 1]++;
-    sched.resize( size_t( numTus ) * 3 + 1 + numDependents.size() + 3 );
-    int32_t* depCount = sched.data();
-    int32_t* depOffset = depCount + numTus;
-    for( int i = 0; i < numTus; i++ ) depCount[i] = (int32_t) deps[i].size();
-    depOffset[0] = 0;
-    for( int i = 0; i < numTus; i++ ) depOffset[i + 1] = depOffset[i] + numDependents[i + 1];
-    const int numEdges = depOffset[numTus];
-    sched.resize( size_t( numTus ) * 2 + 1 + numEdges + numTus + 3 );
-    depCount  = sched.data();
-    depOffset = depCount + numTus;
-    int32_t* depList = depOffset + numTus + 1;
-    int32_t* queue   = depList + numEdges;
-    int32_t* counter = queue + numTus;
-    std::vector<int32_t> fillPos( depOffset, depOffset + numTus );
-    for( int i = 0; i < numTus; i++ ) for( int d: deps[i] ) depList[fillPos[d]++] = i;
-    int numReady = 0;
-    for( int i = 0; i < numTus; i++ ) queue[i] = -1;
-    for( int i = 0; i < numTus; i++ ) if( depCount[i] == 0 ) queue[numReady++] = i;
-    counter[0] = 0;
-    counter[1] = numReady;
-    counter[2] = 0;
-  }
-  const size_t schedBytes = sched.size() * 4;
+  double         ms      = 0;
+  const int16_t* gPlanes = nullptr;   // the downloaded results
+  const int16_t* gPredDl = nullptr;
+  const Tu*      gTusDl  = nullptr;
+  const int32_t* gOffDl  = nullptr;
+  const int32_t* gListDl = nullptr;
+  // the scheduling buffer (intra_deps fills it): pending counts, the dependents of each block (CSR, edgeCap entries),
+  // the queue, the counters, then intra_deps' own arrays
+  const size_t n = size_t( numTus );
+  m.edgeCap      = std::max( m.edgeCap, n * 8 );
   const size_t tuBytes = m.rec.size() * sizeof( Tu ), coefBytes = m.coef.size() * 4, dbgBytes = m.numSamples * 2;
   m.tus.ensure( ctx, tuBytes, gpu::Buffer::DEVICE );
   m.coeffs.ensure( ctx, std::max<size_t>( coefBytes, 4 ), gpu::Buffer::DEVICE );
-  m.sched.ensure( ctx, schedBytes, gpu::Buffer::DEVICE );
   m.dbgPred.ensure( ctx, dbgBytes, gpu::Buffer::DEVICE );
   m.dbgResi.ensure( ctx, dbgBytes, gpu::Buffer::DEVICE );
   P.tus      = m.tus.addr;
@@ -866,88 +868,128 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
   P.scratch  = m.scratch.addr;
   P.dbgPred  = m.dbgPred.addr;
   P.dbgResi  = m.dbgResi.addr;
-  {
-    size_t numEdges = sched.size() - ( size_t( numTus ) * 3 + 1 + 3 );
-    P.depCount  = m.sched.addr;
-    P.depOffset = P.depCount + size_t( numTus ) * 4;
-    P.depList   = P.depOffset + ( size_t( numTus ) + 1 ) * 4;
-    P.queue     = P.depList + numEdges * 4;
-    P.counter   = P.queue + size_t( numTus ) * 4;
-  }
 
-  size_t upBytes = sizeof( Params ) + tuBytes + coefBytes + schedBytes;
-  for( int c = 0; c < numComp; c++ )
+  for( ;; )   // once, again with more room when the dependencies do not fit
   {
-    upBytes += ownerBytes[c];
-  }
-  m.upload.ensure( ctx, upBytes, gpu::Buffer::UPLOAD );
-  size_t up = 0;
-  memcpy( (char*) m.upload.mapped + up, &P, sizeof( Params ) );
-  up += sizeof( Params );
-  memcpy( (char*) m.upload.mapped + up, m.rec.data(), tuBytes );
-  up += tuBytes;
-  memcpy( (char*) m.upload.mapped + up, m.coef.data(), coefBytes );
-  up += coefBytes;
-  for( int c = 0; c < numComp; c++ )
-  {
-    memcpy( (char*) m.upload.mapped + up, ownerMap[c].data(), ownerBytes[c] );
-    up += ownerBytes[c];
-  }
-  memcpy( (char*) m.upload.mapped + up, sched.data(), schedBytes );
-  size_t downBytes = m.on ? 0 : 2 * dbgBytes;
-  for( int c = 0; c < numComp; c++ )
-  {
-    downBytes += planeBytes[c];
-  }
-  m.download.ensure( ctx, downBytes, gpu::Buffer::DOWNLOAD );
+    const size_t cap = m.edgeCap;
+    size_t       schedInts = 0;
+    auto take = [&]( size_t ints ) { const size_t o = schedInts; schedInts += ints; return o; };
+    const size_t oCount = take( n ), oOffset = take( n + 1 ), oList = take( cap ), oQueue = take( n ), oCounter = take( 4 );
+    const size_t oStart = take( n + 1 ), oTmp = take( cap ), oNumDep = take( n );
+    m.sched.ensure( ctx, schedInts * 4, gpu::Buffer::DEVICE );
+    P.depCount  = m.sched.addr + oCount * 4;
+    P.depOffset = m.sched.addr + oOffset * 4;
+    P.depList   = m.sched.addr + oList * 4;
+    P.queue     = m.sched.addr + oQueue * 4;
+    P.counter   = m.sched.addr + oCounter * 4;
+    P.depStart  = m.sched.addr + oStart * 4;
+    P.depTmp    = m.sched.addr + oTmp * 4;
+    P.numDep    = m.sched.addr + oNumDep * 4;
+    P.edgeCap   = (int32_t) cap;
 
-  gpu::Stream& s = *m.stream;
-  s.begin();
-  up = 0;
-  s.copy( m.upload, up, m.params, 0, sizeof( Params ) );
-  up += sizeof( Params );
-  s.copy( m.upload, up, m.tus, 0, tuBytes );
-  up += tuBytes;
-  if( coefBytes )
-  {
-    s.copy( m.upload, up, m.coeffs, 0, coefBytes );
+    const size_t upBytes = sizeof( Params ) + tuBytes + coefBytes;
+    m.upload.ensure( ctx, upBytes, gpu::Buffer::UPLOAD );
+    memcpy( m.upload.mapped, &P, sizeof( Params ) );
+    memcpy( (char*) m.upload.mapped + sizeof( Params ), m.rec.data(), tuBytes );
+    memcpy( (char*) m.upload.mapped + sizeof( Params ) + tuBytes, m.coef.data(), coefBytes );
+    // downloaded: the dependency count (overflow check), with verification the CPU comparison data and the GPU's
+    // scheduling data, then the planes
+    size_t downBytes = 8;
+    const size_t dPred = downBytes, dResi = dPred + dbgBytes, dTus = dResi + dbgBytes, dOffset = dTus + tuBytes;
+    const size_t dList = dOffset + ( n + 1 ) * 4;
+    if( !m.on )
+    {
+      downBytes = dList + cap * 4;
+    }
+    size_t dPlane[3] = {};
+    for( int c = 0; c < numComp; c++ )
+    {
+      dPlane[c] = downBytes;
+      downBytes += planeBytes[c];
+    }
+    m.download.ensure( ctx, downBytes, gpu::Buffer::DOWNLOAD );
+
+    gpu::Stream& s = *m.stream;
+    s.begin();
+    s.copy( m.upload, 0, m.params, 0, sizeof( Params ) );
+    s.copy( m.upload, sizeof( Params ), m.tus, 0, tuBytes );
+    if( coefBytes )
+    {
+      s.copy( m.upload, sizeof( Params ) + tuBytes, m.coeffs, 0, coefBytes );
+    }
+    for( int c = 0; c < numComp; c++ )
+    {
+      s.fill( m.owner[c], 0, ownerBytes[c], 0xFFFFFFFFu );
+      s.fill( m.planes[c], 0, ( planeBytes[c] + 3 ) & ~size_t( 3 ), 0 );
+    }
+    s.fill( m.sched, oQueue * 4, n * 4, 0xFFFFFFFFu );
+    s.fill( m.sched, oCounter * 4, 4 * 4, 0 );
+    s.fill( m.sched, oNumDep * 4, n * 4, 0 );
+    s.barrier();
+    const uint32_t t0 = s.timestamp();
+    const uint32_t depGroups = (uint32_t) ( ( n + 63 ) / 64 );
+    Push push{ m.params.addr, (int32_t) n, m.on ? 0 : 1 };
+    s.dispatch( m.sh->kernelResi, &push, (uint32_t) std::min<size_t>( RESI_GROUPS, n ) );   // the residuals
+    Push pass{ m.params.addr, (int32_t) n, 0 };
+    s.dispatch( m.sh->kernelDeps, &pass, depGroups );   // the owner maps
+    s.barrier();
+    pass.verify = 1;
+    s.dispatch( m.sh->kernelDeps, &pass, depGroups );   // availability, read ranges, dependency counts
+    s.barrier();
+    PushScan scan{ P.depCount, P.depStart, (int32_t) n, 0 };
+    s.dispatch( m.sh->kernelScan, &scan, 1 );
+    s.barrier();
+    pass.verify = 2;
+    s.dispatch( m.sh->kernelDeps, &pass, depGroups );   // the dependencies, the dependents' counts
+    s.barrier();
+    scan = PushScan{ P.numDep, P.depOffset, (int32_t) n, 0 };
+    s.dispatch( m.sh->kernelScan, &scan, 1 );
+    s.barrier();
+    s.fill( m.sched, oNumDep * 4, n * 4, 0 );
+    s.barrier();
+    pass.verify = 3;
+    s.dispatch( m.sh->kernelDeps, &pass, depGroups );   // the dependents lists, the queue
+    s.barrier();
+    s.dispatch( m.sh->kernel, &push, (uint32_t) std::min<size_t>( m.numGroups, n ) );
+    const uint32_t t1 = s.timestamp();
+    s.barrier();
+    s.copy( m.sched, ( oStart + n ) * 4, m.download, 0, 4 );
+    if( !m.on )
+    {
+      s.copy( m.dbgPred, 0, m.download, dPred, dbgBytes );
+      s.copy( m.dbgResi, 0, m.download, dResi, dbgBytes );
+      s.copy( m.tus, 0, m.download, dTus, tuBytes );
+      s.copy( m.sched, oOffset * 4, m.download, dOffset, ( n + 1 ) * 4 );
+      s.copy( m.sched, oList * 4, m.download, dList, cap * 4 );
+    }
+    for( int c = 0; c < numComp; c++ )
+    {
+      s.copy( m.planes[c], 0, m.download, dPlane[c], planeBytes[c] );
+    }
+    s.submitAndWait();
+    const size_t numEdges = (size_t) *(const int32_t*) m.download.mapped;
+    if( numEdges > cap )   // nothing was reconstructed: again with room for them
+    {
+      m.edgeCap = numEdges + numEdges / 4;
+      continue;
+    }
+    if( numEdges > cap - cap / 4 )
+    {
+      m.edgeCap = numEdges + numEdges / 4;   // the next pictures
+    }
+    ms = s.elapsedNs( t0, t1 ) * 1e-6;
+    gPlanes  = (const int16_t*) ( (const char*) m.download.mapped + dPlane[0] );
+    gPredDl  = (const int16_t*) ( (const char*) m.download.mapped + dPred );
+    gTusDl   = (const Tu*) ( (const char*) m.download.mapped + dTus );
+    gOffDl   = (const int32_t*) ( (const char*) m.download.mapped + dOffset );
+    gListDl  = (const int32_t*) ( (const char*) m.download.mapped + dList );
+    break;
   }
-  up += coefBytes;
-  for( int c = 0; c < numComp; c++ )
-  {
-    s.copy( m.upload, up, m.owner[c], 0, ownerBytes[c] );
-    up += ownerBytes[c];
-    s.fill( m.planes[c], 0, ( planeBytes[c] + 3 ) & ~size_t( 3 ), 0 );
-  }
-  s.copy( m.upload, up, m.sched, 0, schedBytes );
-  s.barrier();
-  const uint32_t t0 = s.timestamp();
-  Push push{ m.params.addr, (int32_t) m.rec.size(), m.on ? 0 : 1 };
-  s.dispatch( m.sh->kernelResi, &push, (uint32_t) std::min<size_t>( RESI_GROUPS, m.rec.size() ) );   // the residuals
-  s.barrier();
-  s.dispatch( m.sh->kernel, &push, (uint32_t) std::min<size_t>( m.numGroups, m.rec.size() ) );
-  const uint32_t t1 = s.timestamp();
-  s.barrier();
-  size_t off = 0;
-  if( !m.on )
-  {
-    s.copy( m.dbgPred, 0, m.download, off, dbgBytes );
-    off += dbgBytes;
-    s.copy( m.dbgResi, 0, m.download, off, dbgBytes );
-    off += dbgBytes;
-  }
-  for( int c = 0; c < numComp; c++ )
-  {
-    s.copy( m.planes[c], 0, m.download, off, planeBytes[c] );
-    off += planeBytes[c];
-  }
-  s.submitAndWait();
-  const double ms = s.elapsedNs( t0, t1 ) * 1e-6;
   m.gpuMs += ms;
 
   if( m.on )   // the GPU's picture is the reconstruction
   {
-    const int16_t* gPlane = (const int16_t*) m.download.mapped;
+    const int16_t* gPlane = gPlanes;
     for( int c = 0; c < numComp; c++ )
     {
       PelBuf reco = cs.picture->getRecoBuf( ComponentID( c ) );
@@ -961,10 +1003,28 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
     return;
   }
   // compare: per block prediction and residual, then the whole picture
-  const int16_t* gPred = (const int16_t*) m.download.mapped;
+  const int16_t* gPred = gPredDl;
   const int16_t* gResi = gPred + m.cpuPred.size();
   std::string first;
   int numBad = 0;
+  // the GPU's scheduling data against the host's: availability, read ranges, the dependency graph
+  {
+    std::vector<std::vector<int>> dependents( numTus );
+    for( int i = 0; i < numTus; i++ ) for( int d: deps[i] ) dependents[d].push_back( i );
+    for( int i = 0; i < numTus && first.empty(); i++ )
+    {
+      const Tu& h = m.rec[i];
+      const Tu& g = gTusDl[i];
+      std::vector<int> gd( gListDl + gOffDl[i], gListDl + gOffDl[i + 1] );
+      std::sort( gd.begin(), gd.end() );
+      gd.erase( std::unique( gd.begin(), gd.end() ), gd.end() );
+      std::sort( dependents[i].begin(), dependents[i].end() );
+      if( memcmp( h.avail, g.avail, sizeof( h.avail ) ) || memcmp( h.readMax, g.readMax, sizeof( h.readMax ) ) || gd != dependents[i] )
+      {
+        first = "scheduling data of block " + std::to_string( i ) + " differ (availability, read ranges or dependents)";
+      }
+    }
+  }
   for( size_t i = 0; i < m.rec.size() && first.empty(); i++ )
   {
     const Tu& t = m.rec[i];
@@ -1005,7 +1065,7 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
       }
     }
   }
-  const int16_t* gPlane = gResi + m.cpuPred.size();
+  const int16_t* gPlane = gPlanes;
   for( int c = 0; c < numComp; c++ )
   {
     const CPelBuf reco = cs.picture->getRecoBuf( ComponentID( c ) );

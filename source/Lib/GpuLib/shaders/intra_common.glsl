@@ -41,7 +41,10 @@ struct Params
   uint64_t depOffset;   // int32 per block + 1: its dependents in depList
   uint64_t depList;     // int32: the blocks reading samples of a block
   uint64_t queue;       // int32 per position: the ready blocks in the order they became ready (-1: not yet)
-  uint64_t counter;     // int32 [3]: the next queue position to take, the next to fill, the reconstructed blocks
+  uint64_t counter;     // int32 [4]: the next queue position to take, the next to fill, the reconstructed blocks
+  uint64_t depStart;    // int32 per block + 1: its dependencies in depTmp (intra_deps)
+  uint64_t depTmp;      // int32: the dependencies of each block (intra_deps)
+  uint64_t numDep;      // int32 per block: its number of dependents, then the entries written (intra_deps)
   int      origin[3];
   int      stride[3];
   int      width[3];
@@ -51,6 +54,8 @@ struct Params
   int      unitLog2X[2];
   int      unitLog2Y[2];
   int      matrixOffset[8];
+  int      edgeCap;     // the capacity of depList / depTmp
+  int      pad;
 };
 layout( buffer_reference, std430, buffer_reference_align = 8 ) buffer BufParams { Params p; };
 

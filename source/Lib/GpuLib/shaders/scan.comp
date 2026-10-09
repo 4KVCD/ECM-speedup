@@ -1,0 +1,44 @@
+#version 460
+// exclusive prefix sum of n int32 values in one workgroup: dst[k] = src[0] + ... + src[k - 1] for k = 0 .. n
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+layout( local_size_x = 1024 ) in;
+
+layout( push_constant ) uniform PushScan
+{
+  uint64_t src;
+  uint64_t dst;
+  int      n;
+} ps;
+
+shared int s_sum[1024];
+
+void main()
+{
+  const int lid   = int( gl_LocalInvocationID.x );
+  const int chunk = ( ps.n + 1023 ) / 1024;
+  const int b = min( lid * chunk, ps.n ), e = min( b + chunk, ps.n );
+  int sum = 0;
+  for( int k = b; k < e; k++ ) sum += BufI32( ps.src ).v[k];
+  s_sum[lid] = sum;
+  barrier();
+  for( int off = 1; off < 1024; off <<= 1 )   // inclusive scan of the chunk sums
+  {
+    const int v = lid >= off ? s_sum[lid - off] : 0;
+    barrier();
+    s_sum[lid] += v;
+    barrier();
+  }
+  int run = s_sum[lid] - sum;
+  for( int k = b; k < e; k++ )
+  {
+    const int v = BufI32( ps.src ).v[k];
+    BufI32( ps.dst ).v[k] = run;
+    run += v;
+  }
+  if( lid == 1023 )
+  {
+    BufI32( ps.dst ).v[ps.n] = s_sum[1023];
+  }
+}

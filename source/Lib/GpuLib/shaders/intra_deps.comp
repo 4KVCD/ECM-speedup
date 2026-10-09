@@ -1,0 +1,329 @@
+#version 460
+// the scheduling data of intra_rec, computed on the GPU from the block records: geometry, decoding order and syntax
+// only, with the same rules as GpuIntraRec's host version (which the verification mode compares). One invocation
+// per block; pc.verify selects the pass:
+//   0  the owner maps (each block writes its index over its units; the maps are -1 before)
+//   1  per block the read ranges and the availability (written into the block record) and its number of
+//      dependencies (depCount)
+//   2  the dependencies (depTmp at depStart, the exclusive prefix sum of pass 1) and per block the number of its
+//      dependents (numDep)
+//   3  the dependents lists (depList at depOffset, the prefix sum of numDep; numDep is zero again and counts the
+//      entries) and the queue seeded with the blocks without dependencies
+// Passes 2 and 3 write nothing when the dependencies exceed edgeCap (intra_rec then does nothing either and the
+// host computes the data itself).
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+#include "intra_common.glsl"
+
+layout( local_size_x = 64 ) in;
+
+const int PAD  = 6;    // interpFilterNumPadded
+const int UNIQ = 32;   // the dependencies of a block deduplicated exactly (beyond: duplicates, harmless)
+
+Params P;
+int    g_i, g_ch, g_pass;
+int    g_count, g_base;
+int    g_uniq[UNIQ];
+int    g_numUniq;
+
+int ownerAt( int c, int x, int y )
+{
+  if( x < 0 || y < 0 || ( x >> P.unitLog2X[g_ch] ) >= P.ownerW[g_ch] || ( y >> P.unitLog2Y[g_ch] ) >= P.ownerH[g_ch] )
+  {
+    return -1;
+  }
+  return BufI32( P.owner[c] ).v[( y >> P.unitLog2Y[g_ch] ) * P.ownerW[g_ch] + ( x >> P.unitLog2X[g_ch] )];
+}
+
+bool availAt( int c, int x, int y )
+{
+  const int a = ownerAt( c, x, y );
+  return a >= 0 && a < g_i;
+}
+
+void addDep( int o )
+{
+  if( o < 0 || o >= g_i )
+  {
+    return;
+  }
+  for( int k = 0; k < g_numUniq; k++ )
+  {
+    if( g_uniq[k] == o )
+    {
+      return;
+    }
+  }
+  if( g_numUniq < UNIQ )
+  {
+    g_uniq[g_numUniq++] = o;
+  }
+  if( g_pass == 2 )
+  {
+    BufI32( P.depTmp ).v[g_base + g_count] = o;
+    atomicAdd( BufI32( P.numDep ).v[o], 1 );
+  }
+  g_count++;
+}
+
+// GpuIntraRec::endPicture's dependency loop for block g_i (passes 1 and 2)
+void dependencies( int comp )
+{
+  Tu t = BufTu( P.tus ).v[g_i];
+  const int availComp = t.comp == 0 ? 0 : 1;
+  const int numAbove = max( t.w / t.unitW, 1 ), numLeft = max( t.h / t.unitH, 1 );
+  const int tAU = ( t.w << 3 ) / t.unitW, tLU = ( t.h << 3 ) / t.unitH, totalUnits = tAU + tLU + 1;
+  for( int mrl = 0; mrl < 2; mrl++ )
+  {
+    if( g_pass == 1 )
+    {
+      for( int k = 0; k < 5; k++ ) BufTu( P.tus ).v[g_i].avail[mrl][k] = 0;
+      BufTu( P.tus ).v[g_i].readMax[mrl][0] = 0;
+      BufTu( P.tus ).v[g_i].readMax[mrl][1] = 0;
+    }
+    if( mrl == 1 && t.fusion == 0 )
+    {
+      break;
+    }
+    // the read range
+    const int W = t.w, H = t.h, rf = t.refFilter != 0 ? 1 : 0;
+    int topMax, leftMax;
+    if( t.dirMode == 0 )
+    {
+      topMax  = W + 1 + rf;
+      leftMax = H + 1 + rf;
+    }
+    else if( t.dirMode == 1 )
+    {
+      topMax  = W + 1;
+      leftMax = H + 1;
+    }
+    else
+    {
+      const bool ver = t.isModeVer != 0;
+      const int  w = ver ? W : H, h = ver ? H : W, refLength = 8 * w, sideLength = 8 * h;
+      const int  angle = t.intraPredAngle;
+      int mainMax, sideMax;
+      if( mrl == 0 )
+      {
+        if( angle == 0 )
+        {
+          mainMax = w + 1;
+          sideMax = t.applyPDPC != 0 ? h + 1 : 1;
+        }
+        else if( angle < 0 )
+        {
+          mainMax = w + PAD + 2;
+          sideMax = h + PAD + 2;
+        }
+        else
+        {
+          mainMax = min( refLength, ( ( angle * h ) >> 5 ) + w + 10 );
+          sideMax = 1;
+          if( t.applyPDPC != 0 )
+          {
+            const int limit = min( 3 << t.angularScale, w );
+            sideMax = t.gradPDPC != 0 ? h + 1 : min( sideLength, h + ( ( 256 + limit * t.absInvAngle ) >> 9 ) + 1 );
+          }
+        }
+        mainMax += rf;
+        sideMax += rf;
+      }
+      else
+      {
+        if( angle < 0 )
+        {
+          mainMax = w + PAD + 10;
+          sideMax = min( sideLength + 1, ( ( ( h + 1 + PAD ) * t.absInvAngle + 8 ) >> 4 >> 5 ) + 3 );
+        }
+        else
+        {
+          mainMax = min( refLength + 1, ( ( angle * ( h + 1 ) ) >> 5 ) + w + 12 );
+          sideMax = 1;
+        }
+      }
+      topMax  = ver ? mainMax : sideMax;
+      leftMax = ver ? sideMax : mainMax;
+    }
+    if( t.bf == 2 && mrl == 0 )
+    {
+      topMax  = 8 * W;
+      leftMax = 8 * H;
+    }
+    const int readTop  = max( mrl, min( topMax, 8 * W + mrl ) );
+    const int readLeft = max( mrl, min( leftMax, 8 * H + mrl ) );
+
+    const int x0 = t.x - 1 - mrl, y0 = t.y - 1 - mrl;
+    const int unitsTop  = readTop >= 1 + mrl ? ( readTop - 1 - mrl ) / t.unitW + 1 : 0;
+    const int unitsLeft = readLeft >= 1 + mrl ? ( readLeft - 1 - mrl ) / t.unitH + 1 : 0;
+    const int limA  = max( 1, min( numAbove, unitsTop ) );
+    const int limAR = max( 1, min( tAU - numAbove, unitsTop - numAbove ) );
+    const int limL  = max( 1, min( numLeft, unitsLeft ) );
+    const int limBL = max( 1, min( tLU - numLeft, unitsLeft - numLeft ) );
+    const int corner = availAt( availComp, x0, y0 ) ? 1 : 0;
+    int k;
+    for( k = 0; k < limA && availAt( availComp, t.x + k * t.unitW, y0 ); k++ ) {}
+    const int pA = k;
+    for( k = 0; k < limAR && availAt( availComp, t.x + t.w - 1 + t.unitW + k * t.unitW, y0 ); k++ ) {}
+    const int pAR = k;
+    for( k = 0; k < limL && availAt( availComp, x0, t.y + k * t.unitH ); k++ ) {}
+    const int pL = k;
+    for( k = 0; k < limBL && availAt( availComp, x0, t.y + t.h - 1 + t.unitH + k * t.unitH ); k++ ) {}
+    const int pBL = k;
+    if( g_pass == 1 )
+    {
+      BufTu( P.tus ).v[g_i].readMax[mrl][0] = readTop;
+      BufTu( P.tus ).v[g_i].readMax[mrl][1] = readLeft;
+      BufTu( P.tus ).v[g_i].avail[mrl][0]   = corner;
+      BufTu( P.tus ).v[g_i].avail[mrl][1]   = pA;
+      BufTu( P.tus ).v[g_i].avail[mrl][2]   = pAR;
+      BufTu( P.tus ).v[g_i].avail[mrl][3]   = pL;
+      BufTu( P.tus ).v[g_i].avail[mrl][4]   = pBL;
+    }
+
+    if( t.bf != 0 && mrl == 0 )   // the bilateral filter's neighbours (rows y-2, y-1; columns x-2, x-1)
+    {
+      if( corner != 0 )
+      {
+        addDep( ownerAt( comp, t.x - 2, t.y - 2 ) );
+        addDep( ownerAt( comp, t.x - 1, t.y - 2 ) );
+        addDep( ownerAt( comp, t.x - 2, t.y - 1 ) );
+        addDep( ownerAt( comp, t.x - 1, t.y - 1 ) );
+      }
+      for( int x = 0; x < pA * t.unitW && x < t.w; x++ )
+      {
+        addDep( ownerAt( comp, t.x + x, t.y - 2 ) );
+        addDep( ownerAt( comp, t.x + x, t.y - 1 ) );
+      }
+      for( int y = 0; y < pL * t.unitH && y < t.h; y++ )
+      {
+        addDep( ownerAt( comp, t.x - 2, t.y + y ) );
+        addDep( ownerAt( comp, t.x - 1, t.y + y ) );
+      }
+    }
+    // the owners of the samples in range (intra_rec's fill rule)
+    const int blS = tLU - numLeft - pBL, blE = tLU - 1 - numLeft, lS = tLU - pL, lE = tLU - 1;
+    const int aS = tLU + 1, aE = tLU + pA, arS = tLU + 1 + numAbove, arE = tLU + numAbove + pAR;
+    int firstAvail = totalUnits;
+    if( pAR > 0 ) firstAvail = arS;
+    if( pA > 0 ) firstAvail = aS;
+    if( corner != 0 ) firstAvail = tLU;
+    if( pL > 0 ) firstAvail = lS;
+    if( pBL > 0 ) firstAvail = blS;
+    if( firstAvail >= totalUnits )
+    {
+      continue;   // no neighbour: the DC value
+    }
+    for( int side = 0; side < 2; side++ )
+    {
+      const bool top = side == 0;
+      const int  readMax = top ? readTop : readLeft;
+      int lastKey = -1;
+      for( int idx = 0; idx <= readMax; idx++ )
+      {
+        const int u = idx <= mrl ? tLU : top ? tLU + 1 + ( idx - 1 - mrl ) / t.unitW : tLU - 1 - ( idx - 1 - mrl ) / t.unitH;
+        int pm = -1;
+        if( pBL > 0 && blS <= u ) pm = max( pm, min( u, blE ) );
+        if( pL > 0 && lS <= u ) pm = max( pm, min( u, lE ) );
+        if( corner != 0 && tLU <= u ) pm = max( pm, tLU );
+        if( pA > 0 && aS <= u ) pm = max( pm, min( u, aE ) );
+        if( pAR > 0 && arS <= u ) pm = max( pm, min( u, arE ) );
+        int sx, sy;
+        if( pm == u )
+        {
+          sx = top ? x0 + idx : x0;
+          sy = top ? y0 : y0 + idx;
+          const int key = ( ( sy >> P.unitLog2Y[g_ch] ) * P.ownerW[g_ch] + ( sx >> P.unitLog2X[g_ch] ) ) * 2;
+          if( sx >= 0 && sy >= 0 && key == lastKey )
+          {
+            continue;
+          }
+          lastKey = sx >= 0 && sy >= 0 ? key : -1;
+        }
+        else
+        {
+          if( lastKey == u * 2 + 1 )
+          {
+            continue;
+          }
+          lastKey = u * 2 + 1;
+          const bool before = pm >= 0;
+          const int  s = before ? pm : firstAvail;
+          if( s == tLU )
+          {
+            sx = before ? x0 + mrl : x0;
+            sy = before ? y0 : y0 + mrl;
+          }
+          else if( s > tLU )
+          {
+            sx = x0 + ( before ? ( s - tLU ) * t.unitW + mrl : ( s - tLU - 1 ) * t.unitW + 1 + mrl );
+            sy = y0;
+          }
+          else
+          {
+            sx = x0;
+            sy = y0 + ( before ? ( tLU - s - 1 ) * t.unitH + 1 + mrl : ( tLU - s ) * t.unitH + mrl );
+          }
+        }
+        addDep( ownerAt( comp, sx, sy ) );
+      }
+    }
+  }
+}
+
+void main()
+{
+  g_i    = int( gl_GlobalInvocationID.x );
+  g_pass = pc.verify;
+  if( g_i >= pc.numTus )
+  {
+    return;
+  }
+  P = BufParams( pc.params ).p;
+  const int comp = BufTu( P.tus ).v[g_i].comp;
+  g_ch = comp == 0 ? 0 : 1;
+  const int total = BufI32( P.depStart ).v[pc.numTus];   // valid in passes 2 and 3 (after the prefix sum)
+  if( g_pass == 0 )
+  {
+    const Tu t = BufTu( P.tus ).v[g_i];
+    for( int uy = t.y >> P.unitLog2Y[g_ch]; uy <= ( t.y + t.h - 1 ) >> P.unitLog2Y[g_ch]; uy++ )
+    {
+      for( int ux = t.x >> P.unitLog2X[g_ch]; ux <= ( t.x + t.w - 1 ) >> P.unitLog2X[g_ch]; ux++ )
+      {
+        BufI32( P.owner[comp] ).v[uy * P.ownerW[g_ch] + ux] = g_i;
+      }
+    }
+  }
+  else if( g_pass == 1 || g_pass == 2 )
+  {
+    if( g_pass == 2 && total > P.edgeCap )
+    {
+      return;
+    }
+    g_count   = 0;
+    g_numUniq = 0;
+    g_base    = g_pass == 2 ? BufI32( P.depStart ).v[g_i] : 0;
+    dependencies( comp );
+    if( g_pass == 1 )
+    {
+      BufI32( P.depCount ).v[g_i] = g_count;
+    }
+  }
+  else
+  {
+    if( total > P.edgeCap )
+    {
+      return;
+    }
+    const int b = BufI32( P.depStart ).v[g_i], e = BufI32( P.depStart ).v[g_i + 1];
+    for( int k = b; k < e; k++ )
+    {
+      const int d = BufI32( P.depTmp ).v[k];
+      BufI32( P.depList ).v[BufI32( P.depOffset ).v[d] + atomicAdd( BufI32( P.numDep ).v[d], 1 )] = g_i;
+    }
+    if( e == b )
+    {
+      BufI32( P.queue ).v[atomicAdd( BufI32( P.counter ).v[1], 1 )] = g_i;
+    }
+  }
+}

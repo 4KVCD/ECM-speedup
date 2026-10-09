@@ -244,6 +244,10 @@ void main()
   const int lid = int( gl_LocalInvocationID.x );
   const int NT  = int( gl_WorkGroupSize.x );
   P = BufParams( pc.params ).p;
+  if( BufI32( P.depStart ).v[pc.numTus] > P.edgeCap )   // intra_deps found more dependencies than fit: the host redoes it
+  {
+    return;
+  }
 
   for( int i = lid; i < WEAK4 + 32 * 4; i += NT )   // filter taps fit int16 (TFilterCoeff)
   {
