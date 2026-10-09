@@ -5,9 +5,9 @@
 // from the host: geometry and decoding order only), so independent blocks (the three components, distant parts of
 // the picture) run at the same time and no workgroup waits on a block it holds.
 // Per block: reference samples (and their [1 2 1] filtering), prediction (planar, directional planar, DC, angular
-// with PDPC and intra fusion) and reconstruction with the residual intra_resi computed beforehand for all blocks at
+// with PDPC and intra fusion, the intra bilateral filter) and reconstruction with the residual intra_resi computed beforehand for all blocks at
 // once. Every step follows the C++ of IntraPrediction / DecCu.
-// Not yet: MRL, ISP, MIP, the intra bilateral filter, LFNST / MTS / transform skip, decoder-side intra modes.
+// Not yet: MRL, ISP, MIP, LFNST / MTS / transform skip, decoder-side intra modes.
 #extension GL_GOOGLE_include_directive : require
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
@@ -28,9 +28,14 @@ const int PAD     = 6;                        // interpFilterNumPadded (16 taps 
 const int ANG     = 1792;                     // angular reference buffers (the CPU's are larger; blocks <= 128 use < 1700)
 const int MAX_REF = 2 * ( 8 * 128 + 2 ) + 16; // reference line: top row (stride predSize + 1 + mrl), then the left column
 const int WEAK4   = 5 * 32 * 16;              // offset of the weak 4-tap table in the filter buffer
+const int BF_LUT  = WEAK4 + 32 * 4;           // the bilateral filter's LUT rows (26 x 48), size and MAD factors
+const int BF_SIZE = BF_LUT + 26 * 48;
+const int BF_MAD  = BF_SIZE + 64;
+const int BF_PRED = 0;                        // in s_tmp: the prediction (< 1024 samples: at most 512)
+const int BF_BLK  = 512;                      // in s_tmp: the padded block ((W + 4) x (H + 4) <= 720)
 
 shared int16_t s_ref[2][MAX_REF];             // refBufUnfiltered (line 0; filtered in place when refFilter), fusion line 1
-shared int16_t s_tmp[MAX_REF];
+shared int16_t s_tmp[MAX_REF];                // the reference filter's output; the bilateral filter's blocks
 shared int16_t s_angA[2][ANG];                // refAbove, refAbove2nd
 shared int16_t s_angL[2][ANG];                // refLeft, refLeft2nd
 shared int16_t s_filters[WEAK4 + 32 * 4];     // the filter tables (copied once per workgroup)
@@ -38,6 +43,8 @@ shared int     s_dc;
 shared int     s_ti;
 shared int     s_next;                        // a dependent this workgroup released and continues with (-1: none)
 shared int     s_deps[256];                   // the first dependents of the block (prefetched)
+shared int     s_red[6];                      // workgroup sums
+shared int16_t s_bfLut[48];                   // the bilateral filter's LUT row of the block's QP
 
 Params P;      // the parameter block (loaded once)
 int    g_ti;   // the block being reconstructed
@@ -164,6 +171,44 @@ void storeRecon( Tu t, int x, int y, int pr )
   }
 }
 
+// a predicted sample: reconstructed now, or kept for the bilateral filter
+void emitPred( Tu t, int x, int y, int pr, bool bf )
+{
+  if( bf )
+  {
+    s_tmp[BF_PRED + y * t.w + x] = int16_t( pr );
+  }
+  else
+  {
+    storeRecon( t, x, y, pr );
+  }
+}
+
+// workgroup sums of a and b (all invocations, uniform control flow; the slots are zero before)
+ivec2 wgSum2( int a, int b, int slot )
+{
+  const int sa = subgroupAdd( a ), sb = subgroupAdd( b );
+  if( subgroupElect() )
+  {
+    atomicAdd( s_red[slot], sa );
+    atomicAdd( s_red[slot + 1], sb );
+  }
+  SYNC();
+  return ivec2( s_red[slot], s_red[slot + 1] );
+}
+
+// bifApplyLut (the LUT row in s_bfLut, offset base: 0 distance 1, 16 diagonal, 32 distance 2)
+int bfLut( int diff, int base, int cutBits, int bdShift )
+{
+  const int bitsRound  = 1 << ( cutBits - 2 );
+  const int bitsRound2 = bitsRound + ( 1 << ( cutBits - 1 ) );
+  const int v    = abs( diff );
+  const int idx  = min( ( v + bitsRound ) >> cutBits, 15 );
+  const int idx2 = min( ( v + bitsRound2 ) >> cutBits, 15 );
+  const int w0   = ( ( int( s_bfLut[base + idx] ) + int( s_bfLut[base + idx2] ) + 1 ) >> 1 ) << bdShift;
+  return diff < 0 ? -w0 : w0;
+}
+
 // main / side reference arrays of line l (main = above for vertical modes)
 int mainR( bool isVer, int l, int i ) { return isVer ? int( s_angA[l][i] ) : int( s_angL[l][i] ); }
 int sideR( bool isVer, int l, int i ) { return isVer ? int( s_angL[l][i] ) : int( s_angA[l][i] ); }
@@ -215,6 +260,10 @@ void main()
   }
   for( ;; )
   {
+    if( lid < 6 )
+    {
+      s_red[lid] = 0;
+    }
     // the next block: the dependent this workgroup released last, else a queue position and (once filled) the
     // block at it; blocks handed over directly never enter the queue, so a position may stay empty: the workgroup
     // stops when all blocks are reconstructed
@@ -297,6 +346,22 @@ void main()
       SYNC();
     }
 
+    // ----- the intra bilateral filter (bilateralFilterPredDiamond5x5Clip, luma of intra slices; the host checked
+    // the size, mode and QP): angular modes skip it for textured references (xPredIntaAng's isRefSampleMadSkipBf, the
+    // mean absolute deviation of the (filtered) top and left reference arrays)
+    bool bf = t.bf == 1;
+    if( t.bf == 2 )
+    {
+      const int topLen = W << 3, leftLen = H << 3;   // W, H <= 32: one sample per invocation
+      const int a = lid < topLen ? int( s_ref[0][lid] ) : 0, b = lid < leftLen ? int( s_ref[0][predStride + lid] ) : 0;
+      const ivec2 sum = wgSum2( a, b, 0 );
+      const int lT = findMSB( topLen ), lL = findMSB( leftLen );
+      const int avgT = ( sum.x + ( 1 << ( lT - 1 ) ) ) >> lT, avgL = ( sum.y + ( 1 << ( lL - 1 ) ) ) >> lL;
+      const ivec2 dev = wgSum2( lid < topLen ? abs( a - avgT ) : 0, lid < leftLen ? abs( b - avgL ) : 0, 2 );
+      const int madT = ( dev.x + ( 1 << ( lT - 1 ) ) ) >> lT, madL = ( dev.y + ( 1 << ( lL - 1 ) ) ) >> lL;
+      bf = min( ( ( madT + madL + 1 ) >> 1 ) >> 4, 15 ) <= 10;
+    }
+
     // ----- prediction and reconstruction
     if( t.dirMode == 0 || t.dirMode == 1 )   // planar / DC, then their PDPC
     {
@@ -337,10 +402,10 @@ void main()
           const int wL = 32 >> min( 31, ( x << 1 ) >> pdpcScale );
           v = asPel( v + ( ( wL * ( L - v ) + wT * ( T - v ) + 32 ) >> 6 ) );
         }
-        storeRecon( t, i % W, i / W, v );
+        emitPred( t, i % W, i / W, v, bf );
       }
     }
-    else   // angular (xPredIntraAng without the intra bilateral filter)
+    else   // angular (xPredIntraAng)
     {
       const bool isVer = t.isModeVer != 0;
       const int angle = t.intraPredAngle, absInvAngle = t.absInvAngle;
@@ -538,10 +603,87 @@ void main()
           }
         }
         const int ox = isVer ? x : y, oy = isVer ? y : x;
-        storeRecon( t, ox, oy, asPel( v ) );
+        emitPred( t, ox, oy, asPel( v ), bf );
       }
     }
     SYNC();
+    if( bf )
+    {
+      // getFilterLutParameters: the mean absolute deviation of the prediction gates the filter and sets its strength
+      const int log2W = findMSB( W ), log2H = findMSB( H ), whlog2 = log2W + log2H;
+      const int bdShift = max( 0, t.bitDepth - 10 );
+      if( lid < 48 )
+      {
+        s_bfLut[lid] = int16_t( BufI32( P.filters ).v[BF_LUT + clip3i( 0, 25, t.qp - 17 ) * 48 + lid] );
+      }
+      int acc = 0;
+      for( int i = lid; i < N; i += NT ) acc += int( s_tmp[BF_PRED + i] );
+      const int avg = ( wgSum2( acc, 0, 4 ).x + ( 1 << ( whlog2 - 1 ) ) ) >> whlog2;
+      acc = 0;
+      for( int i = lid; i < N; i += NT ) acc += abs( int( s_tmp[BF_PRED + i] ) - avg );
+      int mad = ( wgSum2( 0, acc, 4 ).y + ( 1 << ( whlog2 - 1 ) ) ) >> whlog2;
+      mad = ( mad + ( bdShift == 0 ? 0 : 1 << ( bdShift - 1 ) ) ) >> bdShift;
+      mad = min( mad >> 4, 15 );
+      if( mad < 10 )
+      {
+        const int bfac = BufI32( P.filters ).v[BF_SIZE + min( log2W, 7 ) * 8 + min( log2H, 7 )] + BufI32( P.filters ).v[BF_MAD + mad];
+        // the block padded by two samples: the prediction mirrored (columns, then rows), then above and left the
+        // reconstruction where the CU's neighbours are available (all of them, else the corner, the left units but
+        // the bottom one and the above units but the last one, as the CPU copies them)
+        const int PW = W + 4;
+        const int numAbove = max( W / t.unitW, 1 ), numLeft = max( H / t.unitH, 1 );
+        const int corner = t.avail[0][0], pA = t.avail[0][1], pL = t.avail[0][3];
+        const bool all = corner != 0 && pA == numAbove && pL == numLeft;
+        const int topRec  = all ? W : min( pA, numAbove - 1 ) * t.unitW;
+        const int leftRec = all ? H : min( pL, numLeft - 1 ) * t.unitH;
+        for( int i = lid; i < PW * ( H + 4 ); i += NT )
+        {
+          const int py = i / PW, px = i % PW;
+          const int y = py - 2, x = px - 2;
+          int v;
+          if( ( py < 2 && px < 2 && corner != 0 ) || ( py < 2 && x >= 0 && x < topRec ) || ( px < 2 && y >= 0 && y < leftRec ) )
+          {
+            v = recoAt( 0, t.x + x, t.y + y );
+          }
+          else
+          {
+            const int my = py == 0 ? 1 : py == 1 ? 0 : py == H + 3 ? H - 2 : py == H + 2 ? H - 1 : y;
+            const int mx = px == 0 ? 1 : px == 1 ? 0 : px == W + 3 ? W - 2 : px == W + 2 ? W - 1 : x;
+            v = int( s_tmp[BF_PRED + my * W + mx] );
+          }
+          s_tmp[BF_BLK + i] = int16_t( v );
+        }
+        SYNC();
+        // the 5x5 diamond (blockBilateralFilterDiamond5x5 with isIntraPredBf), then the prediction plus the
+        // filtered difference, clipped
+        const int cutBits = 3 + bdShift;
+        for( int i = lid; i < N; i += NT )
+        {
+          const int x = i % W, y = i / W;
+          const int c = BF_BLK + ( y + 2 ) * PW + x + 2;
+          const int p = int( s_tmp[c] );
+          int modsum = 0;
+          modsum += bfLut( int( s_tmp[c - 1] ) - p, 0, cutBits, bdShift );
+          modsum += bfLut( int( s_tmp[c + 1] ) - p, 0, cutBits, bdShift );
+          modsum += bfLut( int( s_tmp[c - PW] ) - p, 0, cutBits, bdShift );
+          modsum += bfLut( int( s_tmp[c + PW] ) - p, 0, cutBits, bdShift );
+          modsum += bfLut( int( s_tmp[c - PW - 1] ) - p, 16, cutBits, bdShift );
+          modsum += bfLut( int( s_tmp[c - PW + 1] ) - p, 16, cutBits, bdShift );
+          modsum += bfLut( int( s_tmp[c + PW - 1] ) - p, 16, cutBits, bdShift );
+          modsum += bfLut( int( s_tmp[c + PW + 1] ) - p, 16, cutBits, bdShift );
+          modsum += bfLut( int( s_tmp[c - 2] ) - p, 32, cutBits, bdShift );
+          modsum += bfLut( int( s_tmp[c + 2] ) - p, 32, cutBits, bdShift );
+          modsum += bfLut( int( s_tmp[c - 2 * PW] ) - p, 32, cutBits, bdShift );
+          modsum += bfLut( int( s_tmp[c + 2 * PW] ) - p, 32, cutBits, bdShift );
+          const int filt = asPel( ( modsum * bfac + 128 ) >> 8 );   // (BIF_ROUND_ADD / 2) << 3, BIF_ROUND_SHIFT - 1 + 3
+          storeRecon( t, x, y, clip3i( 0, maxPel, filt + p ) );
+        }
+      }
+      else
+      {
+        for( int i = lid; i < N; i += NT ) storeRecon( t, i % W, i / W, int( s_tmp[BF_PRED + i] ) );
+      }
+    }
 
     // the block's samples (device-coherent stores of all invocations) happen before its dependents are released:
     // the last dependency of a block to finish takes it over (one per block, the workgroup continues with it) or

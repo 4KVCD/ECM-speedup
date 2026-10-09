@@ -39,6 +39,7 @@
 #include "VkCompute.h"
 
 #include "CommonLib/CodingStructure.h"
+#include "CommonLib/BilateralFilter.h"
 #include "CommonLib/InterpolationFilter.h"
 #include "CommonLib/Picture.h"
 #include "CommonLib/Rom.h"
@@ -73,7 +74,9 @@ struct Tu
   int32_t avail[2][5];
   int32_t readMax[2][2];
   int32_t nzRows, nzCols;
-  int32_t pad[3];
+  int32_t bf;
+  int32_t qp;
+  int32_t pad[1];
 };
 static_assert( sizeof( Tu ) == 52 * 4, "Tu layout" );
 
@@ -129,6 +132,7 @@ struct GpuIntraRec::Impl
   int                         numGroups = 0;
   gpu::Buffer                 upload, download;
   int32_t                     matrixOffset[8] = {};
+  std::unique_ptr<BilateralFilter> bif;   // the intra prediction bilateral filter's tables
 
   // the picture being recorded
   std::vector<Tu>             rec;
@@ -175,7 +179,9 @@ GpuIntraRec* GpuIntraRec::create()
   m.stream.reset( new gpu::Stream( *ctx ) );
 
   // tables, from the C++ tables themselves
-  std::vector<int32_t> filt( 5 * 32 * 16 + 32 * 4, 0 );
+  m.bif.reset( new BilateralFilter );   // BilateralFilter::create derives the LUTs
+  m.bif->create();
+  std::vector<int32_t> filt( 5 * 32 * 16 + 32 * 4 + 26 * 48 + 64 + 16, 0 );
   for( int t = 0; t < 5; t++ )
   {
     for( int frac = 0; frac < 32; frac++ )
@@ -194,6 +200,12 @@ GpuIntraRec* GpuIntraRec::create()
     {
       filt[5 * 32 * 16 + frac * 4 + i] = f[i];
     }
+  }
+  {
+    int32_t* bt = filt.data() + 5 * 32 * 16 + 32 * 4;   // intra_rec's BF_LUT, BF_SIZE, BF_MAD
+    for( int q = 0; q < 26; q++ ) for( int i = 0; i < 48; i++ ) bt[q * 48 + i] = m.bif->m_lut[q][i];
+    for( int i = 0; i < 64; i++ ) bt[26 * 48 + i] = m.bif->m_tuSizeFactor[0][i];
+    for( int i = 0; i < 16; i++ ) bt[26 * 48 + 64 + i] = m.bif->m_tuMADFactor[0][i];
   }
   std::vector<int32_t> mat;
   const TMatrixCoeff* tables[7] = { g_trCoreDCT2P2[TRANSFORM_INVERSE][0],  g_trCoreDCT2P4[TRANSFORM_INVERSE][0],
@@ -267,7 +279,6 @@ bool GpuIntraRec::supported( const Slice& slice, std::string& why )
   else if( sps.getChromaFormatIdc() != CHROMA_420 && sps.getChromaFormatIdc() != CHROMA_400 ) why = "chroma format";
   else if( sps.getUseDualITree() )                                                        why = "dual tree";
   else if( sps.getLog2MaxTbSize() > 7 )                                                   why = "transform blocks above 128";
-  else if( sps.getUseIntraPredBf() )                                                      why = "intra bilateral filter";
   else if( sps.getUseLmcs() )                                                             why = "LMCS";
   else if( sps.getUseQcs() )                                                              why = "QCS";
   else if( sps.getScalingListFlag() )                                                     why = "scaling lists";
@@ -351,7 +362,6 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
   else if( cu.eipFlag )                                             why = "EIP";
   else if( pu.multiRefIdx || ipa.multiRefIndex )                    why = "MRL";
   else if( dirMode >= NUM_LUMA_MODE )                               why = "intra mode beyond 66 (LM / NN / ...)";
-  else if( sps.getUseIntraPredBf() )                                why = "intra bilateral filter";
   else if( sps.getUseLmcs() )                                       why = "LMCS";
   else if( sps.getUseQcs() )                                        why = "QCS";
   else if( sps.getScalingListFlag() )                               why = "scaling lists";
@@ -382,6 +392,29 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
   t.angularScale     = ipa.angularScale;
   t.fusion           = ipa.applyFusion;
   t.disableRefFilter = sps.getDisableRefFilter();
+  t.qp = cu.qp;
+  t.bf = 0;
+  if( compID == COMPONENT_Y && sps.getUseIntraPredBf() && slice.isIntra() )
+  {
+    const int W = area.width, H = area.height, qpY = cu.qp;
+    bool apply = qpY > 17 && W <= 128 && H <= 128 && ( W & ( W - 1 ) ) == 0 && ( H & ( H - 1 ) ) == 0 && W >= 4 && H >= 4;
+    apply = apply && W * H > 16 && W * H < 1024 && std::abs( floorLog2( W ) - floorLog2( H ) ) <= 2;
+    if( dirMode > DC_IDX )
+    {
+      const int md = dirMode;
+      apply = apply && !( ( md >= 2 && md <= 3 ) || ( md >= 17 && md <= 19 ) || ( md >= 33 && md <= 35 ) || ( md >= 49 && md <= 51 ) || ( md >= 65 && md <= 66 ) );
+    }
+    apply = apply && m.bif->m_tuSizeFactor[0][std::min( floorLog2( W ), 7 ) * 8 + std::min( floorLog2( H ), 7 )] != 0;
+    if( apply )
+    {
+      if( area.pos() != cu.blocks[COMPONENT_Y].pos() || area.size() != cu.blocks[COMPONENT_Y].size() )
+      {
+        unsupported( "intra bilateral filter of a split CU" );
+        return;
+      }
+      t.bf = dirMode <= DC_IDX ? 1 : 2;
+    }
+  }
   const PreCalcValues& pcv = *cs.pcv;
   const bool noShift = pcv.noChroma2x2 && area.width == 4;
   t.unitW    = pcv.minCUWidth >> ( noShift ? 0 : getComponentScaleX( compID, sps.getChromaFormatIdc() ) );
@@ -626,6 +659,11 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
           topMax  = ver ? mainMax : sideMax;
           leftMax = ver ? sideMax : mainMax;
         }
+        if( t.bf == 2 && mrl == 0 )   // the filter's gate: the texture of the whole reference arrays
+        {
+          topMax  = 8 * W;
+          leftMax = 8 * H;
+        }
         t.readMax[mrl][0] = std::max( mrl, std::min( topMax, 8 * W + mrl ) );
         t.readMax[mrl][1] = std::max( mrl, std::min( leftMax, 8 * H + mrl ) );
 
@@ -654,6 +692,32 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
         for( k = 0; k < limBL && avail( x0, t.y + t.h - 1 + t.unitH + k * t.unitH ); k++ ) {}
         av[4] = k;
 
+        if( t.bf && mrl == 0 )   // the bilateral filter's neighbours (rows y-2, y-1; columns x-2, x-1)
+        {
+          auto addOwner = [&]( int sx, int sy )
+          {
+            const int o = own( t.comp, sx, sy );
+            if( o >= 0 && o < i && mark[o] != i )
+            {
+              mark[o] = i;
+              deps[i].push_back( o );
+            }
+          };
+          if( av[0] )
+          {
+            addOwner( t.x - 2, t.y - 2 ); addOwner( t.x - 1, t.y - 2 ); addOwner( t.x - 2, t.y - 1 ); addOwner( t.x - 1, t.y - 1 );
+          }
+          for( int x = 0; x < av[1] * t.unitW && x < t.w; x++ )
+          {
+            addOwner( t.x + x, t.y - 2 );
+            addOwner( t.x + x, t.y - 1 );
+          }
+          for( int y = 0; y < av[3] * t.unitH && y < t.h; y++ )
+          {
+            addOwner( t.x - 2, t.y + y );
+            addOwner( t.x - 1, t.y + y );
+          }
+        }
         // the owners of the samples in range (the kernel's fill rule)
         const int corner = av[0], pA = av[1], pAR = av[2], pL = av[3], pBL = av[4];
         const int blS = tLU - numLeft - pBL, blE = tLU - 1 - numLeft, lS = tLU - pL, lE = tLU - 1;
@@ -944,15 +1008,16 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
     for( int d: deps[i] ) depth[i] = std::max( depth[i], depth[d] + 1 );
     maxDepth = std::max( maxDepth, depth[i] );
   }
-  int numFilter = 0, numPdpc = 0, numGrad = 0, numFusion = 0;
+  int numFilter = 0, numPdpc = 0, numGrad = 0, numFusion = 0, numBf = 0;
   for( const Tu& t: m.rec )
   {
     numFilter += t.refFilter;
     numPdpc += t.applyPDPC;
     numGrad += t.applyPDPC && t.gradPDPC;
     numFusion += t.fusion;
+    numBf += t.bf != 0;
   }
-  printf( "\n[gpu-intra] POC %d: %d blocks, chain %d (ref filter %d, PDPC %d, gradient PDPC %d, fusion %d), GPU %.2f ms: %s%s%s", m.poc,
-          (int) m.rec.size(), maxDepth, numFilter, numPdpc, numGrad, numFusion, ms, bad ? "MISMATCH, " : "identical",
+  printf( "\n[gpu-intra] POC %d: %d blocks, chain %d (ref filter %d, PDPC %d, gradient PDPC %d, fusion %d, bilateral filter candidates %d), GPU %.2f ms: %s%s%s", m.poc,
+          (int) m.rec.size(), maxDepth, numFilter, numPdpc, numGrad, numFusion, numBf, ms, bad ? "MISMATCH, " : "identical",
           bad ? first.c_str() : "", numBad ? ( ", " + std::to_string( numBad ) + " picture samples differ" ).c_str() : "" );
 }

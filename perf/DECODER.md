@@ -240,7 +240,9 @@ the reconstruction buffer; works in every frame-thread context):
 - tool levels so far (test streams C:\Code\streams_gpu, encoded with the ECM tools off): M1 planar / directional
   planar / DC / angular with the 16-, 10-tap cubic and 6-tap Gaussian luma and 2-tap chroma interpolation, DCT-II,
   scalar dequantization, adaptive luma clipping; M2 adds reference filtering, PDPC (planar / DC, pure H/V,
-  gradient, inverse angle) and intra fusion. GpuIntraRec::supported() rejects every tool whose mode derivation or
+  gradient, inverse angle) and intra fusion; M3 adds the intra prediction bilateral filter (JVET-AK0118: the angular
+  reference texture gate, the prediction texture gate and strength, the 5x5 diamond over the prediction padded with
+  the neighbouring reconstruction as the CPU copies it). GpuIntraRec::supported() rejects every tool whose mode derivation or
   prediction reads reconstructed samples or that the kernels lack, before anything is skipped.
 - kernels: intra_resi (all residuals of the picture at once, dequantization folded into the first DCT-II stage,
   only the nonzero coefficient region) and intra_rec (persistent workgroups take ready blocks from a queue; the

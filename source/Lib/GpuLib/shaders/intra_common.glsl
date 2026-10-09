@@ -20,7 +20,9 @@ struct Tu
   int avail[2][5];   // per reference line (multiRefIdx 0, 1): corner, available prefix of the above / above-right / left / below-left units
   int readMax[2][2];   // per reference line: the highest top / left index the prediction reads (a superset)
   int nzRows, nzCols;   // the nonzero coefficient levels lie in rows < nzRows and columns < nzCols
-  int pad[3];
+  int bf;               // intra prediction bilateral filter possible: 1 planar / DC, 2 angular (also gated by the references)
+  int qp;               // the CU's luma QP
+  int pad[1];
 };
 layout( buffer_reference, std430, buffer_reference_align = 4 ) buffer BufTu { Tu v[]; };
 
