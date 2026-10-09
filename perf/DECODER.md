@@ -221,6 +221,53 @@ commit that caused it:
 - the encoder's decode-bitstream mode read CCSAO CTU control from the shared entries, which the decoder no longer
   filled (it does again when it does not decode in threads).
 
+### GPU reconstruction (first stage of the full GPU decoder, branch dec-gpurecon)
+
+Groundwork (experiments on branch dec-parsefirst):
+- parsing needs nothing from the reconstruction: parsing a whole slice first and reconstructing afterwards is
+  bit-exact on all 19 streams (a canary that skips one CTU breaks every stream). The CPU can parse, the GPU reconstruct.
+- reconstruction is serial within a picture in CTU raster order as soon as it has intra or IBC CUs: with
+  JVET_AJ0172 the IBC / IntraTMP reference area is everything above the CTU row, and the IntraTMP merge list and the
+  BV-guided intra tools follow such vectors; non-adjacent merge candidates reach 8x the CU width. Parallelism comes
+  from independent blocks (components, distant parts of the picture), from pictures decoded at once and from the
+  samples of a block.
+- a dependent per-CU decision chain (merge-list-like code, microbenchmark) runs 7.2x slower on one GPU workgroup than
+  on one CPU core; the GPU only beats 16 CPU threads with ~50 independent chains.
+
+Implemented (`--GpuRecon=2` verifies: the CPU reconstructs, the GPU result is compared per block and per sample;
+`--GpuRecon=1` reconstructs on the GPU: parse-first, a derive-only pass of decompressCtu, GPU picture written into
+the reconstruction buffer; works in every frame-thread context):
+- tool levels so far (test streams C:\Code\streams_gpu, encoded with the ECM tools off): M1 planar / directional
+  planar / DC / angular with the 16-, 10-tap cubic and 6-tap Gaussian luma and 2-tap chroma interpolation, DCT-II,
+  scalar dequantization, adaptive luma clipping; M2 adds reference filtering, PDPC (planar / DC, pure H/V,
+  gradient, inverse angle) and intra fusion. GpuIntraRec::supported() rejects every tool whose mode derivation or
+  prediction reads reconstructed samples or that the kernels lack, before anything is skipped.
+- kernels: intra_resi (all residuals of the picture at once, dequantization folded into the first DCT-II stage,
+  only the nonzero coefficient region) and intra_rec (persistent workgroups take ready blocks from a queue; the
+  host gives each block its dependency count, its dependents and the availability the CPU sees as five numbers per
+  reference line, all from syntax and decoding order; the dependencies are the owners of exactly the reference
+  samples the block's mode reads; the last dependency of a block to finish continues with it; Vulkan memory model)
+
+GPU time over the 24 pictures of the M1 and M2 test sets (RTX 3070), every block and sample identical to the CPU:
+
+| step | commit | GPU time | step | cumulative |
+|---|---|---|---|---|
+| first working kernel (one workgroup, sequential reference fill) | 9435a745 / d7e8556b | 2845.5 ms | | 1.00x |
+| reference samples filled by every invocation | 07d08f15 | 1191.8 ms | 2.39x | 2.39x |
+| independent blocks on 32 concurrent workgroups (memory model) | 640419bb | 376.0 ms | 3.17x | 7.6x |
+| residuals in a parallel pre-pass | 4fb7ccaa | 245.7 ms | 1.53x | 11.6x |
+| ready queue, exact dependencies and read ranges, host availability | ae34848e | 80.6 ms | 3.0x | 35.3x |
+| direct hand-off of released blocks, dependents prefetched | 1001a254 | 68.4 ms | 1.18x | 41.6x |
+| residual pass over the nonzero coefficient region only | 73aca6b3 | 56.8 ms | 1.20x | 50.1x |
+| filter tables in shared memory | 1b405737 | ~55 ms | 1.03x | ~52x |
+
+A 720p intra picture now takes 4-5 ms of GPU time (its longest chain of blocks reading each other: 1127 of 29448).
+With the reconstruction on, the decode time of a 720p picture is parsing ~47 ms + derive-only pass ~24 ms + GPU path
+~17 ms (non-LTO; CPU decoding ~100 ms), so the CPU parts dominate; frame threads parse several pictures at once.
+Found on the way: plain loads through coherent / volatile buffer references returned stale L1 data on the RTX 3070
+(the kernel uses the Vulkan memory model since); a block that hands its released dependent to its own workgroup
+saves the queue round trip; prefetching the dependents' block records into shared memory was slower (dropped).
+
 ## Fixes found on the way
 
 - Decoding that starts at a CRA in the middle of an RA stream (`-s`, random access) crashed the stock decoder:
