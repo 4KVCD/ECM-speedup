@@ -633,14 +633,29 @@ public:
   /// the parameters the last initPredIntraParams() set (recorded by the decoder's GPU reconstruction)
   struct IpaSnapshot
   {
-    bool isModeVer, interpolationFlag, refFilterFlag, applyPDPC, applyFusion;
-    int  multiRefIndex, intraPredAngle, absInvAngle;
+    bool isModeVer, interpolationFlag, refFilterFlag, applyPDPC, useGradPDPC, applyFusion;
+    int  multiRefIndex, intraPredAngle, absInvAngle, angularScale;
   };
   IpaSnapshot ipaSnapshot() const
   {
-    return { m_ipaParam.isModeVer,     m_ipaParam.interpolationFlag, m_ipaParam.refFilterFlag,
-             m_ipaParam.applyPDPC,     m_ipaParam.applyFusion,       m_ipaParam.multiRefIndex,
-             m_ipaParam.intraPredAngle, m_ipaParam.absInvAngle };
+    return { m_ipaParam.isModeVer,
+             m_ipaParam.interpolationFlag,
+             m_ipaParam.refFilterFlag,
+             m_ipaParam.applyPDPC,
+#if GRAD_PDPC
+             m_ipaParam.useGradPDPC,
+#else
+             false,
+#endif
+#if JVET_AB0157_INTRA_FUSION
+             m_ipaParam.applyFusion,
+#else
+             false,
+#endif
+             m_ipaParam.multiRefIndex,
+             m_ipaParam.intraPredAngle,
+             m_ipaParam.absInvAngle,
+             m_ipaParam.angularScale };
   }
 private:
 

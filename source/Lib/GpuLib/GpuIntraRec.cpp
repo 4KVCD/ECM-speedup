@@ -54,7 +54,7 @@
 
 namespace
 {
-// layout shared with intra_rec.comp (struct Tu): 32 int32
+// layout shared with intra_rec.comp (struct Tu): 48 int32
 struct Tu
 {
   int32_t comp, x, y, w, h;
@@ -68,9 +68,10 @@ struct Tu
   int32_t recMin, recMax;
   int32_t dbgOffset;
   int32_t plIdx;
-  int32_t pad[5];
+  int32_t refFilter, applyPDPC, gradPDPC, angularScale, fusion, disableRefFilter;
+  int32_t pad[15];
 };
-static_assert( sizeof( Tu ) == 32 * 4, "Tu layout" );
+static_assert( sizeof( Tu ) == 48 * 4, "Tu layout" );
 
 // layout shared with intra_rec.comp (struct Params, std430)
 struct Params
@@ -159,7 +160,7 @@ GpuIntraRec* GpuIntraRec::create()
   m.stream.reset( new gpu::Stream( *ctx ) );
 
   // tables, from the C++ tables themselves
-  std::vector<int32_t> filt( 5 * 32 * 16, 0 );
+  std::vector<int32_t> filt( 5 * 32 * 16 + 32 * 4, 0 );
   for( int t = 0; t < 5; t++ )
   {
     for( int frac = 0; frac < 32; frac++ )
@@ -169,6 +170,14 @@ GpuIntraRec* GpuIntraRec::create()
       {
         filt[( t * 32 + frac ) * 16 + i] = f[i];
       }
+    }
+  }
+  for( int frac = 0; frac < 32; frac++ )   // weak 4-tap filter of the negative-angle reference extension
+  {
+    const TFilterCoeff* f = InterpolationFilter::getWeak4TapFilterTable( frac );
+    for( int i = 0; i < 4; i++ )
+    {
+      filt[5 * 32 * 16 + frac * 4 + i] = f[i];
     }
   }
   std::vector<int32_t> mat;
@@ -264,7 +273,6 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
   else if( cu.eipFlag )                                             why = "EIP";
   else if( pu.multiRefIdx || ipa.multiRefIndex )                    why = "MRL";
   else if( dirMode >= NUM_LUMA_MODE )                               why = "intra mode beyond 66 (LM / NN / ...)";
-  else if( ipa.refFilterFlag || ipa.applyPDPC || ipa.applyFusion )  why = "reference filter / PDPC / intra fusion";
   else if( sps.getUseIntraPredBf() )                                why = "intra bilateral filter";
   else if( sps.getUseLmcs() )                                       why = "LMCS";
   else if( sps.getUseQcs() )                                        why = "QCS";
@@ -290,6 +298,12 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
   t.absInvAngle    = ipa.absInvAngle;
   t.useCubic       = !ipa.interpolationFlag;
   t.plIdx          = isLuma( compID ) && dirMode == PLANAR_IDX ? cu.plIdx : 0;
+  t.refFilter        = ipa.refFilterFlag;
+  t.applyPDPC        = ipa.applyPDPC;
+  t.gradPDPC         = ipa.useGradPDPC;
+  t.angularScale     = ipa.angularScale;
+  t.fusion           = ipa.applyFusion;
+  t.disableRefFilter = sps.getDisableRefFilter();
   const PreCalcValues& pcv = *cs.pcv;
   const bool noShift = pcv.noChroma2x2 && area.width == 4;
   t.unitW    = pcv.minCUWidth >> ( noShift ? 0 : getComponentScaleX( compID, sps.getChromaFormatIdc() ) );
@@ -496,6 +510,15 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
   m.numVerified++;
   const bool bad = numBad > 0 || !first.empty();
   m.numMismatch += bad ? 1 : 0;
-  printf( "\n[gpu-intra] POC %d: %d blocks, GPU %.2f ms: %s%s%s", m.poc, (int) m.rec.size(), ms, bad ? "MISMATCH, " : "identical",
+  int numFilter = 0, numPdpc = 0, numGrad = 0, numFusion = 0;
+  for( const Tu& t: m.rec )
+  {
+    numFilter += t.refFilter;
+    numPdpc += t.applyPDPC;
+    numGrad += t.applyPDPC && t.gradPDPC;
+    numFusion += t.fusion;
+  }
+  printf( "\n[gpu-intra] POC %d: %d blocks (ref filter %d, PDPC %d, gradient PDPC %d, fusion %d), GPU %.2f ms: %s%s%s", m.poc,
+          (int) m.rec.size(), numFilter, numPdpc, numGrad, numFusion, ms, bad ? "MISMATCH, " : "identical",
           bad ? first.c_str() : "", numBad ? ( ", " + std::to_string( numBad ) + " picture samples differ" ).c_str() : "" );
 }

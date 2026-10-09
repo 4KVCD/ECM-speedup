@@ -1,14 +1,19 @@
 #version 460
-// intra reconstruction of a picture on the GPU (M1: planar/DC/angular, DCT-II, scalar dequantization, no reference
-// filtering / PDPC / intra fusion / intra bilateral filter): one workgroup takes the transform blocks in the CPU's
-// decoding order; per block: reference samples from the decoded-unit map, prediction, dequantization, the two inverse
-// transform stages, reconstruction, map update. Every step follows the C++ of IntraPrediction / Quant / TrQuant.
+// intra reconstruction of a picture on the GPU: one workgroup takes the transform blocks in the CPU's decoding order;
+// per block: reference samples from the decoded-unit map (and their [1 2 1] filtering), prediction (planar,
+// directional planar, DC, angular with PDPC and intra fusion), dequantization, the two inverse transform stages,
+// reconstruction, map update. Every step follows the C++ of IntraPrediction / Quant / TrQuant / DecCu.
+// Not yet: MRL, ISP, MIP, the intra bilateral filter, LFNST / MTS / transform skip, decoder-side intra modes.
 #extension GL_GOOGLE_include_directive : require
 #include "common.glsl"
 
 layout( local_size_x = 256 ) in;
 
-// one transform block of one component (int32 fields, layout shared with GpuIntraRec::Tu)
+// the reconstruction and the decoded-unit map are written by one invocation and read by others of the workgroup
+layout( buffer_reference, std430, buffer_reference_align = 2 ) coherent buffer CBufI16 { int16_t v[]; };
+layout( buffer_reference, std430, buffer_reference_align = 1 ) coherent buffer CBufU8 { uint8_t v[]; };
+
+// one transform block of one component (48 int32, layout shared with GpuIntraRec.cpp)
 struct Tu
 {
   int comp, x, y, w, h;
@@ -22,7 +27,8 @@ struct Tu
   int recMin, recMax;                            // reconstruction clipping (adaptive for luma)
   int dbgOffset;                                 // sample offset of the block in the debug buffers
   int plIdx;                                     // directional planar (luma): 1 horizontal, 2 vertical
-  int pad1, pad2, pad3, pad4, pad5;
+  int refFilter, applyPDPC, gradPDPC, angularScale, fusion, disableRefFilter;
+  int pad[15];
 };
 layout( buffer_reference, std430, buffer_reference_align = 4 ) buffer BufTu { Tu v[]; };
 
@@ -40,7 +46,7 @@ struct Params
   int      decompH[2];
   int      unitLog2X[2];
   int      unitLog2Y[2];
-  uint64_t filters;     // int32: [taps 6,8,10,12,16][32][16] cubic tables, then 4-tap [32][4]
+  uint64_t filters;     // int32: [taps 6,8,10,12,16][32][16] cubic tables, then the weak 4-tap table [32][4]
   uint64_t matrices;    // int32: DCT-II inverse matrices N = 2..128 at matrixOffset[log2N - 1]
   int      matrixOffset[8];
   uint64_t scratch;     // int32: coef | tmp | block | prediction (4 x 16384)
@@ -55,26 +61,33 @@ layout( push_constant ) uniform Push
   int      numTus;
 } pc;
 
-const int ANG_REF_BUF = 2574;   // IntraPrediction::ANG_REF_BUF_SIZE
-const int PAD         = 6;      // interpFilterNumPadded (16 taps / 2 - 2)
-const int MAX_REF     = 2 * ( 8 * 128 + 1 ) + 16;
+const int PAD     = 6;                        // interpFilterNumPadded (16 taps / 2 - 2)
+const int ANG     = 1792;                     // angular reference buffers (the CPU's are larger; blocks <= 128 use < 1700)
+const int MAX_REF = 2 * ( 8 * 128 + 2 ) + 16; // reference line: top row (stride predSize + 1 + mrl), then the left column
+const int WEAK4   = 5 * 32 * 16;              // offset of the weak 4-tap table in the filter buffer
 
-shared int s_ref[MAX_REF];      // refBufUnfiltered: top row (stride predSize + 1), then the left column
-shared int s_refAbove[ANG_REF_BUF];
-shared int s_refLeft[ANG_REF_BUF];
-shared int s_flags[2 * 256 + 2];   // neighborFlags (units)
-shared int s_dc;
+shared int16_t s_ref[2][MAX_REF];             // refBufUnfiltered (line 0; filtered in place when refFilter), fusion line 1
+shared int16_t s_tmp[MAX_REF];
+shared int16_t s_angA[2][ANG];                // refAbove, refAbove2nd
+shared int16_t s_angL[2][ANG];                // refLeft, refLeft2nd
+shared int     s_flags[2 * 256 + 4];          // neighborFlags (units)
+shared int     s_dc;
+
+Params P;   // the parameter block (loaded once)
 
 int filterTap( int taps, int frac, int i )
 {
-  // tables: 6, 8, 10, 12, 16 taps (index 0..4), [frac 0..31][16]
   int t = taps == 6 ? 0 : taps == 8 ? 1 : taps == 10 ? 2 : taps == 12 ? 3 : 4;
-  return BufI32( BufParams( pc.params ).p.filters ).v[( t * 32 + frac ) * 16 + i];
+  return BufI32( P.filters ).v[( t * 32 + frac ) * 16 + i];
+}
+
+int weak4( int frac, int i )
+{
+  return BufI32( P.filters ).v[WEAK4 + frac * 4 + i];
 }
 
 bool isDecomp( int ch, int x, int y )
 {
-  Params P = BufParams( pc.params ).p;
   if( x < 0 || y < 0 )
   {
     return false;
@@ -84,194 +97,12 @@ bool isDecomp( int ch, int x, int y )
   {
     return false;
   }
-  return BufU8( P.decomp[ch] ).v[uy * P.decompW[ch] + ux] != uint8_t( 0 );
+  return CBufU8( P.decomp[ch] ).v[uy * P.decompW[ch] + ux] != uint8_t( 0 );
 }
 
 int recoAt( int comp, int x, int y )
 {
-  Params P = BufParams( pc.params ).p;
-  return int( BufI16( P.plane[comp] ).v[P.origin[comp] + y * P.stride[comp] + x] );
-}
-
-// IntraPrediction::xFillReferenceSamples with multiRefIdx 0 (thread 0); returns predStride
-int fillReference( Tu t )
-{
-  const int ch        = t.comp == 0 ? 0 : 1;
-  const int predSize  = t.w << 3, predHSize = t.h << 3;
-  const int predStride = predSize + 1;
-  const int unitWidth = t.unitW, unitHeight = t.unitH;
-  const int totalAboveUnits = ( predSize + ( unitWidth - 1 ) ) / unitWidth;
-  const int totalLeftUnits  = ( predHSize + ( unitHeight - 1 ) ) / unitHeight;
-  const int totalUnits      = totalAboveUnits + totalLeftUnits + 1;
-  const int numAboveUnits   = max( t.w / unitWidth, 1 );
-  const int numLeftUnits    = max( t.h / unitHeight, 1 );
-  const int numAboveRightUnits = totalAboveUnits - numAboveUnits;
-  const int numLeftBelowUnits  = totalLeftUnits - numLeftUnits;
-  for( int i = 0; i < totalUnits; i++ )
-  {
-    s_flags[i] = 0;
-  }
-  int numIntraNeighbor = 0;
-  // above-left
-  if( isDecomp( ch, t.x - 1, t.y - 1 ) )
-  {
-    s_flags[totalLeftUnits] = 1;
-    numIntraNeighbor++;
-  }
-  // above (multiRefIdx 0: the zero-unit MRL call is empty), above-right
-  {
-    int base = totalLeftUnits + 1;
-    for( int dx = 0, k = 0; dx < numAboveUnits * unitWidth; dx += unitWidth, k++ )
-    {
-      if( !isDecomp( ch, t.x + dx, t.y - 1 ) ) break;
-      s_flags[base + k] = 1;
-      numIntraNeighbor++;
-    }
-    base += numAboveUnits;
-    for( int dx = 0, k = 0; dx < numAboveRightUnits * unitWidth; dx += unitWidth, k++ )
-    {
-      if( !isDecomp( ch, t.x + t.w - 1 + unitWidth + dx, t.y - 1 ) ) break;
-      s_flags[base + k] = 1;
-      numIntraNeighbor++;
-    }
-  }
-  // left, below-left (flags written downwards)
-  {
-    int base = totalLeftUnits - 1;
-    for( int dy = 0, k = 0; dy < numLeftUnits * unitHeight; dy += unitHeight, k++ )
-    {
-      if( !isDecomp( ch, t.x - 1, t.y + dy ) ) break;
-      s_flags[base - k] = 1;
-      numIntraNeighbor++;
-    }
-    base -= numLeftUnits;
-    for( int dy = 0, k = 0; dy < numLeftBelowUnits * unitHeight; dy += unitHeight, k++ )
-    {
-      if( !isDecomp( ch, t.x - 1, t.y + t.h - 1 + unitHeight + dy ) ) break;
-      s_flags[base - k] = 1;
-      numIntraNeighbor++;
-    }
-  }
-
-  const int valueDC = 1 << ( t.bitDepth - 1 );
-  if( numIntraNeighbor == 0 )
-  {
-    for( int j = 0; j <= predSize; j++ ) s_ref[j] = valueDC;
-    for( int i = 0; i <= predHSize; i++ ) s_ref[i + predStride] = valueDC;
-  }
-  else if( numIntraNeighbor == totalUnits )
-  {
-    for( int j = 0; j <= predSize; j++ ) s_ref[j] = recoAt( t.comp, t.x - 1 + j, t.y - 1 );
-    for( int i = 0; i <= predHSize; i++ ) s_ref[i + predStride] = recoAt( t.comp, t.x - 1, t.y - 1 + i );
-  }
-  else
-  {
-    // copy the available units (source position (sx, sy) walks like ptrSrc)
-    if( s_flags[totalLeftUnits] != 0 )
-    {
-      s_ref[0]          = recoAt( t.comp, t.x - 1, t.y - 1 );
-      s_ref[predStride] = s_ref[0];
-    }
-    {
-      int sy = t.y, d = 1 + predStride;
-      for( int unitIdx = totalLeftUnits - 1; unitIdx > 0; unitIdx-- )
-      {
-        if( s_flags[unitIdx] != 0 )
-        {
-          for( int i = 0; i < unitHeight; i++ ) s_ref[d + i] = recoAt( t.comp, t.x - 1, sy + i );
-        }
-        sy += unitHeight;
-        d += unitHeight;
-      }
-      if( s_flags[0] != 0 )
-      {
-        int lastSample = ( predHSize % unitHeight == 0 ) ? unitHeight : predHSize % unitHeight;
-        for( int i = 0; i < lastSample; i++ ) s_ref[d + i] = recoAt( t.comp, t.x - 1, sy + i );
-      }
-    }
-    {
-      int sx = t.x, d = 1;
-      for( int unitIdx = totalLeftUnits + 1; unitIdx < totalUnits - 1; unitIdx++ )
-      {
-        if( s_flags[unitIdx] != 0 )
-        {
-          for( int j = 0; j < unitWidth; j++ ) s_ref[d + j] = recoAt( t.comp, sx + j, t.y - 1 );
-        }
-        sx += unitWidth;
-        d += unitWidth;
-      }
-      if( s_flags[totalUnits - 1] != 0 )
-      {
-        int lastSample = ( predSize % unitWidth == 0 ) ? unitWidth : predSize % unitWidth;
-        for( int j = 0; j < lastSample; j++ ) s_ref[d + j] = recoAt( t.comp, sx + j, t.y - 1 );
-      }
-    }
-    // padding
-    int lastAvailUnit = 0;
-    if( s_flags[0] == 0 )
-    {
-      int firstAvailUnit = 1;
-      while( firstAvailUnit < totalUnits && s_flags[firstAvailUnit] == 0 ) firstAvailUnit++;
-      int firstAvailRow = -1, firstAvailCol = 0;
-      if( firstAvailUnit < totalLeftUnits )
-      {
-        firstAvailRow = ( totalLeftUnits - firstAvailUnit ) * unitHeight;
-      }
-      else if( firstAvailUnit == totalLeftUnits )
-      {
-        firstAvailRow = 0;
-      }
-      else
-      {
-        firstAvailCol = ( firstAvailUnit - totalLeftUnits - 1 ) * unitWidth + 1;
-      }
-      const int firstAvailSample = s_ref[firstAvailRow < 0 ? firstAvailCol : firstAvailRow + predStride];
-      for( int i = predHSize; i > firstAvailRow; i-- ) s_ref[i + predStride] = firstAvailSample;
-      if( firstAvailCol > 0 )
-      {
-        for( int j = 0; j < firstAvailCol; j++ ) s_ref[j] = firstAvailSample;
-      }
-      lastAvailUnit = firstAvailUnit;
-    }
-    int currUnit = lastAvailUnit + 1;
-    while( currUnit < totalUnits )
-    {
-      if( s_flags[currUnit] == 0 )
-      {
-        int lastAvailRow = -1, lastAvailCol = 0;
-        if( lastAvailUnit < totalLeftUnits )
-        {
-          lastAvailRow = ( totalLeftUnits - lastAvailUnit - 1 ) * unitHeight + 1;
-        }
-        else if( lastAvailUnit == totalLeftUnits )
-        {
-          lastAvailCol = 0;
-        }
-        else
-        {
-          lastAvailCol = ( lastAvailUnit - totalLeftUnits ) * unitWidth;
-        }
-        const int lastAvailSample = s_ref[lastAvailRow < 0 ? lastAvailCol : lastAvailRow + predStride];
-        if( currUnit < totalLeftUnits )
-        {
-          for( int i = lastAvailRow - 1; i >= lastAvailRow - unitHeight; i-- ) s_ref[i + predStride] = lastAvailSample;
-        }
-        else if( currUnit == totalLeftUnits )
-        {
-          s_ref[predStride] = lastAvailSample;
-          s_ref[0]          = lastAvailSample;
-        }
-        else
-        {
-          int numSamplesInUnit = ( currUnit == totalUnits - 1 ) ? ( ( predSize % unitWidth == 0 ) ? unitWidth : predSize % unitWidth ) : unitWidth;
-          for( int j = lastAvailCol + 1; j <= lastAvailCol + numSamplesInUnit; j++ ) s_ref[j] = lastAvailSample;
-        }
-      }
-      lastAvailUnit = currUnit;
-      currUnit++;
-    }
-  }
-  return predStride;
+  return int( CBufI16( P.plane[comp] ).v[P.origin[comp] + y * P.stride[comp] + x] );
 }
 
 int clip3i( int lo, int hi, int v )
@@ -284,11 +115,214 @@ int asPel( int v )   // the int16 Pel the CPU stores
   return int( int16_t( v ) );
 }
 
+// isAboveAvailable & co.: units from (px, py) in steps (dx, dy), flags from flagIdx in direction flagDir; stops at
+// the first unit that is not decoded
+int scanUnits( int ch, int px, int py, int dx, int dy, int num, int flagIdx, int flagDir )
+{
+  int n = 0;
+  for( int k = 0; k < num; k++ )
+  {
+    if( !isDecomp( ch, px + k * dx, py + k * dy ) )
+    {
+      break;
+    }
+    s_flags[flagIdx + k * flagDir] = 1;
+    n++;
+  }
+  return n;
+}
+
+// IntraPrediction::xFillReferenceSamples into reference line `line` with multiRefIdx mrl (thread 0)
+void fillReference( Tu t, int line, int mrl )
+{
+  const int ch        = t.comp == 0 ? 0 : 1;
+  const int predSize  = t.w << 3, predHSize = t.h << 3;
+  const int predStride = predSize + 1 + mrl;
+  const int uW = t.unitW, uH = t.unitH;
+  const int lMU = mrl / uH, aMU = mrl / uW;
+  const int tAU = ( predSize + ( uW - 1 ) ) / uW;
+  const int tLU = ( predHSize + ( uH - 1 ) ) / uH;
+  const int totalUnits = tAU + tLU + 1 + lMU + aMU;
+  const int numAboveUnits = max( t.w / uW, 1 ), numLeftUnits = max( t.h / uH, 1 );
+  const int numAboveRightUnits = tAU - numAboveUnits, numLeftBelowUnits = tLU - numLeftUnits;
+  for( int i = 0; i < totalUnits; i++ )
+  {
+    s_flags[i] = 0;
+  }
+  int n = 0;
+  if( isDecomp( ch, t.x - mrl - 1, t.y - mrl - 1 ) )
+  {
+    s_flags[tLU + lMU] = 1;
+    n++;
+  }
+  n += scanUnits( ch, t.x - aMU * uW, t.y - mrl - 1, uW, 0, aMU, tLU + 1 + lMU, 1 );
+  n += scanUnits( ch, t.x - mrl - 1, t.y - lMU * uH, 0, uH, lMU, tLU - 1 + lMU, -1 );
+  n += scanUnits( ch, t.x, t.y - mrl - 1, uW, 0, numAboveUnits, tLU + 1 + lMU + aMU, 1 );
+  n += scanUnits( ch, t.x + t.w - 1 + uW, t.y - mrl - 1, uW, 0, numAboveRightUnits, tLU + 1 + lMU + aMU + numAboveUnits, 1 );
+  n += scanUnits( ch, t.x - mrl - 1, t.y, 0, uH, numLeftUnits, tLU - 1, -1 );
+  n += scanUnits( ch, t.x - mrl - 1, t.y + t.h - 1 + uH, 0, uH, numLeftBelowUnits, tLU - 1 - numLeftUnits, -1 );
+
+  const int x0 = t.x - 1 - mrl, y0 = t.y - 1 - mrl;   // ptrSrc
+  const int valueDC = 1 << ( t.bitDepth - 1 );
+  if( n == 0 )
+  {
+    for( int j = 0; j <= predSize + mrl; j++ ) s_ref[line][j] = int16_t( valueDC );
+    for( int i = 0; i <= predHSize + mrl; i++ ) s_ref[line][i + predStride] = int16_t( valueDC );
+  }
+  else if( n == totalUnits )
+  {
+    for( int j = 0; j <= predSize + mrl; j++ ) s_ref[line][j] = int16_t( recoAt( t.comp, x0 + j, y0 ) );
+    for( int i = 0; i <= predHSize + mrl; i++ ) s_ref[line][i + predStride] = int16_t( recoAt( t.comp, x0, y0 + i ) );
+  }
+  else
+  {
+    if( s_flags[tLU + lMU] != 0 )
+    {
+      s_ref[line][0]          = int16_t( recoAt( t.comp, x0, y0 ) );
+      s_ref[line][predStride] = s_ref[line][0];
+      for( int i = 1; i <= mrl - lMU * uH; i++ )
+      {
+        s_ref[line][i]              = int16_t( recoAt( t.comp, x0 + i, y0 ) );
+        s_ref[line][i + predStride] = int16_t( recoAt( t.comp, x0, y0 + i ) );
+      }
+    }
+    {
+      int sy = y0 + 1 + mrl - lMU * uH;
+      int d  = ( 1 + mrl - lMU * uH ) + predStride;
+      for( int unitIdx = tLU + lMU - 1; unitIdx > 0; unitIdx-- )
+      {
+        if( s_flags[unitIdx] != 0 )
+        {
+          for( int i = 0; i < uH; i++ ) s_ref[line][d + i] = int16_t( recoAt( t.comp, x0, sy + i ) );
+        }
+        sy += uH;
+        d += uH;
+      }
+      if( s_flags[0] != 0 )
+      {
+        int lastSample = ( predHSize % uH == 0 ) ? uH : predHSize % uH;
+        for( int i = 0; i < lastSample; i++ ) s_ref[line][d + i] = int16_t( recoAt( t.comp, x0, sy + i ) );
+      }
+    }
+    {
+      int sx = t.x - aMU * uW;
+      int d  = 1 + mrl - aMU * uW;
+      for( int unitIdx = tLU + lMU + 1; unitIdx < totalUnits - 1; unitIdx++ )
+      {
+        if( s_flags[unitIdx] != 0 )
+        {
+          for( int j = 0; j < uW; j++ ) s_ref[line][d + j] = int16_t( recoAt( t.comp, sx + j, y0 ) );
+        }
+        sx += uW;
+        d += uW;
+      }
+      if( s_flags[totalUnits - 1] != 0 )
+      {
+        int lastSample = ( predSize % uW == 0 ) ? uW : predSize % uW;
+        for( int j = 0; j < lastSample; j++ ) s_ref[line][d + j] = int16_t( recoAt( t.comp, sx + j, y0 ) );
+      }
+    }
+    int lastAvailUnit = 0;
+    if( s_flags[0] == 0 )
+    {
+      int firstAvailUnit = 1;
+      while( firstAvailUnit < totalUnits && s_flags[firstAvailUnit] == 0 ) firstAvailUnit++;
+      int firstAvailRow = -1, firstAvailCol = 0;
+      if( firstAvailUnit < tLU + lMU )
+      {
+        firstAvailRow = ( tLU + lMU - firstAvailUnit ) * uH + mrl - lMU * uH;
+      }
+      else if( firstAvailUnit == tLU + lMU )
+      {
+        firstAvailRow = mrl - lMU * uH;
+      }
+      else
+      {
+        firstAvailCol = ( firstAvailUnit - tLU - lMU - 1 ) * uW + 1 + mrl - aMU * uW;
+      }
+      const int16_t firstAvailSample = s_ref[line][firstAvailRow < 0 ? firstAvailCol : firstAvailRow + predStride];
+      for( int i = predHSize + mrl; i > firstAvailRow; i-- ) s_ref[line][i + predStride] = firstAvailSample;
+      if( firstAvailCol > 0 )
+      {
+        for( int j = 0; j < firstAvailCol; j++ ) s_ref[line][j] = firstAvailSample;
+      }
+      lastAvailUnit = firstAvailUnit;
+    }
+    int currUnit = lastAvailUnit + 1;
+    while( currUnit < totalUnits )
+    {
+      if( s_flags[currUnit] == 0 )
+      {
+        int lastAvailRow = -1, lastAvailCol = 0;
+        if( lastAvailUnit < tLU + lMU )
+        {
+          lastAvailRow = ( tLU + lMU - lastAvailUnit - 1 ) * uH + mrl - lMU * uH + 1;
+        }
+        else if( lastAvailUnit == tLU + lMU )
+        {
+          lastAvailCol = mrl - lMU * uH;
+        }
+        else
+        {
+          lastAvailCol = ( lastAvailUnit - tLU - lMU ) * uW + mrl - aMU * uW;
+        }
+        const int16_t lastAvailSample = s_ref[line][lastAvailRow < 0 ? lastAvailCol : lastAvailRow + predStride];
+        if( currUnit < tLU + lMU )
+        {
+          for( int i = lastAvailRow - 1; i >= lastAvailRow - uH; i-- ) s_ref[line][i + predStride] = lastAvailSample;
+        }
+        else if( currUnit == tLU + lMU )
+        {
+          for( int i = 0; i < mrl - lMU * uH + 1; i++ ) s_ref[line][i + predStride] = lastAvailSample;
+          for( int j = 0; j < mrl - aMU * uW + 1; j++ ) s_ref[line][j] = lastAvailSample;
+        }
+        else
+        {
+          int nsu = ( currUnit == totalUnits - 1 ) ? ( ( predSize % uW == 0 ) ? uW : predSize % uW ) : uW;
+          for( int j = lastAvailCol + 1; j <= lastAvailCol + nsu; j++ ) s_ref[line][j] = lastAvailSample;
+        }
+      }
+      lastAvailUnit = currUnit;
+      currUnit++;
+    }
+  }
+}
+
+// main / side reference arrays of line l (main = above for vertical modes)
+int mainR( bool isVer, int l, int i ) { return isVer ? int( s_angA[l][i] ) : int( s_angL[l][i] ); }
+int sideR( bool isVer, int l, int i ) { return isVer ? int( s_angL[l][i] ) : int( s_angA[l][i] ); }
+void mainW( bool isVer, int l, int i, int v ) { if( isVer ) s_angA[l][i] = int16_t( v ); else s_angL[l][i] = int16_t( v ); }
+
+// the luma interpolation filter of xPredIntraAng for fraction frac (cubic N-tap table or the Gaussian formulas)
+int lumaConv( bool isVer, int l, int base, int taps, bool cubic, bool big, int frac )
+{
+  int sum = 0;
+  if( cubic )
+  {
+    for( int k = 0; k < taps; k++ ) sum += mainR( isVer, l, base + k ) * filterTap( taps, frac, k );
+  }
+  else
+  {
+    int f[6];
+    if( big )
+    {
+      f[0] = 16 - ( frac >> 1 ); f[1] = 64 - 3 * ( frac >> 1 ); f[2] = 96 - frac;
+      f[3] = 64 + frac;          f[4] = 16 + 3 * ( frac >> 1 ); f[5] = frac >> 1;
+    }
+    else
+    {
+      f[0] = 0; f[1] = 64 - ( frac << 1 ); f[2] = 128 - ( frac << 1 ); f[3] = 64 + ( frac << 1 ); f[4] = frac << 1; f[5] = 0;
+    }
+    for( int k = 0; k < 6; k++ ) sum += mainR( isVer, l, base + k ) * int( int16_t( f[k] ) );
+  }
+  return sum;
+}
+
 void main()
 {
-  const uint lid = gl_LocalInvocationID.x;
-  const uint NT  = gl_WorkGroupSize.x;
-  Params P = BufParams( pc.params ).p;
+  const int lid = int( gl_LocalInvocationID.x );
+  const int NT  = int( gl_WorkGroupSize.x );
+  P = BufParams( pc.params ).p;
   BufI32 sc = BufI32( P.scratch );
   const int COEF = 0, TMP = 16384, BLK = 32768, PRED = 49152;
 
@@ -297,103 +331,181 @@ void main()
     Tu t = BufTu( P.tus ).v[ti];
     const int W = t.w, H = t.h, N = W * H;
     const int maxPel = ( 1 << t.bitDepth ) - 1;
+    const int predStride = ( W << 3 ) + 1, predSize = W << 3, predHSize = H << 3;
+    const bool fusion = t.fusion != 0;
 
-    // ----- reference samples
-    int predStride = 0;
+    // ----- reference samples (and the second line of intra fusion)
     if( lid == 0 )
     {
-      predStride = fillReference( t );
-    }
-    predStride = ( t.w << 3 ) + 1;
-    barrier();
-
-    // ----- prediction into scratch PRED (row-major W x H)
-    if( t.dirMode == 0 )   // planar
-    {
-      const int log2W = findMSB( W ), log2H = findMSB( H );
-      const int topRight = s_ref[1 + W], bottomLeft = s_ref[predStride + 1 + H];
-      const int offset = 1 << ( log2W + log2H ), finalShift = 1 + log2W + log2H;
-      for( int i = int( lid ); i < N; i += int( NT ) )
+      fillReference( t, 0, 0 );
+      if( fusion )
       {
-        int x = i % W, y = i / W;
-        int T = s_ref[1 + x], L = s_ref[predStride + 1 + y];
-        int horPred  = ( L << log2W ) + ( x + 1 ) * ( topRight - L );
-        int vertPred = ( T << log2H ) + ( y + 1 ) * ( bottomLeft - T );
+        fillReference( t, 1, 1 );
+      }
+    }
+    barrier();
+    if( t.refFilter != 0 )   // xFilterReferenceSamples (multiRefIdx 0), in place
+    {
+      for( int i = lid; i <= predStride + predHSize; i += NT )
+      {
         int v;
-        if( t.plIdx == 1 )
+        if( i == 0 || i == predStride )
         {
-          v = ( horPred + ( 1 << ( log2W - 1 ) ) ) >> log2W;
+          v = ( int( s_ref[0][0] ) + int( s_ref[0][1] ) + int( s_ref[0][predStride] ) + int( s_ref[0][predStride + 1] ) + 2 ) >> 2;
         }
-        else if( t.plIdx == 2 )
+        else if( i == predSize || i == predStride + predHSize )
         {
-          v = ( vertPred + ( 1 << ( log2H - 1 ) ) ) >> log2H;
+          v = int( s_ref[0][i] );
         }
         else
         {
-          v = ( ( horPred << log2H ) + ( vertPred << log2W ) + offset ) >> finalShift;
+          v = ( int( s_ref[0][i - 1] ) + 2 * int( s_ref[0][i] ) + int( s_ref[0][i + 1] ) + 2 ) >> 2;
         }
-        sc.v[PRED + i] = asPel( v );
+        s_tmp[i] = int16_t( v );
       }
+      barrier();
+      for( int i = lid; i <= predStride + predHSize; i += NT ) s_ref[0][i] = s_tmp[i];
+      barrier();
     }
-    else if( t.dirMode == 1 )   // DC
+
+    // ----- prediction into scratch PRED (row-major W x H)
+    if( t.dirMode == 0 || t.dirMode == 1 )   // planar / DC, then their PDPC
     {
-      if( lid == 0 )
+      const int log2W = findMSB( W ), log2H = findMSB( H );
+      if( t.dirMode == 1 && lid == 0 )
       {
         int denom = ( W == H ) ? ( W << 1 ) : max( W, H );
         int sum = 0;
-        if( W >= H ) for( int k = 0; k < W; k++ ) sum += s_ref[1 + k];
-        if( W <= H ) for( int k = 0; k < H; k++ ) sum += s_ref[predStride + 1 + k];
+        if( W >= H ) for( int k = 0; k < W; k++ ) sum += int( s_ref[0][1 + k] );
+        if( W <= H ) for( int k = 0; k < H; k++ ) sum += int( s_ref[0][predStride + 1 + k] );
         s_dc = ( sum + ( denom >> 1 ) ) >> findMSB( denom );
       }
       barrier();
-      for( int i = int( lid ); i < N; i += int( NT ) ) sc.v[PRED + i] = asPel( s_dc );
+      const int topRight = int( s_ref[0][1 + W] ), bottomLeft = int( s_ref[0][predStride + 1 + H] );
+      const int offset = 1 << ( log2W + log2H ), finalShift = 1 + log2W + log2H;
+      const int pdpcScale = ( log2W - 2 + log2H - 2 + 2 ) >> 2;
+      for( int i = lid; i < N; i += NT )
+      {
+        int x = i % W, y = i / W;
+        int T = int( s_ref[0][1 + x] ), L = int( s_ref[0][predStride + 1 + y] );
+        int v;
+        if( t.dirMode == 1 )
+        {
+          v = s_dc;
+        }
+        else
+        {
+          int horPred  = ( L << log2W ) + ( x + 1 ) * ( topRight - L );
+          int vertPred = ( T << log2H ) + ( y + 1 ) * ( bottomLeft - T );
+          if( t.plIdx == 1 )      v = ( horPred + ( 1 << ( log2W - 1 ) ) ) >> log2W;
+          else if( t.plIdx == 2 ) v = ( vertPred + ( 1 << ( log2H - 1 ) ) ) >> log2H;
+          else                    v = ( ( horPred << log2H ) + ( vertPred << log2W ) + offset ) >> finalShift;
+        }
+        v = asPel( v );
+        if( t.applyPDPC != 0 )   // xIntraPredPlanarDcPdpc
+        {
+          const int wT = 32 >> min( 31, ( y << 1 ) >> pdpcScale );
+          const int wL = 32 >> min( 31, ( x << 1 ) >> pdpcScale );
+          v = asPel( v + ( ( wL * ( L - v ) + wT * ( T - v ) + 32 ) >> 6 ) );
+        }
+        sc.v[PRED + i] = v;
+      }
     }
-    else   // angular (xPredIntraAng, weightMode 4, no PDPC, no bilateral filter)
+    else   // angular (xPredIntraAng without the intra bilateral filter)
     {
       const bool isVer = t.isModeVer != 0;
       const int angle = t.intraPredAngle, absInvAngle = t.absInvAngle;
-      for( int i = int( lid ); i < ANG_REF_BUF; i += int( NT ) )
+      for( int i = lid; i < ANG; i += NT )
       {
-        s_refAbove[i] = 0;
-        s_refLeft[i]  = 0;
+        s_angA[0][i] = int16_t( 0 ); s_angL[0][i] = int16_t( 0 );
+        s_angA[1][i] = int16_t( 0 ); s_angL[1][i] = int16_t( 0 );
       }
       barrier();
       const int topRefLength = W << 3, leftRefLength = H << 3;
-      // refMain / refSide as offsets into s_refAbove / s_refLeft: main = above when vertical
-      int mainBase, sideBase;
+      const int predStride2 = predStride + 1;   // the fusion line (multiRefIdx 1)
+      int mainBase, sideBase, mainBase2 = 0, sideBase2 = 0;
       if( angle < 0 )
       {
-        // copies (top row: width + PAD + 2 samples, left column: height + PAD + 2)
-        for( int i = int( lid ); i < W + PAD + 2; i += int( NT ) ) s_refAbove[H + PAD + i] = s_ref[i];
-        for( int i = int( lid ); i < H + PAD + 2; i += int( NT ) ) s_refLeft[W + PAD + i] = s_ref[predStride + i];
+        for( int i = lid; i < W + PAD + 2; i += NT ) s_angA[0][H + PAD + i] = s_ref[0][i];
+        for( int i = lid; i < H + PAD + 2; i += NT ) s_angL[0][W + PAD + i] = s_ref[0][predStride + i];
+        if( fusion )
+        {
+          for( int i = lid; i < topRefLength + PAD + 1; i += NT ) s_angA[1][H + PAD + 1 + i] = s_ref[1][i];
+          for( int i = lid; i < leftRefLength + PAD + 1; i += NT ) s_angL[1][W + PAD + 1 + i] = s_ref[1][predStride2 + i];
+        }
         barrier();
         mainBase = ( isVer ? H : W ) + PAD;
         sideBase = ( isVer ? W : H ) + PAD;
+        mainBase2 = mainBase + 1;
+        sideBase2 = sideBase + 1;
         const int sizeSide = isVer ? H : W;
-        // extend main to the left (DisableRefFilter: nearest of the two projected samples)
-        for( int k = -( sizeSide + PAD ) + int( lid ); k <= -1; k += int( NT ) )
+        for( int k = -( sizeSide + PAD ) + lid; k <= -1; k += NT )
         {
           int frac32precision = ( -k * absInvAngle + 8 ) >> 4;
           int intpel = frac32precision >> 5, fracpel = frac32precision & 31;
-          int li = clip3i( 0, sizeSide + 2, intpel ), ri = clip3i( 0, sizeSide + 2, intpel + 1 );
-          int left  = isVer ? s_refLeft[sideBase + li] : s_refAbove[sideBase + li];
-          int right = isVer ? s_refLeft[sideBase + ri] : s_refAbove[sideBase + ri];
-          int v = fracpel > 15 ? right : left;
-          if( isVer ) s_refAbove[mainBase + k] = v; else s_refLeft[mainBase + k] = v;
+          int left  = sideR( isVer, 0, sideBase + clip3i( 0, sizeSide + 2, intpel ) );
+          int right = sideR( isVer, 0, sideBase + clip3i( 0, sizeSide + 2, intpel + 1 ) );
+          int v;
+          if( t.disableRefFilter != 0 )
+          {
+            v = fracpel > 15 ? right : left;
+          }
+          else
+          {
+            int lm1 = sideR( isVer, 0, sideBase + clip3i( 0, sizeSide + 2, intpel - 1 ) );
+            int rp1 = sideR( isVer, 0, sideBase + clip3i( 0, sizeSide + 2, intpel + 2 ) );
+            v = clip3i( 0, maxPel, ( weak4( fracpel, 0 ) * lm1 + weak4( fracpel, 1 ) * left + weak4( fracpel, 2 ) * right + weak4( fracpel, 3 ) * rp1 + 32 ) >> 6 );
+          }
+          mainW( isVer, 0, mainBase + k, v );
         }
+        if( fusion )
+        {
+          const int sizeSideRange = ( isVer ? leftRefLength : topRefLength ) + 1;
+          for( int k = -( sizeSide + 1 + PAD ) + lid; k <= -1; k += NT )
+          {
+            int frac32precision = ( -k * absInvAngle + 8 ) >> 4;
+            int intpel = frac32precision >> 5, fracpel = frac32precision & 31;
+            int left  = sideR( isVer, 1, sideBase2 + clip3i( 0, sizeSideRange, intpel ) );
+            int right = sideR( isVer, 1, sideBase2 + clip3i( 0, sizeSideRange, intpel + 1 ) );
+            int v;
+            if( t.disableRefFilter != 0 )
+            {
+              v = fracpel > 15 ? right : left;
+            }
+            else
+            {
+              int lm1 = sideR( isVer, 1, sideBase2 + clip3i( 0, sizeSideRange, intpel - 1 ) );
+              int rp1 = sideR( isVer, 1, sideBase2 + clip3i( 0, sizeSideRange, intpel + 2 ) );
+              v = clip3i( 0, maxPel, ( weak4( fracpel, 0 ) * lm1 + weak4( fracpel, 1 ) * left + weak4( fracpel, 2 ) * right + weak4( fracpel, 3 ) * rp1 + 32 ) >> 6 );
+            }
+            mainW( isVer, 1, mainBase2 + k, v );
+          }
+        }
+        mainBase2 += 1;   // refMain2nd += multiRefIdx2nd
+        sideBase2 += 1;
       }
       else
       {
-        // copies of refLength + PAD samples (read on past each row, as the CPU does in its buffer)
-        for( int i = int( lid ); i < topRefLength + PAD; i += int( NT ) ) s_refAbove[PAD + i] = s_ref[i];
-        for( int i = int( lid ); i < leftRefLength + PAD; i += int( NT ) ) s_refLeft[PAD + i] = s_ref[predStride + i];
+        // copies of refLength + PAD (+1) samples (read on past each row, as the CPU does in its buffer)
+        for( int i = lid; i < topRefLength + PAD; i += NT ) s_angA[0][PAD + i] = s_ref[0][i];
+        for( int i = lid; i < leftRefLength + PAD; i += NT ) s_angL[0][PAD + i] = s_ref[0][predStride + i];
+        if( fusion )
+        {
+          for( int i = lid; i < topRefLength + 1 + PAD; i += NT ) s_angA[1][PAD + i] = s_ref[1][i];
+          for( int i = lid; i < leftRefLength + 1 + PAD; i += NT ) s_angL[1][PAD + i] = s_ref[1][predStride2 + i];
+        }
         barrier();
         if( lid == 0 )
         {
           for( int i = PAD - 1; i >= 0; --i )
           {
-            s_refAbove[i] = s_refAbove[PAD];
-            s_refLeft[i]  = s_refLeft[PAD];
+            s_angA[0][i] = s_angA[0][PAD];
+            s_angL[0][i] = s_angL[0][PAD];
+            if( fusion )
+            {
+              s_angA[1][i] = s_angA[1][PAD];
+              s_angL[1][i] = s_angL[1][PAD];
+            }
           }
         }
         barrier();
@@ -401,14 +513,18 @@ void main()
         sideBase = PAD;
         const int log2Ratio = findMSB( W ) - findMSB( H );
         const int s = max( 0, isVer ? log2Ratio : -log2Ratio );
-        const int maxIndex = ( 0 << s ) + 6;
         const int refLength = isVer ? topRefLength : leftRefLength;
-        const int val = isVer ? s_refAbove[mainBase + refLength] : s_refLeft[mainBase + refLength];
+        const int val  = mainR( isVer, 0, mainBase + refLength );
+        const int val2 = mainR( isVer, 1, PAD + refLength + 1 );
         barrier();
-        for( int z = 1 + int( lid ); z <= maxIndex + PAD; z += int( NT ) )
+        for( int z = 1 + lid; z <= 6 + PAD; z += NT ) mainW( isVer, 0, mainBase + refLength + z, val );
+        if( fusion )
         {
-          if( isVer ) s_refAbove[mainBase + refLength + z] = val; else s_refLeft[mainBase + refLength + z] = val;
+          const int maxIndex2 = ( 1 << s ) + 6 + 4;
+          for( int z = 1 + lid; z <= maxIndex2 + PAD; z += NT ) mainW( isVer, 1, PAD + refLength + 1 + z, val2 );
         }
+        mainBase2 = PAD + 1;   // refMain2nd += multiRefIdx2nd
+        sideBase2 = PAD + 1;
       }
       barrier();
       // rows along the main direction (width/height swapped for horizontal modes)
@@ -422,64 +538,74 @@ void main()
       }
       const int numExtra = taps / 2 - 2;
       const bool intSlope = ( abs( angle ) & 31 ) == 0;
-      for( int i = int( lid ); i < N; i += int( NT ) )
+      const bool big = W >= 32 && H >= 32;
+      const int pdpcLimit = t.applyPDPC != 0 ? min( 3 << ( angle == 0 ? ( ( findMSB( w ) + findMSB( h ) - 2 ) >> 2 ) : t.angularScale ), w ) : 0;
+      for( int i = lid; i < N; i += NT )
       {
         int x = i % w, y = i / w;   // position in the (possibly transposed) block
         int v;
         if( angle == 0 )
         {
-          v = isVer ? s_refAbove[mainBase + 1 + x] : s_refLeft[mainBase + 1 + x];
+          v = mainR( isVer, 0, mainBase + 1 + x );
+          if( x < pdpcLimit )
+          {
+            const int scale = ( findMSB( w ) + findMSB( h ) - 2 ) >> 2;
+            const int topLeft = mainR( isVer, 0, mainBase ), left = sideR( isVer, 0, sideBase + 1 + y );
+            const int wL = 32 >> ( 2 * x >> scale );
+            v = clip3i( 0, maxPel, v + ( ( wL * ( left - topLeft ) + 32 ) >> 6 ) );
+          }
         }
         else
         {
-          int deltaPos = angle * ( y + 1 );
-          int deltaInt = deltaPos >> 5, deltaFract = deltaPos & 31;
+          const int deltaPos = angle * ( y + 1 );
+          const int deltaInt = deltaPos >> 5, deltaFract = deltaPos & 31;
           if( intSlope )
           {
-            v = isVer ? s_refAbove[mainBase + deltaInt + 1 + x] : s_refLeft[mainBase + deltaInt + 1 + x];
+            v = mainR( isVer, 0, mainBase + deltaInt + 1 + x );
           }
           else if( isLuma )
           {
-            int sum = 0;
-            int base = mainBase + deltaInt + x - numExtra;
-            if( t.useCubic != 0 )
+            const bool cubic = t.useCubic != 0;
+            const int c0 = lumaConv( isVer, 0, mainBase + deltaInt + x - numExtra, taps, cubic, big, deltaFract );
+            int val32;
+            if( fusion )
             {
-              for( int k = 0; k < taps; k++ )
-              {
-                int r = isVer ? s_refAbove[base + k] : s_refLeft[base + k];
-                sum += r * filterTap( taps, deltaFract, k );
-              }
+              const int deltaInt2 = ( deltaPos + angle ) >> 5, deltaFract2 = ( deltaPos + angle ) & 31;
+              const int c1 = lumaConv( isVer, 1, mainBase2 + deltaInt2 + x - numExtra, taps, cubic, big, deltaFract2 );
+              val32 = ( 3 * c0 + 1 * c1 + 128 * 4 ) >> ( 8 + 2 );
             }
             else
             {
-              int f[6];
-              if( W >= 32 && H >= 32 )
-              {
-                f[0] = 16 - ( deltaFract >> 1 ); f[1] = 64 - 3 * ( deltaFract >> 1 ); f[2] = 96 - deltaFract;
-                f[3] = 64 + deltaFract; f[4] = 16 + 3 * ( deltaFract >> 1 ); f[5] = deltaFract >> 1;
-              }
-              else
-              {
-                f[0] = 0; f[1] = 64 - ( deltaFract << 1 ); f[2] = 128 - ( deltaFract << 1 );
-                f[3] = 64 + ( deltaFract << 1 ); f[4] = deltaFract << 1; f[5] = 0;
-              }
-              for( int k = 0; k < 6; k++ )
-              {
-                int r = isVer ? s_refAbove[base + k] : s_refLeft[base + k];
-                sum += r * int( int16_t( f[k] ) );
-              }
+              val32 = ( c0 + 128 ) >> 8;
             }
-            v = clip3i( 0, maxPel, clip3i( 0, maxPel, ( sum + 128 ) >> 8 ) );
+            v = clip3i( 0, maxPel, clip3i( 0, maxPel, val32 ) );
           }
           else
           {
-            int b = mainBase + deltaInt + x + 1;
-            int p0 = isVer ? s_refAbove[b] : s_refLeft[b];
-            int p1 = isVer ? s_refAbove[b + 1] : s_refLeft[b + 1];
+            const int p0 = mainR( isVer, 0, mainBase + deltaInt + x + 1 ), p1 = mainR( isVer, 0, mainBase + deltaInt + x + 2 );
             v = asPel( p0 + ( ( deltaFract * ( p1 - p0 ) + 16 ) >> 5 ) );
           }
+          v = asPel( v );
+          if( x < pdpcLimit )
+          {
+            const int scale = t.angularScale;
+            const int wL = 32 >> ( 2 * x >> scale );
+            if( t.gradPDPC != 0 )
+            {
+              const int left = sideR( isVer, 0, sideBase + 1 + y );
+              const int m0 = mainR( isVer, 0, mainBase + deltaInt ), m1 = mainR( isVer, 0, mainBase + deltaInt + 1 );
+              const int topLeft = asPel( m0 + ( ( deltaFract * ( m1 - m0 ) + 16 ) >> 5 ) );
+              v = clip3i( 0, maxPel, v + ( ( wL * ( left - topLeft ) + 32 ) >> 6 ) );
+            }
+            else
+            {
+              const int invAngleSum = 256 + ( x + 1 ) * absInvAngle;
+              const int left = sideR( isVer, 0, sideBase + y + ( invAngleSum >> 9 ) + 1 );
+              v = asPel( v + ( ( wL * ( left - v ) + 32 ) >> 6 ) );
+            }
+          }
         }
-        int ox = isVer ? x : y, oy = isVer ? y : x;
+        const int ox = isVer ? x : y, oy = isVer ? y : x;
         sc.v[PRED + oy * W + ox] = asPel( v );
       }
     }
@@ -489,26 +615,18 @@ void main()
     if( t.cbf != 0 )
     {
       BufI32 cf = BufI32( P.coeffs );
-      for( int i = int( lid ); i < N; i += int( NT ) )
+      for( int i = lid; i < N; i += NT )
       {
         int q = clip3i( t.dqInMin, t.dqInMax, cf.v[t.coeffOffset + i] );
-        int c;
-        if( t.dqRightShift > 0 )
-        {
-          c = ( q * t.dqScale + ( 1 << ( t.dqRightShift - 1 ) ) ) >> t.dqRightShift;
-        }
-        else
-        {
-          c = ( q * t.dqScale ) << ( -t.dqRightShift );
-        }
+        int c = t.dqRightShift > 0 ? ( q * t.dqScale + ( 1 << ( t.dqRightShift - 1 ) ) ) >> t.dqRightShift
+                                   : ( q * t.dqScale ) << ( -t.dqRightShift );
         sc.v[COEF + i] = clip3i( t.trMin, t.trMax, c );
       }
       barrier();
       BufI32 mt = BufI32( P.matrices );
       const int offH = P.matrixOffset[findMSB( H ) - 1], offW = P.matrixOffset[findMSB( W ) - 1];
-      // first stage (vertical, N = H): tmp[xf * H + y] from coefficient column xf
       const int rnd1 = 1 << ( t.shift1 - 1 );
-      for( int i = int( lid ); i < N; i += int( NT ) )
+      for( int i = lid; i < N; i += NT )   // first stage (vertical): tmp[xf * H + y]
       {
         int xf = i / H, y = i % H;
         int sum = 0;
@@ -516,9 +634,8 @@ void main()
         sc.v[TMP + xf * H + y] = clip3i( t.trMin, t.trMax, ( sum + rnd1 ) >> t.shift1 );
       }
       barrier();
-      // second stage (horizontal, N = W): block[y * W + x]
       const int rnd2 = 1 << ( t.shift2 - 1 );
-      for( int i = int( lid ); i < N; i += int( NT ) )
+      for( int i = lid; i < N; i += NT )   // second stage (horizontal): block[y * W + x]
       {
         int y = i / W, x = i % W;
         int sum = 0;
@@ -528,27 +645,26 @@ void main()
     }
     else
     {
-      for( int i = int( lid ); i < N; i += int( NT ) ) sc.v[BLK + i] = 0;
+      for( int i = lid; i < N; i += NT ) sc.v[BLK + i] = 0;
     }
     barrier();
 
-    // ----- reconstruction, debug copies
-    for( int i = int( lid ); i < N; i += int( NT ) )
+    // ----- reconstruction, debug copies, decoded-unit map
+    for( int i = lid; i < N; i += NT )
     {
       int x = i % W, y = i / W;
       int pr = sc.v[PRED + i], re = sc.v[BLK + i];
-      BufI16( P.plane[t.comp] ).v[P.origin[t.comp] + ( t.y + y ) * P.stride[t.comp] + t.x + x] = int16_t( clip3i( t.recMin, t.recMax, pr + re ) );
+      CBufI16( P.plane[t.comp] ).v[P.origin[t.comp] + ( t.y + y ) * P.stride[t.comp] + t.x + x] = int16_t( clip3i( t.recMin, t.recMax, pr + re ) );
       BufI16( P.dbgPred ).v[t.dbgOffset + i] = int16_t( pr );
       BufI16( P.dbgResi ).v[t.dbgOffset + i] = int16_t( re );
     }
-    // decoded-unit map
     {
       const int ch = t.comp == 0 ? 0 : 1;
       const int ux0 = t.x >> P.unitLog2X[ch], uy0 = t.y >> P.unitLog2Y[ch];
       const int uw = t.w >> P.unitLog2X[ch], uh = t.h >> P.unitLog2Y[ch];
-      for( int i = int( lid ); i < uw * uh; i += int( NT ) )
+      for( int i = lid; i < uw * uh; i += NT )
       {
-        BufU8( P.decomp[ch] ).v[( uy0 + i / uw ) * P.decompW[ch] + ux0 + i % uw] = uint8_t( 1 );
+        CBufU8( P.decomp[ch] ).v[( uy0 + i / uw ) * P.decompW[ch] + ux0 + i % uw] = uint8_t( 1 );
       }
     }
     memoryBarrierBuffer();
