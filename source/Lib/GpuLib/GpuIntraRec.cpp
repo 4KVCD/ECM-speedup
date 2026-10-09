@@ -55,7 +55,7 @@
 
 namespace
 {
-// layout shared with intra_rec.comp (struct Tu): 48 int32
+// layout shared with intra_rec.comp (struct Tu): 52 int32
 struct Tu
 {
   int32_t comp, x, y, w, h;
@@ -72,9 +72,10 @@ struct Tu
   int32_t refFilter, applyPDPC, gradPDPC, angularScale, fusion, disableRefFilter;
   int32_t avail[2][5];
   int32_t readMax[2][2];
-  int32_t pad[1];
+  int32_t nzRows, nzCols;
+  int32_t pad[3];
 };
-static_assert( sizeof( Tu ) == 48 * 4, "Tu layout" );
+static_assert( sizeof( Tu ) == 52 * 4, "Tu layout" );
 
 // layout shared with intra_rec.comp (struct Params, std430)
 struct Params
@@ -357,10 +358,16 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
   t.coeffOffset = (int32_t) m.coef.size();
   t.dbgOffset   = (int32_t) m.cpuPred.size();
   const CCoeffBuf c = tu.getCoeffs( compID );
+  t.nzRows = t.nzCols = 0;
   for( int y = 0; y < (int) area.height; y++ )
   {
     for( int x = 0; x < (int) area.width; x++ )
     {
+      if( c.at( x, y ) != 0 )
+      {
+        t.nzRows = std::max( t.nzRows, y + 1 );
+        t.nzCols = std::max( t.nzCols, x + 1 );
+      }
       m.coef.push_back( c.at( x, y ) );
       m.cpuPred.push_back( pred.at( x, y ) );
       m.cpuResi.push_back( resi.at( x, y ) );

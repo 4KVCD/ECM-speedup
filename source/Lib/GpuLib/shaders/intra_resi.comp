@@ -40,12 +40,15 @@ void main()
     const int offH = P.matrixOffset[findMSB( H ) - 1], offW = P.matrixOffset[findMSB( W ) - 1];
     const int rnd1 = 1 << ( t.shift1 - 1 ), rnd2 = 1 << ( t.shift2 - 1 );
     const int addDq = t.dqRightShift > 0 ? 1 << ( t.dqRightShift - 1 ) : 0;
+    // the levels lie in rows < nzRows, columns < nzCols: the skipped terms are zero, and so is the first stage of an
+    // all-zero column ((0 + rnd1) >> shift1), which the second stage then needs not read
+    const int nzR = t.nzRows, nzC = t.nzCols;
     // first stage (vertical): tmp[xf * H + y] from the dequantized coefficient column xf
-    for( int i = lid; i < N; i += NT )
+    for( int i = lid; i < nzC * H; i += NT )
     {
       const int xf = i / H, y = i % H;
       int sum = 0;
-      for( int k = 0; k < H; k++ )
+      for( int k = 0; k < nzR; k++ )
       {
         const int q = cf.v[t.coeffOffset + k * W + xf];
         if( q != 0 )
@@ -63,7 +66,7 @@ void main()
     {
       const int y = i / W, x = i % W;
       int sum = 0;
-      for( int k = 0; k < W; k++ ) sum += mt.v[offW + k * W + x] * tmp.v[k * H + y];
+      for( int k = 0; k < nzC; k++ ) sum += mt.v[offW + k * W + x] * tmp.v[k * H + y];
       resi.v[t.dbgOffset + i] = int16_t( clip3i( t.trMin, t.trMax, ( sum + rnd2 ) >> t.shift2 ) );
     }
     controlBarrier( gl_ScopeWorkgroup, gl_ScopeWorkgroup, gl_StorageSemanticsBuffer, gl_SemanticsAcquireRelease );

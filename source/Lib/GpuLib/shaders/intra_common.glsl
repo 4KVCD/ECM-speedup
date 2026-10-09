@@ -2,7 +2,7 @@
 #ifndef INTRA_COMMON_GLSL
 #define INTRA_COMMON_GLSL
 
-// one transform block of one component (48 int32, layout shared with GpuIntraRec.cpp)
+// one transform block of one component (52 int32, layout shared with GpuIntraRec.cpp)
 struct Tu
 {
   int comp, x, y, w, h;
@@ -19,7 +19,8 @@ struct Tu
   int refFilter, applyPDPC, gradPDPC, angularScale, fusion, disableRefFilter;
   int avail[2][5];   // per reference line (multiRefIdx 0, 1): corner, available prefix of the above / above-right / left / below-left units
   int readMax[2][2];   // per reference line: the highest top / left index the prediction reads (a superset)
-  int pad[1];
+  int nzRows, nzCols;   // the nonzero coefficient levels lie in rows < nzRows and columns < nzCols
+  int pad[3];
 };
 layout( buffer_reference, std430, buffer_reference_align = 4 ) buffer BufTu { Tu v[]; };
 
