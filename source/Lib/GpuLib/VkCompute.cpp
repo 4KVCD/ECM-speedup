@@ -330,6 +330,10 @@ void Context::init()
   use12.bufferDeviceAddress     = VK_TRUE;
   use12.scalarBlockLayout       = has12.scalarBlockLayout;
   use12.timelineSemaphore       = has12.timelineSemaphore;
+  // the Vulkan memory model (acquire / release between workgroups; kernels opt in with use_vulkan_memory_model)
+  use12.vulkanMemoryModel             = has12.vulkanMemoryModel;
+  use12.vulkanMemoryModelDeviceScope  = has12.vulkanMemoryModelDeviceScope;
+  m_vulkanMemoryModel                 = has12.vulkanMemoryModel && has12.vulkanMemoryModelDeviceScope;
   VkPhysicalDeviceVulkan11Features use11{};
   use11.sType                    = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES;
   use11.pNext                    = &use12;

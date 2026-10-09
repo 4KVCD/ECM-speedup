@@ -1,19 +1,28 @@
 #version 460
-// intra reconstruction of a picture on the GPU: one workgroup takes the transform blocks in the CPU's decoding order;
-// per block: reference samples from the decoded-unit map (and their [1 2 1] filtering), prediction (planar,
-// directional planar, DC, angular with PDPC and intra fusion), dequantization, the two inverse transform stages,
-// reconstruction, map update. Every step follows the C++ of IntraPrediction / Quant / TrQuant / DecCu.
+#pragma use_vulkan_memory_model
+// intra reconstruction of a picture on the GPU: persistent workgroups take the transform blocks in the CPU's decoding
+// order from a counter; a block waits only for the blocks whose samples it reads (per-unit owner maps from the host,
+// done flags), so independent blocks (the three components, distant parts of the picture) run at the same time.
+// Per block: reference samples (and their [1 2 1] filtering), prediction (planar, directional planar, DC, angular
+// with PDPC and intra fusion), dequantization, the two inverse transform stages, reconstruction. Every step follows
+// the C++ of IntraPrediction / Quant / TrQuant / DecCu.
 // Not yet: MRL, ISP, MIP, the intra bilateral filter, LFNST / MTS / transform skip, decoder-side intra modes.
 #extension GL_GOOGLE_include_directive : require
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_memory_scope_semantics : require
 #include "common.glsl"
 
 layout( local_size_x = 256 ) in;
 
-// the reconstruction and the decoded-unit map are written by one invocation and read by others of the workgroup
+// Vulkan memory model: the reconstruction and the done flags are written by one workgroup and read by others
+// (device-scope coherent, done flags with release / acquire); the scratch is shared by the invocations of a workgroup
 layout( buffer_reference, std430, buffer_reference_align = 2 ) coherent buffer CBufI16 { int16_t v[]; };
-layout( buffer_reference, std430, buffer_reference_align = 1 ) coherent buffer CBufU8 { uint8_t v[]; };
+layout( buffer_reference, std430, buffer_reference_align = 4 ) coherent buffer CBufI32 { int v[]; };
+layout( buffer_reference, std430, buffer_reference_align = 4 ) workgroupcoherent buffer WBufI32 { int v[]; };
+
+// workgroup barrier that also orders the scratch buffer
+#define SYNC() controlBarrier( gl_ScopeWorkgroup, gl_ScopeWorkgroup, gl_StorageSemanticsShared | gl_StorageSemanticsBuffer, gl_SemanticsAcquireRelease )
 
 // one transform block of one component (48 int32, layout shared with GpuIntraRec.cpp)
 struct Tu
@@ -39,21 +48,23 @@ struct Params
   uint64_t tus;
   uint64_t coeffs;      // int32 levels, per block w*h at coeffOffset
   uint64_t plane[3];    // int16 reconstruction (written), origin/stride below
+  uint64_t owner[3];    // int32 per unit and component: the block covering it (-1: none); 4x4 luma, 2x2 chroma units
+  uint64_t filters;     // int32: [taps 6,8,10,12,16][32][16] cubic tables, then the weak 4-tap table [32][4]
+  uint64_t matrices;    // int32: DCT-II inverse matrices N = 2..128 at matrixOffset[log2N - 1]
+  uint64_t scratch;     // int32 per workgroup: coef | tmp | block | prediction (4 x 16384)
+  uint64_t dbgPred;     // int16 per block w*h at dbgOffset
+  uint64_t dbgResi;
+  uint64_t done;        // int32 per block: reconstructed
+  uint64_t counter;     // int32: the next block to take
   int      origin[3];
   int      stride[3];
   int      width[3];
   int      height[3];
-  uint64_t decomp[2];   // uint8 decoded-unit maps per channel type (4x4 luma units, 2x2 chroma units in 4:2:0)
-  int      decompW[2];
-  int      decompH[2];
+  int      ownerW[2];   // per channel type
+  int      ownerH[2];
   int      unitLog2X[2];
   int      unitLog2Y[2];
-  uint64_t filters;     // int32: [taps 6,8,10,12,16][32][16] cubic tables, then the weak 4-tap table [32][4]
-  uint64_t matrices;    // int32: DCT-II inverse matrices N = 2..128 at matrixOffset[log2N - 1]
   int      matrixOffset[8];
-  uint64_t scratch;     // int32: coef | tmp | block | prediction (4 x 16384)
-  uint64_t dbgPred;     // int16 per block w*h at dbgOffset
-  uint64_t dbgResi;
 };
 layout( buffer_reference, std430, buffer_reference_align = 8 ) buffer BufParams { Params p; };
 
@@ -72,10 +83,11 @@ shared int16_t s_ref[2][MAX_REF];             // refBufUnfiltered (line 0; filte
 shared int16_t s_tmp[MAX_REF];
 shared int16_t s_angA[2][ANG];                // refAbove, refAbove2nd
 shared int16_t s_angL[2][ANG];                // refLeft, refLeft2nd
-shared int     s_flags[2 * 256 + 4];          // neighborFlags (units)
 shared int     s_dc;
+shared int     s_ti;
 
-Params P;   // the parameter block (loaded once)
+Params P;      // the parameter block (loaded once)
+int    g_ti;   // the block being reconstructed
 
 int filterTap( int taps, int frac, int i )
 {
@@ -88,22 +100,40 @@ int weak4( int frac, int i )
   return BufI32( P.filters ).v[WEAK4 + frac * 4 + i];
 }
 
-bool isDecomp( int ch, int x, int y )
+// the block covering sample (x, y) of component comp, -1 outside the picture
+int ownerAt( int comp, int x, int y )
 {
+  const int ch = comp == 0 ? 0 : 1;
   if( x < 0 || y < 0 )
   {
-    return false;
+    return -1;
   }
   int ux = x >> P.unitLog2X[ch], uy = y >> P.unitLog2Y[ch];
-  if( ux >= P.decompW[ch] || uy >= P.decompH[ch] )
+  if( ux >= P.ownerW[ch] || uy >= P.ownerH[ch] )
   {
-    return false;
+    return -1;
   }
-  return CBufU8( P.decomp[ch] ).v[uy * P.decompW[ch] + ux] != uint8_t( 0 );
+  return BufI32( P.owner[comp] ).v[uy * P.ownerW[ch] + ux];
 }
 
+// CodingStructure::isDecomp at the time of block g_ti (the chroma channel type by the Cb blocks, which the CPU
+// reconstructs before the Cr blocks)
+bool isDecomp( int ch, int x, int y )
+{
+  const int o = ownerAt( ch == 0 ? 0 : 1, x, y );
+  return o >= 0 && o < g_ti;
+}
+
+// a reconstructed sample of an earlier block, once that block is done
 int recoAt( int comp, int x, int y )
 {
+  const int o = ownerAt( comp, x, y );
+  if( o >= 0 && o < g_ti )
+  {
+    while( atomicLoad( CBufI32( P.done ).v[o], gl_ScopeQueueFamily, gl_StorageSemanticsBuffer, gl_SemanticsAcquire ) == 0 )
+    {
+    }
+  }
   return int( CBufI16( P.plane[comp] ).v[P.origin[comp] + y * P.stride[comp] + x] );
 }
 
@@ -299,12 +329,24 @@ void main()
   const int lid = int( gl_LocalInvocationID.x );
   const int NT  = int( gl_WorkGroupSize.x );
   P = BufParams( pc.params ).p;
-  BufI32 sc = BufI32( P.scratch );
+  WBufI32 sc = WBufI32( P.scratch + uint64_t( gl_WorkGroupID.x ) * uint64_t( 4 * 4 * 16384 ) );
   const int COEF = 0, TMP = 16384, BLK = 32768, PRED = 49152;
 
-  for( int ti = 0; ti < pc.numTus; ti++ )
+  for( ;; )
   {
-    Tu t = BufTu( P.tus ).v[ti];
+    // the next block (in decoding order, so every block waited for is taken by a running workgroup)
+    SYNC();
+    if( lid == 0 )
+    {
+      s_ti = atomicAdd( CBufI32( P.counter ).v[0], 1 );
+    }
+    SYNC();
+    g_ti = s_ti;
+    if( g_ti >= pc.numTus )
+    {
+      break;
+    }
+    Tu t = BufTu( P.tus ).v[g_ti];
     const int W = t.w, H = t.h, N = W * H;
     const int maxPel = ( 1 << t.bitDepth ) - 1;
     const int predStride = ( W << 3 ) + 1, predSize = W << 3, predHSize = H << 3;
@@ -314,10 +356,10 @@ void main()
     fillReferencePar( t, 0, 0, lid, NT );
     if( fusion )
     {
-      barrier();
+      SYNC();
       fillReferencePar( t, 1, 1, lid, NT );
     }
-    barrier();
+    SYNC();
     if( t.refFilter != 0 )   // xFilterReferenceSamples (multiRefIdx 0), in place
     {
       for( int i = lid; i <= predStride + predHSize; i += NT )
@@ -337,9 +379,9 @@ void main()
         }
         s_tmp[i] = int16_t( v );
       }
-      barrier();
+      SYNC();
       for( int i = lid; i <= predStride + predHSize; i += NT ) s_ref[0][i] = s_tmp[i];
-      barrier();
+      SYNC();
     }
 
     // ----- prediction into scratch PRED (row-major W x H)
@@ -354,7 +396,7 @@ void main()
         if( W <= H ) for( int k = 0; k < H; k++ ) sum += int( s_ref[0][predStride + 1 + k] );
         s_dc = ( sum + ( denom >> 1 ) ) >> findMSB( denom );
       }
-      barrier();
+      SYNC();
       const int topRight = int( s_ref[0][1 + W] ), bottomLeft = int( s_ref[0][predStride + 1 + H] );
       const int offset = 1 << ( log2W + log2H ), finalShift = 1 + log2W + log2H;
       const int pdpcScale = ( log2W - 2 + log2H - 2 + 2 ) >> 2;
@@ -394,7 +436,7 @@ void main()
         s_angA[0][i] = int16_t( 0 ); s_angL[0][i] = int16_t( 0 );
         s_angA[1][i] = int16_t( 0 ); s_angL[1][i] = int16_t( 0 );
       }
-      barrier();
+      SYNC();
       const int topRefLength = W << 3, leftRefLength = H << 3;
       const int predStride2 = predStride + 1;   // the fusion line (multiRefIdx 1)
       int mainBase, sideBase, mainBase2 = 0, sideBase2 = 0;
@@ -407,7 +449,7 @@ void main()
           for( int i = lid; i < topRefLength + PAD + 1; i += NT ) s_angA[1][H + PAD + 1 + i] = s_ref[1][i];
           for( int i = lid; i < leftRefLength + PAD + 1; i += NT ) s_angL[1][W + PAD + 1 + i] = s_ref[1][predStride2 + i];
         }
-        barrier();
+        SYNC();
         mainBase = ( isVer ? H : W ) + PAD;
         sideBase = ( isVer ? W : H ) + PAD;
         mainBase2 = mainBase + 1;
@@ -468,7 +510,7 @@ void main()
           for( int i = lid; i < topRefLength + 1 + PAD; i += NT ) s_angA[1][PAD + i] = s_ref[1][i];
           for( int i = lid; i < leftRefLength + 1 + PAD; i += NT ) s_angL[1][PAD + i] = s_ref[1][predStride2 + i];
         }
-        barrier();
+        SYNC();
         if( lid == 0 )
         {
           for( int i = PAD - 1; i >= 0; --i )
@@ -482,7 +524,7 @@ void main()
             }
           }
         }
-        barrier();
+        SYNC();
         mainBase = PAD;
         sideBase = PAD;
         const int log2Ratio = findMSB( W ) - findMSB( H );
@@ -490,7 +532,7 @@ void main()
         const int refLength = isVer ? topRefLength : leftRefLength;
         const int val  = mainR( isVer, 0, mainBase + refLength );
         const int val2 = mainR( isVer, 1, PAD + refLength + 1 );
-        barrier();
+        SYNC();
         for( int z = 1 + lid; z <= 6 + PAD; z += NT ) mainW( isVer, 0, mainBase + refLength + z, val );
         if( fusion )
         {
@@ -500,7 +542,7 @@ void main()
         mainBase2 = PAD + 1;   // refMain2nd += multiRefIdx2nd
         sideBase2 = PAD + 1;
       }
-      barrier();
+      SYNC();
       // rows along the main direction (width/height swapped for horizontal modes)
       const int w = isVer ? W : H, h = isVer ? H : W;
       const bool isLuma = t.comp == 0;
@@ -583,7 +625,7 @@ void main()
         sc.v[PRED + oy * W + ox] = asPel( v );
       }
     }
-    barrier();
+    SYNC();
 
     // ----- residual
     if( t.cbf != 0 )
@@ -596,7 +638,7 @@ void main()
                                    : ( q * t.dqScale ) << ( -t.dqRightShift );
         sc.v[COEF + i] = clip3i( t.trMin, t.trMax, c );
       }
-      barrier();
+      SYNC();
       BufI32 mt = BufI32( P.matrices );
       const int offH = P.matrixOffset[findMSB( H ) - 1], offW = P.matrixOffset[findMSB( W ) - 1];
       const int rnd1 = 1 << ( t.shift1 - 1 );
@@ -607,7 +649,7 @@ void main()
         for( int k = 0; k < H; k++ ) sum += mt.v[offH + k * H + y] * sc.v[COEF + k * W + xf];
         sc.v[TMP + xf * H + y] = clip3i( t.trMin, t.trMax, ( sum + rnd1 ) >> t.shift1 );
       }
-      barrier();
+      SYNC();
       const int rnd2 = 1 << ( t.shift2 - 1 );
       for( int i = lid; i < N; i += NT )   // second stage (horizontal): block[y * W + x]
       {
@@ -621,9 +663,9 @@ void main()
     {
       for( int i = lid; i < N; i += NT ) sc.v[BLK + i] = 0;
     }
-    barrier();
+    SYNC();
 
-    // ----- reconstruction, debug copies, decoded-unit map
+    // ----- reconstruction, debug copies, done flag
     for( int i = lid; i < N; i += NT )
     {
       int x = i % W, y = i / W;
@@ -632,16 +674,11 @@ void main()
       BufI16( P.dbgPred ).v[t.dbgOffset + i] = int16_t( pr );
       BufI16( P.dbgResi ).v[t.dbgOffset + i] = int16_t( re );
     }
+    // the block's samples (device-coherent stores of all invocations) happen before its done flag
+    controlBarrier( gl_ScopeWorkgroup, gl_ScopeQueueFamily, gl_StorageSemanticsBuffer, gl_SemanticsAcquireRelease );
+    if( lid == 0 )
     {
-      const int ch = t.comp == 0 ? 0 : 1;
-      const int ux0 = t.x >> P.unitLog2X[ch], uy0 = t.y >> P.unitLog2Y[ch];
-      const int uw = t.w >> P.unitLog2X[ch], uh = t.h >> P.unitLog2Y[ch];
-      for( int i = lid; i < uw * uh; i += NT )
-      {
-        CBufU8( P.decomp[ch] ).v[( uy0 + i / uw ) * P.decompW[ch] + ux0 + i % uw] = uint8_t( 1 );
-      }
+      atomicStore( CBufI32( P.done ).v[g_ti], 1, gl_ScopeQueueFamily, gl_StorageSemanticsBuffer, gl_SemanticsRelease );
     }
-    memoryBarrierBuffer();
-    barrier();
   }
 }

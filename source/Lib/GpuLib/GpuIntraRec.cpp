@@ -79,24 +79,26 @@ struct Params
   uint64_t tus;
   uint64_t coeffs;
   uint64_t plane[3];
+  uint64_t owner[3];
+  uint64_t filters;
+  uint64_t matrices;
+  uint64_t scratch;
+  uint64_t dbgPred;
+  uint64_t dbgResi;
+  uint64_t done;
+  uint64_t counter;
   int32_t  origin[3];
   int32_t  stride[3];
   int32_t  width[3];
   int32_t  height[3];
-  uint64_t decomp[2];
-  int32_t  decompW[2];
-  int32_t  decompH[2];
+  int32_t  ownerW[2];
+  int32_t  ownerH[2];
   int32_t  unitLog2X[2];
   int32_t  unitLog2Y[2];
-  uint64_t filters;
-  uint64_t matrices;
   int32_t  matrixOffset[8];
-  uint64_t scratch;
-  uint64_t dbgPred;
-  uint64_t dbgResi;
 };
-static_assert( offsetof( Params, decomp ) == 88 && offsetof( Params, filters ) == 136 && offsetof( Params, scratch ) == 184
-                 && sizeof( Params ) == 208, "Params layout" );
+static_assert( offsetof( Params, origin ) == 120 && offsetof( Params, matrixOffset ) == 200 && sizeof( Params ) == 232,
+               "Params layout" );
 
 struct Push
 {
@@ -115,7 +117,8 @@ struct GpuIntraRec::Impl
   gpu::Kernel                 kernel;
   std::unique_ptr<gpu::Stream> stream;
   gpu::Buffer                 filters, matrices, scratch;
-  gpu::Buffer                 params, tus, coeffs, planes[3], decomp[2], dbgPred, dbgResi;
+  gpu::Buffer                 params, tus, coeffs, planes[3], owner[3], done, dbgPred, dbgResi;
+  int                         numGroups = 0;
   gpu::Buffer                 upload, download;
   int32_t                     matrixOffset[8] = {};
 
@@ -138,7 +141,7 @@ struct GpuIntraRec::Impl
       return;
     }
     for( gpu::Buffer* b: { &filters, &matrices, &scratch, &params, &tus, &coeffs, &planes[0], &planes[1], &planes[2],
-                           &decomp[0], &decomp[1], &dbgPred, &dbgResi, &upload, &download } )
+                           &owner[0], &owner[1], &owner[2], &done, &dbgPred, &dbgResi, &upload, &download } )
     {
       b->destroy( *ctx );
     }
@@ -148,7 +151,7 @@ struct GpuIntraRec::Impl
 GpuIntraRec* GpuIntraRec::create()
 {
   gpu::Context* ctx = gpu::Context::get();
-  if( !ctx )
+  if( !ctx || !ctx->vulkanMemoryModel() )   // the blocks of a picture synchronize through the Vulkan memory model
   {
     return nullptr;
   }
@@ -193,7 +196,9 @@ GpuIntraRec* GpuIntraRec::create()
   }
   m.filters.create( *ctx, filt.size() * 4, gpu::Buffer::DEVICE );
   m.matrices.create( *ctx, mat.size() * 4, gpu::Buffer::DEVICE );
-  m.scratch.create( *ctx, SCRATCH_INTS * 4, gpu::Buffer::DEVICE );
+  // persistent workgroups (ECM_GPU_GROUPS overrides; each has its own scratch)
+  m.numGroups = getenv( "ECM_GPU_GROUPS" ) ? std::max( 1, atoi( getenv( "ECM_GPU_GROUPS" ) ) ) : 32;
+  m.scratch.create( *ctx, size_t( SCRATCH_INTS ) * 4 * m.numGroups, gpu::Buffer::DEVICE );
   m.params.create( *ctx, sizeof( Params ), gpu::Buffer::DEVICE );
   m.upload.create( *ctx, ( filt.size() + mat.size() ) * 4, gpu::Buffer::UPLOAD );
   memcpy( m.upload.mapped, filt.data(), filt.size() * 4 );
@@ -386,21 +391,45 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
     m.planes[c].ensure( ctx, planeBytes[c], gpu::Buffer::DEVICE );
     P.plane[c] = m.planes[c].addr;
   }
-  size_t mapBytes[2] = {};
+  // owner maps: per unit and component the block covering it (CodingStructure unit scales, 4:2:0); -1 elsewhere
+  std::vector<int32_t> ownerMap[3];
+  size_t ownerBytes[3] = {};
   for( int ch = 0; ch < ( numComp > 1 ? 2 : 1 ); ch++ )
   {
     const int sx = ch == 0 ? 2 : 1, sy = ch == 0 ? 2 : 1;   // UnitScaleArray (4:2:0)
     P.unitLog2X[ch] = sx;
     P.unitLog2Y[ch] = sy;
-    P.decompW[ch]   = ( P.width[ch] + ( 1 << sx ) - 1 ) >> sx;
-    P.decompH[ch]   = ( P.height[ch] + ( 1 << sy ) - 1 ) >> sy;
-    mapBytes[ch]    = size_t( P.decompW[ch] ) * P.decompH[ch];
-    m.decomp[ch].ensure( ctx, ( mapBytes[ch] + 3 ) & ~size_t( 3 ), gpu::Buffer::DEVICE );
-    P.decomp[ch] = m.decomp[ch].addr;
+    P.ownerW[ch]    = ( P.width[ch] + ( 1 << sx ) - 1 ) >> sx;
+    P.ownerH[ch]    = ( P.height[ch] + ( 1 << sy ) - 1 ) >> sy;
+  }
+  for( int c = 0; c < numComp; c++ )
+  {
+    const int ch = c == 0 ? 0 : 1;
+    ownerMap[c].assign( size_t( P.ownerW[ch] ) * P.ownerH[ch], -1 );
+  }
+  for( size_t r = 0; r < m.rec.size(); r++ )
+  {
+    const Tu& t  = m.rec[r];
+    const int ch = t.comp == 0 ? 0 : 1;
+    for( int uy = t.y >> P.unitLog2Y[ch]; uy <= ( t.y + t.h - 1 ) >> P.unitLog2Y[ch]; uy++ )
+    {
+      for( int ux = t.x >> P.unitLog2X[ch]; ux <= ( t.x + t.w - 1 ) >> P.unitLog2X[ch]; ux++ )
+      {
+        ownerMap[t.comp][size_t( uy ) * P.ownerW[ch] + ux] = (int32_t) r;
+      }
+    }
+  }
+  for( int c = 0; c < numComp; c++ )
+  {
+    ownerBytes[c] = ownerMap[c].size() * 4;
+    m.owner[c].ensure( ctx, ownerBytes[c], gpu::Buffer::DEVICE );
+    P.owner[c] = m.owner[c].addr;
   }
   const size_t tuBytes = m.rec.size() * sizeof( Tu ), coefBytes = m.coef.size() * 4, dbgBytes = m.cpuPred.size() * 2;
+  const size_t doneBytes = ( m.rec.size() + 1 ) * 4;   // the done flags, then the block counter
   m.tus.ensure( ctx, tuBytes, gpu::Buffer::DEVICE );
   m.coeffs.ensure( ctx, std::max<size_t>( coefBytes, 4 ), gpu::Buffer::DEVICE );
+  m.done.ensure( ctx, doneBytes, gpu::Buffer::DEVICE );
   m.dbgPred.ensure( ctx, dbgBytes, gpu::Buffer::DEVICE );
   m.dbgResi.ensure( ctx, dbgBytes, gpu::Buffer::DEVICE );
   P.tus      = m.tus.addr;
@@ -411,12 +440,27 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
   P.scratch  = m.scratch.addr;
   P.dbgPred  = m.dbgPred.addr;
   P.dbgResi  = m.dbgResi.addr;
+  P.done     = m.done.addr;
+  P.counter  = m.done.addr + m.rec.size() * 4;
 
-  const size_t upBytes = sizeof( Params ) + tuBytes + coefBytes;
+  size_t upBytes = sizeof( Params ) + tuBytes + coefBytes;
+  for( int c = 0; c < numComp; c++ )
+  {
+    upBytes += ownerBytes[c];
+  }
   m.upload.ensure( ctx, upBytes, gpu::Buffer::UPLOAD );
-  memcpy( m.upload.mapped, &P, sizeof( Params ) );
-  memcpy( (char*) m.upload.mapped + sizeof( Params ), m.rec.data(), tuBytes );
-  memcpy( (char*) m.upload.mapped + sizeof( Params ) + tuBytes, m.coef.data(), coefBytes );
+  size_t up = 0;
+  memcpy( (char*) m.upload.mapped + up, &P, sizeof( Params ) );
+  up += sizeof( Params );
+  memcpy( (char*) m.upload.mapped + up, m.rec.data(), tuBytes );
+  up += tuBytes;
+  memcpy( (char*) m.upload.mapped + up, m.coef.data(), coefBytes );
+  up += coefBytes;
+  for( int c = 0; c < numComp; c++ )
+  {
+    memcpy( (char*) m.upload.mapped + up, ownerMap[c].data(), ownerBytes[c] );
+    up += ownerBytes[c];
+  }
   size_t downBytes = 2 * dbgBytes;
   for( int c = 0; c < numComp; c++ )
   {
@@ -426,24 +470,27 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
 
   gpu::Stream& s = *m.stream;
   s.begin();
-  s.copy( m.upload, 0, m.params, 0, sizeof( Params ) );
-  s.copy( m.upload, sizeof( Params ), m.tus, 0, tuBytes );
+  up = 0;
+  s.copy( m.upload, up, m.params, 0, sizeof( Params ) );
+  up += sizeof( Params );
+  s.copy( m.upload, up, m.tus, 0, tuBytes );
+  up += tuBytes;
   if( coefBytes )
   {
-    s.copy( m.upload, sizeof( Params ) + tuBytes, m.coeffs, 0, coefBytes );
+    s.copy( m.upload, up, m.coeffs, 0, coefBytes );
   }
+  up += coefBytes;
   for( int c = 0; c < numComp; c++ )
   {
+    s.copy( m.upload, up, m.owner[c], 0, ownerBytes[c] );
+    up += ownerBytes[c];
     s.fill( m.planes[c], 0, ( planeBytes[c] + 3 ) & ~size_t( 3 ), 0 );
   }
-  for( int ch = 0; ch < ( numComp > 1 ? 2 : 1 ); ch++ )
-  {
-    s.fill( m.decomp[ch], 0, ( mapBytes[ch] + 3 ) & ~size_t( 3 ), 0 );
-  }
+  s.fill( m.done, 0, doneBytes, 0 );
   s.barrier();
   const uint32_t t0 = s.timestamp();
   Push push{ m.params.addr, (int32_t) m.rec.size(), 0 };
-  s.dispatch( m.kernel, &push, 1 );
+  s.dispatch( m.kernel, &push, (uint32_t) std::min<size_t>( m.numGroups, m.rec.size() ) );
   const uint32_t t1 = s.timestamp();
   s.barrier();
   size_t off = 0;
@@ -481,6 +528,26 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
                   predBad ? "prediction" : "residual", k % t.w, k / t.w, predBad ? m.cpuPred[o] : m.cpuResi[o],
                   predBad ? gPred[o] : gResi[o] );
         first = buf;
+        // the blocks owning the reference row above (x - 1 ... x + 2 w) and the column left (... y + 2 h)
+        const int ch = t.comp == 0 ? 0 : 1;
+        auto own = [&]( int x, int y ) -> int
+        {
+          if( x < 0 || y < 0 || ( x >> P.unitLog2X[ch] ) >= P.ownerW[ch] || ( y >> P.unitLog2Y[ch] ) >= P.ownerH[ch] )
+          {
+            return -1;
+          }
+          return ownerMap[t.comp][size_t( y >> P.unitLog2Y[ch] ) * P.ownerW[ch] + ( x >> P.unitLog2X[ch] )];
+        };
+        std::string above = "; owners above:", left = "; left:";
+        for( int x = t.x - 1; x < t.x + 2 * t.w; x += 1 << P.unitLog2X[ch] )
+        {
+          above += " " + std::to_string( own( x, t.y - 1 ) );
+        }
+        for( int y = t.y - 1; y < t.y + 2 * t.h; y += 1 << P.unitLog2Y[ch] )
+        {
+          left += " " + std::to_string( own( t.x - 1, y ) );
+        }
+        first += above + left;
         break;
       }
     }

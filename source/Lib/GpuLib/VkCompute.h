@@ -132,6 +132,8 @@ public:
   VkDevice                  device() const { return m_device; }
   const VkPhysicalDeviceProperties& properties() const { return m_props; }
   const char*               deviceName() const { return m_props.deviceName; }
+  /// the device runs kernels that use the Vulkan memory model (with device scope)
+  bool                      vulkanMemoryModel() const { return m_vulkanMemoryModel; }
   /// a memory type with the wanted properties among those in typeBits, preferring types without the avoided ones;
   /// UINT32_MAX when there is none
   uint32_t                  memoryType( uint32_t typeBits, VkMemoryPropertyFlags want, VkMemoryPropertyFlags avoid ) const;
@@ -160,6 +162,7 @@ private:
   VkPhysicalDeviceProperties       m_props{};
   VkPhysicalDeviceMemoryProperties m_memProps{};
   uint32_t                  m_queueFamily = 0;
+  bool                      m_vulkanMemoryModel = false;
   std::vector<VkQueue>      m_queues;
   std::unique_ptr<std::mutex[]> m_queueLocks;
   uint32_t                  m_nextQueue = 0;
