@@ -47,6 +47,7 @@
 #include "CommonLib/UnitTools.h"
 
 #include "intra_rec.spv.h"
+#include "intra_resi.spv.h"
 
 #include <cstddef>
 #include <cstdio>
@@ -108,13 +109,14 @@ struct Push
 };
 
 constexpr int FILTER_TAPS[5] = { 6, 8, 10, 12, 16 };
-constexpr int SCRATCH_INTS   = 4 * 16384;
+constexpr int SCRATCH_INTS   = 16384;   // per workgroup of intra_resi
+constexpr int RESI_GROUPS    = 256;
 }   // namespace
 
 struct GpuIntraRec::Impl
 {
   gpu::Context*               ctx = nullptr;
-  gpu::Kernel                 kernel;
+  gpu::Kernel                 kernel, kernelResi;
   std::unique_ptr<gpu::Stream> stream;
   gpu::Buffer                 filters, matrices, scratch;
   gpu::Buffer                 params, tus, coeffs, planes[3], owner[3], done, dbgPred, dbgResi;
@@ -160,6 +162,7 @@ GpuIntraRec* GpuIntraRec::create()
   Impl& m = *r->m_impl;
   m.ctx = ctx;
   m.kernel.create( *ctx, spv_intra_rec, sizeof( spv_intra_rec ), sizeof( Push ), "intra_rec" );
+  m.kernelResi.create( *ctx, spv_intra_resi, sizeof( spv_intra_resi ), sizeof( Push ), "intra_resi" );
   m.stream.reset( new gpu::Stream( *ctx ) );
 
   // tables, from the C++ tables themselves
@@ -196,9 +199,9 @@ GpuIntraRec* GpuIntraRec::create()
   }
   m.filters.create( *ctx, filt.size() * 4, gpu::Buffer::DEVICE );
   m.matrices.create( *ctx, mat.size() * 4, gpu::Buffer::DEVICE );
-  // persistent workgroups (ECM_GPU_GROUPS overrides; each has its own scratch)
+  // persistent workgroups of intra_rec (ECM_GPU_GROUPS overrides)
   m.numGroups = getenv( "ECM_GPU_GROUPS" ) ? std::max( 1, atoi( getenv( "ECM_GPU_GROUPS" ) ) ) : 32;
-  m.scratch.create( *ctx, size_t( SCRATCH_INTS ) * 4 * m.numGroups, gpu::Buffer::DEVICE );
+  m.scratch.create( *ctx, size_t( SCRATCH_INTS ) * 4 * RESI_GROUPS, gpu::Buffer::DEVICE );
   m.params.create( *ctx, sizeof( Params ), gpu::Buffer::DEVICE );
   m.upload.create( *ctx, ( filt.size() + mat.size() ) * 4, gpu::Buffer::UPLOAD );
   memcpy( m.upload.mapped, filt.data(), filt.size() * 4 );
@@ -490,6 +493,8 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
   s.barrier();
   const uint32_t t0 = s.timestamp();
   Push push{ m.params.addr, (int32_t) m.rec.size(), 0 };
+  s.dispatch( m.kernelResi, &push, (uint32_t) std::min<size_t>( RESI_GROUPS, m.rec.size() ) );   // the residuals
+  s.barrier();
   s.dispatch( m.kernel, &push, (uint32_t) std::min<size_t>( m.numGroups, m.rec.size() ) );
   const uint32_t t1 = s.timestamp();
   s.barrier();
@@ -577,6 +582,43 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
   m.numVerified++;
   const bool bad = numBad > 0 || !first.empty();
   m.numMismatch += bad ? 1 : 0;
+  // the longest chain of blocks that read each other's samples (the available units of the reference arrays, with
+  // the early stop of each group, as the kernel reads them)
+  std::vector<int> depth( m.rec.size(), 1 );
+  int maxDepth = 0;
+  for( size_t i = 0; i < m.rec.size(); i++ )
+  {
+    const Tu& t  = m.rec[i];
+    const int ch = t.comp == 0 ? 0 : 1;
+    auto own = [&]( int c, int x, int y ) -> int
+    {
+      if( x < 0 || y < 0 || ( x >> P.unitLog2X[ch] ) >= P.ownerW[ch] || ( y >> P.unitLog2Y[ch] ) >= P.ownerH[ch] )
+      {
+        return -1;
+      }
+      return ownerMap[c][size_t( y >> P.unitLog2Y[ch] ) * P.ownerW[ch] + ( x >> P.unitLog2X[ch] )];
+    };
+    const int availComp = t.comp == 0 ? 0 : 1;
+    auto dep = [&]( int x, int y ) -> bool   // available: the block reading it depends on its owner
+    {
+      const int a = own( availComp, x, y );
+      if( a < 0 || a >= (int) i )
+      {
+        return false;
+      }
+      const int o = own( t.comp, x, y );
+      depth[i] = std::max( depth[i], depth[o] + 1 );
+      return true;
+    };
+    const int numAbove = std::max( t.w / t.unitW, 1 ), numLeft = std::max( t.h / t.unitH, 1 );
+    const int tAU = ( t.w << 3 ) / t.unitW, tLU = ( t.h << 3 ) / t.unitH;
+    dep( t.x - 1, t.y - 1 );
+    for( int k = 0; k < numAbove && dep( t.x + k * t.unitW, t.y - 1 ); k++ ) {}
+    for( int k = 0; k < tAU - numAbove && dep( t.x + t.w - 1 + t.unitW + k * t.unitW, t.y - 1 ); k++ ) {}
+    for( int k = 0; k < numLeft && dep( t.x - 1, t.y + k * t.unitH ); k++ ) {}
+    for( int k = 0; k < tLU - numLeft && dep( t.x - 1, t.y + t.h - 1 + t.unitH + k * t.unitH ); k++ ) {}
+    maxDepth = std::max( maxDepth, depth[i] );
+  }
   int numFilter = 0, numPdpc = 0, numGrad = 0, numFusion = 0;
   for( const Tu& t: m.rec )
   {
@@ -585,7 +627,7 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
     numGrad += t.applyPDPC && t.gradPDPC;
     numFusion += t.fusion;
   }
-  printf( "\n[gpu-intra] POC %d: %d blocks (ref filter %d, PDPC %d, gradient PDPC %d, fusion %d), GPU %.2f ms: %s%s%s", m.poc,
-          (int) m.rec.size(), numFilter, numPdpc, numGrad, numFusion, ms, bad ? "MISMATCH, " : "identical",
+  printf( "\n[gpu-intra] POC %d: %d blocks, chain %d (ref filter %d, PDPC %d, gradient PDPC %d, fusion %d), GPU %.2f ms: %s%s%s", m.poc,
+          (int) m.rec.size(), maxDepth, numFilter, numPdpc, numGrad, numFusion, ms, bad ? "MISMATCH, " : "identical",
           bad ? first.c_str() : "", numBad ? ( ", " + std::to_string( numBad ) + " picture samples differ" ).c_str() : "" );
 }

@@ -1,0 +1,71 @@
+#version 460
+#pragma use_vulkan_memory_model
+// residuals of all intra transform blocks of a picture at once (they depend on no other block): dequantization
+// (Quant::dequant without scaling lists) folded into the first inverse DCT-II stage, then the second stage
+// (TrQuant::xIT: two clipped matrix stages, equal to the partial butterflies in integer arithmetic); the result
+// goes to the residual buffer intra_rec adds to its prediction. Persistent workgroups take blocks by index.
+#extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_memory_scope_semantics : require
+#include "common.glsl"
+#include "intra_common.glsl"
+
+layout( local_size_x = 256 ) in;
+
+layout( buffer_reference, std430, buffer_reference_align = 4 ) workgroupcoherent buffer WBufI32 { int v[]; };
+
+int clip3i( int lo, int hi, int v )
+{
+  return min( max( v, lo ), hi );
+}
+
+void main()
+{
+  const int lid = int( gl_LocalInvocationID.x );
+  const int NT  = int( gl_WorkGroupSize.x );
+  Params P = BufParams( pc.params ).p;
+  WBufI32 tmp = WBufI32( P.scratch + uint64_t( gl_WorkGroupID.x ) * uint64_t( 4 * 16384 ) );
+  BufI32 cf = BufI32( P.coeffs );
+  BufI32 mt = BufI32( P.matrices );
+  BufI16 resi = BufI16( P.dbgResi );
+
+  for( int ti = int( gl_WorkGroupID.x ); ti < pc.numTus; ti += int( gl_NumWorkGroups.x ) )
+  {
+    const Tu t = BufTu( P.tus ).v[ti];
+    const int W = t.w, H = t.h, N = W * H;
+    if( t.cbf == 0 )
+    {
+      for( int i = lid; i < N; i += NT ) resi.v[t.dbgOffset + i] = int16_t( 0 );
+      continue;
+    }
+    const int offH = P.matrixOffset[findMSB( H ) - 1], offW = P.matrixOffset[findMSB( W ) - 1];
+    const int rnd1 = 1 << ( t.shift1 - 1 ), rnd2 = 1 << ( t.shift2 - 1 );
+    const int addDq = t.dqRightShift > 0 ? 1 << ( t.dqRightShift - 1 ) : 0;
+    // first stage (vertical): tmp[xf * H + y] from the dequantized coefficient column xf
+    for( int i = lid; i < N; i += NT )
+    {
+      const int xf = i / H, y = i % H;
+      int sum = 0;
+      for( int k = 0; k < H; k++ )
+      {
+        const int q = cf.v[t.coeffOffset + k * W + xf];
+        if( q != 0 )
+        {
+          const int qc = clip3i( t.dqInMin, t.dqInMax, q );
+          const int c  = t.dqRightShift > 0 ? ( qc * t.dqScale + addDq ) >> t.dqRightShift : ( qc * t.dqScale ) << ( -t.dqRightShift );
+          sum += mt.v[offH + k * H + y] * clip3i( t.trMin, t.trMax, c );
+        }
+      }
+      tmp.v[xf * H + y] = clip3i( t.trMin, t.trMax, ( sum + rnd1 ) >> t.shift1 );
+    }
+    controlBarrier( gl_ScopeWorkgroup, gl_ScopeWorkgroup, gl_StorageSemanticsBuffer, gl_SemanticsAcquireRelease );
+    // second stage (horizontal): residual[y * W + x]
+    for( int i = lid; i < N; i += NT )
+    {
+      const int y = i / W, x = i % W;
+      int sum = 0;
+      for( int k = 0; k < W; k++ ) sum += mt.v[offW + k * W + x] * tmp.v[k * H + y];
+      resi.v[t.dbgOffset + i] = int16_t( clip3i( t.trMin, t.trMax, ( sum + rnd2 ) >> t.shift2 ) );
+    }
+    controlBarrier( gl_ScopeWorkgroup, gl_ScopeWorkgroup, gl_StorageSemanticsBuffer, gl_SemanticsAcquireRelease );
+  }
+}

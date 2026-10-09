@@ -4,14 +4,15 @@
 // order from a counter; a block waits only for the blocks whose samples it reads (per-unit owner maps from the host,
 // done flags), so independent blocks (the three components, distant parts of the picture) run at the same time.
 // Per block: reference samples (and their [1 2 1] filtering), prediction (planar, directional planar, DC, angular
-// with PDPC and intra fusion), dequantization, the two inverse transform stages, reconstruction. Every step follows
-// the C++ of IntraPrediction / Quant / TrQuant / DecCu.
+// with PDPC and intra fusion) and reconstruction with the residual intra_resi computed beforehand for all blocks at
+// once. Every step follows the C++ of IntraPrediction / DecCu.
 // Not yet: MRL, ISP, MIP, the intra bilateral filter, LFNST / MTS / transform skip, decoder-side intra modes.
 #extension GL_GOOGLE_include_directive : require
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
 #extension GL_KHR_memory_scope_semantics : require
 #include "common.glsl"
+#include "intra_common.glsl"
 
 layout( local_size_x = 256 ) in;
 
@@ -19,60 +20,8 @@ layout( local_size_x = 256 ) in;
 // (device-scope coherent, done flags with release / acquire); the scratch is shared by the invocations of a workgroup
 layout( buffer_reference, std430, buffer_reference_align = 2 ) coherent buffer CBufI16 { int16_t v[]; };
 layout( buffer_reference, std430, buffer_reference_align = 4 ) coherent buffer CBufI32 { int v[]; };
-layout( buffer_reference, std430, buffer_reference_align = 4 ) workgroupcoherent buffer WBufI32 { int v[]; };
 
-// workgroup barrier that also orders the scratch buffer
-#define SYNC() controlBarrier( gl_ScopeWorkgroup, gl_ScopeWorkgroup, gl_StorageSemanticsShared | gl_StorageSemanticsBuffer, gl_SemanticsAcquireRelease )
-
-// one transform block of one component (48 int32, layout shared with GpuIntraRec.cpp)
-struct Tu
-{
-  int comp, x, y, w, h;
-  int dirMode;                 // final intra mode (PLANAR_IDX 0, DC_IDX 1, angular 2..66)
-  int isModeVer, intraPredAngle, absInvAngle, useCubic;
-  int unitW, unitH;            // availability units (xFillReferenceSamples)
-  int bitDepth;
-  int cbf, coeffOffset;
-  int dqScale, dqRightShift, dqInMin, dqInMax;   // Quant::dequant without scaling lists
-  int trMin, trMax, shift1, shift2;              // TrQuant::xIT
-  int recMin, recMax;                            // reconstruction clipping (adaptive for luma)
-  int dbgOffset;                                 // sample offset of the block in the debug buffers
-  int plIdx;                                     // directional planar (luma): 1 horizontal, 2 vertical
-  int refFilter, applyPDPC, gradPDPC, angularScale, fusion, disableRefFilter;
-  int pad[15];
-};
-layout( buffer_reference, std430, buffer_reference_align = 4 ) buffer BufTu { Tu v[]; };
-
-struct Params
-{
-  uint64_t tus;
-  uint64_t coeffs;      // int32 levels, per block w*h at coeffOffset
-  uint64_t plane[3];    // int16 reconstruction (written), origin/stride below
-  uint64_t owner[3];    // int32 per unit and component: the block covering it (-1: none); 4x4 luma, 2x2 chroma units
-  uint64_t filters;     // int32: [taps 6,8,10,12,16][32][16] cubic tables, then the weak 4-tap table [32][4]
-  uint64_t matrices;    // int32: DCT-II inverse matrices N = 2..128 at matrixOffset[log2N - 1]
-  uint64_t scratch;     // int32 per workgroup: coef | tmp | block | prediction (4 x 16384)
-  uint64_t dbgPred;     // int16 per block w*h at dbgOffset
-  uint64_t dbgResi;
-  uint64_t done;        // int32 per block: reconstructed
-  uint64_t counter;     // int32: the next block to take
-  int      origin[3];
-  int      stride[3];
-  int      width[3];
-  int      height[3];
-  int      ownerW[2];   // per channel type
-  int      ownerH[2];
-  int      unitLog2X[2];
-  int      unitLog2Y[2];
-  int      matrixOffset[8];
-};
-layout( buffer_reference, std430, buffer_reference_align = 8 ) buffer BufParams { Params p; };
-
-layout( push_constant ) uniform Push
-{
-  uint64_t params;
-  int      numTus;
-} pc;
+#define SYNC() barrier()
 
 const int PAD     = 6;                        // interpFilterNumPadded (16 taps / 2 - 2)
 const int ANG     = 1792;                     // angular reference buffers (the CPU's are larger; blocks <= 128 use < 1700)
@@ -294,6 +243,16 @@ void fillReferencePar( Tu t, int line, int mrl, int lid, int NT )
   }
 }
 
+// reconstruction of sample (x, y) of block t from its prediction and the residual of intra_resi (debug copy of the
+// prediction for the verification)
+void storeRecon( Tu t, int x, int y, int pr )
+{
+  const int i  = y * t.w + x;
+  const int re = int( BufI16( P.dbgResi ).v[t.dbgOffset + i] );
+  CBufI16( P.plane[t.comp] ).v[P.origin[t.comp] + ( t.y + y ) * P.stride[t.comp] + t.x + x] = int16_t( clip3i( t.recMin, t.recMax, pr + re ) );
+  BufI16( P.dbgPred ).v[t.dbgOffset + i] = int16_t( pr );
+}
+
 // main / side reference arrays of line l (main = above for vertical modes)
 int mainR( bool isVer, int l, int i ) { return isVer ? int( s_angA[l][i] ) : int( s_angL[l][i] ); }
 int sideR( bool isVer, int l, int i ) { return isVer ? int( s_angL[l][i] ) : int( s_angA[l][i] ); }
@@ -329,8 +288,6 @@ void main()
   const int lid = int( gl_LocalInvocationID.x );
   const int NT  = int( gl_WorkGroupSize.x );
   P = BufParams( pc.params ).p;
-  WBufI32 sc = WBufI32( P.scratch + uint64_t( gl_WorkGroupID.x ) * uint64_t( 4 * 4 * 16384 ) );
-  const int COEF = 0, TMP = 16384, BLK = 32768, PRED = 49152;
 
   for( ;; )
   {
@@ -384,7 +341,7 @@ void main()
       SYNC();
     }
 
-    // ----- prediction into scratch PRED (row-major W x H)
+    // ----- prediction and reconstruction
     if( t.dirMode == 0 || t.dirMode == 1 )   // planar / DC, then their PDPC
     {
       const int log2W = findMSB( W ), log2H = findMSB( H );
@@ -424,7 +381,7 @@ void main()
           const int wL = 32 >> min( 31, ( x << 1 ) >> pdpcScale );
           v = asPel( v + ( ( wL * ( L - v ) + wT * ( T - v ) + 32 ) >> 6 ) );
         }
-        sc.v[PRED + i] = v;
+        storeRecon( t, i % W, i / W, v );
       }
     }
     else   // angular (xPredIntraAng without the intra bilateral filter)
@@ -622,58 +579,11 @@ void main()
           }
         }
         const int ox = isVer ? x : y, oy = isVer ? y : x;
-        sc.v[PRED + oy * W + ox] = asPel( v );
+        storeRecon( t, ox, oy, asPel( v ) );
       }
     }
     SYNC();
 
-    // ----- residual
-    if( t.cbf != 0 )
-    {
-      BufI32 cf = BufI32( P.coeffs );
-      for( int i = lid; i < N; i += NT )
-      {
-        int q = clip3i( t.dqInMin, t.dqInMax, cf.v[t.coeffOffset + i] );
-        int c = t.dqRightShift > 0 ? ( q * t.dqScale + ( 1 << ( t.dqRightShift - 1 ) ) ) >> t.dqRightShift
-                                   : ( q * t.dqScale ) << ( -t.dqRightShift );
-        sc.v[COEF + i] = clip3i( t.trMin, t.trMax, c );
-      }
-      SYNC();
-      BufI32 mt = BufI32( P.matrices );
-      const int offH = P.matrixOffset[findMSB( H ) - 1], offW = P.matrixOffset[findMSB( W ) - 1];
-      const int rnd1 = 1 << ( t.shift1 - 1 );
-      for( int i = lid; i < N; i += NT )   // first stage (vertical): tmp[xf * H + y]
-      {
-        int xf = i / H, y = i % H;
-        int sum = 0;
-        for( int k = 0; k < H; k++ ) sum += mt.v[offH + k * H + y] * sc.v[COEF + k * W + xf];
-        sc.v[TMP + xf * H + y] = clip3i( t.trMin, t.trMax, ( sum + rnd1 ) >> t.shift1 );
-      }
-      SYNC();
-      const int rnd2 = 1 << ( t.shift2 - 1 );
-      for( int i = lid; i < N; i += NT )   // second stage (horizontal): block[y * W + x]
-      {
-        int y = i / W, x = i % W;
-        int sum = 0;
-        for( int k = 0; k < W; k++ ) sum += mt.v[offW + k * W + x] * sc.v[TMP + k * H + y];
-        sc.v[BLK + i] = asPel( clip3i( t.trMin, t.trMax, ( sum + rnd2 ) >> t.shift2 ) );
-      }
-    }
-    else
-    {
-      for( int i = lid; i < N; i += NT ) sc.v[BLK + i] = 0;
-    }
-    SYNC();
-
-    // ----- reconstruction, debug copies, done flag
-    for( int i = lid; i < N; i += NT )
-    {
-      int x = i % W, y = i / W;
-      int pr = sc.v[PRED + i], re = sc.v[BLK + i];
-      CBufI16( P.plane[t.comp] ).v[P.origin[t.comp] + ( t.y + y ) * P.stride[t.comp] + t.x + x] = int16_t( clip3i( t.recMin, t.recMax, pr + re ) );
-      BufI16( P.dbgPred ).v[t.dbgOffset + i] = int16_t( pr );
-      BufI16( P.dbgResi ).v[t.dbgOffset + i] = int16_t( re );
-    }
     // the block's samples (device-coherent stores of all invocations) happen before its done flag
     controlBarrier( gl_ScopeWorkgroup, gl_ScopeQueueFamily, gl_StorageSemanticsBuffer, gl_SemanticsAcquireRelease );
     if( lid == 0 )
