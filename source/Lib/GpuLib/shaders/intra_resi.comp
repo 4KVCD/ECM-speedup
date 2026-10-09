@@ -50,7 +50,7 @@ void main()
       int sum = 0;
       for( int k = 0; k < nzR; k++ )
       {
-        const int q = cf.v[t.coeffOffset + k * W + xf];
+        const int q = cf.v[t.coeffOffset + k * nzC + xf];
         if( q != 0 )
         {
           const int qc = clip3i( t.dqInMin, t.dqInMax, q );

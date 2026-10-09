@@ -111,7 +111,7 @@ struct Push
 {
   uint64_t params;
   int32_t  numTus;
-  int32_t  pad;
+  int32_t  verify;
 };
 
 constexpr int FILTER_TAPS[5] = { 6, 8, 10, 12, 16 };
@@ -133,7 +133,8 @@ struct GpuIntraRec::Impl
   // the picture being recorded
   std::vector<Tu>             rec;
   std::vector<int32_t>        coef;
-  std::vector<int16_t>        cpuPred, cpuResi;
+  std::vector<int16_t>        cpuPred, cpuResi;   // verification only
+  size_t                      numSamples = 0;     // samples of the recorded blocks
   std::string                 unsupportedWhy;
   int                         poc = 0;
   bool                        on = false;
@@ -298,6 +299,7 @@ void GpuIntraRec::beginPicture( const CodingStructure& cs )
   m.coef.clear();
   m.cpuPred.clear();
   m.cpuResi.clear();
+  m.numSamples = 0;
   m.unsupportedWhy.clear();
   m.poc = cs.slice->getPOC();
   std::string why;
@@ -416,26 +418,55 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
     t.recMax = slice.clpRng( compID ).max;
   }
 
-  const int n   = area.width * area.height;
+  // the levels: only the region holding the nonzero ones (rows < nzRows, columns < nzCols)
   t.coeffOffset = (int32_t) m.coef.size();
-  t.dbgOffset   = (int32_t) m.cpuPred.size();
-  const CCoeffBuf c = tu.getCoeffs( compID );
+  t.dbgOffset   = (int32_t) m.numSamples;
+  m.numSamples += size_t( area.width ) * area.height;
   t.nzRows = t.nzCols = 0;
-  for( int y = 0; y < (int) area.height; y++ )
+  if( t.cbf )
   {
-    for( int x = 0; x < (int) area.width; x++ )
+    const CCoeffBuf c = tu.getCoeffs( compID );
+    for( int y = 0; y < (int) area.height; y++ )
     {
-      if( c.at( x, y ) != 0 )
+      const TCoeff* row = c.bufAt( 0, y );
+      for( int x = (int) area.width - 1; x >= t.nzCols; x-- )
       {
-        t.nzRows = std::max( t.nzRows, y + 1 );
-        t.nzCols = std::max( t.nzCols, x + 1 );
+        if( row[x] != 0 )
+        {
+          t.nzRows = y + 1;
+          t.nzCols = x + 1;
+          break;
+        }
       }
-      m.coef.push_back( c.at( x, y ) );
-      m.cpuPred.push_back( pred ? pred->at( x, y ) : 0 );
-      m.cpuResi.push_back( resi ? resi->at( x, y ) : 0 );
+      if( t.nzRows < y + 1 )
+      {
+        for( int x = 0; x < t.nzCols; x++ )
+        {
+          if( row[x] != 0 )
+          {
+            t.nzRows = y + 1;
+            break;
+          }
+        }
+      }
+    }
+    for( int y = 0; y < t.nzRows; y++ )
+    {
+      const TCoeff* row = c.bufAt( 0, y );
+      m.coef.insert( m.coef.end(), row, row + t.nzCols );
     }
   }
-  CHECK( (int) m.coef.size() != t.coeffOffset + n, "coefficient count" );
+  if( pred && resi )   // the CPU's prediction and residual, for the comparison
+  {
+    for( int y = 0; y < (int) area.height; y++ )
+    {
+      for( int x = 0; x < (int) area.width; x++ )
+      {
+        m.cpuPred.push_back( pred->at( x, y ) );
+        m.cpuResi.push_back( resi->at( x, y ) );
+      }
+    }
+  }
   m.rec.push_back( t );
 }
 
@@ -535,19 +566,6 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
       memset( t.readMax, 0, sizeof( t.readMax ) );
       for( int mrl = 0; mrl <= ( t.fusion ? 1 : 0 ); mrl++ )
       {
-        const int x0 = t.x - 1 - mrl, y0 = t.y - 1 - mrl;
-        int* av = t.avail[mrl];
-        av[0] = avail( x0, y0 ) ? 1 : 0;
-        int k;
-        for( k = 0; k < numAbove && avail( t.x + k * t.unitW, y0 ); k++ ) {}
-        av[1] = k;
-        for( k = 0; k < tAU - numAbove && avail( t.x + t.w - 1 + t.unitW + k * t.unitW, y0 ); k++ ) {}
-        av[2] = k;
-        for( k = 0; k < numLeft && avail( x0, t.y + k * t.unitH ); k++ ) {}
-        av[3] = k;
-        for( k = 0; k < tLU - numLeft && avail( x0, t.y + t.h - 1 + t.unitH + k * t.unitH ); k++ ) {}
-        av[4] = k;
-
         // the read range
         const int W = t.w, H = t.h, rf = t.refFilter ? 1 : 0;
         int topMax, leftMax;
@@ -611,6 +629,31 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
         t.readMax[mrl][0] = std::max( mrl, std::min( topMax, 8 * W + mrl ) );
         t.readMax[mrl][1] = std::max( mrl, std::min( leftMax, 8 * H + mrl ) );
 
+        const int x0 = t.x - 1 - mrl, y0 = t.y - 1 - mrl;
+        int* av = t.avail[mrl];
+        // availability: the corner flag and the available prefix of each unit group, scanned only over the units the
+        // read range overlaps (at least one: a group's first unit decides whether any of it is available). Units
+        // beyond the range change neither a sample in range nor its padding source: those come from the nearest
+        // available unit before it in the CPU's unit order (an interval end, or a group's fixed start) or from the
+        // first available unit, whose position only depends on whether its group's prefix is 0.
+        const int topMaxL = t.readMax[mrl][0], leftMaxL = t.readMax[mrl][1];
+        const int unitsTop  = topMaxL >= 1 + mrl ? ( topMaxL - 1 - mrl ) / t.unitW + 1 : 0;
+        const int unitsLeft = leftMaxL >= 1 + mrl ? ( leftMaxL - 1 - mrl ) / t.unitH + 1 : 0;
+        const int limA  = std::max( 1, std::min( numAbove, unitsTop ) );
+        const int limAR = std::max( 1, std::min( tAU - numAbove, unitsTop - numAbove ) );
+        const int limL  = std::max( 1, std::min( numLeft, unitsLeft ) );
+        const int limBL = std::max( 1, std::min( tLU - numLeft, unitsLeft - numLeft ) );
+        av[0] = avail( x0, y0 ) ? 1 : 0;
+        int k;
+        for( k = 0; k < limA && avail( t.x + k * t.unitW, y0 ); k++ ) {}
+        av[1] = k;
+        for( k = 0; k < limAR && avail( t.x + t.w - 1 + t.unitW + k * t.unitW, y0 ); k++ ) {}
+        av[2] = k;
+        for( k = 0; k < limL && avail( x0, t.y + k * t.unitH ); k++ ) {}
+        av[3] = k;
+        for( k = 0; k < limBL && avail( x0, t.y + t.h - 1 + t.unitH + k * t.unitH ); k++ ) {}
+        av[4] = k;
+
         // the owners of the samples in range (the kernel's fill rule)
         const int corner = av[0], pA = av[1], pAR = av[2], pL = av[3], pBL = av[4];
         const int blS = tLU - numLeft - pBL, blE = tLU - 1 - numLeft, lS = tLU - pL, lE = tLU - 1;
@@ -628,6 +671,7 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
         for( int side = 0; side < 2; side++ )
         {
           const bool top = side == 0;
+          int lastKey = -1;   // the owner unit (available sample) or the availability unit (padding) just added
           for( int idx = 0; idx <= t.readMax[mrl][side]; idx++ )
           {
             const int u = idx <= mrl ? tLU : top ? tLU + 1 + ( idx - 1 - mrl ) / t.unitW : tLU - 1 - ( idx - 1 - mrl ) / t.unitH;
@@ -642,9 +686,20 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
             {
               sx = top ? x0 + idx : x0;
               sy = top ? y0 : y0 + idx;
+              const int key = ( ( sy >> P.unitLog2Y[ch] ) * P.ownerW[ch] + ( sx >> P.unitLog2X[ch] ) ) * 2;
+              if( sx >= 0 && sy >= 0 && key == lastKey )
+              {
+                continue;
+              }
+              lastKey = sx >= 0 && sy >= 0 ? key : -1;
             }
             else
             {
+              if( lastKey == u * 2 + 1 )   // the same padding source as the sample before
+              {
+                continue;
+              }
+              lastKey = u * 2 + 1;
               const bool before = pm >= 0;
               const int  s = before ? pm : firstAvail;
               if( s == tLU )
@@ -703,7 +758,7 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
     counter[2] = 0;
   }
   const size_t schedBytes = sched.size() * 4;
-  const size_t tuBytes = m.rec.size() * sizeof( Tu ), coefBytes = m.coef.size() * 4, dbgBytes = m.cpuPred.size() * 2;
+  const size_t tuBytes = m.rec.size() * sizeof( Tu ), coefBytes = m.coef.size() * 4, dbgBytes = m.numSamples * 2;
   m.tus.ensure( ctx, tuBytes, gpu::Buffer::DEVICE );
   m.coeffs.ensure( ctx, std::max<size_t>( coefBytes, 4 ), gpu::Buffer::DEVICE );
   m.sched.ensure( ctx, schedBytes, gpu::Buffer::DEVICE );
@@ -745,7 +800,7 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
     up += ownerBytes[c];
   }
   memcpy( (char*) m.upload.mapped + up, sched.data(), schedBytes );
-  size_t downBytes = 2 * dbgBytes;
+  size_t downBytes = m.on ? 0 : 2 * dbgBytes;
   for( int c = 0; c < numComp; c++ )
   {
     downBytes += planeBytes[c];
@@ -773,17 +828,20 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
   s.copy( m.upload, up, m.sched, 0, schedBytes );
   s.barrier();
   const uint32_t t0 = s.timestamp();
-  Push push{ m.params.addr, (int32_t) m.rec.size(), 0 };
+  Push push{ m.params.addr, (int32_t) m.rec.size(), m.on ? 0 : 1 };
   s.dispatch( m.kernelResi, &push, (uint32_t) std::min<size_t>( RESI_GROUPS, m.rec.size() ) );   // the residuals
   s.barrier();
   s.dispatch( m.kernel, &push, (uint32_t) std::min<size_t>( m.numGroups, m.rec.size() ) );
   const uint32_t t1 = s.timestamp();
   s.barrier();
   size_t off = 0;
-  s.copy( m.dbgPred, 0, m.download, off, dbgBytes );
-  off += dbgBytes;
-  s.copy( m.dbgResi, 0, m.download, off, dbgBytes );
-  off += dbgBytes;
+  if( !m.on )
+  {
+    s.copy( m.dbgPred, 0, m.download, off, dbgBytes );
+    off += dbgBytes;
+    s.copy( m.dbgResi, 0, m.download, off, dbgBytes );
+    off += dbgBytes;
+  }
   for( int c = 0; c < numComp; c++ )
   {
     s.copy( m.planes[c], 0, m.download, off, planeBytes[c] );
@@ -795,7 +853,7 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
 
   if( m.on )   // the GPU's picture is the reconstruction
   {
-    const int16_t* gPlane = (const int16_t*) m.download.mapped + 2 * m.cpuPred.size();
+    const int16_t* gPlane = (const int16_t*) m.download.mapped;
     for( int c = 0; c < numComp; c++ )
     {
       PelBuf reco = cs.picture->getRecoBuf( ComponentID( c ) );

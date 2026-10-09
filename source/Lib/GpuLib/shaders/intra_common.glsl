@@ -27,7 +27,7 @@ layout( buffer_reference, std430, buffer_reference_align = 4 ) buffer BufTu { Tu
 struct Params
 {
   uint64_t tus;
-  uint64_t coeffs;      // int32 levels, per block w*h at coeffOffset
+  uint64_t coeffs;      // int32 levels of each block's nonzero region (nzRows x nzCols, row-major) at coeffOffset
   uint64_t plane[3];    // int16 reconstruction (written), origin/stride below
   uint64_t owner[3];    // int32 per unit and component: the block covering it (-1: none); 4x4 luma, 2x2 chroma units
   uint64_t filters;     // int32: [taps 6,8,10,12,16][32][16] cubic tables, then the weak 4-tap table [32][4]
@@ -56,6 +56,7 @@ layout( push_constant ) uniform Push
 {
   uint64_t params;
   int      numTus;
+  int      verify;    // the prediction is copied for the comparison with the CPU
 } pc;
 
 #endif

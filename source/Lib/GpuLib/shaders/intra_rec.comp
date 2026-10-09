@@ -158,7 +158,10 @@ void storeRecon( Tu t, int x, int y, int pr )
   const int i  = y * t.w + x;
   const int re = int( BufI16( P.dbgResi ).v[t.dbgOffset + i] );
   CBufI16( P.plane[t.comp] ).v[P.origin[t.comp] + ( t.y + y ) * P.stride[t.comp] + t.x + x] = int16_t( clip3i( t.recMin, t.recMax, pr + re ) );
-  BufI16( P.dbgPred ).v[t.dbgOffset + i] = int16_t( pr );
+  if( pc.verify != 0 )
+  {
+    BufI16( P.dbgPred ).v[t.dbgOffset + i] = int16_t( pr );
+  }
 }
 
 // main / side reference arrays of line l (main = above for vertical modes)
