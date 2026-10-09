@@ -11,6 +11,7 @@ import concurrent.futures as cf
 import hashlib
 import json
 import os
+import queue
 import subprocess
 import sys
 import time
@@ -87,29 +88,62 @@ class CpuJob:
         self.k32.CloseHandle(ctypes.c_void_p(self.job))
 
 
-def run_test(exe, outdir, name, more_args=()):
+CPUS = None  # queue of logical CPU numbers (--cpus); each running encode is pinned to one of them
+
+
+def process_cpu_seconds(proc):
+    """user+kernel CPU time of a finished (not yet reaped) child process; less load-sensitive than wall time."""
+    if os.name != "nt":
+        return None
+    import ctypes
+    from ctypes import wintypes
+    ft = [wintypes.FILETIME() for _ in range(4)]
+    ok = ctypes.windll.kernel32.GetProcessTimes(wintypes.HANDLE(int(proc._handle)), *[ctypes.byref(f) for f in ft])
+    if not ok:
+        return None
+    val = lambda f: (f.dwHighDateTime << 32 | f.dwLowDateTime) / 1e7
+    return val(ft[2]) + val(ft[3])
+
+
+def pin(proc, cpu):
+    """restrict a just-started child to one logical CPU (hybrid CPUs: keep every run on a P-core)"""
+    import ctypes
+    if not ctypes.windll.kernel32.SetProcessAffinityMask(int(proc._handle), ctypes.c_size_t(1 << cpu)):
+        raise OSError("SetProcessAffinityMask failed")
+
+
+def run_test(exe, outdir, name, more_args=(), fixed_core=None):
     cfg, yuv, w, h, fps, frames, qp, extra = TESTS[name]
     extra = list(extra) + list(more_args)
     bs = os.path.join(outdir, name + ".bin")
     log = os.path.join(outdir, name + ".log")
     cmd = [exe, "-c", f"{CFG}/{cfg}", "-i", f"{SEQ}/{yuv}", "-wdt", str(w), "-hgt", str(h), "-fr", str(fps),
            "--InputBitDepth=8", "-f", str(frames), "-q", str(qp), "-b", bs, "-o", "NUL"] + extra
-    t0 = time.perf_counter()
-    with open(log, "w") as lf:
-        cpu = None
-        if os.name == "nt":
-            job = CpuJob()
-            try:
-                proc = job.start(cmd, stdout=lf, stderr=subprocess.STDOUT)
+    core = fixed_core if fixed_core is not None else (CPUS.get() if CPUS else None)
+    try:
+        t0 = time.perf_counter()
+        with open(log, "w") as lf:
+            if os.name == "nt":
+                job = CpuJob()
+                try:
+                    proc = job.start(cmd, stdout=lf, stderr=subprocess.STDOUT)
+                    if core is not None:
+                        pin(proc, core)
+                    proc.wait()
+                    cpu = job.cpu_seconds()   # the encoder and all its child processes
+                finally:
+                    job.close()
+            else:
+                proc = subprocess.Popen(cmd, stdout=lf, stderr=subprocess.STDOUT)
+                if core is not None:
+                    pin(proc, core)
                 proc.wait()
-                cpu = job.cpu_seconds()   # the encoder and all its child processes
-            finally:
-                job.close()
-        else:
-            proc = subprocess.Popen(cmd, stdout=lf, stderr=subprocess.STDOUT)
-            proc.wait()
-        rc = proc.returncode
-    dt = time.perf_counter() - t0
+                cpu = process_cpu_seconds(proc)
+            rc = proc.returncode
+        dt = time.perf_counter() - t0
+    finally:
+        if core is not None and fixed_core is None:
+            CPUS.put(core)
     return name, {"time": round(dt, 2), "cpu": round(cpu, 2) if cpu else None, "rc": rc,
                   "md5": md5(bs) if rc == 0 and os.path.exists(bs) else None}
 
@@ -139,36 +173,94 @@ def cmd_run(args):
 
 
 def cmd_ab(args):
-    """Paired measurement: for every test, build A and build B run at the same time, so both see the same load."""
+    """Paired measurement: for every test, build A and build B run at the same time, so both see the same load.
+
+    With --cpus the CPUs are used as pairs: A and B of a test run on the two CPUs of one pair, and repetition r swaps
+    them (r odd), so a faster core does not favour one build. Times are then the mean over the repetitions."""
     names = args.tests.split(",") if args.tests else DEFAULT_TESTS
     res = {args.a: {}, args.b: {}}
-    jobs = []
-    for _ in range(args.reps):
-        for n in names:
-            for build in (args.a, args.b):
-                jobs.append((build, n))
-    with cf.ThreadPoolExecutor(args.jobs) as ex:
-        futs = {}
-        for build, n in jobs:
-            outdir = os.path.join(ROOT, "runs", "ab_" + build)
-            os.makedirs(outdir, exist_ok=True)
-            futs[ex.submit(run_test, f"{ROOT}/bin/{build}/EncoderApp.exe", outdir, n)] = build
-        for fu in cf.as_completed(futs):
-            build = futs[fu]
-            n, r = fu.result()
-            prev = res[build].get(n)
-            if prev:  # keep the minimum over repetitions; md5 must agree
-                r["md5"] = r["md5"] if r["md5"] == prev["md5"] else None
-                r["time"] = min(r["time"], prev["time"])
-                r["cpu"] = min(r["cpu"], prev["cpu"]) if r.get("cpu") and prev.get("cpu") else None
-            res[build][n] = r
-            print(f"{build:6s} {n:14s} {r['time']:9.2f}s  {r['md5']}", flush=True)
+    outdirs = {}
+    for build in (args.a, args.b):
+        for rep in range(args.reps):  # one folder per repetition: repetitions of a test may run at the same time
+            outdirs[build, rep] = os.path.join(ROOT, "runs", "ab_" + build, f"rep{rep}")
+            os.makedirs(outdirs[build, rep], exist_ok=True)
+
+    def add(build, n, r):
+        prev = res[build].get(n)
+        if prev:  # md5 must agree over repetitions
+            r["md5"] = r["md5"] if r["md5"] == prev["md5"] else None
+            r["times"] = prev["times"] + [r["time"]]
+            r["cpus"] = prev["cpus"] + [r["cpu"]]
+        else:
+            r["times"], r["cpus"] = [r["time"]], [r["cpu"]]
+        res[build][n] = r
+        print(f"{build:6s} {n:14s} {r['time']:9.2f}s  cpu {r['cpu']}  {r['md5']}", flush=True)
+
+    ratios = {}
+    if CPUS:
+        cores = []
+        while not CPUS.empty():
+            cores.append(CPUS.get())
+        pairs = queue.Queue()
+        for k in range(0, len(cores) - 1, 2):
+            pairs.put((cores[k], cores[k + 1]))
+
+        def pair_job(n, rep):
+            c = pairs.get()
+            try:
+                ca, cb = (c[1], c[0]) if rep % 2 else c
+                with cf.ThreadPoolExecutor(2) as ex2:
+                    fa = ex2.submit(run_test, f"{ROOT}/bin/{args.a}/EncoderApp.exe", outdirs[args.a, rep], n, (), ca)
+                    fb = ex2.submit(run_test, f"{ROOT}/bin/{args.b}/EncoderApp.exe", outdirs[args.b, rep], n, (), cb)
+                    return fa.result()[1], fb.result()[1], n, rep
+            finally:
+                pairs.put(c)
+
+        with cf.ThreadPoolExecutor(len(cores) // 2) as ex:
+            futs = [ex.submit(pair_job, n, rep) for rep in range(args.reps) for n in names]
+            for fu in cf.as_completed(futs):
+                ra, rb, n, rep = fu.result()
+                ratios.setdefault(n, []).append((ra["cpu"] or 0) / (rb["cpu"] or 1))
+                add(args.a, n, ra)
+                add(args.b, n, rb)
+        for build in res:
+            for r in res[build].values():
+                r["time"] = sum(r["times"]) / len(r["times"])
+                r["cpu"] = sum(r["cpus"]) / len(r["cpus"]) if all(r["cpus"]) else None
+    else:
+        jobs = [(build, n, rep) for rep in range(args.reps) for n in names for build in (args.a, args.b)]
+        with cf.ThreadPoolExecutor(args.jobs) as ex:
+            futs = {ex.submit(run_test, f"{ROOT}/bin/{build}/EncoderApp.exe", outdirs[build, rep], n): build
+                    for build, n, rep in jobs}
+            for fu in cf.as_completed(futs):
+                build = futs[fu]
+                n, r = fu.result()
+                prev = res[build].get(n)
+                if prev:  # keep the minimum over repetitions; md5 must agree
+                    r["md5"] = r["md5"] if r["md5"] == prev["md5"] else None
+                    r["time"] = min(r["time"], prev["time"])
+                    r["cpu"] = min(r["cpu"], prev["cpu"]) if r.get("cpu") and prev.get("cpu") else None
+                res[build][n] = r
+                print(f"{build:6s} {n:14s} {r['time']:9.2f}s  {r['md5']}", flush=True)
+    os.makedirs(RESULTS, exist_ok=True)
+    json.dump(res, open(os.path.join(RESULTS, f"ab_{args.a}_{args.b}.json"), "w"), indent=1, sort_keys=True)
     ref = json.load(open(os.path.join(RESULTS, "ref.json")))
     ok = True
     for build in (args.a, args.b):
         for n, r in res[build].items():
             ok &= r["md5"] is not None and r["md5"] == ref[n]["md5"]
     rc = compare(res[args.a], res[args.b], args.a, args.b)
+    if ratios:
+        # per repetition, A and B ran at the same time on the same core pair: the ratio cancels most of the load
+        print(f"\nper-repetition CPU ratios {args.a}/{args.b} (median):")
+        wa = wb = 0.0
+        for n in sorted(ratios):
+            r = sorted(ratios[n])
+            med = r[len(r) // 2] if len(r) % 2 else (r[len(r) // 2 - 1] + r[len(r) // 2]) / 2
+            print(f"  {n:14s} {med:6.3f}x   [{', '.join(f'{x:.3f}' for x in r)}]")
+            wa += res[args.a][n]["cpu"] or 0
+            wb += (res[args.a][n]["cpu"] or 0) / med
+        print(f"  {'TOTAL':14s} {wa / wb:6.3f}x   (time-weighted)")
     print("bit-exact vs ref:", "ALL MATCH" if ok else "*** MISMATCH ***")
     return 0 if ok and rc == 0 else 1
 
@@ -216,7 +308,14 @@ def main():
     p.add_argument("--jobs", type=int, default=6)
     p.add_argument("--reps", type=int, default=1)
     p.add_argument("--tests")
+    for sp in (r, p):
+        sp.add_argument("--cpus", help="comma-separated logical CPUs to pin runs to, one run per CPU (e.g. the P-cores)")
     args = ap.parse_args()
+    if getattr(args, "cpus", None):
+        global CPUS
+        CPUS = queue.Queue()
+        for c in args.cpus.split(","):
+            CPUS.put(int(c))
     if args.cmd == "run":
         return cmd_run(args)
     if args.cmd == "ab":

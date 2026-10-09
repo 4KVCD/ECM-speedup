@@ -7646,7 +7646,7 @@ void InterSearch::predInterSearch(CodingUnit& cu, Partitioner& partitioner)
 
     PelUnitBuf predBuf = pu.cs->getPredBuf(pu);
     DistParam distParam;
-    m_pcRdCost->setDistParam(distParam, cs.getOrgBuf().Y(), predBuf.Y(), cs.sps->getBitDepth(CHANNEL_TYPE_LUMA), COMPONENT_Y, true);
+    m_pcRdCost->setDistParam(distParam, cs.getOrgBuf(COMPONENT_Y), predBuf.Y(), cs.sps->getBitDepth(CHANNEL_TYPE_LUMA), COMPONENT_Y, true);
     Distortion distLicOn = distParam.distFunc(distParam);
 
 #if JVET_AD0213_LIC_IMP
@@ -7657,7 +7657,7 @@ void InterSearch::predInterSearch(CodingUnit& cu, Partitioner& partitioner)
       pu.cu->licFlag = true;
     }
 #endif
-    m_pcRdCost->setDistParam(distParam, cs.getOrgBuf().Y(), m_predictionBeforeLIC.Y(), cs.sps->getBitDepth(CHANNEL_TYPE_LUMA), COMPONENT_Y, true);
+    m_pcRdCost->setDistParam(distParam, cs.getOrgBuf(COMPONENT_Y), m_predictionBeforeLIC.Y(), cs.sps->getBitDepth(CHANNEL_TYPE_LUMA), COMPONENT_Y, true);
     Distortion distLicOff = distParam.distFunc(distParam);
     if (distLicOn >= distLicOff)
     {
@@ -8194,7 +8194,7 @@ void InterSearch::predInterSearchAdditionalHypothesis(PredictionUnit& pu, const 
           // store MHP MC result for next additonal hypothesis test
           if (pu.addHypData.size() < sps.getMaxNumAddHyps() && m_mhpTempBufCounter < GEO_MAX_TRY_WEIGHTED_SAD)
           {
-            result.predBuf = &m_mhpTempBuf[m_mhpTempBufCounter];
+            result.predBuf = xMhpTempBuf(m_mhpTempBufCounter);
             result.predBufIdx = m_mhpTempBufCounter;
             m_mhpTempBufCounter++;
             result.predBuf->copyFrom(tempOrigBuf, true);
@@ -8331,8 +8331,13 @@ void InterSearch::initGeoAngleSelection(PredictionUnit& pu
 )
 {
   xAMLGetCurBlkTemplate(pu, pu.lwidth(), pu.lheight());
-  memset(&m_gpmacsSplitModeTmSelAvail[0][0][0], 0, sizeof(m_gpmacsSplitModeTmSelAvail));
-  memset(&m_gpmPartTplCost[0][0][0][0], -1, sizeof(m_gpmPartTplCost));
+  // the rows of m_gpmacsSplitModeTmSelAvail (0) and m_gpmPartTplCost (-1) are cleared when first used
+  if( ++m_gpmRowGen == 0 )
+  {
+    memset( m_gpmPartTplCostGen, 0, sizeof( m_gpmPartTplCostGen ) );
+    memset( m_gpmSelAvailGen, 0, sizeof( m_gpmSelAvailGen ) );
+    m_gpmRowGen = 1;
+  }
 
   int16_t wIdx = floorLog2((uint32_t)pu.lwidth ()) - GEO_MIN_CU_LOG2;
   int16_t hIdx = floorLog2((uint32_t)pu.lheight()) - GEO_MIN_CU_LOG2;
@@ -8370,7 +8375,7 @@ void InterSearch::setGeoSplitModeToSyntaxTable(PredictionUnit& pu, MergeCtx& mer
   const int idx0 = mmvdCand0 + 1;
   const int idx1 = mmvdCand1 + 1;
 
-  if ((m_gpmacsSplitModeTmSelAvail[idx0][idx1][mergeCand0] & ((uint16_t)1 << mergeCand1)) == 0)
+  if ((gpmSelAvailRow(idx0, idx1)[mergeCand0] & ((uint16_t)1 << mergeCand1)) == 0)
   {
     uint8_t numValidInList = 0;
     uint8_t modeList[GEO_NUM_SIG_PARTMODE];
@@ -8384,8 +8389,8 @@ void InterSearch::setGeoSplitModeToSyntaxTable(PredictionUnit& pu, MergeCtx& mer
 #if JVET_AI0082_GPM_WITH_INTER_IBC
                       , geoBvList
 #endif
-                      , m_gpmPartTplCost[idx0][mergeCand0]
-                      , m_gpmPartTplCost[idx1][mergeCand1]
+                      , gpmPartTplCostRow(idx0, mergeCand0)
+                      , gpmPartTplCostRow(idx1, mergeCand1)
                       , mergeCtx0
                       , mergeCand0
 #if JVET_Y0065_GPM_INTRA
@@ -8419,7 +8424,7 @@ void InterSearch::setGeoSplitModeToSyntaxTable(PredictionUnit& pu, MergeCtx& mer
     );
 
     xSetGpmModeToSyntaxModeTable(numValidInList, modeList, m_gpmacsSplitModeTmSel[idx0][idx1][mergeCand0][mergeCand1]);
-    m_gpmacsSplitModeTmSelAvail[idx0][idx1][mergeCand0] |= ((uint16_t)1 << mergeCand1);
+    gpmSelAvailRow(idx0, idx1)[mergeCand0] |= ((uint16_t)1 << mergeCand1);
   }
 }
 
@@ -8433,13 +8438,13 @@ void InterSearch::setGeoTMSplitModeToSyntaxTable(PredictionUnit& pu, MergeCtx(&m
   const int idx0 = mmvdCand0 + 1;
   const int idx1 = mmvdCand1 + 1;
 
-  if ((m_gpmacsSplitModeTmSelAvail[idx0][idx1][mergeCand0] & ((uint16_t)1 << mergeCand1)) == 0)
+  if ((gpmSelAvailRow(idx0, idx1)[mergeCand0] & ((uint16_t)1 << mergeCand1)) == 0)
   {
     uint8_t numValidInList = 0;
     uint8_t modeList[GEO_NUM_SIG_PARTMODE];
     selectGeoTMSplitModes(pu
-                        , m_gpmPartTplCost[idx0][mergeCand0]
-                        , m_gpmPartTplCost[idx1][mergeCand1]
+                        , gpmPartTplCostRow(idx0, mergeCand0)
+                        , gpmPartTplCostRow(idx1, mergeCand1)
                         , mergeCtx
 #if JVET_AJ0274_GPM_AFFINE_TM
                         , affMergeCtx
@@ -8451,7 +8456,7 @@ void InterSearch::setGeoTMSplitModeToSyntaxTable(PredictionUnit& pu, MergeCtx(&m
     );
 
     xSetGpmModeToSyntaxModeTable(numValidInList, modeList, m_gpmacsSplitModeTmSel[idx0][idx1][mergeCand0][mergeCand1]);
-    m_gpmacsSplitModeTmSelAvail[idx0][idx1][mergeCand0] |= ((uint16_t)1 << mergeCand1);
+    gpmSelAvailRow(idx0, idx1)[mergeCand0] |= ((uint16_t)1 << mergeCand1);
   }
 }
 #endif
@@ -17334,7 +17339,7 @@ void InterSearch::checkEncLicOff(CodingUnit& cu, MergeCtx& mergeCtx)
 
   PelUnitBuf predBuf = pu.cs->getPredBuf(pu);
   DistParam distParam;
-  m_pcRdCost->setDistParam(distParam, cs.getOrgBuf().Y(), predBuf.Y(), cs.sps->getBitDepth(CHANNEL_TYPE_LUMA), COMPONENT_Y, true);
+  m_pcRdCost->setDistParam(distParam, cs.getOrgBuf(COMPONENT_Y), predBuf.Y(), cs.sps->getBitDepth(CHANNEL_TYPE_LUMA), COMPONENT_Y, true);
   Distortion distLicOn = distParam.distFunc(distParam);
 
   const double  sqrtLambdaForFirstPassIntra = m_pcRdCost->getMotionLambda() * FRAC_BITS_SCALE;
@@ -17415,7 +17420,7 @@ void InterSearch::checkEncLicOff(CodingUnit& cu, MergeCtx& mergeCtx)
     motionCompensation(pu, m_predictionBeforeLIC, REF_PIC_LIST_X);
   }
 #endif
-  m_pcRdCost->setDistParam(distParam, cs.getOrgBuf().Y(), m_predictionBeforeLIC.Y(), cs.sps->getBitDepth(CHANNEL_TYPE_LUMA), COMPONENT_Y, true);
+  m_pcRdCost->setDistParam(distParam, cs.getOrgBuf(COMPONENT_Y), m_predictionBeforeLIC.Y(), cs.sps->getBitDepth(CHANNEL_TYPE_LUMA), COMPONENT_Y, true);
   Distortion distLicOff = distParam.distFunc(distParam);
   m_CABACEstimator->getCtx() = ctxStart;
   uint64_t licOffFracBits = xCalcExpPuBits(pu);
@@ -17496,7 +17501,7 @@ void InterSearch::checkEncLicOn(CodingUnit& cu, MergeCtx& mergeCtx)
 
   PelUnitBuf predBuf = pu.cs->getPredBuf(pu);
   DistParam distParam;
-  m_pcRdCost->setDistParam(distParam, cs.getOrgBuf().Y(), predBuf.Y(), cs.sps->getBitDepth(CHANNEL_TYPE_LUMA), COMPONENT_Y, true);
+  m_pcRdCost->setDistParam(distParam, cs.getOrgBuf(COMPONENT_Y), predBuf.Y(), cs.sps->getBitDepth(CHANNEL_TYPE_LUMA), COMPONENT_Y, true);
   Distortion distLicOff = distParam.distFunc(distParam);
 
   const double  sqrtLambdaForFirstPassIntra = m_pcRdCost->getMotionLambda() * FRAC_BITS_SCALE;
@@ -17571,7 +17576,7 @@ void InterSearch::checkEncLicOn(CodingUnit& cu, MergeCtx& mergeCtx)
     }
   }
 #endif
-  m_pcRdCost->setDistParam(distParam, cs.getOrgBuf().Y(), m_predictionBeforeLIC.Y(), cs.sps->getBitDepth(CHANNEL_TYPE_LUMA), COMPONENT_Y, true);
+  m_pcRdCost->setDistParam(distParam, cs.getOrgBuf(COMPONENT_Y), m_predictionBeforeLIC.Y(), cs.sps->getBitDepth(CHANNEL_TYPE_LUMA), COMPONENT_Y, true);
   Distortion distLicOn = distParam.distFunc(distParam);
   m_CABACEstimator->getCtx() = ctxStart;
   uint64_t licOnFracBits = xCalcExpPuBits(pu);

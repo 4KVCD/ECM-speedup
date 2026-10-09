@@ -45,6 +45,9 @@
 
 #include <utility>
 #include <algorithm>
+#if defined( __AVX2__ )
+#include <immintrin.h>
+#endif
 
 // CS tools
 
@@ -44189,14 +44192,119 @@ void fillNonMPMList(uint8_t* mpm, uint8_t* nonMpm
 }
 #endif
 #if JVET_AG0061_INTER_LFNST_NSPT
-int buildHistogram(const Pel *pReco, int iStride, uint32_t uiHeight, uint32_t uiWidth, int *piHistogram, int direction,
-                   int bw, int bh
-#if JVET_AJ0203_DIMD_2X2_EDGE_OP 
-                 , const int filterSizeIdx
-#endif  
-#if  JVET_AK0217_INTRA_MTSS
-                  , const bool subsampling
-#endif 
+#if ENABLE_SIMD_OPT && defined( __AVX2__ ) && JVET_AJ0203_DIMD_2X2_EDGE_OP && JVET_X0149_TIMD_DIMD_LUT   // 16-bit Pel
+#define DIMD_HIST_SIMD 1
+// perf: the histogram contributions of 8 pixels of a row at once: the gradients (3x3 Sobel, or the 2x2 operator for
+// filterSizeIdx 1), the amplitude and the angle index of each pixel in 32-bit lanes with the integer arithmetic of the
+// scalar loop, then the histogram additions one by one (integer sums: their order does not matter). Pixels
+// x = x0 + k * step, k = 0..7, of the row at pRow (step 1 or 2). Reads pRow[x0 - 1 .. x0 + 8] (step 1) or
+// pRow[x0 - 1 .. x0 + 16] (step 2) of the rows above, at and below. lastPixel: a lane to leave out (-1: none).
+static inline void dimdHistogramRow8(const Pel *pRow, const int iStride, const int x0, const int step,
+                                     const int filterSizeIdx, const int lastPixel, int *piHistogram)
+{
+  // the samples at x0 + k * step + dx of the row at dy, as int32
+  auto samples = [&](const int dx, const int dy) -> __m256i
+  {
+    const Pel *p = pRow + dy * iStride + x0 + dx;
+    if (step == 1)
+    {
+      return _mm256_cvtepi16_epi32(_mm_loadu_si128((const __m128i *) p));
+    }
+    const __m256i v = _mm256_loadu_si256((const __m256i *) p);   // even samples of p[0 .. 15]
+    return _mm256_srai_epi32(_mm256_slli_epi32(v, 16), 16);
+  };
+  __m256i dx, dy;
+  if (filterSizeIdx == 1)
+  {
+    // iDy = r[-s-1] + r[-1] - r[-s] - r[0], iDx = r[-1] + r[0] - r[-s-1] - r[-s]
+    const __m256i al = samples(-1, -1), a0 = samples(0, -1), cl = samples(-1, 0), c0 = samples(0, 0);
+    dy = _mm256_sub_epi32(_mm256_add_epi32(al, cl), _mm256_add_epi32(a0, c0));
+    dx = _mm256_sub_epi32(_mm256_add_epi32(cl, c0), _mm256_add_epi32(al, a0));
+  }
+  else
+  {
+    const __m256i al = samples(-1, -1), a0 = samples(0, -1), ar = samples(1, -1);
+    const __m256i cl = samples(-1, 0), cr = samples(1, 0);
+    const __m256i bl = samples(-1, 1), b0 = samples(0, 1), br = samples(1, 1);
+    // iDy = r[-s-1] + 2 r[-1] + r[s-1] - r[-s+1] - 2 r[+1] - r[s+1]
+    dy = _mm256_sub_epi32(_mm256_add_epi32(_mm256_add_epi32(al, _mm256_slli_epi32(cl, 1)), bl),
+                          _mm256_add_epi32(_mm256_add_epi32(ar, _mm256_slli_epi32(cr, 1)), br));
+    // iDx = r[s-1] + 2 r[s] + r[s+1] - r[-s-1] - 2 r[-s] - r[-s+1]
+    dx = _mm256_sub_epi32(_mm256_add_epi32(_mm256_add_epi32(bl, _mm256_slli_epi32(b0, 1)), br),
+                          _mm256_add_epi32(_mm256_add_epi32(al, _mm256_slli_epi32(a0, 1)), ar));
+  }
+  const __m256i zero = _mm256_setzero_si256();
+  const __m256i one  = _mm256_set1_epi32(1);
+  const __m256i absx = _mm256_abs_epi32(dx);
+  const __m256i absy = _mm256_abs_epi32(dy);
+  const __m256i amp  = _mm256_add_epi32(absx, absy);   // 0 when both gradients are 0 (skipped before: adds nothing)
+
+  // both gradients non-zero: s0 / s1 and the region as in the scalar loop
+  const __m256i gtY = _mm256_cmpgt_epi32(absx, absy);
+  const __m256i s0  = _mm256_blendv_epi8(absx, absy, gtY);
+  const __m256i s1  = _mm256_blendv_epi8(absy, absx, gtY);
+  // floorLog2(s1) from the exponent of s1 as float (exact below 2^24); s1 >= 1 where the result is used
+  const __m256i lg = _mm256_sub_epi32(
+    _mm256_srli_epi32(_mm256_castps_si256(_mm256_cvtepi32_ps(_mm256_max_epi32(s1, one))), 23), _mm256_set1_epi32(127));
+  const __m256i norm  = _mm256_and_si256(_mm256_srlv_epi32(_mm256_slli_epi32(s1, 4), lg), _mm256_set1_epi32(15));
+  const __m256i tabLo = _mm256_loadu_si256((const __m256i *) g_gradDivTable);
+  const __m256i tabHi = _mm256_loadu_si256((const __m256i *) (g_gradDivTable + 8));
+  const __m256i v     = _mm256_or_si256(_mm256_blendv_epi8(_mm256_permutevar8x32_epi32(tabLo, norm),
+                                                       _mm256_permutevar8x32_epi32(tabHi, norm),
+                                                       _mm256_cmpgt_epi32(norm, _mm256_set1_epi32(7))),
+                                    _mm256_set1_epi32(8));
+  const __m256i shift = _mm256_sub_epi32(_mm256_set1_epi32(13), _mm256_sub_epi32(lg, _mm256_cmpgt_epi32(norm, zero)));
+  const __m256i prod  = _mm256_mullo_epi32(s0, v);
+  // shift < 0: (prod + (1 << (-shift - 1))) >> -shift; else prod << shift
+  const __m256i rs       = _mm256_sub_epi32(zero, shift);
+  const __m256i ratioNeg = _mm256_srav_epi32(_mm256_add_epi32(prod, _mm256_sllv_epi32(one, _mm256_sub_epi32(rs, one))), rs);
+  const __m256i ratio =
+    _mm256_blendv_epi8(_mm256_sllv_epi32(prod, shift), ratioNeg, _mm256_cmpgt_epi32(zero, shift));
+  // gradAngleIdx: the number of midpoints (angTable[k - 1] + angTable[k]) / 2, k = 1..16, not above the ratio (the
+  // nearest table entry, the upper one on ties, 16 above the table)
+  static const int mid[16] = { 1024,  3072,  5120,  7168,  10240, 14336, 18432, 22528,
+                               26624, 30720, 34816, 38912, 44032, 50176, 56320, 62464 };
+  __m256i idx = zero;
+  for (int k = 0; k < 16; k++)
+  {
+    idx = _mm256_sub_epi32(idx, _mm256_cmpgt_epi32(ratio, _mm256_set1_epi32(mid[k] - 1)));
+  }
+  // region: |iDx| > |iDy|: HOR, angle up for equal signs; else VER, angle down for equal signs
+  const __m256i sameSign = _mm256_cmpeq_epi32(_mm256_cmpgt_epi32(zero, dx), _mm256_cmpgt_epi32(zero, dy));
+  const __m256i up       = _mm256_cmpeq_epi32(sameSign, gtY);
+  const __m256i offset   = _mm256_blendv_epi8(_mm256_set1_epi32(VER_IDX), _mm256_set1_epi32(HOR_IDX), gtY);
+  const __m256i angBoth  = _mm256_blendv_epi8(_mm256_sub_epi32(offset, idx), _mm256_add_epi32(offset, idx), up);
+  // one gradient zero: VER when iDx is 0, else HOR
+  const __m256i dxZero = _mm256_cmpeq_epi32(dx, zero);
+  const __m256i ang    = _mm256_blendv_epi8(
+    angBoth, _mm256_blendv_epi8(_mm256_set1_epi32(HOR_IDX), _mm256_set1_epi32(VER_IDX), dxZero),
+    _mm256_or_si256(dxZero, _mm256_cmpeq_epi32(dy, zero)));
+
+  alignas(32) int angs[8], amps[8];
+  _mm256_store_si256((__m256i *) angs, ang);
+  _mm256_store_si256((__m256i *) amps, amp);
+  if (lastPixel >= 0)
+  {
+    amps[lastPixel] = 0;
+  }
+  for (int k = 0; k < 8; k++)
+  {
+    piHistogram[angs[k]] += amps[k];
+  }
+}
+#else
+#define DIMD_HIST_SIMD 0
+#endif
+
+template <bool useSimd>
+static int buildHistogramImpl(const Pel *pReco, int iStride, uint32_t uiHeight, uint32_t uiWidth, int *piHistogram,
+                              int direction, int bw, int bh
+#if JVET_AJ0203_DIMD_2X2_EDGE_OP
+                              , const int filterSizeIdx
+#endif
+#if JVET_AK0217_INTRA_MTSS
+                              , const bool subsampling
+#endif
 )
 {
 #if  JVET_AK0217_INTRA_MTSS
@@ -44214,7 +44322,28 @@ int buildHistogram(const Pel *pReco, int iStride, uint32_t uiHeight, uint32_t ui
 
   for (uint32_t y = 0; y < uiHeight; y += hStep)
   {
-    for (uint32_t x = 0; x < uiWidth; x += wStep)
+    uint32_t xStart = 0;
+#if DIMD_HIST_SIMD
+    // perf: groups of 8 pixels in AVX2 (dimdHistogramRow8) while they read no further than the scalar loop: with
+    // step 1 up to x = uiWidth (the right neighbour of its last pixel), with step 2 up to x = uiWidth - 1 (the loads
+    // of a group end at x0 + 16, and the scalar loop reads that column only if it has pixel x0 + 16 as well); the
+    // rest of the row, and the filterSizeIdx 2 variant, as before
+    if (useSimd && filterSizeIdx < 2 && wStep <= 2)
+    {
+      const uint32_t maxRead = wStep == 1 ? 8 : 17;
+      for (; xStart + maxRead <= uiWidth; xStart += 8 * wStep)
+      {
+        int lastPixel = -1;   // the scalar loop leaves out the last pixel of the last row for direction 3
+        if (direction == 3 && y == uiHeight - 1 && (uiWidth - 1 - xStart) % wStep == 0
+            && (uiWidth - 1 - xStart) / wStep < 8)
+        {
+          lastPixel = (uiWidth - 1 - xStart) / wStep;
+        }
+        dimdHistogramRow8(pReco + y * iStride, iStride, xStart, wStep, filterSizeIdx, lastPixel, piHistogram);
+      }
+    }
+#endif
+    for (uint32_t x = xStart; x < uiWidth; x += wStep)
     {
 #if JVET_AJ0203_DIMD_2X2_EDGE_OP
       if (filterSizeIdx == 2 && (direction == 3) && x != 0 && y != 0)
@@ -44297,15 +44426,7 @@ int buildHistogram(const Pel *pReco, int iStride, uint32_t uiHeight, uint32_t ui
         int ratio = static_cast<int>(fRatioScaled);
 #endif
         // get ang_idx
-        int idx = 16;
-        for (int i = 1; i < 17; i++)
-        {
-          if (ratio <= angTable[i])
-          {
-            idx = ratio - angTable[i - 1] < angTable[i] - ratio ? i - 1 : i;
-            break;
-          }
-        }
+        const int idx = gradAngleIdx(ratio, angTable);
 
         iAngUneven = offsets[region] + dirs[region] * idx;
         // iAngUneven = offsets[region - 1] + dirs[region - 1] * idx;
@@ -44322,6 +44443,46 @@ int buildHistogram(const Pel *pReco, int iStride, uint32_t uiHeight, uint32_t ui
     }
   }
   return 0;
+}
+
+int buildHistogram(const Pel *pReco, int iStride, uint32_t uiHeight, uint32_t uiWidth, int *piHistogram, int direction,
+                   int bw, int bh
+#if JVET_AJ0203_DIMD_2X2_EDGE_OP
+                 , const int filterSizeIdx
+#endif
+#if  JVET_AK0217_INTRA_MTSS
+                  , const bool subsampling
+#endif
+)
+{
+#ifdef DIMDHIST_CHECK
+  // reference: the scalar loop alone, from the same histogram
+  int ref[NUM_LUMA_MODE];
+  std::copy(piHistogram, piHistogram + NUM_LUMA_MODE, ref);
+  buildHistogramImpl<false>(pReco, iStride, uiHeight, uiWidth, ref, direction, bw, bh
+#if JVET_AJ0203_DIMD_2X2_EDGE_OP
+                            , filterSizeIdx
+#endif
+#if JVET_AK0217_INTRA_MTSS
+                            , subsampling
+#endif
+  );
+#endif
+  const int res = buildHistogramImpl<true>(pReco, iStride, uiHeight, uiWidth, piHistogram, direction, bw, bh
+#if JVET_AJ0203_DIMD_2X2_EDGE_OP
+                                           , filterSizeIdx
+#endif
+#if JVET_AK0217_INTRA_MTSS
+                                           , subsampling
+#endif
+  );
+#ifdef DIMDHIST_CHECK
+  for (int i = 0; i < NUM_LUMA_MODE; i++)
+  {
+    CHECK(ref[i] != piHistogram[i], "DIMD histogram differs");
+  }
+#endif
+  return res;
 }
 #endif
 
@@ -44511,15 +44672,7 @@ void calcGradForOBMC(const PredictionUnit& pu, const Pel *pReco, const int iStri
           float fRatioScaled = fRatio * (1 << 16);
           int ratio = static_cast<int>(fRatioScaled);
 #endif
-          int idx = 16;
-          for (int i = 1; i < 17; i++)
-          {
-            if (ratio <= angTable[i])
-            {
-              idx = ratio - angTable[i - 1] < angTable[i] - ratio ? i - 1 : i;
-              break;
-            }
-          }
+          const int idx = gradAngleIdx(ratio, angTable);
 
           iAngUneven = offsets[region] + dirs[region] * idx;
         }

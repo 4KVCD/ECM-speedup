@@ -2581,6 +2581,16 @@ void CABACWriter::intra_luma_pred_mode( const PredictionUnit& pu )
     return;
   }
 #endif
+  m_reachedLumaModeMpm = true;
+  if( m_stopBeforeLumaModeMpm )
+  {
+    return;
+  }
+  intra_luma_pred_mode_mpm( pu );
+}
+
+void CABACWriter::intra_luma_pred_mode_mpm( const PredictionUnit& pu )
+{
   // prev_intra_luma_pred_flag
   if ( pu.multiRefIdx )
   {
@@ -11952,7 +11962,43 @@ void CABACWriter::codePredictedSigns( TransformUnit &tu, ComponentID compID )
       signs += signBuff.stride;
       signScanIdx += signScanIdxBuff.stride;
     }
-    stableSortSmall(signCombList.begin(), signCombList.end(), compareOrderIdx);
+    // perf: the scan indices written by DepQuant::getPredictedSigns number these entries 0..n-1, so each entry is
+    // put at its index directly; the stable sort by index (std::stable_sort with a temporary buffer above 32
+    // entries) is kept for any other set of indices
+    {
+      static std::vector<SignCombInfo> placed;
+      static std::vector<uint8_t>      used;
+      const size_t                     n = signCombList.size();
+      placed.assign(n, SignCombInfo(0, 0, false));
+      used.assign(n, 0);
+      bool isPermutation = true;
+      for (const SignCombInfo &c: signCombList)
+      {
+        if (c.idx >= n || used[c.idx])
+        {
+          isPermutation = false;
+          break;
+        }
+        used[c.idx]   = 1;
+        placed[c.idx] = c;
+      }
+      if (isPermutation)
+      {
+#ifdef SIGNSORT_CHECK
+        std::vector<SignCombInfo> ref = signCombList;
+        std::stable_sort(ref.begin(), ref.end(), compareOrderIdx);
+        for (size_t i = 0; i < n; i++)
+        {
+          CHECK(ref[i].idx != placed[i].idx || ref[i].sign != placed[i].sign || ref[i].isSignPred != placed[i].isSignPred, "sign order differs");
+        }
+#endif
+        signCombList.swap(placed);
+      }
+      else
+      {
+        stableSortSmall(signCombList.begin(), signCombList.end(), compareOrderIdx);
+      }
+    }
     int numScanPos = 0;
     for (uint32_t idx = 0; idx < signCombList.size(); idx++)
     {

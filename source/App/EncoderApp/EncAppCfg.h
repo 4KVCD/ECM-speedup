@@ -1338,6 +1338,17 @@ public:
   int                getFrameRate()             const { return m_iFrameRate; }
   const std::string& getBitstreamFileName()     const { return m_bitstreamFileName; }
   const std::string& getReconFileName()         const { return m_reconFileName; }
+  const std::string& getInputFileName()         const { return m_inputFileName; }
+#if JVET_AA0146_WRAP_AROUND_FIX
+  int                getInputFileWidth()        const { return m_sourceWidth - m_sourcePadding[0]; }
+  int                getInputFileHeight()       const { return m_isField ? 0 : m_sourceHeight - m_sourcePadding[1]; }
+#else
+  int                getInputFileWidth()        const { return m_iSourceWidth - m_sourcePadding[0]; }
+  int                getInputFileHeight()       const { return m_isField ? 0 : m_iSourceHeight - m_sourcePadding[1]; }
+#endif
+  // bit depth that sets the sample size of the input file (16-bit samples if either channel type is above 8 bits)
+  int                getInputFileBitDepth()     const { return std::max( m_inputBitDepth[CHANNEL_TYPE_LUMA], m_inputBitDepth[CHANNEL_TYPE_CHROMA] ); }
+  ChromaFormat       getInputChromaFormat()     const { return m_InputChromaFormatIDC; }
 
 };// END CLASS DEFINITION EncAppCfg
 

@@ -738,6 +738,12 @@ namespace DQIntern
     int     m_tabKey = -1;   // channel type, LFNST and inter/intra switch of the current tables
     uint8_t m_tabModels[(sm_maxNumSigSbbCtx + sm_numCtxSetsSig * sm_maxNumSigCtx + 4 * sm_maxNumGtxCtx)
                         * sizeof(BinProbModel_Std)];   // the context models they were computed from (raw bytes)
+    // perf: version stamps (CtxStore::blockStamp) of the context blocks those models were read from, when they all
+    // had one; while the blocks still have the same stamps the models are the same and need no comparison
+    static const int m_maxTabBlocks = 32;
+    unsigned         m_tabBlock[m_maxTabBlocks];
+    uint64_t         m_tabStamp[m_maxTabBlocks];
+    int              m_tabNumBlocks = -1;   // -1: no valid stamps
 #endif
   private:
     const ScanElement *m_scanId2Pos;
@@ -779,6 +785,29 @@ namespace DQIntern
                                      : Ctx::GtxFlag[gtxSet[k] + chType]);
       sizes[4 + k] = numGtx;
     }
+    const CtxStore<BinProbModel_Std> &store = fracBitsAccess.ctxStore;
+    // same key and every block the models are in still has the stamp it had when they were compared: same models
+    if (key == m_tabKey && m_tabNumBlocks >= 0)
+    {
+      bool stampsSame = true;
+      for (int i = 0; i < m_tabNumBlocks && stampsSame; i++)
+      {
+        stampsSame = store.blockStamp(m_tabBlock[i] << CTX_BLOCK_LOG2) == m_tabStamp[i];
+      }
+      if (stampsSame)
+      {
+#ifdef DQSTAMP_CHECK
+        const uint8_t *chk = m_tabModels;
+        for (int i = 0; i < 8; i++)
+        {
+          const size_t bytes = sizes[i] * sizeof(BinProbModel_Std);
+          CHECK(::memcmp(chk, &store[sets[i]->Offset], bytes), "DepQuant rate tables: models changed under equal stamps");
+          chk += bytes;
+        }
+#endif
+        return true;
+      }
+    }
     bool     same  = (key == m_tabKey);
     uint8_t *saved = m_tabModels;
     for (int i = 0; i < 8; i++)
@@ -796,6 +825,24 @@ namespace DQIntern
       saved += bytes;
     }
     m_tabKey = key;
+    // the stamps of the blocks of the models just compared or saved (none valid if a block was written since its stamp)
+    m_tabNumBlocks = 0;
+    for (int i = 0; i < 8 && m_tabNumBlocks >= 0; i++)
+    {
+      const unsigned first = sets[i]->Offset >> CTX_BLOCK_LOG2;
+      const unsigned last  = (sets[i]->Offset + sizes[i] - 1) >> CTX_BLOCK_LOG2;
+      for (unsigned b = first; b <= last; b++)
+      {
+        const uint64_t stamp = store.blockStamp(b << CTX_BLOCK_LOG2);
+        if (stamp == 0 || m_tabNumBlocks == m_maxTabBlocks)
+        {
+          m_tabNumBlocks = -1;
+          break;
+        }
+        m_tabBlock[m_tabNumBlocks]   = b;
+        m_tabStamp[m_tabNumBlocks++] = stamp;
+      }
+    }
     return same;
   }
 #endif
@@ -3652,6 +3699,33 @@ void DepQuant::quant(TransformUnit &tu, const ComponentID &compID, const CCoeffB
 
 #if SIGN_PREDICTION
 #if JVET_Y0141_SIGN_PRED_IMPROVE
+// perf: the order of the stable sort by level, descending, for more than 32 entries: std::sort of unique
+// (level, index) keys instead of std::stable_sort and its temporary buffer. The levels are positive (at least
+// 2 |level| - 1). Not inlined, so that the 16 KB of buffers stay out of the caller's stack frame.
+static NO_INLINE void sortByLevelDescending(static_vector<PositionWithLevel, 32 * 32> &list)
+{
+  const int         n = (int) list.size();
+  uint64_t          key[32 * 32];
+  PositionWithLevel src[32 * 32];
+  for (int i = 0; i < n; i++)
+  {
+    key[i] = ((uint64_t) (0xffffffffu - (uint32_t) list[i].level) << 32) | (uint32_t) i;
+    src[i] = list[i];
+  }
+  std::sort(key, key + n);
+  for (int i = 0; i < n; i++)
+  {
+    list[i] = src[(uint32_t) key[i]];
+  }
+#ifdef SIGNSORT_CHECK
+  std::stable_sort(src, src + n, [](const PositionWithLevel &a, const PositionWithLevel &b) { return a.level > b.level; });
+  for (int i = 0; i < n; i++)
+  {
+    CHECK(src[i].x != list[i].x || src[i].y != list[i].y || src[i].level != list[i].level, "sign position order differs");
+  }
+#endif
+}
+
 void DepQuant::getPredictedSigns(TransformUnit &tu, const ComponentID compID,
                                  static_vector<Position, SIGN_PRED_MAX_NUM> &predSignsXY, uint8_t *signBuf,
                                  bool isDecoder)
@@ -3755,8 +3829,15 @@ void DepQuant::getPredictedSigns(TransformUnit &tu, const ComponentID compID,
       }
       state = int((stateTransTab >> (4 * (2 * state + (level & 1)))) & 15);
     }
-    stableSortSmall(predSignsXYLevel.begin(), predSignsXYLevel.end(),
-                    [](const PositionWithLevel &a, const PositionWithLevel &b) { return a.level > b.level; });
+    if (predSignsXYLevel.size() <= 32)
+    {
+      stableSortSmall(predSignsXYLevel.begin(), predSignsXYLevel.end(),
+                      [](const PositionWithLevel &a, const PositionWithLevel &b) { return a.level > b.level; });
+    }
+    else
+    {
+      sortByLevelDescending(predSignsXYLevel);
+    }
 
     IdxBuf bufSignsScanIdx = tu.getCoeffSignsScanIdx(compID);
 

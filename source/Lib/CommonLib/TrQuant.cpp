@@ -50,7 +50,7 @@
 #include <limits>
 #include <memory.h>
 #include <mutex>
-#if defined( __SSE2__ )
+#if ENABLE_SIMD_OPT && defined( __SSE2__ )
 #include <emmintrin.h>
 #endif
 
@@ -3718,7 +3718,7 @@ void TrQuant::predCoeffSigns(TransformUnit &tu, const ComponentID compID, const 
     else
     {
       uint32_t i = first;
-#if defined( __SSE2__ )
+#if ENABLE_SIMD_OPT && defined( __SSE2__ )   // 16-bit Pel
       // perf: 8 samples per step, same results: the update wraps to 16 bits like the store to Pel, and
       // max - min of two int16 is the exact |difference| as an unsigned 16-bit value
       const __m128i vScale = _mm_set1_epi16( scale );

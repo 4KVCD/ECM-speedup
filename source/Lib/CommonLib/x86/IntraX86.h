@@ -3057,7 +3057,6 @@ bool xPredIntraOpt_SIMD(PelBuf &pDst, const PredictionUnit &pu, const uint32_t m
 #if JVET_AK0061_PDP_MPM && USE_AVX2
   if (vext >= AVX2 && refLen >= 16) 
   {
-    __m256i vmat[4], vcoef[4], vsrc;
     const __m128i offset128 = _mm_set1_epi32(addShift);
 #if JVET_AJ0237_INTERNAL_12BIT
     const __m128i max128 = _mm_set1_epi32((1 << clpRng.bd) - 1);
@@ -3065,9 +3064,12 @@ bool xPredIntraOpt_SIMD(PelBuf &pDst, const PredictionUnit &pu, const uint32_t m
     const __m128i max = _mm_set1_epi32(1023);
 #endif
     const __m128i zeros128 = _mm_setzero_si128();
-    __m128i vmat128[4], vcoef128[4], vsrc128;
     __m128i result;
+#ifdef PDPOPT_CHECK
+    __m256i vmat[4], vcoef[4], vsrc;
+    __m128i vmat128[4], vcoef128[4], vsrc128;
     const int length = (refLen >> 4) << 4;
+#endif
 #if JVET_AN0093_JRGPM_WITH_AFFINE_AND_INTRA
     for (int y = startY; y < pDst.height; y += offsetY, pred += strideOffset)
 #else
@@ -3081,7 +3083,28 @@ bool xPredIntraOpt_SIMD(PelBuf &pDst, const PredictionUnit &pu, const uint32_t m
 #endif
       {
         const int16_t* f0 = filter[y >> yShift][(x >> xShift) >> 2];
-        
+        // perf: the coefficients of a chunk of 8 reference samples are stored output by output (4 x 8), so one
+        // 256-bit load holds two outputs' coefficients: the chunk's samples are broadcast to both halves and
+        // multiplied with them, with no 128-bit loads and inserts. The int32 sums are the same as below (integer
+        // additions in another order).
+        {
+          const int16_t* f   = f0;
+          __m256i        a01 = _mm256_setzero_si256();   // outputs 0 | 1
+          __m256i        a23 = _mm256_setzero_si256();   // outputs 2 | 3
+          for (int k = 0; k < refLen; k += 8, f += 32)
+          {
+            const __m256i s = _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i*) &ref[k]));
+            a01             = _mm256_add_epi32(a01, _mm256_madd_epi16(s, _mm256_loadu_si256((const __m256i*) f)));
+            a23             = _mm256_add_epi32(a23, _mm256_madd_epi16(s, _mm256_loadu_si256((const __m256i*) (f + 16))));
+          }
+          // per 128-bit lane: (o0, o2, o0, o2) and (o1, o3, o1, o3)
+          const __m256i h = _mm256_hadd_epi32(a01, a23);
+          const __m256i q = _mm256_hadd_epi32(h, h);
+          result          = _mm_unpacklo_epi32(_mm256_castsi256_si128(q), _mm256_extracti128_si256(q, 1));
+        }
+#ifdef PDPOPT_CHECK
+        // the former two-chunk loop and the 8-sample remainder must give the same sums
+        const __m128i fast = result;
         vcoef[0] = _mm256_setzero_si256();
         vcoef[1] = _mm256_setzero_si256();
         vcoef[2] = _mm256_setzero_si256();
@@ -3137,6 +3160,12 @@ bool xPredIntraOpt_SIMD(PelBuf &pDst, const PredictionUnit &pu, const uint32_t m
           vcoef128[0] = _mm_hadd_epi32(vcoef128[0], vcoef128[2]);
           result = _mm_add_epi32(result, vcoef128[0]);
         }
+        if (_mm_movemask_epi8(_mm_cmpeq_epi32(result, fast)) != 0xffff)
+        {
+          fprintf(stderr, "PDPOPT_CHECK mismatch\n");
+          abort();
+        }
+#endif
         result = _mm_srai_epi32(_mm_add_epi32(result, offset128), 14);
         result = _mm_min_epi32(result, max128);
         result = _mm_max_epi32(result, zeros128);

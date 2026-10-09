@@ -64,6 +64,12 @@ struct SegmentParallelCfg
   bool        pocOffsetChunks   = false;   // disjoint chunks started at their own POC, joined by concatenation
   std::string bitstreamFile;
   std::string reconFile;
+  // input file, read to estimate the encoding cost of each chunk (raw YUV only; otherwise chunks run in order)
+  std::string inputFile;
+  int         inputWidth        = 0;
+  int         inputHeight       = 0;
+  int         inputBitDepth     = 8;
+  int         inputChromaFormat = 1;   // ChromaFormat of the file
 };
 
 // returns true if the configuration can be split into independently coded chunks; reason gets why not

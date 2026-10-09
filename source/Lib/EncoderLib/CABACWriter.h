@@ -164,6 +164,11 @@ public:
   void        extend_ref_line           (const CodingUnit&              cu );
   void        intra_luma_pred_modes     ( const CodingUnit&             cu );
   void        intra_luma_pred_mode      ( const PredictionUnit&         pu );
+  // the MPM / remaining mode part of intra_luma_pred_mode (after the luma mode flags)
+  void        intra_luma_pred_mode_mpm  ( const PredictionUnit&         pu );
+  // intra_luma_pred_mode stops before its MPM part (the flags only) when set; reachedLumaModeMpm() tells if it got there
+  void        setStopBeforeLumaModeMpm  ( bool b )                          { m_stopBeforeLumaModeMpm = b; m_reachedLumaModeMpm = false; }
+  bool        reachedLumaModeMpm        () const                            { return m_reachedLumaModeMpm; }
 #if JVET_AJ0249_NEURAL_NETWORK_BASED
   void cu_pnn_flag(const CodingUnit& cu);
 #endif
@@ -580,6 +585,8 @@ private:
 #endif  
 private:
   BinEncIf&         m_BinEncoder;
+  bool              m_stopBeforeLumaModeMpm = false;
+  bool              m_reachedLumaModeMpm    = false;
   OutputBitstream*  m_Bitstream;
   Ctx               m_TestCtx;
   EncCu*            m_EncCu;

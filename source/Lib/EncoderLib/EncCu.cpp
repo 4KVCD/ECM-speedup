@@ -9409,7 +9409,7 @@ void EncCu::xCheckRDCostMerge2Nx2N( CodingStructure *&tempCS, CodingStructure *&
 #endif
       DistParam distParam;
       const bool bUseHadamard = !tempCS->slice->getDisableSATDForRD();
-      m_pcRdCost->setDistParam (distParam, tempCS->getOrgBuf().Y(), m_acMergeBuffer[0].Y(), sps.getBitDepth (CHANNEL_TYPE_LUMA), COMPONENT_Y, bUseHadamard);
+      m_pcRdCost->setDistParam (distParam, tempCS->getOrgBuf(COMPONENT_Y), m_acMergeBuffer[0].Y(), sps.getBitDepth (CHANNEL_TYPE_LUMA), COMPONENT_Y, bUseHadamard);
 
 #if MERGE_ENC_OPT
       xCheckSATDCostRegularMerge(tempCS, cu, pu, mergeCtx, acMergeTempBuffer, singleMergeTempBuffer, acMergeTmpBuffer
@@ -12061,11 +12061,11 @@ void EncCu::xCheckRDCostMergeGeoComb2Nx2N(CodingStructure *&tempCS, CodingStruct
 
   const UnitArea localUnitArea(tempCS->area.chromaFormat, Area(0, 0, tempCS->area.Y().width, tempCS->area.Y().height));
   DistParam distParamWholeBlk;
-  m_pcRdCost->setDistParam(distParamWholeBlk, tempCS->getOrgBuf().Y(), m_acMergeBuffer[0].Y().buf, m_acMergeBuffer[0].Y().stride, sps.getBitDepth(CHANNEL_TYPE_LUMA), COMPONENT_Y);
+  m_pcRdCost->setDistParam(distParamWholeBlk, tempCS->getOrgBuf(COMPONENT_Y), m_acMergeBuffer[0].Y().buf, m_acMergeBuffer[0].Y().stride, sps.getBitDepth(CHANNEL_TYPE_LUMA), COMPONENT_Y);
 #if JVET_AG0112_REGRESSION_BASED_GPM_BLENDING
   const bool bUseHadamard = !tempCS->slice->getDisableSATDForRD();
   DistParam distParamWholeBlkGeoBlend;
-  m_pcRdCost->setDistParam(distParamWholeBlkGeoBlend, tempCS->getOrgBuf().Y(), m_acMergeBuffer[0].Y().buf, m_acMergeBuffer[0].Y().stride, sps.getBitDepth(CHANNEL_TYPE_LUMA), COMPONENT_Y, 0, 1, bUseHadamard);
+  m_pcRdCost->setDistParam(distParamWholeBlkGeoBlend, tempCS->getOrgBuf(COMPONENT_Y), m_acMergeBuffer[0].Y().buf, m_acMergeBuffer[0].Y().stride, sps.getBitDepth(CHANNEL_TYPE_LUMA), COMPONENT_Y, 0, 1, bUseHadamard);
 #endif
 #if JVET_AG0164_AFFINE_GPM
   Distortion sadWholeBlk[GEO_MAX_ALL_INTER_UNI_CANDS], sadMMVDWholeBlk[GEO_MAX_ALL_INTER_UNI_CANDS][GPM_EXT_MMVD_MAX_REFINE_NUM];
@@ -12864,14 +12864,14 @@ void EncCu::xCheckRDCostMergeGeoComb2Nx2N(CodingStructure *&tempCS, CodingStruct
 #if JVET_AK0212_GPM_OBMC_MODIFICATION
         if (!useSepObmc)
         {
-          m_pcRdCost->setDistParam(distParam, tempCS->getOrgBuf().Y(), geoTempBuf[mergeCand].Y().buf, geoTempBuf[mergeCand].Y().stride, sadMask, maskStride, stepX, maskStride2, sps.getBitDepth(CHANNEL_TYPE_LUMA), COMPONENT_Y);
+          m_pcRdCost->setDistParam(distParam, tempCS->getOrgBuf(COMPONENT_Y), geoTempBuf[mergeCand].Y().buf, geoTempBuf[mergeCand].Y().stride, sadMask, maskStride, stepX, maskStride2, sps.getBitDepth(CHANNEL_TYPE_LUMA), COMPONENT_Y);
         }
         else
         {
-          m_pcRdCost->setDistParam(distParam, tempCS->getOrgBuf().Y(), geoBuffer[mergeCand].Y().buf, geoBuffer[mergeCand].Y().stride, sadMask, maskStride, stepX, maskStride2, sps.getBitDepth(CHANNEL_TYPE_LUMA), COMPONENT_Y);
+          m_pcRdCost->setDistParam(distParam, tempCS->getOrgBuf(COMPONENT_Y), geoBuffer[mergeCand].Y().buf, geoBuffer[mergeCand].Y().stride, sadMask, maskStride, stepX, maskStride2, sps.getBitDepth(CHANNEL_TYPE_LUMA), COMPONENT_Y);
         }
 #else
-      m_pcRdCost->setDistParam(distParam, tempCS->getOrgBuf().Y(), geoTempBuf[mergeCand].Y().buf, geoTempBuf[mergeCand].Y().stride, sadMask, maskStride, stepX, maskStride2, sps.getBitDepth(CHANNEL_TYPE_LUMA), COMPONENT_Y);
+      m_pcRdCost->setDistParam(distParam, tempCS->getOrgBuf(COMPONENT_Y), geoTempBuf[mergeCand].Y().buf, geoTempBuf[mergeCand].Y().stride, sadMask, maskStride, stepX, maskStride2, sps.getBitDepth(CHANNEL_TYPE_LUMA), COMPONENT_Y);
 #endif
       sadLarge = distParam.distFunc(distParam);
 
@@ -12950,7 +12950,7 @@ void EncCu::xCheckRDCostMergeGeoComb2Nx2N(CodingStructure *&tempCS, CodingStruct
         int rdobuffer = intraRDOBufIdx[geoIntraMPMList[splitDir][0][intraIdx]];
 #endif
 #endif
-        m_pcRdCost->setDistParam(distParam, tempCS->getOrgBuf().Y(), geoIntraTempBuf[rdobuffer].Y().buf, geoIntraTempBuf[rdobuffer].Y().stride, sadMask, maskStride, stepX, maskStride2, sps.getBitDepth(CHANNEL_TYPE_LUMA), COMPONENT_Y);
+        m_pcRdCost->setDistParam(distParam, tempCS->getOrgBuf(COMPONENT_Y), geoIntraTempBuf[rdobuffer].Y().buf, geoIntraTempBuf[rdobuffer].Y().stride, sadMask, maskStride, stepX, maskStride2, sps.getBitDepth(CHANNEL_TYPE_LUMA), COMPONENT_Y);
         sadLarge = distParam.distFunc(distParam);
         tempCost = (double)sadLarge + geoIntraIdxCost[intraIdx] + geoIntraFlag0Cost[1] + geoMMVDFlagCost[0];
 #if JVET_AG0164_AFFINE_GPM
@@ -12979,7 +12979,7 @@ void EncCu::xCheckRDCostMergeGeoComb2Nx2N(CodingStructure *&tempCS, CodingStruct
 #else
           rdobuffer = intraRDOBufIdx[geoIntraMPMList[splitDir][1][intraIdx]];
 #endif
-          m_pcRdCost->setDistParam(distParam, tempCS->getOrgBuf().Y(), geoIntraTempBuf[rdobuffer].Y().buf, geoIntraTempBuf[rdobuffer].Y().stride, sadMask, maskStride, stepX, maskStride2, sps.getBitDepth(CHANNEL_TYPE_LUMA), COMPONENT_Y);
+          m_pcRdCost->setDistParam(distParam, tempCS->getOrgBuf(COMPONENT_Y), geoIntraTempBuf[rdobuffer].Y().buf, geoIntraTempBuf[rdobuffer].Y().stride, sadMask, maskStride, stepX, maskStride2, sps.getBitDepth(CHANNEL_TYPE_LUMA), COMPONENT_Y);
           sadLarge = distParam.distFunc(distParam);
         }
         sadSmall = sadIntraWholeBlk[rdobuffer] - sadLarge;
@@ -13139,7 +13139,7 @@ void EncCu::xCheckRDCostMergeGeoComb2Nx2N(CodingStructure *&tempCS, CodingStruct
 
   DistParam distParamSAD2;
   const bool useHadamard = !tempCS->slice->getDisableSATDForRD();
-  m_pcRdCost->setDistParam(distParamSAD2, tempCS->getOrgBuf().Y(), m_acMergeBuffer[0].Y(), sps.getBitDepth(CHANNEL_TYPE_LUMA), COMPONENT_Y, useHadamard);
+  m_pcRdCost->setDistParam(distParamSAD2, tempCS->getOrgBuf(COMPONENT_Y), m_acMergeBuffer[0].Y(), sps.getBitDepth(CHANNEL_TYPE_LUMA), COMPONENT_Y, useHadamard);
 
   int numberGeoCandChecked = (int)geoSADCostList.size();
   int geoNumMrgSATDCand = min(GEO_MAX_TRY_WEIGHTED_SATD, numberGeoCandChecked);
@@ -13613,6 +13613,7 @@ void EncCu::xCheckRDCostMergeGeoComb2Nx2N(CodingStructure *&tempCS, CodingStruct
         pu.gpmIntraFlag = false;
       }
     }
+    m_pcInterSearch->prepareGpmPartTplCostRows(0);
     m_pcIntraSearch->deriveSgpmInterModeEncOrdered(mergeCtx[GEO_TM_OFF],
       bestCS->picture->getRecoBuf(area), area, cu, sgpmInterInfoList, sgpmInterCostList, m_pcInterSearch
       , sgpmInterIntraInfoList, sgpmInterIntraCostList
@@ -16348,14 +16349,14 @@ void EncCu::xCheckRDCostMergeGeoComb2Nx2N(CodingStructure *&tempCS, CodingStruct
 #if JVET_AK0212_GPM_OBMC_MODIFICATION
           if (!useSepObmc)
           {
-            m_pcRdCost->setDistParam(distParam, tempCS->getOrgBuf().Y(), geoMMVDTempBuf[mergeCand][mmvdCand].Y().buf, geoMMVDTempBuf[mergeCand][mmvdCand].Y().stride, sadMask, maskStride, stepX, maskStride2, sps.getBitDepth(CHANNEL_TYPE_LUMA), COMPONENT_Y);
+            m_pcRdCost->setDistParam(distParam, tempCS->getOrgBuf(COMPONENT_Y), geoMMVDTempBuf[mergeCand][mmvdCand].Y().buf, geoMMVDTempBuf[mergeCand][mmvdCand].Y().stride, sadMask, maskStride, stepX, maskStride2, sps.getBitDepth(CHANNEL_TYPE_LUMA), COMPONENT_Y);
           }
           else
           {
-          m_pcRdCost->setDistParam(distParam, tempCS->getOrgBuf().Y(), geoMMVDBuf[mergeCand][mmvdCand].Y().buf, geoMMVDBuf[mergeCand][mmvdCand].Y().stride, sadMask, maskStride, stepX, maskStride2, sps.getBitDepth(CHANNEL_TYPE_LUMA), COMPONENT_Y);
+          m_pcRdCost->setDistParam(distParam, tempCS->getOrgBuf(COMPONENT_Y), geoMMVDBuf[mergeCand][mmvdCand].Y().buf, geoMMVDBuf[mergeCand][mmvdCand].Y().stride, sadMask, maskStride, stepX, maskStride2, sps.getBitDepth(CHANNEL_TYPE_LUMA), COMPONENT_Y);
           }
 #else
-          m_pcRdCost->setDistParam(distParam, tempCS->getOrgBuf().Y(), geoMMVDTempBuf[mergeCand][mmvdCand].Y().buf, geoMMVDTempBuf[mergeCand][mmvdCand].Y().stride, sadMask, maskStride, stepX, maskStride2, sps.getBitDepth(CHANNEL_TYPE_LUMA), COMPONENT_Y);
+          m_pcRdCost->setDistParam(distParam, tempCS->getOrgBuf(COMPONENT_Y), geoMMVDTempBuf[mergeCand][mmvdCand].Y().buf, geoMMVDTempBuf[mergeCand][mmvdCand].Y().stride, sadMask, maskStride, stepX, maskStride2, sps.getBitDepth(CHANNEL_TYPE_LUMA), COMPONENT_Y);
 #endif
           sadLarge = distParam.distFunc(distParam);
 #if JVET_AG0164_AFFINE_GPM
@@ -16836,14 +16837,14 @@ void EncCu::xCheckRDCostMergeGeoComb2Nx2N(CodingStructure *&tempCS, CodingStruct
 #if JVET_AK0212_GPM_OBMC_MODIFICATION
           if (!useSepObmc)
           {
-            m_pcRdCost->setDistParam(distParam, tempCS->getOrgBuf().Y(), geoTmTempBuf[mergeCand0].Y().buf, geoTmTempBuf[mergeCand0].Y().stride, sadMask, maskStride, stepX, maskStride2, sps.getBitDepth(CHANNEL_TYPE_LUMA), COMPONENT_Y);
+            m_pcRdCost->setDistParam(distParam, tempCS->getOrgBuf(COMPONENT_Y), geoTmTempBuf[mergeCand0].Y().buf, geoTmTempBuf[mergeCand0].Y().stride, sadMask, maskStride, stepX, maskStride2, sps.getBitDepth(CHANNEL_TYPE_LUMA), COMPONENT_Y);
           }
           else
           {
-            m_pcRdCost->setDistParam(distParam, tempCS->getOrgBuf().Y(), geoTmBuffer[mergeCand0].Y().buf, geoTmBuffer[mergeCand0].Y().stride, sadMask, maskStride, stepX, maskStride2, sps.getBitDepth(CHANNEL_TYPE_LUMA), COMPONENT_Y);
+            m_pcRdCost->setDistParam(distParam, tempCS->getOrgBuf(COMPONENT_Y), geoTmBuffer[mergeCand0].Y().buf, geoTmBuffer[mergeCand0].Y().stride, sadMask, maskStride, stepX, maskStride2, sps.getBitDepth(CHANNEL_TYPE_LUMA), COMPONENT_Y);
           }
 #else
-          m_pcRdCost->setDistParam(distParam, tempCS->getOrgBuf().Y(), geoTmTempBuf[mergeCand0].Y().buf, geoTmTempBuf[mergeCand0].Y().stride, sadMask, maskStride, stepX, maskStride2, sps.getBitDepth(CHANNEL_TYPE_LUMA), COMPONENT_Y);
+          m_pcRdCost->setDistParam(distParam, tempCS->getOrgBuf(COMPONENT_Y), geoTmTempBuf[mergeCand0].Y().buf, geoTmTempBuf[mergeCand0].Y().stride, sadMask, maskStride, stepX, maskStride2, sps.getBitDepth(CHANNEL_TYPE_LUMA), COMPONENT_Y);
 #endif
           sadLarge = distParam.distFunc(distParam);
           double tempCost = (double)sadLarge + geoMergeIdxCost[mergeCand] + geoMMVDFlagCost[0];
@@ -16857,14 +16858,14 @@ void EncCu::xCheckRDCostMergeGeoComb2Nx2N(CodingStructure *&tempCS, CodingStruct
 #if JVET_AK0212_GPM_OBMC_MODIFICATION
           if (!useSepObmc)
           {
-            m_pcRdCost->setDistParam(distParam, tempCS->getOrgBuf().Y(), geoTmTempBuf[mergeCand1].Y().buf, geoTmTempBuf[mergeCand1].Y().stride, sadMask, maskStride, stepX, maskStride2, sps.getBitDepth(CHANNEL_TYPE_LUMA), COMPONENT_Y);
+            m_pcRdCost->setDistParam(distParam, tempCS->getOrgBuf(COMPONENT_Y), geoTmTempBuf[mergeCand1].Y().buf, geoTmTempBuf[mergeCand1].Y().stride, sadMask, maskStride, stepX, maskStride2, sps.getBitDepth(CHANNEL_TYPE_LUMA), COMPONENT_Y);
           }
           else
           {
-            m_pcRdCost->setDistParam(distParam, tempCS->getOrgBuf().Y(), geoTmBuffer[mergeCand1].Y().buf, geoTmBuffer[mergeCand1].Y().stride, sadMask, maskStride, stepX, maskStride2, sps.getBitDepth(CHANNEL_TYPE_LUMA), COMPONENT_Y);
+            m_pcRdCost->setDistParam(distParam, tempCS->getOrgBuf(COMPONENT_Y), geoTmBuffer[mergeCand1].Y().buf, geoTmBuffer[mergeCand1].Y().stride, sadMask, maskStride, stepX, maskStride2, sps.getBitDepth(CHANNEL_TYPE_LUMA), COMPONENT_Y);
           }
 #else
-          m_pcRdCost->setDistParam(distParam, tempCS->getOrgBuf().Y(), geoTmTempBuf[mergeCand1].Y().buf, geoTmTempBuf[mergeCand1].Y().stride, sadMask, maskStride, stepX, maskStride2, sps.getBitDepth(CHANNEL_TYPE_LUMA), COMPONENT_Y);
+          m_pcRdCost->setDistParam(distParam, tempCS->getOrgBuf(COMPONENT_Y), geoTmTempBuf[mergeCand1].Y().buf, geoTmTempBuf[mergeCand1].Y().stride, sadMask, maskStride, stepX, maskStride2, sps.getBitDepth(CHANNEL_TYPE_LUMA), COMPONENT_Y);
 #endif
           sadSmall = sadTmWholeBlk[mergeCand1] - distParam.distFunc(distParam);
           tempCost = (double)sadSmall + geoMergeIdxCost[mergeCand] + geoMMVDFlagCost[0];
@@ -16881,14 +16882,14 @@ void EncCu::xCheckRDCostMergeGeoComb2Nx2N(CodingStructure *&tempCS, CodingStruct
 #if JVET_AK0212_GPM_OBMC_MODIFICATION
             if (!useSepObmc)
             {
-              m_pcRdCost->setDistParam(distParam, tempCS->getOrgBuf().Y(), geoTmTempBuf[mergeCand0].Y().buf, geoTmTempBuf[mergeCand0].Y().stride, sadMask, maskStride, stepX, maskStride2, sps.getBitDepth(CHANNEL_TYPE_LUMA), COMPONENT_Y);
+              m_pcRdCost->setDistParam(distParam, tempCS->getOrgBuf(COMPONENT_Y), geoTmTempBuf[mergeCand0].Y().buf, geoTmTempBuf[mergeCand0].Y().stride, sadMask, maskStride, stepX, maskStride2, sps.getBitDepth(CHANNEL_TYPE_LUMA), COMPONENT_Y);
             }
             else
             {
-              m_pcRdCost->setDistParam(distParam, tempCS->getOrgBuf().Y(), geoTmBuffer[mergeCand0].Y().buf, geoTmBuffer[mergeCand0].Y().stride, sadMask, maskStride, stepX, maskStride2, sps.getBitDepth(CHANNEL_TYPE_LUMA), COMPONENT_Y);
+              m_pcRdCost->setDistParam(distParam, tempCS->getOrgBuf(COMPONENT_Y), geoTmBuffer[mergeCand0].Y().buf, geoTmBuffer[mergeCand0].Y().stride, sadMask, maskStride, stepX, maskStride2, sps.getBitDepth(CHANNEL_TYPE_LUMA), COMPONENT_Y);
             }
 #else
-            m_pcRdCost->setDistParam(distParam, tempCS->getOrgBuf().Y(), geoTmTempBuf[mergeCand0].Y().buf, geoTmTempBuf[mergeCand0].Y().stride, sadMask, maskStride, stepX, maskStride2, sps.getBitDepth(CHANNEL_TYPE_LUMA), COMPONENT_Y);
+            m_pcRdCost->setDistParam(distParam, tempCS->getOrgBuf(COMPONENT_Y), geoTmTempBuf[mergeCand0].Y().buf, geoTmTempBuf[mergeCand0].Y().stride, sadMask, maskStride, stepX, maskStride2, sps.getBitDepth(CHANNEL_TYPE_LUMA), COMPONENT_Y);
 #endif
             sadLarge = distParam.distFunc(distParam);
             double tempCost = (double)sadLarge + geoAffTmMergeIdxCost[mergeCand - maxNumTmMrgCand] + geoMMVDFlagCost[0];
@@ -21643,7 +21644,7 @@ void EncCu::xCheckRDCostMergeGeo2Nx2N(CodingStructure *&tempCS, CodingStructure 
   const double sqrtLambdaForFirstPass = m_pcRdCost->getMotionLambda();
   uint8_t maxNumMergeCandidates = cu.cs->sps->getMaxNumGeoCand();
   DistParam distParamWholeBlk;
-  m_pcRdCost->setDistParam(distParamWholeBlk, tempCS->getOrgBuf().Y(), m_acMergeBuffer[0].Y().buf, m_acMergeBuffer[0].Y().stride, sps.getBitDepth(CHANNEL_TYPE_LUMA), COMPONENT_Y);
+  m_pcRdCost->setDistParam(distParamWholeBlk, tempCS->getOrgBuf(COMPONENT_Y), m_acMergeBuffer[0].Y().buf, m_acMergeBuffer[0].Y().stride, sps.getBitDepth(CHANNEL_TYPE_LUMA), COMPONENT_Y);
   Distortion bestWholeBlkSad = MAX_UINT64;
   double bestWholeBlkCost = MAX_DOUBLE;
 
@@ -21742,7 +21743,7 @@ void EncCu::xCheckRDCostMergeGeo2Nx2N(CodingStructure *&tempCS, CodingStructure 
     {
       int bitsCand = mergeCand + 1;
 
-      m_pcRdCost->setDistParam(distParam, tempCS->getOrgBuf().Y(), geoTempBuf[mergeCand].Y().buf, geoTempBuf[mergeCand].Y().stride, sadMask, maskStride, stepX, maskStride2, sps.getBitDepth(CHANNEL_TYPE_LUMA), COMPONENT_Y);
+      m_pcRdCost->setDistParam(distParam, tempCS->getOrgBuf(COMPONENT_Y), geoTempBuf[mergeCand].Y().buf, geoTempBuf[mergeCand].Y().stride, sadMask, maskStride, stepX, maskStride2, sps.getBitDepth(CHANNEL_TYPE_LUMA), COMPONENT_Y);
       sadLarge = distParam.distFunc(distParam);
       m_GeoCostList.insert(splitDir, 0, mergeCand, (double)sadLarge + (double)bitsCand * sqrtLambdaForFirstPass);
       sadSmall = sadWholeBlk[mergeCand] - sadLarge;
@@ -21813,7 +21814,7 @@ void EncCu::xCheckRDCostMergeGeo2Nx2N(CodingStructure *&tempCS, CodingStructure 
 
   DistParam distParamSAD2;
   const bool useHadamard = !tempCS->slice->getDisableSATDForRD();
-  m_pcRdCost->setDistParam(distParamSAD2, tempCS->getOrgBuf().Y(), m_acMergeBuffer[0].Y(), sps.getBitDepth(CHANNEL_TYPE_LUMA), COMPONENT_Y, useHadamard);
+  m_pcRdCost->setDistParam(distParamSAD2, tempCS->getOrgBuf(COMPONENT_Y), m_acMergeBuffer[0].Y(), sps.getBitDepth(CHANNEL_TYPE_LUMA), COMPONENT_Y, useHadamard);
   int geoNumMrgSATDCand = min(GEO_MAX_TRY_WEIGHTED_SATD, geoNumCobo);
 
   for (uint8_t candidateIdx = 0; candidateIdx < min(geoNumCobo, GEO_MAX_TRY_WEIGHTED_SAD); candidateIdx++)
@@ -23892,7 +23893,7 @@ void EncCu::xCheckSATDCostGeoMerge(CodingStructure *&tempCS, CodingUnit &cu, Pre
 
   uint8_t maxNumMergeCandidates = cu.cs->sps->getMaxNumGeoCand();
   DistParam distParamWholeBlk;
-  m_pcRdCost->setDistParam(distParamWholeBlk, tempCS->getOrgBuf().Y(), m_acMergeBuffer[0].Y().buf, m_acMergeBuffer[0].Y().stride, sps.getBitDepth(CHANNEL_TYPE_LUMA), COMPONENT_Y);
+  m_pcRdCost->setDistParam(distParamWholeBlk, tempCS->getOrgBuf(COMPONENT_Y), m_acMergeBuffer[0].Y().buf, m_acMergeBuffer[0].Y().stride, sps.getBitDepth(CHANNEL_TYPE_LUMA), COMPONENT_Y);
   Distortion bestWholeBlkSad = MAX_UINT64;
   double bestWholeBlkCost = MAX_DOUBLE;
 
@@ -24007,7 +24008,7 @@ void EncCu::xCheckSATDCostGeoMerge(CodingStructure *&tempCS, CodingUnit &cu, Pre
       {
         int bitsCand = mergeCand + 1;
 
-        m_pcRdCost->setDistParam(distParamGeo, tempCS->getOrgBuf().Y(), geoTempBuf[mergeCand].Y().buf, geoTempBuf[mergeCand].Y().stride, sadMask, maskStride, stepX, maskStride2, sps.getBitDepth(CHANNEL_TYPE_LUMA), COMPONENT_Y);
+        m_pcRdCost->setDistParam(distParamGeo, tempCS->getOrgBuf(COMPONENT_Y), geoTempBuf[mergeCand].Y().buf, geoTempBuf[mergeCand].Y().stride, sadMask, maskStride, stepX, maskStride2, sps.getBitDepth(CHANNEL_TYPE_LUMA), COMPONENT_Y);
         sadLarge = distParamGeo.distFunc(distParamGeo);
         m_GeoCostList.insert(splitDir, 0, mergeCand, (double)sadLarge + (double)bitsCand * sqrtLambdaForFirstPass);
         sadSmall = sadWholeBlk[mergeCand] - sadLarge;
@@ -24230,7 +24231,7 @@ void EncCu::xCheckRDCostAffineMerge2Nx2N( CodingStructure *&tempCS, CodingStruct
 
       DistParam distParam;
       const bool bUseHadamard = !tempCS->slice->getDisableSATDForRD();
-      m_pcRdCost->setDistParam( distParam, tempCS->getOrgBuf().Y(), m_acMergeBuffer[0].Y(), sps.getBitDepth( CHANNEL_TYPE_LUMA ), COMPONENT_Y, bUseHadamard );
+      m_pcRdCost->setDistParam( distParam, tempCS->getOrgBuf(COMPONENT_Y), m_acMergeBuffer[0].Y(), sps.getBitDepth( CHANNEL_TYPE_LUMA ), COMPONENT_Y, bUseHadamard );
 
       const UnitArea localUnitArea( tempCS->area.chromaFormat, Area( 0, 0, tempCS->area.Y().width, tempCS->area.Y().height ) );
 #if MULTI_HYP_PRED
@@ -24593,7 +24594,7 @@ void EncCu::xCheckRDCostAffineMmvd2Nx2N(CodingStructure *&tempCS, CodingStructur
 #endif
       DistParam distParam;
       const bool bUseHadamard = !tempCS->slice->getDisableSATDForRD();
-      m_pcRdCost->setDistParam(distParam, tempCS->getOrgBuf().Y(), m_acMergeBuffer[0].Y(), sps.getBitDepth(CHANNEL_TYPE_LUMA), COMPONENT_Y, bUseHadamard);
+      m_pcRdCost->setDistParam(distParam, tempCS->getOrgBuf(COMPONENT_Y), m_acMergeBuffer[0].Y(), sps.getBitDepth(CHANNEL_TYPE_LUMA), COMPONENT_Y, bUseHadamard);
 
       {
         for (uint32_t uiMergeCand = 0; uiMergeCand < afMmvdCandCount; uiMergeCand++)
@@ -24997,7 +24998,7 @@ void EncCu::xCheckRDCostTMMerge2Nx2N(CodingStructure *&tempCS, CodingStructure *
 
       DistParam distParam;
       const bool bUseHadamard = !tempCS->slice->getDisableSATDForRD();
-      m_pcRdCost->setDistParam (distParam, tempCS->getOrgBuf().Y(), m_acMergeBuffer[0].Y(), sps.getBitDepth (CHANNEL_TYPE_LUMA), COMPONENT_Y, bUseHadamard);
+      m_pcRdCost->setDistParam (distParam, tempCS->getOrgBuf(COMPONENT_Y), m_acMergeBuffer[0].Y(), sps.getBitDepth (CHANNEL_TYPE_LUMA), COMPONENT_Y, bUseHadamard);
 
       for( uint32_t uiMergeCand = 0; uiMergeCand < candNum; uiMergeCand++ )
       {
@@ -25609,10 +25610,10 @@ void EncCu::xCheckRDCostIBCModeMerge2Nx2N(CodingStructure *&tempCS, CodingStruct
       const CompArea &area = cu.blocks[COMPONENT_Y];
       CompArea        tmpArea(COMPONENT_Y, area.chromaFormat, Position(0, 0), area.size());
       PelBuf          tmpOrgLuma = m_tmpStorageLCU->getBuf(tmpArea);
-      tmpOrgLuma.copyFrom(tempCS->getOrgBuf().Y());
+      tmpOrgLuma.copyFrom(tempCS->getOrgBuf(COMPONENT_Y));
       if (tempCS->slice->getLmcsEnabledFlag() && m_pcReshape->getCTUFlag())
       {
-        tmpOrgLuma.rspSignal(tempCS->getOrgBuf().Y(), m_pcReshape->getFwdLUT());
+        tmpOrgLuma.rspSignal(tempCS->getOrgBuf(COMPONENT_Y), m_pcReshape->getFwdLUT());
       }
       PelStorage m_tmpStorageCUflipH;
       m_tmpStorageCUflipH.create(UnitArea(pu.chromaFormat, Area(0, 0, MAX_CU_SIZE, MAX_CU_SIZE)));
@@ -25631,12 +25632,12 @@ void EncCu::xCheckRDCostIBCModeMerge2Nx2N(CodingStructure *&tempCS, CodingStruct
         const CompArea &area = cu.blocks[COMPONENT_Y];
         CompArea    tmpArea(COMPONENT_Y, area.chromaFormat, Position(0, 0), area.size());
         PelBuf tmpLuma = m_tmpStorageLCU->getBuf(tmpArea);
-        tmpLuma.rspSignal( tempCS->getOrgBuf().Y(), m_pcReshape->getFwdLUT() );
+        tmpLuma.rspSignal( tempCS->getOrgBuf(COMPONENT_Y), m_pcReshape->getFwdLUT() );
         m_pcRdCost->setDistParam(distParam, tmpLuma, refBuf, sps.getBitDepth(CHANNEL_TYPE_LUMA), COMPONENT_Y, bUseHadamard);
       }
       else
       {
-        m_pcRdCost->setDistParam(distParam, tempCS->getOrgBuf().Y(), refBuf, sps.getBitDepth(CHANNEL_TYPE_LUMA), COMPONENT_Y, bUseHadamard);
+        m_pcRdCost->setDistParam(distParam, tempCS->getOrgBuf(COMPONENT_Y), refBuf, sps.getBitDepth(CHANNEL_TYPE_LUMA), COMPONENT_Y, bUseHadamard);
       }
 #endif
 
@@ -25680,12 +25681,12 @@ void EncCu::xCheckRDCostIBCModeMerge2Nx2N(CodingStructure *&tempCS, CodingStruct
           const CompArea &area = cu.blocks[COMPONENT_Y];
           CompArea    tmpArea(COMPONENT_Y, area.chromaFormat, Position(0, 0), area.size());
           PelBuf tmpLuma = m_tmpStorageLCU->getBuf(tmpArea);
-          tmpLuma.rspSignal( tempCS->getOrgBuf().Y(), m_pcReshape->getFwdLUT() );
+          tmpLuma.rspSignal( tempCS->getOrgBuf(COMPONENT_Y), m_pcReshape->getFwdLUT() );
           m_pcRdCost->setDistParam(distParamSad, tmpLuma, m_acMergeBuffer[0].Y().buf, m_acMergeBuffer[0].Y().stride, sps.getBitDepth(CHANNEL_TYPE_LUMA), COMPONENT_Y);
         }
         else
         {
-          m_pcRdCost->setDistParam(distParamSad, tempCS->getOrgBuf().Y(), m_acMergeBuffer[0].Y().buf, m_acMergeBuffer[0].Y().stride, sps.getBitDepth(CHANNEL_TYPE_LUMA), COMPONENT_Y);
+          m_pcRdCost->setDistParam(distParamSad, tempCS->getOrgBuf(COMPONENT_Y), m_acMergeBuffer[0].Y().buf, m_acMergeBuffer[0].Y().stride, sps.getBitDepth(CHANNEL_TYPE_LUMA), COMPONENT_Y);
         }
 #endif
         if (dimdMode == -1 || timdMode == -1)
@@ -27178,12 +27179,12 @@ void EncCu::xCheckRDCostIBCModeMerge2Nx2N(CodingStructure *&tempCS, CodingStruct
           const CompArea &area = cu.blocks[COMPONENT_Y];
           CompArea    tmpArea(COMPONENT_Y, area.chromaFormat, Position(0, 0), area.size());
           PelBuf tmpLuma = m_tmpStorageLCU->getBuf(tmpArea);
-          tmpLuma.rspSignal( tempCS->getOrgBuf().Y(), m_pcReshape->getFwdLUT() );
+          tmpLuma.rspSignal( tempCS->getOrgBuf(COMPONENT_Y), m_pcReshape->getFwdLUT() );
           m_pcRdCost->setDistParam(distParam, tmpLuma, refBuf.buf, refBuf.stride, sadMask, maskStride, stepX, maskStride2, sps.getBitDepth(CHANNEL_TYPE_LUMA), COMPONENT_Y);
         }
         else
         {
-          m_pcRdCost->setDistParam(distParam, tempCS->getOrgBuf().Y(), refBuf.buf, refBuf.stride, sadMask, maskStride, stepX, maskStride2, sps.getBitDepth(CHANNEL_TYPE_LUMA), COMPONENT_Y);
+          m_pcRdCost->setDistParam(distParam, tempCS->getOrgBuf(COMPONENT_Y), refBuf.buf, refBuf.stride, sadMask, maskStride, stepX, maskStride2, sps.getBitDepth(CHANNEL_TYPE_LUMA), COMPONENT_Y);
         }
 #endif
           for (unsigned int mergeCand = 0; mergeCand < mergeCtx.numValidMergeCand; mergeCand++)
@@ -27343,12 +27344,12 @@ void EncCu::xCheckRDCostIBCModeMerge2Nx2N(CodingStructure *&tempCS, CodingStruct
           const CompArea &area = cu.blocks[COMPONENT_Y];
           CompArea    tmpArea(COMPONENT_Y, area.chromaFormat, Position(0, 0), area.size());
           PelBuf tmpLuma = m_tmpStorageLCU->getBuf(tmpArea);
-          tmpLuma.rspSignal( tempCS->getOrgBuf().Y(), m_pcReshape->getFwdLUT() );
+          tmpLuma.rspSignal( tempCS->getOrgBuf(COMPONENT_Y), m_pcReshape->getFwdLUT() );
           m_pcRdCost->setDistParam(distParam, tmpLuma, m_acMergeBuffer[0].Y(), sps.getBitDepth(CHANNEL_TYPE_LUMA), COMPONENT_Y, bUseHadamard);
         }
         else
         {
-          m_pcRdCost->setDistParam(distParam, tempCS->getOrgBuf().Y(), m_acMergeBuffer[0].Y(), sps.getBitDepth(CHANNEL_TYPE_LUMA), COMPONENT_Y, bUseHadamard);
+          m_pcRdCost->setDistParam(distParam, tempCS->getOrgBuf(COMPONENT_Y), m_acMergeBuffer[0].Y(), sps.getBitDepth(CHANNEL_TYPE_LUMA), COMPONENT_Y, bUseHadamard);
         }
 #endif
         int numberGeoCandChecked = (int)geoSADCostList.size();
@@ -28870,12 +28871,12 @@ void EncCu::xCheckRDCostIBCMode(CodingStructure *&tempCS, CodingStructure *&best
                   const CompArea &area = cu.blocks[COMPONENT_Y];
                   CompArea    tmpArea(COMPONENT_Y, area.chromaFormat, Position(0, 0), area.size());
                   PelBuf tmpLuma = m_tmpStorageLCU->getBuf(tmpArea);
-                  tmpLuma.rspSignal( tempCS->getOrgBuf().Y(), m_pcReshape->getFwdLUT() );
+                  tmpLuma.rspSignal( tempCS->getOrgBuf(COMPONENT_Y), m_pcReshape->getFwdLUT() );
                   m_pcRdCost->setDistParam(distParam, tmpLuma, predBuf, tempCS->sps->getBitDepth(CHANNEL_TYPE_LUMA), COMPONENT_Y, true);
                 }
                 else
                 {
-                  m_pcRdCost->setDistParam(distParam, tempCS->getOrgBuf().Y(), predBuf, tempCS->sps->getBitDepth(CHANNEL_TYPE_LUMA), COMPONENT_Y, true);
+                  m_pcRdCost->setDistParam(distParam, tempCS->getOrgBuf(COMPONENT_Y), predBuf, tempCS->sps->getBitDepth(CHANNEL_TYPE_LUMA), COMPONENT_Y, true);
                 }
                 Distortion satd = distParam.distFunc(distParam);
                 uint32_t   addExtraBits  = 1 + pu.cu->bvZeroCompDir;
@@ -31791,7 +31792,30 @@ void EncCu::xCheckRDCostInterMultiHyp2Nx2N(CodingStructure *&tempCS, CodingStruc
   m_bestModeUpdated = tempCS->useDbCost = bestCS->useDbCost = false;
 
   MEResultVec mhResults;
-  const auto RDCostComp = [](const MEResult &x, const MEResult &y) { return x.cost < y.cost; };
+  // perf: the order of a stable sort by cost, found on (cost, index) pairs: the results themselves (each a CodingUnit
+  // and a PredictionUnit) are then copied once, and only the ones that are kept, instead of being moved by the sort
+  const auto costOrder = [](const MEResultVec &v)
+  {
+    std::vector<std::pair<Distortion, uint32_t>> order(v.size());
+    for (uint32_t i = 0; i < (uint32_t) v.size(); i++)
+    {
+      order[i] = { v[i].cost, i };
+    }
+    std::sort(order.begin(), order.end());
+    return order;
+  };
+  // the `keep` cheapest results of v, in stable cost order
+  const auto bestResults = [&costOrder](const MEResultVec &v, const size_t keep)
+  {
+    const auto  order = costOrder(v);
+    MEResultVec best;
+    best.reserve(std::min(keep, order.size()));
+    for (size_t i = 0; i < order.size() && i < keep; i++)
+    {
+      best.push_back(v[order[i].second]);
+    }
+    return best;
+  };
 
   MergeCtx mrgCtx;
   if (sps.getSbTMVPEnabledFlag())
@@ -31819,32 +31843,26 @@ void EncCu::xCheckRDCostInterMultiHyp2Nx2N(CodingStructure *&tempCS, CodingStruc
 
   // Hadamard-based pre-search
   {
-    MEResultVec base = m_baseResultsForMH;
-
-    if (base.empty())
+    if (m_baseResultsForMH.empty())
       return;
 
     tempCS->initStructData(encTestMode.qp);
     CodingUnit &cu = tempCS->addCU(tempCS->area, partitioner.chType);
     PredictionUnit &pu = tempCS->addPU(cu, partitioner.chType);
 
-    int iter = 0;
+    // the best base results, then repeatedly the 2 best of the previous round's results
+    // (a negative count kept every result, as the size_t comparison of the former resize did)
+    MEResultVec base = bestResults(m_baseResultsForMH, (size_t) m_pcEncCfg->getNumMHPCandsToTest());
     do
     {
       MEResultVec out;
-      const auto survivors = iter > 0 ? 2 : m_pcEncCfg->getNumMHPCandsToTest();
-      iter++;
-
-      stableSortSmall(base.begin(), base.end(), RDCostComp);
-      if (base.size() > survivors)
-        base.resize(survivors);
       predInterSearchAdditionalHypothesisMulti(base, out, pu, mrgCtx);
       mhResults.insert(mhResults.end(), out.begin(), out.end());
-      base = out;
+      base = bestResults(out, 2);
     } while (!base.empty());
   }
 
-  stableSortSmall(mhResults.begin(), mhResults.end(), RDCostComp);
+  const auto mhOrder = costOrder(mhResults);
 
   // actual testing with "true" RD costs
   for (int i = 0; i < std::min((int)mhResults.size(), m_pcEncCfg->getAddHypTries()); ++i)
@@ -31853,8 +31871,8 @@ void EncCu::xCheckRDCostInterMultiHyp2Nx2N(CodingStructure *&tempCS, CodingStruc
     CodingUnit &cu = tempCS->addCU(tempCS->area, partitioner.chType);
     PredictionUnit &pu = tempCS->addPU(cu, partitioner.chType);
 
-    pu = mhResults[i].pu;
-    cu = mhResults[i].cu;
+    pu = mhResults[mhOrder[i].second].pu;
+    cu = mhResults[mhOrder[i].second].cu;
 #if JVET_AD0213_LIC_IMP && !JVET_AF0190_RPR_TMP_REORDER_LIC
     if (cu.licFlag && !PU::checkRprLicCondition(pu))
     {

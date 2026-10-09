@@ -370,50 +370,10 @@ private:
 #endif
     {
     }
-    ModeInfo &operator=(const ModeInfo &other)
-    {
-      mipFlg       = other.mipFlg;     // CU::mipFlag
-      mipTrFlg     = other.mipTrFlg;   // PU::mipTransposedFlag
-      mRefId       = other.mRefId;     // PU::multiRefIdx
-      ispMod       = other.ispMod;     // CU::ispMode
-      modeId       = other.modeId;     // PU::intraDir[CHANNEL_TYPE_LUMA]
-#if JVET_V0130_INTRA_TMP
-      tmpFlag      = other.tmpFlag;    // CU::tmpFlag
-#endif
-#if JVET_AD0086_ENHANCED_INTRA_TMP
-      tmpIdx        = other.tmpIdx;
-      tmpFusionFlag = other.tmpFusionFlag;
-      tmpFlmFlag    = other.tmpFlmFlag;
-#if JVET_AG0136_INTRA_TMP_LIC
-      tmpLicFlag    = other.tmpLicFlag;
-      tmpLicIdc     = other.tmpLicIdc;
-#endif
-      tmpIsSubPel   = other.tmpIsSubPel;    // CU::tmpIsSubPel
-      tmpSubPelIdx  = other.tmpSubPelIdx;   // CU::tmpSubPelIdx
-#if JVET_AH0200_INTRA_TMP_BV_REORDER
-      tmpFracIdx   = other.tmpFracIdx;
-#endif
-#endif
-      sgpmFlag     = other.sgpmFlag;   // CU::sgpmFlag
-      sgpmSplitDir = other.sgpmSplitDir;
-      sgpmMode0    = other.sgpmMode0;
-      sgpmMode1    = other.sgpmMode1;
-      sgpmIdx      = other.sgpmIdx;
-#if JVET_AG0152_SGPM_ITMP_IBC
-      sgpmBv0 = other.sgpmBv0;
-      sgpmBv1 = other.sgpmBv1;
-#endif
-#if JVET_AJ0112_REGRESSION_SGPM
-      sgpmIsRegression = other.sgpmIsRegression;
-      sgpmBlendModel = other.sgpmBlendModel;
-#endif
-#if JVET_AM0074_INTRA_MERGE
-      dimd = other.dimd;
-      timd = other.timd;
-#endif
-      return *this;
-    }
-    bool operator==(const ModeInfo cmp) const
+    // perf: the compiler-generated copy (every member, like the field-by-field copy it replaces) keeps ModeInfo
+    // trivially copyable, so the mode lists are copied as plain memory instead of member by member
+    ModeInfo &operator=(const ModeInfo &other) = default;
+    bool operator==(const ModeInfo &cmp) const
     {
       return (mipFlg == cmp.mipFlg && mipTrFlg == cmp.mipTrFlg && mRefId == cmp.mRefId && ispMod == cmp.ispMod
                 && modeId == cmp.modeId 
@@ -445,11 +405,11 @@ private:
 #elif JVET_V0130_INTRA_TMP
 	  ModeInfo() : mipFlg(false), mipTrFlg(false), mRefId(0), ispMod(NOT_INTRA_SUBPARTITIONS), modeId(0), tmpFlag(0) {}
 	  ModeInfo(const bool mipf, const bool miptf, const int mrid, const uint8_t ispm, const uint32_t mode, const bool tpmf = 0) : mipFlg(mipf), mipTrFlg(miptf), mRefId(mrid), ispMod(ispm), modeId(mode), tmpFlag(tpmf) {}
-	  bool operator==(const ModeInfo cmp) const { return (mipFlg == cmp.mipFlg && mipTrFlg == cmp.mipTrFlg && mRefId == cmp.mRefId && ispMod == cmp.ispMod && modeId == cmp.modeId && tmpFlag == cmp.tmpFlag); }
+	  bool operator==(const ModeInfo &cmp) const { return (mipFlg == cmp.mipFlg && mipTrFlg == cmp.mipTrFlg && mRefId == cmp.mRefId && ispMod == cmp.ispMod && modeId == cmp.modeId && tmpFlag == cmp.tmpFlag); }
 #else
     ModeInfo() : mipFlg(false), mipTrFlg(false), mRefId(0), ispMod(NOT_INTRA_SUBPARTITIONS), modeId(0) {}
     ModeInfo(const bool mipf, const bool miptf, const int mrid, const uint8_t ispm, const uint32_t mode) : mipFlg(mipf), mipTrFlg(miptf), mRefId(mrid), ispMod(ispm), modeId(mode) {}
-    bool operator==(const ModeInfo cmp) const { return (mipFlg == cmp.mipFlg && mipTrFlg == cmp.mipTrFlg && mRefId == cmp.mRefId && ispMod == cmp.ispMod && modeId == cmp.modeId); }
+    bool operator==(const ModeInfo &cmp) const { return (mipFlg == cmp.mipFlg && mipTrFlg == cmp.mipTrFlg && mRefId == cmp.mRefId && ispMod == cmp.ispMod && modeId == cmp.modeId); }
 #endif
 #if JVET_AM0074_INTRA_MERGE
     void setDimdParam(uint8_t in) { dimd = in; }
@@ -497,7 +457,7 @@ private:
       ), rdCost(cost)
     {
     }
-    bool operator==(const ModeInfoWithCost cmp) const
+    bool operator==(const ModeInfoWithCost &cmp) const
     {
       return (mipFlg == cmp.mipFlg && mipTrFlg == cmp.mipTrFlg && mRefId == cmp.mRefId && ispMod == cmp.ispMod
               && modeId == cmp.modeId && tmpFlag == cmp.tmpFlag
@@ -525,10 +485,10 @@ private:
     }
 #elif JVET_V0130_INTRA_TMP
 	  ModeInfoWithCost(const bool mipf, const bool miptf, const int mrid, const uint8_t ispm, const uint32_t mode, const bool tpmf, double cost) : ModeInfo(mipf, miptf, mrid, ispm, mode, tpmf), rdCost(cost) {}
-	  bool operator==(const ModeInfoWithCost cmp) const { return (mipFlg == cmp.mipFlg && mipTrFlg == cmp.mipTrFlg && mRefId == cmp.mRefId && ispMod == cmp.ispMod && modeId == cmp.modeId && tmpFlag == cmp.tmpFlag && rdCost == cmp.rdCost); }
+	  bool operator==(const ModeInfoWithCost &cmp) const { return (mipFlg == cmp.mipFlg && mipTrFlg == cmp.mipTrFlg && mRefId == cmp.mRefId && ispMod == cmp.ispMod && modeId == cmp.modeId && tmpFlag == cmp.tmpFlag && rdCost == cmp.rdCost); }
 #else
     ModeInfoWithCost(const bool mipf, const bool miptf, const int mrid, const uint8_t ispm, const uint32_t mode, double cost) : ModeInfo(mipf, miptf, mrid, ispm, mode), rdCost(cost) {}
-    bool operator==(const ModeInfoWithCost cmp) const { return (mipFlg == cmp.mipFlg && mipTrFlg == cmp.mipTrFlg && mRefId == cmp.mRefId && ispMod == cmp.ispMod && modeId == cmp.modeId && rdCost == cmp.rdCost); }
+    bool operator==(const ModeInfoWithCost &cmp) const { return (mipFlg == cmp.mipFlg && mipTrFlg == cmp.mipTrFlg && mRefId == cmp.mRefId && ispMod == cmp.ispMod && modeId == cmp.modeId && rdCost == cmp.rdCost); }
 #endif
     static bool compareModeInfoWithCost(ModeInfoWithCost a, ModeInfoWithCost b) { return a.rdCost < b.rdCost; }
   };
@@ -1022,6 +982,38 @@ public:
   );
   void PLTSearch                  ( CodingStructure &cs, Partitioner& partitioner, ComponentID compBegin, uint32_t numComp);
   uint64_t xFracModeBitsIntra     (PredictionUnit &pu, const uint32_t &uiMode, const ChannelType &compID);
+  // Luma mode bits during estIntraPredLumaQT: the flags before the MPM part (all zero for regular modes) give the same
+  // bits and context updates for every mode of the same CU state, so they are coded once per state and replayed.
+  // Build with -DMODEBITS_CHECK to also code the full syntax on every replay and stop if bits or contexts differ.
+  struct LumaModeFlagsMemo
+  {
+    const PredictionUnit *pu = nullptr;
+    int      multiRefIdx    = -1;
+    int      ispMode        = -1;
+    int      lfnstIdx       = -1;
+    bool     reachedMpm     = false;
+    uint64_t bits           = 0;
+    struct CtxChange
+    {
+      unsigned         idx;
+      BinProbModel_Std before, after;
+    };
+    std::vector<CtxChange> ctxChanges;   // every context the flags coded a bin with: value before and after
+  };
+  static const int    LUMA_MODE_FLAGS_MEMO_SIZE = 8;
+  LumaModeFlagsMemo   m_lumaModeFlagsMemo[LUMA_MODE_FLAGS_MEMO_SIZE];
+  int                 m_lumaModeFlagsMemoNum    = 0;
+  int                 m_lumaModeFlagsMemoNext   = 0;
+  bool                m_lumaModeFlagsMemoActive = false;
+  std::vector<BinProbModel_Std> m_lumaModeFlagsCtxSnapshot;
+  BinStoreVector      m_lumaModeFlagsBinLog;   // contexts the flags being recorded code bins with
+  uint64_t xFracModeBitsLumaMemo  (PredictionUnit &pu);
+  struct LumaModeFlagsMemoScope
+  {
+    IntraSearch &s;
+    explicit LumaModeFlagsMemoScope(IntraSearch &is) : s(is) { s.m_lumaModeFlagsMemoNum = 0; s.m_lumaModeFlagsMemoNext = 0; s.m_lumaModeFlagsMemoActive = true; }
+    ~LumaModeFlagsMemoScope() { s.m_lumaModeFlagsMemoActive = false; s.m_lumaModeFlagsMemoNum = 0; }
+  };
   void invalidateBestModeCost     () { for( int i = 0; i < NUM_LFNST_NUM_PER_SET; i++ ) m_bestModeCostValid[ i ] = false; };
 
   void sortRdModeListFirstColorSpace(ModeInfo mode, double cost, char bdpcmMode, ModeInfo* rdModeList, double* rdCostList, char* bdpcmModeList, int& candNum);

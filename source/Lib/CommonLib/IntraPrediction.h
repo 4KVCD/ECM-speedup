@@ -194,6 +194,7 @@ struct CccmModel
   {
     bd = bitdepth;
     midVal = ( 1 << ( bitdepth - 1 ) );
+    CHECK( num > CCCM_NUM_PARAMS_MAX, "too many CCCM model parameters" );
     params.resize( num );
 #if JVET_AJ0237_INTERNAL_12BIT
     decimBits = DECIM_BITS(bd);
@@ -210,7 +211,9 @@ struct CccmModel
 
   ~CccmModel() {}
 
-  std::vector<TCccmCoeff> params;
+  // perf: a fixed-capacity vector (CCCM_NUM_PARAMS_MAX is the largest model) instead of a std::vector, so that the
+  // many models built during the search allocate nothing; the elements and their size behave as before
+  static_vector<TCccmCoeff, CCCM_NUM_PARAMS_MAX> params;
   int        bd;
   int        midVal;
 #if JVET_AJ0237_INTERNAL_12BIT
@@ -292,7 +295,7 @@ struct CccmModel
   bool valid()
   {
 #if JVET_AM0216_12BIT_FIX
-    for (std::vector<TCccmCoeff>::iterator it = params.begin(); it < params.end(); it++)
+    for (auto it = params.begin(); it < params.end(); it++)
     {
       if (abs(*it) > (4 << decimBits))
       {
