@@ -330,7 +330,7 @@ public:
 
 #if ECM_VULKAN
   void  setGpuLoopFilter        ( int mode );   ///< GpuAlf::Mode; before setFrameThreads
-  void  setGpuRecon             ( int mode );   ///< 0 off, 2 verify the intra pictures (sequential decoding)
+  void  setGpuRecon             ( int mode );   ///< 0 off, 1 on, 2 verify (the intra pictures the GPU path supports; sequential decoding)
 #endif
 
   // frame-level threading

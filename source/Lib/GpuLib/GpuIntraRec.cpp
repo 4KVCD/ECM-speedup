@@ -136,6 +136,8 @@ struct GpuIntraRec::Impl
   std::vector<int16_t>        cpuPred, cpuResi;
   std::string                 unsupportedWhy;
   int                         poc = 0;
+  bool                        on = false;
+  int                         numOn = 0, numFallback = 0;
 
   // totals
   int                         numPictures = 0, numVerified = 0, numMismatch = 0, numSkipped = 0;
@@ -224,10 +226,69 @@ GpuIntraRec::~GpuIntraRec()
   if( m_impl )
   {
     const Impl& m = *m_impl;
-    printf( "\n[gpu-intra] %d pictures: %d verified (%d with differences), %d skipped%s%s; GPU %.1f ms\n", m.numPictures,
-            m.numVerified, m.numMismatch, m.numSkipped, m.firstSkipReason.empty() ? "" : ", first reason: ",
-            m.firstSkipReason.c_str(), m.gpuMs );
+    if( m.on )
+    {
+      printf( "\n[gpu-intra] %d pictures: %d reconstructed on the GPU, %d by the CPU%s%s; GPU %.1f ms\n", m.numPictures,
+              m.numOn, m.numPictures - m.numOn, m.firstSkipReason.empty() ? "" : ", first reason: ", m.firstSkipReason.c_str(),
+              m.gpuMs );
+    }
+    else
+    {
+      printf( "\n[gpu-intra] %d pictures: %d verified (%d with differences), %d skipped%s%s; GPU %.1f ms\n", m.numPictures,
+              m.numVerified, m.numMismatch, m.numSkipped, m.firstSkipReason.empty() ? "" : ", first reason: ",
+              m.firstSkipReason.c_str(), m.gpuMs );
+    }
   }
+}
+
+void GpuIntraRec::setOn( bool on )
+{
+  m_impl->on = on;
+}
+
+bool GpuIntraRec::on() const
+{
+  return m_impl->on;
+}
+
+bool GpuIntraRec::failed() const
+{
+  return !m_impl->unsupportedWhy.empty();
+}
+
+bool GpuIntraRec::supported( const Slice& slice, std::string& why )
+{
+  // every tool whose mode derivation or prediction reads reconstructed samples, or that the kernels do not implement,
+  // must be off: with the GPU reconstruction on, the CPU reconstructs nothing the derivations could read
+  const SPS& sps = *slice.getSPS();
+  why.clear();
+  if( !slice.isIntra() )                                                                  why = "not an intra slice";
+  else if( sps.getChromaFormatIdc() != CHROMA_420 && sps.getChromaFormatIdc() != CHROMA_400 ) why = "chroma format";
+  else if( sps.getUseDualITree() )                                                        why = "dual tree";
+  else if( sps.getLog2MaxTbSize() > 7 )                                                   why = "transform blocks above 128";
+  else if( sps.getUseIntraPredBf() )                                                      why = "intra bilateral filter";
+  else if( sps.getUseLmcs() )                                                             why = "LMCS";
+  else if( sps.getUseQcs() )                                                              why = "QCS";
+  else if( sps.getScalingListFlag() )                                                     why = "scaling lists";
+  else if( sps.getSpsRangeExtension().getExtendedPrecisionProcessingFlag() )               why = "extended precision";
+  else if( sps.getUseColorTrans() )                                                       why = "ACT";
+  else if( sps.getNumPredSigns() > 0 )                                                    why = "sign prediction";
+  else if( sps.getUseMIP() )                                                              why = "MIP";
+  else if( sps.getUseISP() )                                                              why = "ISP";
+  else if( sps.getUseMRL() || sps.getUseTmrl() )                                          why = "MRL / TMRL";
+  else if( sps.getUseIntraLFNSTISlice() || sps.getUseIntraLFNSTPBSlice() || sps.getUseNSPT() ) why = "LFNST / NSPT";
+  else if( sps.getUseIntraMTS() || sps.getUseImplicitMTS() )                              why = "MTS";
+  else if( sps.getTransformSkipEnabledFlag() || sps.getBDPCMEnabledFlag() )               why = "transform skip / BDPCM";
+  else if( sps.getJointCbCrEnabledFlag() )                                                why = "joint CbCr";
+  else if( sps.getUseLMChroma() || sps.getUseCcpMerge() || sps.getUseDdCcpFusion() || sps.getUseBvgCccm() ) why = "cross-component prediction";
+  else if( sps.getUseChromaReordering() || sps.getUseIntraDBV() )                         why = "chroma reordering / DBV";
+  else if( sps.getUseDimd() || sps.getUseBvgDimd() || sps.getUseTimd() || sps.getUseTimdMrg() ) why = "DIMD / TIMD";
+  else if( sps.getUseMdip() || sps.getUseMpmSorting() )                                   why = "MDIP / MPM sorting";
+  else if( sps.getUseIntraTMP() || sps.getIBCFlag() )                                     why = "IntraTMP / IBC";
+  else if( sps.getUseEip() || sps.getUseSgpm() )                                          why = "EIP / SGPM";
+  else if( sps.getUsePDP() )                                                              why = "PDP";
+  else if( slice.getPnnMode() )                                                           why = "NN intra prediction";
+  return why.empty();
 }
 
 void GpuIntraRec::beginPicture( const CodingStructure& cs )
@@ -239,9 +300,10 @@ void GpuIntraRec::beginPicture( const CodingStructure& cs )
   m.cpuResi.clear();
   m.unsupportedWhy.clear();
   m.poc = cs.slice->getPOC();
-  if( cs.pcv->chrFormat != CHROMA_420 && cs.pcv->chrFormat != CHROMA_400 )
+  std::string why;
+  if( !supported( *cs.slice, why ) )
   {
-    unsupported( "chroma format" );
+    unsupported( why.c_str() );
   }
 }
 
@@ -254,7 +316,7 @@ void GpuIntraRec::unsupported( const char* why )
 }
 
 void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, const IntraPrediction::IpaSnapshot& ipa,
-                          const QpParam& qp, const CPelBuf& pred, const CPelBuf& resi )
+                          const QpParam& qp, const CPelBuf* pred, const CPelBuf* resi )
 {
   Impl& m = *m_impl;
   if( !m.unsupportedWhy.empty() )
@@ -369,8 +431,8 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
         t.nzCols = std::max( t.nzCols, x + 1 );
       }
       m.coef.push_back( c.at( x, y ) );
-      m.cpuPred.push_back( pred.at( x, y ) );
-      m.cpuResi.push_back( resi.at( x, y ) );
+      m.cpuPred.push_back( pred ? pred->at( x, y ) : 0 );
+      m.cpuResi.push_back( resi ? resi->at( x, y ) : 0 );
     }
   }
   CHECK( (int) m.coef.size() != t.coeffOffset + n, "coefficient count" );
@@ -381,6 +443,10 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
 {
   Impl& m = *m_impl;
   m.numPictures++;
+  if( m.on && !m.unsupportedWhy.empty() )
+  {
+    m.numFallback++;
+  }
   if( !m.unsupportedWhy.empty() || m.rec.empty() )
   {
     m.numSkipped++;
@@ -727,6 +793,21 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
   const double ms = s.elapsedNs( t0, t1 ) * 1e-6;
   m.gpuMs += ms;
 
+  if( m.on )   // the GPU's picture is the reconstruction
+  {
+    const int16_t* gPlane = (const int16_t*) m.download.mapped + 2 * m.cpuPred.size();
+    for( int c = 0; c < numComp; c++ )
+    {
+      PelBuf reco = cs.picture->getRecoBuf( ComponentID( c ) );
+      for( int y = 0; y < P.height[c]; y++ )
+      {
+        memcpy( reco.bufAt( 0, y ), gPlane + size_t( y ) * P.width[c], P.width[c] * sizeof( Pel ) );
+      }
+      gPlane += size_t( P.width[c] ) * P.height[c];
+    }
+    m.numOn++;
+    return;
+  }
   // compare: per block prediction and residual, then the whole picture
   const int16_t* gPred = (const int16_t*) m.download.mapped;
   const int16_t* gResi = gPred + m.cpuPred.size();

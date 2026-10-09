@@ -636,6 +636,8 @@ public:
     bool isModeVer, interpolationFlag, refFilterFlag, applyPDPC, useGradPDPC, applyFusion;
     int  multiRefIndex, intraPredAngle, absInvAngle, angularScale;
   };
+  /// initIntraPatternChType() sets the parameters only (no reference samples; the decoder's GPU reconstruction)
+  void setParamsOnly( bool b ) { m_paramsOnly = b; }
   IpaSnapshot ipaSnapshot() const
   {
     return { m_ipaParam.isModeVer,
@@ -658,6 +660,7 @@ public:
              m_ipaParam.angularScale };
   }
 private:
+  bool m_paramsOnly = false;
 
 #if JVET_AN0158_INTRA_LONGTAP
   int m_dimdCurrentPredIdx = 0;

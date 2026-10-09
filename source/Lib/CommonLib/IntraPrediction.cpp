@@ -9236,6 +9236,16 @@ void IntraPrediction::initIntraPatternChType(const CodingUnit &cu, const CompAre
   Pel *refBufFiltered   = m_refBuffer[area.compID][PRED_BUF_FILTERED];
 
   setReferenceArrayLengths( area );
+  if( m_paramsOnly )   // the decoder's GPU reconstruction: the parameters only
+  {
+#if JVET_AJ0057_HL_INTRA_METHOD_CONTROL
+    if( cu.cs->sps->getDisableRefFilter() )
+    {
+      m_ipaParam.refFilterFlag = false;
+    }
+#endif
+    return;
+  }
 #if JVET_AH0209_PDP
   m_refAvailable = false;
 #endif

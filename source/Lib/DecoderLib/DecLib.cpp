@@ -658,12 +658,16 @@ void DecLib::setGpuRecon( int mode )
 {
   m_cCuDecoder.setGpuIntraRec( nullptr );
   m_gpuIntraRec.reset();
-  if( mode == 2 )
+  if( mode == 1 || mode == 2 )
   {
     m_gpuIntraRec.reset( GpuIntraRec::create() );
     if( !m_gpuIntraRec )
     {
-      msg( WARNING, "GPU reconstruction: no Vulkan device (%s)\n", gpu::Context::lastError().c_str() );
+      msg( WARNING, "GPU reconstruction: no usable Vulkan device (%s)\n", gpu::Context::lastError().c_str() );
+    }
+    else
+    {
+      m_gpuIntraRec->setOn( mode == 1 );
     }
     m_cCuDecoder.setGpuIntraRec( m_gpuIntraRec.get() );
   }

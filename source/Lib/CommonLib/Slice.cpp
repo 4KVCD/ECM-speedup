@@ -4420,6 +4420,9 @@ SPS::SPS()
 #endif
 #if JVET_W0123_TIMD_FUSION
 , m_timd                      ( false )
+#if JVET_AJ0061_TIMD_MERGE
+, m_timdMrg                   ( false )   // not parsed when the non-inter TM tools are off (GpuIntraRec::supported reads it)
+#endif
 #endif
 #if JVET_AE0174_NONINTER_TM_TOOLS_CONTROL
 #if JVET_AB0155_SGPM

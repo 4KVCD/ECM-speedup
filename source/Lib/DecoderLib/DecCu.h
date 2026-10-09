@@ -98,9 +98,12 @@ protected:
 public:
   /// the GPU reconstruction (verification) recording this decoder's intra blocks, or nullptr
   void setGpuIntraRec( GpuIntraRec* rec ) { m_gpuIntraRec = rec; }
+  /// decompressCtu() derives the intra modes and records the blocks for the GPU, without any sample work
+  void setGpuDeriveOnly( bool b ) { m_gpuDeriveOnly = b; m_pcIntraPred->setParamsOnly( b ); }
   GpuIntraRec* getGpuIntraRec() const { return m_gpuIntraRec; }
 private:
   GpuIntraRec*      m_gpuIntraRec = nullptr;
+  bool              m_gpuDeriveOnly = false;
 #endif
 private:
   TrQuant*          m_pcTrQuant;

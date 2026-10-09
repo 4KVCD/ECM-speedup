@@ -1376,6 +1376,14 @@ void DecCu::xIntraRecBlk( TransformUnit& tu, const ComponentID compID )
     }
 #endif
   }
+#if ECM_VULKAN
+  if( m_gpuDeriveOnly )   // the GPU reconstructs the picture: the block's parameters only
+  {
+    m_gpuIntraRec->record( tu, compID, m_pcIntraPred->ipaSnapshot(), QpParam( tu, compID ), nullptr, nullptr );
+    cs.setDecomp( area );
+    return;
+  }
+#endif
 
   //===== get prediction signal =====
 #if JVET_AG0154_DECODER_DERIVED_CCP_FUSION	  
@@ -2267,7 +2275,8 @@ void DecCu::xIntraRecBlk( TransformUnit& tu, const ComponentID compID )
 #if ECM_VULKAN
   if( m_gpuIntraRec )
   {
-    m_gpuIntraRec->record( tu, compID, m_pcIntraPred->ipaSnapshot(), cQP, piPred, piResi );
+    const CPelBuf cpuPred( piPred ), cpuResi( piResi );
+    m_gpuIntraRec->record( tu, compID, m_pcIntraPred->ipaSnapshot(), cQP, &cpuPred, &cpuResi );
   }
 #endif
 #if JVET_AG0145_ADAPTIVE_CLIPPING

@@ -610,12 +610,25 @@ void DecSlice::decompressSlice( Slice* slice, InputBitstream* bitstream, int deb
 #endif
 
 #if ECM_VULKAN
-  if( GpuIntraRec* gpuRec = m_pcCuDecoder->getGpuIntraRec() )
+  // GPU reconstruction on: a supported picture is parsed first (parsing needs nothing from the reconstruction), then
+  // decompressCtu only derives the block parameters (setGpuDeriveOnly), then the GPU reconstructs the picture
+  GpuIntraRec* gpuRec = m_pcCuDecoder->getGpuIntraRec();
+  bool         gpuOn  = false;
+  if( gpuRec )
   {
     gpuRec->beginPicture( cs );
+    std::string why;
     if( slice->getNumCtuInSlice() != cs.pcv->sizeInCtus )
     {
       gpuRec->unsupported( "several slices" );
+    }
+    else if( gpuRec->on() )
+    {
+      gpuOn = GpuIntraRec::supported( *slice, why );
+      if( !gpuOn )
+      {
+        gpuRec->unsupported( why.c_str() );
+      }
     }
   }
 #endif
@@ -840,6 +853,9 @@ void DecSlice::decompressSlice( Slice* slice, InputBitstream* bitstream, int deb
     cabacReader.setBinBuffer( nullptr );
 #endif
 
+#if ECM_VULKAN
+    if( !gpuOn )
+#endif
     m_pcCuDecoder->decompressCtu( cs, ctuArea );
 
 #if JVET_Z0135_TEMP_CABAC_WIN_WEIGHT
@@ -904,7 +920,54 @@ void DecSlice::decompressSlice( Slice* slice, InputBitstream* bitstream, int deb
   }
 
 #if ECM_VULKAN
-  if( GpuIntraRec* gpuRec = m_pcCuDecoder->getGpuIntraRec() )
+  if( gpuOn )
+  {
+    // decompressCtu over the parsed slice, with the state decompressCtu relies on reset as in the parsing loop
+    // (an intra slice of a supported picture: no IBC, so no motion LUTs)
+    auto reconstructParsed = [&]()
+    {
+      for( unsigned ctuIdx = 0; ctuIdx < slice->getNumCtuInSlice(); ctuIdx++ )
+      {
+        const unsigned ctuRsAddr     = slice->getCtuAddrInSlice( ctuIdx );
+        const unsigned ctuXPosInCtus = ctuRsAddr % widthInCtus;
+        const unsigned ctuYPosInCtus = ctuRsAddr / widthInCtus;
+        const unsigned maxCUSize     = sps->getMaxCUWidth();
+        const UnitArea ctuArea( cs.area.chromaFormat, Area( ctuXPosInCtus * maxCUSize, ctuYPosInCtus * maxCUSize, maxCUSize, maxCUSize ) );
+        const bool rowStart = ctuXPosInCtus == slice->getPPS()->getTileColumnBd( slice->getPPS()->ctuToTileCol( ctuXPosInCtus ) );
+#if JVET_AD0188_CCP_MERGE
+        if( ctuIdx == 0 || rowStart )
+        {
+#if JVET_Z0118_GDR
+          cs.ccpLut.lutCCP0.resize( 0 );
+          cs.ccpLut.lutCCP1.resize( 0 );
+#else
+          cs.ccpLut.lutCCP.resize( 0 );
+#endif
+        }
+#endif
+#if JVET_AG0058_EIP
+        if( ctuIdx == 0 || rowStart )
+        {
+#if JVET_Z0118_GDR
+          cs.eipLut.lutEip0.resize( 0 );
+          cs.eipLut.lutEip1.resize( 0 );
+#else
+          cs.eipLut.lutEip.resize( 0 );
+#endif
+        }
+#endif
+        m_pcCuDecoder->decompressCtu( cs, ctuArea );
+      }
+    };
+    m_pcCuDecoder->setGpuDeriveOnly( true );
+    reconstructParsed();
+    m_pcCuDecoder->setGpuDeriveOnly( false );
+    if( gpuRec->failed() )   // a block the GPU path cannot reconstruct: the CPU reconstructs the picture
+    {
+      reconstructParsed();
+    }
+  }
+  if( gpuRec )
   {
     gpuRec->endPicture( cs );
   }

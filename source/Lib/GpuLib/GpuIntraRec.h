@@ -64,13 +64,23 @@ public:
   static GpuIntraRec* create();
   ~GpuIntraRec();
 
+  /// on: the GPU reconstructs the supported pictures (the CPU only derives the block parameters); off: the CPU
+  /// reconstructs every picture and the GPU's reconstruction of the supported ones is compared (verification)
+  void setOn( bool on );
+  bool on() const;
+  /// whether the GPU path supports the slice's tools (sequence- and slice-level settings; per block record() checks)
+  static bool supported( const Slice& slice, std::string& why );
+
   void beginPicture( const CodingStructure& cs );
-  /// one transform block of one component, after the CPU's prediction and inverse transform
+  /// one transform block of one component (with the CPU's prediction and residual when verifying, else nullptr)
   void record( const TransformUnit& tu, const ComponentID compID, const IntraPrediction::IpaSnapshot& ipa,
-               const QpParam& qp, const CPelBuf& pred, const CPelBuf& resi );
+               const QpParam& qp, const CPelBuf* pred, const CPelBuf* resi );
+  /// the picture has blocks the GPU path cannot reconstruct (on: the CPU reconstructs it instead)
+  bool failed() const;
   /// the picture uses something the GPU path does not support yet (the first reason is reported)
   void unsupported( const char* why );
-  /// reconstructs the recorded picture on the GPU and compares it with the CPU's reconstruction
+  /// reconstructs the recorded picture on the GPU; on: into the picture's reconstruction buffer, off: compared with
+  /// the CPU's reconstruction
   void endPicture( const CodingStructure& cs );
 
   struct Impl;
