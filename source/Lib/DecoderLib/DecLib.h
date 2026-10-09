@@ -273,6 +273,9 @@ private:
   std::unique_ptr<GpuAlfHook> m_gpuAlf;
   // GPU reconstruction (so far: intra pictures, verification against the CPU)
   std::unique_ptr<GpuIntraRec> m_gpuIntraRec;
+  int                          m_gpuReconMode = 0;                   ///< setGpuRecon's mode
+  std::shared_ptr<struct GpuReconPending> m_gpuReconPending;         ///< the instance being created in the background
+  void                         xPollGpuRecon();
 #endif
 
 public:
@@ -330,7 +333,7 @@ public:
 
 #if ECM_VULKAN
   void  setGpuLoopFilter        ( int mode );   ///< GpuAlf::Mode; before setFrameThreads
-  void  setGpuRecon             ( int mode );   ///< 0 off, 1 on, 2 verify (the intra pictures the GPU path supports; sequential decoding)
+  void  setGpuRecon             ( int mode );   ///< 0 off, 1 on, 2 verify, 3 on waiting for the device (the intra pictures the GPU path supports)
 #endif
 
   // frame-level threading

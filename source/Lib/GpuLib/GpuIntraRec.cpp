@@ -38,6 +38,8 @@
 #include "GpuIntraRec.h"
 #include "VkCompute.h"
 
+#include <mutex>
+
 #include "CommonLib/CodingStructure.h"
 #include "CommonLib/BilateralFilter.h"
 #include "CommonLib/InterpolationFilter.h"
@@ -120,67 +122,26 @@ struct Push
 constexpr int FILTER_TAPS[5] = { 6, 8, 10, 12, 16 };
 constexpr int SCRATCH_INTS   = 16384;   // per workgroup of intra_resi
 constexpr int RESI_GROUPS    = 256;
-}   // namespace
 
-struct GpuIntraRec::Impl
+// the kernels and the constant tables, created once and shared by every instance (the decoder contexts of the frame
+// threads); never destroyed, like the device
+struct Shared
 {
-  gpu::Context*               ctx = nullptr;
-  gpu::Kernel                 kernel, kernelResi;
-  std::unique_ptr<gpu::Stream> stream;
-  gpu::Buffer                 filters, matrices, scratch;
-  gpu::Buffer                 params, tus, coeffs, planes[3], owner[3], sched, dbgPred, dbgResi;
-  int                         numGroups = 0;
-  gpu::Buffer                 upload, download;
-  int32_t                     matrixOffset[8] = {};
+  gpu::Kernel                      kernel, kernelResi;
+  gpu::Buffer                      filters, matrices;
+  int32_t                          matrixOffset[8] = {};
   std::unique_ptr<BilateralFilter> bif;   // the intra prediction bilateral filter's tables
-
-  // the picture being recorded
-  std::vector<Tu>             rec;
-  std::vector<int32_t>        coef;
-  std::vector<int16_t>        cpuPred, cpuResi;   // verification only
-  size_t                      numSamples = 0;     // samples of the recorded blocks
-  std::string                 unsupportedWhy;
-  int                         poc = 0;
-  bool                        on = false;
-  int                         numOn = 0, numFallback = 0;
-
-  // totals
-  int                         numPictures = 0, numVerified = 0, numMismatch = 0, numSkipped = 0;
-  std::string                 firstSkipReason;
-  double                      gpuMs = 0;
-
-  ~Impl()
-  {
-    if( !ctx )
-    {
-      return;
-    }
-    for( gpu::Buffer* b: { &filters, &matrices, &scratch, &params, &tus, &coeffs, &planes[0], &planes[1], &planes[2],
-                           &owner[0], &owner[1], &owner[2], &sched, &dbgPred, &dbgResi, &upload, &download } )
-    {
-      b->destroy( *ctx );
-    }
-  }
 };
 
-GpuIntraRec* GpuIntraRec::create()
+Shared* createShared( gpu::Context& ctx )
 {
-  gpu::Context* ctx = gpu::Context::get();
-  if( !ctx || !ctx->vulkanMemoryModel() )   // the blocks of a picture synchronize through the Vulkan memory model
-  {
-    return nullptr;
-  }
-  GpuIntraRec* r = new GpuIntraRec;
-  r->m_impl.reset( new Impl );
-  Impl& m = *r->m_impl;
-  m.ctx = ctx;
-  m.kernel.create( *ctx, spv_intra_rec, sizeof( spv_intra_rec ), sizeof( Push ), "intra_rec" );
-  m.kernelResi.create( *ctx, spv_intra_resi, sizeof( spv_intra_resi ), sizeof( Push ), "intra_resi" );
-  m.stream.reset( new gpu::Stream( *ctx ) );
+  Shared* sh = new Shared;
+  sh->kernel.create( ctx, spv_intra_rec, sizeof( spv_intra_rec ), sizeof( Push ), "intra_rec" );
+  sh->kernelResi.create( ctx, spv_intra_resi, sizeof( spv_intra_resi ), sizeof( Push ), "intra_resi" );
 
   // tables, from the C++ tables themselves
-  m.bif.reset( new BilateralFilter );   // BilateralFilter::create derives the LUTs
-  m.bif->create();
+  sh->bif.reset( new BilateralFilter );   // BilateralFilter::create derives the LUTs
+  sh->bif->create();
   std::vector<int32_t> filt( 5 * 32 * 16 + 32 * 4 + 26 * 48 + 64 + 16, 0 );
   for( int t = 0; t < 5; t++ )
   {
@@ -203,9 +164,9 @@ GpuIntraRec* GpuIntraRec::create()
   }
   {
     int32_t* bt = filt.data() + 5 * 32 * 16 + 32 * 4;   // intra_rec's BF_LUT, BF_SIZE, BF_MAD
-    for( int q = 0; q < 26; q++ ) for( int i = 0; i < 48; i++ ) bt[q * 48 + i] = m.bif->m_lut[q][i];
-    for( int i = 0; i < 64; i++ ) bt[26 * 48 + i] = m.bif->m_tuSizeFactor[0][i];
-    for( int i = 0; i < 16; i++ ) bt[26 * 48 + 64 + i] = m.bif->m_tuMADFactor[0][i];
+    for( int q = 0; q < 26; q++ ) for( int i = 0; i < 48; i++ ) bt[q * 48 + i] = sh->bif->m_lut[q][i];
+    for( int i = 0; i < 64; i++ ) bt[26 * 48 + i] = sh->bif->m_tuSizeFactor[0][i];
+    for( int i = 0; i < 16; i++ ) bt[26 * 48 + 64 + i] = sh->bif->m_tuMADFactor[0][i];
   }
   std::vector<int32_t> mat;
   const TMatrixCoeff* tables[7] = { g_trCoreDCT2P2[TRANSFORM_INVERSE][0],  g_trCoreDCT2P4[TRANSFORM_INVERSE][0],
@@ -215,22 +176,91 @@ GpuIntraRec* GpuIntraRec::create()
   for( int l = 0; l < 7; l++ )
   {
     const int n          = 2 << l;
-    m.matrixOffset[l]    = (int32_t) mat.size();
+    sh->matrixOffset[l]  = (int32_t) mat.size();
     mat.insert( mat.end(), tables[l], tables[l] + n * n );
   }
-  m.filters.create( *ctx, filt.size() * 4, gpu::Buffer::DEVICE );
-  m.matrices.create( *ctx, mat.size() * 4, gpu::Buffer::DEVICE );
+  sh->filters.create( ctx, filt.size() * 4, gpu::Buffer::DEVICE );
+  sh->matrices.create( ctx, mat.size() * 4, gpu::Buffer::DEVICE );
+  gpu::Buffer upload;
+  upload.create( ctx, ( filt.size() + mat.size() ) * 4, gpu::Buffer::UPLOAD );
+  memcpy( upload.mapped, filt.data(), filt.size() * 4 );
+  memcpy( (char*) upload.mapped + filt.size() * 4, mat.data(), mat.size() * 4 );
+  {
+    gpu::Stream stream( ctx );
+    stream.begin();
+    stream.copy( upload, 0, sh->filters, 0, filt.size() * 4 );
+    stream.copy( upload, filt.size() * 4, sh->matrices, 0, mat.size() * 4 );
+    stream.submitAndWait();
+  }
+  upload.destroy( ctx );
+  return sh;
+}
+
+Shared* shared( gpu::Context& ctx )
+{
+  static std::once_flag once;
+  static Shared*        sh = nullptr;
+  std::call_once( once, [&] { sh = createShared( ctx ); } );
+  return sh;
+}
+}   // namespace
+
+struct GpuIntraRec::Impl
+{
+  gpu::Context*               ctx = nullptr;
+  const Shared*               sh  = nullptr;
+  std::unique_ptr<gpu::Stream> stream;
+  gpu::Buffer                 scratch;
+  gpu::Buffer                 params, tus, coeffs, planes[3], owner[3], sched, dbgPred, dbgResi;
+  int                         numGroups = 0;
+  gpu::Buffer                 upload, download;
+
+  // the picture being recorded
+  std::vector<Tu>             rec;
+  std::vector<int32_t>        coef;
+  std::vector<int16_t>        cpuPred, cpuResi;   // verification only
+  size_t                      numSamples = 0;     // samples of the recorded blocks
+  std::string                 unsupportedWhy;
+  int                         poc = 0;
+  bool                        on = false;
+  int                         numOn = 0, numFallback = 0;
+
+  // totals
+  int                         numPictures = 0, numVerified = 0, numMismatch = 0, numSkipped = 0;
+  std::string                 firstSkipReason;
+  double                      gpuMs = 0;
+
+  ~Impl()
+  {
+    if( !ctx )
+    {
+      return;
+    }
+    for( gpu::Buffer* b: { &scratch, &params, &tus, &coeffs, &planes[0], &planes[1], &planes[2],
+                           &owner[0], &owner[1], &owner[2], &sched, &dbgPred, &dbgResi, &upload, &download } )
+    {
+      b->destroy( *ctx );
+    }
+  }
+};
+
+GpuIntraRec* GpuIntraRec::create()
+{
+  gpu::Context* ctx = gpu::Context::get();
+  if( !ctx || !ctx->vulkanMemoryModel() )   // the blocks of a picture synchronize through the Vulkan memory model
+  {
+    return nullptr;
+  }
+  GpuIntraRec* r = new GpuIntraRec;
+  r->m_impl.reset( new Impl );
+  Impl& m = *r->m_impl;
+  m.ctx = ctx;
+  m.sh  = shared( *ctx );
+  m.stream.reset( new gpu::Stream( *ctx ) );
   // persistent workgroups of intra_rec (ECM_GPU_GROUPS overrides)
   m.numGroups = getenv( "ECM_GPU_GROUPS" ) ? std::max( 1, atoi( getenv( "ECM_GPU_GROUPS" ) ) ) : 32;
   m.scratch.create( *ctx, size_t( SCRATCH_INTS ) * 4 * RESI_GROUPS, gpu::Buffer::DEVICE );
   m.params.create( *ctx, sizeof( Params ), gpu::Buffer::DEVICE );
-  m.upload.create( *ctx, ( filt.size() + mat.size() ) * 4, gpu::Buffer::UPLOAD );
-  memcpy( m.upload.mapped, filt.data(), filt.size() * 4 );
-  memcpy( (char*) m.upload.mapped + filt.size() * 4, mat.data(), mat.size() * 4 );
-  m.stream->begin();
-  m.stream->copy( m.upload, 0, m.filters, 0, filt.size() * 4 );
-  m.stream->copy( m.upload, filt.size() * 4, m.matrices, 0, mat.size() * 4 );
-  m.stream->submitAndWait();
   return r;
 }
 
@@ -404,7 +434,7 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
       const int md = dirMode;
       apply = apply && !( ( md >= 2 && md <= 3 ) || ( md >= 17 && md <= 19 ) || ( md >= 33 && md <= 35 ) || ( md >= 49 && md <= 51 ) || ( md >= 65 && md <= 66 ) );
     }
-    apply = apply && m.bif->m_tuSizeFactor[0][std::min( floorLog2( W ), 7 ) * 8 + std::min( floorLog2( H ), 7 )] != 0;
+    apply = apply && m.sh->bif->m_tuSizeFactor[0][std::min( floorLog2( W ), 7 ) * 8 + std::min( floorLog2( H ), 7 )] != 0;
     if( apply )
     {
       if( area.pos() != cu.blocks[COMPONENT_Y].pos() || area.size() != cu.blocks[COMPONENT_Y].size() )
@@ -830,9 +860,9 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
   m.dbgResi.ensure( ctx, dbgBytes, gpu::Buffer::DEVICE );
   P.tus      = m.tus.addr;
   P.coeffs   = m.coeffs.addr;
-  P.filters  = m.filters.addr;
-  P.matrices = m.matrices.addr;
-  memcpy( P.matrixOffset, m.matrixOffset, sizeof( P.matrixOffset ) );
+  P.filters  = m.sh->filters.addr;
+  P.matrices = m.sh->matrices.addr;
+  memcpy( P.matrixOffset, m.sh->matrixOffset, sizeof( P.matrixOffset ) );
   P.scratch  = m.scratch.addr;
   P.dbgPred  = m.dbgPred.addr;
   P.dbgResi  = m.dbgResi.addr;
@@ -893,9 +923,9 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
   s.barrier();
   const uint32_t t0 = s.timestamp();
   Push push{ m.params.addr, (int32_t) m.rec.size(), m.on ? 0 : 1 };
-  s.dispatch( m.kernelResi, &push, (uint32_t) std::min<size_t>( RESI_GROUPS, m.rec.size() ) );   // the residuals
+  s.dispatch( m.sh->kernelResi, &push, (uint32_t) std::min<size_t>( RESI_GROUPS, m.rec.size() ) );   // the residuals
   s.barrier();
-  s.dispatch( m.kernel, &push, (uint32_t) std::min<size_t>( m.numGroups, m.rec.size() ) );
+  s.dispatch( m.sh->kernel, &push, (uint32_t) std::min<size_t>( m.numGroups, m.rec.size() ) );
   const uint32_t t1 = s.timestamp();
   s.barrier();
   size_t off = 0;

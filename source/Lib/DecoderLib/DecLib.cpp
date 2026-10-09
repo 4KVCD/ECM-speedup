@@ -48,8 +48,12 @@
 #include "CommonLib/UnitTools.h"
 #include "CommonLib/ProfileLevelTier.h"
 
+#include <atomic>
+#include <chrono>
 #include <fstream>
+#include <mutex>
 #include <set>
+#include <thread>
 #include <stdio.h>
 #include <fcntl.h>
 #include "AnnexBread.h"
@@ -654,23 +658,71 @@ DecLib::~DecLib()
 }
 
 #if ECM_VULKAN
+// the GPU reconstruction being created by a detached thread (the device and the kernels take ~0.3 s): the decoding
+// does not wait for it, and a process that ends first does not wait either
+struct GpuReconPending
+{
+  std::mutex   mutex;
+  bool         done = false;
+  GpuIntraRec* rec  = nullptr;
+};
+
 void DecLib::setGpuRecon( int mode )
 {
   m_cCuDecoder.setGpuIntraRec( nullptr );
   m_gpuIntraRec.reset();
-  if( mode == 1 || mode == 2 )
+  m_gpuReconPending.reset();
+  m_gpuReconMode = mode >= 1 && mode <= 3 ? mode : 0;
+  if( m_gpuReconMode )
   {
-    m_gpuIntraRec.reset( GpuIntraRec::create() );
-    if( !m_gpuIntraRec )
+    std::shared_ptr<GpuReconPending> pending = std::make_shared<GpuReconPending>();
+    m_gpuReconPending                        = pending;
+    std::thread( [pending] {
+      GpuIntraRec* rec = GpuIntraRec::create();
+      std::lock_guard<std::mutex> lock( pending->mutex );
+      pending->rec  = rec;
+      pending->done = true;
+    } ).detach();
+  }
+}
+
+// before a picture is decoded: takes over the GPU reconstruction once it exists. With the reconstruction on (mode 1),
+// the pictures before are reconstructed by the CPU; verification (2) and mode 3 wait for it
+void DecLib::xPollGpuRecon()
+{
+  if( !m_gpuReconPending )
+  {
+    return;
+  }
+  GpuReconPending& p = *m_gpuReconPending;
+  for( ;; )
+  {
+    {
+      std::lock_guard<std::mutex> lock( p.mutex );
+      if( p.done )
+      {
+        break;
+      }
+    }
+    if( m_gpuReconMode == 1 )
+    {
+      return;
+    }
+    std::this_thread::sleep_for( std::chrono::milliseconds( 1 ) );
+  }
+  m_gpuIntraRec.reset( p.rec );
+  m_gpuReconPending.reset();
+  if( !m_gpuIntraRec )
+  {
+    static std::atomic<bool> warned( false );   // once, not per frame-thread context
+    if( !warned.exchange( true ) )
     {
       msg( WARNING, "GPU reconstruction: no usable Vulkan device (%s)\n", gpu::Context::lastError().c_str() );
     }
-    else
-    {
-      m_gpuIntraRec->setOn( mode == 1 );
-    }
-    m_cCuDecoder.setGpuIntraRec( m_gpuIntraRec.get() );
+    return;
   }
+  m_gpuIntraRec->setOn( m_gpuReconMode != 2 );
+  m_cCuDecoder.setGpuIntraRec( m_gpuIntraRec.get() );
 }
 
 void DecLib::setGpuLoopFilter( int mode )
@@ -1773,6 +1825,9 @@ void DecLib::xDecodeSliceData( Slice* pcSlice, InputBitstream* bitstream, DecSli
 #endif
 
   //  Decode a picture
+#if ECM_VULKAN
+  xPollGpuRecon();
+#endif
   m_cSliceDecoder.decompressSlice( pcSlice, bitstream, ( m_pcPic->poc == getDebugPOC() ? getDebugCTU() : -1 ), state, *m_waitHub );
 }
 
