@@ -67,6 +67,7 @@ struct VkFn
   GPU_VK_FN( GetPhysicalDeviceFeatures2 )
   GPU_VK_FN( GetPhysicalDeviceMemoryProperties )
   GPU_VK_FN( GetPhysicalDeviceQueueFamilyProperties )
+  GPU_VK_FN( EnumerateDeviceExtensionProperties )
   GPU_VK_FN( CreateDevice )
   GPU_VK_FN( GetDeviceProcAddr )
   GPU_VK_FN( DestroyDevice )
@@ -134,6 +135,8 @@ public:
   const char*               deviceName() const { return m_props.deviceName; }
   /// the device runs kernels that use the Vulkan memory model (with device scope)
   bool                      vulkanMemoryModel() const { return m_vulkanMemoryModel; }
+  /// kernels may read the device-wide clock (clockRealtimeEXT / VK_KHR_shader_clock)
+  bool                      shaderDeviceClock() const { return m_shaderDeviceClock; }
   /// a memory type with the wanted properties among those in typeBits, preferring types without the avoided ones;
   /// UINT32_MAX when there is none
   uint32_t                  memoryType( uint32_t typeBits, VkMemoryPropertyFlags want, VkMemoryPropertyFlags avoid ) const;
@@ -163,6 +166,7 @@ private:
   VkPhysicalDeviceMemoryProperties m_memProps{};
   uint32_t                  m_queueFamily = 0;
   bool                      m_vulkanMemoryModel = false;
+  bool                      m_shaderDeviceClock = false;
   std::vector<VkQueue>      m_queues;
   std::unique_ptr<std::mutex[]> m_queueLocks;
   uint32_t                  m_nextQueue = 0;

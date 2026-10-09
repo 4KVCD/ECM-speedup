@@ -70,7 +70,9 @@ struct Tu
   int32_t dbgOffset;
   int32_t plIdx;
   int32_t refFilter, applyPDPC, gradPDPC, angularScale, fusion, disableRefFilter;
-  int32_t pad[15];
+  int32_t avail[2][5];
+  int32_t readMax[2][2];
+  int32_t pad[1];
 };
 static_assert( sizeof( Tu ) == 48 * 4, "Tu layout" );
 
@@ -86,7 +88,10 @@ struct Params
   uint64_t scratch;
   uint64_t dbgPred;
   uint64_t dbgResi;
-  uint64_t done;
+  uint64_t depCount;
+  uint64_t depOffset;
+  uint64_t depList;
+  uint64_t queue;
   uint64_t counter;
   int32_t  origin[3];
   int32_t  stride[3];
@@ -98,7 +103,7 @@ struct Params
   int32_t  unitLog2Y[2];
   int32_t  matrixOffset[8];
 };
-static_assert( offsetof( Params, origin ) == 120 && offsetof( Params, matrixOffset ) == 200 && sizeof( Params ) == 232,
+static_assert( offsetof( Params, origin ) == 144 && offsetof( Params, matrixOffset ) == 224 && sizeof( Params ) == 256,
                "Params layout" );
 
 struct Push
@@ -119,7 +124,7 @@ struct GpuIntraRec::Impl
   gpu::Kernel                 kernel, kernelResi;
   std::unique_ptr<gpu::Stream> stream;
   gpu::Buffer                 filters, matrices, scratch;
-  gpu::Buffer                 params, tus, coeffs, planes[3], owner[3], done, dbgPred, dbgResi;
+  gpu::Buffer                 params, tus, coeffs, planes[3], owner[3], sched, dbgPred, dbgResi;
   int                         numGroups = 0;
   gpu::Buffer                 upload, download;
   int32_t                     matrixOffset[8] = {};
@@ -143,7 +148,7 @@ struct GpuIntraRec::Impl
       return;
     }
     for( gpu::Buffer* b: { &filters, &matrices, &scratch, &params, &tus, &coeffs, &planes[0], &planes[1], &planes[2],
-                           &owner[0], &owner[1], &owner[2], &done, &dbgPred, &dbgResi, &upload, &download } )
+                           &owner[0], &owner[1], &owner[2], &sched, &dbgPred, &dbgResi, &upload, &download } )
     {
       b->destroy( *ctx );
     }
@@ -428,11 +433,206 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
     m.owner[c].ensure( ctx, ownerBytes[c], gpu::Buffer::DEVICE );
     P.owner[c] = m.owner[c].addr;
   }
+  // dependencies: the blocks owning a sample a block reads - geometry, decoding order and syntax only. Per reference
+  // line: the availability the CPU sees (corner flag, available prefix of each unit group), the highest top / left
+  // index the prediction can read (a superset), then for each sample in that range its owner, or for an unavailable
+  // sample the owner of its padding source (the same rule as the kernel's fill)
+  const int numTus = (int) m.rec.size();
+  std::vector<std::vector<int>> deps( numTus );
+  {
+    constexpr int PAD = 6;   // interpFilterNumPadded
+    std::vector<int> mark( numTus, -1 );
+    for( int i = 0; i < numTus; i++ )
+    {
+      Tu&       t  = m.rec[i];
+      const int ch = t.comp == 0 ? 0 : 1;
+      auto own = [&]( int c, int x, int y ) -> int
+      {
+        if( x < 0 || y < 0 || ( x >> P.unitLog2X[ch] ) >= P.ownerW[ch] || ( y >> P.unitLog2Y[ch] ) >= P.ownerH[ch] )
+        {
+          return -1;
+        }
+        return ownerMap[c][size_t( y >> P.unitLog2Y[ch] ) * P.ownerW[ch] + ( x >> P.unitLog2X[ch] )];
+      };
+      const int availComp = t.comp == 0 ? 0 : 1;
+      auto avail = [&]( int x, int y ) { const int a = own( availComp, x, y ); return a >= 0 && a < i; };
+      const int numAbove = std::max( t.w / t.unitW, 1 ), numLeft = std::max( t.h / t.unitH, 1 );
+      const int tAU = ( t.w << 3 ) / t.unitW, tLU = ( t.h << 3 ) / t.unitH, totalUnits = tAU + tLU + 1;
+      memset( t.avail, 0, sizeof( t.avail ) );
+      memset( t.readMax, 0, sizeof( t.readMax ) );
+      for( int mrl = 0; mrl <= ( t.fusion ? 1 : 0 ); mrl++ )
+      {
+        const int x0 = t.x - 1 - mrl, y0 = t.y - 1 - mrl;
+        int* av = t.avail[mrl];
+        av[0] = avail( x0, y0 ) ? 1 : 0;
+        int k;
+        for( k = 0; k < numAbove && avail( t.x + k * t.unitW, y0 ); k++ ) {}
+        av[1] = k;
+        for( k = 0; k < tAU - numAbove && avail( t.x + t.w - 1 + t.unitW + k * t.unitW, y0 ); k++ ) {}
+        av[2] = k;
+        for( k = 0; k < numLeft && avail( x0, t.y + k * t.unitH ); k++ ) {}
+        av[3] = k;
+        for( k = 0; k < tLU - numLeft && avail( x0, t.y + t.h - 1 + t.unitH + k * t.unitH ); k++ ) {}
+        av[4] = k;
+
+        // the read range
+        const int W = t.w, H = t.h, rf = t.refFilter ? 1 : 0;
+        int topMax, leftMax;
+        if( t.dirMode == PLANAR_IDX )
+        {
+          topMax  = W + 1 + rf;
+          leftMax = H + 1 + rf;
+        }
+        else if( t.dirMode == DC_IDX )
+        {
+          topMax  = W + 1;
+          leftMax = H + 1;
+        }
+        else
+        {
+          const bool ver = t.isModeVer != 0;
+          const int  w = ver ? W : H, h = ver ? H : W, refLength = 8 * w, sideLength = 8 * h;
+          const int  angle = t.intraPredAngle;
+          int mainMax, sideMax;
+          if( mrl == 0 )
+          {
+            if( angle == 0 )
+            {
+              mainMax = w + 1;
+              sideMax = t.applyPDPC ? h + 1 : 1;
+            }
+            else if( angle < 0 )
+            {
+              mainMax = w + PAD + 2;   // the copied part (the extension reads the side up to sizeSide + 2)
+              sideMax = h + PAD + 2;
+            }
+            else
+            {
+              mainMax = std::min( refLength, ( ( angle * h ) >> 5 ) + w + 10 );   // beyond refLength: its replicated value
+              sideMax = 1;
+              if( t.applyPDPC )
+              {
+                const int limit = std::min( 3 << t.angularScale, w );
+                sideMax = t.gradPDPC ? h + 1 : std::min( sideLength, h + ( ( 256 + limit * t.absInvAngle ) >> 9 ) + 1 );
+              }
+            }
+            mainMax += rf;
+            sideMax += rf;
+          }
+          else   // the fusion line (non-integer slopes)
+          {
+            if( angle < 0 )
+            {
+              mainMax = w + PAD + 10;
+              sideMax = std::min( sideLength + 1, ( ( ( h + 1 + PAD ) * t.absInvAngle + 8 ) >> 4 >> 5 ) + 3 );
+            }
+            else
+            {
+              mainMax = std::min( refLength + 1, ( ( angle * ( h + 1 ) ) >> 5 ) + w + 12 );
+              sideMax = 1;
+            }
+          }
+          topMax  = ver ? mainMax : sideMax;
+          leftMax = ver ? sideMax : mainMax;
+        }
+        t.readMax[mrl][0] = std::max( mrl, std::min( topMax, 8 * W + mrl ) );
+        t.readMax[mrl][1] = std::max( mrl, std::min( leftMax, 8 * H + mrl ) );
+
+        // the owners of the samples in range (the kernel's fill rule)
+        const int corner = av[0], pA = av[1], pAR = av[2], pL = av[3], pBL = av[4];
+        const int blS = tLU - numLeft - pBL, blE = tLU - 1 - numLeft, lS = tLU - pL, lE = tLU - 1;
+        const int aS = tLU + 1, aE = tLU + pA, arS = tLU + 1 + numAbove, arE = tLU + numAbove + pAR;
+        int firstAvail = totalUnits;
+        if( pAR > 0 ) firstAvail = arS;
+        if( pA > 0 ) firstAvail = aS;
+        if( corner ) firstAvail = tLU;
+        if( pL > 0 ) firstAvail = lS;
+        if( pBL > 0 ) firstAvail = blS;
+        if( firstAvail >= totalUnits )
+        {
+          continue;   // no neighbour: the DC value
+        }
+        for( int side = 0; side < 2; side++ )
+        {
+          const bool top = side == 0;
+          for( int idx = 0; idx <= t.readMax[mrl][side]; idx++ )
+          {
+            const int u = idx <= mrl ? tLU : top ? tLU + 1 + ( idx - 1 - mrl ) / t.unitW : tLU - 1 - ( idx - 1 - mrl ) / t.unitH;
+            int pm = -1;
+            if( pBL > 0 && blS <= u ) pm = std::max( pm, std::min( u, blE ) );
+            if( pL > 0 && lS <= u ) pm = std::max( pm, std::min( u, lE ) );
+            if( corner && tLU <= u ) pm = std::max( pm, tLU );
+            if( pA > 0 && aS <= u ) pm = std::max( pm, std::min( u, aE ) );
+            if( pAR > 0 && arS <= u ) pm = std::max( pm, std::min( u, arE ) );
+            int sx, sy;
+            if( pm == u )
+            {
+              sx = top ? x0 + idx : x0;
+              sy = top ? y0 : y0 + idx;
+            }
+            else
+            {
+              const bool before = pm >= 0;
+              const int  s = before ? pm : firstAvail;
+              if( s == tLU )
+              {
+                sx = before ? x0 + mrl : x0;
+                sy = before ? y0 : y0 + mrl;
+              }
+              else if( s > tLU )
+              {
+                sx = x0 + ( before ? ( s - tLU ) * t.unitW + mrl : ( s - tLU - 1 ) * t.unitW + 1 + mrl );
+                sy = y0;
+              }
+              else
+              {
+                sx = x0;
+                sy = y0 + ( before ? ( tLU - s - 1 ) * t.unitH + 1 + mrl : ( tLU - s ) * t.unitH + mrl );
+              }
+            }
+            const int o = own( t.comp, sx, sy );
+            if( o >= 0 && o < i && mark[o] != i )
+            {
+              mark[o] = i;
+              deps[i].push_back( o );
+            }
+          }
+        }
+      }
+    }
+  }
+  // the scheduling data: pending counts, the dependents of each block (CSR), the queue seeded with the blocks
+  // without dependencies, the two queue counters
+  std::vector<int32_t> sched;
+  {
+    std::vector<int32_t> numDependents( numTus + 1, 0 );
+    for( int i = 0; i < numTus; i++ ) for( int d: deps[i] ) numDependents[d + 1]++;
+    sched.resize( size_t( numTus ) * 3 + 1 + numDependents.size() + 2 );
+    int32_t* depCount = sched.data();
+    int32_t* depOffset = depCount + numTus;
+    for( int i = 0; i < numTus; i++ ) depCount[i] = (int32_t) deps[i].size();
+    depOffset[0] = 0;
+    for( int i = 0; i < numTus; i++ ) depOffset[i + 1] = depOffset[i] + numDependents[i + 1];
+    const int numEdges = depOffset[numTus];
+    sched.resize( size_t( numTus ) * 2 + 1 + numEdges + numTus + 2 );
+    depCount  = sched.data();
+    depOffset = depCount + numTus;
+    int32_t* depList = depOffset + numTus + 1;
+    int32_t* queue   = depList + numEdges;
+    int32_t* counter = queue + numTus;
+    std::vector<int32_t> fillPos( depOffset, depOffset + numTus );
+    for( int i = 0; i < numTus; i++ ) for( int d: deps[i] ) depList[fillPos[d]++] = i;
+    int numReady = 0;
+    for( int i = 0; i < numTus; i++ ) queue[i] = -1;
+    for( int i = 0; i < numTus; i++ ) if( depCount[i] == 0 ) queue[numReady++] = i;
+    counter[0] = 0;
+    counter[1] = numReady;
+  }
+  const size_t schedBytes = sched.size() * 4;
   const size_t tuBytes = m.rec.size() * sizeof( Tu ), coefBytes = m.coef.size() * 4, dbgBytes = m.cpuPred.size() * 2;
-  const size_t doneBytes = ( m.rec.size() + 1 ) * 4;   // the done flags, then the block counter
   m.tus.ensure( ctx, tuBytes, gpu::Buffer::DEVICE );
   m.coeffs.ensure( ctx, std::max<size_t>( coefBytes, 4 ), gpu::Buffer::DEVICE );
-  m.done.ensure( ctx, doneBytes, gpu::Buffer::DEVICE );
+  m.sched.ensure( ctx, schedBytes, gpu::Buffer::DEVICE );
   m.dbgPred.ensure( ctx, dbgBytes, gpu::Buffer::DEVICE );
   m.dbgResi.ensure( ctx, dbgBytes, gpu::Buffer::DEVICE );
   P.tus      = m.tus.addr;
@@ -443,10 +643,16 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
   P.scratch  = m.scratch.addr;
   P.dbgPred  = m.dbgPred.addr;
   P.dbgResi  = m.dbgResi.addr;
-  P.done     = m.done.addr;
-  P.counter  = m.done.addr + m.rec.size() * 4;
+  {
+    size_t numEdges = sched.size() - ( size_t( numTus ) * 3 + 1 + 2 );
+    P.depCount  = m.sched.addr;
+    P.depOffset = P.depCount + size_t( numTus ) * 4;
+    P.depList   = P.depOffset + ( size_t( numTus ) + 1 ) * 4;
+    P.queue     = P.depList + numEdges * 4;
+    P.counter   = P.queue + size_t( numTus ) * 4;
+  }
 
-  size_t upBytes = sizeof( Params ) + tuBytes + coefBytes;
+  size_t upBytes = sizeof( Params ) + tuBytes + coefBytes + schedBytes;
   for( int c = 0; c < numComp; c++ )
   {
     upBytes += ownerBytes[c];
@@ -464,6 +670,7 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
     memcpy( (char*) m.upload.mapped + up, ownerMap[c].data(), ownerBytes[c] );
     up += ownerBytes[c];
   }
+  memcpy( (char*) m.upload.mapped + up, sched.data(), schedBytes );
   size_t downBytes = 2 * dbgBytes;
   for( int c = 0; c < numComp; c++ )
   {
@@ -489,7 +696,7 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
     up += ownerBytes[c];
     s.fill( m.planes[c], 0, ( planeBytes[c] + 3 ) & ~size_t( 3 ), 0 );
   }
-  s.fill( m.done, 0, doneBytes, 0 );
+  s.copy( m.upload, up, m.sched, 0, schedBytes );
   s.barrier();
   const uint32_t t0 = s.timestamp();
   Push push{ m.params.addr, (int32_t) m.rec.size(), 0 };
@@ -582,41 +789,12 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
   m.numVerified++;
   const bool bad = numBad > 0 || !first.empty();
   m.numMismatch += bad ? 1 : 0;
-  // the longest chain of blocks that read each other's samples (the available units of the reference arrays, with
-  // the early stop of each group, as the kernel reads them)
-  std::vector<int> depth( m.rec.size(), 1 );
+  // the longest chain of blocks that read each other's samples
+  std::vector<int> depth( numTus, 1 );
   int maxDepth = 0;
-  for( size_t i = 0; i < m.rec.size(); i++ )
+  for( int i = 0; i < numTus; i++ )
   {
-    const Tu& t  = m.rec[i];
-    const int ch = t.comp == 0 ? 0 : 1;
-    auto own = [&]( int c, int x, int y ) -> int
-    {
-      if( x < 0 || y < 0 || ( x >> P.unitLog2X[ch] ) >= P.ownerW[ch] || ( y >> P.unitLog2Y[ch] ) >= P.ownerH[ch] )
-      {
-        return -1;
-      }
-      return ownerMap[c][size_t( y >> P.unitLog2Y[ch] ) * P.ownerW[ch] + ( x >> P.unitLog2X[ch] )];
-    };
-    const int availComp = t.comp == 0 ? 0 : 1;
-    auto dep = [&]( int x, int y ) -> bool   // available: the block reading it depends on its owner
-    {
-      const int a = own( availComp, x, y );
-      if( a < 0 || a >= (int) i )
-      {
-        return false;
-      }
-      const int o = own( t.comp, x, y );
-      depth[i] = std::max( depth[i], depth[o] + 1 );
-      return true;
-    };
-    const int numAbove = std::max( t.w / t.unitW, 1 ), numLeft = std::max( t.h / t.unitH, 1 );
-    const int tAU = ( t.w << 3 ) / t.unitW, tLU = ( t.h << 3 ) / t.unitH;
-    dep( t.x - 1, t.y - 1 );
-    for( int k = 0; k < numAbove && dep( t.x + k * t.unitW, t.y - 1 ); k++ ) {}
-    for( int k = 0; k < tAU - numAbove && dep( t.x + t.w - 1 + t.unitW + k * t.unitW, t.y - 1 ); k++ ) {}
-    for( int k = 0; k < numLeft && dep( t.x - 1, t.y + k * t.unitH ); k++ ) {}
-    for( int k = 0; k < tLU - numLeft && dep( t.x - 1, t.y + t.h - 1 + t.unitH + k * t.unitH ); k++ ) {}
+    for( int d: deps[i] ) depth[i] = std::max( depth[i], depth[d] + 1 );
     maxDepth = std::max( maxDepth, depth[i] );
   }
   int numFilter = 0, numPdpc = 0, numGrad = 0, numFusion = 0;

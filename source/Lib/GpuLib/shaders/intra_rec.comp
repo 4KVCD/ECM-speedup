@@ -1,8 +1,9 @@
 #version 460
 #pragma use_vulkan_memory_model
-// intra reconstruction of a picture on the GPU: persistent workgroups take the transform blocks in the CPU's decoding
-// order from a counter; a block waits only for the blocks whose samples it reads (per-unit owner maps from the host,
-// done flags), so independent blocks (the three components, distant parts of the picture) run at the same time.
+// intra reconstruction of a picture on the GPU: persistent workgroups take the transform blocks from a queue of ready
+// blocks; a block is ready when the blocks whose samples it reads are reconstructed (dependency lists and counts
+// from the host: geometry and decoding order only), so independent blocks (the three components, distant parts of
+// the picture) run at the same time and no workgroup waits on a block it holds.
 // Per block: reference samples (and their [1 2 1] filtering), prediction (planar, directional planar, DC, angular
 // with PDPC and intra fusion) and reconstruction with the residual intra_resi computed beforehand for all blocks at
 // once. Every step follows the C++ of IntraPrediction / DecCu.
@@ -49,40 +50,9 @@ int weak4( int frac, int i )
   return BufI32( P.filters ).v[WEAK4 + frac * 4 + i];
 }
 
-// the block covering sample (x, y) of component comp, -1 outside the picture
-int ownerAt( int comp, int x, int y )
-{
-  const int ch = comp == 0 ? 0 : 1;
-  if( x < 0 || y < 0 )
-  {
-    return -1;
-  }
-  int ux = x >> P.unitLog2X[ch], uy = y >> P.unitLog2Y[ch];
-  if( ux >= P.ownerW[ch] || uy >= P.ownerH[ch] )
-  {
-    return -1;
-  }
-  return BufI32( P.owner[comp] ).v[uy * P.ownerW[ch] + ux];
-}
-
-// CodingStructure::isDecomp at the time of block g_ti (the chroma channel type by the Cb blocks, which the CPU
-// reconstructs before the Cr blocks)
-bool isDecomp( int ch, int x, int y )
-{
-  const int o = ownerAt( ch == 0 ? 0 : 1, x, y );
-  return o >= 0 && o < g_ti;
-}
-
-// a reconstructed sample of an earlier block, once that block is done
+// a reconstructed sample of an earlier block (all blocks read are reconstructed before the block is queued)
 int recoAt( int comp, int x, int y )
 {
-  const int o = ownerAt( comp, x, y );
-  if( o >= 0 && o < g_ti )
-  {
-    while( atomicLoad( CBufI32( P.done ).v[o], gl_ScopeQueueFamily, gl_StorageSemanticsBuffer, gl_SemanticsAcquire ) == 0 )
-    {
-    }
-  }
   return int( CBufI16( P.plane[comp] ).v[P.origin[comp] + y * P.stride[comp] + x] );
 }
 
@@ -96,111 +66,42 @@ int asPel( int v )   // the int16 Pel the CPU stores
   return int( int16_t( v ) );
 }
 
-// xFillReferenceSamples, all invocations (multiRefIdx 0 or 1, so no MRL units: lMU = aMU = 0). The CPU's padding is
-// "an unavailable unit takes the scan-order nearest available sample before it (the bottom-left unit first, up the
-// left column, the corner, along the top), units before the first available one take its first sample"; the units
-// are checked in parallel (with the early stop of isAboveAvailable & co. per group), the nearest available unit
-// before each unit comes from a subgroup prefix maximum, and every sample is then fetched by its own invocation.
-shared int s_avail[2 * 256 + 4];   // per unit: 1 available
-shared int s_prev[2 * 256 + 4];    // per unit: the nearest available unit at or before it, -1 if none
-shared int s_carry[64];
-shared int s_fail[4];
-shared int s_firstAvail;
-
+// xFillReferenceSamples, all invocations, no barrier (multiRefIdx 0 or 1, so no MRL units: lMU = aMU = 0). The units
+// available to the CPU are given per group (corner flag, the available prefix of the above, above-right, left and
+// below-left units: geometry and decoding order only), i.e. at most five intervals in the CPU's unit order (the
+// bottom-left unit first, up the left column, the corner, along the top). The CPU's padding is "an unavailable unit
+// takes the nearest available sample before it in that order; units before the first available one take its first
+// sample"; every sample is fetched by its own invocation.
 void fillReferencePar( Tu t, int line, int mrl, int lid, int NT )
 {
-  const int ch        = t.comp == 0 ? 0 : 1;
   const int predSize  = t.w << 3, predHSize = t.h << 3;
   const int predStride = predSize + 1 + mrl;
   const int uW = t.unitW, uH = t.unitH;
   const int tAU = predSize / uW, tLU = predHSize / uH;   // multiples (8x the block size)
   const int totalUnits = tAU + tLU + 1;
   const int numAbove = max( t.w / uW, 1 ), numLeft = max( t.h / uH, 1 );
-  const int numAboveRight = tAU - numAbove, numBelowLeft = tLU - numLeft;
   const int x0 = t.x - 1 - mrl, y0 = t.y - 1 - mrl;
-
-  if( lid < 4 )
-  {
-    s_fail[lid] = 1 << 20;
-  }
-  if( lid == 0 )
-  {
-    s_firstAvail = 1 << 20;
-  }
-  barrier();
-  // decoded flags per unit; group g: 0 above, 1 above-right, 2 left, 3 below-left; k = position in the group
-  for( int u = lid; u < totalUnits; u += NT )
-  {
-    int px, py, g = -1, k = 0;
-    if( u == tLU )
-    {
-      px = x0; py = y0;
-    }
-    else if( u > tLU )
-    {
-      int a = u - tLU - 1;
-      if( a < numAbove ) { g = 0; k = a; px = t.x + a * uW; }
-      else { g = 1; k = a - numAbove; px = t.x + t.w - 1 + uW + k * uW; }
-      py = y0;
-    }
-    else
-    {
-      int l = tLU - 1 - u;
-      if( l < numLeft ) { g = 2; k = l; py = t.y + l * uH; }
-      else { g = 3; k = l - numLeft; py = t.y + t.h - 1 + uH + k * uH; }
-      px = x0;
-    }
-    const bool d = isDecomp( ch, px, py );
-    s_avail[u] = ( d ? 1 : 0 ) | ( ( g + 1 ) << 1 ) | ( k << 4 );
-    if( !d && g >= 0 )
-    {
-      atomicMin( s_fail[g], k );
-    }
-  }
-  barrier();
-  // early stop per group; prefix maximum of the available unit indices (per subgroup, then across subgroups)
-  const int numChunks = ( totalUnits + int( gl_SubgroupSize ) - 1 ) / int( gl_SubgroupSize );
-  for( int base = 0; base < numChunks * int( gl_SubgroupSize ); base += NT )
-  {
-    const int u = base + lid;
-    int a = 0;
-    if( u < totalUnits )
-    {
-      const int v = s_avail[u], g = ( ( v >> 1 ) & 7 ) - 1, k = v >> 4;
-      a = ( v & 1 ) != 0 && ( g < 0 || k < s_fail[g] ) ? 1 : 0;
-    }
-    const int m = subgroupInclusiveMax( a != 0 ? u : -1 );
-    if( u < totalUnits )
-    {
-      s_prev[u] = m;
-      if( a != 0 ) atomicMin( s_firstAvail, u );
-    }
-    if( gl_SubgroupInvocationID == gl_SubgroupSize - 1 && u / int( gl_SubgroupSize ) < 64 )
-    {
-      s_carry[u / int( gl_SubgroupSize )] = m;
-    }
-  }
-  barrier();
-  if( lid == 0 )
-  {
-    int c = -1;
-    for( int i = 0; i < numChunks; i++ )
-    {
-      const int m = s_carry[i];
-      s_carry[i] = c;   // the maximum before chunk i
-      c = max( c, m );
-    }
-  }
-  barrier();
-  const int firstAvail = s_firstAvail;
+  const int corner = t.avail[line][0], pA = t.avail[line][1], pAR = t.avail[line][2], pL = t.avail[line][3], pBL = t.avail[line][4];
+  // the available intervals [start, end] in unit order (empty when the prefix is 0)
+  const int blS = tLU - numLeft - pBL, blE = tLU - 1 - numLeft;
+  const int lS = tLU - pL, lE = tLU - 1;
+  const int aS = tLU + 1, aE = tLU + pA;
+  const int arS = tLU + 1 + numAbove, arE = tLU + numAbove + pAR;
+  int firstAvail = totalUnits;
+  if( pAR > 0 ) firstAvail = arS;
+  if( pA > 0 ) firstAvail = aS;
+  if( corner != 0 ) firstAvail = tLU;
+  if( pL > 0 ) firstAvail = lS;
+  if( pBL > 0 ) firstAvail = blS;
   const int valueDC = 1 << ( t.bitDepth - 1 );
-  // samples: top j in [0, predSize + mrl], then left i in [0, predHSize + mrl]
-  const int numTop = predSize + mrl + 1;
-  for( int e = lid; e < numTop + predHSize + mrl + 1; e += NT )
+  // samples read (the host's superset of what the prediction reads; entries beyond are never read): top j in
+  // [0, readMax[line][0]], then left i in [0, readMax[line][1]]
+  const int numTop = t.readMax[line][0] + 1;
+  for( int e = lid; e < numTop + t.readMax[line][1] + 1; e += NT )
   {
     const bool top = e < numTop;
     const int idx = top ? e : e - numTop;
-    int u = idx <= mrl ? tLU : top ? tLU + 1 + ( idx - 1 - mrl ) / uW : tLU - 1 - ( idx - 1 - mrl ) / uH;
+    const int u = idx <= mrl ? tLU : top ? tLU + 1 + ( idx - 1 - mrl ) / uW : tLU - 1 - ( idx - 1 - mrl ) / uH;
     int v;
     if( firstAvail >= totalUnits )
     {
@@ -208,7 +109,13 @@ void fillReferencePar( Tu t, int line, int mrl, int lid, int NT )
     }
     else
     {
-      const int pm = max( s_prev[u], s_carry[u / int( gl_SubgroupSize )] );
+      // the nearest available unit at or before u
+      int pm = -1;
+      if( pBL > 0 && blS <= u ) pm = max( pm, min( u, blE ) );
+      if( pL > 0 && lS <= u ) pm = max( pm, min( u, lE ) );
+      if( corner != 0 && tLU <= u ) pm = max( pm, tLU );
+      if( pA > 0 && aS <= u ) pm = max( pm, min( u, aE ) );
+      if( pAR > 0 && arS <= u ) pm = max( pm, min( u, arE ) );
       int sx, sy;
       if( pm == u )   // available: its own sample
       {
@@ -226,15 +133,13 @@ void fillReferencePar( Tu t, int line, int mrl, int lid, int NT )
         }
         else if( s > tLU )
         {
-          const int j = before ? ( s - tLU ) * uW + mrl : ( s - tLU - 1 ) * uW + 1 + mrl;
-          sx = x0 + j;
+          sx = x0 + ( before ? ( s - tLU ) * uW + mrl : ( s - tLU - 1 ) * uW + 1 + mrl );
           sy = y0;
         }
         else
         {
-          const int i = before ? ( tLU - s - 1 ) * uH + 1 + mrl : ( tLU - s ) * uH + mrl;
           sx = x0;
-          sy = y0 + i;
+          sy = y0 + ( before ? ( tLU - s - 1 ) * uH + 1 + mrl : ( tLU - s ) * uH + mrl );
         }
       }
       v = recoAt( t.comp, sx, sy );
@@ -289,13 +194,27 @@ void main()
   const int NT  = int( gl_WorkGroupSize.x );
   P = BufParams( pc.params ).p;
 
+  for( int i = lid; i < ANG; i += NT )   // the angular arrays are zero between blocks
+  {
+    s_angA[0][i] = int16_t( 0 ); s_angL[0][i] = int16_t( 0 );
+    s_angA[1][i] = int16_t( 0 ); s_angL[1][i] = int16_t( 0 );
+  }
   for( ;; )
   {
-    // the next block (in decoding order, so every block waited for is taken by a running workgroup)
+    // the next ready block: a queue position, then (once filled) the block at it
     SYNC();
     if( lid == 0 )
     {
-      s_ti = atomicAdd( CBufI32( P.counter ).v[0], 1 );
+      const int pos = atomicAdd( CBufI32( P.counter ).v[0], 1 );
+      int b = pc.numTus;
+      if( pos < pc.numTus )
+      {
+        do
+        {
+          b = atomicLoad( CBufI32( P.queue ).v[pos], gl_ScopeQueueFamily, gl_StorageSemanticsBuffer, gl_SemanticsAcquire );
+        } while( b < 0 );
+      }
+      s_ti = b;
     }
     SYNC();
     g_ti = s_ti;
@@ -304,6 +223,8 @@ void main()
       break;
     }
     Tu t = BufTu( P.tus ).v[g_ti];
+    int  angClear  = 0;
+    bool angClear2 = false;
     const int W = t.w, H = t.h, N = W * H;
     const int maxPel = ( 1 << t.bitDepth ) - 1;
     const int predStride = ( W << 3 ) + 1, predSize = W << 3, predHSize = H << 3;
@@ -313,7 +234,6 @@ void main()
     fillReferencePar( t, 0, 0, lid, NT );
     if( fusion )
     {
-      SYNC();
       fillReferencePar( t, 1, 1, lid, NT );
     }
     SYNC();
@@ -388,36 +308,28 @@ void main()
     {
       const bool isVer = t.isModeVer != 0;
       const int angle = t.intraPredAngle, absInvAngle = t.absInvAngle;
-      for( int i = lid; i < ANG; i += NT )
-      {
-        s_angA[0][i] = int16_t( 0 ); s_angL[0][i] = int16_t( 0 );
-        s_angA[1][i] = int16_t( 0 ); s_angL[1][i] = int16_t( 0 );
-      }
-      SYNC();
+      // the arrays are zero on entry (cleared after use, like the CPU's persistent buffers); every entry below is
+      // computed directly from the reference lines (the CPU's copies, padding, end replication and negative-angle
+      // extension), so one barrier suffices
       const int topRefLength = W << 3, leftRefLength = H << 3;
       const int predStride2 = predStride + 1;   // the fusion line (multiRefIdx 1)
-      int mainBase, sideBase, mainBase2 = 0, sideBase2 = 0;
+      const int sizeSide = isVer ? H : W;
+      const int refLength = isVer ? topRefLength : leftRefLength;
+      int mainBase, sideBase, mainBase2, sideBase2;
       if( angle < 0 )
       {
-        for( int i = lid; i < W + PAD + 2; i += NT ) s_angA[0][H + PAD + i] = s_ref[0][i];
-        for( int i = lid; i < H + PAD + 2; i += NT ) s_angL[0][W + PAD + i] = s_ref[0][predStride + i];
-        if( fusion )
-        {
-          for( int i = lid; i < topRefLength + PAD + 1; i += NT ) s_angA[1][H + PAD + 1 + i] = s_ref[1][i];
-          for( int i = lid; i < leftRefLength + PAD + 1; i += NT ) s_angL[1][W + PAD + 1 + i] = s_ref[1][predStride2 + i];
-        }
-        SYNC();
         mainBase = ( isVer ? H : W ) + PAD;
         sideBase = ( isVer ? W : H ) + PAD;
-        mainBase2 = mainBase + 1;
-        sideBase2 = sideBase + 1;
-        const int sizeSide = isVer ? H : W;
+        for( int i = lid; i < W + PAD + 2; i += NT ) s_angA[0][H + PAD + i] = s_ref[0][i];
+        for( int i = lid; i < H + PAD + 2; i += NT ) s_angL[0][W + PAD + i] = s_ref[0][predStride + i];
+        // side entry j (copied above) = the reference line itself
+        const int sideOff = isVer ? predStride : 0;
         for( int k = -( sizeSide + PAD ) + lid; k <= -1; k += NT )
         {
           int frac32precision = ( -k * absInvAngle + 8 ) >> 4;
           int intpel = frac32precision >> 5, fracpel = frac32precision & 31;
-          int left  = sideR( isVer, 0, sideBase + clip3i( 0, sizeSide + 2, intpel ) );
-          int right = sideR( isVer, 0, sideBase + clip3i( 0, sizeSide + 2, intpel + 1 ) );
+          int left  = int( s_ref[0][sideOff + clip3i( 0, sizeSide + 2, intpel ) ] );
+          int right = int( s_ref[0][sideOff + clip3i( 0, sizeSide + 2, intpel + 1 ) ] );
           int v;
           if( t.disableRefFilter != 0 )
           {
@@ -425,21 +337,26 @@ void main()
           }
           else
           {
-            int lm1 = sideR( isVer, 0, sideBase + clip3i( 0, sizeSide + 2, intpel - 1 ) );
-            int rp1 = sideR( isVer, 0, sideBase + clip3i( 0, sizeSide + 2, intpel + 2 ) );
+            int lm1 = int( s_ref[0][sideOff + clip3i( 0, sizeSide + 2, intpel - 1 ) ] );
+            int rp1 = int( s_ref[0][sideOff + clip3i( 0, sizeSide + 2, intpel + 2 ) ] );
             v = clip3i( 0, maxPel, ( weak4( fracpel, 0 ) * lm1 + weak4( fracpel, 1 ) * left + weak4( fracpel, 2 ) * right + weak4( fracpel, 3 ) * rp1 + 32 ) >> 6 );
           }
           mainW( isVer, 0, mainBase + k, v );
         }
+        mainBase2 = mainBase + 1;
+        sideBase2 = sideBase + 1;
         if( fusion )
         {
+          for( int i = lid; i < topRefLength + PAD + 1; i += NT ) s_angA[1][H + PAD + 1 + i] = s_ref[1][i];
+          for( int i = lid; i < leftRefLength + PAD + 1; i += NT ) s_angL[1][W + PAD + 1 + i] = s_ref[1][predStride2 + i];
+          const int sideOff2 = isVer ? predStride2 : 0;
           const int sizeSideRange = ( isVer ? leftRefLength : topRefLength ) + 1;
           for( int k = -( sizeSide + 1 + PAD ) + lid; k <= -1; k += NT )
           {
             int frac32precision = ( -k * absInvAngle + 8 ) >> 4;
             int intpel = frac32precision >> 5, fracpel = frac32precision & 31;
-            int left  = sideR( isVer, 1, sideBase2 + clip3i( 0, sizeSideRange, intpel ) );
-            int right = sideR( isVer, 1, sideBase2 + clip3i( 0, sizeSideRange, intpel + 1 ) );
+            int left  = int( s_ref[1][sideOff2 + clip3i( 0, sizeSideRange, intpel ) ] );
+            int right = int( s_ref[1][sideOff2 + clip3i( 0, sizeSideRange, intpel + 1 ) ] );
             int v;
             if( t.disableRefFilter != 0 )
             {
@@ -447,8 +364,8 @@ void main()
             }
             else
             {
-              int lm1 = sideR( isVer, 1, sideBase2 + clip3i( 0, sizeSideRange, intpel - 1 ) );
-              int rp1 = sideR( isVer, 1, sideBase2 + clip3i( 0, sizeSideRange, intpel + 2 ) );
+              int lm1 = int( s_ref[1][sideOff2 + clip3i( 0, sizeSideRange, intpel - 1 ) ] );
+              int rp1 = int( s_ref[1][sideOff2 + clip3i( 0, sizeSideRange, intpel + 2 ) ] );
               v = clip3i( 0, maxPel, ( weak4( fracpel, 0 ) * lm1 + weak4( fracpel, 1 ) * left + weak4( fracpel, 2 ) * right + weak4( fracpel, 3 ) * rp1 + 32 ) >> 6 );
             }
             mainW( isVer, 1, mainBase2 + k, v );
@@ -459,46 +376,52 @@ void main()
       }
       else
       {
-        // copies of refLength + PAD (+1) samples (read on past each row, as the CPU does in its buffer)
-        for( int i = lid; i < topRefLength + PAD; i += NT ) s_angA[0][PAD + i] = s_ref[0][i];
-        for( int i = lid; i < leftRefLength + PAD; i += NT ) s_angL[0][PAD + i] = s_ref[0][predStride + i];
-        if( fusion )
-        {
-          for( int i = lid; i < topRefLength + 1 + PAD; i += NT ) s_angA[1][PAD + i] = s_ref[1][i];
-          for( int i = lid; i < leftRefLength + 1 + PAD; i += NT ) s_angL[1][PAD + i] = s_ref[1][predStride2 + i];
-        }
-        SYNC();
-        if( lid == 0 )
-        {
-          for( int i = PAD - 1; i >= 0; --i )
-          {
-            s_angA[0][i] = s_angA[0][PAD];
-            s_angL[0][i] = s_angL[0][PAD];
-            if( fusion )
-            {
-              s_angA[1][i] = s_angA[1][PAD];
-              s_angL[1][i] = s_angL[1][PAD];
-            }
-          }
-        }
-        SYNC();
         mainBase = PAD;
         sideBase = PAD;
-        const int log2Ratio = findMSB( W ) - findMSB( H );
-        const int s = max( 0, isVer ? log2Ratio : -log2Ratio );
-        const int refLength = isVer ? topRefLength : leftRefLength;
-        const int val  = mainR( isVer, 0, mainBase + refLength );
-        const int val2 = mainR( isVer, 1, PAD + refLength + 1 );
-        SYNC();
-        for( int z = 1 + lid; z <= 6 + PAD; z += NT ) mainW( isVer, 0, mainBase + refLength + z, val );
+        // above: PAD copies of entry 0, then the top row (read on past the row, as the CPU's memcpy does); left alike;
+        // the main array's end is replicated over 12 entries (maxIndex 6 + PAD)
+        const int end0 = PAD + refLength;
+        const int val  = int( s_ref[0][( isVer ? 0 : predStride ) + refLength] );
+        for( int j = lid; j < PAD + topRefLength + PAD + ( isVer ? 7 : 0 ); j += NT )
+        {
+          int v = j < PAD ? int( s_ref[0][0] ) : int( s_ref[0][j - PAD] );
+          if( isVer && j > end0 ) v = val;
+          s_angA[0][j] = int16_t( v );
+        }
+        for( int j = lid; j < PAD + leftRefLength + PAD + ( isVer ? 0 : 7 ); j += NT )
+        {
+          int v = j < PAD ? int( s_ref[0][predStride] ) : int( s_ref[0][predStride + j - PAD] );
+          if( !isVer && j > end0 ) v = val;
+          s_angL[0][j] = int16_t( v );
+        }
         if( fusion )
         {
-          const int maxIndex2 = ( 1 << s ) + 6 + 4;
-          for( int z = 1 + lid; z <= maxIndex2 + PAD; z += NT ) mainW( isVer, 1, PAD + refLength + 1 + z, val2 );
+          const int log2Ratio = findMSB( W ) - findMSB( H );
+          const int sh = max( 0, isVer ? log2Ratio : -log2Ratio );
+          const int maxIndex2 = ( 1 << sh ) + 6 + 4;
+          const int end1 = PAD + refLength + 1;
+          const int val2 = int( s_ref[1][( isVer ? 0 : predStride2 ) + refLength + 1] );
+          const int lenA = isVer ? end1 + maxIndex2 + PAD + 1 : PAD + topRefLength + 1 + PAD;
+          const int lenL = isVer ? PAD + leftRefLength + 1 + PAD : end1 + maxIndex2 + PAD + 1;
+          for( int j = lid; j < lenA; j += NT )
+          {
+            int v = j < PAD ? int( s_ref[1][0] ) : j < PAD + topRefLength + 1 + PAD ? int( s_ref[1][j - PAD] ) : 0;
+            if( isVer && j > end1 ) v = val2;
+            s_angA[1][j] = int16_t( v );
+          }
+          for( int j = lid; j < lenL; j += NT )
+          {
+            int v = j < PAD ? int( s_ref[1][predStride2] ) : j < PAD + leftRefLength + 1 + PAD ? int( s_ref[1][predStride2 + j - PAD] ) : 0;
+            if( !isVer && j > end1 ) v = val2;
+            s_angL[1][j] = int16_t( v );
+          }
         }
         mainBase2 = PAD + 1;   // refMain2nd += multiRefIdx2nd
         sideBase2 = PAD + 1;
       }
+      // cleared after the block (IntraPrediction's angRefClearEnd with multiRefIdx 0)
+      angClear = min( ANG, 2 * ( W + H ) + max( topRefLength, leftRefLength ) + 2 * PAD + 2 + ( 1 << abs( findMSB( W ) - findMSB( H ) ) ) + 16 );
+      angClear2 = fusion;
       SYNC();
       // rows along the main direction (width/height swapped for horizontal modes)
       const int w = isVer ? W : H, h = isVer ? H : W;
@@ -584,11 +507,30 @@ void main()
     }
     SYNC();
 
-    // the block's samples (device-coherent stores of all invocations) happen before its done flag
+    // the block's samples (device-coherent stores of all invocations) happen before its dependents are released:
+    // the last dependency of a block to finish queues it
     controlBarrier( gl_ScopeWorkgroup, gl_ScopeQueueFamily, gl_StorageSemanticsBuffer, gl_SemanticsAcquireRelease );
-    if( lid == 0 )
     {
-      atomicStore( CBufI32( P.done ).v[g_ti], 1, gl_ScopeQueueFamily, gl_StorageSemanticsBuffer, gl_SemanticsRelease );
+      const int d0 = BufI32( P.depOffset ).v[g_ti], d1 = BufI32( P.depOffset ).v[g_ti + 1];
+      for( int k = d0 + lid; k < d1; k += NT )
+      {
+        const int d = BufI32( P.depList ).v[k];
+        if( atomicAdd( CBufI32( P.depCount ).v[d], -1, gl_ScopeQueueFamily, gl_StorageSemanticsBuffer, gl_SemanticsAcquireRelease ) == 1 )
+        {
+          const int pos = atomicAdd( CBufI32( P.counter ).v[1], 1 );
+          atomicStore( CBufI32( P.queue ).v[pos], d, gl_ScopeQueueFamily, gl_StorageSemanticsBuffer, gl_SemanticsRelease );
+        }
+      }
+    }
+    for( int i = lid; i < angClear; i += NT )
+    {
+      s_angA[0][i] = int16_t( 0 );
+      s_angL[0][i] = int16_t( 0 );
+      if( angClear2 )
+      {
+        s_angA[1][i] = int16_t( 0 );
+        s_angL[1][i] = int16_t( 0 );
+      }
     }
   }
 }

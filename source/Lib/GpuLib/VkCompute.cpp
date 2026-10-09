@@ -245,6 +245,7 @@ void Context::init()
   GPU_LOAD_INSTANCE( GetPhysicalDeviceFeatures2 )
   GPU_LOAD_INSTANCE( GetPhysicalDeviceMemoryProperties )
   GPU_LOAD_INSTANCE( GetPhysicalDeviceQueueFamilyProperties )
+GPU_LOAD_INSTANCE( EnumerateDeviceExtensionProperties )
   GPU_LOAD_INSTANCE( CreateDevice )
   GPU_LOAD_INSTANCE( GetDeviceProcAddr )
   GPU_LOAD_INSTANCE( DestroyDevice )
@@ -308,6 +309,22 @@ void Context::init()
   VkPhysicalDeviceFeatures2 has{};
   has.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
   has.pNext = &has11;
+  // optional: the device-wide shader clock (timing diagnostics of the kernels)
+  uint32_t numExt = 0;
+  m_vk.EnumerateDeviceExtensionProperties( m_physical, nullptr, &numExt, nullptr );
+  std::vector<VkExtensionProperties> exts( numExt );
+  m_vk.EnumerateDeviceExtensionProperties( m_physical, nullptr, &numExt, exts.data() );
+  bool hasClockExt = false;
+  for( const auto& e: exts )
+  {
+    hasClockExt |= strcmp( e.extensionName, VK_KHR_SHADER_CLOCK_EXTENSION_NAME ) == 0;
+  }
+  VkPhysicalDeviceShaderClockFeaturesKHR hasClock{};
+  hasClock.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_CLOCK_FEATURES_KHR;
+  if( hasClockExt )
+  {
+    has13.pNext = &hasClock;
+  }
   m_vk.GetPhysicalDeviceFeatures2( m_physical, &has );
   if( !has.features.shaderInt16 || !has.features.shaderInt64 || !has11.storageBuffer16BitAccess
       || !has12.storageBuffer8BitAccess || !has12.shaderInt8 || !has12.bufferDeviceAddress )
@@ -316,12 +333,18 @@ void Context::init()
                               + ": needs shaderInt16/Int64/Int8, 8/16-bit storage and buffer device addresses" );
   }
 
+  VkPhysicalDeviceShaderClockFeaturesKHR useClock{};
+  useClock.sType               = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_CLOCK_FEATURES_KHR;
+  useClock.shaderSubgroupClock = hasClock.shaderSubgroupClock;
+  useClock.shaderDeviceClock   = hasClock.shaderDeviceClock;
+  m_shaderDeviceClock          = hasClockExt && hasClock.shaderDeviceClock;
   VkPhysicalDeviceVulkan13Features use13{};
   use13.sType                = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
   use13.synchronization2     = has13.synchronization2;
   use13.subgroupSizeControl  = has13.subgroupSizeControl;
   use13.computeFullSubgroups = has13.computeFullSubgroups;
   use13.maintenance4         = has13.maintenance4;
+  use13.pNext                = hasClockExt ? &useClock : nullptr;
   VkPhysicalDeviceVulkan12Features use12{};
   use12.sType                  = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
   use12.pNext                  = &use13;
@@ -388,6 +411,12 @@ void Context::init()
   deviceInfo.pNext                = &use;
   deviceInfo.queueCreateInfoCount = 1;
   deviceInfo.pQueueCreateInfos    = &queueInfo;
+  const char* extNames[] = { VK_KHR_SHADER_CLOCK_EXTENSION_NAME };
+  if( hasClockExt )
+  {
+    deviceInfo.enabledExtensionCount   = 1;
+    deviceInfo.ppEnabledExtensionNames = extNames;
+  }
   check( m_vk.CreateDevice( m_physical, &deviceInfo, nullptr, &m_device ), "vkCreateDevice" );
 
   auto deviceFn = [this]( const char* name ) {
