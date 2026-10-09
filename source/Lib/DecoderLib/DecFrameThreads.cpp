@@ -76,6 +76,10 @@ DecFrameThreads::DecFrameThreads( DecLib& main, int numThreads, bool serial )
     ctx.m_targetSubPicIdx = main.m_targetSubPicIdx;
 #if ECM_VULKAN
     ctx.m_gpuLoopFilter   = main.m_gpuLoopFilter;
+    if( main.m_gpuIntraRec )   // every context reconstructs its own pictures on the GPU (own queue and buffers)
+    {
+      ctx.setGpuRecon( main.m_gpuIntraRec->on() ? 1 : 2 );
+    }
 #endif
 #if JVET_AL0142_CCSAO_REUSE_CTU
     ctx.m_CABACDecoder.getCABACReader( 0 )->setCcSaoPrvMirror( false );
