@@ -653,6 +653,7 @@ void DecApp::xCreateDecLib()
 #endif
 #if ECM_VULKAN
   m_cDecLib.setGpuLoopFilter( m_gpuLoopFilter );
+  m_cDecLib.setGpuRecon( m_gpuRecon );
 #endif
   int         frameThreads = m_frameThreads;
   std::string reason;

@@ -49,6 +49,9 @@
 #include "CommonLib/IntraPrediction.h"
 #include "CommonLib/Unit.h"
 #include "CommonLib/Reshape.h"
+#if ECM_VULKAN
+#include "GpuIntraRec.h"
+#endif
 //! \ingroup DecoderLib
 //! \{
 
@@ -91,6 +94,14 @@ protected:
   void xDeriveCUMV        ( CodingUnit&      cu );
   void xReconPLT          ( CodingUnit&      cu,       ComponentID compBegin, uint32_t numComp );
   PelStorage        *m_tmpStorageLCU;
+#if ECM_VULKAN
+public:
+  /// the GPU reconstruction (verification) recording this decoder's intra blocks, or nullptr
+  void setGpuIntraRec( GpuIntraRec* rec ) { m_gpuIntraRec = rec; }
+  GpuIntraRec* getGpuIntraRec() const { return m_gpuIntraRec; }
+private:
+  GpuIntraRec*      m_gpuIntraRec = nullptr;
+#endif
 private:
   TrQuant*          m_pcTrQuant;
   IntraPrediction*  m_pcIntraPred;

@@ -74,6 +74,7 @@ struct DecPicJob;
 class  DecFrameThreads;
 #if ECM_VULKAN
 class  GpuAlfHook;
+class  GpuIntraRec;
 #endif
 
 //! \ingroup DecoderLib
@@ -270,6 +271,8 @@ private:
   int                     m_gpuLoopFilter = 0;      ///< GpuAlf::Mode
   bool                    m_gpuUnavailable = false;
   std::unique_ptr<GpuAlfHook> m_gpuAlf;
+  // GPU reconstruction (so far: intra pictures, verification against the CPU)
+  std::unique_ptr<GpuIntraRec> m_gpuIntraRec;
 #endif
 
 public:
@@ -327,6 +330,7 @@ public:
 
 #if ECM_VULKAN
   void  setGpuLoopFilter        ( int mode );   ///< GpuAlf::Mode; before setFrameThreads
+  void  setGpuRecon             ( int mode );   ///< 0 off, 2 verify the intra pictures (sequential decoding)
 #endif
 
   // frame-level threading

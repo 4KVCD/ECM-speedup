@@ -629,6 +629,21 @@ private:
 
   IntraPredParam m_ipaParam;
 
+public:
+  /// the parameters the last initPredIntraParams() set (recorded by the decoder's GPU reconstruction)
+  struct IpaSnapshot
+  {
+    bool isModeVer, interpolationFlag, refFilterFlag, applyPDPC, applyFusion;
+    int  multiRefIndex, intraPredAngle, absInvAngle;
+  };
+  IpaSnapshot ipaSnapshot() const
+  {
+    return { m_ipaParam.isModeVer,     m_ipaParam.interpolationFlag, m_ipaParam.refFilterFlag,
+             m_ipaParam.applyPDPC,     m_ipaParam.applyFusion,       m_ipaParam.multiRefIndex,
+             m_ipaParam.intraPredAngle, m_ipaParam.absInvAngle };
+  }
+private:
+
 #if JVET_AN0158_INTRA_LONGTAP
   int m_dimdCurrentPredIdx = 0;
   std::pair<int,int> m_numTapsPerModeTIMD;

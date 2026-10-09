@@ -609,6 +609,17 @@ void DecSlice::decompressSlice( Slice* slice, InputBitstream* bitstream, int deb
   }
 #endif
 
+#if ECM_VULKAN
+  if( GpuIntraRec* gpuRec = m_pcCuDecoder->getGpuIntraRec() )
+  {
+    gpuRec->beginPicture( cs );
+    if( slice->getNumCtuInSlice() != cs.pcv->sizeInCtus )
+    {
+      gpuRec->unsupported( "several slices" );
+    }
+  }
+#endif
+
   // for every CTU in the slice segment...
 
 #if JVET_AD0188_CCP_MERGE
@@ -891,6 +902,13 @@ void DecSlice::decompressSlice( Slice* slice, InputBitstream* bitstream, int deb
       }
     }
   }
+
+#if ECM_VULKAN
+  if( GpuIntraRec* gpuRec = m_pcCuDecoder->getGpuIntraRec() )
+  {
+    gpuRec->endPicture( cs );
+  }
+#endif
 
 #if JVET_AC0089_NNVC_USE_BPM_INFO
   pic->dumpPicBpmInfo();

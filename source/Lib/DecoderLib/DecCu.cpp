@@ -289,6 +289,12 @@ void DecCu::decompressCtu( CodingStructure& cs, const UnitArea& ctuArea )
       }
 #endif
 
+#if ECM_VULKAN
+      if( m_gpuIntraRec && currCU.predMode != MODE_INTRA )
+      {
+        m_gpuIntraRec->unsupported( "inter / IBC / palette CU" );
+      }
+#endif
       if (currCU.predMode != MODE_INTRA && currCU.predMode != MODE_PLT && currCU.Y().valid())
       {
         xDeriveCUMV(currCU);
@@ -2258,6 +2264,12 @@ void DecCu::xIntraRecBlk( TransformUnit& tu, const ComponentID compID )
     }
 #endif
   }
+#if ECM_VULKAN
+  if( m_gpuIntraRec )
+  {
+    m_gpuIntraRec->record( tu, compID, m_pcIntraPred->ipaSnapshot(), cQP, piPred, piResi );
+  }
+#endif
 #if JVET_AG0145_ADAPTIVE_CLIPPING
   ClpRng clpRng = tu.cu->cs->slice->clpRng(compID);
   if (compID == COMPONENT_Y)

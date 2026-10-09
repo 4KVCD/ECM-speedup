@@ -107,6 +107,7 @@ protected:
   int           m_frameThreads = 0;                  ///< decode pictures in this many threads (0, 1: off)
   bool          m_frameThreadsSerial = false;        ///< test: one picture at a time on the frame threads
   int           m_gpuLoopFilter = 0;                 ///< loop filters on the Vulkan device (GpuAlf::Mode)
+  int           m_gpuRecon = 0;                      ///< reconstruction on the Vulkan device (DecLib::setGpuRecon)
 public:
   DecAppCfg();
   virtual ~DecAppCfg();

@@ -654,6 +654,21 @@ DecLib::~DecLib()
 }
 
 #if ECM_VULKAN
+void DecLib::setGpuRecon( int mode )
+{
+  m_cCuDecoder.setGpuIntraRec( nullptr );
+  m_gpuIntraRec.reset();
+  if( mode == 2 )
+  {
+    m_gpuIntraRec.reset( GpuIntraRec::create() );
+    if( !m_gpuIntraRec )
+    {
+      msg( WARNING, "GPU reconstruction: no Vulkan device (%s)\n", gpu::Context::lastError().c_str() );
+    }
+    m_cCuDecoder.setGpuIntraRec( m_gpuIntraRec.get() );
+  }
+}
+
 void DecLib::setGpuLoopFilter( int mode )
 {
   m_gpuLoopFilter = mode;
