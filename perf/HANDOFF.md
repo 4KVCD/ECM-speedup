@@ -14,7 +14,7 @@ memory, scratchpad and claude.ai artifacts do not carry over.
 2. The previous session's memory notes are copied to `C:\Code\tools\claude-notes\*.md`. They hold the same facts as
    this file, in short form.
 3. Check the state:
-   - `git -C C:/Code/opt status`: clean, branch `opt` at 5bcd8f6d or later.
+   - `git -C C:/Code/opt status`: clean, branch `opt` at 7d41000f or a later handoff commit.
    - `git -C C:/Code/opt fetch origin`: `origin/perf` = `origin/merge` = `opt`.
    - `gh auth status`: logged in as 4KVCD.
 4. Before changing code, confirm the setup: run the suite with the current build. Every md5 must match
@@ -27,7 +27,7 @@ memory, scratchpad and claude.ai artifacts do not carry over.
 
 ## 1. Where things stand
 
-- **Branches** on github.com/4KVCD/ECM-speedup: `perf` (default) and `merge` are both at 5bcd8f6d and hold all kept
+- **Branches** on github.com/4KVCD/ECM-speedup: `perf` (default) and `merge` point to the same commit and hold all kept
   work. Locally the work branch is `opt` in `C:\Code\opt`, which tracks `origin/merge`.
   - `dev` has 3 commits from an earlier session on the user's other PC (an i7-10700) that are not merged; see
     section 9.
@@ -98,7 +98,7 @@ memory, scratchpad and claude.ai artifacts do not carry over.
 ```
 C:\Code\ECM      main clone, branch perf at 2ffd9ac3 (behind origin/perf; pull before using it). Never commit here.
                  bench.py reads its cfg files from C:\Code\ECM\cfg (unchanged from stock).
-C:\Code\opt      work worktree, branch opt -> origin/merge, at 5bcd8f6d
+C:\Code\opt      work worktree, branch opt -> origin/merge (same commit as origin/perf)
 C:\Code\stock    worktree at 6d442b2a (stock + GCC 16 fixes), built as C:\Code\bin\stock
 C:\Code\probe, probe2, probe3, probe4
                  detached scratch worktrees for experiments and probes; reset before use:
