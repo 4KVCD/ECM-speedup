@@ -7,7 +7,7 @@ first, then `perf/DECODER.md` (the decoder speed-up log, incl. the section "GPU 
 ## 1. Goal and status in one paragraph
 
 The user wants the JVET ECM-20.0 codec much faster with **bit-exact output** (decoder: every decoded frame identical
-to the stock decoder `C:\Code\bin\ref\DecoderApp.exe`; encoder: identical bitstream). Target 10x single-thread; the
+to the stock decoder `C:\Code\ECM\bin\ref\DecoderApp.exe`; encoder: identical bitstream). Target 10x single-thread; the
 wall-clock gains with threads are "the easy baseline". Decoder status: single-thread ~1.2-1.3x (details in DECODER.md), frame threads
 (`--FrameThreads=N`, all-intra 720p ~3x), segment-parallel decoding (`--ParallelSegments=N`), GPU loop filters
 (`--GpuLoopFilter=1`: ALF, SAO, BIF, CCSAO, LF-CCCM, offset refinement on Vulkan). The user then asked for **a full
@@ -38,7 +38,7 @@ Commits / git
 - Detailed commit messages: subject names the exact function / subsystem / metric; body = problem, cause, change,
   measurements (paired, bit-exact checks), hardware; end with `Co-Authored-By: Claude <noreply@anthropic.com>`.
   Commit with `git -c user.email=thebrianzheng@gmail.com commit ...`.
-- Never use `git stash`. Never commit in the main folder (`C:\Code\ECM`); work in worktrees `C:\Code\wt-*`.
+- Never use `git stash`. Never commit in the main folder (`C:\Code\ECM`); work in worktrees `C:\Code\ECM\wt-*`.
   Don't merge other sessions' branches (unless the user asks, as with the GitHub pull of 2026-10-09).
 - Don't push / post / edit anything on any remote without the user's explicit permission, each time. Don't keep
   asking to push: raise it only for a release or when another PC (e.g. an AMD one) needs to test.
@@ -81,25 +81,30 @@ Machine
 
 ## 4. Setting up the new computer
 
-Directory layout the scripts assume (change the paths in `perf/gpu/*` if yours differ):
+Directory layout the scripts assume (change the paths in `perf/gpu/*` if yours differ). Everything of the project
+lives inside the main clone C:\Code\ECM (C:\Code holds one folder per project); the clone's .gitignore covers
+build/ and bin/, and .git/info/exclude (local, not in git) the other folders. Never run `git clean -x` in the main
+clone: it would delete the test material and the toolchain.
 ```
-C:\Code\ECM            main clone (never commit here)       C:\Code\wt-<name>   worktrees (git worktree add)
-C:\Code\tools          portable toolchain (env.ps1 puts it on PATH; perf\build.ps1 dot-sources ..\..\tools\env.ps1)
-C:\Code\build\<name>   build dirs                           C:\Code\bin\<name>  the exes of each build
-C:\Code\bin\ref        the STOCK ECM-20.0 decoder/encoder (reference for every comparison)
-C:\Code\seq            raw YUV test sources                 C:\Code\streams     the 19 decoder test streams
-C:\Code\streams_gpu    the GPU test streams                 C:\Code\runs        outputs/logs
+C:\Code\ECM                   main clone (never commit here)  C:\Code\ECM\wt-<name>      worktrees (git worktree add)
+C:\Code\ECM\tools             portable toolchain (env.ps1 puts it on PATH; perf\build.ps1 dot-sources ..\..\tools\env.ps1)
+C:\Code\ECM\build\<name>      build dirs                      C:\Code\ECM\bin\<name>     the exes of each build
+C:\Code\ECM\bin\ref           the STOCK ECM-20.0 decoder/encoder (reference for every comparison)
+C:\Code\ECM\seq               raw YUV test sources            C:\Code\ECM\streams        the 19 decoder test streams
+C:\Code\ECM\streams_gpu       the GPU test streams            C:\Code\ECM\runs           outputs/logs
 ```
+Don't reuse a build dir configured before 2026-10-10 without deleting it first: its CMakeCache.txt records the
+old C:\Code\build and C:\Code\wt-* paths, so CMake refuses to configure it. The exes in bin\ are not affected.
 Toolchain used (Windows 11): WinLibs GCC 16.2 (mingw64), CMake 4.4.4, Ninja, MinGit, gh. Vulkan: no SDK needed;
 `vulkan-1.dll` is loaded at run time. Build inputs (download only with the user's OK): Vulkan-Headers tag
-`vulkan-sdk-1.4.363.0` (C:\Code\tools\vulkan-headers\Vulkan-Headers-vulkan-sdk-1.4.363.0) and glslang 16.6.0
-(C:\Code\tools\glslang\bin\glslang.exe). The GPU must support Vulkan 1.3 compute with buffer device address and
+`vulkan-sdk-1.4.363.0` (C:\Code\ECM\tools\vulkan-headers\Vulkan-Headers-vulkan-sdk-1.4.363.0) and glslang 16.6.0
+(C:\Code\ECM\tools\glslang\bin\glslang.exe). The GPU must support Vulkan 1.3 compute with buffer device address and
 the **vulkanMemoryModel** feature (GpuIntraRec::create returns null otherwise); tested only on an RTX 3070 (driver
 616.92).
 
-Builds (from a worktree, e.g. `C:\Code\wt-gr` on branch dec-gpurecon):
+Builds (from a worktree, e.g. `C:\Code\ECM\wt-gr` on branch dec-gpurecon):
 ```
-perf\build.ps1 gr -NoLto -DECM_VULKAN=ON -DECM_VULKAN_HEADERS=C:/Code/tools/vulkan-headers/Vulkan-Headers-vulkan-sdk-1.4.363.0/include -DECM_GLSLANG=C:/Code/tools/glslang/bin/glslang.exe
+perf\build.ps1 gr -NoLto -DECM_VULKAN=ON -DECM_VULKAN_HEADERS=C:/Code/ECM/tools/vulkan-headers/Vulkan-Headers-vulkan-sdk-1.4.363.0/include -DECM_GLSLANG=C:/Code/ECM/tools/glslang/bin/glslang.exe
 perf\build.ps1 grL -DECM_VULKAN=ON <same two paths>        # LTO, for timing
 ```
 Pitfalls: all build dirs of one worktree share its in-source `lib/` and `bin/`: before switching build dir run
@@ -113,11 +118,11 @@ commands that combine `Remove-Item` with `//` text. `perf\gpu\crlf.ps1 <worktree
 
 ## 5. Test material
 
-- Sources in C:\Code\seq (not in git): foreman_352x288.yuv, ParkJoy_1280x720.yuv (62 frames),
+- Sources in C:\Code\ECM\seq (not in git): foreman_352x288.yuv, ParkJoy_1280x720.yuv (62 frames),
   FourPeople_1280x720.yuv; y4m originals in seq\y4m. 1080p/4K: none of our own yet; the VVenc-Vulkan session on the
   old PC had crowd_run/ducks/park_joy 1080p50 y4m in C:\Code\VVenc-Vulkan\data (another session's folder: ask
   first). The user wants 1080p/4K testing.
-- GPU test streams (C:\Code\streams_gpu, not in git, regenerate with the scripts; all-intra, ECM tools off except the
+- GPU test streams (C:\Code\ECM\streams_gpu, not in git, regenerate with the scripts; all-intra, ECM tools off except the
   level's tools, `perf\gpu\enc_m1.ps1` lists the disabled tools; it uses the bit-exact optimized encoder build qaCpu, which writes the same bitstream as stock):
   - `enc_set.ps1 m1`                                         M1: planar/DC/angular, DCT-II only
   - `enc_set.ps1 m2 --IntraToolControlMode=1 --IntraPredBf=0` M2: + reference filter, PDPC, intra fusion
@@ -130,8 +135,8 @@ commands that combine `Remove-Item` with `//` text. `perf\gpu\crlf.ps1 <worktree
     running the checkers (they pick up every .bin).
   - The AI cfg needs `--TemporalSubsampleRatio=1`; the 350x286 encode crashes the stock encoder.
   - Note: EnableTMnoninterTools=0 in these streams leaves stock `SPS::m_timdMrg` unparsed (fixed by a ctor init).
-- The 19 regular decoder streams (C:\Code\streams, CTC-like AI/RA/LD incl. *_md5) with `perf\decbench.py`; stock
-  references in C:\Code\runs\ref_big etc.
+- The 19 regular decoder streams (C:\Code\ECM\streams, CTC-like AI/RA/LD incl. *_md5) with `perf\decbench.py`; stock
+  references in C:\Code\ECM\runs\ref_big etc.
 
 ## 6. Scripts (perf/gpu, copied from the old session's scratchpad)
 

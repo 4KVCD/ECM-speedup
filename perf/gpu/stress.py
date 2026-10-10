@@ -1,12 +1,12 @@
 # stress.py <build> <reps> [extra decoder args]: decodes every GPU test stream <reps> times with --GpuRecon=2 (or the
 # given args); saves the full output of any decode whose summary is not "all verified, 0 differences, 0 skipped"
 import os, re, subprocess, sys
-ROOT = "C:/Code/streams_gpu"
-OUT = "C:/Code/runs/stress"
+ROOT = "C:/Code/ECM/streams_gpu"
+OUT = "C:/Code/ECM/runs/stress"
 build, reps = sys.argv[1], int(sys.argv[2])
 extra = sys.argv[3:] or ["--GpuRecon=2"]
 os.makedirs(OUT, exist_ok=True)
-exe = f"C:/Code/bin/{build}/DecoderApp.exe"
+exe = f"C:/Code/ECM/bin/{build}/DecoderApp.exe"
 names = sorted(f[:-4] for f in os.listdir(ROOT) if f.endswith(".bin"))
 bad = 0
 runs = 0

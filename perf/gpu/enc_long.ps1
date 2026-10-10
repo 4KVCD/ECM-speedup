@@ -11,11 +11,11 @@ for( $i = 0; $i -lt $Segs; $i++ )
   } -ArgumentList $sp, $seg, $Yuv, $W, $H, $Per, ( $i * $Per ), $Extra
 }
 $jobs | Wait-Job | Receive-Job
-$out = [IO.File]::Create( "C:\Code\streams_gpu\$Name.bin" )
+$out = [IO.File]::Create( "C:\Code\ECM\streams_gpu\$Name.bin" )
 for( $i = 0; $i -lt $Segs; $i++ )
 {
-  $b = [IO.File]::ReadAllBytes( "C:\Code\streams_gpu\${Name}_seg$i.bin" )
+  $b = [IO.File]::ReadAllBytes( "C:\Code\ECM\streams_gpu\${Name}_seg$i.bin" )
   $out.Write( $b, 0, $b.Length )
 }
 $out.Close()
-"wrote C:\Code\streams_gpu\$Name.bin"
+"wrote C:\Code\ECM\streams_gpu\$Name.bin"

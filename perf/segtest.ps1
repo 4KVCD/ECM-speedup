@@ -1,10 +1,10 @@
 # Checks that encoding intra-period chunks independently and concatenating them with parcat
 # gives a bitstream byte-identical to one full-sequence encode.
-#   segtest.ps1 -Exe C:\Code\bin\ref\EncoderApp.exe -Parcat C:\Code\bin\ref\parcat.exe
-param( [string]$Exe = "C:\Code\bin\ref\EncoderApp.exe", [string]$Parcat = "C:\Code\bin\ref\parcat.exe",
-       [string]$Yuv = "C:\Code\seq\foreman_128x128.yuv", [int]$W = 128, [int]$H = 128, [int]$Frames = 65,
+#   segtest.ps1 -Exe C:\Code\ECM\bin\ref\EncoderApp.exe -Parcat C:\Code\ECM\bin\ref\parcat.exe
+param( [string]$Exe = "C:\Code\ECM\bin\ref\EncoderApp.exe", [string]$Parcat = "C:\Code\ECM\bin\ref\parcat.exe",
+       [string]$Yuv = "C:\Code\ECM\seq\foreman_128x128.yuv", [int]$W = 128, [int]$H = 128, [int]$Frames = 65,
        [int]$Period = 32, [int]$QP = 32, [string]$Cfg = "C:\Code\ECM\cfg\encoder_randomaccess_ecm.cfg",
-       [string]$Out = "C:\Code\runs\segtest" )
+       [string]$Out = "C:\Code\ECM\runs\segtest" )
 New-Item -ItemType Directory -Force $Out | Out-Null
 $common = @( "-c", $Cfg, "-i", $Yuv, "-wdt", $W, "-hgt", $H, "-fr", 30, "--InputBitDepth=8", "-q", $QP, "-o", "NUL" )
 $jobs = @()

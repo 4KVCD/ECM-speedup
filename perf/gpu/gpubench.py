@@ -2,10 +2,10 @@
 # GPU milliseconds per picture (best repetition), whether every picture was identical, and the totals
 import os, re, subprocess, sys
 
-ROOT = "C:/Code/streams_gpu"
+ROOT = "C:/Code/ECM/streams_gpu"
 build = sys.argv[1]
 reps = int(sys.argv[2]) if len(sys.argv) > 2 else 3
-exe = f"C:/Code/bin/{build}/DecoderApp.exe"
+exe = f"C:/Code/ECM/bin/{build}/DecoderApp.exe"
 names = sorted(f[:-4] for f in os.listdir(ROOT) if f.endswith(".bin"))
 tot = 0.0
 totPics = 0

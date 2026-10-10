@@ -2,11 +2,11 @@
 param( [string]$Prefix, [Parameter(ValueFromRemainingArguments=$true)][string[]]$Extra )
 $sp = $PSScriptRoot
 $jobs = @(
-  @( "${Prefix}_fore32",   'C:\Code\seq\foreman_352x288.yuv',     352,  288, 4, '32' ),
-  @( "${Prefix}_fore22",   'C:\Code\seq\foreman_352x288.yuv',     352,  288, 2, '22' ),
-  @( "${Prefix}_fore37",   'C:\Code\seq\foreman_352x288.yuv',     352,  288, 2, '37' ),
-  @( "${Prefix}_park720",  'C:\Code\seq\ParkJoy_1280x720.yuv',    1280, 720, 2, '32' ),
-  @( "${Prefix}_four720",  'C:\Code\seq\FourPeople_1280x720.yuv', 1280, 720, 2, '27' )
+  @( "${Prefix}_fore32",   'C:\Code\ECM\seq\foreman_352x288.yuv',     352,  288, 4, '32' ),
+  @( "${Prefix}_fore22",   'C:\Code\ECM\seq\foreman_352x288.yuv',     352,  288, 2, '22' ),
+  @( "${Prefix}_fore37",   'C:\Code\ECM\seq\foreman_352x288.yuv',     352,  288, 2, '37' ),
+  @( "${Prefix}_park720",  'C:\Code\ECM\seq\ParkJoy_1280x720.yuv',    1280, 720, 2, '32' ),
+  @( "${Prefix}_four720",  'C:\Code\ECM\seq\FourPeople_1280x720.yuv', 1280, 720, 2, '27' )
 )
 foreach( $j in $jobs )
 {

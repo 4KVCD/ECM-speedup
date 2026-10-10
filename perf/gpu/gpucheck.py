@@ -1,11 +1,11 @@
 # gpucheck.py <build> [stream names...] [-- extra decoder args]
-# decodes C:/Code/streams_gpu/<name>.bin with the stock decoder (cached) and with C:/Code/bin/<build>/DecoderApp.exe,
+# decodes C:/Code/ECM/streams_gpu/<name>.bin with the stock decoder (cached) and with C:/Code/ECM/bin/<build>/DecoderApp.exe,
 # compares every frame; prints the decoder's own timing lines
 import hashlib, os, subprocess, sys, time
 
-ROOT = "C:/Code/streams_gpu"
-REF = "C:/Code/bin/ref/DecoderApp.exe"
-OUT = "C:/Code/runs/gpucheck"
+ROOT = "C:/Code/ECM/streams_gpu"
+REF = "C:/Code/ECM/bin/ref/DecoderApp.exe"
+OUT = "C:/Code/ECM/runs/gpucheck"
 
 def frames(path, w, h):
     size = w * h * 3 // 2 * 2   # 4:2:0, 16-bit output
@@ -36,7 +36,7 @@ def main():
     if not names:
         names = sorted(f[:-4] for f in os.listdir(ROOT) if f.endswith(".bin"))
     os.makedirs(OUT, exist_ok=True)
-    exe = f"C:/Code/bin/{build}/DecoderApp.exe"
+    exe = f"C:/Code/ECM/bin/{build}/DecoderApp.exe"
     allok = True
     for n in names:
         stream = f"{ROOT}/{n}.bin"
