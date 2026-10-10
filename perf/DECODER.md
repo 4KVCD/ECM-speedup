@@ -4,9 +4,9 @@ Goal: 10x faster single-threaded decoding with bit-exact output (every decoded f
 ECM-20.0 decoder); multithreading first, then the largest single-thread costs.
 
 Machine: i7-10700 8C/16T, Windows 11, GCC 16.2 (WinLibs), static builds with link-time optimization
-(`perf/build.ps1`). Baseline: the stock ECM-20.0 decoder (`C:/Code/bin/ref`, GCC 16.2 -O3, static, no LTO).
+(`perf/build.ps1`). Baseline: the stock ECM-20.0 decoder (`C:/Code/ECM/bin/ref`, GCC 16.2 -O3, static, no LTO).
 
-Tests: `perf/decbench.py` decodes the streams in `C:/Code/streams` (ECM streams made with the bit-exact encoder,
+Tests: `perf/decbench.py` decodes the streams in `C:/Code/ECM/streams` (ECM streams made with the bit-exact encoder,
 several with MD5 picture-hash SEI) and compares the md5 of every output frame with the stock decoder; timings
 are wall time and the CPU time of all processes, paired (both builds at the same time) unless noted. The streams
 so far are short (128x128 to 720p, 1-4 s); the 1080p/4K benchmark plan is pending.
@@ -229,7 +229,7 @@ commit that caused it:
 - `IntraPrediction::ANG_REF_BUF_SIZE` (encoder step 19) was odr-used without a definition: unoptimized builds did
   not link. Now `constexpr`.
 - Tooling: `perf/build.ps1 -NoLto` never configured (the one-element cmake argument list became a plain string, which
-  was splatted character by character); `pgo.ps1` / `pgo_dec.ps1` deleted `C:\Code\build\<name>` without checking
+  was splatted character by character); `pgo.ps1` / `pgo_dec.ps1` deleted `C:\Code\ECM\build\<name>` without checking
   the name (`..` would have deleted `C:\Code`). Both scripts and `build.ps1` now accept plain names only.
 
 ## Profile notes

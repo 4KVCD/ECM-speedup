@@ -7,9 +7,9 @@
   decbench.py ab <A> <B> [--jobs N] [--reps R] [--streams a,b] [--extra-a ARGS] [--extra-b ARGS]
       paired timing: for each stream, builds A and B decode at the same time (same load); every frame checked
 
-Streams are C:/Code/streams/<name>.bin (ECM bitstreams). The reference "dref" is the stock ECM-20.0 decoder
-(run once: decbench.py run dref --exe C:/Code/bin/ref/DecoderApp.exe); its per-frame md5s are the expected output.
-Builds are C:/Code/bin/<build>/DecoderApp.exe. CPU time counts every process of a run (segment-parallel children too).
+Streams are C:/Code/ECM/streams/<name>.bin (ECM bitstreams). The reference "dref" is the stock ECM-20.0 decoder
+(run once: decbench.py run dref --exe C:/Code/ECM/bin/ref/DecoderApp.exe); its per-frame md5s are the expected output.
+Builds are C:/Code/ECM/bin/<build>/DecoderApp.exe. CPU time counts every process of a run (segment-parallel children too).
 """
 import argparse
 import concurrent.futures as cf

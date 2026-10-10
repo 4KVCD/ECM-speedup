@@ -1,17 +1,17 @@
 # Profile-guided build: instrumented build -> training encodes -> optimized rebuild in the same tree.
 #   perf\pgo.ps1 <name> [extra cmake -D args...]
 # Training content (FourPeople and CrowdRun 256x256 crops) is deliberately different from the benchmark sequences:
-#   C:\Code\seq\FourPeople_256x256.yuv: y4m2yuv.py FourPeople_1280x720_60.y4m <out> 10 256 256 512 232
-#   C:\Code\seq\CrowdRun_256x256.yuv:   y4m2yuv.py crowd_run_1080p50.y4m <out> 10 256 256 832 412
+#   C:\Code\ECM\seq\FourPeople_256x256.yuv: y4m2yuv.py FourPeople_1280x720_60.y4m <out> 10 256 256 512 232
+#   C:\Code\ECM\seq\CrowdRun_256x256.yuv:   y4m2yuv.py crowd_run_1080p50.y4m <out> 10 256 256 832 412
 #   (sources: media.xiph.org/video/derf/y4m; only the first frames are needed)
 param( [Parameter(Mandatory=$true)][ValidatePattern('^[A-Za-z0-9_-]+$')][string]$Name, [Parameter(ValueFromRemainingArguments=$true)][string[]]$CMakeArgs )   # Name: a plain name, the build directory is deleted
 $ErrorActionPreference = 'Continue'
 . "$PSScriptRoot\..\..\tools\env.ps1"
 $env:CCACHE_DISABLE = "1"   # profile flags + ccache: don't risk stale objects
 $src   = Resolve-Path "$PSScriptRoot\.."
-$build = "C:\Code\build\$Name"
-$out   = "C:\Code\bin\$Name"
-$train = "C:\Code\runs\pgo-train-$Name"
+$build = "C:\Code\ECM\build\$Name"
+$out   = "C:\Code\ECM\bin\$Name"
+$train = "C:\Code\ECM\runs\pgo-train-$Name"
 [string[]]$lto = @( "-DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON", "-DCMAKE_POLICY_DEFAULT_CMP0069=NEW" )
 
 function Build( [string]$flags )
@@ -39,7 +39,7 @@ $runs = @(
   @( "encoder_lowdelay_ecm.cfg",     "CrowdRun_256x256.yuv",   50, 3, 32 ) )
 foreach( $r in $runs )
 {
-  & $exe -c "$src\cfg\$($r[0])" -i "C:\Code\seq\$($r[1])" -wdt 256 -hgt 256 -fr $r[2] --InputBitDepth=8 -f $r[3] -q $r[4] -b "$train\t.bin" -o NUL | Select-String 'Total Time'
+  & $exe -c "$src\cfg\$($r[0])" -i "C:\Code\ECM\seq\$($r[1])" -wdt 256 -hgt 256 -fr $r[2] --InputBitDepth=8 -f $r[3] -q $r[4] -b "$train\t.bin" -o NUL | Select-String 'Total Time'
 }
 
 # 3) optimized build from the profile (same build tree, so .gcda paths match)

@@ -1,6 +1,6 @@
 # Profile-guided build of the decoder: instrumented build -> training decodes -> optimized rebuild in the same tree.
 #   perf\pgo_dec.ps1 <name> [extra cmake -D args...]
-# The training streams are 9 of the 18 decbench streams (C:\Code\streams); the other 9 show whether a gain is specific
+# The training streams are 9 of the 18 decbench streams (C:\Code\ECM\streams); the other 9 show whether a gain is specific
 # to the training content. Only the DecoderApp of the result is meant to be used: its EncoderApp is optimized with a
 # decoder profile.
 param( [Parameter(Mandatory=$true)][ValidatePattern('^[A-Za-z0-9_-]+$')][string]$Name, [Parameter(ValueFromRemainingArguments=$true)][string[]]$CMakeArgs )   # Name: a plain name, the build directory is deleted
@@ -8,8 +8,8 @@ $ErrorActionPreference = 'Continue'
 . "$PSScriptRoot\..\..\tools\env.ps1"
 $env:CCACHE_DISABLE = "1"   # profile flags + ccache: don't risk stale objects
 $src   = Resolve-Path "$PSScriptRoot\.."
-$build = "C:\Code\build\$Name"
-$out   = "C:\Code\bin\$Name"
+$build = "C:\Code\ECM\build\$Name"
+$out   = "C:\Code\ECM\bin\$Name"
 $lto   = @( "-DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON", "-DCMAKE_POLICY_DEFAULT_CMP0069=NEW" )
 
 function Build( [string]$flags )
@@ -28,7 +28,7 @@ $exe = "$src\bin\ninja\gcc-mingw-16.2\x86_64\release\DecoderApp.exe"
 # 2) training (sequential: concurrent .gcda merging is not safe on MinGW)
 foreach( $s in "ai_parkjoy", "ai_md5", "aiodd", "ai_foreman", "ra_parkjoy", "ra_foreman", "raodd", "ld_foreman", "ld_md5" )
 {
-  & $exe -b "C:\Code\streams\$s.bin" -o NUL | Select-String 'Total Time'
+  & $exe -b "C:\Code\ECM\streams\$s.bin" -o NUL | Select-String 'Total Time'
 }
 
 # 3) optimized build from the profile (same build tree, so .gcda paths match)

@@ -16,8 +16,8 @@ import subprocess
 import sys
 import time
 
-ROOT = "C:/Code"
-CFG = f"{ROOT}/ECM/cfg"
+ROOT = "C:/Code/ECM"   # the project folder, which is also the main clone
+CFG = f"{ROOT}/cfg"
 SEQ = f"{ROOT}/seq"
 RESULTS = f"{ROOT}/runs/results"
 
