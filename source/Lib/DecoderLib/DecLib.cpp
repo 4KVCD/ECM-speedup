@@ -4487,12 +4487,15 @@ void DecLib::xDecodeSPS( InputNALUnit& nalu )
   m_HLSReader.parseSPS( sps );
   sps->setLayerId( nalu.m_nuhLayerId );
   DTRACE( g_trace_ctx, D_QP_PER_CTU, "CTU Size: %dx%d", sps->getMaxCUWidth(), sps->getMaxCUHeight() );
-  if( m_parameterSetManager.wouldReplaceSPS( sps->getSPSId(), nalu.getBitstream().getFifo() ) )
+  const int spsId = sps->getSPSId();
+  if( m_parameterSetManager.wouldReplaceSPS( spsId, nalu.getBitstream().getFifo() ) )
   {
     drainFrameThreads();   // pictures in flight use the stored one
-    m_spsGeneration[sps->getSPSId()]++;   // every PPS of this SPS needs new PreCalcValues
+    m_spsGeneration[spsId]++;   // every PPS of this SPS needs new PreCalcValues
   }
   m_parameterSetManager.storeSPS( sps, nalu.getBitstream().getFifo() );
+  // storeSPS deletes the new SPS when it repeats the stored one. The code below reads the stored SPS instead.
+  sps = m_parameterSetManager.getSPS( spsId );
 #if JVET_AM0209_CHROMA_ALF_CCALF_REUSE_CTU
   if (sps->getALFEnabledFlag() && !g_pictureControlInfoInit)
   {
