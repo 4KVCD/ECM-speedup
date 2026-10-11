@@ -121,6 +121,7 @@ protected:
   int       m_firstValidFrame;
   int       m_lastValidFrame;
   int       m_parallelSegments;                               ///< number of intra-period chunks encoded concurrently (1: off)
+  bool      m_powerThrottling;                                ///< Windows may throttle the encoder in the background (EcoQoS)
   int       m_segmentLength;                                  ///< frames per chunk, a multiple of the intra period (0: automatic)
   int       m_segmentPocOffset;                               ///< POC of the first picture (all-intra chunk worker)
   int       m_framesToBeEncoded;                              ///< number of encoded frames
@@ -1323,6 +1324,7 @@ public:
 
   // segment-parallel encoding (see SegmentParallel.h)
   int                getParallelSegments()      const { return m_parallelSegments; }
+  bool               getPowerThrottling()       const { return m_powerThrottling; }
   int                getSegmentLength()         const { return m_segmentLength; }
   // all-intra chunks can start at their own POC (SegmentPOCOffset) and be joined by plain concatenation
   bool               getPocOffsetChunksSupported() const

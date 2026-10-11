@@ -82,6 +82,31 @@ static void printMacroSettings()
 // Main function
 // ====================================================================================================================
 
+// Windows 11 throttles background processes (EcoQoS: lower clocks, efficiency cores), which slowed encodes started
+// without a foreground window by up to a third on a hybrid CPU. Asking not to be throttled keeps the fast cores.
+// Declared here because windows.h clashes with the codec's names.
+#ifdef _WIN32
+extern "C" __declspec( dllimport ) int __stdcall SetProcessInformation( void* process, int infoClass, void* info,
+                                                                         unsigned long size );
+extern "C" __declspec( dllimport ) void* __stdcall GetCurrentProcess();
+#endif
+static void xSetPowerThrottling( bool allow )
+{
+#ifdef _WIN32
+  if( !allow )
+  {
+    // PROCESS_POWER_THROTTLING_STATE: current version, execution speed controlled, not throttled
+    struct
+    {
+      unsigned long version, controlMask, stateMask;
+    } state = { 1, 1, 0 };
+    SetProcessInformation( GetCurrentProcess(), 4 /* ProcessPowerThrottling */, &state, sizeof( state ) );
+  }
+#else
+  (void) allow;
+#endif
+}
+
 int main(int argc, char* argv[])
 {
   // print information
@@ -193,6 +218,10 @@ int main(int argc, char* argv[])
       return 1;
     }
 
+    if( layerIdx == 0 )
+    {
+      xSetPowerThrottling( pcEncApp[0]->getPowerThrottling() );
+    }
     if( layerIdx == 0 && pcEncApp[0]->getParallelSegments() > 1 )
     {
       // encode intra-period chunks in concurrent child processes and join them (bit-exact)

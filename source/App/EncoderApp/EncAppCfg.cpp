@@ -2084,6 +2084,7 @@ bool EncAppCfg::parseCfg( int argc, char* argv[] )
     ("FirstValidFrame",                               m_firstValidFrame,                                       0, "First valid frame")
     ("LastValidFrame",                                m_lastValidFrame,                                  MAX_INT, "Last valid frame")
     ("ParallelSegments",                              m_parallelSegments,                                      1, "Encode intra-period chunks in this many concurrent processes and join them (bit-exact with a sequential encode; RA/AI with CRA refresh)")
+    ("PowerThrottling",                               m_powerThrottling,                                   false, "Windows: let the system throttle the encoder when it runs in the background (EcoQoS: lower clocks, efficiency cores). Off: the encoder asks not to be throttled")
     ("SegmentLength",                                 m_segmentLength,                                         0, "Frames per chunk for ParallelSegments, a multiple of IntraPeriod (0: automatic)")
     ("SegmentPOCOffset",                              m_segmentPocOffset,                                      0, "Internal (ParallelSegments workers): POC of the first picture of an all-intra chunk")
 #if JVET_AJ0249_NEURAL_NETWORK_BASED

@@ -105,8 +105,9 @@ Commits on `enc-mt`, all bit-exact with stock ECM-20.0 (bitstream md5 of the sui
 - Found by the matrix of stage A: `--FrameThreads` >= 3 stopped with "PDP predictor unavailable" on ra_cif (bug of
   cfe3c39a, fixed in its own commit): a search stack's first picture used IntraPrediction's PDP buffer pointers before
   any CU of that stack had set them.
-- Unpinned runs on this hybrid CPU are slower than pinned ones even with one thread (LD 17 frames: 201 s vs 174 s on
-  P-cores): Windows puts the encoder's threads on E-cores. Worth trying: opt out of power throttling (EcoQoS) at start.
+- Unpinned runs on this hybrid CPU were slower than pinned ones even with one thread (LD 17 frames: 201 s vs 174 s on
+  P-cores): Windows throttled the background encoder (EcoQoS) and put it on E-cores. The encoder now opts out
+  (`--PowerThrottling`, next commit): unpinned single-thread runs 1.24-1.26x faster, AI with 8 frame threads 1.15x.
 
 ## Tools in perf/mt
 

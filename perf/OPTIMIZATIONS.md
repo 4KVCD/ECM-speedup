@@ -138,6 +138,22 @@ lower all-core turbo, one duplicated intra frame per chunk, unequal chunk comple
 | ra_parkjoy (256x256, 5 frames) | 55.9 s | 52.4 s, 1.07x | 51.1 s, 1.09x | 52.8 s, 1.06x | 1.5 / 2.0 / 2.5 GB | yes |
 | ra_foreman (QCIF, 9 frames) | 89.5 s | 88.4 s, 1.01x | 88.4 s, 1.01x | 91.1 s, 0.98x | 1.5 / 2.1 / 2.6 GB | yes |
 
+## Power throttling (`--PowerThrottling`, default 0)
+
+- Windows 11 throttles processes running in the background (EcoQoS: lower clocks, efficiency cores). An encoder started
+  without a foreground window (a script, a batch job) ran up to a third slower on the 265K, and its time varied with
+  where the scheduler put it. By default the encoder now asks Windows not to throttle it (SetProcessInformation,
+  ProcessPowerThrottling, for this process only and only while it runs); `--PowerThrottling=1` leaves it to Windows.
+  Output identical. Unpinned, one run at a time:
+
+| test | before | now | `--PowerThrottling=1` |
+|---|---|---|---|
+| ld_foreman, 1 thread | 52.4 s (49-56) | 41.5 s, 1.26x | 52.1 s |
+| ai_foreman, 1 thread | 39.7 s (36-44) | 32.0 s, 1.24x | 37.8 s |
+| AI 33 pictures, FrameThreads=8 | 37.6 s | 32.8 s, 1.15x | |
+
+  The times now equal those pinned to P-cores; benchmarks in this file are pinned, so they did not change.
+
 ## Notes
 - GCC 16 needed two build fixes (missing `<cstdint>`; `-fno-aggressive-loop-optimizations`, because
   `EncAdaptiveLoopFilter.cpp` reads `m_chromaScaleIdxFinal[4][1]` with alternative index up to 7).
