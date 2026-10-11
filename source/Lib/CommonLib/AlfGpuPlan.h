@@ -181,3 +181,38 @@ private:
   bool    m_maskChroma = false;
   uint8_t m_epoch = 0;
 };
+
+#if JVET_AK0065_TALF
+class Picture;
+
+/// What TAlfProcess filters in one picture, recorded by AdaptiveLoopFilter::talfGpuPlan so that the GPU decoder can
+/// filter the samples: the luma 4x4 blocks that getMotionOffset accepts, with their reference blocks and filters.
+struct TalfGpuPlan
+{
+  struct Filter
+  {
+    int32_t coeff[NUM_TALF_COEFF];
+    int32_t clip[NUM_TALF_COEFF];   ///< the clipping value of each coefficient
+    int32_t shift;
+    int32_t shape;                  ///< 0: templateShape0, 1: templateShape1
+  };
+  struct Block
+  {
+    int16_t x, y;           ///< luma position
+    int16_t mv[2][2];       ///< integer offsets of the reference blocks
+    uint8_t ref[2];         ///< indices into refs; ref[1] only with bi
+    uint8_t filter;         ///< index into filters
+    uint8_t pad;
+  };
+
+  bool                        gpu = false;      ///< false: TAlfProcess filters on the CPU (cpuReason says why)
+  const char*                 cpuReason = nullptr;
+  bool                        bi = false;       ///< the average of two reference blocks, else one
+  int                         mode = 0;         ///< TAlfFilterMode
+  std::vector<const Picture*> refs;             ///< the unscaled reference pictures that the blocks read
+  std::vector<Filter>         filters;
+  std::vector<Block>          blocks;
+
+  void unsupported( const char* reason ) { gpu = false; cpuReason = reason; }
+};
+#endif

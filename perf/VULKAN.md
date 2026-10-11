@@ -133,6 +133,21 @@ Quirks kept: the chroma offsets and the sub-model threshold are summed in 16-bit
 rounding term of `xGetDivScaleRoundShift` shifts by the bit count modulo 32, as x86 does; the regression window at a
 CTU's left or top edge keeps its start and still grows by 2 samples; `clipArea` clips only at the right and bottom.
 
+### Temporal ALF
+
+The temporal ALF (`TAlfProcess`) adds to the luma of each 4x4 block of the CTUs with TALF on a correction from 13
+pairs of samples around the block's position in one or two reference pictures, moved by the motion of a nearby
+block. `AdaptiveLoopFilter::talfGpuPlan` runs the CPU's block selection (`getRefPics`, `getMotionOffset`) and
+records the accepted blocks with their reference pictures, integer motion and filter; `talf.comp` filters them, one
+invocation per sample. The reference samples can lie up to 29 samples outside the picture, in the border that
+`finishPicture` filled with motion-compensated padding, so the GPU keeps copies of the last 8 reference pictures'
+luma with a 32-sample border, taken from the CPU when a picture first serves as a TALF reference.
+
+The GPU follows the AVX2 code that the stock decoder runs: the correction is added without clipping (adaptive
+clipping clips the picture afterwards), and the rounding offset `1 << (shift - 1)` takes the shift count modulo 32.
+`simdSetBiInput` steps through the second reference block's upper samples with the first block's stride; both
+strides are equal unless the reference pictures differ in size, and such pictures run on the CPU.
+
 ## Status
 
 | stage | GPU | checked on the corpus |
@@ -147,6 +162,9 @@ CTU's left or top edge keeps its start and still grows by 2 samples; `clipArea` 
 | offset refinement after deblocking and after ALF | yes | 48 streams identical, 34 and 84 pictures |
 | LF-CCCM: CTU model types 0, 1, 3-6, window sizes 0-2, 4, 5, all update factors, every branch of the window process | yes | 48 streams identical, 73 pictures, 31612 windows |
 | LF-CCCM CTU model types 2 and 7, window sizes 3, 6, 7 | yes | not exercised |
+| temporal ALF modes FORWARD_TALF_MV, BACKWARD_TALF_MV, BIDIR_TALF_MV, template shapes 0 and 1 | yes | 48 streams identical, 320 pictures, 5 with filtered blocks, 10420 blocks |
+| temporal ALF modes FORWARD_TALF, BACKWARD_TALF, BIDIR_TALF (the two nearest reference pictures, no motion) | yes | not exercised |
+| temporal ALF after an ALF on the CPU, with reference pictures of another size, with GDR | CPU | 48 streams identical with every picture forced to the CPU path |
 | everything else | CPU | - |
 
 Speed: on the hybrid path the per-picture copies and the synchronous waits cost more than the GPU saves. ra_cif

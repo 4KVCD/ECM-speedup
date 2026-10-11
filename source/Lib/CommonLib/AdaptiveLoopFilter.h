@@ -199,6 +199,8 @@ public:
   void destroy();
 #if JVET_AK0065_TALF
   void TAlfProcess(CodingStructure &cs);
+  /// Records into plan what TAlfProcess would filter in this picture, without filtering; see TalfGpuPlan.
+  void talfGpuPlan( CodingStructure& cs, TalfGpuPlan& plan );
 #endif
 #if RPR_ENABLE
   Size  getAlfSize() { return Size(m_tempBuf.get(COMPONENT_Y).width, m_tempBuf.get(COMPONENT_Y).height); }

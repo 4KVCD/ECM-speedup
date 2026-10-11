@@ -1231,17 +1231,27 @@ void DecLib::executeLoopFilters()
 #endif
   }
 #endif
-#if ECM_VULKAN
-  if( m_vkCore )
-  {
-    // the temporal ALF runs on the CPU
-    m_vkLoopFilter.syncToCpu( cs );
-  }
-#endif
 #if JVET_AK0065_TALF
   if( cs.sps->getUseTAlf())
   {
-    m_cALF.TAlfProcess(cs);
+#if ECM_VULKAN
+    // The temporal ALF runs on the GPU after an ALF on the GPU; in check mode the CPU runs it too.
+    const bool gpuTalf = m_vkCore && m_vkLoopFilter.talf( cs, m_cALF );
+    if( m_vkCore && !gpuTalf )
+    {
+      m_vkLoopFilter.syncToCpu( cs );
+    }
+    if( !gpuTalf || m_vkCheck )
+#endif
+    {
+      m_cALF.TAlfProcess(cs);
+    }
+#if ECM_VULKAN
+    if( gpuTalf )
+    {
+      m_vkLoopFilter.checkAgainstCpu( cs, "temporal ALF" );
+    }
+#endif
   }
 #endif
 #if JVET_AK0121_LOOPFILTER_OFFSET_REFINEMENT
@@ -1272,10 +1282,16 @@ void DecLib::executeLoopFilters()
       if( m_vkCore )
       {
         m_vkLoopFilter.checkAgainstCpu( cs, "offset refinement after ALF" );
-        m_vkLoopFilter.syncToCpu( cs );
       }
 #endif
     }
+  }
+#endif
+#if ECM_VULKAN
+  if( m_vkCore )
+  {
+    // the picture leaves the loop filters on the CPU
+    m_vkLoopFilter.syncToCpu( cs );
   }
 #endif
   // Use residual buffer to store post-filtered image

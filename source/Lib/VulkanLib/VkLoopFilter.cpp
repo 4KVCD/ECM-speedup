@@ -169,11 +169,19 @@ void VkLoopFilter::destroy()
   {
     m_core->destroyBuffer( *b );
   }
+#if JVET_AK0065_TALF
+  m_core->destroyBuffer( m_talfParams );
+  for( TalfRef& r: m_talfRefs )
+  {
+    m_core->destroyBuffer( r.buf );
+  }
+  m_talfRefs.clear();
+#endif
 }
 
 const char* VkLoopFilter::stageName( int stage )
 {
-  static const char* names[NUM_STAGES] = { "deblocking", "SAO/BIF/CCSAO", "offset refinement", "LF-CCCM", "ALF" };
+  static const char* names[NUM_STAGES] = { "deblocking", "SAO/BIF/CCSAO", "offset refinement", "LF-CCCM", "ALF", "temporal ALF" };
   return names[stage];
 }
 
@@ -209,6 +217,9 @@ void VkLoopFilter::beginPicture( CodingStructure& cs )
   m_lastStage  = 0;
   m_alfInputOnGpu = false;
   m_counts.pictures++;
+#if JVET_AK0065_TALF
+  talfForget( cs.picture );
+#endif
 }
 
 void VkLoopFilter::ensureOnGpu( CodingStructure& cs )

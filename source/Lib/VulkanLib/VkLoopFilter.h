@@ -51,6 +51,7 @@
 
 class AdaptiveLoopFilter;
 class CodingStructure;
+class Picture;
 class SampleAdaptiveOffset;
 
 namespace vkd
@@ -93,8 +94,9 @@ private:
   ChromaFormat m_format  = CHROMA_420;
 };
 
-/// Runs in-loop filter stages of a picture on the GPU: deblocking, and SAO with the bilateral filter and CCSAO.
-/// The CPU decoder runs the other stages and hands over the parameters each GPU stage needs.
+/// Runs the in-loop filters of a picture on the GPU: deblocking, SAO with the bilateral filter and CCSAO, the offset
+/// refinements, LF-CCCM, ALF and the temporal ALF. The CPU decoder hands over the parameters each GPU stage needs and
+/// runs a stage itself when the GPU does not cover a picture.
 ///
 /// In check mode the CPU also runs every GPU stage. Each GPU stage then starts from the CPU's input and its result
 /// must equal the CPU's (checkAgainstCpu). Otherwise the picture stays on the GPU between GPU stages, and
@@ -133,6 +135,12 @@ public:
   void lfCccmApply( CodingStructure& cs );
   void lfCccmCheck( CodingStructure& cs, const PelUnitBuf& cpuCorrection );
 
+#if JVET_AK0065_TALF
+  /// The temporal ALF, as AdaptiveLoopFilter::TAlfProcess, after ALF and the LF-CCCM correction. Returns false if
+  /// TAlfProcess has to run on the CPU (talfCpuReasons says why), e.g. after an ALF on the CPU.
+  bool talf( CodingStructure& cs, AdaptiveLoopFilter& alf );
+#endif
+
   /// The deblocking's coding information (luma), which the offset refinement and ALF read; after loopFilterPic.
   void uploadCodingInfo( const CPelBuf& ci );
   /// The offset refinement of AdaptiveLoopFilter::calcOffsetRefinement and copyOffsetRefinement, after deblocking
@@ -151,6 +159,7 @@ public:
     STAGE_REFINE,
     STAGE_LFCCCM,
     STAGE_ALF,
+    STAGE_TALF,
     NUM_STAGES
   };
   static const char* stageName( int stage );
@@ -182,10 +191,17 @@ public:
     uint64_t lfCccmImpModes[5]    = {};   ///< pictures by update factor (impMode)
     uint64_t lfCccmBranches[6]    = {};   ///< steps with a smaller model, too few samples, an invalid model, a stop at
                                           ///< a deviating sample, halves with sub-models, all steps
+    uint64_t talfPictures   = 0;   ///< pictures whose temporal ALF ran on the GPU
+    uint64_t talfCpuPictures = 0;  ///< pictures whose temporal ALF ran on the CPU (talfCpuReasons)
+    uint64_t talfBlocks     = 0;   ///< filtered 4x4 blocks
+    uint64_t talfModes[6]   = {};  ///< pictures with filtered blocks, by TAlfFilterMode
+    uint64_t talfShapes[2]  = {};  ///< filtered blocks by template shape
   };
   const Counts& counts() const { return m_counts; }
   /// Why ALF stayed on the CPU, with the number of pictures.
   const std::map<std::string, uint64_t>& alfCpuReasons() const { return m_alfCpuReasons; }
+  /// Why the temporal ALF stayed on the CPU, with the number of pictures.
+  const std::map<std::string, uint64_t>& talfCpuReasons() const { return m_talfCpuReasons; }
 
 private:
   void ensureOnGpu( CodingStructure& cs );
@@ -238,6 +254,26 @@ private:
   Buffer           m_alfTables;         ///< the fixed filter tables
   Buffer           m_alfParams;         ///< per picture: parameters, CTUs, filters, tiles
   std::map<std::string, uint64_t> m_alfCpuReasons;
+
+#if JVET_AK0065_TALF
+  // The temporal ALF reads the luma of reference pictures with the border that finishPicture padded. Copies of the
+  // last few on the GPU, by picture; beginPicture drops the copy of a picture object that holds a new picture.
+  struct TalfRef
+  {
+    const Picture* pic     = nullptr;
+    Buffer         buf;
+    int            origin  = 0;
+    int            stride  = 0;
+    uint64_t       lastUse = 0;
+  };
+  const TalfRef& talfRef( const Picture* pic );
+  void           talfForget( const Picture* pic );
+  TalfGpuPlan          m_talfPlan;
+  std::vector<TalfRef> m_talfRefs;
+  uint64_t             m_talfUse = 0;
+  Buffer               m_talfParams;   ///< per picture: blocks, filters, references
+#endif
+  std::map<std::string, uint64_t> m_talfCpuReasons;
 
   void             addGpuTime( Stage stage, int t0, int t1 );
   double           m_gpuMs = 0;

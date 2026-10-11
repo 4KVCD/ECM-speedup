@@ -665,18 +665,24 @@ void DecApp::xDestroyDecLib()
       };
       // perf/vkcoverage.py reads the numbers of this line in order
       msg( INFO, " GPU stages checked on %llu pictures: deblocking segments %llu, SAO CTUs by type%s, bilateral filter blocks %llu, CCSAO CTUs by band candidate%s, by edge direction%s,"
-                 " ALF pictures %llu, luma CTUs by fixed set and APS filter type%s, by classifier%s, with scaling %llu, chroma CTUs by type%s, CCALF CTUs %llu, chroma scaling pictures %llu, mirrored regions %llu, offset refinement pictures after deblocking and after ALF%s, LF-CCCM pictures %llu, LF-CCCM windows %llu, CTUs by model type%s, by window size%s, pictures by update factor%s, window steps: smaller model, too few samples, invalid model, stopped, sub-models, all%s\n",
+                 " ALF pictures %llu, luma CTUs by fixed set and APS filter type%s, by classifier%s, with scaling %llu, chroma CTUs by type%s, CCALF CTUs %llu, chroma scaling pictures %llu, mirrored regions %llu, offset refinement pictures after deblocking and after ALF%s, LF-CCCM pictures %llu, LF-CCCM windows %llu, CTUs by model type%s, by window size%s, pictures by update factor%s, window steps: smaller model, too few samples, invalid model, stopped, sub-models, all%s,"
+                 " temporal ALF pictures on the GPU %llu, on the CPU %llu, blocks %llu, pictures by mode%s, blocks by template shape%s\n",
            (unsigned long long) n.pictures, (unsigned long long) n.deblockSegments, list( n.saoCtus, 5 ).c_str(), (unsigned long long) n.bifBlocks,
            list( n.ccSaoBand, 9 ).c_str(), list( n.ccSaoEdge, 4 ).c_str(), (unsigned long long) n.alfPictures, list( n.alfLumaCtus, 6 ).c_str(),
            list( n.alfClassifier, 3 ).c_str(), (unsigned long long) n.alfScaleCtus, list( n.alfChromaCtus, 2 ).c_str(),
            (unsigned long long) n.ccAlfCtus, (unsigned long long) n.alfChromaScalePictures, (unsigned long long) n.alfMirrors,
            list( n.refinePictures, 2 ).c_str(), (unsigned long long) n.lfCccmPictures, (unsigned long long) n.lfCccmWindows,
            list( n.lfCccmModelTypes, 8 ).c_str(), list( n.lfCccmWindowSizes, 8 ).c_str(), list( n.lfCccmImpModes, 5 ).c_str(),
-           list( n.lfCccmBranches, 6 ).c_str() );
+           list( n.lfCccmBranches, 6 ).c_str(), (unsigned long long) n.talfPictures, (unsigned long long) n.talfCpuPictures,
+           (unsigned long long) n.talfBlocks, list( n.talfModes, 6 ).c_str(), list( n.talfShapes, 2 ).c_str() );
     }
     for( const auto& r: m_cDecLib.vulkanAlfCpuReasons() )
     {
       msg( INFO, " ALF on the CPU: %llu pictures, %s\n", (unsigned long long) r.second, r.first.c_str() );
+    }
+    for( const auto& r: m_cDecLib.vulkanTalfCpuReasons() )
+    {
+      msg( INFO, " temporal ALF on the CPU: %llu pictures, %s\n", (unsigned long long) r.second, r.first.c_str() );
     }
   }
 #endif

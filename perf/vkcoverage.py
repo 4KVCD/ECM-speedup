@@ -26,7 +26,10 @@ LABELS = (["pictures", "deblocking segments"] + [f"SAO {t}" for t in ("EO0", "EO
           + [f"LF-CCCM model type {i}" for i in range(8)] + [f"LF-CCCM window size {i}" for i in range(8)]
           + [f"LF-CCCM update factor {i}" for i in range(5)]
           + [f"LF-CCCM steps: {t}" for t in ("smaller model", "too few samples", "invalid model", "stopped", "sub-models",
-                                             "all")])
+                                             "all")]
+          + ["TALF pictures on the GPU", "TALF pictures on the CPU", "TALF blocks"]
+          + [f"TALF mode {t}" for t in ("FORWARD_MV", "BACKWARD_MV", "BIDIR_MV", "FORWARD", "BACKWARD", "BIDIR")]
+          + [f"TALF shape {i}" for i in range(2)])
 
 
 def run(exe, name):

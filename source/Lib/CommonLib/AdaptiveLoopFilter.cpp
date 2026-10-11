@@ -2226,6 +2226,117 @@ void AdaptiveLoopFilter::TAlfProcess(CodingStructure &cs)
     applyTAlfFilter(cs, compId, recAfterALF, recBeforeALF, params, m_tAlfCtbControl, talfControl);
   }
 }
+
+void AdaptiveLoopFilter::talfGpuPlan( CodingStructure& cs, TalfGpuPlan& plan )
+{
+  plan.gpu       = true;
+  plan.cpuReason = nullptr;
+  plan.refs.clear();
+  plan.filters.clear();
+  plan.blocks.clear();
+  if( !cs.sps->getUseTAlf() )
+  {
+    return;
+  }
+  if( cs.isGdrEnabled() )
+  {
+    plan.unsupported( "GDR" );
+    return;
+  }
+  getRefPics( cs );
+  std::vector<TAlfFilterParam> params;
+  const TAlfControl talfControl = cs.slice->getTileGroupTAlfControl();
+  APS**             apss        = cs.slice->getTAlfAPSs();
+  for( int apsId: talfControl.apsIds )
+  {
+    params.push_back( apss[apsId]->getTAlfAPSParam() );
+  }
+  const int  mode    = talfControl.mode;
+  const bool isMv    = isMvTAlf( mode );
+  const int  refList = isFwdTAlf( mode ) ? 0 : 1;
+  plan.mode = mode;
+  plan.bi   = isBiTAlf( mode );
+
+  // the reference pictures as setBiInput and setUniInput choose them, by index in plan.refs
+  auto refIndex = [&]( const Picture* pic ) {
+    for( size_t i = 0; i < plan.refs.size(); i++ )
+    {
+      if( plan.refs[i] == pic )
+      {
+        return int( i );
+      }
+    }
+    plan.refs.push_back( pic );
+    return int( plan.refs.size() ) - 1;
+  };
+  int filterOf[MAX_NUM_TALF_FILTERS * MAX_NUM_TALF_FILTERS];
+  std::fill_n( filterOf, MAX_NUM_TALF_FILTERS * MAX_NUM_TALF_FILTERS, -1 );
+
+  int ctbIdx = 0;
+  for( int yPos = 0; yPos < m_picHeight; yPos += m_maxCUHeight )
+  {
+    for( int xPos = 0; xPos < m_picWidth; xPos += m_maxCUWidth, ctbIdx++ )
+    {
+      const TAlfCtbParam& ctb = m_tAlfCtbControl[ctbIdx];
+      if( !ctb.enabledFlag )
+      {
+        continue;
+      }
+      if( ctb.setIdx >= params.size() || ctb.filterIdx >= MAX_NUM_TALF_FILTERS )
+      {
+        plan.unsupported( "TALF filter set out of range" );
+        return;
+      }
+      const TAlfFilterParam& param  = params[ctb.setIdx];
+      int&                   filter = filterOf[ctb.setIdx * MAX_NUM_TALF_FILTERS + ctb.filterIdx];
+      if( filter < 0 )
+      {
+        TalfGpuPlan::Filter f;
+        for( int i = 0; i < NUM_TALF_COEFF; i++ )
+        {
+          f.coeff[i] = param.coeff[ctb.filterIdx][i];
+          f.clip[i]  = m_alfClippingValues[CHANNEL_TYPE_LUMA][param.clipIdx[ctb.filterIdx][i]];
+        }
+        f.shift = param.shift[ctb.filterIdx];
+        f.shape = param.shapeIdx > 0 ? 1 : 0;
+        filter  = int( plan.filters.size() );
+        plan.filters.push_back( f );
+      }
+      // filterBlkTAlf: the motion of a block stays in mvField for the next blocks of the CTU
+      const UnitArea ctu = clipArea( UnitArea( cs.pcv->chrFormat, Area( xPos, yPos, m_maxCUWidth, m_maxCUHeight ) ), *cs.slice->getPic() );
+      const CompArea& blk = ctu.blocks[COMPONENT_Y];
+      MvField mvField[2];
+      for( int y = blk.y; y < blk.y + blk.height; y += TALF_SBB_SIZE )
+      {
+        for( int x = blk.x; x < blk.x + blk.width; x += TALF_SBB_SIZE )
+        {
+          if( !getMotionOffset( cs, Position( x, y ), mvField, mode, param.shapeIdx ) )
+          {
+            continue;
+          }
+          TalfGpuPlan::Block b = {};
+          b.x      = int16_t( x );
+          b.y      = int16_t( y );
+          b.filter = uint8_t( filter );
+          for( int k = 0; k < ( plan.bi ? 2 : 1 ); k++ )
+          {
+            const int list = plan.bi ? k : refList;
+            const Picture* ref = isMv ? cs.slice->getRefPic( RefPicList( list ), mvField[list].refIdx )->unscaledPic
+                                      : cs.slice->getRefPic( m_refCombs[list].rplId, m_refCombs[list].refId )->unscaledPic;
+            b.ref[k]   = uint8_t( refIndex( ref ) );
+            b.mv[k][0] = int16_t( mvField[list].mv.getHor() );
+            b.mv[k][1] = int16_t( mvField[list].mv.getVer() );
+          }
+          plan.blocks.push_back( b );
+        }
+      }
+    }
+  }
+  if( plan.refs.size() > 255 || plan.filters.size() > 255 )
+  {
+    plan.unsupported( "too many TALF references or filters" );
+  }
+}
 #endif
 void AdaptiveLoopFilter::reconstructCoeffAPSs(CodingStructure& cs, bool luma, bool chroma, bool isRdo)
 {

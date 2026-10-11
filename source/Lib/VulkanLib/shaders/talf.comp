@@ -1,0 +1,108 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+// The temporal ALF of luma (AdaptiveLoopFilter::filterBlkTAlf with the AVX2 simdSetBiInput, simdSetUniInput and
+// simdFilterBatchTAlf) on the 4x4 blocks that the CPU's plan lists: per sample, the differences between 13 pairs of
+// reference samples around the motion-shifted position and the ALF input sample, clipped and weighted, are added to
+// the ALF output. With two reference blocks a reference sample is the average of both. One invocation per sample.
+
+layout( local_size_x = 64 ) in;
+
+struct TalfBlock
+{
+  int16_t x, y;
+  int16_t mv[4];      // reference block 0 (x, y), then 1
+  uint8_t ref[2];
+  uint8_t filterIdx;
+  uint8_t pad;
+};
+struct TalfFilter
+{
+  int coeff[13];
+  int clip[13];
+  int shift;
+  int offset;         // 1 << ( shift - 1 ), as x86 computes it
+  int shape;
+};
+struct TalfRef
+{
+  I16Buf buf;
+  int    origin;
+  int    stride;
+};
+layout( buffer_reference, scalar, buffer_reference_align = 4 ) buffer TalfBlocks { TalfBlock b[]; };
+layout( buffer_reference, scalar, buffer_reference_align = 4 ) buffer TalfFilters { TalfFilter f[]; };
+layout( buffer_reference, scalar, buffer_reference_align = 8 ) buffer TalfRefs { TalfRef r[]; };
+
+layout( push_constant, scalar ) uniform Push
+{
+  I16Buf      dst;        // the picture after ALF, filtered in place
+  I16Buf      src;        // the ALF input
+  TalfBlocks  blocks;
+  TalfFilters filters;
+  TalfRefs    refs;
+  int         dstOrigin, dstStride;
+  int         srcOrigin, srcStride;
+  int         numBlocks;
+  int         bi;
+} pc;
+
+// templateShape0 and templateShape1 of AlfParameters.h
+const ivec2 shape0[13] = { ivec2( 0, 0 ), ivec2( 1, 0 ), ivec2( 0, 1 ), ivec2( 1, 1 ), ivec2( -1, 1 ), ivec2( 2, 0 ),
+                           ivec2( 0, 2 ), ivec2( -2, 1 ), ivec2( 2, 1 ), ivec2( -1, 2 ), ivec2( 1, 2 ), ivec2( 3, 0 ),
+                           ivec2( 0, 3 ) };
+const ivec2 shape1[13] = { ivec2( 0, 0 ), ivec2( 1, 0 ), ivec2( 0, 1 ), ivec2( 1, 1 ), ivec2( -1, 1 ), ivec2( 2, 0 ),
+                           ivec2( 0, 2 ), ivec2( 3, 0 ), ivec2( 0, 3 ), ivec2( 4, 0 ), ivec2( 0, 4 ), ivec2( 5, 0 ),
+                           ivec2( 0, 5 ) };
+
+int refPel( TalfRef r, ivec2 p ) { return int( r.buf.v[r.origin + p.y * r.stride + p.x] ); }
+
+void main()
+{
+  const int blk = int( gl_GlobalInvocationID.x ) >> 4;
+  if( blk >= pc.numBlocks )
+  {
+    return;
+  }
+  const int       s  = int( gl_GlobalInvocationID.x ) & 15;
+  const TalfBlock b  = pc.blocks.b[blk];
+  const ivec2     p  = ivec2( b.x + ( s & 3 ), b.y + ( s >> 2 ) );
+  const int       c  = int( pc.src.v[pc.srcOrigin + p.y * pc.srcStride + p.x] );
+  TalfRef         rA = pc.refs.r[b.ref[0]];
+  TalfRef         rB = pc.refs.r[pc.bi != 0 ? b.ref[1] : b.ref[0]];
+  const ivec2     pA = p + ivec2( b.mv[0], b.mv[1] );
+  const ivec2     pB = p + ivec2( b.mv[2], b.mv[3] );
+  const int       f  = b.filterIdx;
+  const bool      s1 = pc.filters.f[f].shape != 0;
+
+  int toAdd = 0;
+  for( int i = 0; i < 13; i++ )
+  {
+    const ivec2 rel = s1 ? shape1[i] : shape0[i];
+    int upper, lower;
+    if( pc.bi != 0 )
+    {
+      upper = ( refPel( rA, pA + rel ) + refPel( rB, pB + rel ) ) >> 1;
+      lower = ( refPel( rA, pA - rel ) + refPel( rB, pB - rel ) ) >> 1;
+    }
+    else
+    {
+      upper = refPel( rA, pA + rel );
+      lower = refPel( rA, pA - rel );
+    }
+    // the centre pairs the reference sample with the ALF input sample itself, whose difference is 0
+    if( i == 0 )
+    {
+      lower = c;
+    }
+    const int clip = pc.filters.f[f].clip[i];
+    const int pair = clamp( upper - c, -clip, clip ) + clamp( lower - c, -clip, clip );
+    toAdd += pc.filters.f[f].coeff[i] * pair;
+  }
+  // _mm256_abs_epi32, then _mm256_sign_epi32 with the sum's sign
+  const int mag  = ( ( toAdd < 0 ? -toAdd : toAdd ) + pc.filters.f[f].offset ) >> pc.filters.f[f].shift;
+  const int corr = toAdd < 0 ? -mag : toAdd == 0 ? 0 : mag;
+  const int d    = pc.dstOrigin + p.y * pc.dstStride + p.x;
+  pc.dst.v[d]    = int16_t( int( pc.dst.v[d] ) + corr );
+}
