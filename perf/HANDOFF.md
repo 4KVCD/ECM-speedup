@@ -13,7 +13,7 @@ wall-clock gains with threads are "the easy baseline". Decoder status: single-th
 (`--GpuLoopFilter=1`: ALF, SAO, BIF, CCSAO, LF-CCCM, offset refinement on Vulkan). The user then asked for **a full
 GPU decoder in Vulkan, optimized until nothing is left** ("The GPU decoder needs to fully decode the frame on the
 GPU"; "Your first Vulkan version is going to be slow. That's OK"). That work is branch `dec-gpurecon`: intra
-reconstruction on the GPU (`--GpuRecon`), tool levels M1-M6 done and verified bit-exact; it is **not yet faster than
+reconstruction on the GPU (`--GpuRecon`), tool levels M1-M7 done and verified bit-exact; it is **not yet faster than
 the CPU decoder** (see section 8) and supports only a restricted tool set (all real CTC streams fall back to the CPU,
 first reason: sign prediction).
 
@@ -136,6 +136,9 @@ commands that combine `Remove-Item` with `//` text. `perf\gpu\crlf.ps1 <worktree
   - M6 (M5's arguments plus): `m6` `--DepQuant=2` (dependent quantization, 8 states, as in CTC), `m6q`
     `--DepQuant=2 --QCS=1` (as in CTC), `m6s` `--QCS=1` (scalar quantization with QCS), `m6d1` `--DepQuant=1`
     (4 states).
+  - M7 (m6q's arguments plus `--JointCbCr=1`): `m7` dual tree, `m7s` `--DualITree=0`, `m7q` `--DualITree=0
+    --CbQpOffset=3 --CrQpOffset=-3 --CbCrQpOffset=-2` (unequal chroma QPs). In m7 the foreman streams use the
+    negative ICT modes, park720 the positive ones (counted with a temporary print).
   - each set: fore22/32/37 (CIF), park720, four720 (2-4 pictures). Longer ones: m2_fore33, m2_park16, m3_park16
     (`enc_m1.ps1 <name> <yuv> 1280 720 16 --TemporalSubsampleRatio=1 -q 32 <level args>`), m3_park60 (60 frames,
     `enc_long.ps1 m3_park60 ...\ParkJoy_1280x720.yuv 1280 720 4 15 -q 32 --IntraToolControlMode=1 --IntraPredBf=1`:
@@ -188,7 +191,7 @@ everything that depends on samples runs on the GPU, implemented line by line aft
 TrQuant.cpp, BilateralFilter.cpp). `supported()` must reject every tool whose mode derivation or prediction reads
 reconstructed samples or that the kernels lack.
 
-Files: `source/Lib/GpuLib/GpuIntraRec.{h,cpp}`, `shaders/intra_common.glsl` (Tu = 58 ints and Params layouts,
+Files: `source/Lib/GpuLib/GpuIntraRec.{h,cpp}`, `shaders/intra_common.glsl` (Tu = 60 ints and Params layouts,
 static_asserts on the host), `intra_resi.comp`, `intra_rec.comp`, `intra_deps.comp`, `scan.comp`, `VkCompute.*`
 (device with vulkanMemoryModel + optional shader clock; up to 8 queues round-robin); `DecoderLib/DecCu.cpp`
 (record calls), `DecSlice.cpp` (parse-first, derive pass, CPU fallback), `DecLib.cpp` (setGpuRecon,
@@ -203,6 +206,7 @@ slice per picture. M4: the dual tree of intra slices (no kernel change). M5: LMC
 bilateral filter on inverse-mapped samples, chroma residual scaling from the luma next to the CU; the host uploads
 the LUTs and the chroma scale per luma value, `Reshape::getChromaAdjNeighbours` finds the neighbouring luma CUs).
 M6: dependent quantization (the host records quantization indices) and QCS (`m_coeffShift64` from Quant.h).
+M7: joint CbCr (the Cb block computes both residuals in intra_resi; Tu::jccr, jccrOffset).
 
 ## 8. Numbers (i7-10700 8C/16T, Win11, GCC 16.2, RTX 3070 driver 616.92)
 
@@ -224,14 +228,14 @@ Profile of a GPU-on decode (non-LTO, m2_park16, share of all samples): parsing ~
 ## 9. Next steps (in the order I would take them)
 
 1. Time 180ccabc (paired grL builds, `walls.py` with `--GpuRecon=3`, CPU vs GPU, FT8; use m3_park60).
-2. Done (2026-10-11): M4 dual tree, M5 LMCS, M6 dependent quantization and QCS. All 19 regular streams now stop
-   at "sign prediction" (the next sequence-level check; the block-level tools of step 4 follow).
+2. Done (2026-10-11): M4 dual tree, M5 LMCS, M6 dependent quantization and QCS, M7 joint CbCr. All 19 regular
+   streams now stop at "sign prediction" (the next sequence-level check; the block-level tools of step 4 follow).
 3. Make the GPU path win on CPU time per picture: the derive-only pass (record during parsing or a leaner pass;
    speed up getSpatialIpm/getPURestricted, which also helps the CPU decoder), GPU behaviour with frame threads
    (8 contexts x 32 persistent workgroups oversubscribe the GPU; spinning workgroups; try fewer groups per context,
    more frame threads than cores to hide GPU waits, overlapping a picture's GPU work with the next picture's parse).
 4. More tool levels, roughly in the order CTC AI needs them: MRL/TMRL, ISP, MIP, MTS/LFNST/NSPT, transform
-   skip/BDPCM, JCCR, sign prediction (reads reconstruction: GPU), CCLM/CCCM and the other
+   skip/BDPCM, sign prediction (reads reconstruction: GPU), CCLM/CCCM and the other
    cross-component tools (GPU), DIMD/TIMD/MPM sorting/chroma reordering/DBV (mode derivations that read the
    reconstruction: these have to move to the GPU too), IntraTMP/IBC, then inter pictures. Each level: new test set
    with exactly that tool on, verify mode identical, canaries, commit.

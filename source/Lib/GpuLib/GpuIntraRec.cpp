@@ -63,7 +63,7 @@
 
 namespace
 {
-// layout shared with intra_rec.comp (struct Tu): 58 int32
+// layout shared with intra_rec.comp (struct Tu): 60 int32
 struct Tu
 {
   int32_t comp, x, y, w, h;
@@ -87,8 +87,9 @@ struct Tu
   int32_t crsX, crsY, crsW, crsH;
   int32_t crsAvail;
   int32_t quant;
+  int32_t jccr, jccrOffset;
 };
-static_assert( sizeof( Tu ) == 58 * 4, "Tu layout" );
+static_assert( sizeof( Tu ) == 60 * 4, "Tu layout" );
 
 // Tu::lmcs
 constexpr int LMCS_BF_INVERSE  = 1;   // the intra bilateral filter works on inverse-mapped samples
@@ -97,6 +98,10 @@ constexpr int LMCS_CHROMA_SCALE = 2;   // the chroma residual is scaled by the C
 // Tu::quant
 constexpr int QUANT_DEP = 1;   // dependent quantization: the coefficients are quantization indices (DepQuant)
 constexpr int QUANT_QCS = 2;   // quantization center shift (JVET-AN0095 / JVET-AE0125)
+
+// Tu::jccr (joint coding of the chroma residuals): the Cb block of a TU carries the ICT mode (TU::getICTMode, +-1..+-3)
+// and computes both residuals; its Cr block, recorded right after it, is marked JCCR_DERIVED
+constexpr int JCCR_DERIVED = 4;
 
 // layout shared with intra_rec.comp (struct Params, std430)
 struct Params
@@ -359,7 +364,6 @@ bool GpuIntraRec::supported( const Slice& slice, std::string& why )
   else if( sps.getUseIntraLFNSTISlice() || sps.getUseIntraLFNSTPBSlice() || sps.getUseNSPT() ) why = "LFNST / NSPT";
   else if( sps.getUseIntraMTS() || sps.getUseImplicitMTS() )                              why = "MTS";
   else if( sps.getTransformSkipEnabledFlag() || sps.getBDPCMEnabledFlag() )               why = "transform skip / BDPCM";
-  else if( sps.getJointCbCrEnabledFlag() )                                                why = "joint CbCr";
   else if( sps.getUseLMChroma() || sps.getUseCcpMerge() || sps.getUseDdCcpFusion() || sps.getUseBvgCccm() ) why = "cross-component prediction";
   else if( sps.getUseChromaReordering() || sps.getUseIntraDBV() )                         why = "chroma reordering / DBV";
   else if( sps.getUseDimd() || sps.getUseBvgDimd() || sps.getUseTimd() || sps.getUseTimdMrg() ) why = "DIMD / TIMD";
@@ -422,7 +426,7 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
   else if( cu.ispMode )                                             why = "ISP";
   else if( cu.lfnstIdx )                                            why = "LFNST";
   else if( tu.mtsIdx[compID] != MTS_DCT2_DCT2 )                     why = "MTS / transform skip";
-  else if( tu.jointCbCr )                                           why = "joint CbCr";
+  else if( tu.jointCbCr && tu.mtsIdx[COMPONENT_Cr] != MTS_DCT2_DCT2 ) why = "transform skip of joint CbCr";
   else if( cu.tmpFlag )                                             why = "IntraTMP";
   else if( cu.dimd )                                                why = "DIMD";
   else if( cu.timd )                                                why = "TIMD";
@@ -489,7 +493,32 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
   t.unitW    = pcv.minCUWidth >> ( noShift ? 0 : getComponentScaleX( compID, sps.getChromaFormatIdc() ) );
   t.unitH    = pcv.minCUHeight >> ( noShift ? 0 : getComponentScaleY( compID, sps.getChromaFormatIdc() ) );
   t.bitDepth = sps.getBitDepth( chType );
-  t.cbf      = TU::getCbf( tu, compID ) ? 1 : 0;
+
+  // the component whose coefficients give the block's residual: with joint CbCr (DecCu::xIntraRecBlk at Cb), the
+  // coded one of the pair (Cb for jointCbCr 2 and 3, else Cr with its own QP); the Cb block computes both residuals
+  // (TrQuant::invTransformICT), the Cr block that follows it gets its residual from there
+  ComponentID resiComp = compID;
+  t.jccr       = 0;
+  t.jccrOffset = 0;
+  if( tu.jointCbCr && compID == COMPONENT_Cb )
+  {
+    t.jccr   = TU::getICTMode( tu );
+    resiComp = ( tu.jointCbCr >> 1 ) ? COMPONENT_Cb : COMPONENT_Cr;
+  }
+  else if( tu.jointCbCr && compID == COMPONENT_Cr )
+  {
+    // DecCu::xIntraRecQT records a TU's Cb and Cr blocks one after the other, so the Cr samples follow the Cb ones
+    const Tu* cb = m.rec.empty() ? nullptr : &m.rec.back();
+    if( !cb || cb->comp != COMPONENT_Cb || cb->x != area.x || cb->y != area.y || cb->jccr == 0
+        || cb->jccrOffset != (int32_t) m.numSamples )
+    {
+      unsupported( "joint CbCr: a Cr block not right after its Cb block" );
+      return;
+    }
+    t.jccr = JCCR_DERIVED;
+  }
+  const QpParam resiQp = resiComp == compID ? qp : QpParam( tu, resiComp );
+  t.cbf = t.jccr != JCCR_DERIVED && TU::getCbf( tu, resiComp ) ? 1 : 0;
 
   // dequantization without scaling lists, transform skip or extended precision: DepQuant::dequant (dequantBlock) with
   // dependent quantization, else Quant::dequant; QCS blends either with the dequantization of the next larger index
@@ -499,8 +528,8 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
   {
     // the index of a level depends on the quantizer state (the indices are derived with the levels below); QP + 1,
     // and the scale is shifted left instead of a negative right shift, without rounding
-    const bool sqrt2          = TU::needsSqrt2Scale( tu, compID );
-    const int  qpDQ           = qp.Qp( false ) + 1;
+    const bool sqrt2          = TU::needsSqrt2Scale( tu, resiComp );
+    const int  qpDQ           = resiQp.Qp( false ) + 1;
     const int  qpPer          = qpDQ / 6;
     const int  qpRem          = qpDQ - 6 * qpPer;
     const int  transformShift = getTransformShift( t.bitDepth, area.size(), maxLog2TrDynamicRange ) + ( sqrt2 ? -1 : 0 );
@@ -513,12 +542,12 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
   }
   else
   {
-    const bool needSqrtAdjustment  = TU::needsBlockSizeTrafoScale( tu, compID );
+    const bool needSqrtAdjustment  = TU::needsBlockSizeTrafoScale( tu, resiComp );
     const int  iTransformShift     = getTransformShift( t.bitDepth, area.size(), maxLog2TrDynamicRange ) + ( needSqrtAdjustment ? -1 : 0 );
-    const int  rightShift          = IQUANT_SHIFT - ( iTransformShift + qp.per( false ) );
+    const int  rightShift          = IQUANT_SHIFT - ( iTransformShift + resiQp.per( false ) );
     const int  scaleBits           = IQUANT_SHIFT + 1;
     const int  targetInputBitDepth = std::min<int>( maxLog2TrDynamicRange + 1, 32 + rightShift - scaleBits );
-    t.dqScale      = g_invQuantScales[needSqrtAdjustment ? 1 : 0][qp.rem( false )];
+    t.dqScale      = g_invQuantScales[needSqrtAdjustment ? 1 : 0][resiQp.rem( false )];
     t.dqRightShift = rightShift;
     t.dqInMin      = -( 1 << ( targetInputBitDepth - 1 ) );
     t.dqInMax      = ( 1 << ( targetInputBitDepth - 1 ) ) - 1;
@@ -588,10 +617,14 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
   t.coeffOffset = (int32_t) m.coef.size();
   t.dbgOffset   = (int32_t) m.numSamples;
   m.numSamples += size_t( area.width ) * area.height;
+  if( t.jccr != 0 && t.jccr != JCCR_DERIVED )
+  {
+    t.jccrOffset = (int32_t) m.numSamples;   // the Cr block's samples
+  }
   t.nzRows = t.nzCols = 0;
   if( t.cbf )
   {
-    const CCoeffBuf c = tu.getCoeffs( compID );
+    const CCoeffBuf c = tu.getCoeffs( resiComp );
     for( int y = 0; y < (int) area.height; y++ )
     {
       const TCoeff* row = c.bufAt( 0, y );

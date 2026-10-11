@@ -2,7 +2,7 @@
 #ifndef INTRA_COMMON_GLSL
 #define INTRA_COMMON_GLSL
 
-// one transform block of one component (58 int32, layout shared with GpuIntraRec.cpp)
+// one transform block of one component (60 int32, layout shared with GpuIntraRec.cpp)
 struct Tu
 {
   int comp, x, y, w, h;
@@ -26,6 +26,8 @@ struct Tu
   int crsX, crsY, crsW, crsH;   // chroma residual scaling: the CU's luma area (its left column and above row are averaged)
   int crsAvail;         // bit 0: there is a luma CU left of the area, bit 1: above it
   int quant;            // bit 0: dependent quantization (the coefficients are quantization indices), bit 1: QCS
+  int jccr;             // joint CbCr: the Cb block's ICT mode (+-1..+-3; it computes both residuals), 4 for the Cr block
+  int jccrOffset;       // the Cr block's dbgOffset (in the Cb block)
 };
 layout( buffer_reference, std430, buffer_reference_align = 4 ) buffer BufTu { Tu v[]; };
 

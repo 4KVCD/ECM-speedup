@@ -257,7 +257,10 @@ the reconstruction buffer; works in every frame-thread context):
   Quant::dequant (32-bit), with QCS blending in the dequantization of the next larger index. Until M6 dependent
   quantization was not rejected although the kernel dequantized every level as a scalar one: a stream with dependent
   quantization and otherwise supported tools decoded wrong with the reconstruction on (no test set and no regular
-  stream had that combination). GpuIntraRec::supported() rejects every tool whose mode derivation or prediction reads
+  stream had that combination); M7 adds joint coding of the chroma residuals (JCCR): intra_resi computes the coded
+  residual of a pair (Cb, or Cr with its own QP) at the Cb block and writes the other component's residual derived
+  from it (TrQuant::invTransformICT, all six ICT modes); the Cr block, which the decoder records right after its Cb
+  block, takes it from there. GpuIntraRec::supported() rejects every tool whose mode derivation or prediction reads
   reconstructed samples or that the kernels lack, before anything is skipped. All 19 regular streams now fall back to
   the CPU at sign prediction, the next sequence-level check (before M6: QCS, before M5: LMCS, before M4: dual tree);
   many block-level tools follow.

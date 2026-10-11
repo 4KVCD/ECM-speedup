@@ -4,7 +4,8 @@
 // (Quant::dequant, or DepQuant's dequantBlock with dependent quantization, either with QCS; without scaling lists)
 // folded into the first inverse DCT-II stage, then the second stage
 // (TrQuant::xIT: two clipped matrix stages, equal to the partial butterflies in integer arithmetic); the result
-// goes to the residual buffer intra_rec adds to its prediction. Persistent workgroups take blocks by index.
+// goes to the residual buffer intra_rec adds to its prediction, with joint CbCr together with the other chroma
+// component's residual derived from it. Persistent workgroups take blocks by index.
 // Don't keep the first stage's output in a global scratch buffer: while other processes shared the GPU (RTX 3070),
 // whole warps of the second stage read it before the other warps' writes had reached it, although the barrier between
 // the stages had workgroup and even device scope.
@@ -57,6 +58,25 @@ int dequant( Tu t, int q, int add, BufI32 mt, int qcsOffset )
   return clip3i( t.trMin, t.trMax, c );
 }
 
+// TrQuant's invTransformCbCr: the residual of the other component of a joint CbCr pair from the coded one (ICT mode
+// +-1, +-2: Cr from Cb, +-3: Cb from Cr)
+int jccrDerived( int mode, int r )
+{
+  if( mode == 1 || mode == 3 )
+  {
+    return r >> 1;
+  }
+  if( mode == -1 || mode == -3 )
+  {
+    return ( -r ) >> 1;
+  }
+  if( mode == 2 )
+  {
+    return r;
+  }
+  return r == -32768 ? 32767 : -r;   // -2, with the CPU's clipping of -(-32768) to 16 bits
+}
+
 void main()
 {
   const int lid = int( gl_LocalInvocationID.x );
@@ -70,9 +90,17 @@ void main()
   {
     const Tu t = BufTu( P.tus ).v[ti];
     const int W = t.w, H = t.h, N = W * H;
+    if( t.jccr == 4 )   // the Cr block of a joint CbCr pair: the Cb block writes its residual
+    {
+      continue;
+    }
+    // where the residual goes: with joint CbCr, the coded component's, and the derived one's
+    const int codedOffset   = abs( t.jccr ) == 3 ? t.jccrOffset : t.dbgOffset;
+    const int derivedOffset = abs( t.jccr ) == 3 ? t.dbgOffset : t.jccrOffset;
     if( t.cbf == 0 )
     {
       for( int i = lid; i < N; i += NT ) resi.v[t.dbgOffset + i] = int16_t( 0 );
+      for( int i = lid; t.jccr != 0 && i < N; i += NT ) resi.v[t.jccrOffset + i] = int16_t( 0 );
       continue;
     }
     const int offH = P.matrixOffset[findMSB( H ) - 1], offW = P.matrixOffset[findMSB( W ) - 1];
@@ -103,7 +131,12 @@ void main()
       const int y = i / W, x = i % W;
       int sum = 0;
       for( int k = 0; k < nzC; k++ ) sum += mt.v[offW + k * W + x] * int( s_stage1[k * H + y] );
-      resi.v[t.dbgOffset + i] = int16_t( clip3i( t.trMin, t.trMax, ( sum + rnd2 ) >> t.shift2 ) );
+      const int r = clip3i( t.trMin, t.trMax, ( sum + rnd2 ) >> t.shift2 );
+      resi.v[codedOffset + i] = int16_t( r );
+      if( t.jccr != 0 )
+      {
+        resi.v[derivedOffset + i] = int16_t( jccrDerived( t.jccr, r ) );
+      }
     }
     barrier();
   }
