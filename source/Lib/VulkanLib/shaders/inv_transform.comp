@@ -1,0 +1,341 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+// The inverse transform of one transform block, as TrQuant::invTransformNxN with the decisions that
+// TrQuant::recordInvTransform took on the CPU: dequantization (Quant::dequant or the dependent quantizer's
+// dequantBlock), LFNST, then the separable transform as the AVX2 fastInverseTransform_SIMD computes it, NSPT or
+// transform skip. One workgroup per block.
+
+layout( local_size_x = 256 ) in;
+
+layout( buffer_reference, scalar, buffer_reference_align = 4 ) coherent buffer CI32Buf { int v[]; };
+
+struct TrJob
+{
+  int  width, height;
+  int  depQuant, bdpcm, scalingList, qcs;
+  int  shift, scale, add, inputMin, inputMax, coefMin, coefMax;
+  uint stateLo, stateHi;
+  int  lfnst, lfnstSbSize, lfnstNumIn, lfnstZeroOut, lfnstTrSize, lfnstTranspose, lfnstExt, lfnstMat;
+  int  mode, matHor, matVer, skipWidth, skipHeight, shift1, shift2;
+  int  nsptW, nsptH, nsptTranspose, nsptNumIn, nsptShift, nsptMat;
+  int  offCoeff, offDequant, offQcs, offDqScan, offLfnstScan, offNsptScan;   // into data
+};
+layout( buffer_reference, scalar, buffer_reference_align = 4 ) buffer TrJobRef { TrJob j; };
+
+layout( push_constant, scalar ) uniform Push
+{
+  TrJobRef job;
+  I32Buf   data;     // coefficients, dequant factors, QCS weights, scans
+  I8Buf    mat8;     // LFNST and NSPT matrices
+  I16Buf   mat16;    // inverse transform kernels
+  CI32Buf  coef;     // the dequantized coefficients, then the LFNST output in place
+  CI32Buf  tmp;      // the first pass, NSPT output
+  I16Buf   resi;     // width x height
+} pc;
+
+const int MODE_SKIP = 0, MODE_2D = 1, MODE_1D_VER = 2, MODE_1D_HOR = 3, MODE_NSPT = 4;
+
+void sync()
+{
+  memoryBarrierBuffer();
+  barrier();
+}
+
+// One pass of fastInverseTransform_SIMD: out[i * n + j] = clip( ( sum_k in[k * line + i] * mat[k * n + j] + rnd ) >> shift ).
+// Sizes that are not multiples of 4 (n = 2) take the generic loop, which leaves out lines and inputs past the
+// zero-out region.
+void invPass( bool fromCoef, int matOff, int n, int line, int skipLine, int skipLine2, int shift, int lo, int hi, bool toCoef )
+{
+  const int rnd   = 1 << ( shift - 1 );
+  const int zoRow = ( n & 3 ) == 0 ? line : line - skipLine;
+  const int zoCol = ( n & 3 ) == 0 ? n : n - skipLine2;
+  for( int o = int( gl_LocalInvocationID.x ); o < line * n; o += 256 )
+  {
+    const int i = o / n, j = o - i * n;
+    int       v = 0;
+    if( i < zoRow )
+    {
+      int sum = 0;
+      for( int k = 0; k < zoCol; k++ )
+      {
+        const int x = fromCoef ? pc.coef.v[k * line + i] : pc.tmp.v[k * line + i];
+        sum += x * int( pc.mat16.v[matOff + k * n + j] );
+      }
+      v = clamp( ( sum + rnd ) >> shift, lo, hi );
+    }
+    if( toCoef )
+    {
+      pc.coef.v[o] = v;
+    }
+    else
+    {
+      pc.tmp.v[o] = v;
+    }
+  }
+}
+
+// The position in the block of LFNST output j, as the scatter loops of TrQuant::xInvLfnst.
+ivec2 lfnstDest( TrJob J, int j )
+{
+  const int sb = J.lfnstSbSize;
+  if( J.lfnstTranspose != 0 )
+  {
+    if( sb == 4 )
+    {
+      return ivec2( j >> 2, j & 3 );
+    }
+    if( sb == 8 )
+    {
+      return ivec2( j >> 3, j & 7 );
+    }
+    if( j < 48 )
+    {
+      return ivec2( j / 12, j % 12 );
+    }
+    if( j < 80 )
+    {
+      return ivec2( 4 + ( ( j - 48 ) >> 3 ), ( j - 48 ) & 7 );
+    }
+    return ivec2( 8 + ( ( j - 80 ) >> 2 ), ( j - 80 ) & 3 );
+  }
+  if( sb == 16 )
+  {
+    if( j < 48 )
+    {
+      return ivec2( j % 12, j / 12 );
+    }
+    if( j < 80 )
+    {
+      return ivec2( ( j - 48 ) & 7, 4 + ( ( j - 48 ) >> 3 ) );
+    }
+    return ivec2( ( j - 80 ) & 3, 8 + ( ( j - 80 ) >> 2 ) );
+  }
+  if( J.lfnstExt != 0 || sb == 4 )
+  {
+    return ivec2( j % sb, j / sb );
+  }
+  // VVC LFNST 8x8: rows 0-3 of 8 outputs, rows 4-7 of 4
+  if( j < 32 )
+  {
+    return ivec2( j & 7, j >> 3 );
+  }
+  return ivec2( ( j - 32 ) & 3, 4 + ( ( j - 32 ) >> 2 ) );
+}
+
+shared int s_in[256];
+
+void main()
+{
+  const TrJob J   = pc.job.j;
+  const int   lid = int( gl_LocalInvocationID.x );
+  const int   w = J.width, h = J.height, n = w * h;
+
+  // ---- dequantization ----
+  if( J.depQuant != 0 )
+  {
+    for( int i = lid; i < n; i += 256 )
+    {
+      pc.coef.v[i] = 0;
+    }
+    sync();
+    if( lid == 0 )
+    {
+      int last = -1;
+      for( int s = n - 1; s >= 0; s-- )
+      {
+        if( pc.data.v[J.offCoeff + pc.data.v[J.offDqScan + s]] != 0 )
+        {
+          last = s;
+          break;
+        }
+      }
+      const uint64_t stateTrans = uint64_t( J.stateLo ) | ( uint64_t( J.stateHi ) << 32 );
+      int            invQScale  = J.scale;
+      int            state      = 0;
+      for( int s = last; s >= 0; s-- )
+      {
+        const int pos   = pc.data.v[J.offDqScan + s];
+        const int level = pc.data.v[J.offCoeff + pos];
+        if( level != 0 )
+        {
+          if( J.scalingList != 0 )
+          {
+            invQScale = pc.data.v[J.offDequant + pos];
+          }
+          if( J.shift < 0 && ( J.scalingList != 0 || s == last ) )
+          {
+            invQScale <<= -J.shift;
+          }
+          const int     qIdx = ( level << 1 ) + ( level > 0 ? -( state & 1 ) : ( state & 1 ) );
+          const int     sh   = J.shift < 0 ? 0 : J.shift;
+          int64_t       nom  = ( int64_t( qIdx ) * int64_t( invQScale ) + int64_t( J.add ) ) >> sh;
+          if( J.qcs != 0 )
+          {
+            const int     qIdx2 = qIdx + ( qIdx > 0 ? 1 : -1 );
+            const int64_t nom2  = ( int64_t( qIdx2 ) * int64_t( invQScale ) + int64_t( J.add ) ) >> sh;
+            const int     aq    = abs( qIdx );
+            const int     cs    = aq < 64 ? pc.data.v[J.offQcs + aq] : 0;
+            nom = ( int64_t( 1024 - cs ) * nom + int64_t( cs ) * nom2 ) >> 10;
+          }
+          pc.coef.v[pos] = int( clamp( nom, int64_t( J.coefMin ), int64_t( J.coefMax ) ) );
+        }
+        state = int( ( stateTrans >> uint( ( state << 3 ) + ( ( level & 1 ) << 2 ) ) ) & 15ul );
+      }
+    }
+  }
+  else
+  {
+    // Quant::dequant, after invResDPCM accumulates the levels of a BDPCM block
+    if( J.bdpcm == 1 )
+    {
+      for( int y = lid; y < h; y += 256 )
+      {
+        int acc = pc.data.v[J.offCoeff + y * w];
+        pc.coef.v[y * w] = acc;
+        for( int x = 1; x < w; x++ )
+        {
+          acc = clamp( acc + pc.data.v[J.offCoeff + y * w + x], J.coefMin, J.coefMax );
+          pc.coef.v[y * w + x] = acc;
+        }
+      }
+    }
+    else if( J.bdpcm == 2 )
+    {
+      for( int x = lid; x < w; x += 256 )
+      {
+        int acc = pc.data.v[J.offCoeff + x];
+        pc.coef.v[x] = acc;
+        for( int y = 1; y < h; y++ )
+        {
+          acc = clamp( acc + pc.data.v[J.offCoeff + y * w + x], J.coefMin, J.coefMax );
+          pc.coef.v[y * w + x] = acc;
+        }
+      }
+    }
+    sync();
+    for( int i = lid; i < n; i += 256 )
+    {
+      const int q     = J.bdpcm != 0 ? pc.coef.v[i] : pc.data.v[J.offCoeff + i];
+      const int clipQ = clamp( q, J.inputMin, J.inputMax );
+      const int scale = J.scalingList != 0 ? pc.data.v[J.offDequant + i] : J.scale;
+      int       c, c2 = 0;
+      if( J.shift > 0 )
+      {
+        const int add = 1 << ( J.shift - 1 );
+        c = ( clipQ * scale + add ) >> J.shift;
+        if( J.qcs != 0 )
+        {
+          c2 = ( ( clipQ + ( clipQ > 0 ? 1 : -1 ) ) * scale + add ) >> J.shift;
+        }
+      }
+      else
+      {
+        c = ( clipQ * scale ) << -J.shift;
+        if( J.qcs != 0 )
+        {
+          c2 = ( ( clipQ + ( clipQ > 0 ? 1 : -1 ) ) * scale ) << -J.shift;
+        }
+      }
+      if( J.qcs != 0 )
+      {
+        const int aq = abs( clipQ );
+        const int cs = aq < 64 ? pc.data.v[J.offQcs + aq] : 0;
+        c = ( ( 1024 - cs ) * c + cs * c2 ) >> 10;
+      }
+      pc.coef.v[i] = clamp( c, J.coefMin, J.coefMax );
+    }
+  }
+  sync();
+
+  // ---- LFNST, in place ----
+  if( J.lfnst != 0 )
+  {
+    if( lid < J.lfnstNumIn )
+    {
+      s_in[lid] = pc.coef.v[pc.data.v[J.offLfnstScan + lid]];
+    }
+    barrier();
+    int v = 0;
+    if( lid < J.lfnstTrSize )
+    {
+      int sum = 0;
+      for( int i = 0; i < J.lfnstZeroOut; i++ )
+      {
+        sum += s_in[i] * int( pc.mat8.v[J.lfnstMat + i * J.lfnstTrSize + lid] );
+      }
+      v = clamp( ( sum + 64 ) >> 7, J.coefMin, J.coefMax );
+    }
+    sync();
+    if( lid < J.lfnstTrSize )
+    {
+      const ivec2 d = lfnstDest( J, lid );
+      pc.coef.v[d.y * w + d.x] = v;
+    }
+    sync();
+  }
+
+  // ---- transform ----
+  if( J.mode == MODE_SKIP )
+  {
+    for( int i = lid; i < n; i += 256 )
+    {
+      pc.resi.v[i] = int16_t( pc.coef.v[i] );
+    }
+    return;
+  }
+  if( J.mode == MODE_NSPT )
+  {
+    if( lid < J.nsptNumIn )
+    {
+      s_in[lid] = pc.coef.v[pc.data.v[J.offNsptScan + lid]];
+    }
+    barrier();
+    const int trSize = J.nsptW * J.nsptH;
+    const int rnd    = 1 << ( J.nsptShift - 1 );
+    for( int j = lid; j < trSize; j += 256 )
+    {
+      int sum = 0;
+      for( int i = 0; i < J.nsptNumIn; i++ )
+      {
+        sum += s_in[i] * int( pc.mat8.v[J.nsptMat + i * trSize + j] );
+      }
+      const int v = clamp( ( sum + rnd ) >> J.nsptShift, J.coefMin, J.coefMax );
+      // computeInvNspt's output is nsptW x nsptH; a transposed block reads it column by column
+      const int pos = J.nsptTranspose != 0 ? ( j % h ) * w + j / h : j;
+      pc.resi.v[pos] = int16_t( v );
+    }
+    return;
+  }
+  if( J.mode == MODE_2D )
+  {
+    invPass( true, J.matVer, h, w, J.skipWidth, J.skipHeight, J.shift1, J.coefMin, J.coefMax, false );
+    sync();
+    // the second pass reads the first pass from tmp and writes its result over the coefficients
+    invPass( false, J.matHor, w, h, 0, J.skipWidth, J.shift2, J.coefMin, J.coefMax, true );
+  }
+  else if( J.mode == MODE_1D_VER )
+  {
+    invPass( true, J.matVer, h, 1, 0, J.skipHeight, J.shift1, J.coefMin, J.coefMax, false );
+    sync();
+    for( int i = lid; i < n; i += 256 )
+    {
+      pc.coef.v[i] = pc.tmp.v[i];
+    }
+  }
+  else
+  {
+    invPass( true, J.matHor, w, 1, 0, J.skipWidth, J.shift1, J.coefMin, J.coefMax, false );
+    sync();
+    for( int i = lid; i < n; i += 256 )
+    {
+      pc.coef.v[i] = pc.tmp.v[i];
+    }
+  }
+  sync();
+  for( int i = lid; i < n; i += 256 )
+  {
+    pc.resi.v[i] = int16_t( pc.coef.v[i] );
+  }
+}

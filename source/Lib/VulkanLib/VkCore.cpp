@@ -312,9 +312,13 @@ bool Core::init( bool validation, int deviceIndex )
   cai.commandPool        = m_cmdPool;
   cai.level              = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
   cai.commandBufferCount = 1;
-  check( vkAllocateCommandBuffers( m_device, &cai, &m_cmd ), "vkAllocateCommandBuffers" );
-  VkFenceCreateInfo fci = { VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
-  check( vkCreateFence( m_device, &fci, nullptr, &m_fence ), "vkCreateFence" );
+  for( Ctx& c: m_ctx )
+  {
+    check( vkAllocateCommandBuffers( m_device, &cai, &c.cmd ), "vkAllocateCommandBuffers" );
+    VkFenceCreateInfo fci = { VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+    check( vkCreateFence( m_device, &fci, nullptr, &c.fence ), "vkCreateFence" );
+    c.queryResults.resize( MAX_QUERIES );
+  }
 
   VkPushConstantRange range = { VK_SHADER_STAGE_COMPUTE_BIT, 0, 256 };
   VkPipelineLayoutCreateInfo pli = { VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
@@ -324,9 +328,8 @@ bool Core::init( bool validation, int deviceIndex )
 
   VkQueryPoolCreateInfo qpi = { VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO };
   qpi.queryType  = VK_QUERY_TYPE_TIMESTAMP;
-  qpi.queryCount = 1024;
+  qpi.queryCount = MAX_QUERIES * NUM_CTX;
   check( vkCreateQueryPool( m_device, &qpi, nullptr, &m_queries ), "vkCreateQueryPool" );
-  m_queryResults.resize( 1024 );
   return true;
 }
 
@@ -342,7 +345,11 @@ void Core::destroy()
     m_pipelines.clear();
     vkDestroyQueryPool( m_device, m_queries, nullptr );
     vkDestroyPipelineLayout( m_device, m_layout, nullptr );
-    vkDestroyFence( m_device, m_fence, nullptr );
+    for( Ctx& c: m_ctx )
+    {
+      vkDestroyFence( m_device, c.fence, nullptr );
+      c.fence = VK_NULL_HANDLE;
+    }
     vkDestroyCommandPool( m_device, m_cmdPool, nullptr );
     vkDestroyDevice( m_device, nullptr );
     m_device = VK_NULL_HANDLE;
@@ -493,23 +500,33 @@ VkPipeline Core::pipeline( const char* name )
   return pipe;
 }
 
-void Core::begin()
+void Core::begin( int ctx )
 {
-  wait();
-  check( vkResetCommandBuffer( m_cmd, 0 ), "vkResetCommandBuffer" );
+  for( int open: m_open )
+  {
+    if( open == ctx )
+    {
+      throw std::runtime_error( "command context opened twice" );
+    }
+  }
+  wait( ctx );
+  m_open.push_back( ctx );
+  Ctx& c = cur();
+  check( vkResetCommandBuffer( c.cmd, 0 ), "vkResetCommandBuffer" );
   VkCommandBufferBeginInfo bi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
   bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-  check( vkBeginCommandBuffer( m_cmd, &bi ), "vkBeginCommandBuffer" );
-  vkCmdResetQueryPool( m_cmd, m_queries, 0, 1024 );
-  m_numQueries = 0;
+  check( vkBeginCommandBuffer( c.cmd, &bi ), "vkBeginCommandBuffer" );
+  vkCmdResetQueryPool( c.cmd, m_queries, ctx * MAX_QUERIES, MAX_QUERIES );
+  c.numQueries = 0;
 }
 
 void Core::dispatch( const char* shader, uint32_t gx, uint32_t gy, uint32_t gz, const void* push, uint32_t pushSize, bool repeatable )
 {
-  vkCmdBindPipeline( m_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline( shader ) );
+  Ctx& c = cur();
+  vkCmdBindPipeline( c.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline( shader ) );
   if( pushSize )
   {
-    vkCmdPushConstants( m_cmd, m_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, pushSize, push );
+    vkCmdPushConstants( c.cmd, m_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, pushSize, push );
   }
   if( m_profiling )
   {
@@ -519,15 +536,15 @@ void Core::dispatch( const char* shader, uint32_t gx, uint32_t gy, uint32_t gz, 
     {
       barrier();
       d.from[r] = timestamp();
-      vkCmdDispatch( m_cmd, gx, gy, gz );
+      vkCmdDispatch( c.cmd, gx, gy, gz );
       barrier();
       d.to[r] = timestamp();
     }
-    m_pending.push_back( d );
+    c.pending.push_back( d );
   }
   else
   {
-    vkCmdDispatch( m_cmd, gx, gy, gz );
+    vkCmdDispatch( c.cmd, gx, gy, gz );
   }
 }
 
@@ -552,7 +569,7 @@ void Core::barrier()
   mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
   mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT
                      | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT | VK_ACCESS_INDIRECT_COMMAND_READ_BIT;
-  vkCmdPipelineBarrier( m_cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+  vkCmdPipelineBarrier( cur().cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_HOST_BIT
                           | VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT,
                         0, 1, &mb, 0, nullptr, 0, nullptr );
@@ -560,71 +577,77 @@ void Core::barrier()
 
 void Core::fill( const Buffer& buf, uint32_t value, size_t offset, size_t size )
 {
-  vkCmdFillBuffer( m_cmd, buf.buffer, offset, size, value );
+  vkCmdFillBuffer( cur().cmd, buf.buffer, offset, size, value );
 }
 
 void Core::copy( const Buffer& src, const Buffer& dst, size_t srcOffset, size_t dstOffset, size_t size )
 {
   VkBufferCopy region = { srcOffset, dstOffset, size };
-  vkCmdCopyBuffer( m_cmd, src.buffer, dst.buffer, 1, &region );
+  vkCmdCopyBuffer( cur().cmd, src.buffer, dst.buffer, 1, &region );
 }
 
 int Core::timestamp()
 {
-  if( m_numQueries >= int( m_queryResults.size() ) )
+  Ctx& c = cur();
+  if( c.numQueries >= MAX_QUERIES )
   {
     throw std::runtime_error( "too many timestamps in one submission" );
   }
-  vkCmdWriteTimestamp( m_cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, m_queries, m_numQueries );
-  return m_numQueries++;
+  vkCmdWriteTimestamp( c.cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, m_queries, m_open.back() * MAX_QUERIES + c.numQueries );
+  return c.numQueries++;
 }
 
 void Core::submit( bool wait )
 {
-  check( vkEndCommandBuffer( m_cmd ), "vkEndCommandBuffer" );
+  const int ctx = m_open.back();
+  Ctx&      c   = cur();
+  m_open.pop_back();
+  check( vkEndCommandBuffer( c.cmd ), "vkEndCommandBuffer" );
   VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
   si.commandBufferCount = 1;
-  si.pCommandBuffers    = &m_cmd;
-  check( vkResetFences( m_device, 1, &m_fence ), "vkResetFences" );
-  check( vkQueueSubmit( m_queue, 1, &si, m_fence ), "vkQueueSubmit" );
-  m_inFlight = true;
+  si.pCommandBuffers    = &c.cmd;
+  check( vkResetFences( m_device, 1, &c.fence ), "vkResetFences" );
+  check( vkQueueSubmit( m_queue, 1, &si, c.fence ), "vkQueueSubmit" );
+  c.inFlight = true;
   if( wait )
   {
-    this->wait();
+    this->wait( ctx );
   }
 }
 
-void Core::wait()
+void Core::wait( int ctx )
 {
-  if( !m_inFlight )
+  Ctx& c = m_ctx[ctx];
+  if( !c.inFlight )
   {
     return;
   }
-  check( vkWaitForFences( m_device, 1, &m_fence, VK_TRUE, UINT64_MAX ), "vkWaitForFences" );
-  m_inFlight = false;
-  if( m_numQueries )
+  check( vkWaitForFences( m_device, 1, &c.fence, VK_TRUE, UINT64_MAX ), "vkWaitForFences" );
+  c.inFlight = false;
+  if( c.numQueries )
   {
-    check( vkGetQueryPoolResults( m_device, m_queries, 0, m_numQueries, m_numQueries * sizeof( uint64_t ),
-                                  m_queryResults.data(), sizeof( uint64_t ), VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT ),
+    check( vkGetQueryPoolResults( m_device, m_queries, ctx * MAX_QUERIES, c.numQueries, c.numQueries * sizeof( uint64_t ),
+                                  c.queryResults.data(), sizeof( uint64_t ), VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT ),
            "vkGetQueryPoolResults" );
   }
-  for( const PendingDispatch& d: m_pending )
+  for( const PendingDispatch& d: c.pending )
   {
-    double ms = elapsedMs( d.from[0], d.to[0] );
+    double ms = elapsedMs( d.from[0], d.to[0], ctx );
     for( int r = 1; r < d.runs; r++ )
     {
-      ms = std::min( ms, elapsedMs( d.from[r], d.to[r] ) );
+      ms = std::min( ms, elapsedMs( d.from[r], d.to[r], ctx ) );
     }
     ShaderTime& t = m_profile[d.shader];
     t.ms += ms;
     t.count++;
   }
-  m_pending.clear();
+  c.pending.clear();
 }
 
-double Core::elapsedMs( int from, int to ) const
+double Core::elapsedMs( int from, int to, int ctx ) const
 {
-  return ( m_queryResults[to] - m_queryResults[from] ) * m_props.limits.timestampPeriod * 1e-6;
+  const std::vector<uint64_t>& r = m_ctx[ctx].queryResults;
+  return ( r[to] - r[from] ) * m_props.limits.timestampPeriod * 1e-6;
 }
 
 }   // namespace vkd

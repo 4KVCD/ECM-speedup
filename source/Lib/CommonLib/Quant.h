@@ -46,6 +46,8 @@
 
 #include "UnitPartitioner.h"
 
+struct GpuInvTransformJob;
+
 //! \ingroup CommonLib
 //! \{
 
@@ -145,6 +147,10 @@ public:
   virtual void quant             ( TransformUnit &tu, const ComponentID &compID, const CCoeffBuf &pSrc, TCoeff &uiAbsSum, const QpParam &cQP, const Ctx& ctx );
   // de-quantization
   virtual void dequant           ( const TransformUnit &tu, CoeffBuf &dstCoeff, const ComponentID &compID, const QpParam &cQP );
+  /// Records into job the parameters with which dequant would run, for the GPU decoder (TrQuantGpu.cpp).
+  virtual void gpuDequantParams  ( const TransformUnit &tu, const ComponentID &compID, const QpParam &cQP, GpuInvTransformJob &job );
+  /// The 64 weights of the latent shift of SPS QCS.
+  static const int* qcsTable();
 
 #if ENABLE_SPLIT_PARALLELISM
   virtual void copyState         ( const Quant& other );

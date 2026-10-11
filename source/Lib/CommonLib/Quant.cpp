@@ -51,6 +51,16 @@
 const int m_coeffShift64[64] = { 0, 63, 31, 21, 15, 12, 10, 9, 7, 7, 6, 5, 5, 4, 4, 4, 3, 3, 3, 3, 3, 3,
                                  2, 2,  2,  2,  2,  2,  2,  2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
                                  1, 1,  1,  1,  1,  1,  1,  1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1 };
+
+const int* Quant::qcsTable()
+{
+  return m_coeffShift64;
+}
+#else
+const int* Quant::qcsTable()
+{
+  return nullptr;
+}
 #endif
 
 //! \ingroup CommonLib

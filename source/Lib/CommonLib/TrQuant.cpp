@@ -44,6 +44,7 @@
 #include "Reshape.h"
 
 #include "dtrace_buffer.h"
+#include "GpuRecon.h"
 
 #include <stdlib.h>
 #include <limits>
@@ -996,6 +997,15 @@ void TrQuant::xFwdLfnst( const TransformUnit &tu, const ComponentID compID, cons
 
 
 void TrQuant::invTransformNxN( TransformUnit &tu, const ComponentID &compID, PelBuf &pResi, const QpParam &cQP )
+{
+  if( g_gpuReconHooks && g_gpuReconHooks->invTransformNxN( *this, tu, compID, pResi, cQP ) )
+  {
+    return;
+  }
+  invTransformNxNCpu( tu, compID, pResi, cQP );
+}
+
+void TrQuant::invTransformNxNCpu( TransformUnit &tu, const ComponentID &compID, PelBuf &pResi, const QpParam &cQP )
 {
 #if JVET_AL0181_ASBT
   const CompArea &area    = tu.blocksResidual[compID];

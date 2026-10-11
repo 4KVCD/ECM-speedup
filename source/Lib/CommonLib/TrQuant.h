@@ -171,6 +171,13 @@ protected:
 public:
 
   void invTransformNxN  (TransformUnit &tu, const ComponentID &compID, PelBuf &pResi, const QpParam &cQPs);
+  /// invTransformNxN on the CPU, without asking g_gpuReconHooks.
+  void invTransformNxNCpu( TransformUnit &tu, const ComponentID &compID, PelBuf &pResi, const QpParam &cQPs );
+  /// Records into job what invTransformNxN would compute, for the GPU decoder (TrQuantGpu.cpp). Returns false if the
+  /// recording does not cover this configuration of TypeDef.h.
+  bool recordInvTransform( TransformUnit &tu, const ComponentID compID, const QpParam &cQP, GpuInvTransformJob &job );
+  /// The inverse kernel of a transform type for blocks of 1 << log2Size samples, as the CPU uses it.
+  static const int16_t* inverseTransformKernel( int trType, int log2Size );
   void transformNxN     ( TransformUnit& tu, const ComponentID& compID, const QpParam& cQP, std::vector<TrMode>* trModes, const int maxCand );
   void transformNxN     ( TransformUnit& tu, const ComponentID& compID, const QpParam& cQP, TCoeff& uiAbsSum, const Ctx& ctx, const bool loadTr = false );
 #if JVET_W0103_INTRA_MTS

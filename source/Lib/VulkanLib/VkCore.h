@@ -110,9 +110,18 @@ public:
   /// Returns the compute pipeline of an embedded shader, creating it on first use.
   VkPipeline pipeline( const char* name );
 
-  /// Command recording. One command buffer is open at a time. submit() waits for its completion, unless wait is
-  /// false: then wait() does, and begin() waits for it first. Timestamps can be read once the commands completed.
-  void begin();
+  /// Command recording. Each context has a command buffer, a fence and timestamps of its own: the loop filters keep
+  /// theirs open or in flight across a picture while reconstruction submits and waits in between. begin( ctx ) makes
+  /// ctx the current context until submit(); a context opened inside another one returns to it. submit() waits for
+  /// the completion, unless wait is false: then wait( ctx ) does, and begin( ctx ) waits for it first. Timestamps
+  /// can be read once the commands completed.
+  enum Context
+  {
+    CTX_FILTER,
+    CTX_RECON,
+    NUM_CTX
+  };
+  void begin( int ctx = CTX_FILTER );
   /// repeatable: running the dispatch again gives the same result (it does not filter in place), so profiling may
   /// repeat it
   void dispatch( const char* shader, uint32_t gx, uint32_t gy, uint32_t gz, const void* push, uint32_t pushSize, bool repeatable = false );
@@ -126,9 +135,9 @@ public:
   bool        profiling() const { return m_profiling; }
   std::string profileReport() const;    ///< shaders by total time
   void submit( bool wait = true );
-  void wait();
-  bool inFlight() const { return m_inFlight; }
-  double elapsedMs( int from, int to ) const;
+  void wait( int ctx = CTX_FILTER );
+  bool inFlight( int ctx = CTX_FILTER ) const { return m_ctx[ctx].inFlight; }
+  double elapsedMs( int from, int to, int ctx = CTX_FILTER ) const;
 
 #define VKD_DECLARE( name ) PFN_##name name = nullptr;
   VKD_INSTANCE_FUNCS( VKD_DECLARE )
@@ -152,13 +161,9 @@ private:
   VkQueue                     m_queue      = VK_NULL_HANDLE;
   uint32_t                    m_queueFamily = 0;
   VkCommandPool               m_cmdPool    = VK_NULL_HANDLE;
-  VkCommandBuffer             m_cmd        = VK_NULL_HANDLE;
-  VkFence                     m_fence      = VK_NULL_HANDLE;
   VkPipelineLayout            m_layout     = VK_NULL_HANDLE;
-  VkQueryPool                 m_queries    = VK_NULL_HANDLE;
-  int                         m_numQueries = 0;
-  bool                        m_inFlight   = false;
-  std::vector<uint64_t>       m_queryResults;
+  VkQueryPool                 m_queries    = VK_NULL_HANDLE;   ///< MAX_QUERIES per context
+  static const int            MAX_QUERIES  = 1024;
   bool                        m_profiling = false;
   int                         m_profileRuns = 1;
   struct PendingDispatch
@@ -167,7 +172,18 @@ private:
     int         runs;
     int         from[8], to[8];
   };
-  std::vector<PendingDispatch> m_pending;
+  struct Ctx
+  {
+    VkCommandBuffer              cmd        = VK_NULL_HANDLE;
+    VkFence                      fence      = VK_NULL_HANDLE;
+    int                          numQueries = 0;
+    bool                         inFlight   = false;
+    std::vector<uint64_t>        queryResults;
+    std::vector<PendingDispatch> pending;
+  };
+  Ctx              m_ctx[NUM_CTX];
+  std::vector<int> m_open;   ///< the contexts being recorded, the current one last
+  Ctx&             cur() { return m_ctx[m_open.back()]; }
   struct ShaderTime
   {
     double   ms    = 0;

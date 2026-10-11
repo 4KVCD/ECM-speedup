@@ -55,6 +55,7 @@ public:
 
   virtual void quant  ( TransformUnit &tu, const ComponentID &compID, const CCoeffBuf &pSrc, TCoeff &uiAbsSum, const QpParam &cQP, const Ctx& ctx );
   virtual void dequant( const TransformUnit &tu, CoeffBuf &dstCoeff, const ComponentID &compID, const QpParam &cQP );
+  virtual void gpuDequantParams( const TransformUnit &tu, const ComponentID &compID, const QpParam &cQP, GpuInvTransformJob &job );
 #if SIGN_PREDICTION
 #if JVET_Y0141_SIGN_PRED_IMPROVE
   static void getPredictedSigns(TransformUnit &tu, const ComponentID compID,
