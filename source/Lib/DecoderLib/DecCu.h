@@ -52,6 +52,7 @@
 #if ECM_VULKAN
 #include "GpuIntraRec.h"
 #endif
+class GpuIntraRec;
 //! \ingroup DecoderLib
 //! \{
 
@@ -94,7 +95,6 @@ protected:
   void xDeriveCUMV        ( CodingUnit&      cu );
   void xReconPLT          ( CodingUnit&      cu,       ComponentID compBegin, uint32_t numComp );
   PelStorage        *m_tmpStorageLCU;
-#if ECM_VULKAN
 public:
   /// the GPU reconstruction (verification) recording this decoder's intra blocks, or nullptr
   void setGpuIntraRec( GpuIntraRec* rec ) { m_gpuIntraRec = rec; }
@@ -102,9 +102,11 @@ public:
   void setGpuDeriveOnly( bool b ) { m_gpuDeriveOnly = b; m_pcIntraPred->setParamsOnly( b ); }
   GpuIntraRec* getGpuIntraRec() const { return m_gpuIntraRec; }
 private:
+  // Don't put these members under #if ECM_VULKAN: EncCu derives from DecCu, and EncoderLib is compiled without
+  // ECM_VULKAN (only the targets linking DecoderLib or GpuLib get it), so EncoderLib, DecoderLib and EncoderApp would
+  // disagree on the layout of DecCu, EncCu and EncLib, and the encoder of a Vulkan build crashes.
   GpuIntraRec*      m_gpuIntraRec = nullptr;
   bool              m_gpuDeriveOnly = false;
-#endif
 private:
   TrQuant*          m_pcTrQuant;
   IntraPrediction*  m_pcIntraPred;

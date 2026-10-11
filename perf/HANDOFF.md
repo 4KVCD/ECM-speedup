@@ -238,6 +238,9 @@ Profile of a GPU-on decode (non-LTO, m2_park16, share of all samples): parsing ~
 - RTX 3070, also with the memory model: data passed between the invocations of one workgroup through a global buffer
   and a barrier was read stale by whole warps while another process loaded the GPU (intra_resi, fixed by shared
   memory). Pass data inside a workgroup through shared memory, and stress-test with `gpuload.py` running.
+- Class layouts must not depend on `ECM_VULKAN`: the define reaches only the targets that link DecoderLib or GpuLib,
+  not EncoderLib, and EncCu derives from DecCu. GPU members under `#if ECM_VULKAN` in DecCu made the encoder of every
+  Vulkan build of dec-gpurecon crash at start-up (fixed 2026-10-11). Run the encoder suite on a Vulkan build too.
 - The NVIDIA GPU drops to a low clock between pictures (kernels ~3x slower); power settings are off limits.
 - `BilateralFilter` derives its LUTs in `create()`, not in the constructor.
 - ECM intra reconstruction is raster-serial within a picture once intra/IBC CUs exist (JVET_AJ0172 IBC/IntraTMP
