@@ -275,8 +275,13 @@ the reconstruction buffer; works in every frame-thread context):
   prediction): intra_rec Haar-downsamples the unfiltered references, multiplies with the mode's matrix (the host
   uploads MipData.h's matrices) and computes each upsampled sample in closed form (the CPU's running sums are
   before * (factor - pos) + behind * pos, rounded once); the host records MIP blocks with the DC mode, whose read
-  range covers MIP's and whose bilateral filter has no angular gate, as MIP's. GpuIntraRec::supported() rejects
-  every tool whose mode derivation or prediction reads
+  range covers MIP's and whose bilateral filter has no angular gate, as MIP's; M11 adds LFNST and NSPT, both syntax
+  only: for blocks with lfnstIdx the host runs the CPU's own dequantization and inverse LFNST
+  (TrQuant::getInvLfnstOutput) and the GPU the primary transform, and where NSPT replaces the primary transform the
+  host computes the residual with TrQuant::invTransformNxN. That keeps them exact by construction, but NSPT blocks are
+  many (in m11 ~40 % of the coded blocks), so the host does much of the transform work there: NSPT (and LFNST) on the
+  GPU is a speed-up still to do. LFNST of MIP blocks stays on the CPU (its kernel follows a DIMD mode derived from the
+  MIP prediction). GpuIntraRec::supported() rejects every tool whose mode derivation or prediction reads
   reconstructed samples or that the kernels lack, before anything is skipped. All 19 regular streams now fall back to
   the CPU at sign prediction, the next sequence-level check (before M6: QCS, before M5: LMCS, before M4: dual tree);
   many block-level tools follow.

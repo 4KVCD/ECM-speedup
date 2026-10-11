@@ -64,7 +64,7 @@
 
 namespace
 {
-// layout shared with intra_rec.comp (struct Tu): 66 int32
+// layout shared with intra_rec.comp (struct Tu): 67 int32
 struct Tu
 {
   int32_t comp, x, y, w, h;
@@ -92,8 +92,9 @@ struct Tu
   int32_t mtxV, mtxH;
   int32_t transformSkip;
   int32_t mipMatrix, mipTransposed, mipSizeId;
+  int32_t precomputed;
 };
-static_assert( sizeof( Tu ) == 66 * 4, "Tu layout" );
+static_assert( sizeof( Tu ) == 67 * 4, "Tu layout" );
 
 // Tu::lmcs
 constexpr int LMCS_BF_INVERSE  = 1;   // the intra bilateral filter works on inverse-mapped samples
@@ -106,6 +107,10 @@ constexpr int QUANT_QCS = 2;   // quantization center shift (JVET-AN0095 / JVET-
 // Tu::jccr (joint coding of the chroma residuals): the Cb block of a TU carries the ICT mode (TU::getICTMode, +-1..+-3)
 // and computes both residuals; its Cr block, recorded right after it, is marked JCCR_DERIVED
 constexpr int JCCR_DERIVED = 4;
+
+// Tu::precomputed: the host ran a step of the CPU's inverse transform on the coefficients
+constexpr int PRECOMPUTED_COEFFS   = 1;   // dequantized and inverse-LFNST'ed: the input of the primary transform
+constexpr int PRECOMPUTED_RESIDUAL = 2;   // the residual itself (NSPT, which replaces the primary transform)
 
 // layout shared with intra_rec.comp (struct Params, std430)
 struct Params
@@ -391,7 +396,6 @@ bool GpuIntraRec::supported( const Slice& slice, std::string& why )
   else if( sps.getNumPredSigns() > 0 )                                                    why = "sign prediction";
   else if( sps.getUseISP() )                                                              why = "ISP";
   else if( sps.getUseMRL() || sps.getUseTmrl() )                                          why = "MRL / TMRL";
-  else if( sps.getUseIntraLFNSTISlice() || sps.getUseIntraLFNSTPBSlice() || sps.getUseNSPT() ) why = "LFNST / NSPT";
   else if( sps.getUseLMChroma() || sps.getUseCcpMerge() || sps.getUseDdCcpFusion() || sps.getUseBvgCccm() ) why = "cross-component prediction";
   else if( sps.getUseChromaReordering() || sps.getUseIntraDBV() )                         why = "chroma reordering / DBV";
   else if( sps.getUseDimd() || sps.getUseBvgDimd() || sps.getUseTimd() || sps.getUseTimdMrg() ) why = "DIMD / TIMD";
@@ -454,7 +458,8 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
   if( !CU::isIntra( cu ) )                                          why = "not intra";
   else if( !isLuma( compID ) && PU::isMIP( pu, chType ) )           why = "chroma MIP (4:4:4)";
   else if( cu.ispMode )                                             why = "ISP";
-  else if( cu.lfnstIdx )                                            why = "LFNST";
+  // LFNST / NSPT of MIP blocks select their kernel by a DIMD mode the CPU derives from the MIP prediction
+  else if( cu.mipFlag && cu.lfnstIdx )                              why = "LFNST of MIP";
   // transform skip with the regular residual coding is dequantized like a transform block (DepQuant::dequant)
   else if( ( tu.mtsIdx[compID] == MTS_SKIP || ( tu.jointCbCr && tu.mtsIdx[COMPONENT_Cr] == MTS_SKIP ) )
            && slice.getTSResidualCodingDisabledFlag() )             why = "transform skip with regular residual coding";
@@ -584,22 +589,38 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
   const bool ts   = tu.mtsIdx[resiComp] == MTS_SKIP;
   t.transformSkip = ts ? 1 : 0;
 
-  // TrQuant::xIT's transform types (DCT-II, or those of explicit MTS) and their matrices
+  // TrQuant::xIT's transform types (DCT-II, or those of explicit MTS) and their matrices. With LFNST / NSPT (lfnstIdx)
+  // the host runs the CPU's own dequantization and inverse LFNST and the GPU the primary transform; where NSPT replaces
+  // the primary transform, the host computes the residual itself (both syntax only)
   t.mtxV = t.mtxH = 0;
+  t.precomputed   = 0;
   if( t.cbf && !ts )
   {
-    int trTypeHor, trTypeVer;
-    if( !m.trQuant || !m.trQuant->getInvTransformTypes( tu, resiComp, trTypeHor, trTypeVer ) )
+    if( !m.trQuant )
     {
-      unsupported( m.trQuant ? "NSPT or a 1-D transform" : "transform types without the decoder's TrQuant" );
+      unsupported( "transform types without the decoder's TrQuant" );
       return;
     }
-    t.mtxV = m.sh->trOffset[trTypeVer][floorLog2( area.height ) - 1];
-    t.mtxH = m.sh->trOffset[trTypeHor][floorLog2( area.width ) - 1];
-    if( t.mtxV < 0 || t.mtxH < 0 )
+    int trTypeHor, trTypeVer;
+    if( !m.trQuant->getInvTransformTypes( tu, resiComp, trTypeHor, trTypeVer ) )
     {
-      unsupported( "a transform type without a matrix of this size" );
-      return;
+      if( !cu.lfnstIdx )
+      {
+        unsupported( "a 1-D transform" );
+        return;
+      }
+      t.precomputed = PRECOMPUTED_RESIDUAL;
+    }
+    else
+    {
+      t.mtxV = m.sh->trOffset[trTypeVer][floorLog2( area.height ) - 1];
+      t.mtxH = m.sh->trOffset[trTypeHor][floorLog2( area.width ) - 1];
+      if( t.mtxV < 0 || t.mtxH < 0 )
+      {
+        unsupported( "a transform type without a matrix of this size" );
+        return;
+      }
+      t.precomputed = cu.lfnstIdx ? PRECOMPUTED_COEFFS : 0;
     }
   }
 
@@ -608,6 +629,10 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
   // with the dequantization of the next larger index
   const int maxLog2TrDynamicRange = sps.getMaxLog2TrDynamicRange( chType );
   t.quant = ( slice.getDepQuantEnabledIdc() && !ts ? QUANT_DEP : 0 ) | ( sps.getUseQcs() ? QUANT_QCS : 0 );
+  if( t.precomputed )   // the host dequantized
+  {
+    t.quant = 0;
+  }
   if( t.quant & QUANT_DEP )
   {
     // the index of a level depends on the quantizer state (the indices are derived with the levels below); QP + 1,
@@ -718,6 +743,19 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
       accumulated.resize( area.area() );
       CoeffBuf acc( accumulated.data(), area.width, area.height );
       invResDPCM( tu, resiComp, acc );
+      c = CCoeffBuf( accumulated.data(), area.width, area.height );
+    }
+    else if( t.precomputed == PRECOMPUTED_COEFFS )
+    {
+      c = m.trQuant->getInvLfnstOutput( tu, resiComp, resiQp );
+    }
+    else if( t.precomputed == PRECOMPUTED_RESIDUAL )
+    {
+      // invTransformNxN takes the TU non-const but only reads it
+      std::vector<Pel> resiPel( area.area() );
+      PelBuf           resiBuf( resiPel.data(), area.width, area.height );
+      m.trQuant->invTransformNxN( const_cast<TransformUnit&>( tu ), resiComp, resiBuf, resiQp );
+      accumulated.assign( resiPel.begin(), resiPel.end() );
       c = CCoeffBuf( accumulated.data(), area.width, area.height );
     }
     for( int y = 0; y < (int) area.height; y++ )

@@ -13,7 +13,7 @@ wall-clock gains with threads are "the easy baseline". Decoder status: single-th
 (`--GpuLoopFilter=1`: ALF, SAO, BIF, CCSAO, LF-CCCM, offset refinement on Vulkan). The user then asked for **a full
 GPU decoder in Vulkan, optimized until nothing is left** ("The GPU decoder needs to fully decode the frame on the
 GPU"; "Your first Vulkan version is going to be slow. That's OK"). That work is branch `dec-gpurecon`: intra
-reconstruction on the GPU (`--GpuRecon`), tool levels M1-M10 done and verified bit-exact; it is **not yet faster than
+reconstruction on the GPU (`--GpuRecon`), tool levels M1-M11 done and verified bit-exact; it is **not yet faster than
 the CPU decoder** (see section 8) and supports only a restricted tool set (all real CTC streams fall back to the CPU,
 first reason: sign prediction).
 
@@ -149,6 +149,10 @@ commands that combine `Remove-Item` with `//` text. `perf\gpu\crlf.ps1 <worktree
     screen-like content from `perf\gpu\gen_screen.py` (deterministic).
   - M10 (m9's arguments plus `--MIP=1`): `m10`; its foreman streams have 1235 MIP blocks of all three size classes,
     transposed and not, 4x4 to 32x32.
+  - M11 (m9's arguments plus `--IntraLFNSTISlice=1 --LFNSTExt=1 --NSPT=1`, without MIP, as LFNST of MIP blocks is not
+    supported yet): `m11`; its foreman streams: lfnstIdx 1-3 on all components, 382 blocks with separable LFNST and
+    3348 NSPT blocks (4x4 to 32x8) among 7896 coded blocks. `m11m_fore32` (`enc_m1.ps1`, also `--MIP=1`): has MIP
+    blocks with LFNST, so its pictures fall back to the CPU ("LFNST of MIP").
   - each set: fore22/32/37 (CIF), park720, four720 (2-4 pictures). Longer ones: m2_fore33, m2_park16, m3_park16
     (`enc_m1.ps1 <name> <yuv> 1280 720 16 --TemporalSubsampleRatio=1 -q 32 <level args>`), m3_park60 (60 frames,
     `enc_long.ps1 m3_park60 ...\ParkJoy_1280x720.yuv 1280 720 4 15 -q 32 --IntraToolControlMode=1 --IntraPredBf=1`:
@@ -202,7 +206,7 @@ everything that depends on samples runs on the GPU, implemented line by line aft
 TrQuant.cpp, BilateralFilter.cpp). `supported()` must reject every tool whose mode derivation or prediction reads
 reconstructed samples or that the kernels lack.
 
-Files: `source/Lib/GpuLib/GpuIntraRec.{h,cpp}`, `shaders/intra_common.glsl` (Tu = 66 ints and Params layouts,
+Files: `source/Lib/GpuLib/GpuIntraRec.{h,cpp}`, `shaders/intra_common.glsl` (Tu = 67 ints and Params layouts,
 static_asserts on the host), `intra_resi.comp`, `intra_rec.comp`, `intra_deps.comp`, `scan.comp`, `VkCompute.*`
 (device with vulkanMemoryModel + optional shader clock; up to 8 queues round-robin); `DecoderLib/DecCu.cpp`
 (record calls), `DecSlice.cpp` (parse-first, derive pass, CPU fallback), `DecLib.cpp` (setGpuRecon,
@@ -221,7 +225,8 @@ M7: joint CbCr (the Cb block computes both residuals in intra_resi; Tu::jccr, jc
 M8: explicit intra MTS (TrQuant::getInvTransformTypes per block; every transform matrix read back by impulses with
 TrQuant::getInvTransformMatrix; Tu::mtxV, mtxH). M9: transform skip and BDPCM (Tu::transformSkip; invResDPCM on
 the host; BDPCM blocks predict as mode 18 / 50 with the filters off). M10: MIP (Tu::mipMatrix etc.; recorded with the
-DC mode for the read range and the bilateral filter).
+DC mode for the read range and the bilateral filter). M11: LFNST / NSPT on the host side (Tu::precomputed: 1 the
+host's dequantized, inverse-LFNST'ed coefficients, 2 the host's residual for NSPT).
 
 ## 8. Numbers (i7-10700 8C/16T, Win11, GCC 16.2, RTX 3070 driver 616.92)
 
@@ -244,14 +249,16 @@ Profile of a GPU-on decode (non-LTO, m2_park16, share of all samples): parsing ~
 
 1. Time 180ccabc (paired grL builds, `walls.py` with `--GpuRecon=3`, CPU vs GPU, FT8; use m3_park60).
 2. Done (2026-10-11): M4 dual tree, M5 LMCS, M6 dependent quantization and QCS, M7 joint CbCr, M8 explicit MTS,
-   M9 transform skip and BDPCM, M10 MIP.
+   M9 transform skip and BDPCM, M10 MIP, M11 LFNST / NSPT (computed by the host: move to the GPU for speed).
    All 19 regular streams now stop at "sign prediction" (the next sequence-level check; the block-level tools of
    step 4 follow).
 3. Make the GPU path win on CPU time per picture: the derive-only pass (record during parsing or a leaner pass;
    speed up getSpatialIpm/getPURestricted, which also helps the CPU decoder), GPU behaviour with frame threads
    (8 contexts x 32 persistent workgroups oversubscribe the GPU; spinning workgroups; try fewer groups per context,
    more frame threads than cores to hide GPU waits, overlapping a picture's GPU work with the next picture's parse).
-4. More tool levels, roughly in the order CTC AI needs them: MRL/TMRL, ISP, LFNST/NSPT, implicit MTS (with
+4. More tool levels, roughly in the order CTC AI needs them: MRL/TMRL, ISP (references shifted from the CU's, the
+   bilateral filter padded at the CU's origin, 4-wide prediction regions over 1- and 2-wide blocks, 1-D transforms),
+   LFNST of MIP (with the MIP prediction's DIMD mode), implicit MTS (with
    DIMD), sign prediction (reads reconstruction: GPU), CCLM/CCCM and the other
    cross-component tools (GPU), DIMD/TIMD/MPM sorting/chroma reordering/DBV (mode derivations that read the
    reconstruction: these have to move to the GPU too), IntraTMP/IBC, then inter pictures. Each level: new test set

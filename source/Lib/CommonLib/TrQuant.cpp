@@ -1017,6 +1017,24 @@ void TrQuant::invTransformNxN( TransformUnit &tu, const ComponentID &compID, Pel
 
   CHECK( uiWidth > tu.cs->sps->getMaxTbSize() || uiHeight > tu.cs->sps->getMaxTbSize(), "Maximal allowed transformation size exceeded!" );
   CoeffBuf tempCoeff = CoeffBuf(m_tempCoeff, area);
+  xDeQuantLfnst( tu, compID, cQP, tempCoeff );
+
+  if (tu.mtsIdx[compID] == MTS_SKIP)
+  {
+    xITransformSkip(tempCoeff, pResi, tu, compID);
+  }
+  else
+  {
+    xIT(tu, compID, tempCoeff, pResi);
+  }
+
+  //DTRACE_BLOCK_COEFF(tu.getCoeffs(compID), tu, tu.cu->predMode, compID);
+  DTRACE_PEL_BUF( D_RESIDUALS, pResi, tu, tu.cu->predMode, compID);
+}
+
+// invTransformNxN's first steps: the dequantized coefficients in tempCoeff (m_tempCoeff), then the inverse LFNST on them
+void TrQuant::xDeQuantLfnst( const TransformUnit &tu, const ComponentID &compID, const QpParam &cQP, CoeffBuf &tempCoeff )
+{
   xDeQuant(tu, tempCoeff, compID, cQP);
 
   DTRACE_COEFF_BUF(D_TCOEFF, tempCoeff, tu, tu.cu->predMode, compID);
@@ -1031,18 +1049,18 @@ void TrQuant::invTransformNxN( TransformUnit &tu, const ComponentID &compID, Pel
   {
     xInvLfnst(tu, compID);
   }
+}
 
-  if (tu.mtsIdx[compID] == MTS_SKIP)
-  {
-    xITransformSkip(tempCoeff, pResi, tu, compID);
-  }
-  else
-  {
-    xIT(tu, compID, tempCoeff, pResi);
-  }
-
-  //DTRACE_BLOCK_COEFF(tu.getCoeffs(compID), tu, tu.cu->predMode, compID);
-  DTRACE_PEL_BUF( D_RESIDUALS, pResi, tu, tu.cu->predMode, compID);
+CCoeffBuf TrQuant::getInvLfnstOutput( const TransformUnit &tu, const ComponentID compID, const QpParam &cQP )
+{
+#if JVET_AL0181_ASBT
+  const CompArea &area = tu.blocksResidual[compID];
+#else
+  const CompArea &area = tu.blocks[compID];
+#endif
+  CoeffBuf tempCoeff( m_tempCoeff, area );
+  xDeQuantLfnst( tu, compID, cQP, tempCoeff );
+  return tempCoeff;
 }
 
 std::pair<int64_t,int64_t> TrQuant::fwdTransformICT( const TransformUnit &tu, const PelBuf &resCb, const PelBuf &resCr, PelBuf &resC1, PelBuf &resC2, int jointCbCr )
