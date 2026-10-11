@@ -45,6 +45,7 @@
 #include "CommonLib/BilateralFilter.h"
 #include "CommonLib/InterpolationFilter.h"
 #include "CommonLib/Picture.h"
+#include "CommonLib/Reshape.h"
 #include "CommonLib/Rom.h"
 #include "CommonLib/Slice.h"
 #include "CommonLib/TrQuant.h"
@@ -61,7 +62,7 @@
 
 namespace
 {
-// layout shared with intra_rec.comp (struct Tu): 52 int32
+// layout shared with intra_rec.comp (struct Tu): 58 int32
 struct Tu
 {
   int32_t comp, x, y, w, h;
@@ -81,9 +82,16 @@ struct Tu
   int32_t nzRows, nzCols;
   int32_t bf;
   int32_t qp;
+  int32_t lmcs;
+  int32_t crsX, crsY, crsW, crsH;
+  int32_t crsAvail;
   int32_t pad[1];
 };
-static_assert( sizeof( Tu ) == 52 * 4, "Tu layout" );
+static_assert( sizeof( Tu ) == 58 * 4, "Tu layout" );
+
+// Tu::lmcs
+constexpr int LMCS_BF_INVERSE  = 1;   // the intra bilateral filter works on inverse-mapped samples
+constexpr int LMCS_CHROMA_SCALE = 2;   // the chroma residual is scaled by the CU's neighbouring luma
 
 // layout shared with intra_rec.comp (struct Params, std430)
 struct Params
@@ -104,6 +112,7 @@ struct Params
   uint64_t depStart;
   uint64_t depTmp;
   uint64_t numDep;
+  uint64_t lmcs;
   int32_t  origin[3];
   int32_t  stride[3];
   int32_t  width[3];
@@ -114,9 +123,10 @@ struct Params
   int32_t  unitLog2Y[2];
   int32_t  matrixOffset[8];
   int32_t  edgeCap;
-  int32_t  pad;
+  int32_t  lmcsLutSize;
+  int32_t  lumaClipMin, lumaClipMax;
 };
-static_assert( offsetof( Params, origin ) == 160 && offsetof( Params, matrixOffset ) == 240 && sizeof( Params ) == 280,
+static_assert( offsetof( Params, origin ) == 168 && offsetof( Params, matrixOffset ) == 248 && sizeof( Params ) == 296,
                "Params layout" );
 
 struct Push
@@ -225,7 +235,8 @@ struct GpuIntraRec::Impl
   gpu::Context*               ctx = nullptr;
   const Shared*               sh  = nullptr;
   std::unique_ptr<gpu::Stream> stream;
-  gpu::Buffer                 params, tus, coeffs, planes[3], owner[3], sched, dbgPred, dbgResi;
+  gpu::Buffer                 params, tus, coeffs, planes[3], owner[3], sched, dbgPred, dbgResi, lmcs;
+  Reshape*                    reshape = nullptr;   // the decoder's reshaper (LMCS state of the picture being decoded)
   int                         numGroups = 0;
   size_t                      edgeCap   = 0;   // dependency edges per picture the scheduling buffer holds
   gpu::Buffer                 upload, download;
@@ -235,6 +246,7 @@ struct GpuIntraRec::Impl
   std::vector<int32_t>        coef;
   std::vector<int16_t>        cpuPred, cpuResi;   // verification only
   size_t                      numSamples = 0;     // samples of the recorded blocks
+  bool                        lmcsUsed = false;   // a block of the picture reads the LMCS tables
   std::string                 unsupportedWhy;
   int                         poc = 0;
   bool                        on = false;
@@ -252,7 +264,7 @@ struct GpuIntraRec::Impl
       return;
     }
     for( gpu::Buffer* b: { &params, &tus, &coeffs, &planes[0], &planes[1], &planes[2],
-                           &owner[0], &owner[1], &owner[2], &sched, &dbgPred, &dbgResi, &upload, &download } )
+                           &owner[0], &owner[1], &owner[2], &sched, &dbgPred, &dbgResi, &lmcs, &upload, &download } )
     {
       b->destroy( *ctx );
     }
@@ -303,6 +315,11 @@ void GpuIntraRec::setOn( bool on )
   m_impl->on = on;
 }
 
+void GpuIntraRec::setReshape( Reshape* reshape )
+{
+  m_impl->reshape = reshape;
+}
+
 bool GpuIntraRec::on() const
 {
   return m_impl->on;
@@ -322,7 +339,6 @@ bool GpuIntraRec::supported( const Slice& slice, std::string& why )
   if( !slice.isIntra() )                                                                  why = "not an intra slice";
   else if( sps.getChromaFormatIdc() != CHROMA_420 && sps.getChromaFormatIdc() != CHROMA_400 ) why = "chroma format";
   else if( sps.getLog2MaxTbSize() > 7 )                                                   why = "transform blocks above 128";
-  else if( sps.getUseLmcs() )                                                             why = "LMCS";
   else if( sps.getUseQcs() )                                                              why = "QCS";
   else if( sps.getScalingListFlag() )                                                     why = "scaling lists";
   else if( sps.getSpsRangeExtension().getExtendedPrecisionProcessingFlag() )               why = "extended precision";
@@ -354,6 +370,7 @@ void GpuIntraRec::beginPicture( const CodingStructure& cs )
   m.cpuPred.clear();
   m.cpuResi.clear();
   m.numSamples = 0;
+  m.lmcsUsed   = false;
   m.unsupportedWhy.clear();
   m.poc = cs.slice->getPOC();
   std::string why;
@@ -405,7 +422,7 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
   else if( cu.eipFlag )                                             why = "EIP";
   else if( pu.multiRefIdx || ipa.multiRefIndex )                    why = "MRL";
   else if( dirMode >= NUM_LUMA_MODE )                               why = "intra mode beyond 66 (LM / NN / ...)";
-  else if( sps.getUseLmcs() )                                       why = "LMCS";
+  else if( sps.getUseLmcs() && !m.reshape )                         why = "LMCS without the decoder's reshaper";
   else if( sps.getUseQcs() )                                        why = "QCS";
   else if( sps.getScalingListFlag() )                               why = "scaling lists";
   else if( sps.getSpsRangeExtension().getExtendedPrecisionProcessingFlag() ) why = "extended precision";
@@ -497,6 +514,44 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
   {
     t.recMin = slice.clpRng( compID ).min;
     t.recMax = slice.clpRng( compID ).max;
+  }
+  // LMCS (the reconstruction stays in the mapped domain): the luma clipping range is mapped (DecCu::xIntraRecBlk),
+  // the intra bilateral filter works on inverse-mapped samples (IntraPrediction::checkBfLmcsApplication), and the
+  // chroma residual is scaled by the average luma next to the CU (DecCu::xIntraRecBlk, calculateChromaAdjVpduNei)
+  t.lmcs = 0;
+  if( sps.getUseLmcs() )
+  {
+    Reshape&                rsp   = *m.reshape;
+    const SliceReshapeInfo& rInfo = rsp.getSliceReshaperInfo();
+    if( compID == COMPONENT_Y && cs.picHeader->getLmcsEnabledFlag() )
+    {
+      t.recMin = rsp.getFwdLUT()[slice.getLumaPelMin()];
+      t.recMax = rsp.getFwdLUT()[slice.getLumaPelMax()];
+    }
+    const bool bfLmcs = cs.picHeader->getLmcsEnabledFlag() && rInfo.getUseSliceReshaper()
+                        && ( slice.getSliceType() == I_SLICE ? rInfo.getUseSliceReshaper() : rsp.getCTUFlag() );
+    if( t.bf && bfLmcs )
+    {
+      t.lmcs |= LMCS_BF_INVERSE;
+    }
+    const bool lmcsSlice = slice.getLmcsEnabledFlag() && ( slice.isIntra() || rsp.getCTUFlag() );
+    if( lmcsSlice && isChroma( compID ) && area.width * area.height > 4 && ( TU::getCbf( tu, compID ) || tu.jointCbCr )
+        && cs.picHeader->getLmcsChromaResidualScaleFlag() )
+    {
+      t.lmcs |= LMCS_CHROMA_SCALE;
+      // the CU's luma, or the chroma CU's area in luma samples (DecCu::xIntraRecBlk with LMCS_CHROMA_CALC_CU)
+      const Area areaY = cu.Y().valid() ? Area( cu.Y() )
+                                        : Area( recalcPosition( tu.chromaFormat, tu.chType, CHANNEL_TYPE_LUMA, cu.blocks[tu.chType].pos() ),
+                                                recalcSize( tu.chromaFormat, tu.chType, CHANNEL_TYPE_LUMA, cu.blocks[tu.chType].size() ) );
+      const CodingUnit *cuLeft, *cuAbove;
+      Reshape::getChromaAdjNeighbours( tu, areaY.pos(), cuLeft, cuAbove );
+      t.crsX     = areaY.x;
+      t.crsY     = areaY.y;
+      t.crsW     = areaY.width;
+      t.crsH     = areaY.height;
+      t.crsAvail = ( cuLeft ? 1 : 0 ) | ( cuAbove ? 2 : 0 );
+    }
+    m.lmcsUsed |= t.lmcs != 0;
   }
 
   // the levels: only the region holding the nonzero ones (rows < nzRows, columns < nzCols)
@@ -843,6 +898,26 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
           }
         }
       }
+      if( t.lmcs & LMCS_CHROMA_SCALE )   // the luma column left of and the row above the CU, clipped to the picture
+      {
+        auto addLuma = [&]( int sx, int sy )
+        {
+          const int o = ownerMap[COMPONENT_Y][size_t( sy >> P.unitLog2Y[0] ) * P.ownerW[0] + ( sx >> P.unitLog2X[0] )];
+          if( o >= 0 && o < i && mark[o] != i )
+          {
+            mark[o] = i;
+            deps[i].push_back( o );
+          }
+        };
+        if( t.crsAvail & 1 )
+        {
+          for( int k = 0; k < t.crsH; k++ ) addLuma( t.crsX - 1, std::min( t.crsY + k, P.height[0] - 1 ) );
+        }
+        if( t.crsAvail & 2 )
+        {
+          for( int k = 0; k < t.crsW; k++ ) addLuma( std::min( t.crsX + k, P.width[0] - 1 ), t.crsY - 1 );
+        }
+      }
     }
   }
   double         ms      = 0;
@@ -867,6 +942,27 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
   memcpy( P.matrixOffset, m.sh->matrixOffset, sizeof( P.matrixOffset ) );
   P.dbgPred  = m.dbgPred.addr;
   P.dbgResi  = m.dbgResi.addr;
+  P.lumaClipMin = cs.slice->clpRng( COMPONENT_Y ).min;
+  P.lumaClipMax = cs.slice->clpRng( COMPONENT_Y ).max;
+  // the picture's LMCS tables: the forward and inverse LUTs and the chroma scale of every average luma value
+  // (Reshape::calculateChromaAdj itself)
+  std::vector<int32_t> lmcsTable;
+  if( m.lmcsUsed )
+  {
+    Reshape&  rsp = *m.reshape;
+    const int lutSize = (int) rsp.getFwdLUT().size();
+    lmcsTable.resize( 3 * size_t( lutSize ) );
+    for( int v = 0; v < lutSize; v++ )
+    {
+      lmcsTable[v]               = rsp.getFwdLUT()[v];
+      lmcsTable[lutSize + v]     = rsp.getInvLUT()[v];
+      lmcsTable[2 * lutSize + v] = rsp.calculateChromaAdj( Pel( v ) );
+    }
+    m.lmcs.ensure( ctx, lmcsTable.size() * 4, gpu::Buffer::DEVICE );
+    P.lmcs        = m.lmcs.addr;
+    P.lmcsLutSize = lutSize;
+  }
+  const size_t lmcsBytes = lmcsTable.size() * 4;
 
   for( ;; )   // once, again with more room when the dependencies do not fit
   {
@@ -886,11 +982,12 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
     P.numDep    = m.sched.addr + oNumDep * 4;
     P.edgeCap   = (int32_t) cap;
 
-    const size_t upBytes = sizeof( Params ) + tuBytes + coefBytes;
+    const size_t upBytes = sizeof( Params ) + tuBytes + coefBytes + lmcsBytes;
     m.upload.ensure( ctx, upBytes, gpu::Buffer::UPLOAD );
     memcpy( m.upload.mapped, &P, sizeof( Params ) );
     memcpy( (char*) m.upload.mapped + sizeof( Params ), m.rec.data(), tuBytes );
     memcpy( (char*) m.upload.mapped + sizeof( Params ) + tuBytes, m.coef.data(), coefBytes );
+    memcpy( (char*) m.upload.mapped + sizeof( Params ) + tuBytes + coefBytes, lmcsTable.data(), lmcsBytes );
     // downloaded: the dependency count (overflow check), with verification the CPU comparison data and the GPU's
     // scheduling data, then the planes
     size_t downBytes = 8;
@@ -915,6 +1012,10 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
     if( coefBytes )
     {
       s.copy( m.upload, sizeof( Params ) + tuBytes, m.coeffs, 0, coefBytes );
+    }
+    if( lmcsBytes )
+    {
+      s.copy( m.upload, sizeof( Params ) + tuBytes + coefBytes, m.lmcs, 0, lmcsBytes );
     }
     for( int c = 0; c < numComp; c++ )
     {

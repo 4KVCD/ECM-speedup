@@ -722,6 +722,7 @@ void DecLib::xPollGpuRecon()
     return;
   }
   m_gpuIntraRec->setOn( m_gpuReconMode != 2 );
+  m_gpuIntraRec->setReshape( &m_cReshaper );
   m_cCuDecoder.setGpuIntraRec( m_gpuIntraRec.get() );
 }
 

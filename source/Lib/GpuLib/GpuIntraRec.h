@@ -56,6 +56,7 @@
 
 class CodingStructure;
 class QpParam;
+class Reshape;
 
 class GpuIntraRec
 {
@@ -68,6 +69,8 @@ public:
   /// reconstructs every picture and the GPU's reconstruction of the supported ones is compared (verification)
   void setOn( bool on );
   bool on() const;
+  /// the decoder's reshaper, whose LMCS state (LUTs, chroma scales, slice flags) is that of the picture being decoded
+  void setReshape( Reshape* reshape );
   /// whether the GPU path supports the slice's tools (sequence- and slice-level settings; per block record() checks)
   static bool supported( const Slice& slice, std::string& why );
 

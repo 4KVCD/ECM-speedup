@@ -2,7 +2,7 @@
 #ifndef INTRA_COMMON_GLSL
 #define INTRA_COMMON_GLSL
 
-// one transform block of one component (52 int32, layout shared with GpuIntraRec.cpp)
+// one transform block of one component (58 int32, layout shared with GpuIntraRec.cpp)
 struct Tu
 {
   int comp, x, y, w, h;
@@ -22,6 +22,9 @@ struct Tu
   int nzRows, nzCols;   // the nonzero coefficient levels lie in rows < nzRows and columns < nzCols
   int bf;               // intra prediction bilateral filter possible: 1 planar / DC, 2 angular (also gated by the references)
   int qp;               // the CU's luma QP
+  int lmcs;             // LMCS: bit 0 the bilateral filter works on inverse-mapped samples, bit 1 chroma residual scaling
+  int crsX, crsY, crsW, crsH;   // chroma residual scaling: the CU's luma area (its left column and above row are averaged)
+  int crsAvail;         // bit 0: there is a luma CU left of the area, bit 1: above it
   int pad[1];
 };
 layout( buffer_reference, std430, buffer_reference_align = 4 ) buffer BufTu { Tu v[]; };
@@ -44,6 +47,7 @@ struct Params
   uint64_t depStart;    // int32 per block + 1: its dependencies in depTmp (intra_deps)
   uint64_t depTmp;      // int32: the dependencies of each block (intra_deps)
   uint64_t numDep;      // int32 per block: its number of dependents, then the entries written (intra_deps)
+  uint64_t lmcs;        // int32, lmcsLutSize entries each: the forward LUT, the inverse LUT, the chroma scale of each average luma
   int      origin[3];
   int      stride[3];
   int      width[3];
@@ -54,7 +58,8 @@ struct Params
   int      unitLog2Y[2];
   int      matrixOffset[8];
   int      edgeCap;     // the capacity of depList / depTmp
-  int      pad;
+  int      lmcsLutSize;              // entries of each LMCS table (1 << luma bit depth)
+  int      lumaClipMin, lumaClipMax; // the slice's luma clipping range (the average luma of chroma residual scaling)
 };
 layout( buffer_reference, std430, buffer_reference_align = 8 ) buffer BufParams { Params p; };
 

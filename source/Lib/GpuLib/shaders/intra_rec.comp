@@ -6,7 +6,8 @@
 // the picture) run at the same time and no workgroup waits on a block it holds.
 // Per block: reference samples (and their [1 2 1] filtering), prediction (planar, directional planar, DC, angular
 // with PDPC and intra fusion, the intra bilateral filter) and reconstruction with the residual intra_resi computed beforehand for all blocks at
-// once. Every step follows the C++ of IntraPrediction / DecCu.
+// once (with LMCS: scaled for chroma by the neighbouring luma, the bilateral filter on inverse-mapped samples). Every
+// step follows the C++ of IntraPrediction / DecCu.
 // Not yet: MRL, ISP, MIP, LFNST / MTS / transform skip, decoder-side intra modes.
 #extension GL_GOOGLE_include_directive : require
 #extension GL_KHR_shader_subgroup_basic : require
@@ -48,6 +49,8 @@ shared int16_t s_bfLut[48];                   // the bilateral filter's LUT row 
 
 Params P;      // the parameter block (loaded once)
 int    g_ti;   // the block being reconstructed
+bool   g_crs;       // LMCS chroma residual scaling of the block
+int    g_crsScale;  // its scale (Reshape::calculateChromaAdj)
 
 int filterTap( int taps, int frac, int i )
 {
@@ -74,6 +77,22 @@ int clip3i( int lo, int hi, int v )
 int asPel( int v )   // the int16 Pel the CPU stores
 {
   return int( int16_t( v ) );
+}
+
+// LMCS: the forward and inverse luma mappings (Reshape's LUTs)
+int fwdLut( int v ) { return BufI32( P.lmcs ).v[v]; }
+int invLut( int v ) { return BufI32( P.lmcs ).v[P.lmcsLutSize + v]; }
+
+// Reshape::scalePel: the residual scaled by scale / 2^11 (CSCALE_FP_PREC), magnitude rounded; scale is an int16_t there
+int scalePel( int val, int scale, int maxVal )
+{
+  const int sc   = int( int16_t( scale ) );
+  const int sign = val < 0 ? -1 : 0;
+  val = clip3i( ~maxVal, maxVal, val );
+  val = ( val ^ sign ) - sign;
+  int tmp = ( val * sc + ( 1 << 10 ) ) >> 11;
+  tmp = ( tmp ^ sign ) - sign;
+  return clip3i( -32768, 32767, tmp );
 }
 
 // xFillReferenceSamples, all invocations, no barrier (multiRefIdx 0 or 1, so no MRL units: lMU = aMU = 0). The units
@@ -163,7 +182,15 @@ void fillReferencePar( Tu t, int line, int mrl, int lid, int NT )
 void storeRecon( Tu t, int x, int y, int pr )
 {
   const int i  = y * t.w + x;
-  const int re = int( BufI16( P.dbgResi ).v[t.dbgOffset + i] );
+  int       re = int( BufI16( P.dbgResi ).v[t.dbgOffset + i] );
+  if( g_crs )   // the residual the CPU reconstructs with (and records, for the comparison)
+  {
+    re = scalePel( re, g_crsScale, ( 1 << t.bitDepth ) - 1 );
+    if( pc.verify != 0 )
+    {
+      BufI16( P.dbgResi ).v[t.dbgOffset + i] = int16_t( re );
+    }
+  }
   CBufI16( P.plane[t.comp] ).v[P.origin[t.comp] + ( t.y + y ) * P.stride[t.comp] + t.x + x] = int16_t( clip3i( t.recMin, t.recMax, pr + re ) );
   if( pc.verify != 0 )
   {
@@ -318,6 +345,23 @@ void main()
     const int maxPel = ( 1 << t.bitDepth ) - 1;
     const int predStride = ( W << 3 ) + 1, predSize = W << 3, predHSize = H << 3;
     const bool fusion = t.fusion != 0;
+
+    // ----- LMCS chroma residual scaling (Reshape::calculateChromaAdjVpduNei with LMCS_CHROMA_CALC_CU): the rounded
+    // mean of the luma column left of and the row above the CU (rows / columns beyond the picture replaced by the last
+    // one), clipped, selects the scale; without neighbours the mid-level value does
+    g_crs      = ( t.lmcs & 2 ) != 0;
+    g_crsScale = 0;
+    if( g_crs )
+    {
+      const bool hasLeft = ( t.crsAvail & 1 ) != 0, hasAbove = ( t.crsAvail & 2 ) != 0;
+      int sum = 0;
+      for( int k = lid; hasLeft && k < t.crsH; k += NT ) sum += recoAt( 0, t.crsX - 1, min( t.crsY + k, P.height[0] - 1 ) );
+      for( int k = lid; hasAbove && k < t.crsW; k += NT ) sum += recoAt( 0, min( t.crsX + k, P.width[0] - 1 ), t.crsY - 1 );
+      const int total  = wgSum2( sum, 0, 0 ).x;
+      const int pelnum = ( hasLeft ? t.crsH : 0 ) + ( hasAbove ? t.crsW : 0 );
+      const int lumaValue = pelnum > 0 ? clip3i( P.lumaClipMin, P.lumaClipMax, ( total + ( pelnum >> 1 ) ) / pelnum ) : P.lmcsLutSize >> 1;
+      g_crsScale = BufI32( P.lmcs ).v[2 * P.lmcsLutSize + lumaValue];
+    }
 
     // ----- reference samples (and the second line of intra fusion)
     fillReferencePar( t, 0, 0, lid, NT );
@@ -613,6 +657,14 @@ void main()
     SYNC();
     if( bf )
     {
+      // with LMCS the filter works on the inverse-mapped prediction and reconstruction, and its output (also when the
+      // gate skips the filter) is mapped back (bilateralFilterPredDiamond5x5Clip)
+      const bool lmcsBf = ( t.lmcs & 1 ) != 0;
+      if( lmcsBf )
+      {
+        for( int i = lid; i < N; i += NT ) s_tmp[BF_PRED + i] = int16_t( invLut( int( s_tmp[BF_PRED + i] ) ) );
+        SYNC();
+      }
       // getFilterLutParameters: the mean absolute deviation of the prediction gates the filter and sets its strength
       const int log2W = findMSB( W ), log2H = findMSB( H ), whlog2 = log2W + log2H;
       const int bdShift = max( 0, t.bitDepth - 10 );
@@ -648,6 +700,7 @@ void main()
           if( ( py < 2 && px < 2 && corner != 0 ) || ( py < 2 && x >= 0 && x < topRec ) || ( px < 2 && y >= 0 && y < leftRec ) )
           {
             v = recoAt( 0, t.x + x, t.y + y );
+            v = lmcsBf ? invLut( v ) : v;
           }
           else
           {
@@ -680,12 +733,17 @@ void main()
           modsum += bfLut( int( s_tmp[c - 2 * PW] ) - p, 32, cutBits, bdShift );
           modsum += bfLut( int( s_tmp[c + 2 * PW] ) - p, 32, cutBits, bdShift );
           const int filt = asPel( ( modsum * bfac + 128 ) >> 8 );   // (BIF_ROUND_ADD / 2) << 3, BIF_ROUND_SHIFT - 1 + 3
-          storeRecon( t, x, y, clip3i( 0, maxPel, filt + p ) );
+          const int filtered = clip3i( 0, maxPel, filt + p );
+          storeRecon( t, x, y, lmcsBf ? fwdLut( filtered ) : filtered );
         }
       }
       else
       {
-        for( int i = lid; i < N; i += NT ) storeRecon( t, i % W, i / W, int( s_tmp[BF_PRED + i] ) );
+        for( int i = lid; i < N; i += NT )
+        {
+          const int pr = int( s_tmp[BF_PRED + i] );
+          storeRecon( t, i % W, i / W, lmcsBf ? fwdLut( pr ) : pr );
+        }
       }
     }
 

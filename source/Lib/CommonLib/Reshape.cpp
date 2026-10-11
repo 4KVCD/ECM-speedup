@@ -145,42 +145,13 @@ int  Reshape::calculateChromaAdjVpduNei(TransformUnit &tu, const CompArea &areaY
 #endif
 #endif
     Position topLeft(xPos, yPos);
-    CodingUnit *topLeftLuma;
     const CodingUnit *cuAbove, *cuLeft;
 #if LMCS_CHROMA_CALC_CU
-#if JVET_AI0136_ADAPTIVE_DUAL_TREE
-    if (tu.cu->separateTree && cs.slice->getSliceType() == I_SLICE)
-#else
-    if (CS::isDualITree(cs) && cs.slice->getSliceType() == I_SLICE)
-#endif
-    {
-#if JVET_AI0136_ADAPTIVE_DUAL_TREE
-      topLeftLuma = tu.cs->getLumaCU(topLeft,CHANNEL_TYPE_LUMA);
-      cuAbove = tu.cs->getLumaCU(topLeft.offset(0, -1),CHANNEL_TYPE_LUMA);
-      cuLeft  = tu.cs->getLumaCU(topLeft.offset(-1, 0),CHANNEL_TYPE_LUMA);
-#else
-      topLeftLuma = tu.cs->picture->cs->getCU(topLeft, CHANNEL_TYPE_LUMA);
-      cuAbove = cs.picture->cs->getCURestricted(topLeft.offset(0, -1), *topLeftLuma, CHANNEL_TYPE_LUMA);
-      cuLeft  = cs.picture->cs->getCURestricted(topLeft.offset(-1, 0), *topLeftLuma, CHANNEL_TYPE_LUMA);
-#endif
-    }
-#if JVET_AI0136_ADAPTIVE_DUAL_TREE
-    else if(tu.cu->separateTree)
-    {
-      topLeftLuma = cs.getLumaCU(topLeft,CHANNEL_TYPE_LUMA);
-      cuAbove = tu.cs->getLumaCU(topLeft.offset(0, -1),CHANNEL_TYPE_LUMA);
-      cuLeft  = tu.cs->getLumaCU(topLeft.offset(-1, 0),CHANNEL_TYPE_LUMA);
-    }
-#endif
-    else
-    {
-      topLeftLuma = cs.getCU(topLeft, CHANNEL_TYPE_LUMA);
-      cuAbove = cs.getCURestricted(topLeft.offset(0, -1), *topLeftLuma, CHANNEL_TYPE_LUMA);
-      cuLeft  = cs.getCURestricted(topLeft.offset(-1, 0), *topLeftLuma, CHANNEL_TYPE_LUMA);
-    }
+    getChromaAdjNeighbours( tu, topLeft, cuLeft, cuAbove );
 
     CompArea lumaArea = CompArea(COMPONENT_Y, tu.chromaFormat, topLeft, areaY, true);
 #else
+    CodingUnit *topLeftLuma;
     if (CS::isDualITree(cs) && cs.slice->getSliceType() == I_SLICE)
     {
       topLeftLuma = tu.cs->picture->cs->getCU(topLeft, CHANNEL_TYPE_LUMA);
@@ -263,6 +234,32 @@ int  Reshape::calculateChromaAdjVpduNei(TransformUnit &tu, const CompArea &areaY
     return(chromaScale);
   }
 }
+#if LMCS_CHROMA_CALC_CU
+void Reshape::getChromaAdjNeighbours( const TransformUnit &tu, const Position &topLeft, const CodingUnit *&cuLeft, const CodingUnit *&cuAbove )
+{
+  CodingStructure &cs = *tu.cs;
+#if JVET_AI0136_ADAPTIVE_DUAL_TREE
+  if( tu.cu->separateTree )   // the dual tree of intra slices and the separate trees of inter slices: the luma CUs there
+  {
+    cuAbove = cs.getLumaCU( topLeft.offset( 0, -1 ), CHANNEL_TYPE_LUMA );
+    cuLeft  = cs.getLumaCU( topLeft.offset( -1, 0 ), CHANNEL_TYPE_LUMA );
+    return;
+  }
+#else
+  if( CS::isDualITree( cs ) && cs.slice->getSliceType() == I_SLICE )
+  {
+    const CodingUnit *topLeftLuma = cs.picture->cs->getCU( topLeft, CHANNEL_TYPE_LUMA );
+    cuAbove = cs.picture->cs->getCURestricted( topLeft.offset( 0, -1 ), *topLeftLuma, CHANNEL_TYPE_LUMA );
+    cuLeft  = cs.picture->cs->getCURestricted( topLeft.offset( -1, 0 ), *topLeftLuma, CHANNEL_TYPE_LUMA );
+    return;
+  }
+#endif
+  const CodingUnit *topLeftLuma = cs.getCU( topLeft, CHANNEL_TYPE_LUMA );
+  cuAbove = cs.getCURestricted( topLeft.offset( 0, -1 ), *topLeftLuma, CHANNEL_TYPE_LUMA );
+  cuLeft  = cs.getCURestricted( topLeft.offset( -1, 0 ), *topLeftLuma, CHANNEL_TYPE_LUMA );
+}
+#endif
+
 /** find inx of PWL for inverse mapping
 * \param average luma pred of TU
 * \return idx of PWL for inverse mapping

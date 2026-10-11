@@ -35,6 +35,12 @@ int ownerAt( int c, int x, int y )
   return BufI32( P.owner[c] ).v[( y >> P.unitLog2Y[g_ch] ) * P.ownerW[g_ch] + ( x >> P.unitLog2X[g_ch] )];
 }
 
+// the block owning luma sample (x, y) inside the picture (the reads of chroma residual scaling)
+int ownerLumaAt( int x, int y )
+{
+  return BufI32( P.owner[0] ).v[( y >> P.unitLog2Y[0] ) * P.ownerW[0] + ( x >> P.unitLog2X[0] )];
+}
+
 bool availAt( int c, int x, int y )
 {
   const int a = ownerAt( c, x, y );
@@ -267,6 +273,17 @@ void dependencies( int comp )
         }
         addDep( ownerAt( comp, sx, sy ) );
       }
+    }
+  }
+  if( ( t.lmcs & 2 ) != 0 )   // LMCS chroma residual scaling: the luma column left of and the row above the CU, clipped
+  {
+    if( ( t.crsAvail & 1 ) != 0 )
+    {
+      for( int k = 0; k < t.crsH; k++ ) addDep( ownerLumaAt( t.crsX - 1, min( t.crsY + k, P.height[0] - 1 ) ) );
+    }
+    if( ( t.crsAvail & 2 ) != 0 )
+    {
+      for( int k = 0; k < t.crsW; k++ ) addDep( ownerLumaAt( min( t.crsX + k, P.width[0] - 1 ), t.crsY - 1 ) );
     }
   }
 }

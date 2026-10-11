@@ -106,6 +106,11 @@ public:
   bool getReshapeFlag() { return m_reshape; }
   void setReshapeFlag(bool b) { m_reshape = b; }
   int  calculateChromaAdjVpduNei(TransformUnit &tu, const CompArea &areaY);
+#if LMCS_CHROMA_CALC_CU
+  /// the luma CUs left of and above the CU at topLeft (luma position) whose samples next to the CU set the chroma
+  /// residual scale; nullptr where there is none (calculateChromaAdjVpduNei, and the GPU reconstruction's records)
+  static void getChromaAdjNeighbours( const TransformUnit &tu, const Position &topLeft, const CodingUnit *&cuLeft, const CodingUnit *&cuAbove );
+#endif
 #if !LMCS_CHROMA_CALC_CU
 #if JVET_Z0118_GDR
   void setVPDULoc(int x, int y, PictureType pt) { m_vpduX = x, m_vpduY = y; m_pt = pt; }

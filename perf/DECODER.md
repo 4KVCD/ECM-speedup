@@ -244,9 +244,16 @@ the reconstruction buffer; works in every frame-thread context):
   reference texture gate, the prediction texture gate and strength, the 5x5 diamond over the prediction padded with
   the neighbouring reconstruction as the CPU copies it); M4 adds the dual tree of intra slices (separate luma and
   chroma coding trees): nothing in the kernels changed, because the host records the transform blocks in decoding
-  order and the owners and availability are per component. GpuIntraRec::supported() rejects every tool whose mode
-  derivation or prediction reads reconstructed samples or that the kernels lack, before anything is skipped. All 19
-  regular streams now fall back to the CPU because of LMCS (before M4: dual tree).
+  order and the owners and availability are per component; M5 adds LMCS (luma mapping with chroma scaling) on intra
+  pictures: the reconstruction stays in the mapped domain, the luma clipping range is mapped, the intra bilateral
+  filter works on inverse-mapped prediction and padding samples and maps its output back (also where its texture
+  gate skips the filter), and the chroma residual is scaled by the rounded mean of the luma column left of and the
+  row above the CU (Reshape::calculateChromaAdjVpduNei with LMCS_CHROMA_CALC_CU; the host records the CU's luma area
+  and which neighbours exist, the GPU averages, and the chroma block depends on the luma blocks it reads); the host
+  uploads the picture's forward and inverse LUTs and the chroma scale of every luma value. GpuIntraRec::supported()
+  rejects every tool whose mode derivation or prediction reads reconstructed samples or that the kernels lack, before
+  anything is skipped. All 19 regular streams now fall back to the CPU at QCS, the next sequence-level check (before
+  M5: LMCS, before M4: dual tree); many block-level tools follow.
 - kernels: intra_resi (all residuals of the picture at once, dequantization folded into the first DCT-II stage,
   only the nonzero coefficient region) and intra_rec (persistent workgroups take ready blocks from a queue; the
   host gives each block its dependency count, its dependents and the availability the CPU sees as five numbers per
