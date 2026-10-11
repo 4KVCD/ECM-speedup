@@ -325,7 +325,6 @@ bool GpuIntraRec::supported( const Slice& slice, std::string& why )
   why.clear();
   if( !slice.isIntra() )                                                                  why = "not an intra slice";
   else if( sps.getChromaFormatIdc() != CHROMA_420 && sps.getChromaFormatIdc() != CHROMA_400 ) why = "chroma format";
-  else if( sps.getUseDualITree() )                                                        why = "dual tree";
   else if( sps.getLog2MaxTbSize() > 7 )                                                   why = "transform blocks above 128";
   else if( sps.getUseLmcs() )                                                             why = "LMCS";
   else if( sps.getUseQcs() )                                                              why = "QCS";

@@ -13,9 +13,9 @@ wall-clock gains with threads are "the easy baseline". Decoder status: single-th
 (`--GpuLoopFilter=1`: ALF, SAO, BIF, CCSAO, LF-CCCM, offset refinement on Vulkan). The user then asked for **a full
 GPU decoder in Vulkan, optimized until nothing is left** ("The GPU decoder needs to fully decode the frame on the
 GPU"; "Your first Vulkan version is going to be slow. That's OK"). That work is branch `dec-gpurecon`: intra
-reconstruction on the GPU (`--GpuRecon`), tool levels M1-M3 done and verified bit-exact; it is **not yet faster than
+reconstruction on the GPU (`--GpuRecon`), tool levels M1-M4 done and verified bit-exact; it is **not yet faster than
 the CPU decoder** (see section 8) and supports only a restricted tool set (all real CTC streams fall back to the CPU,
-first reason: dual tree).
+first reason: LMCS).
 
 ## 2. The user's rules (follow them exactly)
 
@@ -104,9 +104,11 @@ the **vulkanMemoryModel** feature (GpuIntraRec::create returns null otherwise); 
 
 Builds (from a worktree, e.g. `C:\Code\ECM\wt-gr` on branch dec-gpurecon):
 ```
-perf\build.ps1 gr -NoLto -DECM_VULKAN=ON -DECM_VULKAN_HEADERS=C:/Code/ECM/tools/vulkan-headers/Vulkan-Headers-vulkan-sdk-1.4.363.0/include -DECM_GLSLANG=C:/Code/ECM/tools/glslang/bin/glslang.exe
-perf\build.ps1 grL -DECM_VULKAN=ON <same two paths>        # LTO, for timing
+perf\build.ps1 gr -NoLto '-DECM_VULKAN=ON' '-DECM_VULKAN_HEADERS=C:/Code/ECM/tools/vulkan-headers/Vulkan-Headers-vulkan-sdk-1.4.363.0/include' '-DECM_GLSLANG=C:/Code/ECM/tools/glslang/bin/glslang.exe'
+perf\build.ps1 grL '-DECM_VULKAN=ON' <same two paths>        # LTO, for timing
 ```
+Quote the -D arguments in PowerShell: unquoted, `-DNAME=C:/...` is split at the colon and the configure fails.
+Likewise PowerShell 5.1 drops an empty argument, so `-o ""` makes the next option the output file name.
 Pitfalls: all build dirs of one worktree share its in-source `lib/` and `bin/`: before switching build dir run
 `perf\gpu\cleanlibs_gr.ps1` (edit its path to your worktree) or the next build may link stale libraries. LTO needs
 `-DCMAKE_POLICY_DEFAULT_CMP0069=NEW` (build.ps1 passes it). Shaders (`source/Lib/GpuLib/shaders/*.comp`) are
@@ -127,7 +129,7 @@ commands that combine `Remove-Item` with `//` text. `perf\gpu\crlf.ps1 <worktree
   - `enc_set.ps1 m1`                                         M1: planar/DC/angular, DCT-II only
   - `enc_set.ps1 m2 --IntraToolControlMode=1 --IntraPredBf=0` M2: + reference filter, PDPC, intra fusion
   - `enc_set.ps1 m3 --IntraToolControlMode=1 --IntraPredBf=1` M3: + intra-prediction bilateral filter
-  - `enc_set.ps1 m4 --IntraToolControlMode=1 --IntraPredBf=1 --DualITree=1` M4: + dual tree (not supported yet)
+  - `enc_set.ps1 m4 --IntraToolControlMode=1 --IntraPredBf=1 --DualITree=1` M4: + dual tree
   - each set: fore22/32/37 (CIF), park720, four720 (2-4 pictures). Longer ones: m2_fore33, m2_park16, m3_park16
     (`enc_m1.ps1 <name> <yuv> 1280 720 16 --TemporalSubsampleRatio=1 -q 32 <level args>`), m3_park60 (60 frames,
     `enc_long.ps1 m3_park60 ...\ParkJoy_1280x720.yuv 1280 720 4 15 -q 32 --IntraToolControlMode=1 --IntraPredBf=1`:
@@ -212,10 +214,7 @@ Profile of a GPU-on decode (non-LTO, m2_park16, share of all samples): parsing ~
 ## 9. Next steps (in the order I would take them)
 
 1. Time 180ccabc (paired grL builds, `walls.py` with `--GpuRecon=3`, CPU vs GPU, FT8; use m3_park60).
-2. M4 dual tree: remove the `sps.getUseDualITree()` rejection in `GpuIntraRec::supported()` (one line; host records
-   TUs in decoding order and uses per-component owners/availability, so it should mostly work), verify on the m4
-   set (`gpucheck.py gr m4_... -- --GpuRecon=2` and `=3`), canary, commit. All 19 regular streams currently stop at
-   "dual tree".
+2. Done (2026-10-11): M4 dual tree. All 19 regular streams now stop at "LMCS", the first tool of step 4.
 3. Make the GPU path win on CPU time per picture: the derive-only pass (record during parsing or a leaner pass;
    speed up getSpatialIpm/getPURestricted, which also helps the CPU decoder), GPU behaviour with frame threads
    (8 contexts x 32 persistent workgroups oversubscribe the GPU; spinning workgroups; try fewer groups per context,

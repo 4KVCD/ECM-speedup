@@ -242,8 +242,11 @@ the reconstruction buffer; works in every frame-thread context):
   scalar dequantization, adaptive luma clipping; M2 adds reference filtering, PDPC (planar / DC, pure H/V,
   gradient, inverse angle) and intra fusion; M3 adds the intra prediction bilateral filter (JVET-AK0118: the angular
   reference texture gate, the prediction texture gate and strength, the 5x5 diamond over the prediction padded with
-  the neighbouring reconstruction as the CPU copies it). GpuIntraRec::supported() rejects every tool whose mode derivation or
-  prediction reads reconstructed samples or that the kernels lack, before anything is skipped.
+  the neighbouring reconstruction as the CPU copies it); M4 adds the dual tree of intra slices (separate luma and
+  chroma coding trees): nothing in the kernels changed, because the host records the transform blocks in decoding
+  order and the owners and availability are per component. GpuIntraRec::supported() rejects every tool whose mode
+  derivation or prediction reads reconstructed samples or that the kernels lack, before anything is skipped. All 19
+  regular streams now fall back to the CPU because of LMCS (before M4: dual tree).
 - kernels: intra_resi (all residuals of the picture at once, dequantization folded into the first DCT-II stage,
   only the nonzero coefficient region) and intra_rec (persistent workgroups take ready blocks from a queue; the
   host gives each block its dependency count, its dependents and the availability the CPU sees as five numbers per
