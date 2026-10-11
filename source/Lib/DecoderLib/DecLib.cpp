@@ -684,6 +684,7 @@ bool DecLib::initVulkan( bool check, bool validate, int device, std::string& err
     return false;
   }
   m_vkCheck = check;
+  m_vkCore->setProfiling( getenv( "VK_PROFILE" ) ? std::max( 1, atoi( getenv( "VK_PROFILE" ) ) ) : 0 );
   m_vkLoopFilter.init( m_vkCore, check );
   msg( INFO, "GPU decoding on %s, driver 0x%x%s\n", m_vkCore->deviceName().c_str(), m_vkCore->driverVersion(),
        check ? ", every picture checked against the CPU" : "" );

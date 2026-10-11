@@ -568,7 +568,7 @@ void VkLoopFilter::alfRun( CodingStructure& cs, AdaptiveLoopFilter& alf )
     const GpuPicture::Plane& pl = pic.plane( c );
     const int m = c ? margin >> getComponentScaleX( ComponentID( c ), pic.format() ) : margin;
     PadPush push = { pic.buffer().address, pl.origin, pl.stride, pl.width, pl.height, m };
-    m_core->dispatch( "alf_pad", uint32_t( ( pl.width + 2 * m + 15 ) / 16 ), uint32_t( ( pl.height + 2 * m + 15 ) / 16 ), 1, &push, sizeof( push ) );
+    m_core->dispatch( "alf_pad", uint32_t( ( pl.width + 2 * m + 15 ) / 16 ), uint32_t( ( pl.height + 2 * m + 15 ) / 16 ), 1, &push, sizeof( push ), true );
   };
   for( int c = 0; c < numComp; c++ )
   {
@@ -579,17 +579,17 @@ void VkLoopFilter::alfRun( CodingStructure& cs, AdaptiveLoopFilter& alf )
   m_core->barrier();
 
   AlfPush push = { addr + offParams, 0 };
-  m_core->dispatch( "alf_class", uint32_t( ( width + 31 ) / 32 ), uint32_t( ( height + 31 ) / 32 ), 1, &push, sizeof( push ) );
+  m_core->dispatch( "alf_class", uint32_t( ( width + 31 ) / 32 ), uint32_t( ( height + 31 ) / 32 ), 1, &push, sizeof( push ), true );
   if( needChromaClasses )
   {
-    m_core->dispatch( "alf_cclass", uint32_t( ( widthC / 2 + 15 ) / 16 ), uint32_t( ( heightC / 2 + 15 ) / 16 ), 2, &push, sizeof( push ) );
+    m_core->dispatch( "alf_cclass", uint32_t( ( widthC / 2 + 15 ) / 16 ), uint32_t( ( heightC / 2 + 15 ) / 16 ), 2, &push, sizeof( push ), true );
   }
   m_core->barrier();
   auto run = [&]( const char* shader, int list ) {
     if( !lists[list]->empty() )
     {
       push.tiles = addr + offList[list];
-      m_core->dispatch( shader, uint32_t( lists[list]->size() ), 1, 1, &push, sizeof( push ) );
+      m_core->dispatch( shader, uint32_t( lists[list]->size() ), 1, 1, &push, sizeof( push ), true );
       m_core->barrier();
     }
   };
@@ -602,17 +602,17 @@ void VkLoopFilter::alfRun( CodingStructure& cs, AdaptiveLoopFilter& alf )
   if( !lumaTiles.empty() )
   {
     push.tiles = addr + offList[6];
-    m_core->dispatch( "alf_luma", uint32_t( lumaTiles.size() ), 1, 1, &push, sizeof( push ) );
+    m_core->dispatch( "alf_luma", uint32_t( lumaTiles.size() ), 1, 1, &push, sizeof( push ), true );
   }
   if( !chromaTiles.empty() )
   {
     push.tiles = addr + offList[7];
-    m_core->dispatch( "alf_chroma", uint32_t( chromaTiles.size() ), 1, 1, &push, sizeof( push ) );
+    m_core->dispatch( "alf_chroma", uint32_t( chromaTiles.size() ), 1, 1, &push, sizeof( push ), true );
   }
   m_core->barrier();
   const int t1 = m_core->timestamp();
   m_core->submit();
-  m_gpuMs += m_core->elapsedMs( t0, t1 );
+  addGpuTime( STAGE_ALF, t0, t1 );
   m_cpuCurrent = m_check;
   m_gpuCurrent = true;
   m_lastStage  = 3;
@@ -686,7 +686,7 @@ void VkLoopFilter::offsetRefinement( CodingStructure& cs, int stageIdx, int refi
   m_core->barrier();
   const int t1 = m_core->timestamp();
   m_core->submit();
-  m_gpuMs += m_core->elapsedMs( t0, t1 );
+  addGpuTime( STAGE_REFINE, t0, t1 );
   m_cpuCurrent = m_check;
   m_lastStage  = 4;
   m_counts.refinePictures[stageIdx > 0 ? 1 : 0]++;

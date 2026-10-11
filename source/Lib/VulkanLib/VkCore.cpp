@@ -38,6 +38,7 @@
 #include "VkCore.h"
 #include "VkShaders.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <stdexcept>
@@ -323,9 +324,9 @@ bool Core::init( bool validation, int deviceIndex )
 
   VkQueryPoolCreateInfo qpi = { VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO };
   qpi.queryType  = VK_QUERY_TYPE_TIMESTAMP;
-  qpi.queryCount = 256;
+  qpi.queryCount = 1024;
   check( vkCreateQueryPool( m_device, &qpi, nullptr, &m_queries ), "vkCreateQueryPool" );
-  m_queryResults.resize( 256 );
+  m_queryResults.resize( 1024 );
   return true;
 }
 
@@ -498,18 +499,50 @@ void Core::begin()
   VkCommandBufferBeginInfo bi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
   bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
   check( vkBeginCommandBuffer( m_cmd, &bi ), "vkBeginCommandBuffer" );
-  vkCmdResetQueryPool( m_cmd, m_queries, 0, 256 );
+  vkCmdResetQueryPool( m_cmd, m_queries, 0, 1024 );
   m_numQueries = 0;
 }
 
-void Core::dispatch( const char* shader, uint32_t gx, uint32_t gy, uint32_t gz, const void* push, uint32_t pushSize )
+void Core::dispatch( const char* shader, uint32_t gx, uint32_t gy, uint32_t gz, const void* push, uint32_t pushSize, bool repeatable )
 {
   vkCmdBindPipeline( m_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline( shader ) );
   if( pushSize )
   {
     vkCmdPushConstants( m_cmd, m_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, pushSize, push );
   }
-  vkCmdDispatch( m_cmd, gx, gy, gz );
+  if( m_profiling )
+  {
+    // the fastest of several runs: the iGPU clocks up while it is busy
+    PendingDispatch d = { shader, repeatable ? m_profileRuns : 1, {}, {} };
+    for( int r = 0; r < d.runs; r++ )
+    {
+      barrier();
+      d.from[r] = timestamp();
+      vkCmdDispatch( m_cmd, gx, gy, gz );
+      barrier();
+      d.to[r] = timestamp();
+    }
+    m_pending.push_back( d );
+  }
+  else
+  {
+    vkCmdDispatch( m_cmd, gx, gy, gz );
+  }
+}
+
+std::string Core::profileReport() const
+{
+  std::vector<std::pair<std::string, ShaderTime>> v( m_profile.begin(), m_profile.end() );
+  std::sort( v.begin(), v.end(), []( const auto& a, const auto& b ) { return a.second.ms > b.second.ms; } );
+  std::string s;
+  char        line[160];
+  for( const auto& e: v )
+  {
+    snprintf( line, sizeof( line ), "  %-24s %10.3f ms %8llu dispatches %10.3f us each\n", e.first.c_str(), e.second.ms,
+              (unsigned long long) e.second.count, e.second.count ? 1000 * e.second.ms / e.second.count : 0.0 );
+    s += line;
+  }
+  return s;
 }
 
 void Core::barrier()
@@ -537,7 +570,7 @@ void Core::copy( const Buffer& src, const Buffer& dst, size_t srcOffset, size_t 
 
 int Core::timestamp()
 {
-  if( m_numQueries >= 256 )
+  if( m_numQueries >= int( m_queryResults.size() ) )
   {
     throw std::runtime_error( "too many timestamps in one submission" );
   }
@@ -560,6 +593,18 @@ void Core::submit()
                                   m_queryResults.data(), sizeof( uint64_t ), VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT ),
            "vkGetQueryPoolResults" );
   }
+  for( const PendingDispatch& d: m_pending )
+  {
+    double ms = elapsedMs( d.from[0], d.to[0] );
+    for( int r = 1; r < d.runs; r++ )
+    {
+      ms = std::min( ms, elapsedMs( d.from[r], d.to[r] ) );
+    }
+    ShaderTime& t = m_profile[d.shader];
+    t.ms += ms;
+    t.count++;
+  }
+  m_pending.clear();
 }
 
 double Core::elapsedMs( int from, int to ) const

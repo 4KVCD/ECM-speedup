@@ -215,18 +215,18 @@ void VkLoopFilter::lfCccm( CodingStructure& cs, int impMode )
   m_core->begin();
   const int t0 = m_core->timestamp();
   m_core->copy( m_pic.buffer(), m_lfCorr, 0, 0, m_pic.buffer().size );
-  m_core->dispatch( "lfcccm_down", uint32_t( ( widthC + 2 + 15 ) / 16 ), uint32_t( ( heightC + 2 + 15 ) / 16 ), 1, &down, sizeof( down ) );
+  m_core->dispatch( "lfcccm_down", uint32_t( ( widthC + 2 + 15 ) / 16 ), uint32_t( ( heightC + 2 + 15 ) / 16 ), 1, &down, sizeof( down ), true );
   m_core->barrier();
   if( !windows.empty() )
   {
-    m_core->dispatch( "lfcccm_window", uint32_t( windows.size() ), 1, 1, &wp, sizeof( wp ) );
+    m_core->dispatch( "lfcccm_window", uint32_t( windows.size() ), 1, 1, &wp, sizeof( wp ), true );
     m_core->barrier();
   }
   m_core->dispatch( "lfcccm_apply", uint32_t( ( widthC + 15 ) / 16 ), uint32_t( ( heightC + 15 ) / 16 ), 2, &ap, sizeof( ap ) );
   m_core->barrier();
   const int t1 = m_core->timestamp();
   m_core->submit();
-  m_gpuMs += m_core->elapsedMs( t0, t1 );
+  addGpuTime( STAGE_LFCCCM, t0, t1 );
   if( m_check )
   {
     m_counts.lfCccmPictures++;
@@ -249,7 +249,7 @@ void VkLoopFilter::lfCccmApply( CodingStructure& cs )
   m_core->barrier();
   const int t1 = m_core->timestamp();
   m_core->submit();
-  m_gpuMs += m_core->elapsedMs( t0, t1 );
+  addGpuTime( STAGE_LFCCCM, t0, t1 );
   m_cpuCurrent = m_check;
   m_lastStage  = 5;
 }

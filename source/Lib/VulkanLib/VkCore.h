@@ -43,6 +43,7 @@
 #define VK_NO_PROTOTYPES
 #include <vulkan/vulkan.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <string>
 #include <unordered_map>
@@ -111,11 +112,18 @@ public:
 
   /// Command recording. One command buffer is open at a time; submit() waits for its completion.
   void begin();
-  void dispatch( const char* shader, uint32_t gx, uint32_t gy, uint32_t gz, const void* push, uint32_t pushSize );
+  /// repeatable: running the dispatch again gives the same result (it does not filter in place), so profiling may
+  /// repeat it
+  void dispatch( const char* shader, uint32_t gx, uint32_t gy, uint32_t gz, const void* push, uint32_t pushSize, bool repeatable = false );
   void barrier();                       ///< makes all earlier shader writes visible to later shaders and the host
   void fill( const Buffer& buf, uint32_t value, size_t offset = 0, size_t size = VK_WHOLE_SIZE );
   void copy( const Buffer& src, const Buffer& dst, size_t srcOffset, size_t dstOffset, size_t size );
   int  timestamp();                     ///< records a timestamp, returns its index for elapsedMs()
+  /// Profiling: every dispatch is timed on its own with barriers around it; repeatable ones run runs times and the
+  /// fastest run counts. The times are summed per shader.
+  void        setProfiling( int runs ) { m_profiling = runs > 0; m_profileRuns = std::min( std::max( runs, 1 ), 8 ); }
+  bool        profiling() const { return m_profiling; }
+  std::string profileReport() const;    ///< shaders by total time
   void submit();
   double elapsedMs( int from, int to ) const;
 
@@ -147,6 +155,21 @@ private:
   VkQueryPool                 m_queries    = VK_NULL_HANDLE;
   int                         m_numQueries = 0;
   std::vector<uint64_t>       m_queryResults;
+  bool                        m_profiling = false;
+  int                         m_profileRuns = 1;
+  struct PendingDispatch
+  {
+    const char* shader;
+    int         runs;
+    int         from[8], to[8];
+  };
+  std::vector<PendingDispatch> m_pending;
+  struct ShaderTime
+  {
+    double   ms    = 0;
+    uint64_t count = 0;
+  };
+  std::unordered_map<std::string, ShaderTime> m_profile;
   std::unordered_map<std::string, VkPipeline> m_pipelines;
   std::string                 m_error;
   std::string                 m_deviceName;

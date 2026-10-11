@@ -639,6 +639,19 @@ void DecApp::xDestroyDecLib()
   if( m_vulkan )
   {
     msg( INFO, "\n GPU time:   %12.3f sec.\n", m_cDecLib.vulkanGpuMs() / 1000 );
+    std::string stages;
+    for( int i = 0; i < vkd::VkLoopFilter::NUM_STAGES; i++ )
+    {
+      char buf[96];
+      snprintf( buf, sizeof( buf ), "%s%s %.3f", i ? ", " : "", vkd::VkLoopFilter::stageName( i ), m_cDecLib.vulkanLoopFilter().stageMs( i ) / 1000 );
+      stages += buf;
+    }
+    msg( INFO, " GPU time by stage (sec.): %s\n", stages.c_str() );
+    const std::string profile = m_cDecLib.vulkanProfileReport();
+    if( !profile.empty() )
+    {
+      msg( INFO, " GPU time by shader, each dispatch timed alone:\n%s", profile.c_str() );
+    }
     if( m_cDecLib.vulkanCheck() )
     {
       const auto& n = m_cDecLib.vulkanCounts();

@@ -246,6 +246,9 @@ public:
   /// Returns false with a message in error if no usable GPU is found.
   bool initVulkan( bool check, bool validate, int device, std::string& error );
   double vulkanGpuMs() const { return m_vkLoopFilter.gpuMs(); }
+  const vkd::VkLoopFilter& vulkanLoopFilter() const { return m_vkLoopFilter; }
+  /// With the environment variable VK_PROFILE: GPU time per shader, else empty.
+  std::string vulkanProfileReport() const { return m_vkCore && m_vkCore->profiling() ? m_vkCore->profileReport() : std::string(); }
   const vkd::VkLoopFilter::Counts& vulkanCounts() const { return m_vkLoopFilter.counts(); }
   bool vulkanCheck() const { return m_vkCheck; }
   const std::map<std::string, uint64_t>& vulkanAlfCpuReasons() const { return m_vkLoopFilter.alfCpuReasons(); }

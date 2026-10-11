@@ -171,6 +171,19 @@ void VkLoopFilter::destroy()
   }
 }
 
+const char* VkLoopFilter::stageName( int stage )
+{
+  static const char* names[NUM_STAGES] = { "deblocking", "SAO/BIF/CCSAO", "offset refinement", "LF-CCCM", "ALF" };
+  return names[stage];
+}
+
+void VkLoopFilter::addGpuTime( Stage stage, int t0, int t1 )
+{
+  const double ms = m_core->elapsedMs( t0, t1 );
+  m_gpuMs += ms;
+  m_stageMs[stage] += ms;
+}
+
 void VkLoopFilter::ensureBuffer( Buffer& buf, size_t size, Mem mem )
 {
   if( buf.size < size )
@@ -345,7 +358,7 @@ void VkLoopFilter::deblock( CodingStructure& cs )
   }
   const int t1 = m_core->timestamp();
   m_core->submit();
-  m_gpuMs += m_core->elapsedMs( t0, t1 );
+  addGpuTime( STAGE_DEBLOCK, t0, t1 );
   m_cpuCurrent = m_check;
   m_lastStage  = 1;
 }
@@ -876,7 +889,7 @@ void VkLoopFilter::sao( CodingStructure& cs, SampleAdaptiveOffset& saoCpu )
   m_core->barrier();
   const int t1 = m_core->timestamp();
   m_core->submit();
-  m_gpuMs += m_core->elapsedMs( t0, t1 );
+  addGpuTime( STAGE_SAO, t0, t1 );
   m_cpuCurrent = m_check;
   m_lastStage  = 2;
   if( m_check )

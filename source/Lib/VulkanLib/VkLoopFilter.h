@@ -143,6 +143,18 @@ public:
   void checkAgainstCpu( CodingStructure& cs, const char* stage );
 
   double gpuMs() const { return m_gpuMs; }
+  /// GPU time per stage, in the order of stageName.
+  enum Stage
+  {
+    STAGE_DEBLOCK,
+    STAGE_SAO,
+    STAGE_REFINE,
+    STAGE_LFCCCM,
+    STAGE_ALF,
+    NUM_STAGES
+  };
+  static const char* stageName( int stage );
+  double             stageMs( int stage ) const { return m_stageMs[stage]; }
 
   /// Check mode: how much work each GPU stage did, so that a check run shows which paths it covered.
   struct Counts
@@ -227,7 +239,9 @@ private:
   Buffer           m_alfParams;         ///< per picture: parameters, CTUs, filters, tiles
   std::map<std::string, uint64_t> m_alfCpuReasons;
 
+  void             addGpuTime( Stage stage, int t0, int t1 );
   double           m_gpuMs = 0;
+  double           m_stageMs[NUM_STAGES] = {};
   Counts           m_counts;
 };
 

@@ -24,6 +24,14 @@ DecoderApp options:
 
 `perf/vkcoverage.py EXE` sums those counts over the corpus, so that paths the corpus never exercises show up.
 
+With `--Vulkan=1` the decoder prints the GPU time in total and per stage. With the environment variable
+`VK_PROFILE=N` it also times every dispatch on its own, with barriers around it, and prints the time per shader.
+Dispatches that do not filter in place run N times (up to 8) and the fastest run counts, because the iGPU's clock
+varies; the others run once. Profiling slows the decoder down, so its total time means nothing.
+
+`perf/vkbench.py EXE [EXE ...]` runs decoder builds alternately on one stream, pinned to one logical CPU, and prints
+the minimum and median of the total time, the GPU time and each stage's GPU time.
+
 `VulkanTestApp` runs unit tests of shader code against the CPU: `selftest` and `sf64`, the software double arithmetic
 that replaces FP64 on GPUs without it.
 
