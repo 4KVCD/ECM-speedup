@@ -3,7 +3,8 @@
 time on their own P-cores, and compares the bitstream md5s with runs/results/ref.json. Tests ref.json lacks (ld_cif,
 ra_cif) are first encoded by the reference exe with default options.
 
-usage: cu_matrix.py EXE TAG REFEXE      (MATRIX_GROUPS=default,cu2,cu2check,cu4,cu8,cu2ft2 selects groups)
+usage: cu_matrix.py EXE TAG REFEXE      (MATRIX_GROUPS=default,cu2,cu2check,cu4,cu8,cu2ft2,ft2,ft4,ft8,ft4cu2
+                                        selects groups)
 """
 import ctypes
 import json
@@ -76,6 +77,11 @@ if "cu4" in GROUPS:
     group([(t, ["--CuThreads=4"], "cu4") for t in SUITE + EXTRA], P4)
 if "cu8" in GROUPS:
     group([(t, ["--CuThreads=8"], "cu8") for t in SUITE], P8)
+for n in (2, 4, 8):
+    if f"ft{n}" in GROUPS:
+        group([(t, [f"--FrameThreads={n}"], f"ft{n}") for t in SUITE + EXTRA], P4 if n <= 4 else P8)
+if "ft4cu2" in GROUPS:
+    group([(t, ["--FrameThreads=4", "--CuThreads=2"], "ft4cu2") for t in SUITE + EXTRA], P8)
 if "cu2ft2" in GROUPS:
     group([(t, ["--CuThreads=2", "--FrameThreads=2"], "cu2ft2") for t in ["ra_foreman", "ra_parkjoy", "ld_foreman", "ra_cif"]], P4)
 bad = [(t, n) for t, n, r in results if r["md5"] != ref.get(t)]

@@ -104,6 +104,7 @@ private:
   TExt360AppEncTop*      m_ext360;
 #endif
   bool m_flush;
+  bool m_eos = false;   ///< the last GOP has been read
 
 public:
   EncApp( fstream& bitStream, EncLibCommon* encLibCommon );

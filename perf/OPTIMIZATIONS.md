@@ -90,21 +90,26 @@ lower all-core turbo, one duplicated intra frame per chunk, unequal chunk comple
 
 ## Frame threads (`--FrameThreads=N`)
 
-- The pictures of a GOP run in threads of their own, at most N with a search stack at a time; setups and finishes
-  (loop filters, slice writing) take turns in coding order, and a search starts when its references and the pictures
-  it takes coding-order state from are done (`perf/HANDOFF_MULTITHREADING.md`, P1). Output identical at every N.
-- The temporal CABAC context store chains each picture to the previous picture of its temporal layer and QP, and the
-  finishes run in coding order, so RA gains about 1.35x at most (`perf/mt/ft_sim.py` predicts the measured times
-  within 1 %). LD and AI gain little. `--ParallelSegments` combines with it.
-- Core Ultra 7 265K (8P + 12E), ra_long's configuration (foreman 128x128, QP 32, intra period 32), first 65 frames,
-  one run each on an otherwise idle machine:
+- The pictures run in threads of their own, at most N with a search stack at a time; setups and finishes (loop
+  filters, slice writing) take turns in coding order, and a search starts when its references and the pictures it
+  takes coding-order state from are done (`perf/HANDOFF_MULTITHREADING.md`, P1). The GOPs overlap (P5 stage A): the
+  next GOPs are read and started while a GOP's pictures are in flight, and the reconstructions are written in output
+  order as they are done. Output identical at every N (bitstream and reconstruction).
+- All-intra pictures are independent, so AI scales with N. The temporal CABAC context store chains each RA picture
+  to the previous picture of its temporal layer and QP, and the finishes run in coding order, so RA gains 1.3-1.5x
+  (`perf/mt/ft_sim.py` and `p5_sim.py` model it). LD gains nothing. `--ParallelSegments` combines with it.
+- Core Ultra 7 265K, one run at a time on the 8 P-cores, foreman 128x128 QP 32 (ai_long's and ra_long's
+  configurations); the previous commit's single-thread time as base:
 
-| FrameThreads | wall | CPU | speedup | bit-exact |
-|---|---|---|---|---|
-| 1 | 559.8 s | 557.3 s | - | yes |
-| 2 | 522.2 s | 557.5 s | 1.07x | yes |
-| 4 | 449.4 s | 559.7 s | 1.25x | yes |
-| 8 | 414.8 s | 568.7 s | 1.35x | yes |
+| FrameThreads | AI, 33 pictures (TemporalSubsampleRatio 8) | RA, 65 frames (3 intra periods) | bit-exact |
+|---|---|---|---|
+| 1 | 207.8 s | 568.0 s | yes |
+| 2 | 110.0 s, 1.89x | | yes |
+| 4 | 59.9 s, 3.47x | 431.9 s, 1.32x | yes |
+| 8 | 33.7 s, 6.17x | 378.9 s, 1.50x | yes |
+
+  Before the GOPs overlapped (P1 alone), the RA case took 449.4 s with 4 threads and 414.8 s with 8, and AI did not
+  gain. LD (17 frames) takes 174.2 s with one thread and 170.5 s with 4.
 
 ## CU threads (`--CuThreads=N`)
 

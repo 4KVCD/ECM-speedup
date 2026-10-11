@@ -100,7 +100,8 @@ struct EncSearchStack;
 /// one stack uses them for the AMaxBT statistics and the CABAC init table only.
 struct EncPicOrder
 {
-  int                           gopIdx = 0;                     ///< index of the picture in its GOP (compressGOP picIdInGOP)
+  int64_t                       turn   = 0;                     ///< setup and finish turn: the picture's index in coding order
+                                                                ///< over all GOPs (frame threads), else its index in the GOP
   const Picture*                pic    = nullptr;
   int                           stackIdx = 0;                   ///< the picture's search stack
   bool                          finished = false;               ///< the picture is done, including the padding as a reference
@@ -294,7 +295,9 @@ public:
 
   void  init        ( EncLib* pcEncLib );
 
-  /// Encodes the first numPics pictures of the GOP in threads (FrameThreads): each runs compressGOP for its picIdInGOP.
+  /// Starts the first numPics pictures of the GOP in threads (FrameThreads): each runs compressGOP for its picIdInGOP.
+  /// Returns at once: the pictures of later GOPs may start before these are done (setups and finishes keep coding
+  /// order over all GOPs). The recon output list is not used.
   void  compressGOPFrameThreads( int numPics, int iPOCLast, int iNumPicRcvd, PicList& rcListPic,
                                  std::list<PelUnitBuf*>& rcListPicYuvRec, bool isField, bool isTff,
                                  const InputColourSpaceConversion snr_conversion, const bool printFrameMSE,
@@ -302,6 +305,13 @@ public:
                                  const bool printMSSSIM,
 #endif
                                  bool isEncodeLtRef );
+  /// Waits until at most maxPending of the started pictures are not done; throws the error of a failed picture.
+  void  waitFrameThreads    ( int64_t maxPending );
+  /// Waits until all started pictures are done; throws the error of a failed picture.
+  void  finishFrameThreads  ();
+  /// A picture is done (encoded, written, its reconstruction final); forgetPicDone before the buffer is reused.
+  bool  isPicDone           ( const Picture* pic );
+  void  forgetPicDone       ( const Picture* pic );
   void  compressGOP ( int iPOCLast, int iNumPicRcvd, PicList& rcListPic, std::list<PelUnitBuf*>& rcListPicYuvRec,
                       bool isField, bool isTff, const InputColourSpaceConversion snr_conversion, const bool printFrameMSE,
 #if MSSIM_UNIFORM_METRICS_LOG
@@ -439,15 +449,20 @@ protected:
   bool                     m_ftActive = false;
   std::mutex               m_ftMutex;
   std::condition_variable  m_ftCv;
-  int                      m_ftSetupTurn  = 0;         ///< GOP index whose setup may run
-  int                      m_ftFinishTurn = 0;         ///< GOP index whose finish may run
+  int64_t                  m_ftSetupTurn  = 0;         ///< turn (EncPicOrder::turn) whose setup may run
+  int64_t                  m_ftFinishTurn = 0;         ///< turn whose finish may run
+  int64_t                  m_ftNumTurns   = 0;         ///< turns started (pictures and GOP indices without one)
+  int64_t                  m_ftNumDone    = 0;         ///< turns whose thread has returned
+  static thread_local int64_t m_ftTurn;                ///< the turn of the running compressGOP call
   bool                     m_ftError      = false;
+  std::exception_ptr       m_ftFirstError;
+  std::set<const Picture*> m_ftPicsDone;               ///< done and not yet forgotten (forgetPicDone)
   std::vector<bool>        m_ftStackBusy;
   std::set<const Picture*> m_ftPicsInFlight;           ///< set up and not done (not usable as a reference yet)
   std::mutex               m_ftApsMapMutex;            ///< EncLib's APS map: held by the finish, taken by a setup to use it
   template<class Pred> void xFtWait( Pred pred );      ///< waits until pred() holds (pred runs with m_ftMutex locked)
   void xFtRunInPool       ( std::function<void()> job );   ///< runs job on a worker thread
-  void xFtSkip            ( int gopIdx );              ///< a GOP index without a picture passes both turns
+  void xFtSkip            ( int64_t turn );            ///< a GOP index without a picture passes both turns
   void xFtAcquireStack    ( EncPicOrder& order );
   void xFtEndSetup        ( EncPicOrder& order );
   void xFtWaitSearchInputs( Slice* slice, EncPicOrder& order );

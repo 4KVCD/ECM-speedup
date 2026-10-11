@@ -93,6 +93,7 @@ thread_local int             EncGOP::m_iNumPicCoded   = 0;
 thread_local EncSlice*       EncGOP::m_pcSliceEncoder = nullptr;
 thread_local EncSearchStack* EncGOP::m_pcSearchStack  = nullptr;
 thread_local EncPicOrder*    EncGOP::m_pcPicOrder     = nullptr;
+thread_local int64_t         EncGOP::m_ftTurn         = 0;
 
 // Worker threads for the frame threads. They are started when first needed and never end (the process ends them): a
 // thread that exits runs the destructors of its thread_local objects, which crashes with MinGW's emulated TLS.
@@ -160,19 +161,27 @@ void EncGOP::compressGOPFrameThreads( int numPics, int iPOCLast, int iNumPicRcvd
 #endif
                                       bool isEncodeLtRef )
 {
-  m_ftActive     = true;
-  m_ftSetupTurn  = 0;
-  m_ftFinishTurn = 0;
-  m_ftError      = false;
-  m_ftStackBusy.assign( m_pcEncLib->getNumSearchStacks(), false );
-  m_ftPicsInFlight.clear();
-
-  std::exception_ptr firstError;
-  int                numDone = 0;
+  if( !m_ftActive )
+  {
+    m_ftActive     = true;
+    m_ftSetupTurn  = 0;
+    m_ftFinishTurn = 0;
+    m_ftNumTurns   = 0;
+    m_ftNumDone    = 0;
+    m_ftError      = false;
+    m_ftFirstError = nullptr;
+    m_ftStackBusy.assign( m_pcEncLib->getNumSearchStacks(), false );
+    m_ftPicsInFlight.clear();
+    m_ftPicsDone.clear();
+  }
+  const int64_t firstTurn = m_ftNumTurns;
+  m_ftNumTurns += numPics;
+  // the GOP's arguments by value: the call returns before the pictures are done
   for( int i = 0; i < numPics; i++ )
   {
-    xFtRunInPool( [&, i]()
+    xFtRunInPool( [=, &rcListPic, &rcListPicYuvRecOut]()
     {
+      m_ftTurn = firstTurn + i;
       try
       {
         compressGOP( iPOCLast, iNumPicRcvd, rcListPic, rcListPicYuvRecOut, isField, isTff, snr_conversion, printFrameMSE,
@@ -189,41 +198,66 @@ void EncGOP::compressGOPFrameThreads( int numPics, int iPOCLast, int iNumPicRcvd
         std::lock_guard<std::mutex> lock( m_ftMutex );
         if( !m_ftError )
         {
-          firstError = std::current_exception();
-          m_ftError  = true;
+          m_ftFirstError = std::current_exception();
+          m_ftError      = true;
         }
       }
       std::lock_guard<std::mutex> lock( m_ftMutex );
-      numDone++;
+      m_ftNumDone++;
       m_ftCv.notify_all();
     } );
   }
+}
+
+void EncGOP::waitFrameThreads( int64_t maxPending )
+{
+  std::unique_lock<std::mutex> lock( m_ftMutex );
+  m_ftCv.wait( lock, [&]() { return m_ftError || m_ftNumTurns - m_ftNumDone <= maxPending; } );
+  if( m_ftError )
   {
-    std::unique_lock<std::mutex> lock( m_ftMutex );
-    m_ftCv.wait( lock, [&]() { return numDone == numPics; } );
-  }
-  m_ftActive = false;
-  if( !firstError && m_lastPicOrder )
-  {
-    // the shared picture header continues from the GOP's last picture (xUsePicHeaderCopy)
-    *m_lastPicOrder->sharedPicHeader = m_pcEncLib->getSearchStack( m_lastPicOrder->stackIdx ).picHeader;
-  }
-  if( firstError )
-  {
-    std::rethrow_exception( firstError );
+    // the other pictures stop at their next wait (FtAbort)
+    m_ftCv.wait( lock, [&]() { return m_ftNumDone == m_ftNumTurns; } );
+    std::rethrow_exception( m_ftFirstError );
   }
 }
 
-void EncGOP::xFtSkip( int gopIdx )
+void EncGOP::finishFrameThreads()
+{
+  if( !m_ftActive )
+  {
+    return;
+  }
+  waitFrameThreads( 0 );
+  m_ftActive = false;
+  if( m_lastPicOrder )
+  {
+    // the shared picture header continues from the last picture (xUsePicHeaderCopy)
+    *m_lastPicOrder->sharedPicHeader = m_pcEncLib->getSearchStack( m_lastPicOrder->stackIdx ).picHeader;
+  }
+}
+
+bool EncGOP::isPicDone( const Picture* pic )
+{
+  std::lock_guard<std::mutex> lock( m_ftMutex );
+  return m_ftPicsDone.count( pic ) > 0;
+}
+
+void EncGOP::forgetPicDone( const Picture* pic )
+{
+  std::lock_guard<std::mutex> lock( m_ftMutex );
+  m_ftPicsDone.erase( pic );
+}
+
+void EncGOP::xFtSkip( int64_t turn )
 {
   {
     std::lock_guard<std::mutex> lock( m_ftMutex );
-    m_ftSetupTurn = gopIdx + 1;
+    m_ftSetupTurn = turn + 1;
     m_ftCv.notify_all();
   }
-  xFtWait( [&]() { return m_ftFinishTurn == gopIdx; } );
+  xFtWait( [&]() { return m_ftFinishTurn == turn; } );
   std::lock_guard<std::mutex> lock( m_ftMutex );
-  m_ftFinishTurn = gopIdx + 1;
+  m_ftFinishTurn = turn + 1;
   m_ftCv.notify_all();
 }
 
@@ -239,7 +273,7 @@ void EncGOP::xFtEndSetup( EncPicOrder& order )
 {
   std::lock_guard<std::mutex> lock( m_ftMutex );
   m_ftPicsInFlight.insert( order.pic );
-  m_ftSetupTurn = order.gopIdx + 1;
+  m_ftSetupTurn = order.turn + 1;
   m_ftCv.notify_all();
 }
 
@@ -342,8 +376,9 @@ void EncGOP::xEndPicture( EncPicOrder& order )
   std::lock_guard<std::mutex> lock( m_ftMutex );
   order.finished = true;
   m_ftPicsInFlight.erase( order.pic );
+  m_ftPicsDone.insert( order.pic );
   m_ftStackBusy[order.stackIdx] = false;
-  m_ftFinishTurn = order.gopIdx + 1;
+  m_ftFinishTurn = order.turn + 1;
   m_ftCv.notify_all();
 }
 
@@ -2334,9 +2369,12 @@ void EncGOP::compressGOP(int iPOCLast, int iNumPicRcvd, PicList &rcListPic, std:
                          bool isEncodeLtRef, const int picIdInGOP)
 {
   // TODO: Split this function up.
+  // with frame threads, the setup holds EncLib's picture list: the encoder reads the next pictures into it meanwhile
+  std::unique_lock<std::mutex> picListLock( m_pcEncLib->getPicListMutex(), std::defer_lock );
   if( m_ftActive )
   {
-    xFtWait( [&]() { return m_ftSetupTurn == picIdInGOP; } );
+    xFtWait( [&]() { return m_ftSetupTurn == m_ftTurn; } );
+    picListLock.lock();
   }
 
   Picture*        pcPic = NULL;
@@ -2419,7 +2457,8 @@ void EncGOP::compressGOP(int iPOCLast, int iNumPicRcvd, PicList &rcListPic, std:
       }
       if( m_ftActive )
       {
-        xFtSkip( picIdInGOP );
+        picListLock.unlock();
+        xFtSkip( m_ftTurn );
       }
       continue;
     }
@@ -2431,7 +2470,7 @@ void EncGOP::compressGOP(int iPOCLast, int iNumPicRcvd, PicList &rcListPic, std:
 
     // the pictures use the search stacks in turn
     const std::shared_ptr<EncPicOrder> picOrder = std::make_shared<EncPicOrder>();
-    picOrder->gopIdx   = picIdInGOP;
+    picOrder->turn     = m_ftActive ? m_ftTurn : picIdInGOP;
     picOrder->stackIdx = int( m_numPicsStarted++ % m_pcEncLib->getNumSearchStacks() );
     picOrder->previous = m_lastPicOrder;
     m_lastPicOrder     = picOrder;
@@ -3938,6 +3977,7 @@ void EncGOP::compressGOP(int iPOCLast, int iNumPicRcvd, PicList &rcListPic, std:
     xSetupPicOrder( pcSlice, picOrder );
     if( m_ftActive )
     {
+      picListLock.unlock();
       xFtEndSetup( *picOrder );   // from here on, the next picture's setup runs at the same time
     }
     EncReshape* const picReshaper = &m_pcSearchStack->reshaper;
@@ -5984,7 +6024,10 @@ void EncGOP::xGetBuffer( PicList&                  rcListPic,
   CHECK(!(rpcPic != NULL), "Unspecified error");
   CHECK(!(rpcPic->getPOC() == pocCurr), "Unspecified error");
 
-  (**iterPicYuvRec) = rpcPic->getRecoBuf();
+  if( !m_ftActive )   // with frame threads, EncLib hands the pictures out for output (EncLib::getFrameThreadsOutput)
+  {
+    (**iterPicYuvRec) = rpcPic->getRecoBuf();
+  }
   return;
 }
 
@@ -7349,7 +7392,7 @@ void EncGOP::xStartPicFinish( Slice* slice, EncPicOrder& order, std::unique_lock
 {
   if( m_ftActive )
   {
-    xFtWait( [&]() { return m_ftFinishTurn == order.gopIdx; } );   // the finishes run in coding order
+    xFtWait( [&]() { return m_ftFinishTurn == order.turn; } );   // the finishes run in coding order
     apsMapLock.lock();   // the finish adds and changes APSs; the next pictures' setups may look them up
   }
   // the LMCS APS of a picture with a new reshaper model (set up in xPicInitLMCS)

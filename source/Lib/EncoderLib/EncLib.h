@@ -63,7 +63,10 @@
 #include "RateCtrl.h"
 #include "EncSearchStack.h"
 
+#include <deque>
 #include <memory>
+#include <mutex>
+#include <set>
 #include <vector>
 
 #if JVET_AL0153_ALF_CCCM
@@ -87,6 +90,11 @@ private:
   int                       m_iNumPicRcvd;                        ///< number of received pictures
   uint32_t                  m_uiNumAllPicCoded;                   ///< number of coded pictures
   PicList&                  m_cListPic;                           ///< dynamic list of pictures
+  // frame threads: the reading of a picture into m_cListPic (encodePrep) and the setups of the pictures in flight
+  // take turns; the pictures read wait in input order for their output, and their buffers are not reused before
+  std::mutex                m_picListMutex;
+  std::deque<Picture*>      m_ftOutputQueue;
+  std::set<const Picture*>  m_ftBusyPics;
   int                       m_layerId;
 
   // the slice and CU encoders and the searches, one stack per picture searched at the same time
@@ -190,6 +198,7 @@ public:
 
   AUWriterIf*             getAUWriterIf         ()              { return   m_AUWriterIf;           }
   PicList*                getListPic            ()              { return  &m_cListPic;             }
+  std::mutex&             getPicListMutex       ()              { return  m_picListMutex;          }
   /// The stacks for the mode search of pictures; the getters below return the objects of the first one.
   int                     getNumSearchStacks    () const        { return  int( m_searchStacks.size() ); }
   EncSearchStack&         getSearchStack        ( int i = 0 )   { return  *m_searchStacks[i];      }
@@ -270,6 +279,12 @@ public:
   bool encode( const InputColourSpaceConversion snrCSC, // used for SNR calculations. Picture in original colour space.
                std::list<PelUnitBuf*>& rcListPicYuvRecOut,
                int& iNumEncoded );
+
+  /// Frame threads: the reconstruction of the next picture in output order, if it is done (else false). The picture's
+  /// buffer may be reused by the next encodePrep, so the caller writes it out before.
+  bool getFrameThreadsOutput( PelUnitBuf& rec );
+  /// Frame threads: waits until every picture started is done.
+  void finishFrameThreads   () { m_cGOPEncoder.finishFrameThreads(); }
 
   bool encodePrep( bool bEos,
                PelStorage* pcPicYuvOrg,

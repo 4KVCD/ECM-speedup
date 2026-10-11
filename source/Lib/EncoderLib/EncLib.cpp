@@ -1189,6 +1189,11 @@ bool EncLib::encodePrep(bool flush, PelStorage* pcPicYuvOrg, const InputColourSp
       ppsID = m_vps->getGeneralLayerIdx( m_layerId );
     }
 
+    std::unique_lock<std::mutex> picListLock( m_picListMutex, std::defer_lock );
+    if( getFrameThreads() > 1 )
+    {
+      picListLock.lock();   // the setups of earlier GOPs may use the list (EncGOP::compressGOP)
+    }
     xGetNewPicBuffer( rcListPicYuvRecOut, pcPicCurr, ppsID );
 
     const PPS *pPPS = ( ppsID < 0 ) ? m_ppsMap.getFirstPS() : m_ppsMap.getPS( ppsID );
@@ -1236,6 +1241,11 @@ bool EncLib::encodePrep(bool flush, PelStorage* pcPicYuvOrg, const InputColourSp
     {
       AQpPreanalyzer::preanalyze( pcPicCurr );
     }
+    if( getFrameThreads() > 1 )
+    {
+      m_ftOutputQueue.push_back( pcPicCurr );   // the pictures come in output order
+      m_ftBusyPics.insert( pcPicCurr );
+    }
   }
 
   if( ( m_iNumPicRcvd == 0 ) || ( !flush && ( m_iPOCLast != 0 ) && ( m_iNumPicRcvd != m_iGOPSize ) && ( m_iGOPSize != 0 ) ) )
@@ -1273,9 +1283,12 @@ bool EncLib::encode( const InputColourSpaceConversion snrCSC, std::list<PelUnitB
   // compress GOP
   if( getFrameThreads() > 1 )
   {
-    // the first call encodes all pictures of the GOP (the first picture of the sequence is a GOP of its own)
+    // the first call starts all pictures of the GOP (the first picture of the sequence is a GOP of its own). It
+    // returns before they are done, so the next GOPs are read and started meanwhile: at most a GOP, or a picture per
+    // search stack, ahead of the pictures in flight.
     if( m_picIdInGOP == 0 )
     {
+      m_cGOPEncoder.waitFrameThreads( std::max( getNumSearchStacks(), m_iGOPSize ) );
       m_cGOPEncoder.compressGOPFrameThreads( m_iPOCLast ? m_iGOPSize : 1, m_iPOCLast, m_iNumPicRcvd, m_cListPic,
                                              rcListPicYuvRecOut, false, false, snrCSC, m_printFrameMSE,
 #if MSSIM_UNIFORM_METRICS_LOG
@@ -1461,6 +1474,20 @@ bool EncLib::encode( const InputColourSpaceConversion snrCSC, std::list<PelUnitB
  .
  \retval rpcPic obtained picture buffer
  */
+bool EncLib::getFrameThreadsOutput( PelUnitBuf& rec )
+{
+  if( m_ftOutputQueue.empty() || !m_cGOPEncoder.isPicDone( m_ftOutputQueue.front() ) )
+  {
+    return false;
+  }
+  Picture* pic = m_ftOutputQueue.front();
+  m_ftOutputQueue.pop_front();
+  m_cGOPEncoder.forgetPicDone( pic );
+  m_ftBusyPics.erase( pic );
+  rec = pic->getRecoBuf();
+  return true;
+}
+
 void EncLib::xGetNewPicBuffer ( std::list<PelUnitBuf*>& rcListPicYuvRecOut, Picture*& rpcPic, int ppsId )
 {
   // rotate the output buffer
@@ -1489,7 +1516,9 @@ void EncLib::xGetNewPicBuffer ( std::list<PelUnitBuf*>& rcListPicYuvRecOut, Pict
     for( int i = 0; i < iSize; i++ )
     {
       rpcPic = *iterPic;
-      if( !rpcPic->referenced && rpcPic->layerId == m_layerId )
+      // with frame threads, pictures read ahead may already be marked unused for reference, and a picture's buffer
+      // stays until it is output (m_ftBusyPics)
+      if( !rpcPic->referenced && rpcPic->layerId == m_layerId && !m_ftBusyPics.count( rpcPic ) )
       {
         break;
       }

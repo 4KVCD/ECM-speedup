@@ -35,6 +35,7 @@
     \brief    Encoder application class
 */
 
+#include <deque>
 #include <list>
 #include <fstream>
 #include <stdlib.h>
@@ -2020,6 +2021,7 @@ bool EncApp::encodePrep( bool& eos )
   }
 
   bool keepDoing = false;
+  m_eos          = eos;
 
   // call encoding function for one frame
   if( m_isField )
@@ -2060,8 +2062,28 @@ bool EncApp::encode()
   // output when the entire GOP was proccessed
   if( !keepDoing )
   {
+    if( m_cEncLib.getFrameThreads() > 1 )
+    {
+      // the GOP's pictures may still be in flight: write the pictures done so far, at the end all of them
+      if( m_eos )
+      {
+        m_cEncLib.finishFrameThreads();
+      }
+      std::deque<PelUnitBuf> recs;
+      std::list<PelUnitBuf*> recList;
+      PelUnitBuf             rec;
+      while( m_cEncLib.getFrameThreadsOutput( rec ) )
+      {
+        recs.push_back( rec );
+        recList.push_back( &recs.back() );
+      }
+      if( !recList.empty() )
+      {
+        xWriteOutput( int( recList.size() ), recList );
+      }
+    }
     // write bistream to file if necessary
-    if( m_numEncoded > 0 )
+    else if( m_numEncoded > 0 )
     {
       xWriteOutput( m_numEncoded, m_recBufList );
     }

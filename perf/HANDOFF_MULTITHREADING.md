@@ -87,6 +87,26 @@ Commits on `enc-mt`, all bit-exact with stock ECM-20.0 (bitstream md5 of the sui
     RA, where the intra loops are a small part, that cancels the gain.
   - Revised estimate for P2 on LD, all probed loops at the probe's efficiency: about 1.25x; realistically 1.1-1.2x,
     after a separate engineering step for each of many loops.
+- P5 stage A (the commit after the PDP fix): GOPs overlap. `EncLib::encode` returns while the GOP's pictures are in
+  flight, so the next GOPs are read and started meanwhile (at most a GOP, or a picture per search stack, ahead);
+  setups and finishes keep their turns in coding order over all GOPs; EncLib hands the reconstructions out in output
+  order as they are done, and a picture's buffer is not reused before. The setups and EncLib's reading of a picture
+  share a lock on the picture list (the reading also rotates the recon ring and writes the shared picture header's
+  SPS/PPS IDs). Pictures read ahead are marked unused for reference by earlier pictures' setups (as within a GOP
+  before), so buffer reuse also checks that the picture has been output.
+  - AI gets most of what `ft_sim.py`/`p5_sim.py` predict: 33 pictures 3.47x with 4 threads, 6.17x with 8 (P-cores). RA gains only at GOP boundaries (65 frames, 3 intra periods: 1.32x with 4 threads, 1.50x with 8, against 1.25x and 1.35x
+    before),
+    LD nothing (in coding-order finishes, one stack per picture in turn).
+  - `perf/mt/p5_sim.py` (list scheduling with K threads and S stacks): with the finishes ordered only within an intra
+    period, RA would reach 5.2x with 8 threads and 8 stacks (7.2x with 16 stacks), AI 7.2x. That is stage B: per-period
+    copies of the finish state (ALF/SAO/CCSAO encoders, APS map, the HLS writer), the sequential finish state decided
+    in the setup (`m_bSeqFirst`, AUD) or moved to an output step in coding order (AU output, PSNR sums, log line), and
+    stacks taken by pictures that are ready.
+- Found by the matrix of stage A: `--FrameThreads` >= 3 stopped with "PDP predictor unavailable" on ra_cif (bug of
+  cfe3c39a, fixed in its own commit): a search stack's first picture used IntraPrediction's PDP buffer pointers before
+  any CU of that stack had set them.
+- Unpinned runs on this hybrid CPU are slower than pinned ones even with one thread (LD 17 frames: 201 s vs 174 s on
+  P-cores): Windows puts the encoder's threads on E-cores. Worth trying: opt out of power throttling (EcoQoS) at start.
 
 ## Tools in perf/mt
 
@@ -101,8 +121,10 @@ Commits on `enc-mt`, all bit-exact with stock ECM-20.0 (bitstream md5 of the sui
 - `grain_probe/insert_grain_probes.py <tree>`: adds timers to every candidate loop in a throwaway checkout of 2912a239
   and prints, at exit, the speed-up a 2/4/8/16-worker pool would reach with 2 us overhead per task (results in
   Progress). Its task times include each candidate's setup.
+- `p5_sim.py <serial log> [finish fraction]`: event-driven schedule of overlapping GOPs with K threads and S stacks,
+  finishes in coding order globally or per intra period.
 - `cu_matrix.py EXE TAG REFEXE`: the bit-exactness matrix of the thread options (default, CuThreads 2/4/8, the
-  check, with FrameThreads), jobs on their own P-cores; `cu_scale.py EXE tests counts`: CuThreads timings, one run at
+  check, FrameThreads 2/4/8 and combinations), jobs on their own P-cores; `cu_scale.py EXE tests counts`: CuThreads timings, one run at
   a time on P-cores, with each run's peak commit.
 
 ## Measurements (i7-10700 8C/16T, 64 GB, Windows 11, GCC 16.2)
@@ -321,7 +343,8 @@ AI-latency ~2-2.5x.
 
 ## Next steps
 
-1. The grain probe and the first P2 step changed the ranking above; decide with the user between:
+1. The grain probe and the first P2 step changed the ranking above; the user decided (2026-10-11): P5 first, then
+   more P2 for LD, then any further threading gain. The two options were:
    - P5 first: let later GOPs start while earlier ones finish, in one process. AI pictures and RA intra periods read
      nothing from earlier periods after the RAS-init reset (`--ParallelSegments` relies on that), so AI throughput
      should approach the thread count (ParallelSegments: 6.66x with processes) and RA gain several times with
@@ -331,5 +354,5 @@ AI-latency ~2-2.5x.
    - More P2 for LD, the only configuration nothing else speeds up: merge SATD pass, ME per reference, the GPM stages,
      intra RMD in chunks, then P3 speculation for the merge/GPM full RD and the intra MTS pass. Expected 1.1-1.2x on
      LD in all, each loop a step like the first (state sync, record and compare, shadow check).
-2. P0, P1 and the first P2 step are done (see Progress).
+2. P0, P1, the first P2 step and P5 stage A are done (see Progress). Next: P5 stage B (Progress has the plan).
 3. Report each step as step % and cumulative % with before/after numbers and commit hashes, one commit per step.

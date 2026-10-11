@@ -2,7 +2,8 @@
 into a search, which waits for its references, for the last earlier picture of its temporal layer since the last IRAP
 (temporal CABAC context store and AMaxBT statistics) and for a free stack (at most K pictures in flight, stacks taken
 in coding order), and a finish of the given fraction of the work, in coding order. Prints the makespan for
-K = 1..32 with a barrier after every GOP (as implemented) and without it.
+K = 1..32 with a barrier after every GOP (as in P1), without it, and without it with the finishes in coding order only
+within an intra period (an IRAP's finish does not wait for the previous period's; P5).
 usage: ft_sim.py <serial encoder log> [finish fraction, default 0.1] [GOP size, default 32]"""
 import re
 import sys
@@ -25,7 +26,7 @@ def gop_of(i):
     return 0 if i == 0 else (i - 1) // gop + 1   # the first picture is a GOP of its own
 
 
-def simulate(K, barrier):
+def simulate(K, barrier, periodFinishes=False):
     done = {}          # poc -> finish end time
     stack_free = [0.0] * K
     last_finish = 0.0
@@ -34,6 +35,8 @@ def simulate(K, barrier):
     for i, (poc, tid, et, refs, irap) in enumerate(pics):
         if irap:
             last_of_tid = {}   # RAS init: the context store and the AMaxBT statistics start again
+            if periodFinishes:
+                last_finish = 0.0
         g = gop_of(i)
         if barrier and g > 0 and i > 0 and gop_of(i - 1) != g:
             t_gop_start = max(done.values())
@@ -54,4 +57,6 @@ print(f"{len(pics)} pictures, serial work {total:.0f} s, finish fraction {fin}")
 for K in (1, 2, 4, 8, 16, 32):
     a = simulate(K, True)
     b = simulate(K, False)
-    print(f"K={K:2d}  GOP barrier {a:7.0f} s ({total / a:4.2f}x)   overlapping GOPs {b:7.0f} s ({total / b:4.2f}x)")
+    c = simulate(K, False, True)
+    print(f"K={K:2d}  GOP barrier {a:7.0f} s ({total / a:4.2f}x)   overlapping GOPs {b:7.0f} s ({total / b:4.2f}x)"
+          f"   + finishes per period {c:7.0f} s ({total / c:4.2f}x)")
