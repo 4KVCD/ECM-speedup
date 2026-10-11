@@ -137,8 +137,6 @@ void VkLoopFilter::alfBuffers( CodingStructure& cs, AdaptiveLoopFilter& alf )
   {
     m_src.create( *m_core, format, width, height, 16 );
     m_resi.create( *m_core, CHROMA_400, width, height, 16 );
-    m_core->destroyBuffer( m_alfCi );
-    m_alfCi = m_core->createBuffer( size_t( width ) * height * sizeof( Pel ), Mem::HostWrite );
     m_core->destroyBuffer( m_alfCls );
     const size_t lumaBlocks = size_t( width / 2 ) * ( height / 2 );
     m_alfCls = m_core->createBuffer( ( 6 * lumaBlocks + 2 * lumaBlocks / 4 + 64 ) * sizeof( int16_t ), Mem::HostCached );
@@ -328,7 +326,7 @@ void VkLoopFilter::alfRun( CodingStructure& cs, AdaptiveLoopFilter& alf )
   const int width = pcv.lumaWidth, height = pcv.lumaHeight;
   const int widthC = numComp > 1 ? m_pic.plane( 1 ).width : 0, heightC = numComp > 1 ? m_pic.plane( 1 ).height : 0;
 
-  // inputs: the picture before ALF, the residual and the coding information
+  // inputs: the picture before ALF and the residual; the coding information arrived after deblocking
   if( m_check )
   {
     // The CPU picture already holds ALFProcess's output; its input is in the ALF's copy.
@@ -339,14 +337,6 @@ void VkLoopFilter::alfRun( CodingStructure& cs, AdaptiveLoopFilter& alf )
     ensureOnGpu( cs );
   }
   m_resi.upload( alf.callRecResiBuf() );
-  {
-    const CPelBuf ci = alf.callCodingInfoBuf( cs ).get( COMPONENT_Y );
-    Pel* d = m_alfCi.ptr<Pel>();
-    for( int y = 0; y < height; y++ )
-    {
-      memcpy( d + size_t( y ) * width, ci.buf + y * ci.stride, width * sizeof( Pel ) );
-    }
-  }
 
   // per picture parameters, then CTUs, filters and tiles, each 8-byte aligned
   std::vector<GpuAlfTile> fixA, fixB, mirrorA[2], mirrorB[2], lumaTiles, chromaTiles;
@@ -410,7 +400,7 @@ void VkLoopFilter::alfRun( CodingStructure& cs, AdaptiveLoopFilter& alf )
   P.db     = m_db.buffer().address;
   P.dst    = m_pic.buffer().address;
   P.resi   = m_resi.buffer().address;
-  P.ci     = m_alfCi.address;
+  P.ci     = m_codingInfo.address;
   P.res    = m_alfRes.address;
   P.cls    = m_alfCls.address;
   P.clsStride = width / 2;
@@ -626,6 +616,91 @@ void VkLoopFilter::alfRun( CodingStructure& cs, AdaptiveLoopFilter& alf )
   m_cpuCurrent = m_check;
   m_gpuCurrent = true;
   m_lastStage  = 3;
+  m_alfInputOnGpu = true;
+}
+
+// Push constants of offset_refine.comp
+struct RefinePush
+{
+  uint64_t src, dst, ci, ctuOn;
+  int32_t  srcOrigin, srcStride, dstOrigin, dstStride, ciStride, width, height, ctuSizeLog2, ctusW;
+  int32_t  maxVal, bdScale, paramA, paramB, paramC, boundTh;
+};
+static_assert( offsetof( RefinePush, boundTh ) == 88, "offset_refine.comp push constant layout" );
+
+void VkLoopFilter::offsetRefinement( CodingStructure& cs, int stageIdx, int refineIdx, AdaptiveLoopFilter& alf )
+{
+  const SPS& sps = *cs.sps;
+  const int  width = cs.pcv->lumaWidth, height = cs.pcv->lumaHeight;
+  ensureOnGpu( cs );
+  // the stage's input: the picture before deblocking, or the ALF input
+  const GpuPicture* src = &m_db;
+  if( stageIdx > 0 )
+  {
+    if( !m_alfInputOnGpu || m_check )
+    {
+      if( !m_src.matches( m_pic.format(), width, height ) )
+      {
+        m_src.create( *m_core, m_pic.format(), width, height, 16 );
+      }
+      m_src.upload( alf.callRecAfterSaoBuf() );
+    }
+    src = &m_src;
+  }
+  // after ALF, only the CTUs with luma ALF on, if the slice has luma ALF
+  const int numCtus = cs.pcv->sizeInCtus;
+  ensureBuffer( m_refineCtus, size_t( numCtus ), Mem::HostWrite );
+  const bool perCtu = stageIdx > 0 && cs.slice->getTileGroupAlfEnabledFlag( COMPONENT_Y );
+  if( perCtu )
+  {
+    memcpy( m_refineCtus.mapped, cs.picture->getAlfCtuEnableFlag( COMPONENT_Y ), numCtus );
+  }
+
+  const int bitDepth = sps.getBitDepth( CHANNEL_TYPE_LUMA );
+  const bool useDiffTh = !sps.getInloopOffsetRefineFlag() && !cs.slice->isIntra();
+  RefinePush push;
+  push.src       = src->buffer().address;
+  push.dst       = m_pic.buffer().address;
+  push.ci        = m_codingInfo.address;
+  push.ctuOn     = perCtu ? m_refineCtus.address : 0;
+  push.srcOrigin = src->plane( 0 ).origin;
+  push.srcStride = src->plane( 0 ).stride;
+  push.dstOrigin = m_pic.plane( 0 ).origin;
+  push.dstStride = m_pic.plane( 0 ).stride;
+  push.ciStride  = width;
+  push.width     = width;
+  push.height    = height;
+  push.ctuSizeLog2 = floorLog2( cs.pcv->maxCUWidth );
+  push.ctusW     = cs.pcv->widthInCtus;
+  push.maxVal    = ( 1 << bitDepth ) - 1;
+  push.bdScale   = std::max( 0, bitDepth - 10 );
+  push.paramA    = sps.getInloopOffsetRefineFunc() ? 5 : 6;
+  push.paramB    = 31;
+  push.paramC    = 5;
+  // the thresholds of calcOffsetRefinementBlk for samples at block boundaries
+  push.boundTh   = refineIdx == 1 ? ( useDiffTh ? ( stageIdx ? 16 : 9 ) : ( stageIdx ? 15 : 12 ) ) : ( useDiffTh ? 3 : 1 );
+
+  m_core->begin();
+  const int t0 = m_core->timestamp();
+  m_core->dispatch( "offset_refine", uint32_t( ( width + 15 ) / 16 ), uint32_t( ( height + 15 ) / 16 ), 1, &push, sizeof( push ) );
+  m_core->barrier();
+  const int t1 = m_core->timestamp();
+  m_core->submit();
+  m_gpuMs += m_core->elapsedMs( t0, t1 );
+  m_cpuCurrent = m_check;
+  m_lastStage  = 4;
+  m_counts.refinePictures[stageIdx > 0 ? 1 : 0]++;
+}
+
+void VkLoopFilter::uploadCodingInfo( const CPelBuf& ci )
+{
+  const int width = m_pic.plane( 0 ).width, height = m_pic.plane( 0 ).height;
+  ensureBuffer( m_codingInfo, size_t( width ) * height * sizeof( Pel ), Mem::HostWrite );
+  Pel* d = m_codingInfo.ptr<Pel>();
+  for( int y = 0; y < height; y++ )
+  {
+    memcpy( d + size_t( y ) * width, ci.buf + y * ci.stride, width * sizeof( Pel ) );
+  }
 }
 
 }   // namespace vkd

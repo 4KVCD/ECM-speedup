@@ -21,7 +21,7 @@ LABELS = (["pictures", "deblocking segments"] + [f"SAO {t}" for t in ("EO0", "EO
                                        "13_DB_RESI_DIRECT", "13_DB_RESI")]
           + [f"ALF classifier {i}" for i in range(3)]
           + ["ALF luma scaling CTUs", "ALF chroma 9", "ALF chroma 9_NO_FIX", "CCALF CTUs", "ALF chroma scaling pictures",
-             "ALF mirrored regions"])
+             "ALF mirrored regions", "refinement after deblocking", "refinement after ALF"])
 
 
 def run(exe, name):

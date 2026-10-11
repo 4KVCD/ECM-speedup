@@ -164,7 +164,7 @@ void VkLoopFilter::destroy()
   m_src.destroy( *m_core );
   m_resi.destroy( *m_core );
   for( Buffer* b: { &m_edgeBuf, &m_saoParams, &m_bifBlocks, &m_bifTables, &m_ccSaoSets, &m_ctuBytes, &m_ccSaoTables,
-                    &m_alfCi, &m_alfRes, &m_alfCls, &m_alfTables, &m_alfParams } )
+                    &m_codingInfo, &m_refineCtus, &m_alfRes, &m_alfCls, &m_alfTables, &m_alfParams } )
   {
     m_core->destroyBuffer( *b );
   }
@@ -193,6 +193,7 @@ void VkLoopFilter::beginPicture( CodingStructure& cs )
   m_cpuCurrent = true;
   m_gpuCurrent = false;
   m_lastStage  = 0;
+  m_alfInputOnGpu = false;
   m_counts.pictures++;
 }
 

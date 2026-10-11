@@ -1,0 +1,51 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+// The loop filter offset refinement of luma (AdaptiveLoopFilter::calcOffsetRefinementBlk) after deblocking (stage 0)
+// or after ALF (stage 1): a small correction against the change of the stage, from the log2 of its magnitude.
+// One invocation per luma sample; dst holds the stage's output and is refined in place.
+
+layout( local_size_x = 16, local_size_y = 16 ) in;
+
+layout( push_constant, scalar ) uniform Push
+{
+  I16Buf  src;          // the stage's input
+  I16Buf  dst;          // the stage's output
+  I16Buf  ci;           // the deblocking's coding information
+  U8Buf   ctuOn;        // stage 1: per CTU, 0 leaves it unrefined; 0 for all CTUs refines all
+  int     srcOrigin, srcStride;
+  int     dstOrigin, dstStride;
+  int     ciStride;
+  int     width, height;
+  int     ctuSizeLog2, ctusW;
+  int     maxVal;       // (1 << bitDepth) - 1
+  int     bdScale;
+  int     paramA, paramB, paramC;
+  int     boundTh;      // the threshold of samples at block boundaries
+} pc;
+
+void main()
+{
+  const int x = int( gl_GlobalInvocationID.x ), y = int( gl_GlobalInvocationID.y );
+  if( x >= pc.width || y >= pc.height )
+  {
+    return;
+  }
+  if( uint64_t( pc.ctuOn ) != 0 && pc.ctuOn.v[( y >> pc.ctuSizeLog2 ) * pc.ctusW + ( x >> pc.ctuSizeLog2 )] == 0 )
+  {
+    return;
+  }
+  const int d     = pc.dstOrigin + y * pc.dstStride + x;
+  const int src1  = int( pc.dst.v[d] );
+  const int diff  = src1 - int( pc.src.v[pc.srcOrigin + y * pc.srcStride + x] );
+  int       a     = clamp( abs( diff ), 0, pc.maxVal ) >> pc.bdScale;
+  const int sign  = diff < 0 ? 1 : -1;   // against the stage's change
+  if( pc.ci.v[y * pc.ciStride + x] > 0 )
+  {
+    a = a > pc.boundTh ? a : 0;
+  }
+  const int log2a  = a == 0 ? 0 : findMSB( a );
+  const int refine = sign * ( ( pc.paramA * log2a + pc.paramB ) >> pc.paramC );
+  pc.dst.v[d] = int16_t( src1 + ( refine << pc.bdScale ) );
+}

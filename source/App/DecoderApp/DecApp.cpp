@@ -652,11 +652,12 @@ void DecApp::xDestroyDecLib()
       };
       // perf/vkcoverage.py reads the numbers of this line in order
       msg( INFO, " GPU stages checked on %llu pictures: deblocking segments %llu, SAO CTUs by type%s, bilateral filter blocks %llu, CCSAO CTUs by band candidate%s, by edge direction%s,"
-                 " ALF pictures %llu, luma CTUs by fixed set and APS filter type%s, by classifier%s, with scaling %llu, chroma CTUs by type%s, CCALF CTUs %llu, chroma scaling pictures %llu, mirrored regions %llu\n",
+                 " ALF pictures %llu, luma CTUs by fixed set and APS filter type%s, by classifier%s, with scaling %llu, chroma CTUs by type%s, CCALF CTUs %llu, chroma scaling pictures %llu, mirrored regions %llu, offset refinement pictures after deblocking and after ALF%s\n",
            (unsigned long long) n.pictures, (unsigned long long) n.deblockSegments, list( n.saoCtus, 5 ).c_str(), (unsigned long long) n.bifBlocks,
            list( n.ccSaoBand, 9 ).c_str(), list( n.ccSaoEdge, 4 ).c_str(), (unsigned long long) n.alfPictures, list( n.alfLumaCtus, 6 ).c_str(),
            list( n.alfClassifier, 3 ).c_str(), (unsigned long long) n.alfScaleCtus, list( n.alfChromaCtus, 2 ).c_str(),
-           (unsigned long long) n.ccAlfCtus, (unsigned long long) n.alfChromaScalePictures, (unsigned long long) n.alfMirrors );
+           (unsigned long long) n.ccAlfCtus, (unsigned long long) n.alfChromaScalePictures, (unsigned long long) n.alfMirrors,
+           list( n.refinePictures, 2 ).c_str() );
     }
     for( const auto& r: m_cDecLib.vulkanAlfCpuReasons() )
     {

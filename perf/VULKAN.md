@@ -98,6 +98,13 @@ several slices, virtual boundaries, loop filtering disabled across slice, tile o
 QP for the fixed filters (`cuQpDeltaSubdiv`) and the NN loop filter. The decoder prints how many pictures took the
 CPU path and why.
 
+### Offset refinement
+
+The luma offset refinement after deblocking and after ALF (`calcOffsetRefinement`) runs per sample: a small
+correction against the stage's change, from the log2 of its magnitude, with a threshold at block boundaries (the
+deblocking's coding information, which the GPU receives once per picture after deblocking). After ALF it skips the
+CTUs with luma ALF off.
+
 ## Status
 
 | stage | GPU | checked on the corpus |
@@ -109,6 +116,7 @@ CPU path and why.
 | ALF luma: fixed filter sets alone, APS filter types 13_EXT_DB_RESI_DIRECT, 13_EXT_DB_RESI, 13_DB_RESI_DIRECT, 13_DB_RESI, classifiers 0-2, residual scaling; chroma ALF_FILTER_9, CCALF, chroma scaling | yes | 48 streams identical, 320 pictures on the GPU |
 | ALF chroma ALF_FILTER_9_NO_FIX | yes | not exercised |
 | ALF in pictures the plan does not cover (see ALF) | CPU | - |
+| offset refinement after deblocking and after ALF | yes | 48 streams identical, 34 and 84 pictures |
 | everything else | CPU | - |
 
 Speed: on the hybrid path the per-picture copies and the synchronous waits cost more than the GPU saves. ra_cif

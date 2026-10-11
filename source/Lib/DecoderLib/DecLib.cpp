@@ -969,6 +969,10 @@ void DecLib::executeLoopFilters()
     m_cLoopFilter.setEdgeMaps( nullptr );
     m_vkLoopFilter.deblock( cs );
     m_vkLoopFilter.checkAgainstCpu( cs, "deblocking" );
+    if( storeCodingInfo )
+    {
+      m_vkLoopFilter.uploadCodingInfo( codingInfoBuf.get( COMPONENT_Y ) );
+    }
   }
 #endif
 
@@ -988,11 +992,20 @@ void DecLib::executeLoopFilters()
 #if ECM_VULKAN
       if( m_vkCore )
       {
-        m_vkLoopFilter.syncToCpu( cs );
+        m_vkLoopFilter.offsetRefinement( cs, stageIdx, refineIdx, m_cALF );
+      }
+      if( !m_vkCore || m_vkCheck )
+#endif
+      {
+        m_cALF.calcOffsetRefinement(cs, dbfInput, dbfOutput, dbfOffsetRefine, stageIdx, refineIdx );
+        m_cALF.copyOffsetRefinement(cs, dbfOffsetRefine, dbfOutput);
+      }
+#if ECM_VULKAN
+      if( m_vkCore )
+      {
+        m_vkLoopFilter.checkAgainstCpu( cs, "offset refinement after deblocking" );
       }
 #endif
-      m_cALF.calcOffsetRefinement(cs, dbfInput, dbfOutput, dbfOffsetRefine, stageIdx, refineIdx );
-      m_cALF.copyOffsetRefinement(cs, dbfOffsetRefine, dbfOutput);
     }
   }
 #endif
@@ -1022,6 +1035,13 @@ void DecLib::executeLoopFilters()
 #endif
 
   {
+#if ECM_VULKAN
+    if( m_vkCore )
+    {
+      // the NN loop filter runs on the CPU
+      m_vkLoopFilter.syncToCpu( cs );
+    }
+#endif
 #if JVET_AF0043_AF0205_PADDING
     m_pcPic->paddingBsMapBufBorder( 8 );
     m_pcPic->paddingRecBeforeDbfBufBorder( 8 );
@@ -1200,8 +1220,24 @@ void DecLib::executeLoopFilters()
 
       int stageIdx = 1;
       int refineIdx = cs.slice->getOffsetRefinementAlfIdx();
-      m_cALF.calcOffsetRefinement(cs, alfInput, alfOutput, alfOffsetRefine, stageIdx, refineIdx );
-      m_cALF.copyOffsetRefinement(cs, alfOffsetRefine, alfOutput);
+#if ECM_VULKAN
+      if( m_vkCore )
+      {
+        m_vkLoopFilter.offsetRefinement( cs, stageIdx, refineIdx, m_cALF );
+      }
+      if( !m_vkCore || m_vkCheck )
+#endif
+      {
+        m_cALF.calcOffsetRefinement(cs, alfInput, alfOutput, alfOffsetRefine, stageIdx, refineIdx );
+        m_cALF.copyOffsetRefinement(cs, alfOffsetRefine, alfOutput);
+      }
+#if ECM_VULKAN
+      if( m_vkCore )
+      {
+        m_vkLoopFilter.checkAgainstCpu( cs, "offset refinement after ALF" );
+        m_vkLoopFilter.syncToCpu( cs );
+      }
+#endif
     }
   }
 #endif

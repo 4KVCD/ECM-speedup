@@ -126,6 +126,12 @@ public:
   void alfPrepare( CodingStructure& cs, AdaptiveLoopFilter& alf );
   bool alf( CodingStructure& cs, AdaptiveLoopFilter& alf );
 
+  /// The deblocking's coding information (luma), which the offset refinement and ALF read; after loopFilterPic.
+  void uploadCodingInfo( const CPelBuf& ci );
+  /// The offset refinement of AdaptiveLoopFilter::calcOffsetRefinement and copyOffsetRefinement, after deblocking
+  /// (stageIdx 0) or after ALF (1).
+  void offsetRefinement( CodingStructure& cs, int stageIdx, int refineIdx, AdaptiveLoopFilter& alf );
+
   /// Check mode: compares the GPU result of the last stage with the CPU picture; throws on a difference.
   void checkAgainstCpu( CodingStructure& cs, const char* stage );
 
@@ -149,6 +155,7 @@ public:
     uint64_t ccAlfCtus      = 0;
     uint64_t alfChromaScalePictures = 0;
     uint64_t alfMirrors     = 0;   ///< mirrored padding regions of the result planes
+    uint64_t refinePictures[2] = {};  ///< pictures with the offset refinement after deblocking, after ALF
   };
   const Counts& counts() const { return m_counts; }
   /// Why ALF stayed on the CPU, with the number of pictures.
@@ -190,7 +197,9 @@ private:
   GpuPicture       m_db;                ///< the picture before deblocking
   GpuPicture       m_src;               ///< the ALF input
   GpuPicture       m_resi;              ///< the luma residual
-  Buffer           m_alfCi;             ///< the deblocking's coding information, luma
+  Buffer           m_codingInfo;        ///< the deblocking's coding information, luma
+  Buffer           m_refineCtus;        ///< offset refinement after ALF: CTUs with luma ALF on
+  bool             m_alfInputOnGpu = false;   ///< m_src holds this picture's ALF input
   Buffer           m_alfRes;            ///< the result planes of AlfGpuPlan::Plane
   size_t           m_alfResOffset[AlfGpuPlan::NUM_PLANES] = {};
   int              m_alfResWidth[AlfGpuPlan::NUM_PLANES]  = {};
