@@ -1,0 +1,66 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+// The joint clipping after SAO, bilateral filter and CCSAO, a port of SampleAdaptiveOffset::jointClipSaoBifCcSao.
+// Mode 0: one invocation per sample of a component; samples of CTUs where SAO or CCSAO is on are clipped.
+// Mode 1: one workgroup per bilateral-filtered block, whose samples are clipped. The CPU clips those blocks only in
+// CTUs without SAO and CCSAO, but in the other CTUs mode 0 clips them anyway, and clipping twice changes nothing.
+
+layout( local_size_x = 256 ) in;
+
+struct BifBlock
+{
+  int x, y, w, h;
+  int comp;
+  int qp;
+  int strengthLog2W;
+  int strengthLog2H;
+  uint flags;
+};
+layout( buffer_reference, scalar, buffer_reference_align = 4 ) buffer BifBlocks { BifBlock b[]; };
+layout( buffer_reference, scalar, buffer_reference_align = 1 ) buffer CtuBytes { uint8_t b[]; };
+
+layout( push_constant, scalar ) uniform Push
+{
+  I16Buf    dst;
+  BifBlocks blocks;
+  CtuBytes  ctuClip;     // [comp * numCtus + ctu]: 1 if SAO or CCSAO is on
+  int       origin[3];
+  int       stride[3];
+  int       maxVal[3];
+  int       mode;
+  int       comp;        // mode 0
+  int       width;       // mode 0: component size
+  int       height;
+  int       ctuW;        // mode 0: CTU size in component samples
+  int       ctuH;
+  int       widthInCtus;
+  int       numCtus;
+} pc;
+
+void main()
+{
+  if( pc.mode == 0 )
+  {
+    const int i = int( gl_GlobalInvocationID.x );
+    const int x = i % pc.width, y = i / pc.width;
+    if( y >= pc.height )
+    {
+      return;
+    }
+    const int ctu = ( y / pc.ctuH ) * pc.widthInCtus + x / pc.ctuW;
+    if( pc.ctuClip.b[pc.comp * pc.numCtus + ctu] != uint8_t( 0 ) )
+    {
+      const int idx = pc.origin[pc.comp] + y * pc.stride[pc.comp] + x;
+      pc.dst.v[idx] = int16_t( clamp( int( pc.dst.v[idx] ), 0, pc.maxVal[pc.comp] ) );
+    }
+    return;
+  }
+  const BifBlock b = pc.blocks.b[gl_WorkGroupID.x];
+  for( int i = int( gl_LocalInvocationID.x ); i < b.w * b.h; i += 256 )
+  {
+    const int idx = pc.origin[b.comp] + ( b.y + i / b.w ) * pc.stride[b.comp] + b.x + i % b.w;
+    pc.dst.v[idx] = int16_t( clamp( int( pc.dst.v[idx] ), 0, pc.maxVal[b.comp] ) );
+  }
+}

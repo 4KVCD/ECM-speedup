@@ -1,0 +1,205 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+// Bilateral filter of the in-loop filter stage, a port of BilateralFilter::bilateralFilterDiamond5x5 and
+// blockBilateralFilterDiamond5x5. One workgroup filters one block: a transform block, or the part of it between
+// virtual boundaries. The CPU decides which blocks are filtered and how their border is padded (BifBlock).
+// The filter reads the picture before SAO and adds its result to the picture that SAO has written.
+
+layout( local_size_x = 256 ) in;
+
+// flags: luma (bit 0), inter (1), top/bottom/left/right samples available for padding (2-5), the block touches the
+// top/bottom CTU boundary (6, 7), clip the result now (8, blocks between virtual boundaries).
+struct BifBlock
+{
+  int x, y, w, h;          // in component samples
+  int comp;
+  int qp;                  // CU QP plus the PPS BIF QP offset
+  int strengthLog2W;       // floorLog2 of the size that selects the strength factor
+  int strengthLog2H;
+  uint flags;
+};
+layout( buffer_reference, scalar, buffer_reference_align = 4 ) buffer BifBlocks { BifBlock b[]; };
+
+// BilateralFilter tables: lut[26][48], lutChroma[26][48], tuSizeFactor[2][64], tuMADFactor[2][16], and the chroma
+// factors, all int8.
+layout( buffer_reference, scalar, buffer_reference_align = 1 ) buffer BifTables { int8_t t[]; };
+const int LUT = 0, LUT_C = 26 * 48, SIZE_F = 2 * 26 * 48, MAD_F = SIZE_F + 128, SIZE_F_C = MAD_F + 32, MAD_F_C = SIZE_F_C + 128;
+
+layout( push_constant, scalar ) uniform Push
+{
+  I16Buf    src;
+  I16Buf    dst;
+  BifBlocks blocks;
+  BifTables tables;
+  int       origin[3];
+  int       stride[3];
+  int       bitDepth;          // BilateralFilter::internalBitDepth
+  int       maxVal[3];         // clipping range of each component
+  int       roundAdd;          // BIF_ROUND_ADD >> strength
+  int       roundShift;        // BIF_ROUND_SHIFT - strength
+} pc;
+
+shared int s_sum;
+shared int s_mad;
+
+BifBlock g_b;
+int      g_origin, g_stride;
+
+int src( int x, int y ) { return int( pc.src.v[g_origin + ( g_b.y + y ) * g_stride + g_b.x + x] ); }
+
+// The padded block of the CPU (tempblock) at block coordinates (x, y), -2 <= x < w + 2, -2 <= y < h + 2.
+int tb( int x, int y )
+{
+  const int w = g_b.w, h = g_b.h;
+  const bool availT = ( g_b.flags & 4u ) != 0u, availB = ( g_b.flags & 8u ) != 0u;
+  const bool availL = ( g_b.flags & 16u ) != 0u, availR = ( g_b.flags & 32u ) != 0u;
+  if( availT && availB && availL && availR )
+  {
+    // All around available: the picture is copied, except that the second line beyond a CTU boundary is
+    // replaced by the first.
+    if( y == -2 && ( g_b.flags & 64u ) != 0u )
+    {
+      y = -1;
+    }
+    if( y == h + 1 && ( g_b.flags & 128u ) != 0u )
+    {
+      y = h;
+    }
+    return src( x, y );
+  }
+  const bool inX = x >= 0 && x < w, inY = y >= 0 && y < h;
+  if( inX && inY )
+  {
+    return src( x, y );
+  }
+  if( inX )
+  {
+    if( y < 0 )
+    {
+      return availT ? src( x, y ) : src( x, 0 );
+    }
+    return availB ? src( x, y ) : src( x, h - 1 );
+  }
+  if( inY )
+  {
+    if( x < 0 )
+    {
+      return availL ? src( x, y ) : src( 0, y );
+    }
+    return availR ? src( x, y ) : src( w - 1, y );
+  }
+  // corners
+  if( y < 0 )
+  {
+    if( x < 0 )
+    {
+      return availT && availL ? src( x, y ) : src( 0, 0 );
+    }
+    return availT && availR ? src( x, y ) : src( w - 1, 0 );
+  }
+  if( x < 0 )
+  {
+    return availB && availL ? src( x, y ) : src( 0, h - 1 );
+  }
+  return availB && availR ? src( x, y ) : src( w - 1, h - 1 );
+}
+
+int g_lut;          // offset of the LUT row in the tables
+int g_cutBitsNum;
+int g_bdShift;
+
+// bifApplyLut: the weight of a difference, with the sign of the difference (zero counts as positive)
+int applyLut( int diff, int lutShift )
+{
+  const int sg0 = diff >> 31;
+  const int v0  = ( diff + sg0 ) ^ sg0;
+  const int bitsRound  = 1 << ( g_cutBitsNum - 2 );
+  const int bitsRound2 = bitsRound + ( 1 << ( g_cutBitsNum - 1 ) );
+  int idx = ( v0 + bitsRound ) >> g_cutBitsNum;
+  idx = 15 + ( ( idx - 15 ) & ( ( idx - 15 ) >> 31 ) );
+  int idx2 = ( v0 + bitsRound2 ) >> g_cutBitsNum;
+  idx2 = 15 + ( ( idx2 - 15 ) & ( ( idx2 - 15 ) >> 31 ) );
+  int w0 = ( int( pc.tables.t[g_lut + lutShift + idx] ) + int( pc.tables.t[g_lut + lutShift + idx2] ) + 1 ) >> 1;
+  w0 = w0 << g_bdShift;
+  return ( w0 + sg0 ) ^ sg0;
+}
+
+void main()
+{
+  g_b = pc.blocks.b[gl_WorkGroupID.x];
+  g_origin = pc.origin[g_b.comp];
+  g_stride = pc.stride[g_b.comp];
+  const int  w = g_b.w, h = g_b.h, n = w * h;
+  const bool isLuma  = ( g_b.flags & 1u ) != 0u;
+  const int  isInter = int( ( g_b.flags >> 1 ) & 1u );
+  const uint tid = gl_LocalInvocationID.x;
+
+  // calcMAD on the block itself
+  if( tid == 0u )
+  {
+    s_sum = 0;
+    s_mad = 0;
+  }
+  barrier();
+  int part = 0;
+  for( int i = int( tid ); i < n; i += 256 )
+  {
+    part += src( i % w, i / w );
+  }
+  part = subgroupAdd( part );
+  if( subgroupElect() )
+  {
+    atomicAdd( s_sum, part );
+  }
+  barrier();
+  const int whlog2  = floorLog2( uint( w ) ) + floorLog2( uint( h ) );
+  const int average = ( s_sum + ( 1 << ( whlog2 - 1 ) ) ) >> whlog2;
+  part = 0;
+  for( int i = int( tid ); i < n; i += 256 )
+  {
+    part += abs( src( i % w, i / w ) - average );
+  }
+  part = subgroupAdd( part );
+  if( subgroupElect() )
+  {
+    atomicAdd( s_mad, part );
+  }
+  barrier();
+  int mad = ( s_mad + ( 1 << ( whlog2 - 1 ) ) ) >> whlog2;
+
+  // getFilterLutParameters / getFilterLutParametersChroma
+  g_bdShift = max( 0, pc.bitDepth - 10 );
+  const int madOffset = g_bdShift == 0 ? 0 : ( 1 << ( g_bdShift - 1 ) );
+  mad = ( mad + madOffset ) >> g_bdShift;
+  const int sw = min( g_b.strengthLog2W, 7 ), sh = min( g_b.strengthLog2H, 7 );
+  mad = min( mad >> 4, 15 );
+  int bfac = int( pc.tables.t[( isLuma ? SIZE_F : SIZE_F_C ) + isInter * 64 + sw * 8 + sh] );
+  if( bfac != 0 )
+  {
+    bfac += int( pc.tables.t[( isLuma ? MAD_F : MAD_F_C ) + isInter * 16 + mad] );
+  }
+  const int sqp = clamp( g_b.qp - 17, 0, 25 );
+  g_lut        = ( isLuma ? LUT : LUT_C ) + sqp * 48;
+  g_cutBitsNum = ( isLuma ? 3 : 2 ) + g_bdShift;
+
+  const bool clipNow = ( g_b.flags & 256u ) != 0u;
+  const int  maxVal  = pc.maxVal[g_b.comp];
+  for( int i = int( tid ); i < n; i += 256 )
+  {
+    const int x = i % w, y = i / w;
+    const int pixel = tb( x, y );
+    // The CPU takes the up, left, up-right and up-left terms from the neighbour's own computation, negated.
+    int modsum = -applyLut( pixel - tb( x, y - 1 ), 0 ) - applyLut( pixel - tb( x - 1, y ), 0 )
+                 - applyLut( pixel - tb( x + 1, y - 1 ), 16 ) - applyLut( pixel - tb( x - 1, y - 1 ), 16 );
+    modsum += applyLut( tb( x + 1, y ) - pixel, 0 ) + applyLut( tb( x, y + 1 ) - pixel, 0 );
+    modsum += applyLut( tb( x - 1, y + 1 ) - pixel, 16 ) + applyLut( tb( x + 1, y + 1 ) - pixel, 16 );
+    modsum += applyLut( tb( x, y - 2 ) - pixel, 32 ) + applyLut( tb( x, y + 2 ) - pixel, 32 );
+    modsum += applyLut( tb( x - 2, y ) - pixel, 32 ) + applyLut( tb( x + 2, y ) - pixel, 32 );
+    const int filt = int( int16_t( ( modsum * bfac + ( pc.roundAdd << 3 ) ) >> ( pc.roundShift + 3 ) ) );
+    const int idx  = g_origin + ( g_b.y + y ) * g_stride + g_b.x + x;
+    const int v    = int( pc.dst.v[idx] ) + filt;
+    pc.dst.v[idx]  = int16_t( clipNow ? clamp( v, 0, maxVal ) : v );
+  }
+}

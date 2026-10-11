@@ -137,8 +137,8 @@ bool DecAppCfg::parseCfg( int argc, char* argv[] )
   ("targetSubPicIdx",          m_targetSubPicIdx,                     0,           "Specify which subpicture shall be written to output, using subpic index, 0: disabled, subpicIdx=m_targetSubPicIdx-1 \n" )
   ("ParseSliceFirst",          m_parseSliceFirst,                     false,       "Parse all CTUs of a slice before reconstructing them (same output; checks that parsing is independent of reconstruction)")
 #if ECM_VULKAN
-  ("Vulkan",                   m_vulkan,                              false,       "Run deblocking on the GPU (Vulkan)")
-  ("VulkanCheck",              m_vulkanCheck,                         false,       "With Vulkan: also deblock on the CPU and stop at the first difference")
+  ("Vulkan",                   m_vulkan,                              false,       "Run the decoding stages ported to the GPU (Vulkan): deblocking, SAO, bilateral filter, CCSAO")
+  ("VulkanCheck",              m_vulkanCheck,                         false,       "With Vulkan: also run those stages on the CPU and stop at the first difference")
   ("VulkanValidate",           m_vulkanValidate,                      false,       "With Vulkan: enable the Khronos validation layer")
   ("VulkanDevice",             m_vulkanDevice,                        -1,          "With Vulkan: index of the GPU, -1 prefers a discrete GPU")
 #endif

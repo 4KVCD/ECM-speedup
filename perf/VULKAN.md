@@ -16,11 +16,13 @@ DecoderApp options:
 
 | option | meaning |
 |---|---|
-| `--Vulkan=1` | deblock on the GPU |
-| `--VulkanCheck=1` | with `--Vulkan`: also deblock on the CPU and stop at the first sample that differs, with the edge parameters and samples around it |
+| `--Vulkan=1` | run the stages ported to the GPU (see Status) |
+| `--VulkanCheck=1` | with `--Vulkan`: also run those stages on the CPU, start each GPU stage from the CPU's input and stop at the first sample that differs; at the end, print how much work each GPU stage did |
 | `--VulkanValidate=1` | enable the Khronos validation layer (from the SDK) |
 | `--VulkanDevice=N` | choose the GPU; -1 prefers a discrete GPU |
 | `--ParseSliceFirst=1` | parse all CTUs of a slice before reconstructing them; the output must not change |
+
+`perf/vkcoverage.py EXE` sums those counts over the corpus, so that paths the corpus never exercises show up.
 
 `VulkanTestApp` runs unit tests of shader code against the CPU: `selftest` and `sf64`, the software double arithmetic
 that replaces FP64 on GPUs without it.
@@ -54,13 +56,31 @@ samples apart, one with filter length 3, read each other's output. The GPU there
 (vertical edges) or 4 columns (horizontal edges) in the CPU's order, left to right or top to bottom, one strip per
 invocation.
 
+### SAO, bilateral filter and CCSAO
+
+As on the CPU, SAO, the bilateral filter (BIF) and CCSAO read the deblocked picture and add their offsets without
+clipping; one joint clip follows. SAO runs per sample: the CPU's sign-line recurrences reduce to two sign
+comparisons. The CPU lists the transform blocks that BIF filters, split at virtual boundaries, with the border
+availability that decides their padding; the GPU filters one block per workgroup. CCSAO walks each CTU line by line
+with pointers that it advances differently per case, and band case 6 starts its line loop at y = 1 on line 0, so a
+4:2:0 luma line y reads chroma line (y + 1) / 2. The GPU replays the CPU's pointer advances per line to get every
+case right.
+
 ## Status
 
 | stage | GPU | checked on the corpus |
 |---|---|---|
 | deblocking, luma and chroma | yes | 48 streams identical |
 | deblocking with LADF or the asymmetric GDR filter | yes | not exercised: no corpus stream uses them |
+| SAO (all 4 edge classes, band offset), bilateral filter luma and chroma, CCSAO edge directions 0-3 and band candidates 4-8, joint clipping | yes | 48 streams identical |
+| CCSAO band candidates 0-3, virtual boundaries | yes | not exercised |
 | everything else | CPU | - |
 
-Speed: on the hybrid path the per-picture copies and the synchronous wait cost more than the GPU saves. ra_cif
-(289 frames CIF, Core Ultra 7 265K iGPU): 6.01 s CPU deblocking, 6.43 s GPU deblocking, of which 0.105 s GPU time.
+Speed: on the hybrid path the per-picture copies and the synchronous waits cost more than the GPU saves. ra_cif
+(289 frames CIF, Core Ultra 7 265K iGPU), decoder time:
+
+| stages on the GPU | total | GPU time |
+|---|---|---|
+| none | 5.8-6.0 s | - |
+| deblocking | 6.4 s | 0.105 s |
+| deblocking, SAO, BIF, CCSAO | 7.1-7.4 s | 0.45 s |

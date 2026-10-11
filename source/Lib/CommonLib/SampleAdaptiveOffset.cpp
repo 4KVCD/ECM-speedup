@@ -1692,6 +1692,34 @@ void SampleAdaptiveOffset::applyCcSao(CodingStructure &cs, const PreCalcValues& 
   }
 }
 
+void SampleAdaptiveOffset::reconstructSaoParams( CodingStructure& cs, SAOBlkParam* dst )
+{
+  const SAOBlkParam* src = cs.picture->getSAO();
+  for( int ctuRsAddr = 0; ctuRsAddr < cs.pcv->sizeInCtus; ctuRsAddr++ )
+  {
+    dst[ctuRsAddr] = src[ctuRsAddr];
+  }
+  // As in xReconstructBlkSAOParams: merge candidates point into dst, where the CTUs before are already resolved.
+  for( int ctuRsAddr = 0; ctuRsAddr < cs.pcv->sizeInCtus; ctuRsAddr++ )
+  {
+    SAOBlkParam* mergeList[NUM_SAO_MERGE_TYPES] = { nullptr };
+    getMergeList( cs, ctuRsAddr, dst, mergeList );
+    reconstructBlkSAOParam( dst[ctuRsAddr], mergeList );
+  }
+}
+
+uint8_t SampleAdaptiveOffset::ctuAvailability( CodingStructure& cs, const Position& pos ) const
+{
+  bool avail[8];
+  deriveLoopFilterBoundaryAvailibility( cs, pos, avail[0], avail[1], avail[2], avail[3], avail[4], avail[5], avail[6], avail[7] );
+  uint8_t bits = 0;
+  for( int i = 0; i < 8; i++ )
+  {
+    bits |= avail[i] << i;
+  }
+  return bits;
+}
+
 void SampleAdaptiveOffset::jointClipSaoBifCcSao(CodingStructure& cs)
 {
 #if JVET_V0094_BILATERAL_FILTER

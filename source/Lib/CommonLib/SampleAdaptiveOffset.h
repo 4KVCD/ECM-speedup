@@ -85,6 +85,15 @@ public:
   uint8_t* getCcSaoControlIdc(const ComponentID compID) { return m_ccSaoControl[compID]; }
   PelStorage& getCcSaoBuf() { return m_ccSaoBuf; }
   void jointClipSaoBifCcSao(CodingStructure& cs);
+
+  /// For a filter implementation outside this class (the GPU decoder): the SAO parameters of every CTU with merges
+  /// resolved and offsets scaled, as SAOProcess uses them, written to dst. The picture's own parameters stay as
+  /// they are.
+  void reconstructSaoParams( CodingStructure& cs, SAOBlkParam* dst );
+  /// Which neighbours of the CTU at pos the loop filters may read, as bits: left, right, above, below, above-left,
+  /// above-right, below-left, below-right (bit 0 to 7).
+  uint8_t ctuAvailability( CodingStructure& cs, const Position& pos ) const;
+  uint32_t offsetStepLog2( const ComponentID comp ) const { return m_offsetStepLog2[comp]; }
 #if JVET_AE0151_CCSAO_HISTORY_OFFSETS_AND_EXT_EO
   static int getCcSaoClassNum(const int compIdx, const int setIdx, const CcSaoComParam& ccSaoParam);
   inline int getCcSaoEdgeIdx(const Pel c, const Pel a, const int t, const int edgeIdc)

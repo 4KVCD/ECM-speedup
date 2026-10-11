@@ -240,13 +240,14 @@ private:
   vkd::Core*              m_vkCore  = nullptr;
   vkd::VkLoopFilter       m_vkLoopFilter;
   bool                    m_vkCheck = false;   ///< run the CPU filters too and require identical results
-  double                  m_vkGpuMs = 0;       ///< GPU time of all pictures
 
 public:
   /// Moves the in-loop filters to the GPU. With check set, the CPU also filters and every picture must match.
   /// Returns false with a message in error if no usable GPU is found.
   bool initVulkan( bool check, bool validate, int device, std::string& error );
-  double vulkanGpuMs() const { return m_vkGpuMs; }
+  double vulkanGpuMs() const { return m_vkLoopFilter.gpuMs(); }
+  const vkd::VkLoopFilter::Counts& vulkanCounts() const { return m_vkLoopFilter.counts(); }
+  bool vulkanCheck() const { return m_vkCheck; }
 #endif
 
   DCI*                    m_dci;

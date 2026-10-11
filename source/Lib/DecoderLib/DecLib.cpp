@@ -684,7 +684,7 @@ bool DecLib::initVulkan( bool check, bool validate, int device, std::string& err
     return false;
   }
   m_vkCheck = check;
-  m_vkLoopFilter.init( m_vkCore );
+  m_vkLoopFilter.init( m_vkCore, check );
   msg( INFO, "GPU decoding on %s, driver 0x%x%s\n", m_vkCore->deviceName().c_str(), m_vkCore->driverVersion(),
        check ? ", every picture checked against the CPU" : "" );
   return true;
@@ -955,8 +955,8 @@ void DecLib::executeLoopFilters()
   if( m_vkCore )
   {
     // The CPU walks the coding units and records the edge parameters; the GPU filters the samples.
-    m_vkLoopFilter.beginPicture( cs, m_vkCheck );
-    m_cLoopFilter.setEdgeMaps( &m_vkLoopFilter.edgeMaps() );
+    m_vkLoopFilter.beginPicture( cs );
+    m_cLoopFilter.setEdgeMaps( &m_vkLoopFilter.deblockPrepare( cs ) );
   }
 #endif
   m_cLoopFilter.loopFilterPic( cs, codingInfoBuf, storeCodingInfo );
@@ -968,22 +968,7 @@ void DecLib::executeLoopFilters()
   {
     m_cLoopFilter.setEdgeMaps( nullptr );
     m_vkLoopFilter.deblock( cs );
-    m_vkGpuMs += m_vkLoopFilter.lastGpuMs();
-    PelUnitBuf reco = cs.picture->getRecoBuf();
-    if( m_vkCheck )
-    {
-      std::string diff;
-      int         comp, x, y;
-      if( !m_vkLoopFilter.picture().compare( reco, diff, comp, x, y ) )
-      {
-        THROW( "GPU deblocking differs from the CPU in POC " << cs.slice->getPOC() << ": " << diff
-               << ( comp == 0 ? m_vkLoopFilter.describeLuma( x, y, reco ) : std::string() ) );
-      }
-    }
-    else
-    {
-      m_vkLoopFilter.picture().download( reco );
-    }
+    m_vkLoopFilter.checkAgainstCpu( cs, "deblocking" );
   }
 #endif
 
@@ -1000,6 +985,12 @@ void DecLib::executeLoopFilters()
 
       int stageIdx = 0;
       int refineIdx = cs.slice->getOffsetRefinementDbfIdx();
+#if ECM_VULKAN
+      if( m_vkCore )
+      {
+        m_vkLoopFilter.syncToCpu( cs );
+      }
+#endif
       m_cALF.calcOffsetRefinement(cs, dbfInput, dbfOutput, dbfOffsetRefine, stageIdx, refineIdx );
       m_cALF.copyOffsetRefinement(cs, dbfOffsetRefine, dbfOutput);
     }
@@ -1062,8 +1053,19 @@ void DecLib::executeLoopFilters()
   }
 #endif
 
+#if ECM_VULKAN
+  // SAO, bilateral filter and CCSAO run on the GPU; in check mode the CPU runs them too.
+  const bool cpuSao = !m_vkCore || m_vkCheck;
+  if( m_vkCore )
+  {
+    m_vkLoopFilter.sao( cs, m_cSAO );
+  }
+#else
+  const bool cpuSao = true;
+#endif
+
 #if JVET_W0066_CCSAO
-  if (cs.sps->getCCSAOEnabledFlag())
+  if (cs.sps->getCCSAOEnabledFlag() && cpuSao)
   {
     m_cSAO.getCcSaoBuf().copyFrom( cs.getRecoBuf() );
   }
@@ -1071,15 +1073,15 @@ void DecLib::executeLoopFilters()
 
 #if JVET_V0094_BILATERAL_FILTER
 #if JVET_X0071_CHROMA_BILATERAL_FILTER
-  if( cs.sps->getSAOEnabledFlag() || cs.pps->getUseBIF() || cs.pps->getUseChromaBIF())
+  if( cpuSao && ( cs.sps->getSAOEnabledFlag() || cs.pps->getUseBIF() || cs.pps->getUseChromaBIF() ) )
 #else
-  if( cs.sps->getSAOEnabledFlag() || cs.pps->getUseBIF())
+  if( cpuSao && ( cs.sps->getSAOEnabledFlag() || cs.pps->getUseBIF() ) )
 #endif
 #else
 #if JVET_X0071_CHROMA_BILATERAL_FILTER
-  if( cs.sps->getSAOEnabledFlag() || cs.pps->getUseChromaBIF())
+  if( cpuSao && ( cs.sps->getSAOEnabledFlag() || cs.pps->getUseChromaBIF() ) )
 #else
-  if( cs.sps->getSAOEnabledFlag() )
+  if( cpuSao && cs.sps->getSAOEnabledFlag() )
 #endif
 #endif
   {
@@ -1087,12 +1089,23 @@ void DecLib::executeLoopFilters()
   }
     
 #if JVET_W0066_CCSAO
-  if (cs.sps->getCCSAOEnabledFlag())
+  if (cs.sps->getCCSAOEnabledFlag() && cpuSao)
   {
     m_cSAO.getCcSaoComParam() = cs.slice->m_ccSaoComParam;
     m_cSAO.CCSAOProcess( cs );
   }
-  m_cSAO.jointClipSaoBifCcSao( cs );
+  if( cpuSao )
+  {
+    m_cSAO.jointClipSaoBifCcSao( cs );
+  }
+#endif
+#if ECM_VULKAN
+  if( m_vkCore )
+  {
+    m_vkLoopFilter.checkAgainstCpu( cs, "SAO, bilateral filter and CCSAO" );
+    // The stages after this one run on the CPU.
+    m_vkLoopFilter.syncToCpu( cs );
+  }
 #endif
 
 #if JVET_AL0153_ALF_CCCM

@@ -47,6 +47,7 @@
 #include <vector>
 
 class CodingStructure;
+class SampleAdaptiveOffset;
 
 namespace vkd
 {
@@ -88,34 +89,78 @@ private:
   ChromaFormat m_format  = CHROMA_420;
 };
 
-/// Runs the deblocking filter of a picture on the GPU. The CPU decoder hands over the reconstruction and the edge
-/// parameters that LoopFilter records while it walks the coding units.
+/// Runs in-loop filter stages of a picture on the GPU: deblocking, and SAO with the bilateral filter and CCSAO.
+/// The CPU decoder runs the other stages and hands over the parameters each GPU stage needs.
+///
+/// In check mode the CPU also runs every GPU stage. Each GPU stage then starts from the CPU's input and its result
+/// must equal the CPU's (checkAgainstCpu). Otherwise the picture stays on the GPU between GPU stages, and
+/// syncToCpu copies it back before a stage that runs on the CPU.
 class VkLoopFilter
 {
 public:
-  void init( Core* core ) { m_core = core; }
+  void init( Core* core, bool check );
   void destroy();
+  bool checking() const { return m_check; }
 
-  /// Prepares the GPU buffers for the picture of cs and uploads its reconstruction.
-  void beginPicture( const CodingStructure& cs, bool filterOnCpu );
-  /// The edge maps for LoopFilter::setEdgeMaps, cleared for the current picture.
-  DeblockEdgeMaps& edgeMaps() { return m_maps; }
-  /// Deblocks the uploaded picture with the recorded edge parameters.
-  void deblock( const CodingStructure& cs );
-  GpuPicture& picture() { return m_pic; }
-  double lastGpuMs() const { return m_lastGpuMs; }
-  /// Describes the edge parameters and samples around a luma position, for a difference found by the check mode.
-  std::string describeLuma( int x, int y, const CPelUnitBuf& cpu ) const;
+  /// Starts a picture whose reconstruction is on the CPU.
+  void beginPicture( CodingStructure& cs );
+  /// Makes the CPU picture current, before a stage that runs on the CPU. The GPU copy is stale afterwards.
+  void syncToCpu( CodingStructure& cs );
+
+  /// The edge maps for LoopFilter::setEdgeMaps, cleared, before LoopFilter::loopFilterPic.
+  DeblockEdgeMaps& deblockPrepare( CodingStructure& cs );
+  /// Deblocks the picture with the recorded edge parameters.
+  void deblock( CodingStructure& cs );
+
+  /// SAO, bilateral filter, CCSAO and their joint clipping, as SAOProcess, CCSAOProcess and jointClipSaoBifCcSao.
+  void sao( CodingStructure& cs, SampleAdaptiveOffset& sao );
+
+  /// Check mode: compares the GPU result of the last stage with the CPU picture; throws on a difference.
+  void checkAgainstCpu( CodingStructure& cs, const char* stage );
+
+  double gpuMs() const { return m_gpuMs; }
+
+  /// Check mode: how much work each GPU stage did, so that a check run shows which paths it covered.
+  struct Counts
+  {
+    uint64_t pictures       = 0;
+    uint64_t deblockSegments = 0;   ///< luma and chroma edge segments with a boundary strength
+    uint64_t saoCtus[5]     = {};  ///< CTU components with SAO on, by type: edge 0, 90, 135, 45 degrees, band
+    uint64_t bifBlocks      = 0;
+    uint64_t ccSaoBand[9]   = {};  ///< CTU components with CCSAO on, by band candidate position
+    uint64_t ccSaoEdge[4]   = {};  ///< and by edge direction
+  };
+  const Counts& counts() const { return m_counts; }
 
 private:
-  std::vector<Pel> m_input;   ///< the picture before deblocking, kept in check mode for describeLuma
-  Core*           m_core = nullptr;
-  GpuPicture      m_pic;
-  Buffer          m_edgeBuf;   ///< luma maps (vertical, horizontal), then chroma maps (vertical, horizontal)
-  DeblockEdgeMaps m_maps;
-  size_t          m_lumaMapBytes   = 0;
-  size_t          m_chromaMapBytes = 0;
-  double          m_lastGpuMs      = 0;
+  void ensureOnGpu( CodingStructure& cs );
+  void ensureBuffer( Buffer& buf, size_t size, Mem mem );
+  std::string describeLuma( int x, int y, const CPelUnitBuf& cpu ) const;
+
+  Core*            m_core  = nullptr;
+  bool             m_check = false;
+  bool             m_cpuCurrent = true;
+  bool             m_gpuCurrent = false;
+  int              m_lastStage  = 0;     ///< 1 after deblocking, for describeLuma
+  GpuPicture       m_pic;
+  GpuPicture       m_tmp;               ///< scratch picture, e.g. the input of SAO
+  std::vector<Pel> m_input;             ///< check mode: the input of the last stage, for describeLuma
+
+  Buffer           m_edgeBuf;           ///< deblocking: luma maps (vertical, horizontal), then chroma maps
+  DeblockEdgeMaps  m_maps;
+  size_t           m_lumaMapBytes   = 0;
+  size_t           m_chromaMapBytes = 0;
+
+  Buffer           m_saoParams;         ///< SaoCtu per CTU and component
+  Buffer           m_bifBlocks;
+  Buffer           m_bifTables;
+  Buffer           m_ccSaoSets;
+  Buffer           m_ctuBytes;          ///< CCSAO set per CTU and component, CTU availability, clip flags
+  Buffer           m_ccSaoTables;
+  std::vector<uint8_t> m_scratch;
+
+  double           m_gpuMs = 0;
+  Counts           m_counts;
 };
 
 }   // namespace vkd

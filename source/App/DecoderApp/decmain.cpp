@@ -105,6 +105,12 @@ int main(int argc, char* argv[])
     std::cout << "Memory allocation failed: " << e.what() << std::endl;
     returnCode = EXIT_FAILURE;
   }
+  catch( const std::exception& e )
+  {
+    // e.g. a failed Vulkan call of the GPU decoder
+    std::cerr << "\nERROR: " << e.what() << std::endl;
+    returnCode = EXIT_FAILURE;
+  }
 #endif
 
   #if JVET_Z0150_MEMORY_USAGE_PRINT

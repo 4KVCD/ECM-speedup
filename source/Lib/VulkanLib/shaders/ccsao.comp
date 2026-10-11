@@ -1,0 +1,317 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+// Cross-component SAO without clipping, a port of SampleAdaptiveOffset::offsetCTUCcSaoNoClip and of
+// offsetBlockCcSaoNoClipEdge / offsetBlockCcSaoNoClip. Those functions walk a CTU line by line with pointers into
+// the luma and chroma planes that they advance after each line, and the advances differ between cases: in band
+// case 6 the line loop starts at y = 1 on line 0, so 4:2:0 luma lines read chroma line (y + 1) / 2. To reproduce
+// every case exactly, one invocation handles one step of the CPU's line sequence (first line, an iteration of the
+// main loop, or last line) and replays the pointer advances of the steps before it.
+
+layout( local_size_x = 64 ) in;
+
+struct CcSaoSet
+{
+  int     type;          // 0: band, 1: edge
+  int     candPos[3];    // band: candPos[0] = luma candidate; edge: [0] = edge direction, [1] = edge component
+  int     bandNum[3];    // band: band numbers Y, U, V; edge: [0] band table index, [1] threshold, [2] edge idc
+  int16_t offset[64];
+};
+layout( buffer_reference, scalar, buffer_reference_align = 4 ) buffer CcSaoSets { CcSaoSet s[]; };   // [comp * 4 + set]
+layout( buffer_reference, scalar, buffer_reference_align = 1 ) buffer CtuBytes { uint8_t b[]; };
+
+layout( push_constant, scalar ) uniform Push
+{
+  I16Buf    src;          // the picture before SAO
+  I16Buf    dst;
+  CcSaoSets sets;
+  CtuBytes  setIdc;       // [comp * numCtus + ctu], 0: off
+  CtuBytes  avail;        // [ctu], SampleAdaptiveOffset::ctuAvailability
+  int       origin[3];
+  int       stride[3];
+  int       width[3];
+  int       height[3];
+  int       comp;
+  int       numCtus;
+  int       widthInCtus;
+  int       ctuSize;      // luma
+  int       scaleX;       // chroma subsampling
+  int       scaleY;
+  int       bitDepth;     // of comp
+  int       offsetStepLog2;
+  int       numHorVb;     // virtual boundaries in luma samples
+  int       numVerVb;
+  int       horVb[3];
+  int       verVb[3];
+  I16Buf    tabs;         // g_ccSaoEdgeThr[2][16], then g_ccSaoBandTab[16][2]
+} pc;
+
+// g_ccSaoEdgePosX/Y, g_ccSaoBandTab, g_ccSaoEdgeThr, g_ccSaoEdgeNum, g_ccSaoCandPosX/Y of Rom.cpp
+const int edgePosX[8] = int[]( -1, 1, 0, 0, -1, 1, 1, -1 );
+const int edgePosY[8] = int[]( 0, 0, -1, 1, -1, 1, -1, 1 );
+const int candPosX[9] = int[]( -1, 0, 1, -1, 0, 1, -1, 0, 1 );
+const int candPosY[9] = int[]( -1, -1, -1, 0, 0, 0, 1, 1, 1 );
+const int edgeNum[4]  = int[]( 16, 4, 4, 2 );   // [edgeIdc][0..1]
+
+
+// A sample of plane c, with the picture border replicated outward (SampleAdaptiveOffset::CCSAOProcess extends the
+// border by one sample before filtering).
+int S( int c, int x, int y )
+{
+  x = clamp( x, 0, pc.width[c] - 1 );
+  y = clamp( y, 0, pc.height[c] - 1 );
+  return int( pc.src.v[pc.origin[c] + y * pc.stride[c] + x] );
+}
+
+int edgeIdxOf( int c, int a, int t, int edgeIdc )
+{
+  const int d = c - a;
+  if( edgeIdc == 0 )
+  {
+    return d < 0 ? ( d < -t ? 0 : 1 ) : ( d < t ? 2 : 3 );
+  }
+  return d < t ? 0 : 1;
+}
+
+// Emulated line pointers, relative to the CTU: the line of the filtered component (also the dst line), of luma
+// and of chroma.
+int g_rowD, g_rowY, g_rowC;
+
+void advanceAfterFirstLine()
+{
+  g_rowD++;
+  if( pc.comp == 0 )
+  {
+    g_rowY++;
+    g_rowC += 1 - pc.scaleY;
+  }
+  else
+  {
+    g_rowY += 1 << pc.scaleY;
+    g_rowC++;
+  }
+}
+
+void advanceAfterMainLine( int y )
+{
+  g_rowD++;
+  if( pc.comp == 0 )
+  {
+    g_rowY++;
+    g_rowC += ( y & 1 ) | ( 1 - pc.scaleY );
+  }
+  else
+  {
+    g_rowY += 1 << pc.scaleY;
+    g_rowC++;
+  }
+}
+
+bool vbDisabled( int x, int y, bool checkVer, bool checkHor, int lumaX, int lumaY, int lumaW, int lumaH, int compX, int compY )
+{
+  const int sx = pc.comp == 0 ? 0 : pc.scaleX, sy = pc.comp == 0 ? 0 : pc.scaleY;
+  if( checkVer )
+  {
+    for( int i = 0; i < pc.numVerVb; i++ )
+    {
+      const int v = pc.verVb[i];
+      if( lumaX <= v && v <= lumaX + lumaW )
+      {
+        const int p = ( v >> sx ) - compX;
+        if( x == p || x == p - 1 )
+        {
+          return true;
+        }
+      }
+    }
+  }
+  if( checkHor )
+  {
+    for( int i = 0; i < pc.numHorVb; i++ )
+    {
+      const int v = pc.horVb[i];
+      if( lumaY <= v && v <= lumaY + lumaH )
+      {
+        const int p = ( v >> sy ) - compY;
+        if( y == p || y == p - 1 )
+        {
+          return true;
+        }
+      }
+    }
+  }
+  return false;
+}
+
+void main()
+{
+  const int ctu  = int( gl_GlobalInvocationID.y );
+  const int slot = int( gl_GlobalInvocationID.x );
+  if( ctu >= pc.numCtus )
+  {
+    return;
+  }
+  const int setIdc = int( pc.setIdc.b[pc.comp * pc.numCtus + ctu] );
+  if( setIdc == 0 )
+  {
+    return;
+  }
+  const CcSaoSet st = pc.sets.s[pc.comp * 4 + setIdc - 1];
+  const int  sx = pc.comp == 0 ? 0 : pc.scaleX, sy = pc.comp == 0 ? 0 : pc.scaleY;
+  const int  lumaX = ( ctu % pc.widthInCtus ) * pc.ctuSize, lumaY = ( ctu / pc.widthInCtus ) * pc.ctuSize;
+  const int  lumaW = min( pc.ctuSize, pc.width[0] - lumaX ), lumaH = min( pc.ctuSize, pc.height[0] - lumaY );
+  const int  x0 = lumaX >> sx, y0 = lumaY >> sy;   // the CTU in the filtered component
+  const int  w = lumaW >> sx, h = lumaH >> sy;
+  const uint av = uint( pc.avail.b[ctu] );
+  const bool L = ( av & 1u ) != 0u, R = ( av & 2u ) != 0u, A = ( av & 4u ) != 0u, B = ( av & 8u ) != 0u;
+  const bool AL = ( av & 16u ) != 0u, AR = ( av & 32u ) != 0u, BL = ( av & 64u ) != 0u, BR = ( av & 128u ) != 0u;
+  const int  startXd = L ? 0 : 1, endXd = R ? w : w - 1;
+  const bool vbAny = pc.numHorVb > 0 || pc.numVerVb > 0;
+
+  // The CPU's line sequence of this case: an optional advance before the loop, an optional first line, main loop
+  // iterations y = ys .. ye - 1, an optional last line. Each step has an x range and the y the CPU passes to the
+  // virtual boundary test.
+  bool preAdvance = false, hasFirst = false, hasLast = false;
+  int  ys = 0, ye = h;
+  int  firstS = 0, firstE = 0, mainS = 0, mainE = w, lastS = 0, lastE = 0;
+  bool checkVer = true, checkHor = true;
+  const bool edge = st.type == 1;
+  const int  kase = st.candPos[0];   // edge: direction 0-3, band: candidate 0-8
+  if( edge )
+  {
+    if( kase == 0 )
+    {
+      mainS = startXd; mainE = endXd; checkHor = false;
+    }
+    else if( kase == 1 )
+    {
+      preAdvance = !A; ys = A ? 0 : 1; ye = B ? h : h - 1; checkVer = false;
+    }
+    else
+    {
+      hasFirst = hasLast = true;
+      ys = 1; ye = h - 1;
+      mainS = startXd; mainE = endXd;
+      if( kase == 2 )
+      {
+        firstS = AL ? 0 : 1;          firstE = A ? endXd : 1;
+        lastS  = B ? startXd : w - 1; lastE  = BR ? w : w - 1;
+      }
+      else
+      {
+        firstS = A ? startXd : w - 1; firstE = AR ? w : w - 1;
+        lastS  = BL ? 0 : 1;          lastE  = B ? endXd : 1;
+      }
+    }
+  }
+  else
+  {
+    const int bs = L ? 0 : 1;
+    switch( kase )
+    {
+    case 0: hasFirst = true; firstS = AL ? 0 : 1; firstE = A ? w : 1; ys = 1; mainS = bs; break;
+    case 1: preAdvance = !A; ys = A ? 0 : 1; checkVer = false; break;
+    case 2: hasFirst = true; firstS = A ? bs : w - 1; firstE = AR ? w : w - 1; ys = 1; mainS = bs; break;
+    case 3: mainS = bs; checkHor = false; break;
+    case 4: checkVer = checkHor = false; break;
+    case 5: mainE = R ? w : w - 1; checkHor = false; break;
+    case 6: ys = 1; mainS = bs; hasLast = true; lastS = BL ? 0 : 1; lastE = B ? w : 1; break;
+    case 7: ye = B ? h : h - 1; checkVer = false; break;
+    case 8: ye = h - 1; mainE = R ? w : w - 1; hasLast = true; lastS = B ? 0 : w - 1; lastE = BR ? w : w - 1; break;
+    }
+  }
+
+  const int numMain  = max( ye - ys, 0 );
+  const int numSlots = ( hasFirst ? 1 : 0 ) + numMain + ( hasLast ? 1 : 0 );
+  if( slot >= numSlots )
+  {
+    return;
+  }
+  g_rowD = g_rowY = g_rowC = 0;
+  if( preAdvance )
+  {
+    advanceAfterFirstLine();
+  }
+  int s = 0;
+  if( hasFirst && slot > 0 )
+  {
+    advanceAfterFirstLine();
+    s = 1;
+  }
+  for( int y = ys; s < slot && y < ye; y++, s++ )
+  {
+    advanceAfterMainLine( y );
+  }
+  int xS, xE, vbY;
+  if( hasFirst && slot == 0 )
+  {
+    xS = firstS; xE = firstE; vbY = 0;
+  }
+  else if( hasLast && slot == numSlots - 1 )
+  {
+    xS = lastS; xE = lastE; vbY = h - 1;
+  }
+  else
+  {
+    xS = mainS; xE = mainE; vbY = ys + slot - ( hasFirst ? 1 : 0 );
+  }
+
+  // the planes as the CPU's col pointers see them
+  const int cy0 = lumaY >> pc.scaleY, cx0 = lumaX >> pc.scaleX;
+  const int edgeCmp = st.candPos[1];
+  int thrVal = 0, eIdc = 0, eNum = 0, eNumUni = 0, bandCmp = 0, bandNumE = 0;
+  if( edge )
+  {
+    const int bandIdc = st.bandNum[0];
+    bandCmp  = int( pc.tabs.v[32 + bandIdc * 2] );
+    bandNumE = int( pc.tabs.v[32 + bandIdc * 2 + 1] );
+    eIdc     = st.bandNum[2];
+    thrVal   = int( pc.tabs.v[eIdc * 16 + st.bandNum[1]] ) << max( 0, pc.bitDepth - 10 );
+    eNum     = edgeNum[eIdc * 2];
+    eNumUni  = edgeNum[eIdc * 2 + 1];
+  }
+  for( int x = xS; x < xE; x++ )
+  {
+    if( vbAny && checkVer || vbAny && checkHor )
+    {
+      if( vbDisabled( x, vbY, checkVer, checkHor, lumaX, lumaY, lumaW, lumaH, x0, y0 ) )
+      {
+        continue;
+      }
+    }
+    // positions of the col pointers: luma (lx, ly), chroma (cx, cy)
+    int lx, ly, cx, cy;
+    if( pc.comp == 0 )
+    {
+      lx = lumaX + x;                          ly = lumaY + g_rowY;
+      cx = cx0 + ( x >> pc.scaleX );           cy = cy0 + g_rowC;
+    }
+    else
+    {
+      lx = lumaX + ( x << pc.scaleX );         ly = lumaY + g_rowY;
+      cx = cx0 + x;                            cy = cy0 + g_rowC;
+    }
+    int classIdx;
+    if( edge )
+    {
+      const int ex = edgeCmp == 0 ? lx : cx, ey = edgeCmp == 0 ? ly : cy;
+      const int e  = S( edgeCmp, ex, ey );
+      const int a  = S( edgeCmp, ex + edgePosX[kase * 2], ey + edgePosY[kase * 2] );
+      const int b  = S( edgeCmp, ex + edgePosX[kase * 2 + 1], ey + edgePosY[kase * 2 + 1] );
+      const int edgeIdx = edgeIdxOf( e, a, thrVal, eIdc ) * eNumUni + edgeIdxOf( e, b, thrVal, eIdc );
+      const int bv      = bandCmp == 0 ? S( 0, lx, ly ) : S( bandCmp, cx, cy );
+      const int bandIdx = ( bv * bandNumE ) >> pc.bitDepth;
+      classIdx = bandIdx * eNum + edgeIdx;
+    }
+    else
+    {
+      const int bandY = ( S( 0, lx + candPosX[kase], ly + candPosY[kase] ) * st.bandNum[0] ) >> pc.bitDepth;
+      const int bandU = ( S( 1, cx, cy ) * st.bandNum[1] ) >> pc.bitDepth;
+      const int bandV = ( S( 2, cx, cy ) * st.bandNum[2] ) >> pc.bitDepth;
+      classIdx = bandY * st.bandNum[1] * st.bandNum[2] + bandU * st.bandNum[2] + bandV;
+    }
+    const int idx = pc.origin[pc.comp] + ( y0 + g_rowD ) * pc.stride[pc.comp] + x0 + x;
+    pc.dst.v[idx] = int16_t( int( pc.dst.v[idx] ) + ( int( st.offset[classIdx] ) << pc.offsetStepLog2 ) );
+  }
+}

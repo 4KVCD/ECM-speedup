@@ -639,6 +639,26 @@ void DecApp::xDestroyDecLib()
   if( m_vulkan )
   {
     msg( INFO, "\n GPU time:   %12.3f sec.\n", m_cDecLib.vulkanGpuMs() / 1000 );
+    if( m_cDecLib.vulkanCheck() )
+    {
+      const auto& n = m_cDecLib.vulkanCounts();
+      std::string sao, band, edge;
+      for( uint64_t v: n.saoCtus )
+      {
+        sao += " " + std::to_string( v );
+      }
+      for( uint64_t v: n.ccSaoBand )
+      {
+        band += " " + std::to_string( v );
+      }
+      for( uint64_t v: n.ccSaoEdge )
+      {
+        edge += " " + std::to_string( v );
+      }
+      msg( INFO, " GPU stages checked on %llu pictures: deblocking segments %llu, SAO CTUs by type%s, bilateral filter blocks %llu, CCSAO CTUs by band candidate%s, by edge direction%s\n",
+           (unsigned long long) n.pictures, (unsigned long long) n.deblockSegments, sao.c_str(), (unsigned long long) n.bifBlocks,
+           band.c_str(), edge.c_str() );
+    }
   }
 #endif
   // destroy decoder class
