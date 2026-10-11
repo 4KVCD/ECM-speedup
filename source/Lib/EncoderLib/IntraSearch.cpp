@@ -614,6 +614,9 @@ void IntraSearch::init( EncCfg*        pcEncCfg,
     }
     m_pdpIntraPredBuf[i] = new Pel[ MAX_PDP_SIZE * MAX_PDP_SIZE ]; //MAX_PDP_SIZE where pdp is applied.
   }
+  // the prediction's view of the buffers: a CU that saves PDP predictions sets it too, but a search stack's first
+  // picture (frame threads) may use a saved prediction before any CU of that stack did
+  std::memcpy( m_pdpIntraPredBufIP, m_pdpIntraPredBuf, sizeof( m_pdpIntraPredBufIP ) );
 #endif
 #if JVET_AM0074_INTRA_MERGE
   for (int i = 0; i < DIMD_FUSION_NUM; i++)
