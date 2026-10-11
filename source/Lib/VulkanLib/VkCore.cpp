@@ -495,6 +495,7 @@ VkPipeline Core::pipeline( const char* name )
 
 void Core::begin()
 {
+  wait();
   check( vkResetCommandBuffer( m_cmd, 0 ), "vkResetCommandBuffer" );
   VkCommandBufferBeginInfo bi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
   bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
@@ -578,7 +579,7 @@ int Core::timestamp()
   return m_numQueries++;
 }
 
-void Core::submit()
+void Core::submit( bool wait )
 {
   check( vkEndCommandBuffer( m_cmd ), "vkEndCommandBuffer" );
   VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
@@ -586,7 +587,21 @@ void Core::submit()
   si.pCommandBuffers    = &m_cmd;
   check( vkResetFences( m_device, 1, &m_fence ), "vkResetFences" );
   check( vkQueueSubmit( m_queue, 1, &si, m_fence ), "vkQueueSubmit" );
+  m_inFlight = true;
+  if( wait )
+  {
+    this->wait();
+  }
+}
+
+void Core::wait()
+{
+  if( !m_inFlight )
+  {
+    return;
+  }
   check( vkWaitForFences( m_device, 1, &m_fence, VK_TRUE, UINT64_MAX ), "vkWaitForFences" );
+  m_inFlight = false;
   if( m_numQueries )
   {
     check( vkGetQueryPoolResults( m_device, m_queries, 0, m_numQueries, m_numQueries * sizeof( uint64_t ),

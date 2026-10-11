@@ -108,11 +108,21 @@ public:
   void destroy();
   bool checking() const { return m_check; }
 
-  /// Starts a picture whose reconstruction is on the CPU.
+  /// Starts a picture whose reconstruction is on the CPU. The previous picture must be complete (completePicture).
   void beginPicture( CodingStructure& cs );
   /// Makes the CPU picture current, before a stage that runs on the CPU. Unless cpuWrites is false, the GPU copy is
   /// stale afterwards outside check mode.
   void syncToCpu( CodingStructure& cs, bool cpuWrites = true );
+  /// Ends the picture's GPU stages. Outside check mode they record into one command buffer, which endPicture
+  /// submits without waiting; picturePending is then true until completePicture waits for the GPU and copies the
+  /// result into the CPU picture.
+  void endPicture();
+  bool picturePending() const { return m_downloadPending; }
+  void completePicture( PelUnitBuf reco );
+
+  /// The adaptive clipping of luma (DecLib::adaptiveClipToRealRange) on the GPU picture. Returns false, doing
+  /// nothing, if the CPU picture is the current one.
+  bool clipLuma( CodingStructure& cs, int minVal, int maxVal );
 
   /// The edge maps for LoopFilter::setEdgeMaps, cleared, before LoopFilter::loopFilterPic.
   DeblockEdgeMaps& deblockPrepare( CodingStructure& cs );
@@ -139,6 +149,9 @@ public:
   /// The temporal ALF, as AdaptiveLoopFilter::TAlfProcess, after ALF and the LF-CCCM correction. Returns false if
   /// TAlfProcess has to run on the CPU (talfCpuReasons says why), e.g. after an ALF on the CPU.
   bool talf( CodingStructure& cs, AdaptiveLoopFilter& alf );
+  /// Before TAlfProcess on the CPU after an ALF on the GPU: copies the ALF input, which TAlfProcess reads, into the
+  /// ALF's CPU buffer, since ALFProcess left that buffer alone outside check mode.
+  void alfInputToCpu( AdaptiveLoopFilter& alf );
 #endif
 
   /// The deblocking's coding information (luma), which the offset refinement and ALF read; after loopFilterPic.
@@ -160,6 +173,7 @@ public:
     STAGE_LFCCCM,
     STAGE_ALF,
     STAGE_TALF,
+    STAGE_CLIP,
     NUM_STAGES
   };
   static const char* stageName( int stage );
@@ -204,6 +218,20 @@ public:
   const std::map<std::string, uint64_t>& talfCpuReasons() const { return m_talfCpuReasons; }
 
 private:
+  /// The stages record into one command buffer per picture; in check mode each stage submits and waits on its own.
+  int  stageBegin();                        ///< opens the command buffer if needed; returns the start timestamp
+  void stageEnd( Stage stage, int t0 );
+  void submitStages( bool wait );
+  void waitStages();                        ///< waits for submitted stages and adds their GPU time
+  struct StageTime
+  {
+    Stage stage;
+    int   t0, t1;
+  };
+  std::vector<StageTime> m_stageTimes;
+  bool             m_recording       = false;
+  bool             m_downloadPending = false;
+
   void ensureOnGpu( CodingStructure& cs );
   void ensureBuffer( Buffer& buf, size_t size, Mem mem );
   std::string describeLuma( int x, int y, const CPelUnitBuf& cpu ) const;
@@ -270,7 +298,7 @@ private:
   void           talfForget( const Picture* pic );
   TalfGpuPlan          m_talfPlan;
   std::vector<TalfRef> m_talfRefs;
-  uint64_t             m_talfUse = 0;
+  uint64_t             m_talfUse = 0;    ///< counts the pictures with TALF blocks; lastUse holds the last one
   Buffer               m_talfParams;   ///< per picture: blocks, filters, references
 #endif
   std::map<std::string, uint64_t> m_talfCpuReasons;

@@ -53,6 +53,12 @@ checks any decoder build against it (`check EXE "--args=--Vulkan=1"`). Streams a
 - Pictures live in buffers that both CPU and GPU can access. On a unified-memory GPU every buffer is device-local
   and host-visible, so uploads and downloads are plain copies.
 - Shaders get buffer device addresses through push constants; there are no descriptor sets.
+- The loop filter stages of a picture record into one command buffer, which `finishPicture` submits without
+  waiting: the GPU filters picture N while the CPU goes on with picture N+1. The result comes back, and the
+  picture's border padding (`mcFramePad`, which reads the filtered border blocks) runs, when the picture is first
+  needed: by a slice that references it, for output, before the next picture's loop filters, before a picture
+  buffer that its padding reads is reused, or before a new SPS or PPS. A stage that falls back to the CPU syncs
+  first. Check mode submits and waits stage by stage.
 - The GPU has no FP64 (`shaderFloat64` is false on the Intel iGPU), so the decoder's double arithmetic will use
   `shaders/sf64.glsl`, which rounds like SSE2 bit for bit.
 
@@ -167,9 +173,9 @@ strides are equal unless the reference pictures differ in size, and such picture
 | temporal ALF after an ALF on the CPU, with reference pictures of another size, with GDR | CPU | 48 streams identical with every picture forced to the CPU path |
 | everything else | CPU | - |
 
-Speed: on the hybrid path the per-picture copies and the synchronous waits cost more than the GPU saves. ra_cif
-(289 frames CIF, decoder pinned to one core of the Core Ultra 7 265K, Intel iGPU), `perf/vkbench.py`, minimum and
-median of paired runs:
+Speed: ra_cif (289 frames CIF, decoder pinned to one core of the Core Ultra 7 265K, Intel iGPU), `perf/vkbench.py`,
+minimum and median of paired runs. The machine's speed drifts by about 10 % between sessions (other load), so
+compare rows measured together:
 
 | build | total | GPU time |
 |---|---|---|
@@ -179,6 +185,12 @@ median of paired runs:
 | GPU: + ALF | 8.5-9.3 s (3 runs) | 1.2-2.1 s |
 | GPU: + offset refinement, LF-CCCM with one workgroup per window | 10.10 s, median 10.44 | 3.78 s, median 3.83 |
 | GPU: + LF-CCCM kernels by window size, ALF parameters read in place | 7.94 s, median 8.00 | 1.88 s, median 1.91 |
+| later session: stock ECM-20.0 | 7.23 s, median 7.29 | - |
+| later session: this branch, CPU path | 6.39 s, median 6.42 | - |
+| later session: GPU, + temporal ALF | 8.16 s, median 8.40 | 0.93 s, median 1.25 |
+| later session: GPU, + one submission per picture without waiting | 6.48 s, median 7.31 | 0.84 s, median 0.86 |
 
 The GPU time of a stage depends on how busy the GPU is: the iGPU clocks down between submissions, so with less
-work per picture the unchanged stages (deblocking, SAO) take longer.
+work per picture the unchanged stages (deblocking, SAO) take longer. Waking the idle iGPU took about 2.4 ms per
+picture when every stage waited for its result. With one submission per picture the CPU still waits about 2 ms
+per picture, when the next picture references the one the GPU is filtering.

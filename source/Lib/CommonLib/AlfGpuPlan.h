@@ -40,6 +40,7 @@
 #include "CommonDef.h"
 
 #include <cstdint>
+#include <functional>
 #include <vector>
 
 /// What ALFProcess computes for one picture, recorded so that the GPU decoder can do the sample work.
@@ -125,6 +126,9 @@ struct AlfGpuPlan
   /// With skipSamples: ALFProcess still copies its inputs (the picture before ALF, with padding), which later CPU
   /// stages such as the temporal ALF read.
   bool                  keepCpuInputs = true;
+  /// Called before ALFProcess filters the samples on the CPU after all (a picture the plan does not cover, or a
+  /// stale one), so that the owner can make the CPU picture current.
+  std::function<void()> beforeCpuSamples;
 
   // ---- recorded by ALFProcess ----
   bool        gpu       = false;     ///< the GPU processes this picture

@@ -110,7 +110,8 @@ public:
   /// Returns the compute pipeline of an embedded shader, creating it on first use.
   VkPipeline pipeline( const char* name );
 
-  /// Command recording. One command buffer is open at a time; submit() waits for its completion.
+  /// Command recording. One command buffer is open at a time. submit() waits for its completion, unless wait is
+  /// false: then wait() does, and begin() waits for it first. Timestamps can be read once the commands completed.
   void begin();
   /// repeatable: running the dispatch again gives the same result (it does not filter in place), so profiling may
   /// repeat it
@@ -124,7 +125,9 @@ public:
   void        setProfiling( int runs ) { m_profiling = runs > 0; m_profileRuns = std::min( std::max( runs, 1 ), 8 ); }
   bool        profiling() const { return m_profiling; }
   std::string profileReport() const;    ///< shaders by total time
-  void submit();
+  void submit( bool wait = true );
+  void wait();
+  bool inFlight() const { return m_inFlight; }
   double elapsedMs( int from, int to ) const;
 
 #define VKD_DECLARE( name ) PFN_##name name = nullptr;
@@ -154,6 +157,7 @@ private:
   VkPipelineLayout            m_layout     = VK_NULL_HANDLE;
   VkQueryPool                 m_queries    = VK_NULL_HANDLE;
   int                         m_numQueries = 0;
+  bool                        m_inFlight   = false;
   std::vector<uint64_t>       m_queryResults;
   bool                        m_profiling = false;
   int                         m_profileRuns = 1;

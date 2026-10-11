@@ -240,6 +240,10 @@ private:
   vkd::Core*              m_vkCore  = nullptr;
   vkd::VkLoopFilter       m_vkLoopFilter;
   bool                    m_vkCheck = false;   ///< run the CPU filters too and require identical results
+  /// Outside check mode the GPU filters a picture while the decoder goes on with the next one. Until vulkanResolve,
+  /// the result of m_vkPending is on the GPU only and its border padding (finishPicture) waits.
+  Picture*                m_vkPending = nullptr;
+  bool                    xVulkanPendingUses( const Picture* pic ) const;
 
 public:
   /// Moves the in-loop filters to the GPU. With check set, the CPU also filters and every picture must match.
@@ -253,6 +257,9 @@ public:
   bool vulkanCheck() const { return m_vkCheck; }
   const std::map<std::string, uint64_t>& vulkanAlfCpuReasons() const { return m_vkLoopFilter.alfCpuReasons(); }
   const std::map<std::string, uint64_t>& vulkanTalfCpuReasons() const { return m_vkLoopFilter.talfCpuReasons(); }
+  /// Completes the picture whose loop filters may still run on the GPU (see m_vkPending) if it is pic, or whichever it
+  /// is for nullptr. Call it before reading the samples of a decoded picture outside the decoder, e.g. for output.
+  void vulkanResolve( const Picture* pic = nullptr );
 #endif
 
   DCI*                    m_dci;
@@ -371,6 +378,8 @@ protected:
 
   Picture * xGetNewPicBuffer( const SPS &sps, const PPS &pps, const uint32_t temporalLayer, const int layerId );
   void  xCreateLostPicture( int iLostPOC, const int layerId );
+  /// The border padding of a reference picture after its loop filters (in finishPicture).
+  void  xPadPicture( Picture* pic );
 #if JVET_S0124_UNAVAILABLE_REFERENCE
   void  xCreateUnavailablePicture( const PPS *pps, const int iUnavailablePoc, const bool longTermFlag, const int temporalId, const int layerId, const bool interLayerRefPicFlag );
 #else

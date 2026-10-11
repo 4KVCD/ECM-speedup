@@ -1,0 +1,27 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+// The adaptive clipping of luma after the loop filters (DecLib::adaptiveClipToRealRange): every sample clipped to
+// the slice's luma range. One invocation per sample.
+
+layout( local_size_x = 16, local_size_y = 16 ) in;
+
+layout( push_constant, scalar ) uniform Push
+{
+  I16Buf buf;
+  int    origin, stride, width, height;
+  int    minVal, maxVal;
+} pc;
+
+void main()
+{
+  const int x = int( gl_GlobalInvocationID.x ), y = int( gl_GlobalInvocationID.y );
+  if( x >= pc.width || y >= pc.height )
+  {
+    return;
+  }
+  const int i = pc.origin + y * pc.stride + x;
+  // ClipPel's order of min and max, which also holds for a range with minVal > maxVal
+  pc.buf.v[i] = int16_t( min( max( int( pc.buf.v[i] ), pc.minVal ), pc.maxVal ) );
+}

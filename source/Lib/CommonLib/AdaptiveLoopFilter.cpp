@@ -677,6 +677,10 @@ void AdaptiveLoopFilter::ALFProcess(CodingStructure& cs)
   if( plan && !gpuPlanSupported( cs ) )
   {
     m_gpuPlan = nullptr;
+    if( plan->beforeCpuSamples )
+    {
+      plan->beforeCpuSamples();
+    }
   }
   alfProcessCtus( cs );
   if( m_gpuPlan && plan->stale )
@@ -686,6 +690,10 @@ void AdaptiveLoopFilter::ALFProcess(CodingStructure& cs)
     m_gpuPlan = nullptr;
     if( plan->skipSamples )
     {
+      if( plan->beforeCpuSamples )
+      {
+        plan->beforeCpuSamples();
+      }
       alfProcessCtus( cs );
     }
   }

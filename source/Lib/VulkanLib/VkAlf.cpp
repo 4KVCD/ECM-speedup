@@ -288,14 +288,31 @@ static std::string alfDiagnose( const AlfGpuPlan& plan, const AdaptiveLoopFilter
 void VkLoopFilter::alfPrepare( CodingStructure& cs, AdaptiveLoopFilter& alf )
 {
   alfBuffers( cs, alf );
-  m_alfPlan.skipSamples   = !m_check;
-  m_alfPlan.keepCpuInputs = true;
+  // Outside check mode the CPU neither filters nor copies the samples; the CPU picture may be out of date until a
+  // fallback to the CPU syncs it.
+  m_alfPlan.skipSamples      = !m_check;
+  m_alfPlan.keepCpuInputs    = m_check;
+  m_alfPlan.beforeCpuSamples = [this, &cs]() { syncToCpu( cs ); };
   alf.setGpuPlan( &m_alfPlan );
 }
+
+#if JVET_AK0065_TALF
+void VkLoopFilter::alfInputToCpu( AdaptiveLoopFilter& alf )
+{
+  if( m_check || !m_alfInputOnGpu )
+  {
+    return;
+  }
+  submitStages( true );
+  PelUnitBuf input = alf.callRecBeforeAlfBuf();
+  m_src.download( input );
+}
+#endif
 
 bool VkLoopFilter::alf( CodingStructure& cs, AdaptiveLoopFilter& alf )
 {
   alf.setGpuPlan( nullptr );
+  m_alfPlan.beforeCpuSamples = nullptr;
   const AlfGpuPlan& plan = m_alfPlan;
   if( !plan.gpu )
   {
@@ -545,8 +562,7 @@ void VkLoopFilter::alfRun( CodingStructure& cs, AdaptiveLoopFilter& alf )
   m_counts.alfPictures++;
 
   // dispatches
-  m_core->begin();
-  const int t0 = m_core->timestamp();
+  const int t0 = stageBegin();
   if( !m_check )
   {
     // the ALF input; in check mode the CPU's copy was uploaded instead
@@ -610,9 +626,7 @@ void VkLoopFilter::alfRun( CodingStructure& cs, AdaptiveLoopFilter& alf )
     m_core->dispatch( "alf_chroma", uint32_t( chromaTiles.size() ), 1, 1, &push, sizeof( push ), true );
   }
   m_core->barrier();
-  const int t1 = m_core->timestamp();
-  m_core->submit();
-  addGpuTime( STAGE_ALF, t0, t1 );
+  stageEnd( STAGE_ALF, t0 );
   m_cpuCurrent = m_check;
   m_gpuCurrent = true;
   m_lastStage  = 3;
@@ -680,13 +694,10 @@ void VkLoopFilter::offsetRefinement( CodingStructure& cs, int stageIdx, int refi
   // the thresholds of calcOffsetRefinementBlk for samples at block boundaries
   push.boundTh   = refineIdx == 1 ? ( useDiffTh ? ( stageIdx ? 16 : 9 ) : ( stageIdx ? 15 : 12 ) ) : ( useDiffTh ? 3 : 1 );
 
-  m_core->begin();
-  const int t0 = m_core->timestamp();
+  const int t0 = stageBegin();
   m_core->dispatch( "offset_refine", uint32_t( ( width + 15 ) / 16 ), uint32_t( ( height + 15 ) / 16 ), 1, &push, sizeof( push ) );
   m_core->barrier();
-  const int t1 = m_core->timestamp();
-  m_core->submit();
-  addGpuTime( STAGE_REFINE, t0, t1 );
+  stageEnd( STAGE_REFINE, t0 );
   m_cpuCurrent = m_check;
   m_lastStage  = 4;
   m_counts.refinePictures[stageIdx > 0 ? 1 : 0]++;

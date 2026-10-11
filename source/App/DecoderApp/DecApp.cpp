@@ -769,6 +769,10 @@ void DecApp::xWriteOutput( PicList* pcListPic, uint32_t tId )
           (pcPicTop->getPOC() == m_iPOCLastDisplay+1 || m_iPOCLastDisplay < 0))
       {
         // write to file
+#if ECM_VULKAN
+        m_cDecLib.vulkanResolve( pcPicTop );
+        m_cDecLib.vulkanResolve( pcPicBottom );
+#endif
         numPicsNotYetDisplayed = numPicsNotYetDisplayed-2;
         if ( !m_reconFileName.empty() )
         {
@@ -825,6 +829,9 @@ void DecApp::xWriteOutput( PicList* pcListPic, uint32_t tId )
         (numPicsNotYetDisplayed >  numReorderPicsHighestTid || dpbFullness > maxDecPicBufferingHighestTid))
       {
         // write to file
+#if ECM_VULKAN
+        m_cDecLib.vulkanResolve( pcPic );
+#endif
         numPicsNotYetDisplayed--;
         if (!pcPic->referenced)
         {
@@ -879,6 +886,10 @@ void DecApp::xWriteOutput( PicList* pcListPic, uint32_t tId )
  */
 void DecApp::xFlushOutput( PicList* pcListPic, const int layerId )
 {
+#if ECM_VULKAN
+  // flushing writes and then deletes the pictures
+  m_cDecLib.vulkanResolve();
+#endif
   if(!pcListPic || pcListPic->empty())
   {
     return;

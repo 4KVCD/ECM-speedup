@@ -158,6 +158,7 @@ void VkLoopFilter::destroy()
   {
     return;
   }
+  submitStages( true );
   m_pic.destroy( *m_core );
   m_tmp.destroy( *m_core );
   m_db.destroy( *m_core );
@@ -181,8 +182,97 @@ void VkLoopFilter::destroy()
 
 const char* VkLoopFilter::stageName( int stage )
 {
-  static const char* names[NUM_STAGES] = { "deblocking", "SAO/BIF/CCSAO", "offset refinement", "LF-CCCM", "ALF", "temporal ALF" };
+  static const char* names[NUM_STAGES] = { "deblocking", "SAO/BIF/CCSAO", "offset refinement", "LF-CCCM", "ALF", "temporal ALF", "clipping" };
   return names[stage];
+}
+
+int VkLoopFilter::stageBegin()
+{
+  if( !m_recording )
+  {
+    waitStages();
+    m_core->begin();
+    m_recording = true;
+  }
+  return m_core->timestamp();
+}
+
+void VkLoopFilter::stageEnd( Stage stage, int t0 )
+{
+  m_stageTimes.push_back( { stage, t0, m_core->timestamp() } );
+  if( m_check )
+  {
+    submitStages( true );
+  }
+}
+
+void VkLoopFilter::submitStages( bool wait )
+{
+  if( m_recording )
+  {
+    m_core->submit( false );
+    m_recording = false;
+  }
+  if( wait )
+  {
+    waitStages();
+  }
+}
+
+void VkLoopFilter::waitStages()
+{
+  if( m_core->inFlight() || m_recording )
+  {
+    submitStages( false );
+    m_core->wait();
+  }
+  for( const StageTime& t: m_stageTimes )
+  {
+    addGpuTime( t.stage, t.t0, t.t1 );
+  }
+  m_stageTimes.clear();
+}
+
+void VkLoopFilter::endPicture()
+{
+  submitStages( m_check );
+  m_downloadPending = !m_cpuCurrent;
+}
+
+void VkLoopFilter::completePicture( PelUnitBuf reco )
+{
+  waitStages();
+  if( m_downloadPending )
+  {
+    m_pic.download( reco );
+    m_downloadPending = false;
+    m_cpuCurrent      = true;
+  }
+}
+
+// Push constants of clip_luma.comp.
+struct ClipLumaPush
+{
+  uint64_t buf;
+  int32_t  origin, stride, width, height, minVal, maxVal;
+};
+
+bool VkLoopFilter::clipLuma( CodingStructure& cs, int minVal, int maxVal )
+{
+  if( !m_check && ( m_cpuCurrent || !m_gpuCurrent ) )
+  {
+    return false;
+  }
+  ensureOnGpu( cs );
+  const GpuPicture::Plane& pl = m_pic.plane( 0 );
+  ClipLumaPush push = { m_pic.buffer().address, pl.origin, pl.stride, pl.width, pl.height, minVal, maxVal };
+  const int t0 = stageBegin();
+  m_core->dispatch( "clip_luma", uint32_t( ( pl.width + 15 ) / 16 ), uint32_t( ( pl.height + 15 ) / 16 ), 1, &push, sizeof( push ) );
+  m_core->barrier();
+  stageEnd( STAGE_CLIP, t0 );
+  m_cpuCurrent = m_check;
+  m_lastStage  = 7;
+  return true;
 }
 
 void VkLoopFilter::addGpuTime( Stage stage, int t0, int t1 )
@@ -212,6 +302,8 @@ void VkLoopFilter::beginPicture( CodingStructure& cs )
     m_tmp.create( *m_core, format, width, height, 16 );
     m_db.create( *m_core, format, width, height, 16 );
   }
+  CHECK( m_downloadPending || m_recording, "the previous picture is not complete" );
+  waitStages();
   m_cpuCurrent = true;
   m_gpuCurrent = false;
   m_lastStage  = 0;
@@ -226,7 +318,9 @@ void VkLoopFilter::ensureOnGpu( CodingStructure& cs )
 {
   if( m_check || !m_gpuCurrent )
   {
-    // In check mode every GPU stage starts from the CPU's input, so that a difference points at that stage.
+    // In check mode every GPU stage starts from the CPU's input, so that a difference points at that stage. The
+    // upload must not overtake recorded commands that read the picture.
+    submitStages( true );
     m_pic.upload( cs.picture->getRecoBuf() );
     m_gpuCurrent = true;
   }
@@ -241,6 +335,7 @@ void VkLoopFilter::syncToCpu( CodingStructure& cs, bool cpuWrites )
 {
   if( !m_cpuCurrent )
   {
+    submitStages( true );
     PelUnitBuf reco = cs.picture->getRecoBuf();
     m_pic.download( reco );
     m_cpuCurrent = true;
@@ -346,8 +441,7 @@ void VkLoopFilter::deblock( CodingStructure& cs )
       m_counts.deblockSegments += ( m_maps.chroma[dir][i].flags & 15 ) != 0;
     }
   }
-  m_core->begin();
-  const int t0 = m_core->timestamp();
+  const int t0 = stageBegin();
   // ALF reads the picture before deblocking
   m_core->copy( m_pic.buffer(), m_db.buffer(), 0, 0, m_pic.buffer().size );
   m_core->barrier();
@@ -367,9 +461,7 @@ void VkLoopFilter::deblock( CodingStructure& cs )
     }
     m_core->barrier();
   }
-  const int t1 = m_core->timestamp();
-  m_core->submit();
-  addGpuTime( STAGE_DEBLOCK, t0, t1 );
+  stageEnd( STAGE_DEBLOCK, t0 );
   m_cpuCurrent = m_check;
   m_lastStage  = 1;
 }
@@ -759,8 +851,7 @@ void VkLoopFilter::sao( CodingStructure& cs, SampleAdaptiveOffset& saoCpu )
     }
   }
 
-  m_core->begin();
-  const int t0 = m_core->timestamp();
+  const int t0 = stageBegin();
   m_core->copy( m_pic.buffer(), m_tmp.buffer(), 0, 0, m_pic.buffer().size );
   m_core->barrier();
   const int scaleXc = getComponentScaleX( COMPONENT_Cb, m_pic.format() ), scaleYc = getComponentScaleY( COMPONENT_Cb, m_pic.format() );
@@ -898,9 +989,7 @@ void VkLoopFilter::sao( CodingStructure& cs, SampleAdaptiveOffset& saoCpu )
     }
   }
   m_core->barrier();
-  const int t1 = m_core->timestamp();
-  m_core->submit();
-  addGpuTime( STAGE_SAO, t0, t1 );
+  stageEnd( STAGE_SAO, t0 );
   m_cpuCurrent = m_check;
   m_lastStage  = 2;
   if( m_check )

@@ -219,8 +219,7 @@ void VkLoopFilter::lfCccm( CodingStructure& cs, int impMode )
 
   const LfCccmApplyPush ap = applyPush( cs, m_pic, m_lfCorr, 0 );
 
-  m_core->begin();
-  const int t0 = m_core->timestamp();
+  const int t0 = stageBegin();
   m_core->copy( m_pic.buffer(), m_lfCorr, 0, 0, m_pic.buffer().size );
   m_core->dispatch( "lfcccm_down", uint32_t( ( widthC + 2 + 15 ) / 16 ), uint32_t( ( heightC + 2 + 15 ) / 16 ), 1, &down, sizeof( down ), true );
   m_core->barrier();
@@ -248,9 +247,7 @@ void VkLoopFilter::lfCccm( CodingStructure& cs, int impMode )
   }
   m_core->dispatch( "lfcccm_apply", uint32_t( ( widthC + 15 ) / 16 ), uint32_t( ( heightC + 15 ) / 16 ), 2, &ap, sizeof( ap ) );
   m_core->barrier();
-  const int t1 = m_core->timestamp();
-  m_core->submit();
-  addGpuTime( STAGE_LFCCCM, t0, t1 );
+  stageEnd( STAGE_LFCCCM, t0 );
   if( m_check )
   {
     m_counts.lfCccmPictures++;
@@ -267,13 +264,10 @@ void VkLoopFilter::lfCccmApply( CodingStructure& cs )
 {
   ensureOnGpu( cs );
   const LfCccmApplyPush ap = applyPush( cs, m_pic, m_lfCorr, 1 );
-  m_core->begin();
-  const int t0 = m_core->timestamp();
+  const int t0 = stageBegin();
   m_core->dispatch( "lfcccm_apply", uint32_t( ( ap.width + 15 ) / 16 ), uint32_t( ( ap.height + 15 ) / 16 ), 2, &ap, sizeof( ap ) );
   m_core->barrier();
-  const int t1 = m_core->timestamp();
-  m_core->submit();
-  addGpuTime( STAGE_LFCCCM, t0, t1 );
+  stageEnd( STAGE_LFCCCM, t0 );
   m_cpuCurrent = m_check;
   m_lastStage  = 5;
 }

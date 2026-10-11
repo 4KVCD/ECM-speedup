@@ -709,6 +709,9 @@ void DecLib::init(
 
 void DecLib::deletePicBuffer ( )
 {
+#if ECM_VULKAN
+  vulkanResolve();
+#endif
   PicList::iterator  iterPic   = m_cListPic.begin();
   int iSize = int( m_cListPic.size() );
 
@@ -801,6 +804,12 @@ Picture* DecLib::xGetNewPicBuffer( const SPS &sps, const PPS &pps, const uint32_
   }
   else
   {
+#if ECM_VULKAN
+    if( xVulkanPendingUses( pcPic ) )
+    {
+      vulkanResolve();
+    }
+#endif
     if( !pcPic->Y().Size::operator==( Size( pps.getPicWidthInLumaSamples(), pps.getPicHeightInLumaSamples() ) ) || pps.pcv->maxCUWidth != sps.getMaxCUWidth() || pps.pcv->maxCUHeight != sps.getMaxCUHeight() || pcPic->layerId != layerId )
     {
       pcPic->destroy();
@@ -955,7 +964,9 @@ void DecLib::executeLoopFilters()
 #if ECM_VULKAN
   if( m_vkCore )
   {
-    // The CPU walks the coding units and records the edge parameters; the GPU filters the samples.
+    // The CPU walks the coding units and records the edge parameters; the GPU filters the samples. The GPU and its
+    // buffers serve one picture at a time.
+    vulkanResolve();
     m_vkLoopFilter.beginPicture( cs );
     m_cLoopFilter.setEdgeMaps( &m_vkLoopFilter.deblockPrepare( cs ) );
   }
@@ -1123,9 +1134,8 @@ void DecLib::executeLoopFilters()
 #if ECM_VULKAN
   if( m_vkCore )
   {
+    // ALFProcess leaves the CPU picture alone unless it falls back to the CPU, and then syncs it first.
     m_vkLoopFilter.checkAgainstCpu( cs, "SAO, bilateral filter and CCSAO" );
-    // ALF reads the CPU picture, without changing it unless it falls back to the CPU
-    m_vkLoopFilter.syncToCpu( cs, false );
   }
 #endif
 
@@ -1240,6 +1250,7 @@ void DecLib::executeLoopFilters()
     if( m_vkCore && !gpuTalf )
     {
       m_vkLoopFilter.syncToCpu( cs );
+      m_vkLoopFilter.alfInputToCpu( m_cALF );
     }
     if( !gpuTalf || m_vkCheck )
 #endif
@@ -1288,9 +1299,9 @@ void DecLib::executeLoopFilters()
   }
 #endif
 #if ECM_VULKAN
-  if( m_vkCore )
+  if( m_vkCore && m_targetSubPicIdx )
   {
-    // the picture leaves the loop filters on the CPU
+    // the masking of the other subpictures runs on the CPU
     m_vkLoopFilter.syncToCpu( cs );
   }
 #endif
@@ -1319,6 +1330,79 @@ void DecLib::executeLoopFilters()
   m_pcPic->cs->slice->stopProcessingTimer();
 }
 
+void DecLib::xPadPicture( Picture* pic )
+{
+#if JVET_AA0096_MC_BOUNDARY_PADDING
+  const Slice* pcSlice = pic->cs->slice;
+#if JVET_AK0085_TM_BOUNDARY_PADDING
+if(!(pic->getUseTMBP() && pic->cs->sps->getTMBP()))
+#endif
+{
+  m_cFrameMcPadPrediction.init(&m_cRdCost, pcSlice->getSPS()->getChromaFormatIdc(), pcSlice->getSPS()->getMaxCUHeight(),
+#if JVET_AJ0172_IBC_ITMP_ALIGN_REF_AREA
+#if JVET_AJ0237_INTERNAL_12BIT
+                               NULL, pic->getPicWidthInLumaSamples(),pic->getPicHeightInLumaSamples(), pcSlice->getSPS()->getBitDepth(CHANNEL_TYPE_LUMA));
+#else
+                               NULL, pic->getPicWidthInLumaSamples(),pic->getPicHeightInLumaSamples());
+#endif
+#else
+#if JVET_AJ0237_INTERNAL_12BIT
+                               NULL, pic->getPicWidthInLumaSamples(), pcSlice->getSPS()->getBitDepth(CHANNEL_TYPE_LUMA));
+#else
+                               NULL, pic->getPicWidthInLumaSamples());
+#endif
+#endif
+  m_cFrameMcPadPrediction.mcFramePad(pic, *(pic->slices[0]));
+}
+#if JVET_AK0085_TM_BOUNDARY_PADDING
+else
+{
+  pic->extendPicBorder(pcSlice->getPPS());
+}
+#endif
+#endif
+}
+
+#if ECM_VULKAN
+void DecLib::vulkanResolve( const Picture* pic )
+{
+  if( !m_vkPending || ( pic && pic != m_vkPending ) )
+  {
+    return;
+  }
+  Picture* pending = m_vkPending;
+  m_vkPending      = nullptr;
+  m_vkLoopFilter.completePicture( pending->getRecoBuf() );
+  xPadPicture( pending );
+}
+
+bool DecLib::xVulkanPendingUses( const Picture* pic ) const
+{
+  if( !m_vkPending )
+  {
+    return false;
+  }
+  if( pic == m_vkPending )
+  {
+    return true;
+  }
+  // the reference pictures that xPadPicture reads
+  const Slice* slice = m_vkPending->slices[0];
+  for( int list = 0; list < NUM_REF_PIC_LIST_01; list++ )
+  {
+    for( int i = 0; i < slice->getNumRefIdx( RefPicList( list ) ); i++ )
+    {
+      const Picture* ref = slice->getRefPic( RefPicList( list ), i );
+      if( ref == pic || ( ref && ref->unscaledPic == pic ) )
+      {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+#endif
+
 void DecLib::finishPictureLight(int& poc, PicList*& rpcListPic )
 {
   Slice*  pcSlice = m_pcPic->cs->slice;
@@ -1340,6 +1424,13 @@ void DecLib::adaptiveClipToRealRange()
   clpRng.max = m_pcPic->cs->slice->getLumaPelMax();
   m_pcPic->lumaClpRng.max = clpRng.max;
   m_pcPic->lumaClpRng.min = clpRng.min;
+#if ECM_VULKAN
+  const bool gpuClip = m_vkCore && m_vkLoopFilter.clipLuma( *m_pcPic->cs, clpRng.min, clpRng.max );
+  if( gpuClip && !m_vkCheck )
+  {
+    return;
+  }
+#endif
   int compIdx = 0;
   ComponentID compID = ComponentID(compIdx);
   int width = m_pcPic->cs->pps->getPicWidthInLumaSamples();
@@ -1355,6 +1446,12 @@ void DecLib::adaptiveClipToRealRange()
     }
     reconPel += stride;
   }
+#if ECM_VULKAN
+  if( gpuClip )
+  {
+    m_vkLoopFilter.checkAgainstCpu( *m_pcPic->cs, "adaptive clipping" );
+  }
+#endif
 }
 #endif
 
@@ -1370,6 +1467,19 @@ void DecLib::finishPicture(int& poc, PicList*& rpcListPic, MsgLevel msgl )
   s.pixels = s.count * m_pcPic->Y().width * m_pcPic->Y().height;
 #endif
 
+#if ECM_VULKAN
+  if( m_vkCore )
+  {
+    // Outside check mode the GPU goes on filtering while the decoder continues; the picture's samples are read here
+    // only for GDR and a picture hash SEI.
+    m_vkLoopFilter.endPicture();
+    if( m_pcPic->cs->isGdrEnabled()
+        || ( m_decodedPictureHashSEIEnabled && !getSeisByType( m_pcPic->SEIs, SEI::DECODED_PICTURE_HASH ).empty() ) )
+    {
+      m_vkLoopFilter.completePicture( m_pcPic->getRecoBuf() );
+    }
+  }
+#endif
 #if JVET_Z0118_GDR
  m_pcPic->setCleanDirty(false);
  m_pcPic->copyCleanCurPicture();
@@ -1500,34 +1610,17 @@ void DecLib::finishPicture(int& poc, PicList*& rpcListPic, MsgLevel msgl )
   }
 #endif
   m_pcPic->cs->destroyTemporaryCsData();
-#if JVET_AA0096_MC_BOUNDARY_PADDING
-#if JVET_AK0085_TM_BOUNDARY_PADDING
-if(!(m_pcPic->getUseTMBP() && m_pcPic->cs->sps->getTMBP()))
+#if ECM_VULKAN
+  if( m_vkCore && m_vkLoopFilter.picturePending() )
+  {
+    // vulkanResolve pads the border once the GPU has finished the picture.
+    m_vkPending = m_pcPic;
+  }
+  else
 #endif
-{
-  m_cFrameMcPadPrediction.init(&m_cRdCost, pcSlice->getSPS()->getChromaFormatIdc(), pcSlice->getSPS()->getMaxCUHeight(),
-#if JVET_AJ0172_IBC_ITMP_ALIGN_REF_AREA
-#if JVET_AJ0237_INTERNAL_12BIT
-                               NULL, m_pcPic->getPicWidthInLumaSamples(),m_pcPic->getPicHeightInLumaSamples(), pcSlice->getSPS()->getBitDepth(CHANNEL_TYPE_LUMA));
-#else
-                               NULL, m_pcPic->getPicWidthInLumaSamples(),m_pcPic->getPicHeightInLumaSamples());
-#endif
-#else
-#if JVET_AJ0237_INTERNAL_12BIT
-                               NULL, m_pcPic->getPicWidthInLumaSamples(), pcSlice->getSPS()->getBitDepth(CHANNEL_TYPE_LUMA));
-#else
-                               NULL, m_pcPic->getPicWidthInLumaSamples());
-#endif
-#endif
-  m_cFrameMcPadPrediction.mcFramePad(m_pcPic, *(m_pcPic->slices[0]));
-}
-#if JVET_AK0085_TM_BOUNDARY_PADDING
-else
-{
-  m_pcPic->extendPicBorder(pcSlice->getPPS());
-}
-#endif
-#endif
+  {
+    xPadPicture( m_pcPic );
+  }
 
 #if !JVET_Z0118_GDR
   m_pcPic->cs->picHeader->initPicHeader();
@@ -1570,6 +1663,10 @@ void DecLib::xUpdateRasInit(Slice* slice)
 
 void DecLib::xCreateLostPicture( int iLostPoc, const int layerId )
 {
+#if ECM_VULKAN
+  // the lost picture is a copy of a decoded one
+  vulkanResolve();
+#endif
   msg( INFO, "\ninserting lost poc : %d\n",iLostPoc);
   Picture *cFillPic = xGetNewPicBuffer( *( m_parameterSetManager.getFirstSPS() ), *( m_parameterSetManager.getFirstPPS() ), 0, layerId );
 
@@ -3498,6 +3595,20 @@ bool DecLib::xDecodeSlice(InputNALUnit &nalu, int &iSkipFrame, int iPOCLastDispl
   pcSlice->getPic()->sliceSubpicIdx.push_back(pps->getSubPicIdxFromSubPicId(pcSlice->getSliceSubPicId()));
   pcSlice->checkCRA(pcSlice->getRPL0(), pcSlice->getRPL1(), m_pocCRA[nalu.m_nuhLayerId], m_cListPic);
   pcSlice->constructRefPicList(m_cListPic);
+#if ECM_VULKAN
+  for( int list = 0; m_vkPending && list < NUM_REF_PIC_LIST_01; list++ )
+  {
+    for( int i = 0; i < pcSlice->getNumRefIdx( RefPicList( list ) ); i++ )
+    {
+      // the slice reads the pending picture: its loop filters and padding must be complete
+      if( pcSlice->getRefPic( RefPicList( list ), i ) == m_vkPending )
+      {
+        vulkanResolve();
+        break;
+      }
+    }
+  }
+#endif
   pcSlice->setPrevGDRSubpicPOC(m_prevGDRSubpicPOC[nalu.m_nuhLayerId][currSubPicIdx]);
   pcSlice->setPrevIRAPSubpicPOC(m_prevIRAPSubpicPOC[nalu.m_nuhLayerId][currSubPicIdx]);
   pcSlice->setPrevIRAPSubpicType(m_prevIRAPSubpicType[nalu.m_nuhLayerId][currSubPicIdx]);
@@ -4082,6 +4193,10 @@ void DecLib::xDecodeDCI(InputNALUnit& nalu)
 
 void DecLib::xDecodeSPS( InputNALUnit& nalu )
 {
+#if ECM_VULKAN
+  // the pending picture's padding reads its parameter sets
+  vulkanResolve();
+#endif
   SPS* sps = new SPS();
   m_HLSReader.setBitstream( &nalu.getBitstream() );
 
@@ -4112,6 +4227,10 @@ void DecLib::xDecodeSPS( InputNALUnit& nalu )
 
 void DecLib::xDecodePPS( InputNALUnit& nalu )
 {
+#if ECM_VULKAN
+  // the pending picture's padding reads its parameter sets
+  vulkanResolve();
+#endif
   PPS* pps = new PPS();
   m_HLSReader.setBitstream( &nalu.getBitstream() );
   m_HLSReader.parsePPS( pps );

@@ -73,7 +73,6 @@ static const int TALF_REF_MARGIN = 32;
 
 const VkLoopFilter::TalfRef& VkLoopFilter::talfRef( const Picture* pic )
 {
-  m_talfUse++;
   for( TalfRef& r: m_talfRefs )
   {
     if( r.pic == pic )
@@ -82,21 +81,20 @@ const VkLoopFilter::TalfRef& VkLoopFilter::talfRef( const Picture* pic )
       return r;
     }
   }
-  // Not on the GPU yet: take the least recently used slot, or a new one.
+  // Not on the GPU yet: take the least recently used slot that this picture does not use, or a new one.
   static const size_t maxRefs = 8;
   TalfRef* slot = nullptr;
-  if( m_talfRefs.size() < maxRefs )
+  for( TalfRef& r: m_talfRefs )
+  {
+    if( m_talfRefs.size() >= maxRefs && r.lastUse < m_talfUse && ( !slot || r.lastUse < slot->lastUse ) )
+    {
+      slot = &r;
+    }
+  }
+  if( !slot )
   {
     m_talfRefs.emplace_back();
     slot = &m_talfRefs.back();
-  }
-  else
-  {
-    slot = &m_talfRefs[0];
-    for( TalfRef& r: m_talfRefs )
-    {
-      slot = r.lastUse < slot->lastUse ? &r : slot;
-    }
   }
   // the CPU picture with the border that finishPicture padded, as filterBlkTAlf reads it
   const CPelBuf luma   = pic->getRecoBuf( COMPONENT_Y );
@@ -189,6 +187,7 @@ bool VkLoopFilter::talf( CodingStructure& cs, AdaptiveLoopFilter& alf )
     filters[i].shape  = f.shape;
   }
   GpuTalfRef* refs = reinterpret_cast<GpuTalfRef*>( base + offRefs );
+  m_talfUse++;
   for( size_t i = 0; i < plan.refs.size(); i++ )
   {
     const TalfRef& r = talfRef( plan.refs[i] );
@@ -201,13 +200,10 @@ bool VkLoopFilter::talf( CodingStructure& cs, AdaptiveLoopFilter& alf )
   TalfPush push = { m_pic.buffer().address, m_src.buffer().address, m_talfParams.address, m_talfParams.address + offFilters,
                     m_talfParams.address + offRefs, dst.origin, dst.stride, src.origin, src.stride,
                     int32_t( plan.blocks.size() ), plan.bi ? 1 : 0 };
-  m_core->begin();
-  const int t0 = m_core->timestamp();
+  const int t0 = stageBegin();
   m_core->dispatch( "talf", uint32_t( ( plan.blocks.size() * 16 + 63 ) / 64 ), 1, 1, &push, sizeof( push ) );
   m_core->barrier();
-  const int t1 = m_core->timestamp();
-  m_core->submit();
-  addGpuTime( STAGE_TALF, t0, t1 );
+  stageEnd( STAGE_TALF, t0 );
   m_cpuCurrent = m_check;
   m_lastStage  = 6;
   return true;
