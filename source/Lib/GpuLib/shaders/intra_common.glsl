@@ -2,7 +2,7 @@
 #ifndef INTRA_COMMON_GLSL
 #define INTRA_COMMON_GLSL
 
-// one transform block of one component (63 int32, layout shared with GpuIntraRec.cpp)
+// one transform block of one component (66 int32, layout shared with GpuIntraRec.cpp)
 struct Tu
 {
   int comp, x, y, w, h;
@@ -30,6 +30,8 @@ struct Tu
   int jccrOffset;       // the Cr block's dbgOffset (in the Cb block)
   int mtxV, mtxH;       // the inverse transform matrices (DCT-II or MTS) of the columns (size h) and the rows (size w)
   int transformSkip;    // the dequantized levels are the residual (with BDPCM the host accumulated the levels)
+  int mipMatrix;        // MIP: the mode's matrix in the matrices buffer (-1: no MIP; dirMode is then DC)
+  int mipTransposed, mipSizeId;
 };
 layout( buffer_reference, std430, buffer_reference_align = 4 ) buffer BufTu { Tu v[]; };
 

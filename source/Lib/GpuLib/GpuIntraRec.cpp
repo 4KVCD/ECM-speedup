@@ -44,6 +44,7 @@
 #include "CommonLib/CodingStructure.h"
 #include "CommonLib/BilateralFilter.h"
 #include "CommonLib/InterpolationFilter.h"
+#include "CommonLib/MipData.h"
 #include "CommonLib/Picture.h"
 #include "CommonLib/Quant.h"
 #include "CommonLib/Reshape.h"
@@ -63,7 +64,7 @@
 
 namespace
 {
-// layout shared with intra_rec.comp (struct Tu): 63 int32
+// layout shared with intra_rec.comp (struct Tu): 66 int32
 struct Tu
 {
   int32_t comp, x, y, w, h;
@@ -90,8 +91,9 @@ struct Tu
   int32_t jccr, jccrOffset;
   int32_t mtxV, mtxH;
   int32_t transformSkip;
+  int32_t mipMatrix, mipTransposed, mipSizeId;
 };
-static_assert( sizeof( Tu ) == 63 * 4, "Tu layout" );
+static_assert( sizeof( Tu ) == 66 * 4, "Tu layout" );
 
 // Tu::lmcs
 constexpr int LMCS_BF_INVERSE  = 1;   // the intra bilateral filter works on inverse-mapped samples
@@ -167,6 +169,7 @@ struct Shared
   gpu::Buffer                      filters, matrices;
   int32_t                          trOffset[NUM_TRANS_TYPE][7];   // of the inverse transform matrices of sizes 2..128 in matrices (-1: none)
   int32_t                          qcsOffset = 0;                 // of the QCS weights in matrices
+  int32_t                          mipOffset[3] = {};             // of the MIP matrices of each size class in matrices
   std::unique_ptr<BilateralFilter> bif;   // the intra prediction bilateral filter's tables
 };
 
@@ -230,6 +233,14 @@ Shared* createShared( gpu::Context& ctx )
   }
   sh->qcsOffset = (int32_t) mat.size();   // read by intra_resi's dequantization with QCS
   mat.insert( mat.end(), m_coeffShift64, m_coeffShift64 + 64 );
+  // MIP (MatrixIntraPrediction::getMatrixData): per size class, the modes' matrices, each a row of weights per
+  // reduced prediction sample (the large class without the first input's weight)
+  sh->mipOffset[0] = (int32_t) mat.size();
+  mat.insert( mat.end(), &mipMatrix4x4[0][0][0], &mipMatrix4x4[0][0][0] + sizeof( mipMatrix4x4 ) );
+  sh->mipOffset[1] = (int32_t) mat.size();
+  mat.insert( mat.end(), &mipMatrix8x8[0][0][0], &mipMatrix8x8[0][0][0] + sizeof( mipMatrix8x8 ) );
+  sh->mipOffset[2] = (int32_t) mat.size();
+  mat.insert( mat.end(), &mipMatrix16x16[0][0][0], &mipMatrix16x16[0][0][0] + sizeof( mipMatrix16x16 ) );
   sh->filters.create( ctx, filt.size() * 4, gpu::Buffer::DEVICE );
   sh->matrices.create( ctx, mat.size() * 4, gpu::Buffer::DEVICE );
   gpu::Buffer upload;
@@ -378,7 +389,6 @@ bool GpuIntraRec::supported( const Slice& slice, std::string& why )
   else if( sps.getSpsRangeExtension().getExtendedPrecisionProcessingFlag() )               why = "extended precision";
   else if( sps.getUseColorTrans() )                                                       why = "ACT";
   else if( sps.getNumPredSigns() > 0 )                                                    why = "sign prediction";
-  else if( sps.getUseMIP() )                                                              why = "MIP";
   else if( sps.getUseISP() )                                                              why = "ISP";
   else if( sps.getUseMRL() || sps.getUseTmrl() )                                          why = "MRL / TMRL";
   else if( sps.getUseIntraLFNSTISlice() || sps.getUseIntraLFNSTPBSlice() || sps.getUseNSPT() ) why = "LFNST / NSPT";
@@ -434,12 +444,15 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
   const Slice&           slice = *cs.slice;
   const ChannelType      chType = toChannelType( compID );
   const CompArea&        area   = tu.blocks[compID];
-  const int              dirMode = PU::getFinalIntraMode( pu, chType );
+  // MIP blocks (luma; IntraPrediction::predIntraMip) are recorded with the DC mode: they read the references DC reads
+  // (a superset), and their bilateral filter, like DC's, has no angular texture gate; Tu::mipMatrix selects MIP
+  const bool             mip     = isLuma( compID ) && cu.mipFlag;
+  const int              dirMode = mip ? DC_IDX : PU::getFinalIntraMode( pu, chType );
 
   // what the GPU path does not do yet
   const char* why = nullptr;
   if( !CU::isIntra( cu ) )                                          why = "not intra";
-  else if( cu.mipFlag )                                             why = "MIP";
+  else if( !isLuma( compID ) && PU::isMIP( pu, chType ) )           why = "chroma MIP (4:4:4)";
   else if( cu.ispMode )                                             why = "ISP";
   else if( cu.lfnstIdx )                                            why = "LFNST";
   // transform skip with the regular residual coding is dequantized like a transform block (DepQuant::dequant)
@@ -505,6 +518,24 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
       }
       t.bf = dirMode <= DC_IDX ? 1 : 2;
     }
+  }
+  // MIP (MatrixIntraPrediction::predBlock): the mode's matrix, transposition and size class; the prediction reads the
+  // unfiltered references and uses none of the angular parameters
+  t.mipMatrix = -1;
+  if( mip )
+  {
+    const int    sizeId = getMipSizeId( area.size() );
+    const int    rows[3] = { 16, 16, 64 }, rowLen[3] = { 4, 8, 7 };   // reduced samples, weights per sample
+    const int    modeIdx = pu.intraDir[CHANNEL_TYPE_LUMA];
+    if( modeIdx < 0 || modeIdx >= getNumModesMip( area.size() ) )
+    {
+      unsupported( "MIP mode index out of range" );
+      return;
+    }
+    t.mipMatrix     = m.sh->mipOffset[sizeId] + modeIdx * rows[sizeId] * rowLen[sizeId];
+    t.mipTransposed = pu.mipTransposedFlag ? 1 : 0;
+    t.mipSizeId     = sizeId;
+    t.refFilter = t.applyPDPC = t.gradPDPC = t.fusion = 0;
   }
   // BDPCM (IntraPrediction::xPredIntraBDPCM): the unfiltered left column (1, horizontal) or above row (2, vertical)
   // copied, i.e. the angular prediction of mode 18 or 50 without reference filter, PDPC, fusion or bilateral filter

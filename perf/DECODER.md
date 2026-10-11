@@ -271,7 +271,11 @@ the reconstruction buffer; works in every frame-thread context):
   with the QP of transform skip and no transform shift, are the residual; also for joint CbCr) and BDPCM (the host
   accumulates the levels with the CPU's own invResDPCM; the prediction copies the unfiltered left column or above row,
   which is the GPU's mode 18 / 50 prediction with reference filter, PDPC, fusion and bilateral filter off). Transform
-  skip with the regular residual coding (dequantized by DepQuant) stays on the CPU. GpuIntraRec::supported() rejects
+  skip with the regular residual coding (dequantized by DepQuant) stays on the CPU; M10 adds MIP (matrix intra
+  prediction): intra_rec Haar-downsamples the unfiltered references, multiplies with the mode's matrix (the host
+  uploads MipData.h's matrices) and computes each upsampled sample in closed form (the CPU's running sums are
+  before * (factor - pos) + behind * pos, rounded once); the host records MIP blocks with the DC mode, whose read
+  range covers MIP's and whose bilateral filter has no angular gate, as MIP's. GpuIntraRec::supported() rejects
   every tool whose mode derivation or prediction reads
   reconstructed samples or that the kernels lack, before anything is skipped. All 19 regular streams now fall back to
   the CPU at sign prediction, the next sequence-level check (before M6: QCS, before M5: LMCS, before M4: dual tree);

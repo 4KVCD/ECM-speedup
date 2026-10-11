@@ -5,10 +5,10 @@
 // from the host: geometry and decoding order only), so independent blocks (the three components, distant parts of
 // the picture) run at the same time and no workgroup waits on a block it holds.
 // Per block: reference samples (and their [1 2 1] filtering), prediction (planar, directional planar, DC, angular
-// with PDPC and intra fusion, the intra bilateral filter) and reconstruction with the residual intra_resi computed beforehand for all blocks at
-// once (with LMCS: scaled for chroma by the neighbouring luma, the bilateral filter on inverse-mapped samples). Every
-// step follows the C++ of IntraPrediction / DecCu.
-// Not yet: MRL, ISP, MIP, LFNST / MTS / transform skip, decoder-side intra modes.
+// with PDPC and intra fusion, MIP, the intra bilateral filter) and reconstruction with the residual intra_resi computed
+// beforehand for all blocks at once (with LMCS: scaled for chroma by the neighbouring luma, the bilateral filter on
+// inverse-mapped samples). Every step follows the C++ of IntraPrediction / MatrixIntraPrediction / DecCu.
+// Not yet: MRL, ISP, LFNST / NSPT, decoder-side intra modes.
 #extension GL_GOOGLE_include_directive : require
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
@@ -46,6 +46,8 @@ shared int     s_next;                        // a dependent this workgroup rele
 shared int     s_deps[256];                   // the first dependents of the block (prefetched)
 shared int     s_red[6];                      // workgroup sums
 shared int16_t s_bfLut[48];                   // the bilateral filter's LUT row of the block's QP
+shared int     s_mipBdry[8];                  // MIP: the reduced boundary (top, then left)
+shared int     s_mipRed[64];                  // MIP: the reduced prediction (4 x 4 or 8 x 8)
 
 Params P;      // the parameter block (loaded once)
 int    g_ti;   // the block being reconstructed
@@ -209,6 +211,34 @@ void emitPred( Tu t, int x, int y, int pr, bool bf )
   {
     storeRecon( t, x, y, pr );
   }
+}
+
+// MIP's upsampling (MatrixIntraPrediction::predictionUpsampling) in closed form, each sample on its own: the CPU's
+// running sums give before * (factor - pos) + behind * pos, rounded and shifted once. Horizontal stage: reduced row r
+// at column x, between the reduced samples; the first segment starts from the left reference of the last row of the
+// vertical segment r
+int mipHor( int r, int x, int ps, int upH, int upV, int predStride )
+{
+  if( upH == 1 )
+  {
+    return s_mipRed[r * ps + x];
+  }
+  const int j = x / upH, pos = x % upH + 1, lg = findMSB( upH );
+  const int before = j == 0 ? int( s_ref[0][predStride + ( r + 1 ) * upV] ) : s_mipRed[r * ps + j - 1];
+  return ( before * ( upH - pos ) + s_mipRed[r * ps + j] * pos + ( 1 << ( lg - 1 ) ) ) >> lg;
+}
+
+// the MIP prediction of sample (x, y): the vertical stage over the horizontal one; the first segment starts from the
+// top reference
+int mipSample( int x, int y, int ps, int upH, int upV, int predStride )
+{
+  if( upV == 1 )
+  {
+    return mipHor( y, x, ps, upH, upV, predStride );
+  }
+  const int i = y / upV, pos = y % upV + 1, lg = findMSB( upV );
+  const int before = i == 0 ? int( s_ref[0][1 + x] ) : mipHor( i - 1, x, ps, upH, upV, predStride );
+  return ( before * ( upV - pos ) + mipHor( i, x, ps, upH, upV, predStride ) * pos + ( 1 << ( lg - 1 ) ) ) >> lg;
 }
 
 // workgroup sums of a and b (all invocations, uniform control flow; the slots are zero before)
@@ -411,7 +441,47 @@ void main()
     }
 
     // ----- prediction and reconstruction
-    if( t.dirMode == 0 || t.dirMode == 1 )   // planar / DC, then their PDPC
+    if( t.mipMatrix >= 0 )   // MIP (MatrixIntraPrediction::prepareInputForPred, computeReducedPred, predictionUpsampling)
+    {
+      const int bs = t.mipSizeId == 0 ? 2 : 4, ps = t.mipSizeId < 2 ? 4 : 8, inSize = 2 * bs;
+      // the reduced boundary: the Haar-downsampled top (entries 0 .. bs - 1) and left (bs .. 2 bs - 1) references
+      if( lid < inSize )
+      {
+        const bool top = lid < bs;
+        const int  k = top ? lid : lid - bs, f = ( top ? W : H ) / bs, lg = findMSB( f );
+        int sum = 0;
+        for( int j = 0; j < f; j++ ) sum += int( s_ref[0][( top ? 1 : predStride + 1 ) + k * f + j] );
+        s_mipBdry[lid] = f > 1 ? ( sum + ( 1 << ( lg - 1 ) ) ) >> lg : sum;
+      }
+      SYNC();
+      // the matrix input: [top, left], transposed [left, top], rebased on its first entry; that entry becomes the
+      // difference to the mid level, or 0 for the large size class, whose matrices have no weight for it
+      const bool transposed = t.mipTransposed != 0;
+      int mipIn[8];
+      for( int i = 0; i < inSize; i++ ) mipIn[i] = s_mipBdry[transposed ? ( i < bs ? bs + i : i - bs ) : i];
+      const int inputOffset = mipIn[0];
+      mipIn[0] = t.mipSizeId < 2 ? ( 1 << ( t.bitDepth - 1 ) ) - inputOffset : 0;
+      int inSum = mipIn[0];
+      for( int i = 1; i < inSize; i++ )
+      {
+        mipIn[i] -= inputOffset;
+        inSum += mipIn[i];
+      }
+      // the reduced prediction, one sample per invocation (computed in the transposed order when transposed); the
+      // large class's rows hold the weights of inputs 1 ..
+      if( lid < ps * ps )
+      {
+        const int rowLen = t.mipSizeId == 2 ? inSize - 1 : inSize, first = t.mipSizeId == 2 ? 1 : 0;
+        int sum = 0;
+        for( int i = first; i < inSize; i++ ) sum += mipIn[i] * BufI32( P.matrices ).v[t.mipMatrix + lid * rowLen + i - first];
+        const int offset = ( 1 << ( 6 - 1 ) ) - 32 * inSum;   // MIP_SHIFT_MATRIX 6, MIP_OFFSET_MATRIX 32
+        s_mipRed[transposed ? ( lid % ps ) * ps + lid / ps : lid] = clip3i( 0, maxPel, ( ( sum + offset ) >> 6 ) + inputOffset );
+      }
+      SYNC();
+      const int upH = W / ps, upV = H / ps;
+      for( int i = lid; i < N; i += NT ) emitPred( t, i % W, i / W, mipSample( i % W, i / W, ps, upH, upV, predStride ), bf );
+    }
+    else if( t.dirMode == 0 || t.dirMode == 1 )   // planar / DC, then their PDPC
     {
       const int log2W = findMSB( W ), log2H = findMSB( H );
       if( t.dirMode == 1 && lid == 0 )
