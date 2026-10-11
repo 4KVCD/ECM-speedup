@@ -50,6 +50,7 @@
 //! \{
 
 class EncLib;
+struct EncSearchStack;
 class EncGOP;
 
 // ====================================================================================================================
@@ -120,7 +121,7 @@ public:
 
   void    create              ( int iWidth, int iHeight, ChromaFormat chromaFormat, uint32_t iMaxCUWidth, uint32_t iMaxCUHeight, uint8_t uhTotalDepth );
   void    destroy             ();
-  void    init                ( EncLib* pcEncLib, const SPS& sps );
+  void    init                ( EncLib* pcEncLib, EncSearchStack& stack, const SPS& sps );
 
   /// preparation of slice encoding (reference marking, QP and lambda)
   void    initEncSlice        ( Picture*  pcPic, const int pocLast, const int pocCurr,

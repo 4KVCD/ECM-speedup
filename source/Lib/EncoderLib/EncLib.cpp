@@ -80,6 +80,7 @@ EncLib::EncLib( EncLibCommon* encLibCommon )
   m_uiNumAllPicCoded  =  0;
 
   m_iMaxRefPicNum     = 0;
+  m_searchStacks.emplace_back( new EncSearchStack );
 
 #if ENABLE_SIMD_OPT_BUFFER && defined(TARGET_SIMD_X86)
   g_pelBufOP.initPelBufOpsX86();
@@ -111,44 +112,19 @@ void EncLib::create( const int layerId )
 #if JVET_AJ0237_INTERNAL_12BIT
   m_cGOPEncoder.m_cBilateralFilter.setInternalBitDepth(m_bitDepth[COMPONENT_Y]);
 #endif
-#if ENABLE_SPLIT_PARALLELISM
-#if ENABLE_SPLIT_PARALLELISM
-  m_numCuEncStacks  = m_numSplitThreads == 1 ? 1 : NUM_RESERVERD_SPLIT_JOBS;
-#else
-  m_numCuEncStacks  = 1;
-#endif
-
-  m_cCuEncoder      = new EncCu              [m_numCuEncStacks];
-  m_cInterSearch    = new InterSearch        [m_numCuEncStacks];
-  m_cIntraSearch    = new IntraSearch        [m_numCuEncStacks];
-#if JVET_V0094_BILATERAL_FILTER || JVET_X0071_CHROMA_BILATERAL_FILTER
-  m_bilateralFilter = new BilateralFilter    [m_numCuEncStacks];
-#endif
-  m_cTrQuant        = new TrQuant            [m_numCuEncStacks];
-  m_CABACEncoder    = new CABACEncoder       [m_numCuEncStacks];
-  m_cRdCost         = new RdCost             [m_numCuEncStacks];
-  m_ctxCache        = new CtxCache           [m_numCuEncStacks];
-
-  for( int jId = 0; jId < m_numCuEncStacks; jId++ )
+  for( auto& stack: m_searchStacks )
   {
-    m_cCuEncoder[jId].         create( this );
+    stack->cuEncoder.create( this );
 #if JVET_V0094_BILATERAL_FILTER || JVET_X0071_CHROMA_BILATERAL_FILTER
-    m_bilateralFilter[jId].    create();
-#endif
-
-  }
-#else
-  m_cCuEncoder.         create( this );
-#if JVET_V0094_BILATERAL_FILTER || JVET_X0071_CHROMA_BILATERAL_FILTER
-  m_bilateralFilter.    create();
+    stack->bilateralFilter.create();
 #if JVET_AJ0237_INTERNAL_12BIT
-  m_bilateralFilter.setInternalBitDepth(m_bitDepth[COMPONENT_Y]);
-#endif
+    stack->bilateralFilter.setInternalBitDepth( m_bitDepth[COMPONENT_Y] );
 #endif
 #endif
 #if JVET_J0090_MEMORY_BANDWITH_MEASURE
-  m_cInterSearch.cacheAssign( &m_cacheModel );
+    stack->interSearch.cacheAssign( &m_cacheModel );
 #endif
+  }
 
   m_cLoopFilter.create(floorLog2(m_maxCUWidth) - MIN_CU_LOG2);
 
@@ -242,15 +218,11 @@ void EncLib::destroy ()
 {
   // destroy processing unit classes
   m_cGOPEncoder.        destroy();
-  m_cSliceEncoder.      destroy();
-#if ENABLE_SPLIT_PARALLELISM
-  for( int jId = 0; jId < m_numCuEncStacks; jId++ )
+  for( auto& stack: m_searchStacks )
   {
-    m_cCuEncoder[jId].destroy();
+    stack->sliceEncoder.destroy();
+    stack->cuEncoder.destroy();
   }
-#else
-  m_cCuEncoder.         destroy();
-#endif
   if( m_alf )
   {
     m_cEncALF.destroy();
@@ -266,35 +238,14 @@ void EncLib::destroy ()
 #else
   m_cReshaper.          destroy();
 #endif
-#if ENABLE_SPLIT_PARALLELISM
-  for( int jId = 0; jId < m_numCuEncStacks; jId++ )
+  for( auto& stack: m_searchStacks )
   {
-    m_cInterSearch[jId].   destroy();
-    m_cIntraSearch[jId].   destroy();
+    stack->interSearch.destroy();
+    stack->intraSearch.destroy();
 #if JVET_V0094_BILATERAL_FILTER || JVET_X0071_CHROMA_BILATERAL_FILTER
-    m_bilateralFilter[jId].destroy();
+    stack->bilateralFilter.destroy();
 #endif
   }
-#else
-  m_cInterSearch.       destroy();
-  m_cIntraSearch.       destroy();
-#if JVET_V0094_BILATERAL_FILTER || JVET_X0071_CHROMA_BILATERAL_FILTER
-  m_bilateralFilter.    destroy();
-#endif
-#endif
-
-#if ENABLE_SPLIT_PARALLELISM
-  delete[] m_cCuEncoder;
-  delete[] m_cInterSearch;
-  delete[] m_cIntraSearch;
-#if JVET_V0094_BILATERAL_FILTER || JVET_X0071_CHROMA_BILATERAL_FILTER
-  delete[] m_bilateralFilter;
-#endif
-  delete[] m_cTrQuant;
-  delete[] m_CABACEncoder;
-  delete[] m_cRdCost;
-  delete[] m_ctxCache;
-#endif
 
   return;
 }
@@ -337,14 +288,10 @@ void EncLib::init( bool isFieldCoding, AUWriterIf* auWriterIf )
     m_cRateCtrl.initHrdParam(sps0.getGeneralHrdParameters(), sps0.getOlsHrdParameters(), m_iFrameRate, m_RCInitialCpbFullness);
   }
 #endif
-#if ENABLE_SPLIT_PARALLELISM
-  for( int jId = 0; jId < m_numCuEncStacks; jId++ )
+  for( auto& stack: m_searchStacks )
   {
-    m_cRdCost[jId].setCostMode ( m_costMode );
+    stack->rdCost.setCostMode( m_costMode );
   }
-#else
-  m_cRdCost.setCostMode ( m_costMode );
-#endif
 
   // initialize PPS
 #if JVET_AA0146_WRAP_AROUND_FIX
@@ -673,116 +620,65 @@ void EncLib::init( bool isFieldCoding, AUWriterIf* auWriterIf )
 
   // initialize processing unit classes
   m_cGOPEncoder.  init( this );
-  m_cSliceEncoder.init( this, sps0 );
-#if ENABLE_SPLIT_PARALLELISM
-  for( int jId = 0; jId < m_numCuEncStacks; jId++ )
+  for( auto& stackPtr: m_searchStacks )
   {
-    // precache a few objects
-    for( int i = 0; i < 10; i++ )
-    {
-      auto x = m_ctxCache[jId].get();
-      m_ctxCache[jId].cache( x );
-    }
+    EncSearchStack& stack = *stackPtr;
+    stack.sliceEncoder.init( this, stack, sps0 );
+    stack.cuEncoder.init( this, stack, sps0 );
 
-    m_cCuEncoder[jId].init( this, sps0, jId );
-
-    // initialize transform & quantization class
-    m_cTrQuant[jId].init( jId == 0 ? nullptr : m_cTrQuant[0].getQuant(),
-                          1 << m_log2MaxTbSize,
-
-                          m_useRDOQ,
-                          m_useRDOQTS,
+    // initialize transform & quantization class; the other stacks share the scaling-list tables of the first
+    stack.trQuant.init( &stack == m_searchStacks[0].get() ? nullptr : getTrQuant()->getQuant(),
+                        1 << m_log2MaxTbSize,
+                        m_useRDOQ,
+                        m_useRDOQTS,
 #if T0196_SELECTIVE_RDOQ
-                          m_useSelectiveRDOQ,
+                        m_useSelectiveRDOQ,
 #endif
-                          true
+                        true
     );
 
     // initialize encoder search class
-    CABACWriter* cabacEstimator = m_CABACEncoder[jId].getCABACEstimator( &sps0 );
-    m_cIntraSearch[jId].init( this,
+    CABACWriter* cabacEstimator = stack.cabacEncoder.getCABACEstimator( &sps0 );
+    stack.intraSearch.init( this,
 #if JVET_V0094_BILATERAL_FILTER || JVET_X0071_CHROMA_BILATERAL_FILTER
-                             &m_bilateralFilter[jId],
+                            &stack.bilateralFilter,
 #endif
-                              &m_cTrQuant[jId],
-                              &m_cRdCost[jId],
-                              cabacEstimator,
-                              getCtxCache( jId ), m_maxCUWidth, m_maxCUHeight, floorLog2(m_maxCUWidth) - m_log2MinCUSize
-                            , &m_cReshaper[jId]
-                            , sps0.getBitDepth(CHANNEL_TYPE_LUMA)
+                            &stack.trQuant,
+                            &stack.rdCost,
+                            cabacEstimator,
+                            &stack.ctxCache, m_maxCUWidth, m_maxCUHeight, floorLog2(m_maxCUWidth) - m_log2MinCUSize
+                          , &m_cReshaper
+                          , sps0.getBitDepth(CHANNEL_TYPE_LUMA)
     );
-    m_cInterSearch[jId].init( this,
+    stack.interSearch.init( this,
 #if JVET_V0094_BILATERAL_FILTER || JVET_X0071_CHROMA_BILATERAL_FILTER
-                             &m_bilateralFilter[jId],
+                            &stack.bilateralFilter,
 #endif
-                              &m_cTrQuant[jId],
-                              m_iSearchRange,
-                              m_bipredSearchRange,
-                              m_motionEstimationSearchMethod,
-                              getUseCompositeRef(),
-                              m_maxCUWidth, m_maxCUHeight, floorLog2(m_maxCUWidth) - m_log2MinCUSize, &m_cRdCost[jId], cabacEstimator, getCtxCache( jId )
-                           , &m_cReshaper[jId]
-    );
-
-    // link temporary buffets from intra search with inter search to avoid unnecessary memory overhead
-    m_cInterSearch[jId].setTempBuffers( m_cIntraSearch[jId].getSplitCSBuf(), m_cIntraSearch[jId].getFullCSBuf(), m_cIntraSearch[jId].getSaveCSBuf() );
-  }
-#else  // ENABLE_SPLIT_PARALLELISM || ENABLE_WPP_PARALLELISM
-  m_cCuEncoder.   init( this, sps0 );
-
-  // initialize transform & quantization class
-  m_cTrQuant.init( nullptr,
-                   1 << m_log2MaxTbSize,
-                   m_useRDOQ,
-                   m_useRDOQTS,
-#if T0196_SELECTIVE_RDOQ
-                   m_useSelectiveRDOQ,
-#endif
-                   true
-  );
-
-  // initialize encoder search class
-  CABACWriter* cabacEstimator = m_CABACEncoder.getCABACEstimator(&sps0);
-  m_cIntraSearch.init( this,
-#if JVET_V0094_BILATERAL_FILTER || JVET_X0071_CHROMA_BILATERAL_FILTER
-                       &m_bilateralFilter,
-#endif
-                       &m_cTrQuant,
-                       &m_cRdCost,
-                       cabacEstimator,
-                       getCtxCache(), m_maxCUWidth, m_maxCUHeight, floorLog2(m_maxCUWidth) - m_log2MinCUSize
-                     , &m_cReshaper
-                     , sps0.getBitDepth(CHANNEL_TYPE_LUMA)
-  );
-  m_cInterSearch.init( this,
-#if JVET_V0094_BILATERAL_FILTER || JVET_X0071_CHROMA_BILATERAL_FILTER
-                       &m_bilateralFilter,
-#endif
-                       &m_cTrQuant,
-                       m_iSearchRange,
-                       m_bipredSearchRange,
-                       m_motionEstimationSearchMethod,
-                       getUseCompositeRef(),
-    m_maxCUWidth, m_maxCUHeight, floorLog2(m_maxCUWidth) - m_log2MinCUSize, &m_cRdCost, cabacEstimator, getCtxCache()
-                     , &m_cReshaper
+                            &stack.trQuant,
+                            m_iSearchRange,
+                            m_bipredSearchRange,
+                            m_motionEstimationSearchMethod,
+                            getUseCompositeRef(),
+      m_maxCUWidth, m_maxCUHeight, floorLog2(m_maxCUWidth) - m_log2MinCUSize, &stack.rdCost, cabacEstimator, &stack.ctxCache
+                          , &m_cReshaper
 #if JVET_Z0153_IBC_EXT_REF
-                     , pps0.getPicWidthInLumaSamples()
+                          , pps0.getPicWidthInLumaSamples()
 #if JVET_AJ0172_IBC_ITMP_ALIGN_REF_AREA
-                     , pps0.getPicHeightInLumaSamples()
+                          , pps0.getPicHeightInLumaSamples()
 #endif
 #endif
-  );
+    );
 
-  // link temporary buffets from intra search with inter search to avoid unneccessary memory overhead
-  m_cInterSearch.setTempBuffers( m_cIntraSearch.getSplitCSBuf(), m_cIntraSearch.getFullCSBuf(), m_cIntraSearch.getSaveCSBuf() );
-#endif // ENABLE_SPLIT_PARALLELISM || ENABLE_WPP_PARALLELISM
+    // link temporary buffets from intra search with inter search to avoid unneccessary memory overhead
+    stack.interSearch.setTempBuffers( stack.intraSearch.getSplitCSBuf(), stack.intraSearch.getFullCSBuf(), stack.intraSearch.getSaveCSBuf() );
 
 #if JVET_AE0159_FIBC || JVET_AE0059_INTER_CCCM || JVET_AE0078_IBC_LIC_EXTENSION || JVET_AF0073_INTER_CCP_MERGE
-  m_cInterSearch.setIntraPrediction(&m_cIntraSearch);
+    stack.interSearch.setIntraPrediction( &stack.intraSearch );
 #endif
 #if JVET_AH0200_INTRA_TMP_BV_REORDER
-  m_cIntraSearch.setInterPrediction(&m_cInterSearch);
+    stack.intraSearch.setInterPrediction( &stack.interSearch );
 #endif
+  }
   m_iMaxRefPicNum = 0;
 
 #if ER_CHROMA_QP_WCG_PPS
@@ -878,27 +774,19 @@ void EncLib::xInitScalingLists( SPS &sps, APS &aps )
   if(getUseScalingListId() == SCALING_LIST_OFF)
   {
     quant->setFlatScalingList(maxLog2TrDynamicRange, sps.getBitDepths());
-    quant->setUseScalingList(false);
-#if ENABLE_SPLIT_PARALLELISM
-    for( int jId = 1; jId < m_numCuEncStacks; jId++ )
+    for( auto& stack: m_searchStacks )
     {
-      getTrQuant( jId )->getQuant()->setFlatScalingList( maxLog2TrDynamicRange, sps.getBitDepths() );
-      getTrQuant( jId )->getQuant()->setUseScalingList( false );
+      stack->trQuant.getQuant()->setUseScalingList( false );
     }
-#endif
   }
   else if(getUseScalingListId() == SCALING_LIST_DEFAULT)
   {
     aps.getScalingList().setDefaultScalingList ();
     quant->setScalingList( &( aps.getScalingList() ), maxLog2TrDynamicRange, sps.getBitDepths() );
-    quant->setUseScalingList(true);
-#if ENABLE_SPLIT_PARALLELISM
-    for( int jId = 1; jId < m_numCuEncStacks; jId++ )
+    for( auto& stack: m_searchStacks )
     {
-      getTrQuant( jId )->getQuant()->setUseScalingList( true );
+      stack->trQuant.getQuant()->setUseScalingList( true );
     }
-    sps.setDisableScalingMatrixForLfnstBlks(getDisableScalingMatrixForLfnstBlks());
-#endif
   }
   else if(getUseScalingListId() == SCALING_LIST_FILE_READ)
   {
@@ -911,13 +799,10 @@ void EncLib::xInitScalingLists( SPS &sps, APS &aps )
     }
     aps.getScalingList().setChromaScalingListPresentFlag((sps.getChromaFormatIdc()!=CHROMA_400));
     quant->setScalingList( &( aps.getScalingList() ), maxLog2TrDynamicRange, sps.getBitDepths() );
-    quant->setUseScalingList(true);
-#if ENABLE_SPLIT_PARALLELISM
-    for( int jId = 1; jId < m_numCuEncStacks; jId++ )
+    for( auto& stack: m_searchStacks )
     {
-      getTrQuant( jId )->getQuant()->setUseScalingList( true );
+      stack->trQuant.getQuant()->setUseScalingList( true );
     }
-#endif
 
     sps.setDisableScalingMatrixForLfnstBlks(getDisableScalingMatrixForLfnstBlks());
   }
@@ -3662,7 +3547,7 @@ void EncLib::deriveHorCollocatedChroma(PelStorage* pcPicYuvOrg)
   if (m_horCollocatedChromaFlag < 0)
   {
     CHECK(m_chromaFormatIDC != CHROMA_420, "HorCollocatedChroma error");
-    m_horCollocatedChromaFlag = m_cIntraSearch.calcHorCollocatedChroma(pcPicYuvOrg, m_bitDepth[CH_C], &m_cRdCost);
+    m_horCollocatedChromaFlag = getIntraSearch()->calcHorCollocatedChroma(pcPicYuvOrg, m_bitDepth[CH_C], getRdCost());
     SPS &sps0 = *(m_spsMap.allocatePS( m_vps->getGeneralLayerIdx( m_layerId ) ));
     sps0.setHorCollocatedChromaFlag(m_horCollocatedChromaFlag);
   }

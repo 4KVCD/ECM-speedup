@@ -62,6 +62,7 @@
 //! \{
 
 class EncLib;
+struct EncSearchStack;
 class HLSWriter;
 class EncSlice;
 
@@ -513,7 +514,7 @@ private:
 #endif
 public:
   /// copy parameters from encoder class
-  void  init                ( EncLib* pcEncLib, const SPS& sps PARL_PARAM( const int jId = 0 ) );
+  void  init                ( EncLib* pcEncLib, EncSearchStack& stack, const SPS& sps PARL_PARAM( const int jId = 0 ) );
 
   void setDecCuReshaperInEncCU(EncReshape* pcReshape, ChromaFormat chromaFormatIDC) { initDecCuReshaper((Reshape*) pcReshape, chromaFormatIDC); }
   /// create internal buffers

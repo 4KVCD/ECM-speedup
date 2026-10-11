@@ -90,19 +90,19 @@ void EncSlice::destroy()
 #endif
 }
 
-void EncSlice::init( EncLib* pcEncLib, const SPS& sps )
+void EncSlice::init( EncLib* pcEncLib, EncSearchStack& stack, const SPS& sps )
 {
   m_pcCfg             = pcEncLib;
   m_pcLib             = pcEncLib;
   m_pcListPic         = pcEncLib->getListPic();
 
   m_pcGOPEncoder      = pcEncLib->getGOPEncoder();
-  m_pcCuEncoder       = pcEncLib->getCuEncoder();
-  m_pcInterSearch     = pcEncLib->getInterSearch();
-  m_CABACWriter       = pcEncLib->getCABACEncoder()->getCABACWriter   (&sps);
-  m_CABACEstimator    = pcEncLib->getCABACEncoder()->getCABACEstimator(&sps);
-  m_pcTrQuant         = pcEncLib->getTrQuant();
-  m_pcRdCost          = pcEncLib->getRdCost();
+  m_pcCuEncoder       = &stack.cuEncoder;
+  m_pcInterSearch     = &stack.interSearch;
+  m_CABACWriter       = stack.cabacEncoder.getCABACWriter   (&sps);
+  m_CABACEstimator    = stack.cabacEncoder.getCABACEstimator(&sps);
+  m_pcTrQuant         = &stack.trQuant;
+  m_pcRdCost          = &stack.rdCost;
 
   // create lambda and QP arrays
   m_vdRdPicLambda.resize(m_pcCfg->getDeltaQpRD() * 2 + 1 );

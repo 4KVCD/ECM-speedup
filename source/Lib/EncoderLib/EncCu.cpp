@@ -663,18 +663,18 @@ EncCu::~EncCu()
 
 /** \param    pcEncLib      pointer of encoder class
  */
-void EncCu::init( EncLib* pcEncLib, const SPS& sps PARL_PARAM( const int tId ) )
+void EncCu::init( EncLib* pcEncLib, EncSearchStack& stack, const SPS& sps PARL_PARAM( const int tId ) )
 {
   m_pcEncCfg           = pcEncLib;
-  m_pcIntraSearch      = pcEncLib->getIntraSearch( PARL_PARAM0( tId ) );
-  m_pcInterSearch      = pcEncLib->getInterSearch( PARL_PARAM0( tId ) );
-  m_pcTrQuant          = pcEncLib->getTrQuant( PARL_PARAM0( tId ) );
-  m_pcRdCost           = pcEncLib->getRdCost ( PARL_PARAM0( tId ) );
-  m_CABACEstimator     = pcEncLib->getCABACEncoder( PARL_PARAM0( tId ) )->getCABACEstimator( &sps );
+  m_pcIntraSearch      = &stack.intraSearch;
+  m_pcInterSearch      = &stack.interSearch;
+  m_pcTrQuant          = &stack.trQuant;
+  m_pcRdCost           = &stack.rdCost;
+  m_CABACEstimator     = stack.cabacEncoder.getCABACEstimator( &sps );
   m_CABACEstimator->setEncCu(this);
-  m_ctxCache           = pcEncLib->getCtxCache( PARL_PARAM0( tId ) );
+  m_ctxCache           = &stack.ctxCache;
   m_pcRateCtrl         = pcEncLib->getRateCtrl();
-  m_pcSliceEncoder     = pcEncLib->getSliceEncoder();
+  m_pcSliceEncoder     = &stack.sliceEncoder;
 #if ENABLE_SPLIT_PARALLELISM
   m_pcEncLib           = pcEncLib;
   m_dataId             = tId;

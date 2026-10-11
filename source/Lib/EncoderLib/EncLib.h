@@ -61,6 +61,10 @@
 #include "EncReshape.h"
 #include "EncAdaptiveLoopFilter.h"
 #include "RateCtrl.h"
+#include "EncSearchStack.h"
+
+#include <memory>
+#include <vector>
 
 #if JVET_AL0153_ALF_CCCM
 #include "EncLoopFilterCccm.h"
@@ -85,26 +89,9 @@ private:
   PicList&                  m_cListPic;                           ///< dynamic list of pictures
   int                       m_layerId;
 
-  // encoder search
-#if ENABLE_SPLIT_PARALLELISM
-  InterSearch              *m_cInterSearch;                       ///< encoder search class
-  IntraSearch              *m_cIntraSearch;                       ///< encoder search class
-#else
-  InterSearch               m_cInterSearch;                       ///< encoder search class
-  IntraSearch               m_cIntraSearch;                       ///< encoder search class
-#endif
+  // the slice and CU encoders and the searches, one stack per picture searched at the same time
+  std::vector<std::unique_ptr<EncSearchStack>> m_searchStacks;
   // coding tool
-#if ENABLE_SPLIT_PARALLELISM
-#if JVET_V0094_BILATERAL_FILTER || JVET_X0071_CHROMA_BILATERAL_FILTER
-  BilateralFilter          *m_bilateralFilter;
-#endif
-  TrQuant                  *m_cTrQuant;                           ///< transform & quantization class
-#else
-#if JVET_V0094_BILATERAL_FILTER || JVET_X0071_CHROMA_BILATERAL_FILTER
-  BilateralFilter           m_bilateralFilter;
-#endif
-  TrQuant                   m_cTrQuant;                           ///< transform & quantization class
-#endif
   LoopFilter                m_cLoopFilter;                        ///< deblocking filter class
   EncSampleAdaptiveOffset   m_cEncSAO;                            ///< sample adaptive offset class
   EncAdaptiveLoopFilter     m_cEncALF;
@@ -112,12 +99,6 @@ private:
 #if JVET_AL0153_ALF_CCCM
   EncLoopFilterCccm         m_cEncLoopFilterCccm;
 #endif
-#if ENABLE_SPLIT_PARALLELISM
-  CABACEncoder             *m_CABACEncoder;
-#else
-  CABACEncoder              m_CABACEncoder;
-#endif
-
 #if ENABLE_SPLIT_PARALLELISM
   EncReshape               *m_cReshaper;                        ///< reshaper class
 #else
@@ -130,25 +111,11 @@ private:
 
   // processing unit
   EncGOP                    m_cGOPEncoder;                        ///< GOP encoder
-  EncSlice                  m_cSliceEncoder;                      ///< slice encoder
-#if ENABLE_SPLIT_PARALLELISM
-  EncCu                    *m_cCuEncoder;                         ///< CU encoder
-#else
-  EncCu                     m_cCuEncoder;                         ///< CU encoder
-#endif
   // SPS
   ParameterSetMap<SPS>&     m_spsMap;                             ///< SPS. This is the base value. This is copied to PicSym
   ParameterSetMap<PPS>&     m_ppsMap;                             ///< PPS. This is the base value. This is copied to PicSym
   ParameterSetMap<APS>&     m_apsMap;                             ///< APS. This is the base value. This is copied to PicSym
   PicHeader                 m_picHeader;                          ///< picture header
-  // RD cost computation
-#if ENABLE_SPLIT_PARALLELISM
-  RdCost                   *m_cRdCost;                            ///< RD cost computation class
-  CtxCache                 *m_ctxCache;                           ///< buffer for temporarily stored context models
-#else
-  RdCost                    m_cRdCost;                            ///< RD cost computation class
-  CtxCache                  m_ctxCache;                           ///< buffer for temporarily stored context models
-#endif
   // quality control
   RateCtrl                  m_cRateCtrl;                          ///< Rate control class
 
@@ -220,51 +187,33 @@ public:
 
   AUWriterIf*             getAUWriterIf         ()              { return   m_AUWriterIf;           }
   PicList*                getListPic            ()              { return  &m_cListPic;             }
-#if ENABLE_SPLIT_PARALLELISM
-  InterSearch*            getInterSearch        ( int jId = 0 ) { return  &m_cInterSearch[jId];    }
-  IntraSearch*            getIntraSearch        ( int jId = 0 ) { return  &m_cIntraSearch[jId];    }
+  /// The stacks for the mode search of pictures; the getters below return the objects of the first one.
+  int                     getNumSearchStacks    () const        { return  int( m_searchStacks.size() ); }
+  EncSearchStack&         getSearchStack        ( int i = 0 )   { return  *m_searchStacks[i];      }
+  InterSearch*            getInterSearch        ()              { return  &m_searchStacks[0]->interSearch; }
+  IntraSearch*            getIntraSearch        ()              { return  &m_searchStacks[0]->intraSearch; }
 
 #if JVET_V0094_BILATERAL_FILTER || JVET_X0071_CHROMA_BILATERAL_FILTER
-  BilateralFilter*        getBilateralFilter    ( int jId = 0 ) { return  &m_bilateralFilter[jId]; }
+  BilateralFilter*        getBilateralFilter    ()              { return  &m_searchStacks[0]->bilateralFilter; }
 #endif
-  TrQuant*                getTrQuant            ( int jId = 0 ) { return  &m_cTrQuant[jId];        }
-#else
-  InterSearch*            getInterSearch        ()              { return  &m_cInterSearch;         }
-  IntraSearch*            getIntraSearch        ()              { return  &m_cIntraSearch;         }
-
-#if JVET_V0094_BILATERAL_FILTER || JVET_X0071_CHROMA_BILATERAL_FILTER
-  BilateralFilter*        getBilateralFilter    ()              { return  &m_bilateralFilter;      }
-#endif
-  TrQuant*                getTrQuant            ()              { return  &m_cTrQuant;             }
-#endif
+  TrQuant*                getTrQuant            ()              { return  &m_searchStacks[0]->trQuant; }
   LoopFilter*             getLoopFilter         ()              { return  &m_cLoopFilter;          }
   EncSampleAdaptiveOffset* getSAO               ()              { return  &m_cEncSAO;              }
   EncAdaptiveLoopFilter*  getALF                ()              { return  &m_cEncALF;              }
   EncGOP*                 getGOPEncoder         ()              { return  &m_cGOPEncoder;          }
-  EncSlice*               getSliceEncoder       ()              { return  &m_cSliceEncoder;        }
+  EncSlice*               getSliceEncoder       ()              { return  &m_searchStacks[0]->sliceEncoder; }
   EncHRD*                 getHRD                ()              { return  &m_encHRD;               }
 #if JVET_AL0153_ALF_CCCM
   EncLoopFilterCccm*      getLoopFilterCccmEncoder ()           { return &m_cEncLoopFilterCccm;    }
 #endif
-#if ENABLE_SPLIT_PARALLELISM
-  EncCu*                  getCuEncoder          ( int jId = 0 ) { return  &m_cCuEncoder[jId];      }
-#else
-  EncCu*                  getCuEncoder          ()              { return  &m_cCuEncoder;           }
-#endif
+  EncCu*                  getCuEncoder          ()              { return  &m_searchStacks[0]->cuEncoder; }
   HLSWriter*              getHLSWriter          ()              { return  &m_HLSWriter;            }
-#if ENABLE_SPLIT_PARALLELISM
-  CABACEncoder*           getCABACEncoder       ( int jId = 0 ) { return  &m_CABACEncoder[jId];    }
-
-  RdCost*                 getRdCost             ( int jId = 0 ) { return  &m_cRdCost[jId];         }
-  CtxCache*               getCtxCache           ( int jId = 0 ) { return  &m_ctxCache[jId];        }
-#else
-  CABACEncoder*           getCABACEncoder       ()              { return  &m_CABACEncoder;         }
+  CABACEncoder*           getCABACEncoder       ()              { return  &m_searchStacks[0]->cabacEncoder; }
 #if JVET_AA0096_MC_BOUNDARY_PADDING
   InterPrediction *         getFrameMcPadPredSearch() { return &m_cFrameMcPadPredSearch; }
 #endif
-  RdCost*                 getRdCost             ()              { return  &m_cRdCost;              }
-  CtxCache*               getCtxCache           ()              { return  &m_ctxCache;             }
-#endif
+  RdCost*                 getRdCost             ()              { return  &m_searchStacks[0]->rdCost; }
+  CtxCache*               getCtxCache           ()              { return  &m_searchStacks[0]->ctxCache; }
   RateCtrl*               getRateCtrl           ()              { return  &m_cRateCtrl;            }
 
 
