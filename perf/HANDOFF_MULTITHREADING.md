@@ -54,6 +54,39 @@ Commits on `enc-mt`, all bit-exact with stock ECM-20.0 (bitstream md5 of the sui
   1.3x on RA (`ft_sim.py` on the serial ra_long log: at most ~1.35x with any number of threads). The larger gains
   are P2 (all configs) and, for long RA encodes, `--ParallelSegments`, which overlaps intra periods with processes
   and combines with frame threads.
+- P2, first step: `--CuThreads=N` (the commit after the FrameThreads one): the intra luma RD candidates of the DCT2
+  and LFNST passes are coded by N helpers at the same time (light stacks of ~130 MB). Bit-exact at 1/2/4/8 and with
+  FrameThreads. It gains little: 1.06-1.11x on the intra test pictures and ra_parkjoy at 2-4 threads, 1.00-1.01x
+  on foreman LD/RA; 8 threads are slower than 4 (OPTIMIZATIONS.md has the table).
+- Grain probe (now run, `perf/mt/grain_probe`, small clips, one P-core each). Loop time and average task:
+
+  | loop | AI foreman CIF 1 f | LD foreman QCIF 5 f | RA foreman QCIF 9 f | probe speed-up at 4 workers |
+  |---|---|---|---|---|
+  | encode total | 34.8 s | 46.0 s | 96.6 s | |
+  | intra RMD (rough mode decision) | 8.9 s, 0.4 us | 5.1 s, 0.4 us | 5.3 s, 0.4 us | 0.6x (too fine) |
+  | intra RD DCT2 pass | 5.2 s, 9 us | 1.4 s, 11 us | 2.0 s, 9 us | 2.6x |
+  | intra RD LFNST passes | 4.2 s, 5 us | 1.5 s, 5 us | 3.7 s, 6 us | 2.7x |
+  | intra RD MTS pass | 2.7 s, 8 us | 0.7 s, 7 us | 1.8 s, 10 us | 2.8x (needs speculation) |
+  | intra RD ISP | 2.0 s, 0.8 us | 0.6 s, 0.9 us | 1.2 s, 1.1 us | 1.2x |
+  | merge SATD pass | - | 3.9 s, 4 us | 13.7 s, 7 us | 2.6-3.1x |
+  | merge full RD | - | 3.8 s, 29 us | 6.3 s, 27 us | 2.9x (needs speculation) |
+  | uni/bi ME per reference | - | 2.4 s, 6 us | 3.3 s, 9 us | 1.2-2.5x |
+  | GPM MC, SAD, blend, RD | - | 1.8 s | 4.1 s | 1.4-3.4x |
+
+  The probed loops cover about half of each encode; the rest (merge list building and its TM/BDMVR refinements,
+  affine ME, AMVP, GPM candidate stages, chroma, TMP search) is spread over dozens of functions of 0.5-3 % each
+  (LD profile: merge test 29 %, inter test 21 %, GPM 17 %, each split over 15-20 callees). At CIF the task sizes
+  are the same as at QCIF.
+- What the first step measured, against the probe's model of 2 us per task:
+  - The real cost per loop and task was far higher at first: the main thread's record, compare and install of a
+    result, the workers' state sync and wake-up (12 us per loop while they slept), and the helpers' candidate coding
+    at 1.7x the serial time (shared allocator lock). After the fixes in the commit: ~1.7 s of main-thread overhead
+    for ~1.1 M candidates of 5 us each (ai_foreman), helpers at 1.2x the serial time.
+  - Workers that spin cost the main thread ~3 % of turbo frequency (a serial encode next to three spinning P-cores:
+    33.0 s -> 34.1 s). Sleeping workers wake too late for loops of 50 us, so they spin 2 ms after each job; in LD and
+    RA, where the intra loops are a small part, that cancels the gain.
+  - Revised estimate for P2 on LD, all probed loops at the probe's efficiency: about 1.25x; realistically 1.1-1.2x,
+    after a separate engineering step for each of many loops.
 
 ## Tools in perf/mt
 
@@ -66,8 +99,11 @@ Commits on `enc-mt`, all bit-exact with stock ECM-20.0 (bitstream md5 of the sui
 - `ft_sim.py <serial log> [finish fraction] [GOP size]`: frame-thread schedule simulation (references, same-layer
   CABAC chain reset at IRAPs, stacks in coding order, finishes in coding order) for 1-32 threads.
 - `grain_probe/insert_grain_probes.py <tree>`: adds timers to every candidate loop in a throwaway checkout of 2912a239
-  and prints, at exit, the speed-up a 2/4/8/16-worker pool would reach with 2 us overhead per task. The probed tree
-  compiled; the measurement itself was stopped before it ran (next step 1).
+  and prints, at exit, the speed-up a 2/4/8/16-worker pool would reach with 2 us overhead per task (results in
+  Progress). Its task times include each candidate's setup.
+- `cu_matrix.py EXE TAG REFEXE`: the bit-exactness matrix of the thread options (default, CuThreads 2/4/8, the
+  check, with FrameThreads), jobs on their own P-cores; `cu_scale.py EXE tests counts`: CuThreads timings, one run at
+  a time on P-cores, with each run's peak commit.
 
 ## Measurements (i7-10700 8C/16T, 64 GB, Windows 11, GCC 16.2)
 
@@ -285,8 +321,15 @@ AI-latency ~2-2.5x.
 
 ## Next steps
 
-1. Run the loop-grain probe on RA/LD/AI and compare each loop's measured speed-up with the estimates above. Use a
-   build of `perf/mt/grain_probe` on a throwaway worktree of 2912a239, pinned runs. Then finalise the plan with the
-   user, at most 3 review rounds.
-2. P0 and P1 are done (see Progress). Next is P2, starting with the loop the grain probe ranks first.
+1. The grain probe and the first P2 step changed the ranking above; decide with the user between:
+   - P5 first: let later GOPs start while earlier ones finish, in one process. AI pictures and RA intra periods read
+     nothing from earlier periods after the RAS-init reset (`--ParallelSegments` relies on that), so AI throughput
+     should approach the thread count (ParallelSegments: 6.66x with processes) and RA gain several times with
+     FrameThreads, without the duplicated intra picture of RA chunks. This is what ParallelSegments already gives with
+     processes; the new part is one process. Work: EncLib::encode returns while GOPs are in flight, picture buffers are
+     reused only when done, setups and finishes keep coding order across GOPs, output in order.
+   - More P2 for LD, the only configuration nothing else speeds up: merge SATD pass, ME per reference, the GPM stages,
+     intra RMD in chunks, then P3 speculation for the merge/GPM full RD and the intra MTS pass. Expected 1.1-1.2x on
+     LD in all, each loop a step like the first (state sync, record and compare, shadow check).
+2. P0, P1 and the first P2 step are done (see Progress).
 3. Report each step as step % and cumulative % with before/after numbers and commit hashes, one commit per step.

@@ -267,8 +267,13 @@ public:
 #endif
   void initStructData  (const int &QP = MAX_INT, const bool &skipMotBuf = false);
   void initSubStructure(      CodingStructure& cs, const ChannelType chType, const UnitArea &subArea, const bool &isTuEnc);
+  /// As initSubStructure for TU encoding, with the CU and PU copied from the given objects instead of this structure's
+  /// (which another thread may be changing).
+  void initSubStructure(      CodingStructure& cs, const ChannelType chType, const UnitArea &subArea, const CodingUnit& cuFrom,
+                              const PredictionUnit& puFrom );
 
-  void copyStructure   (const CodingStructure& cs, const ChannelType chType, const bool copyTUs = false, const bool copyRecoBuffer = false);
+  void copyStructure   (const CodingStructure& cs, const ChannelType chType, const bool copyTUs = false, const bool copyRecoBuffer = false,
+                        const bool copyCUsAndPUs = true);
   void useSubStructure (const CodingStructure& cs, const ChannelType chType, const UnitArea &subArea, const bool cpyPred, const bool cpyReco, const bool cpyOrgResi, const bool cpyResi, const bool updateCost);
   void useSubStructure (const CodingStructure& cs, const ChannelType chType,                          const bool cpyPred, const bool cpyReco, const bool cpyOrgResi, const bool cpyResi, const bool updateCost) { useSubStructure(cs, chType, cs.area, cpyPred, cpyReco, cpyOrgResi, cpyResi, updateCost); }
 

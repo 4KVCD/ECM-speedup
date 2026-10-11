@@ -51,6 +51,11 @@
 #include "CommonLib/BilateralFilter.h"
 #endif
 #include "EncReshape.h"
+#include "EncCuWorkers.h"
+#include <atomic>
+#include <deque>
+#include <exception>
+#include <memory>
 
 //! \ingroup EncoderLib
 //! \{
@@ -942,6 +947,57 @@ public:
 #endif
   IntraSearch();
   ~IntraSearch();
+
+  /// CuThreads: the helper searches that code RD candidates of this search's CUs (the first one in this thread, the
+  /// others in the workers' threads); check: code the candidates here too and compare
+  void setRdHelpers( const std::vector<IntraSearch*>& helpers, EncCuWorkers* workers, bool check );
+
+private:
+  // CuThreads. In an RD pass without a running cost threshold, every candidate starts from the same state. The loop
+  // runs once to set the candidates up and record them, the helpers code them, and the second run takes each result
+  // where it would code the candidate.
+  struct RdTask;
+  struct RdResult;
+  struct RdJob;
+  std::vector<IntraSearch*> m_rdHelpers;
+  EncCuWorkers*             m_rdWorkers      = nullptr;
+  bool                      m_rdCheck        = false;
+  int64_t                   m_rdNumChecked   = 0;       ///< candidates the check compared
+  std::vector<std::unique_ptr<RdTask>> m_rdTasks;
+  std::unique_ptr<RdJob>    m_rdJob;
+  // the state the last taken result left in the CABAC estimator and the picture, set when the serial loop would need it
+  const RdTask*             m_rdPendingCtx   = nullptr;
+  const RdTask*             m_rdPendingWrite = nullptr;
+  // helper side
+  bool                      m_isRdHelper     = false;
+  bool                      m_rdWrotePicture = false;   ///< the candidate coding wrote its reconstruction to the picture
+  struct RdHelperOwnBuffers;                            ///< a helper's own buffers while it uses the main search's
+  std::unique_ptr<RdHelperOwnBuffers> m_rdOwn;
+  std::vector<std::deque<RdResult>> m_rdResults;        ///< result structures by CU size
+  int                       m_rdResultsUsed  = 0;       ///< results of the current job (one CU size)
+  std::unique_ptr<QTBTPartitioner> m_rdPartitioner;    ///< the job's partitioner while a candidate is coded
+  static void xRdJobEntry  ( void* job, int worker );
+  void xRdHelperSync       ( IntraSearch& main );
+  void xRdHelperRestore    ();
+  void xRdHelperRunTasks   ( RdJob& job );
+  void xRdHelperRunTask    ( RdJob& job, RdTask& task );
+  void xRdHelperRunTaskSafe( RdJob& job, RdTask& task );   ///< passes an exception to the job
+  RdResult& xRdAcquireResult( int width, int height );
+  void xRdDestroyResults   ();
+  // main side
+  bool xRdEligible         ( const CodingUnit& cu, const PredictionUnit& pu, int mode ) const;
+  void xRdRecord           ( int idx, int mode, const CodingUnit& cu, const PredictionUnit& pu );
+  void xRdStartJob         ( CodingStructure& cs, const Partitioner& partitioner, const Ctx& ctxStart, int numTasks,
+                             bool mtsCheckRangeFlag, int mtsFirstCheckId, int mtsLastCheckId, bool moreProbMTSIdxFirst );
+  bool xRdSameCandidate    ( const RdTask& task, const CodingUnit& cu, const PredictionUnit& pu );
+  RdTask& xRdWaitTask      ( int idx );
+  bool xRdTakeResult       ( const RdTask& task, CodingStructure& cs, CodingStructure& csTemp, double bestCost,
+                             const Partitioner& partitioner );
+  void xRdFlushPicture     ();
+  void xRdEndJob           ();
+  void xRdCheck            ( const CodingStructure& csMain, bool validMain, const RdTask& task, int mode );
+
+public:
 
   void init                       ( EncCfg*        pcEncCfg,
 #if JVET_V0094_BILATERAL_FILTER || JVET_X0071_CHROMA_BILATERAL_FILTER

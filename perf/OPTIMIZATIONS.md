@@ -106,6 +106,33 @@ lower all-core turbo, one duplicated intra frame per chunk, unequal chunk comple
 | 4 | 449.4 s | 559.7 s | 1.25x | yes |
 | 8 | 414.8 s | 568.7 s | 1.35x | yes |
 
+## CU threads (`--CuThreads=N`)
+
+- In the intra luma RD passes without a running cost threshold (the DCT2 pass and the LFNST passes, not the MTS
+  pass), N helpers (the picture's own thread and N-1 workers) code the RD candidates of a CU at the same time. The
+  candidate loop runs twice: the first run sets every candidate up and records it (CU and PU bytes, LFNST mode
+  indices), the helpers code the recorded candidates, and the second run takes each result where it would code the
+  candidate, after checking that it set the candidate up the same way. Output identical at every N;
+  `--CuThreadsCheck=1` codes every candidate in the picture's own search too and stops at a difference
+  (`perf/HANDOFF_MULTITHREADING.md`, P2).
+- Coded serially as before: ISP, PNN, TMP with LIC, BDPCM, ACT, CUs larger than the maximum transform size, passes
+  with fewer than two candidates. A helper is a light stack of ~130 MB.
+- The small-object allocator keeps per-thread free lists; with one shared spinlock the helpers' candidate coding took
+  1.7x the serial time.
+- The gain is small: the candidates take ~5 us each, and the rest of the loop (setups, ISP, PNN) stays serial.
+  Workers spin 2 ms after each job (a sleeping thread wakes too late for a loop), which costs the picture's thread
+  ~3 % of turbo frequency: foreman in LD and RA, where intra RD is a small part, gains 0-1 %; ParkJoy in RA, with
+  many intra CUs, gains about as much as intra pictures.
+- Core Ultra 7 265K, one run at a time on 4 P-cores (8 for N=8):
+
+| test | CuThreads=1 | 2 | 4 | 8 | peak commit (1 / 4 / 8) | bit-exact |
+|---|---|---|---|---|---|---|
+| ai_foreman (CIF, 1 intra picture) | 33.2 s | 30.9 s, 1.07x | 29.8 s, 1.11x | 31.6 s, 1.05x | 1.5 / 2.0 / 2.5 GB | yes |
+| ai_parkjoy (256x256, 2 intra pictures) | 46.7 s | 44.2 s, 1.06x | 43.5 s, 1.07x | 44.5 s, 1.05x | 1.4 / 2.0 / 2.5 GB | yes |
+| ld_foreman (QCIF, 5 frames) | 41.8 s | 41.7 s, 1.00x | 41.7 s, 1.00x | 42.3 s, 0.99x | 1.5 / 2.0 / 2.5 GB | yes |
+| ra_parkjoy (256x256, 5 frames) | 55.9 s | 52.4 s, 1.07x | 51.1 s, 1.09x | 52.8 s, 1.06x | 1.5 / 2.0 / 2.5 GB | yes |
+| ra_foreman (QCIF, 9 frames) | 89.5 s | 88.4 s, 1.01x | 88.4 s, 1.01x | 91.1 s, 0.98x | 1.5 / 2.1 / 2.6 GB | yes |
+
 ## Notes
 - GCC 16 needed two build fixes (missing `<cstdint>`; `-fno-aggressive-loop-optimizations`, because
   `EncAdaptiveLoopFilter.cpp` reads `m_chromaScaleIdxFinal[4][1]` with alternative index up to 7).

@@ -1570,6 +1570,8 @@ void EncApp::xInitLibCfg()
   m_cEncLib.setDebugCTU                                          ( m_debugCTU );
   m_cEncLib.setSearchStackCount                                  ( m_searchStackCount );
   m_cEncLib.setFrameThreads                                      ( m_frameThreads );
+  m_cEncLib.setCuThreads                                         ( m_cuThreads );
+  m_cEncLib.setCuThreadsCheck                                    ( m_cuThreadsCheck );
 #if ENABLE_SPLIT_PARALLELISM
   m_cEncLib.setNumSplitThreads                                   ( m_numSplitThreads );
   m_cEncLib.setForceSingleSplitThread                            ( m_forceSplitSequential );

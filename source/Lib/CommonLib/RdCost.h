@@ -947,7 +947,7 @@ public:
   {
     return Distortion(m_motionLambda * getAmvpSbTmvpBitsOfVectorWithPredictor(amvpSbTmvpMvdOffset, numOffset));
   }
-  const int m_estAmvpSbTmvpIdxBits[3][3] = { { 3, 0, 0 },
+  static constexpr int m_estAmvpSbTmvpIdxBits[3][3] = { { 3, 0, 0 },
                                              { 4, 4, 0 },
                                              { 4, 5, 5 } };
   uint32_t       getAmvpSbTmvpBitsOfVectorWithPredictor(const int amvpSbTmvpMvdOffset, const int numOffset)

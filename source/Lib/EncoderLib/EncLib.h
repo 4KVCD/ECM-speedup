@@ -91,6 +91,8 @@ private:
 
   // the slice and CU encoders and the searches, one stack per picture searched at the same time
   std::vector<std::unique_ptr<EncSearchStack>> m_searchStacks;
+  // CuThreads: the helpers of each search stack (stack i has the helpers i * CuThreads ... i * CuThreads + CuThreads - 1)
+  std::vector<std::unique_ptr<EncRdHelperStack>> m_rdHelperStacks;
   // coding tool
   LoopFilter                m_cLoopFilter;                        ///< deblocking filter class
   EncSampleAdaptiveOffset   m_cEncSAO;                            ///< sample adaptive offset class
@@ -167,6 +169,7 @@ protected:
   void  xInitPicHeader    (PicHeader &picHeader, const SPS &sps, const PPS &pps); ///< initialize Picture Header from encoder options
   void  xInitAPS          (APS &aps);                 ///< initialize APS from encoder options
   void  xInitScalingLists ( SPS &sps, APS &aps );     ///< initialize scaling lists
+  std::vector<TrQuant*> xAllTrQuants();               ///< the quantizers of the search stacks and their helpers
   void  xInitPPSforLT(PPS& pps);
   void  xInitHrdParameters(SPS &sps);                 ///< initialize HRDParameters parameters
 
@@ -190,6 +193,8 @@ public:
   /// The stacks for the mode search of pictures; the getters below return the objects of the first one.
   int                     getNumSearchStacks    () const        { return  int( m_searchStacks.size() ); }
   EncSearchStack&         getSearchStack        ( int i = 0 )   { return  *m_searchStacks[i];      }
+  int                     getNumRdHelpers       () const        { return  m_searchStacks.empty() ? 0 : int( m_rdHelperStacks.size() / m_searchStacks.size() ); }
+  EncRdHelperStack&       getRdHelperStack      ( int i, int h ) { return *m_rdHelperStacks[i * getNumRdHelpers() + h]; }
   InterSearch*            getInterSearch        ()              { return  &m_searchStacks[0]->interSearch; }
   IntraSearch*            getIntraSearch        ()              { return  &m_searchStacks[0]->intraSearch; }
 

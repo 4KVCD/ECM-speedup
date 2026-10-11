@@ -72,3 +72,18 @@ struct EncSearchStack
   PicHeader       picHeader;
   LoopFilter      loopFilter;
 };
+
+/// CuThreads: the objects a helper codes intra RD candidates of a picture stack's CUs with. It predicts with the
+/// reshaper of the picture stack and takes the per-CU state of its intra search (IntraSearch::setRdHelpers).
+struct EncRdHelperStack
+{
+  IntraSearch     intraSearch;
+  InterPrediction interPrediction;   ///< the OBMC of intra candidates
+#if JVET_V0094_BILATERAL_FILTER || JVET_X0071_CHROMA_BILATERAL_FILTER
+  BilateralFilter bilateralFilter;
+#endif
+  TrQuant         trQuant;
+  CABACEncoder    cabacEncoder;
+  RdCost          rdCost;
+  CtxCache        ctxCache;
+};

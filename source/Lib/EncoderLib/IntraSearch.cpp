@@ -174,6 +174,12 @@ void IntraSearch::destroy()
 {
   CHECK( !m_isInitialized, "Not initialized" );
 
+  if( m_rdCheck )
+  {
+    msg( INFO, "CuThreadsCheck: %lld RD candidates coded by a helper and here, all identical\n", (long long) m_rdNumChecked );
+  }
+  xRdDestroyResults();
+
   if( m_pcEncCfg )
   {
     const uint32_t uiNumLayersToAllocateSplit = 1;
@@ -904,6 +910,673 @@ void tmpFusionBlending(int16_t* __restrict  refTarget[] , const int* const __res
   }
 }
 #endif
+
+// CuThreads: a helper search's own buffer pointers, kept while it uses the main search's buffers instead (the main
+// search fills those for the CU before the RD loop; the candidates only read them)
+struct IntraSearch::RdHelperOwnBuffers
+{
+#if JVET_AJ0061_TIMD_MERGE || JVET_AJ0146_TIMDSAD
+  decltype( IntraSearch::m_timdPredBuf )        m_timdPredBuf;
+#endif
+#if JVET_AJ0146_TIMDSAD
+  decltype( IntraSearch::m_timdSadPredBuf )     m_timdSadPredBuf;
+#endif
+#if JVET_AH0076_OBIC
+  decltype( IntraSearch::m_dimdPredBuf )        m_dimdPredBuf;
+  decltype( IntraSearch::m_obicPredBuf )        m_obicPredBuf;
+#endif
+#if JVET_AG0058_EIP
+  decltype( IntraSearch::m_eipPredBuf )         m_eipPredBuf;
+  decltype( IntraSearch::m_eipMergePredBuf )    m_eipMergePredBuf;
+#if JVET_AL0106_BV_EIP
+  decltype( IntraSearch::m_eipBvPredBuf )       m_eipBvPredBuf;
+#endif
+#endif
+#if JVET_AM0074_INTRA_MERGE
+  decltype( IntraSearch::m_intraMergePredBuf )  m_intraMergePredBuf;
+#endif
+#if JVET_AK0059_MDIP
+  decltype( IntraSearch::m_mdipPredBuf )        m_mdipPredBuf;
+#endif
+#if JVET_AB0155_SGPM
+  decltype( IntraSearch::m_sgpmPredBuf )        m_sgpmPredBuf;
+#endif
+#if JVET_AL0108_BVG_DIMD
+  decltype( IntraSearch::m_bvgDimdPredBuf )     m_bvgDimdPredBuf;
+#endif
+#if JVET_AH0209_PDP
+  decltype( IntraSearch::m_pdpIntraPredBuf )    m_pdpIntraPredBuf;
+  decltype( IntraSearch::m_pdpIntraPredBufIP )  m_pdpIntraPredBufIP;
+#endif
+#if JVET_AD0086_ENHANCED_INTRA_TMP
+  decltype( IntraSearch::m_tmpRefBuf )          m_tmpRefBuf;
+#endif
+};
+
+#define RD_ALIAS( m )   std::memcpy( &m_rdOwn->m, &m, sizeof( m ) ); std::memcpy( &m, &main.m, sizeof( m ) )
+#define RD_RESTORE( m ) std::memcpy( &m, &m_rdOwn->m, sizeof( m ) )
+#define RD_COPY( m )    static_assert( std::is_trivially_copyable<decltype( m )>::value, #m ); std::memcpy( &m, &main.m, sizeof( m ) )
+
+void IntraSearch::xRdHelperSync( IntraSearch& main )
+{
+  // the per-CU settings of the objects the candidates use
+  *m_pcRdCost = *main.m_pcRdCost;
+  m_pcTrQuant->copySearchStateFrom( *main.m_pcTrQuant );
+#if JVET_AJ0161_OBMC_EXT_WITH_INTRA_PRED
+  m_pcInterPred->copyObmcCuStateFrom( *main.m_pcInterPred );
+#endif
+  CHECK( m_pcReshape != main.m_pcReshape, "A helper search predicts with the reshaper of its picture" );
+
+  // the predictions the main search prepared for the CU
+#if JVET_AJ0061_TIMD_MERGE || JVET_AJ0146_TIMDSAD
+  RD_ALIAS( m_timdPredBuf );
+#endif
+#if JVET_AJ0146_TIMDSAD
+  RD_ALIAS( m_timdSadPredBuf );
+#endif
+#if JVET_AH0076_OBIC
+  RD_ALIAS( m_dimdPredBuf );
+  RD_ALIAS( m_obicPredBuf );
+#endif
+#if JVET_AG0058_EIP
+  RD_ALIAS( m_eipPredBuf );
+  RD_ALIAS( m_eipMergePredBuf );
+#if JVET_AL0106_BV_EIP
+  RD_ALIAS( m_eipBvPredBuf );
+#endif
+#endif
+#if JVET_AM0074_INTRA_MERGE
+  RD_ALIAS( m_intraMergePredBuf );
+#endif
+#if JVET_AK0059_MDIP
+  RD_ALIAS( m_mdipPredBuf );
+#endif
+#if JVET_AB0155_SGPM
+  RD_ALIAS( m_sgpmPredBuf );
+#endif
+#if JVET_AL0108_BVG_DIMD
+  RD_ALIAS( m_bvgDimdPredBuf );
+#endif
+#if JVET_AH0209_PDP
+  RD_ALIAS( m_pdpIntraPredBuf );
+  RD_ALIAS( m_pdpIntraPredBufIP );
+  RD_COPY( m_pdpIntraPredReady );
+#endif
+#if JVET_AD0086_ENHANCED_INTRA_TMP
+  RD_ALIAS( m_tmpRefBuf );
+  RD_COPY( m_tmpRefArea );
+#endif
+
+  // the CU's models, candidates and flags
+#if JVET_AG0058_EIP
+  RD_COPY( m_eipModel );
+  RD_COPY( m_eipMergeModel );
+#if JVET_AL0106_BV_EIP
+  RD_COPY( m_eipBvModel );
+#endif
+#if JVET_AJ0082_MM_EIP
+  m_numSigEip = main.m_numSigEip;
+#endif
+#endif
+#if JVET_AJ0249_NEURAL_NETWORK_BASED
+  m_isDimdPredictionSaved = main.m_isDimdPredictionSaved;
+  m_isObicPredictionSaved = main.m_isObicPredictionSaved;
+#endif
+#if JVET_W0103_INTRA_MTS
+  m_globalBestCostStore = main.m_globalBestCostStore;
+#if JVET_Y0142_ADAPT_INTRA_MTS
+  m_coeffAbsSumDCT2 = main.m_coeffAbsSumDCT2;
+#endif
+#endif
+#if SECONDARY_MPM
+  RD_COPY( m_intraMPM );
+  RD_COPY( m_intraNonMPM );
+#endif
+#if JVET_AD0086_ENHANCED_INTRA_TMP
+  RD_COPY( m_tmpXdisp );
+  RD_COPY( m_tmpYdisp );
+  RD_COPY( m_tmpFusionInfo );
+  RD_COPY( m_tmpFlmParams );
+#if JVET_AG0136_INTRA_TMP_LIC
+  RD_COPY( m_tmpXdispUseMR );
+  RD_COPY( m_tmpYdispUseMR );
+  RD_COPY( m_tmpFusionInfoUseMR );
+  m_memLicParams = main.m_memLicParams;
+#endif
+#endif
+#if JVET_AJ0249_NEURAL_NETWORK_BASED
+  m_evalIdx = main.m_evalIdx;   // the CU's reference availability, evaluated once
+#endif
+#if JVET_AH0209_PDP
+  RD_COPY( m_ref );             // the CU's PDP reference samples, filled once
+  RD_COPY( m_refShort );
+#endif
+#if JVET_AJ0161_OBMC_EXT_WITH_INTRA_PRED
+  m_intraOBMCNeighState = main.m_intraOBMCNeighState;
+#endif
+#if TMP_FAST_ENC
+  m_tmpNumCand = main.m_tmpNumCand;
+#if JVET_AG0136_INTRA_TMP_LIC
+  m_tmpNumCandUseMR = main.m_tmpNumCandUseMR;
+#endif
+#endif
+}
+
+void IntraSearch::xRdHelperRestore()
+{
+#if JVET_AJ0061_TIMD_MERGE || JVET_AJ0146_TIMDSAD
+  RD_RESTORE( m_timdPredBuf );
+#endif
+#if JVET_AJ0146_TIMDSAD
+  RD_RESTORE( m_timdSadPredBuf );
+#endif
+#if JVET_AH0076_OBIC
+  RD_RESTORE( m_dimdPredBuf );
+  RD_RESTORE( m_obicPredBuf );
+#endif
+#if JVET_AG0058_EIP
+  RD_RESTORE( m_eipPredBuf );
+  RD_RESTORE( m_eipMergePredBuf );
+#if JVET_AL0106_BV_EIP
+  RD_RESTORE( m_eipBvPredBuf );
+#endif
+#endif
+#if JVET_AM0074_INTRA_MERGE
+  RD_RESTORE( m_intraMergePredBuf );
+#endif
+#if JVET_AK0059_MDIP
+  RD_RESTORE( m_mdipPredBuf );
+#endif
+#if JVET_AB0155_SGPM
+  RD_RESTORE( m_sgpmPredBuf );
+#endif
+#if JVET_AL0108_BVG_DIMD
+  RD_RESTORE( m_bvgDimdPredBuf );
+#endif
+#if JVET_AH0209_PDP
+  RD_RESTORE( m_pdpIntraPredBuf );
+  RD_RESTORE( m_pdpIntraPredBufIP );
+#endif
+#if JVET_AD0086_ENHANCED_INTRA_TMP
+  RD_RESTORE( m_tmpRefBuf );
+#endif
+}
+
+/// One RD candidate of a pass, set up by the loop's first run and coded by a helper search.
+struct IntraSearch::RdTask
+{
+  int               mode = 0;
+  // the candidate's CU and PU as the loop set them up: byte copies, compared with the loop's CU and PU when it reaches
+  // the candidate again, and the units the helper codes from
+  alignas( CodingUnit )     unsigned char cuBytes[sizeof( CodingUnit )];
+  alignas( PredictionUnit ) unsigned char puBytes[sizeof( PredictionUnit )];
+  int               lfnstIntraModeIdx[4] = { 0, 0, 0, 0 };
+  RdResult*         result = nullptr;
+  bool              valid  = false;
+  bool              wrotePicture = false;            ///< the coding wrote the reconstruction to the picture
+  bool              setCoeffAbsSumDCT2 = false;
+  int64_t           coeffAbsSumDCT2 = 0;
+  std::atomic<bool> done{ false };
+  const CodingUnit&     cu() const { return *std::launder( reinterpret_cast<const CodingUnit*>( cuBytes ) ); }
+  const PredictionUnit& pu() const { return *std::launder( reinterpret_cast<const PredictionUnit*>( puBytes ) ); }
+};
+
+/// A helper's coding structure and CABAC state after one candidate; the helper's until the job ends.
+struct IntraSearch::RdResult
+{
+  CodingStructure*  cs = nullptr;
+  Ctx               ctx;
+};
+
+/// The pass the helpers work on.
+struct IntraSearch::RdJob
+{
+  IntraSearch*      main = nullptr;
+  CodingStructure*  cs   = nullptr;                  ///< the CU's structure, parent of the candidates'
+  std::unique_ptr<QTBTPartitioner> partitioner;      ///< a copy: the main search changes its own while it codes
+  Ctx               ctxStart;                        ///< synced, so that the helpers copy it at the same time
+  bool              mtsCheckRangeFlag   = false;
+  int               mtsFirstCheckId     = 0;
+  int               mtsLastCheckId      = 0;
+  bool              moreProbMTSIdxFirst = false;
+  int               numTasks = 0;
+  std::atomic<int>  claim{ 0 };                      ///< the next task to code
+  std::atomic<int>  synced{ 0 };                     ///< workers that have taken over the main search's state
+  std::atomic<bool> failed{ false };                 ///< a helper threw: error is the first exception
+  std::exception_ptr error;
+  void fail()
+  {
+    if( !failed.exchange( true, std::memory_order_acq_rel ) )
+    {
+      error = std::current_exception();
+    }
+  }
+};
+
+namespace
+{
+// the bytes of a unit after its area, without [skipBegin, skipEnd)
+bool rdSameBytes( const void* a, const void* b, size_t size, size_t skipBegin = 0, size_t skipEnd = 0 )
+{
+  const char* pa = static_cast<const char*>( a );
+  const char* pb = static_cast<const char*>( b );
+  if( skipBegin < skipEnd )
+  {
+    return !std::memcmp( pa + sizeof( UnitArea ), pb + sizeof( UnitArea ), skipBegin - sizeof( UnitArea ) )
+           && !std::memcmp( pa + skipEnd, pb + skipEnd, size - skipEnd );
+  }
+  return !std::memcmp( pa + sizeof( UnitArea ), pb + sizeof( UnitArea ), size - sizeof( UnitArea ) );
+}
+constexpr int64_t RD_UNSET = std::numeric_limits<int64_t>::min();
+}   // namespace
+
+void IntraSearch::setRdHelpers( const std::vector<IntraSearch*>& helpers, EncCuWorkers* workers, bool check )
+{
+  m_rdHelpers = helpers;
+  m_rdWorkers = workers;
+  m_rdCheck   = check;
+  m_rdJob.reset( new RdJob );
+  for( IntraSearch* h: helpers )
+  {
+    h->m_isRdHelper = true;
+    h->m_rdOwn.reset( new RdHelperOwnBuffers );
+  }
+}
+
+void IntraSearch::xRdJobEntry( void* job, int worker )
+{
+  RdJob&       j      = *static_cast<RdJob*>( job );
+  IntraSearch& helper = *j.main->m_rdHelpers[worker];
+  // an exception goes to the main search (xRdWaitTask), which ends the job and throws it
+  try
+  {
+    helper.xRdHelperSync( *j.main );
+  }
+  catch( ... )
+  {
+    j.fail();
+  }
+  j.synced.fetch_add( 1, std::memory_order_acq_rel );
+  if( !j.failed.load( std::memory_order_acquire ) )
+  {
+    helper.xRdHelperRunTasks( j );
+  }
+  helper.xRdHelperRestore();
+}
+
+void IntraSearch::xRdDestroyResults()
+{
+  for( auto& sizePool: m_rdResults )
+  {
+    for( RdResult& r: sizePool )
+    {
+      r.cs->destroy();
+      delete r.cs;
+    }
+  }
+  m_rdResults.clear();
+}
+
+void IntraSearch::xRdHelperRunTasks( RdJob& job )
+{
+  while( job.claim.load( std::memory_order_acquire ) < job.numTasks )
+  {
+    const int i = job.claim.fetch_add( 1, std::memory_order_acq_rel );
+    if( i < job.numTasks )
+    {
+      xRdHelperRunTaskSafe( job, *job.main->m_rdTasks[i] );
+    }
+  }
+}
+
+void IntraSearch::xRdHelperRunTaskSafe( RdJob& job, RdTask& task )
+{
+  try
+  {
+    xRdHelperRunTask( job, task );
+  }
+  catch( ... )
+  {
+    job.fail();
+    task.done.store( true, std::memory_order_release );
+  }
+}
+
+IntraSearch::RdResult& IntraSearch::xRdAcquireResult( int width, int height )
+{
+  const size_t key = gp_sizeIdxInfo->idxFrom( width ) * gp_sizeIdxInfo->numHeights() + gp_sizeIdxInfo->idxFrom( height );
+  if( key >= m_rdResults.size() )
+  {
+    m_rdResults.resize( key + 1 );
+  }
+  std::deque<RdResult>& pool = m_rdResults[key];
+  if( m_rdResultsUsed == (int) pool.size() )
+  {
+    pool.emplace_back();
+    RdResult& r = pool.back();
+    r.cs = new CodingStructure( m_unitCache.cuCache, m_unitCache.puCache, m_unitCache.tuCache );
+#if JVET_Z0118_GDR
+    r.cs->create( m_pcEncCfg->getChromaFormatIdc(), Area( 0, 0, width, height ), false, (bool) m_pcEncCfg->getPLTMode(),
+                  m_pcEncCfg->getGdrEnabled() );
+#else
+    r.cs->create( m_pcEncCfg->getChromaFormatIdc(), Area( 0, 0, width, height ), false, (bool) m_pcEncCfg->getPLTMode() );
+#endif
+  }
+  return pool[m_rdResultsUsed++];
+}
+
+void IntraSearch::xRdHelperRunTask( RdJob& job, RdTask& task )
+{
+  m_pcTrQuant->setLfnstIntraModeIdxAll( task.lfnstIntraModeIdx );
+  RdResult&        r      = xRdAcquireResult( task.cu().lwidth(), task.cu().lheight() );
+  CodingStructure& csTemp = *r.cs;
+  csTemp.slice = job.cs->slice;
+  job.cs->initSubStructure( csTemp, job.partitioner->chType, job.cs->area, task.cu(), task.pu() );
+  m_CABACEstimator->getCtx().copyFromShared( job.ctxStart );
+  if( !m_rdPartitioner )
+  {
+    m_rdPartitioner.reset( new QTBTPartitioner( *job.partitioner ) );
+  }
+  else
+  {
+    *m_rdPartitioner = *job.partitioner;   // reuses the storage
+  }
+  QTBTPartitioner& partitioner = *m_rdPartitioner;
+  m_rdWrotePicture = false;
+#if JVET_W0103_INTRA_MTS && JVET_Y0142_ADAPT_INTRA_MTS
+  m_coeffAbsSumDCT2 = RD_UNSET;   // set by the coding of some candidates only
+#endif
+  task.valid = xRecurIntraCodingLumaQT( csTemp, partitioner, MAX_DOUBLE, -1, TU_NO_ISP, false, job.mtsCheckRangeFlag,
+                                        job.mtsFirstCheckId, job.mtsLastCheckId, job.moreProbMTSIdxFirst
+#if JVET_AG0136_INTRA_TMP_LIC
+                                        , m_pcInterPred
+#endif
+  );
+  task.wrotePicture = m_rdWrotePicture;
+#if JVET_W0103_INTRA_MTS && JVET_Y0142_ADAPT_INTRA_MTS
+  task.setCoeffAbsSumDCT2 = m_coeffAbsSumDCT2 != RD_UNSET;
+  task.coeffAbsSumDCT2    = m_coeffAbsSumDCT2;
+#endif
+  r.ctx.swap( m_CABACEstimator->getCtx() );   // the next task copies the start state over the estimator's
+  task.result = &r;
+  task.done.store( true, std::memory_order_release );
+}
+
+bool IntraSearch::xRdEligible( const CodingUnit& cu, const PredictionUnit& pu, int mode ) const
+{
+  return mode >= 0 && !cu.ispMode && !cu.bdpcmMode && !cu.colorTransform && !cu.mtsFlag
+#if JVET_AG0136_INTRA_TMP_LIC
+         && !( cu.tmpFlag && cu.tmpLicFlag )   // the helpers do not take over the LIC state of the TMP prediction
+#endif
+#if JVET_AJ0249_NEURAL_NETWORK_BASED
+         && pu.intraDir[CHANNEL_TYPE_LUMA] != PNN_IDX   // nor the CU state of the neural network prediction
+#endif
+         && cu.lwidth() <= cu.cs->sps->getMaxTbSize() && cu.lheight() <= cu.cs->sps->getMaxTbSize();   // one TU
+}
+
+void IntraSearch::xRdRecord( int idx, int mode, const CodingUnit& cu, const PredictionUnit& pu )
+{
+  if( idx == (int) m_rdTasks.size() )
+  {
+    m_rdTasks.emplace_back( new RdTask );
+  }
+  RdTask& task = *m_rdTasks[idx];
+  std::memcpy( task.cuBytes, static_cast<const void*>( &cu ), sizeof( CodingUnit ) );
+  std::memcpy( task.puBytes, static_cast<const void*>( &pu ), sizeof( PredictionUnit ) );
+  task.mode = mode;
+  m_pcTrQuant->getLfnstIntraModeIdxAll( task.lfnstIntraModeIdx );
+}
+
+void IntraSearch::xRdStartJob( CodingStructure& cs, const Partitioner& partitioner, const Ctx& ctxStart, int numTasks,
+                               bool mtsCheckRangeFlag, int mtsFirstCheckId, int mtsLastCheckId, bool moreProbMTSIdxFirst )
+{
+  RdJob& job = *m_rdJob;
+  job.main   = this;
+  job.cs     = &cs;
+  if( !job.partitioner )
+  {
+    job.partitioner.reset( new QTBTPartitioner( dynamic_cast<const QTBTPartitioner&>( partitioner ) ) );
+  }
+  else
+  {
+    *job.partitioner = dynamic_cast<const QTBTPartitioner&>( partitioner );
+  }
+  job.ctxStart            = ctxStart;   // leaves the copy without unsynced changes
+  job.mtsCheckRangeFlag   = mtsCheckRangeFlag;
+  job.mtsFirstCheckId     = mtsFirstCheckId;
+  job.mtsLastCheckId      = mtsLastCheckId;
+  job.moreProbMTSIdxFirst = moreProbMTSIdxFirst;
+  job.numTasks            = numTasks;
+  job.claim.store( 0, std::memory_order_relaxed );
+  job.synced.store( 0, std::memory_order_relaxed );
+  job.failed.store( false, std::memory_order_relaxed );
+  job.error = nullptr;
+  for( int i = 0; i < numTasks; i++ )
+  {
+    m_rdTasks[i]->done.store( false, std::memory_order_relaxed );
+    m_rdTasks[i]->result = nullptr;
+  }
+  m_rdPendingCtx   = nullptr;
+  m_rdPendingWrite = nullptr;
+  // this thread codes candidates too: a worker for each other one, as far as there are workers
+  const int numWorkers = m_rdWorkers ? std::min( m_rdWorkers->getNumWorkers(), numTasks - 1 ) : 0;
+  if( m_rdWorkers )
+  {
+    m_rdWorkers->start( &xRdJobEntry, &job, numWorkers );
+  }
+  // the workers read this search's state until they have taken it over
+  try
+  {
+    m_rdHelpers[0]->xRdHelperSync( *this );
+  }
+  catch( ... )
+  {
+    job.fail();
+  }
+  while( job.synced.load( std::memory_order_acquire ) < numWorkers )
+  {
+    _mm_pause();
+  }
+  if( job.failed.load( std::memory_order_acquire ) )
+  {
+    xRdEndJob();
+    std::rethrow_exception( job.error );
+  }
+}
+
+bool IntraSearch::xRdSameCandidate( const RdTask& task, const CodingUnit& cu, const PredictionUnit& pu )
+{
+#if JVET_AJ0249_NEURAL_NETWORK_BASED
+  // set after the coding of a PNN candidate, read and written only by PNN candidates (TrQuant, UnitTools)
+  const size_t pnnBegin = reinterpret_cast<const char*>( &cu.indicesRepresentationPnn ) - reinterpret_cast<const char*>( &cu );
+  const size_t pnnEnd   = pnnBegin + sizeof( cu.indicesRepresentationPnn );
+#else
+  const size_t pnnBegin = 0;
+  const size_t pnnEnd   = 0;
+#endif
+  int lfnstIdx[4];
+  m_pcTrQuant->getLfnstIntraModeIdxAll( lfnstIdx );
+  const bool same = rdSameBytes( task.cuBytes, &cu, sizeof( CodingUnit ), pnnBegin, pnnEnd )
+                    && rdSameBytes( task.puBytes, &pu, sizeof( PredictionUnit ) )
+                    && std::equal( lfnstIdx, lfnstIdx + 4, task.lfnstIntraModeIdx );
+  return same;
+}
+
+IntraSearch::RdTask& IntraSearch::xRdWaitTask( int idx )
+{
+  RdJob&  job  = *m_rdJob;
+  RdTask& task = *m_rdTasks[idx];
+  // code the tasks no helper has taken yet, until this one is done
+  while( !task.done.load( std::memory_order_acquire ) )
+  {
+    if( job.claim.load( std::memory_order_acquire ) < job.numTasks )
+    {
+      const int i = job.claim.fetch_add( 1, std::memory_order_acq_rel );
+      if( i < job.numTasks )
+      {
+        m_rdHelpers[0]->xRdHelperRunTaskSafe( job, *m_rdTasks[i] );
+      }
+    }
+    else
+    {
+      _mm_pause();
+    }
+  }
+  if( job.failed.load( std::memory_order_acquire ) )
+  {
+    // the helpers are done with the job before the exception leaves the search
+    m_rdPendingCtx   = nullptr;
+    m_rdPendingWrite = nullptr;
+    xRdEndJob();
+    std::rethrow_exception( job.error );
+  }
+  return task;
+}
+
+bool IntraSearch::xRdTakeResult( const RdTask& task, CodingStructure& cs, CodingStructure& csTemp, double bestCost,
+                                 const Partitioner& partitioner )
+{
+  const CodingStructure& r    = *task.result->cs;
+  const CompArea&        area = cs.area.Y();
+  if( r.cost < bestCost )
+  {
+    // the loop takes the candidate as its best one: the whole result
+    cs.initSubStructure( csTemp, partitioner.chType, cs.area, *r.cus[0], *r.pus[0] );
+#if JVET_AJ0249_NEURAL_NETWORK_BASED
+    csTemp.cus[0]->indicesRepresentationPnn = cs.cus[0]->indicesRepresentationPnn;   // see xRdSameCandidate
+#endif
+    csTemp.copyStructure( r, partitioner.chType, true, false, false );
+    csTemp.getPredBuf( area ).copyFrom( r.getPredBuf( area ) );
+    csTemp.getResiBuf( area ).copyFrom( r.getResiBuf( area ) );
+    csTemp.getRecoBuf( area ).copyFrom( r.getRecoBuf( area ) );
+  }
+  else
+  {
+    csTemp.cost = r.cost;   // the loop reads only the cost of other candidates
+  }
+  if( task.wrotePicture )
+  {
+    m_rdPendingWrite = &task;
+  }
+  m_rdPendingCtx = &task;
+#if JVET_W0103_INTRA_MTS && JVET_Y0142_ADAPT_INTRA_MTS
+  if( task.setCoeffAbsSumDCT2 )
+  {
+    m_coeffAbsSumDCT2 = task.coeffAbsSumDCT2;
+  }
+#endif
+  return task.valid;
+}
+
+void IntraSearch::xRdFlushPicture()
+{
+  if( m_rdPendingWrite )
+  {
+    // as the coding of the candidate does (xRecurIntraCodingLumaQT)
+    const CodingStructure& r    = *m_rdPendingWrite->result->cs;
+    const CompArea&        area = r.area.Y();
+#if JVET_Z0118_GDR
+    r.updateReconMotIPM( area );
+#else
+    r.picture->getRecoBuf( area ).copyFrom( r.getRecoBuf( area ) );
+#endif
+    r.picture->getPredBuf( area ).copyFrom( r.getPredBuf( area ) );
+    m_rdPendingWrite = nullptr;
+  }
+}
+
+void IntraSearch::xRdEndJob()
+{
+  RdJob& job = *m_rdJob;
+  // the state the last coded candidate left
+  xRdFlushPicture();
+  if( m_rdPendingCtx )
+  {
+    m_CABACEstimator->getCtx() = m_rdPendingCtx->result->ctx;
+    m_rdPendingCtx = nullptr;
+  }
+  job.claim.store( job.numTasks, std::memory_order_release );   // no further tasks
+  if( m_rdWorkers )
+  {
+    m_rdWorkers->wait();
+  }
+  m_rdHelpers[0]->xRdHelperRestore();
+  for( IntraSearch* h: m_rdHelpers )
+  {
+    h->m_rdResultsUsed = 0;
+  }
+  job.numTasks = 0;
+}
+
+void IntraSearch::xRdCheck( const CodingStructure& csMain, bool validMain, const RdTask& task, int mode )
+{
+  const CodingStructure& csHelper    = *task.result->cs;
+  const bool             validHelper = task.valid;
+  const CodingUnit&      cu          = *csMain.cus[0];
+  std::string diff;
+  if( validMain != validHelper )
+  {
+    diff += " valid";
+  }
+  if( csMain.cost != csHelper.cost )
+  {
+    diff += " cost";
+  }
+  if( csMain.dist != csHelper.dist )
+  {
+    diff += " dist";
+  }
+  if( csMain.fracBits != csHelper.fracBits )
+  {
+    diff += " bits";
+  }
+  if( csMain.tus.size() != csHelper.tus.size() )
+  {
+    diff += " numTus";
+  }
+  else if( !csMain.tus.empty() )
+  {
+    const TransformUnit& a = *csMain.tus[0];
+    const TransformUnit& b = *csHelper.tus[0];
+    if( a.cbf[COMPONENT_Y] != b.cbf[COMPONENT_Y] || a.mtsIdx[COMPONENT_Y] != b.mtsIdx[COMPONENT_Y] )
+    {
+      diff += " tuFlags";
+    }
+    const CCoeffBuf ca = a.getCoeffs( COMPONENT_Y );
+    const CCoeffBuf cb = b.getCoeffs( COMPONENT_Y );
+    for( int y = 0; y < (int) ca.height && diff.find( "coeffs" ) == std::string::npos; y++ )
+    {
+      if( memcmp( ca.bufAt( 0, y ), cb.bufAt( 0, y ), ca.width * sizeof( TCoeff ) ) )
+      {
+        diff += " coeffs";
+      }
+    }
+  }
+  const CPelBuf ra = csMain.getRecoBuf( cu.Y() );
+  const CPelBuf rb = csHelper.getRecoBuf( csHelper.cus[0]->Y() );
+  for( int y = 0; y < (int) ra.height && diff.find( "reco" ) == std::string::npos; y++ )
+  {
+    if( memcmp( ra.bufAt( 0, y ), rb.bufAt( 0, y ), ra.width * sizeof( Pel ) ) )
+    {
+      diff += " reco";
+    }
+  }
+#if JVET_W0103_INTRA_MTS && JVET_Y0142_ADAPT_INTRA_MTS
+  if( task.setCoeffAbsSumDCT2 && m_coeffAbsSumDCT2 != task.coeffAbsSumDCT2 )
+  {
+    diff += " coeffAbsSumDCT2";
+  }
+#endif
+  if( !diff.empty() )
+  {
+    THROW( "CuThreadsCheck: POC " << cu.slice->getPOC() << " CU " << cu.lx() << "," << cu.ly() << " " << cu.lwidth() << "x"
+           << cu.lheight() << " mode " << mode << " dir " << int( csMain.pus[0]->intraDir[0] ) << " lfnst " << int( cu.lfnstIdx )
+           << " mip " << int( cu.mipFlag ) << " tmp " << int( cu.tmpFlag ) << " mrl " << int( csMain.pus[0]->multiRefIdx )
+           << " cost " << csMain.cost << " vs " << csHelper.cost << ": differs in" << diff );
+  }
+  m_rdNumChecked++;
+}
+
 bool IntraSearch::estIntraPredLumaQT(CodingUnit &cu, Partitioner &partitioner, const double bestCostSoFar, bool mtsCheckRangeFlag, int mtsFirstCheckId, int mtsLastCheckId, bool moreProbMTSIdxFirst, CodingStructure* bestCS
 #if JVET_AG0136_INTRA_TMP_LIC
                                      , InterPrediction* pcInterPred 
@@ -911,6 +1584,10 @@ bool IntraSearch::estIntraPredLumaQT(CodingUnit &cu, Partitioner &partitioner, c
 )
 {
   LumaModeFlagsMemoScope lumaModeFlagsMemoScope(*this);   // mode bits memo valid within this search (fixed neighbours)
+  if( m_rdWorkers && !cu.mtsFlag )
+  {
+    m_rdWorkers->wake();   // CuThreads: the workers spin by the time the RD loop starts
+  }
   CodingStructure       &cs            = *cu.cs;
   const SPS             &sps           = *cs.sps;
   const uint32_t             uiWidthBit    = floorLog2(partitioner.currArea().lwidth() );
@@ -6126,8 +6803,73 @@ bool IntraSearch::estIntraPredLumaQT(CodingUnit &cu, Partitioner &partitioner, c
     double costRdPnn = MAX_DOUBLE;
     bool isFirstScanned = true;
 #endif
+    // CuThreads (see m_rdTasks): the first run of the loop only records the candidates for the helpers
+    const bool rdParallel = !m_rdHelpers.empty() && !cu.mtsFlag && !isSecondColorSpace;
+    int        rdNumTasks = 0;
+    int        rdNextTask = 0;
+    // the second run starts from the state the first one found: the setup of the candidates changes the CU, PU and
+    // LFNST indices, derives the EIP models' DIMD modes once (the second run would skip the derivation and the CU
+    // fields it sets) and counts the PNN candidates
+    uint8_t    rdCuSaved[sizeof( CodingUnit )];
+    uint8_t    rdPuSaved[sizeof( PredictionUnit )];
+    int        rdLfnstSaved[4];
+#if JVET_AG0058_EIP
+    decltype( m_eipModel )      rdEipModelSaved;
+    decltype( m_eipMergeModel ) rdEipMergeModelSaved;
+#if JVET_AL0106_BV_EIP
+    decltype( m_eipBvModel )    rdEipBvModelSaved;
+#endif
+#endif
+#if JVET_AJ0249_NEURAL_NETWORK_BASED
+    const bool rdFirstScannedSaved = isFirstScanned;
+#endif
+    if( rdParallel )
+    {
+      std::memcpy( rdCuSaved, static_cast<const void*>( &cu ), sizeof( CodingUnit ) );
+      std::memcpy( rdPuSaved, static_cast<const void*>( &pu ), sizeof( PredictionUnit ) );
+      m_pcTrQuant->getLfnstIntraModeIdxAll( rdLfnstSaved );
+#if JVET_AG0058_EIP
+      std::copy( std::begin( m_eipModel ), std::end( m_eipModel ), std::begin( rdEipModelSaved ) );
+      std::copy( std::begin( m_eipMergeModel ), std::end( m_eipMergeModel ), std::begin( rdEipMergeModelSaved ) );
+#if JVET_AL0106_BV_EIP
+      std::copy( std::begin( m_eipBvModel ), std::end( m_eipBvModel ), std::begin( rdEipBvModelSaved ) );
+#endif
+#endif
+    }
+    for( int rdRun = rdParallel ? 0 : 1; rdRun < 2; rdRun++ )
+    {
+    const bool rdCollect = rdRun == 0;
+    if( rdRun == 1 && rdParallel )
+    {
+      std::memcpy( static_cast<void*>( &cu ), rdCuSaved, sizeof( CodingUnit ) );
+      std::memcpy( static_cast<void*>( &pu ), rdPuSaved, sizeof( PredictionUnit ) );
+      m_pcTrQuant->setLfnstIntraModeIdxAll( rdLfnstSaved );
+#if JVET_AJ0249_NEURAL_NETWORK_BASED
+      isFirstScanned = rdFirstScannedSaved;
+#endif
+      if( rdNumTasks < 2 )
+      {
+        rdNumTasks = 0;   // nothing to do at the same time: the candidate is coded here, as without helpers
+      }
+      if( rdNumTasks )
+      {
+        // the helpers take the EIP models with the DIMD modes the setup derived
+        xRdStartJob( cs, partitioner, ctxStart, rdNumTasks, mtsCheckRangeFlag, mtsFirstCheckId, mtsLastCheckId, moreProbMTSIdxFirst );
+      }
+#if JVET_AG0058_EIP
+      std::copy( std::begin( rdEipModelSaved ), std::end( rdEipModelSaved ), std::begin( m_eipModel ) );
+      std::copy( std::begin( rdEipMergeModelSaved ), std::end( rdEipMergeModelSaved ), std::begin( m_eipMergeModel ) );
+#if JVET_AL0106_BV_EIP
+      std::copy( std::begin( rdEipBvModelSaved ), std::end( rdEipBvModelSaved ), std::begin( m_eipBvModel ) );
+#endif
+#endif
+    }
     for (int mode = isSecondColorSpace ? 0 : -2 * int(testBDPCM); mode < (int)uiRdModeList.size(); mode++)
     {
+      if( rdCollect && mode >= numNonISPModes )
+      {
+        break;   // the ISP candidates depend on the results of the others
+      }
 #if JVET_AJ0249_NEURAL_NETWORK_BASED
       const int idxInModeCostStore = mode - idxShift;
       if (spsIntraLfnstEnabled && isShapeHandledPnn && mode == idxPnnBackwardCompatibility && m_globalBestCostStore > costRdPnn)
@@ -6707,6 +7449,16 @@ bool IntraSearch::estIntraPredLumaQT(CodingUnit &cu, Partitioner &partitioner, c
 #endif
       // set context models
       m_CABACEstimator->getCtx() = ctxStart;
+      m_rdPendingCtx = nullptr;   // CuThreads: the state of the last taken result is gone, as in the serial loop
+
+      if( rdCollect )
+      {
+        if( xRdEligible( cu, pu, mode ) )
+        {
+          xRdRecord( rdNumTasks++, mode, cu, pu );
+        }
+        continue;
+      }
 
       // determine residual for partition
       cs.initSubStructure( *csTemp, partitioner.chType, cs.area, true );
@@ -6718,6 +7470,7 @@ bool IntraSearch::estIntraPredLumaQT(CodingUnit &cu, Partitioner &partitioner, c
         {
           m_modeCtrl->setISPWasTested(true);
         }
+        xRdFlushPicture();
         tmpValidReturn = xIntraCodingLumaISP(*csTemp, subTuPartitioner, bestCurrentCost);
         if (csTemp->tus.size() == 0)
         {
@@ -6754,10 +7507,32 @@ bool IntraSearch::estIntraPredLumaQT(CodingUnit &cu, Partitioner &partitioner, c
       {
         if (cu.colorTransform)
         {
+          xRdFlushPicture();
           tmpValidReturn = xRecurIntraCodingACTQT(*csTemp, partitioner, mtsCheckRangeFlag, mtsFirstCheckId, mtsLastCheckId, moreProbMTSIdxFirst);
         }
         else
         {
+          // CuThreads: the result of a helper search, which coded the candidate as the loop set it up the first time
+          RdTask* rdTask = nullptr;
+          if( rdNextTask < rdNumTasks && xRdEligible( cu, pu, mode ) )
+          {
+            if( m_rdTasks[rdNextTask]->mode == mode && xRdSameCandidate( *m_rdTasks[rdNextTask], cu, pu ) )
+            {
+              rdTask = &xRdWaitTask( rdNextTask++ );
+            }
+            else
+            {
+              CHECK( m_rdCheck, "CuThreadsCheck: the loop set a candidate up differently in its second run" );
+              rdNextTask = rdNumTasks;   // the recorded candidates no longer match: code the rest here
+            }
+          }
+          if( rdTask && !m_rdCheck )
+          {
+            tmpValidReturn = xRdTakeResult( *rdTask, cs, *csTemp, csBest->cost, partitioner );
+          }
+          else
+          {
+          xRdFlushPicture();
           tmpValidReturn = xRecurIntraCodingLumaQT(
             *csTemp, partitioner, uiBestPUMode.ispMod ? bestCurrentCost : MAX_DOUBLE, -1, TU_NO_ISP,
             uiBestPUMode.ispMod, mtsCheckRangeFlag, mtsFirstCheckId, mtsLastCheckId, moreProbMTSIdxFirst
@@ -6765,6 +7540,11 @@ bool IntraSearch::estIntraPredLumaQT(CodingUnit &cu, Partitioner &partitioner, c
             , pcInterPred
 #endif
           );
+            if( rdTask )
+            {
+              xRdCheck( *csTemp, tmpValidReturn, *rdTask, mode );
+            }
+          }
         }
       }
 #if JVET_Y0142_ADAPT_INTRA_MTS
@@ -7262,6 +8042,11 @@ bool IntraSearch::estIntraPredLumaQT(CodingUnit &cu, Partitioner &partitioner, c
       }
 #endif
     } // Mode loop
+    }   // rdRun
+    if( rdNumTasks )
+    {
+      xRdEndJob();
+    }
 #if INTRA_TRANS_ENC_OPT
     if (setSkipTimdControl && regAngCost != MAX_DOUBLE && timdAngCost != MAX_DOUBLE)
     {
@@ -18076,6 +18861,12 @@ bool IntraSearch::xRecurIntraCodingLumaQT( CodingStructure &cs, Partitioner &par
     if( !sps.getUseLFNST() || validReturnFull || validReturnSplit )
 #endif
     {
+      if( m_isRdHelper )
+      {
+        m_rdWrotePicture = true;   // the main search writes the picture when it takes the result
+      }
+      else
+      {
       // otherwise this would've happened in useSubStructure
 #if JVET_Z0118_GDR
       cs.updateReconMotIPM(currArea.Y());
@@ -18083,6 +18874,7 @@ bool IntraSearch::xRecurIntraCodingLumaQT( CodingStructure &cs, Partitioner &par
       cs.picture->getRecoBuf(currArea.Y()).copyFrom(cs.getRecoBuf(currArea.Y()));
 #endif
       cs.picture->getPredBuf(currArea.Y()).copyFrom(cs.getPredBuf(currArea.Y()));
+      }
 
       if( cu.ispMode && earlySkipISP )
       {

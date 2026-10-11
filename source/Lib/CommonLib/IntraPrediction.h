@@ -396,6 +396,7 @@ struct TimdMergeInfo
 
 class IntraPrediction
 {
+  friend class IntraSearch;   // CuThreads helpers take the CU state of the TMP prediction (IntraSearch::xRdHelperSync)
 public:
 #if MMLM
   bool m_encPreRDRun;

@@ -116,6 +116,19 @@ void EncLib::create( const int layerId )
   {
     m_searchStacks.emplace_back( new EncSearchStack );
   }
+  // CuThreads: a helper per thread (the picture's own thread uses the first one); the check codes with one helper
+  m_rdHelperStacks.clear();
+  const int numRdHelpers = getCuThreads() > 1 ? getCuThreads() : ( getCuThreadsCheck() ? 1 : 0 );
+  for( int i = 0; i < int( m_searchStacks.size() ) * numRdHelpers; i++ )
+  {
+    m_rdHelperStacks.emplace_back( new EncRdHelperStack );
+#if JVET_V0094_BILATERAL_FILTER || JVET_X0071_CHROMA_BILATERAL_FILTER
+    m_rdHelperStacks.back()->bilateralFilter.create();
+#if JVET_AJ0237_INTERNAL_12BIT
+    m_rdHelperStacks.back()->bilateralFilter.setInternalBitDepth( m_bitDepth[COMPONENT_Y] );
+#endif
+#endif
+  }
   for( auto& stack: m_searchStacks )
   {
     stack->cuEncoder.create( this );
@@ -264,6 +277,14 @@ void EncLib::destroy ()
     stack->intraSearch.destroy();
 #if JVET_V0094_BILATERAL_FILTER || JVET_X0071_CHROMA_BILATERAL_FILTER
     stack->bilateralFilter.destroy();
+#endif
+  }
+  for( auto& helper: m_rdHelperStacks )
+  {
+    helper->intraSearch.destroy();
+    helper->interPrediction.destroy();
+#if JVET_V0094_BILATERAL_FILTER || JVET_X0071_CHROMA_BILATERAL_FILTER
+    helper->bilateralFilter.destroy();
 #endif
   }
 
@@ -699,6 +720,64 @@ void EncLib::init( bool isFieldCoding, AUWriterIf* auWriterIf )
     stack.intraSearch.setInterPrediction( &stack.interSearch );
 #endif
   }
+  for( int i = 0; i < getNumSearchStacks(); i++ )
+  {
+    std::vector<IntraSearch*> helpers;
+    for( int h = 0; h < getNumRdHelpers(); h++ )
+    {
+      EncRdHelperStack& helper = getRdHelperStack( i, h );
+      helper.rdCost.setCostMode( m_costMode );
+      helper.trQuant.init( getTrQuant()->getQuant(), 1 << m_log2MaxTbSize, m_useRDOQ, m_useRDOQTS,
+#if T0196_SELECTIVE_RDOQ
+                           m_useSelectiveRDOQ,
+#endif
+                           true );
+      // the helpers predict with the reshaper of the picture's stack
+      helper.intraSearch.init( this,
+#if JVET_V0094_BILATERAL_FILTER || JVET_X0071_CHROMA_BILATERAL_FILTER
+                               &helper.bilateralFilter,
+#endif
+                               &helper.trQuant, &helper.rdCost, helper.cabacEncoder.getCABACEstimator( &sps0 ),
+                               &helper.ctxCache, m_maxCUWidth, m_maxCUHeight, floorLog2( m_maxCUWidth ) - m_log2MinCUSize,
+                               &getSearchStack( i ).reshaper, sps0.getBitDepth( CHANNEL_TYPE_LUMA ) );
+#if INTER_LIC || (TM_AMVP || TM_MRG || JVET_Z0084_IBC_TM) || JVET_W0090_ARMC_TM || JVET_Z0056_GPM_SPLIT_MODE_REORDERING
+#if JVET_Z0153_IBC_EXT_REF
+#if JVET_AJ0172_IBC_ITMP_ALIGN_REF_AREA
+#if JVET_AJ0237_INTERNAL_12BIT
+      helper.interPrediction.init( &helper.rdCost, m_chromaFormatIDC, m_maxCUHeight, &getSearchStack( i ).reshaper,
+                                   pps0.getPicWidthInLumaSamples(), pps0.getPicHeightInLumaSamples(),
+                                   getBitDepth( CHANNEL_TYPE_LUMA ) );
+#else
+      helper.interPrediction.init( &helper.rdCost, m_chromaFormatIDC, m_maxCUHeight, &getSearchStack( i ).reshaper,
+                                   pps0.getPicWidthInLumaSamples(), pps0.getPicHeightInLumaSamples() );
+#endif
+#else
+#if JVET_AJ0237_INTERNAL_12BIT
+      helper.interPrediction.init( &helper.rdCost, m_chromaFormatIDC, m_maxCUHeight, &getSearchStack( i ).reshaper,
+                                   pps0.getPicWidthInLumaSamples(), getBitDepth( CHANNEL_TYPE_LUMA ) );
+#else
+      helper.interPrediction.init( &helper.rdCost, m_chromaFormatIDC, m_maxCUHeight, &getSearchStack( i ).reshaper,
+                                   pps0.getPicWidthInLumaSamples() );
+#endif
+#endif
+#else
+      helper.interPrediction.init( &helper.rdCost, m_chromaFormatIDC, m_maxCUHeight, &getSearchStack( i ).reshaper );
+#endif
+#else
+      helper.interPrediction.init( &helper.rdCost, m_chromaFormatIDC, m_maxCUHeight );
+#endif
+#if JVET_AE0159_FIBC || JVET_AE0059_INTER_CCCM || JVET_AE0078_IBC_LIC_EXTENSION || JVET_AF0073_INTER_CCP_MERGE
+      helper.interPrediction.setIntraPrediction( &helper.intraSearch );
+#endif
+#if JVET_AH0200_INTRA_TMP_BV_REORDER
+      helper.intraSearch.setInterPrediction( &helper.interPrediction );
+#endif
+      helpers.push_back( &helper.intraSearch );
+    }
+    // the workers are never deleted: their threads run until the process ends
+    EncCuWorkers* workers = getCuThreads() > 1 ? new EncCuWorkers( getCuThreads() - 1 ) : nullptr;
+    getSearchStack( i ).intraSearch.setRdHelpers( helpers, workers, getCuThreadsCheck() );
+  }
   m_iMaxRefPicNum = 0;
 
 #if ER_CHROMA_QP_WCG_PPS
@@ -781,6 +860,20 @@ void EncLib::init( bool isFieldCoding, AUWriterIf* auWriterIf )
 #endif
 }
 
+std::vector<TrQuant*> EncLib::xAllTrQuants()
+{
+  std::vector<TrQuant*> all;
+  for( auto& stack: m_searchStacks )
+  {
+    all.push_back( &stack->trQuant );
+  }
+  for( auto& helper: m_rdHelperStacks )
+  {
+    all.push_back( &helper->trQuant );
+  }
+  return all;
+}
+
 void EncLib::xInitScalingLists( SPS &sps, APS &aps )
 {
   // Initialise scaling lists
@@ -795,19 +888,19 @@ void EncLib::xInitScalingLists( SPS &sps, APS &aps )
   // own error scales without scaling list (QuantRDOQ::m_errScaleNoScalingList)
   if(getUseScalingListId() == SCALING_LIST_OFF)
   {
-    for( auto& stack: m_searchStacks )
+    for( TrQuant* trQuant: xAllTrQuants() )
     {
-      stack->trQuant.getQuant()->setFlatScalingList( maxLog2TrDynamicRange, sps.getBitDepths() );
-      stack->trQuant.getQuant()->setUseScalingList( false );
+      trQuant->getQuant()->setFlatScalingList( maxLog2TrDynamicRange, sps.getBitDepths() );
+      trQuant->getQuant()->setUseScalingList( false );
     }
   }
   else if(getUseScalingListId() == SCALING_LIST_DEFAULT)
   {
     aps.getScalingList().setDefaultScalingList ();
-    for( auto& stack: m_searchStacks )
+    for( TrQuant* trQuant: xAllTrQuants() )
     {
-      stack->trQuant.getQuant()->setScalingList( &( aps.getScalingList() ), maxLog2TrDynamicRange, sps.getBitDepths() );
-      stack->trQuant.getQuant()->setUseScalingList( true );
+      trQuant->getQuant()->setScalingList( &( aps.getScalingList() ), maxLog2TrDynamicRange, sps.getBitDepths() );
+      trQuant->getQuant()->setUseScalingList( true );
     }
   }
   else if(getUseScalingListId() == SCALING_LIST_FILE_READ)
@@ -820,10 +913,10 @@ void EncLib::xInitScalingLists( SPS &sps, APS &aps )
       setUseScalingListId( SCALING_LIST_DEFAULT );
     }
     aps.getScalingList().setChromaScalingListPresentFlag((sps.getChromaFormatIdc()!=CHROMA_400));
-    for( auto& stack: m_searchStacks )
+    for( TrQuant* trQuant: xAllTrQuants() )
     {
-      stack->trQuant.getQuant()->setScalingList( &( aps.getScalingList() ), maxLog2TrDynamicRange, sps.getBitDepths() );
-      stack->trQuant.getQuant()->setUseScalingList( true );
+      trQuant->getQuant()->setScalingList( &( aps.getScalingList() ), maxLog2TrDynamicRange, sps.getBitDepths() );
+      trQuant->getQuant()->setUseScalingList( true );
     }
 
     sps.setDisableScalingMatrixForLfnstBlks(getDisableScalingMatrixForLfnstBlks());

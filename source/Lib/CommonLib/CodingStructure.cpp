@@ -2547,6 +2547,24 @@ void CodingStructure::destroyCoeffs()
   }
 }
 
+void CodingStructure::initSubStructure( CodingStructure& subStruct, const ChannelType _chType, const UnitArea &subArea,
+                                        const CodingUnit& cuFrom, const PredictionUnit& puFrom )
+{
+  CHECK( cus.size() != 1 || pus.size() != 1, "One CU and one PU expected" );
+  initSubStructure( subStruct, _chType, subArea, false );
+  CHECKD( area != subStruct.area, "Trying to init sub-structure for TU-encoding of incompatible size" );
+  subStruct.m_isTuEnc = true;
+  CodingUnit &cu = subStruct.addCU( *cus[0], _chType );
+  cu = cuFrom;
+  PredictionUnit &pu = subStruct.addPU( *pus[0], _chType );
+  pu = puFrom;
+  unsigned numComp = ::getNumberValidChannels( area.chromaFormat );
+  for( unsigned i = 0; i < numComp; i++)
+  {
+    ::memcpy( subStruct.m_isDecomp[i], m_isDecomp[i], (unitScale[i].scale( area.blocks[i].size() ).area() * sizeof( bool ) ) );
+  }
+}
+
 void CodingStructure::initSubStructure( CodingStructure& subStruct, const ChannelType _chType, const UnitArea &subArea, const bool &isTuEnc )
 {
   CHECK( this == &subStruct, "Trying to init self as sub-structure" );
@@ -2874,7 +2892,8 @@ void CodingStructure::useSubStructure( const CodingStructure& subStruct, const C
   }
 }
 
-void CodingStructure::copyStructure( const CodingStructure& other, const ChannelType chType, const bool copyTUs, const bool copyRecoBuf )
+void CodingStructure::copyStructure( const CodingStructure& other, const ChannelType chType, const bool copyTUs, const bool copyRecoBuf,
+                                     const bool copyCUsAndPUs )
 {
   fracBits = other.fracBits;
   dist     = other.dist;
@@ -2889,7 +2908,7 @@ void CodingStructure::copyStructure( const CodingStructure& other, const Channel
 #endif
 
   // copy the CUs over
-  for (const auto &pcu : other.cus)
+  for( const auto &pcu: copyCUsAndPUs ? other.cus : std::vector<CodingUnit*>() )
   {
     if( !dualITreeArea.contains( *pcu ) )
     {
@@ -2905,7 +2924,7 @@ void CodingStructure::copyStructure( const CodingStructure& other, const Channel
   }
 
   // copy the PUs over
-  for (const auto &ppu : other.pus)
+  for( const auto &ppu: copyCUsAndPUs ? other.pus : std::vector<PredictionUnit*>() )
   {
     if( !dualITreeArea.contains( *ppu ) )
     {

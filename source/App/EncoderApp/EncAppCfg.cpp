@@ -1990,6 +1990,8 @@ bool EncAppCfg::parseCfg( int argc, char* argv[] )
   ("NumWppThreads",                                   m_numWppThreads,                              1, "Number of threads used to run WPP-style parallelization")
   ("SearchStacks",                                    m_searchStackCount,                           1, "Check of the multithreading infrastructure: number of mode-search stacks, which the pictures use in turn (one thread; the output does not change)")
   ("FrameThreads",                                    m_frameThreads,                               1, "Number of pictures of a GOP encoded at the same time (threads); the output does not change")
+  ("CuThreads",                                       m_cuThreads,                                  1, "Number of threads that search the candidates of a picture's CUs; the output does not change")
+  ("CuThreadsCheck",                                  m_cuThreadsCheck,                         false, "Check of CuThreads: also evaluates the helpers' candidates serially and stops at the first difference")
   ("NumWppExtraLines",                                m_numWppExtraLines,                           0, "Number of additional wpp lines to switch when threads are blocked")
   ("DebugCTU",                                        m_debugCTU,                                  -1, "If DebugBitstream is present, load frames up to this POC from this bitstream. Starting with DebugPOC-frame at CTUline containin debug CTU.")
   ("EnsureWppBitEqual",                               m_ensureWppBitEqual,                      false, "Ensure the results are equal to results with WPP-style parallelism, even if WPP is off")
@@ -3937,6 +3939,7 @@ bool EncAppCfg::xCheckParameter()
   xConfirmPara( m_numWppThreads != 1, "ENABLE_WPP_PARALLELISM is disabled, numWppThreads has to be 1" );
   xConfirmPara( m_searchStackCount < 1 || m_searchStackCount > 64, "SearchStacks must be in the range 1..64" );
   xConfirmPara( m_frameThreads < 1 || m_frameThreads > 64, "FrameThreads must be in the range 1..64" );
+  xConfirmPara( m_cuThreads < 1 || m_cuThreads > 64, "CuThreads must be in the range 1..64" );
   if( m_frameThreads > 1 )
   {
     // frame threads keep every picture's state apart; these tools share state between pictures in other ways
