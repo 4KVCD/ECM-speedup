@@ -590,6 +590,17 @@ void DecApp::xCreateDecLib()
 #endif
   );
   m_cDecLib.setDecodedPictureHashSEIEnabled(m_decodedPictureHashSEIEnabled);
+  m_cDecLib.setParseWholeSliceFirst( m_parseSliceFirst );
+#if ECM_VULKAN
+  if( m_vulkan )
+  {
+    std::string error;
+    if( !m_cDecLib.initVulkan( m_vulkanCheck, m_vulkanValidate, m_vulkanDevice, error ) )
+    {
+      EXIT( "Vulkan: " << error );
+    }
+  }
+#endif
 
 #if NN_COMMON_SPS
   m_cDecLib.setNnlfModelName(m_nnlfModelName);
@@ -624,6 +635,12 @@ void DecApp::xDestroyDecLib()
     }
   }
 
+#if ECM_VULKAN
+  if( m_vulkan )
+  {
+    msg( INFO, "\n GPU time:   %12.3f sec.\n", m_cDecLib.vulkanGpuMs() / 1000 );
+  }
+#endif
   // destroy decoder class
   m_cDecLib.destroy();
 }

@@ -1455,6 +1455,28 @@ void LoopFilter::xEdgeFilterLuma( const CodingUnit& cu, const DeblockEdgeDir edg
       const int iSideThreshold = ( iBeta + ( iBeta >> 1 ) ) >> 3;
       const int iThrCut   = iTc * 10;
 
+      if( m_edgeMaps )
+      {
+        // The recorded QP excludes the LADF shift, which the GPU derives from the samples it filters.
+        const bool noFilterP = spsPaletteEnabledFlag && CU::isPLT( cuP );
+        const bool noFilterQ = spsPaletteEnabledFlag && CU::isPLT( cuQ );
+#if JVET_AB0171_ASYMMETRIC_DB_FOR_GDR
+        const bool asymmetric = m_applyAsymmetricDB;
+#else
+        const bool asymmetric = false;
+#endif
+        DeblockLumaEdge& e = m_edgeMaps->luma[edgeDir][( pos.y >> 2 ) * m_edgeMaps->unitsW + ( pos.x >> 2 )];
+        e.flags = uiBs | ( maxFilterLengthP << 2 ) | ( maxFilterLengthQ << 5 ) | ( sidePisLarge << 8 ) | ( sideQisLarge << 9 )
+                  | ( noFilterP << 10 ) | ( noFilterQ << 11 ) | ( asymmetric << 12 );
+        e.qp             = int8_t( ( cuP.qp + cuQ.qp + 1 ) >> 1 );
+        e.tcOffsetDiv2   = int8_t( tcOffsetDiv2 );
+        e.betaOffsetDiv2 = int8_t( betaOffsetDiv2 );
+        if( !m_edgeMaps->filterSamples )
+        {
+          continue;
+        }
+      }
+
       const unsigned uiBlocksInPart = pelsInPart / 4 ? pelsInPart / 4 : 1;
 
       for( int iBlkIdx = 0; iBlkIdx < uiBlocksInPart; iBlkIdx++ )
@@ -1716,6 +1738,25 @@ void LoopFilter::xEdgeFilterChroma(const CodingUnit& cu, const DeblockEdgeDir ed
         isChromaHorCTBBoundary = true;
       }
 
+      DeblockChromaEdge* edgeRecord = nullptr;
+      if( m_edgeMaps )
+      {
+#if JVET_AB0171_ASYMMETRIC_DB_FOR_GDR
+        const bool asymmetric = m_applyAsymmetricDB;
+#else
+        const bool asymmetric = false;
+#endif
+        edgeRecord = &m_edgeMaps->chroma[edgeDir][( pos.y >> 2 ) * m_edgeMaps->unitsW + ( pos.x >> 2 )];
+        edgeRecord->flags = bS[0] | ( bS[1] << 2 ) | ( maxFilterLengthP << 4 ) | ( maxFilterLengthQ << 7 ) | ( bPartPNoFilter << 10 )
+                            | ( bPartQNoFilter << 11 ) | ( asymmetric << 12 ) | ( isChromaHorCTBBoundary << 13 );
+        for( int c = 0; c < 2; c++ )
+        {
+          edgeRecord->qp[c]             = 0;
+          edgeRecord->tcOffsetDiv2[c]   = int8_t( tcOffsetDiv2[c] );
+          edgeRecord->betaOffsetDiv2[c] = int8_t( betaOffsetDiv2[c] );
+        }
+      }
+
       for( int chromaIdx = 0; chromaIdx < 2; chromaIdx++ )
       {
         if ((bS[chromaIdx] == 2) || (largeBoundary && (bS[chromaIdx] == 1)))
@@ -1737,6 +1778,15 @@ void LoopFilter::xEdgeFilterChroma(const CodingUnit& cu, const DeblockEdgeDir ed
           int       baseQp_P   = cQP.Qp(0) - qpBdOffset;
           int       baseQp_Q   = cQQ.Qp(0) - qpBdOffset;
           int       iQP        = ((baseQp_Q + baseQp_P + 1) >> 1);
+
+          if( edgeRecord )
+          {
+            edgeRecord->qp[chromaIdx] = int8_t( iQP );
+            if( !m_edgeMaps->filterSamples )
+            {
+              continue;
+            }
+          }
 
           const int iIndexTC =
             Clip3<int>( 0, MAX_QP + DEFAULT_INTRA_TC_OFFSET,

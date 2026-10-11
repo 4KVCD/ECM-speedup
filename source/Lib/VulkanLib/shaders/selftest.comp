@@ -1,0 +1,23 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+// Smoke test of the shader pipeline: dst[i] = 3 * src[i] + 1 for i < count.
+
+layout( local_size_x = 64 ) in;
+
+layout( push_constant, scalar ) uniform Push
+{
+  I32Buf src;
+  I32Buf dst;
+  int    count;
+} pc;
+
+void main()
+{
+  const int i = int( gl_GlobalInvocationID.x );
+  if( i < pc.count )
+  {
+    pc.dst.v[i] = 3 * pc.src.v[i] + 1;
+  }
+}

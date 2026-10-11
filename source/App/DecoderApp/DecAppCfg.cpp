@@ -135,6 +135,13 @@ bool DecAppCfg::parseCfg( int argc, char* argv[] )
 #endif
   ("MCTSCheck",                m_mctsCheck,                           false,       "If enabled, the decoder checks for violations of mc_exact_sample_value_match_flag in Temporal MCTS ")
   ("targetSubPicIdx",          m_targetSubPicIdx,                     0,           "Specify which subpicture shall be written to output, using subpic index, 0: disabled, subpicIdx=m_targetSubPicIdx-1 \n" )
+  ("ParseSliceFirst",          m_parseSliceFirst,                     false,       "Parse all CTUs of a slice before reconstructing them (same output; checks that parsing is independent of reconstruction)")
+#if ECM_VULKAN
+  ("Vulkan",                   m_vulkan,                              false,       "Run deblocking on the GPU (Vulkan)")
+  ("VulkanCheck",              m_vulkanCheck,                         false,       "With Vulkan: also deblock on the CPU and stop at the first difference")
+  ("VulkanValidate",           m_vulkanValidate,                      false,       "With Vulkan: enable the Khronos validation layer")
+  ("VulkanDevice",             m_vulkanDevice,                        -1,          "With Vulkan: index of the GPU, -1 prefers a discrete GPU")
+#endif
   ( "UpscaledOutput",          m_upscaledOutput,                          0,       "Upscaled output for RPR" )
 #if JVET_AB0082
   ("UpscaleFilterForDisplay",  m_upscaleFilterForDisplay,                 2,       "Filters used for upscaling reconstruction to full resolution (2: ECM 12 - tap luma and 6 - tap chroma MC filters, 1 : Alternative 12 - tap luma and 6 - tap chroma filters, 0 : VVC 8 - tap luma and 4 - tap chroma MC filters)")

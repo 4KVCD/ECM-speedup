@@ -69,6 +69,7 @@ private:
   PLTBuf          m_palettePredictorSyncState;      /// palette predictor storage at wavefront/WPP
 #if JVET_AG0117_CABAC_SPATIAL_TUNING
   std::vector<BinStoreVector> m_binVectors;
+  bool            m_parseWholeSliceFirst = false;   ///< parse all CTUs of a slice before reconstructing any of them
 #endif
 
 public:
@@ -85,6 +86,7 @@ public:
   void  destroy           ();
 
   void  decompressSlice   ( Slice* slice, InputBitstream* bitstream, int debugCTU );
+  void  setParseWholeSliceFirst( bool b ) { m_parseWholeSliceFirst = b; }
 
 #if JVET_AG0098_AMVP_WITH_SBTMVP
   std::map<int, uint32_t> m_amvpSbTmvpArea;

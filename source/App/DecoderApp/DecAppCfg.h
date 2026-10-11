@@ -92,6 +92,13 @@ protected:
   int          m_upscaleFilterForDisplay;
 #endif
   int           m_targetSubPicIdx;                    ///< Specify which subpicture shall be write to output, using subpicture index
+  bool          m_parseSliceFirst;                    ///< parse whole slices before reconstructing them
+#if ECM_VULKAN
+  bool          m_vulkan;                             ///< run deblocking on the GPU
+  bool          m_vulkanCheck;                        ///< also deblock on the CPU and require identical results
+  bool          m_vulkanValidate;                     ///< enable the Khronos validation layer
+  int           m_vulkanDevice;                       ///< GPU index, -1 for the default choice
+#endif
 #if GDR_LEAK_TEST
   int           m_gdrPocRandomAccess;                   ///<
 #endif

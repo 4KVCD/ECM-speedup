@@ -47,6 +47,43 @@
 
 #define DEBLOCK_SMALLEST_BLOCK  8
 
+/// Parameters of one luma edge segment of 4 samples, for a deblocking implementation outside LoopFilter (the GPU
+/// decoder). flags: bs (bits 0-1), maxFilterLengthP (2-4), maxFilterLengthQ (5-7), sidePisLarge (8),
+/// sideQisLarge (9), P not filtered (10), Q not filtered (11), asymmetric filter (12). qp is the average of the two
+/// CU QPs before the LADF shift.
+struct DeblockLumaEdge
+{
+  uint32_t flags;
+  int8_t   qp;
+  int8_t   tcOffsetDiv2;
+  int8_t   betaOffsetDiv2;
+  int8_t   pad;
+};
+
+/// Parameters of the chroma edge segment at the chroma samples of a 4-sample luma segment. flags: bs Cb (bits 0-1),
+/// bs Cr (2-3), maxFilterLengthP (4-6), maxFilterLengthQ (7-9), P not filtered (10), Q not filtered (11),
+/// asymmetric filter (12), horizontal CTB boundary (13).
+struct DeblockChromaEdge
+{
+  uint32_t flags;
+  int8_t   qp[2];
+  int8_t   tcOffsetDiv2[2];
+  int8_t   betaOffsetDiv2[2];
+  int8_t   pad[2];
+};
+
+/// Edge maps that LoopFilter fills while it deblocks: one entry per 4x4 luma unit and edge direction, for the edge at
+/// the left (vertical) or top (horizontal) of the unit. Entries of edges that are not filtered stay as they are, so
+/// the owner clears the maps before each picture.
+struct DeblockEdgeMaps
+{
+  int                unitsW        = 0;
+  int                unitsH        = 0;
+  DeblockLumaEdge*   luma[2]       = { nullptr, nullptr };   ///< [EDGE_VER, EDGE_HOR]
+  DeblockChromaEdge* chroma[2]     = { nullptr, nullptr };
+  bool               filterSamples = true;   ///< false: only record the parameters and leave the samples unchanged
+};
+
 // ====================================================================================================================
 // Class definition
 // ====================================================================================================================
@@ -155,6 +192,14 @@ public:
   }
 
   void resetFilterLengths();
+
+  /// While maps is set, every filtered edge segment is also recorded there.
+  void setEdgeMaps( DeblockEdgeMaps* maps ) { m_edgeMaps = maps; }
+
+private:
+  DeblockEdgeMaps* m_edgeMaps = nullptr;
+
+public:
 
 #if JVET_AB0171_ASYMMETRIC_DB_FOR_GDR
 private:

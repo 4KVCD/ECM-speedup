@@ -572,26 +572,19 @@ void DecSlice::decompressSlice( Slice* slice, InputBitstream* bitstream, int deb
 #endif
   }
 #endif
-  unsigned subStrmId = 0;
-  for( unsigned ctuIdx = 0; ctuIdx < slice->getNumCtuInSlice(); ctuIdx++ )
+  // The reconstruction steps of one CTU. They read nothing the parser writes later in the slice, so they can run
+  // right after the CTU is parsed or after the whole slice is parsed.
+  auto reconstructCtu = [&]( const unsigned ctuIdx )
   {
     const unsigned  ctuRsAddr       = slice->getCtuAddrInSlice(ctuIdx);
     const unsigned  ctuXPosInCtus   = ctuRsAddr % widthInCtus;
     const unsigned  ctuYPosInCtus   = ctuRsAddr / widthInCtus;
     const unsigned  tileColIdx      = slice->getPPS()->ctuToTileCol( ctuXPosInCtus );
-    const unsigned  tileRowIdx      = slice->getPPS()->ctuToTileRow( ctuYPosInCtus );
     const unsigned  tileXPosInCtus  = slice->getPPS()->getTileColumnBd( tileColIdx );
-    const unsigned  tileYPosInCtus  = slice->getPPS()->getTileRowBd( tileRowIdx );
-    const unsigned  tileColWidth    = slice->getPPS()->getTileColumnWidth( tileColIdx );
-    const unsigned  tileRowHeight   = slice->getPPS()->getTileRowHeight( tileRowIdx );
-    const unsigned  tileIdx         = slice->getPPS()->getTileIdx( ctuXPosInCtus, ctuYPosInCtus);
-    const unsigned  maxCUSize             = sps->getMaxCUWidth();
+    const unsigned  maxCUSize       = sps->getMaxCUWidth();
     Position pos( ctuXPosInCtus*maxCUSize, ctuYPosInCtus*maxCUSize) ;
     UnitArea ctuArea(cs.area.chromaFormat, Area( pos.x, pos.y, maxCUSize, maxCUSize ) );
     const SubPic &curSubPic = slice->getPPS()->getSubPicFromPos(pos);
-#if JVET_AL0153_ALF_CCCM
-    slice->lfCccmClearControlInformation(ctuRsAddr);
-#endif
     // padding/restore at slice level
     if (slice->getPPS()->getNumSubPics()>=2 && curSubPic.getTreatedAsPicFlag() && ctuIdx==0)
     {
@@ -620,43 +613,6 @@ void DecSlice::decompressSlice( Slice* slice, InputBitstream* bitstream, int deb
       }
     }
 
-    DTRACE_UPDATE( g_trace_ctx, std::make_pair( "ctu", ctuRsAddr ) );
-
-    cabacReader.initBitstream( ppcSubstreams[subStrmId] );
-
-    // set up CABAC contexts' state for this CTU
-    if( ctuXPosInCtus == tileXPosInCtus && ctuYPosInCtus == tileYPosInCtus )
-    {
-      if( ctuIdx != 0 ) // if it is the first CTU, then the entropy coder has already been reset
-      {
-        cabacReader.initCtxModels( *slice );
-        cs.resetPrevPLT(cs.prevPLT);
-      }
-      pic->m_prevQP[0] = pic->m_prevQP[1] = slice->getSliceQp();
-    }
-    else if( ctuXPosInCtus == tileXPosInCtus && wavefrontsEnabled )
-    {
-      // Synchronize cabac probabilities with top CTU if it's available and at the start of a line.
-      if( ctuIdx != 0 ) // if it is the first CTU, then the entropy coder has already been reset
-      {
-        cabacReader.initCtxModels( *slice );
-        cs.resetPrevPLT(cs.prevPLT);
-      }
-      if( cs.getCURestricted( pos.offset(0, -1), pos, slice->getIndependentSliceIdx(), tileIdx, CH_L ) )
-      {
-        // Top is available, so use it.
-        cabacReader.getCtx() = m_entropyCodingSyncContextState;
-        cs.setPrevPLT(m_palettePredictorSyncState);
-      }
-      pic->m_prevQP[0] = pic->m_prevQP[1] = slice->getSliceQp();
-    }
-
-    bool updateBcwCodingOrder = cs.slice->getSliceType() == B_SLICE && ctuIdx == 0;
-    if(updateBcwCodingOrder)
-    {
-      resetBcwCodingOrder(true, cs);
-    }
-
 #if JVET_AD0208_IBC_ADAPT_FOR_CAM_CAPTURED_CONTENTS
     if ((cs.slice->getSliceType() != I_SLICE || cs.slice->getUseIBC()) && ctuXPosInCtus == tileXPosInCtus)
 #else
@@ -664,7 +620,7 @@ void DecSlice::decompressSlice( Slice* slice, InputBitstream* bitstream, int deb
 #endif
     {
 #if JVET_Z0118_GDR
-      cs.motionLut.lut0.resize(0);      
+      cs.motionLut.lut0.resize(0);
       cs.motionLut.lutIbc0.resize(0);
 
       if (cs.isGdrEnabled())
@@ -677,7 +633,7 @@ void DecSlice::decompressSlice( Slice* slice, InputBitstream* bitstream, int deb
       cs.motionLut.lutIbc.resize(0);
 #endif
 
-#if JVET_Z0139_HIST_AFF   
+#if JVET_Z0139_HIST_AFF
       for (int i = 0; i < 2 * MAX_NUM_AFFHMVP_ENTRIES_ONELIST; i++)
       {
 #if JVET_Z0118_GDR
@@ -731,6 +687,89 @@ void DecSlice::decompressSlice( Slice* slice, InputBitstream* bitstream, int deb
       pic->mctsInfo.init( &cs, getCtuAddr( ctuArea.lumaPos(), *( cs.pcv ) ) );
     }
 
+    m_pcCuDecoder->decompressCtu( cs, ctuArea );
+
+    if (slice->getPPS()->getNumSubPics() >= 2 && curSubPic.getTreatedAsPicFlag() && ctuIdx == (slice->getNumCtuInSlice() - 1))
+    // for last Ctu in the slice
+    {
+      int subPicX = (int)curSubPic.getSubPicLeft();
+      int subPicY = (int)curSubPic.getSubPicTop();
+      int subPicWidth = (int)curSubPic.getSubPicWidthInLumaSample();
+      int subPicHeight = (int)curSubPic.getSubPicHeightInLumaSample();
+      for (int rlist = REF_PIC_LIST_0; rlist < NUM_REF_PIC_LIST_01; rlist++)
+      {
+        int n = slice->getNumRefIdx((RefPicList)rlist);
+        for (int idx = 0; idx < n; idx++)
+        {
+          Picture *refPic = slice->getRefPic((RefPicList)rlist, idx);
+          if (refPic->getSubPicSaved())
+          {
+            refPic->restoreSubPicBorder(refPic->getPOC(), subPicX, subPicY, subPicWidth, subPicHeight);
+            refPic->setSubPicSaved(false);
+          }
+        }
+      }
+    }
+  };
+
+  unsigned subStrmId = 0;
+  unsigned numParsedCtus = 0;
+  for( unsigned ctuIdx = 0; ctuIdx < slice->getNumCtuInSlice(); ctuIdx++ )
+  {
+    const unsigned  ctuRsAddr       = slice->getCtuAddrInSlice(ctuIdx);
+    const unsigned  ctuXPosInCtus   = ctuRsAddr % widthInCtus;
+    const unsigned  ctuYPosInCtus   = ctuRsAddr / widthInCtus;
+    const unsigned  tileColIdx      = slice->getPPS()->ctuToTileCol( ctuXPosInCtus );
+    const unsigned  tileRowIdx      = slice->getPPS()->ctuToTileRow( ctuYPosInCtus );
+    const unsigned  tileXPosInCtus  = slice->getPPS()->getTileColumnBd( tileColIdx );
+    const unsigned  tileYPosInCtus  = slice->getPPS()->getTileRowBd( tileRowIdx );
+    const unsigned  tileColWidth    = slice->getPPS()->getTileColumnWidth( tileColIdx );
+    const unsigned  tileRowHeight   = slice->getPPS()->getTileRowHeight( tileRowIdx );
+    const unsigned  tileIdx         = slice->getPPS()->getTileIdx( ctuXPosInCtus, ctuYPosInCtus);
+    const unsigned  maxCUSize             = sps->getMaxCUWidth();
+    Position pos( ctuXPosInCtus*maxCUSize, ctuYPosInCtus*maxCUSize) ;
+    UnitArea ctuArea(cs.area.chromaFormat, Area( pos.x, pos.y, maxCUSize, maxCUSize ) );
+#if JVET_AL0153_ALF_CCCM
+    slice->lfCccmClearControlInformation(ctuRsAddr);
+#endif
+
+    DTRACE_UPDATE( g_trace_ctx, std::make_pair( "ctu", ctuRsAddr ) );
+
+    cabacReader.initBitstream( ppcSubstreams[subStrmId] );
+
+    // set up CABAC contexts' state for this CTU
+    if( ctuXPosInCtus == tileXPosInCtus && ctuYPosInCtus == tileYPosInCtus )
+    {
+      if( ctuIdx != 0 ) // if it is the first CTU, then the entropy coder has already been reset
+      {
+        cabacReader.initCtxModels( *slice );
+        cs.resetPrevPLT(cs.prevPLT);
+      }
+      pic->m_prevQP[0] = pic->m_prevQP[1] = slice->getSliceQp();
+    }
+    else if( ctuXPosInCtus == tileXPosInCtus && wavefrontsEnabled )
+    {
+      // Synchronize cabac probabilities with top CTU if it's available and at the start of a line.
+      if( ctuIdx != 0 ) // if it is the first CTU, then the entropy coder has already been reset
+      {
+        cabacReader.initCtxModels( *slice );
+        cs.resetPrevPLT(cs.prevPLT);
+      }
+      if( cs.getCURestricted( pos.offset(0, -1), pos, slice->getIndependentSliceIdx(), tileIdx, CH_L ) )
+      {
+        // Top is available, so use it.
+        cabacReader.getCtx() = m_entropyCodingSyncContextState;
+        cs.setPrevPLT(m_palettePredictorSyncState);
+      }
+      pic->m_prevQP[0] = pic->m_prevQP[1] = slice->getSliceQp();
+    }
+
+    bool updateBcwCodingOrder = cs.slice->getSliceType() == B_SLICE && ctuIdx == 0;
+    if(updateBcwCodingOrder)
+    {
+      resetBcwCodingOrder(true, cs);
+    }
+
     if( ctuRsAddr == debugCTU )
     {
       break;
@@ -764,13 +803,17 @@ void DecSlice::decompressSlice( Slice* slice, InputBitstream* bitstream, int deb
 #endif
 
     cabacReader.coding_tree_unit( cs, ctuArea, pic->m_prevQP, ctuRsAddr );
+    numParsedCtus++;
 
 #if JVET_AG0117_CABAC_SPATIAL_TUNING
     // Done with data collection for this CTU
     cabacReader.setBinBuffer( nullptr );
 #endif
 
-    m_pcCuDecoder->decompressCtu( cs, ctuArea );
+    if( !m_parseWholeSliceFirst )
+    {
+      reconstructCtu( ctuIdx );
+    }
 
 #if JVET_Z0135_TEMP_CABAC_WIN_WEIGHT
     // store CABAC context to be used in next frames
@@ -810,26 +853,13 @@ void DecSlice::decompressSlice( Slice* slice, InputBitstream* bitstream, int deb
         subStrmId++;
       }
     }
-    if (slice->getPPS()->getNumSubPics() >= 2 && curSubPic.getTreatedAsPicFlag() && ctuIdx == (slice->getNumCtuInSlice() - 1))
-    // for last Ctu in the slice
+  }
+
+  if( m_parseWholeSliceFirst )
+  {
+    for( unsigned ctuIdx = 0; ctuIdx < numParsedCtus; ctuIdx++ )
     {
-      int subPicX = (int)curSubPic.getSubPicLeft();
-      int subPicY = (int)curSubPic.getSubPicTop();
-      int subPicWidth = (int)curSubPic.getSubPicWidthInLumaSample();
-      int subPicHeight = (int)curSubPic.getSubPicHeightInLumaSample();
-      for (int rlist = REF_PIC_LIST_0; rlist < NUM_REF_PIC_LIST_01; rlist++)
-      {
-        int n = slice->getNumRefIdx((RefPicList)rlist);
-        for (int idx = 0; idx < n; idx++)
-        {
-          Picture *refPic = slice->getRefPic((RefPicList)rlist, idx);
-          if (refPic->getSubPicSaved())
-          {
-            refPic->restoreSubPicBorder(refPic->getPOC(), subPicX, subPicY, subPicWidth, subPicHeight);
-            refPic->setSubPicSaved(false);
-          }
-        }
-      }
+      reconstructCtu( ctuIdx );
     }
   }
 

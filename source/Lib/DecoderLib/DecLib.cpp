@@ -665,7 +665,31 @@ void DecLib::destroy()
 #if JVET_V0094_BILATERAL_FILTER || JVET_X0071_CHROMA_BILATERAL_FILTER
   m_cBilateralFilter.destroy();
 #endif
+#if ECM_VULKAN
+  m_vkLoopFilter.destroy();
+  delete m_vkCore;
+  m_vkCore = nullptr;
+#endif
 }
+
+#if ECM_VULKAN
+bool DecLib::initVulkan( bool check, bool validate, int device, std::string& error )
+{
+  m_vkCore = new vkd::Core;
+  if( !m_vkCore->init( validate, device ) )
+  {
+    error = m_vkCore->error();
+    delete m_vkCore;
+    m_vkCore = nullptr;
+    return false;
+  }
+  m_vkCheck = check;
+  m_vkLoopFilter.init( m_vkCore );
+  msg( INFO, "GPU decoding on %s, driver 0x%x%s\n", m_vkCore->deviceName().c_str(), m_vkCore->driverVersion(),
+       check ? ", every picture checked against the CPU" : "" );
+  return true;
+}
+#endif
 
 void DecLib::init(
 #if JVET_J0090_MEMORY_BANDWITH_MEASURE
@@ -927,9 +951,40 @@ void DecLib::executeLoopFilters()
   const bool storeCodingInfo = cs.sps->getALFEnabledFlag();
 #endif
   PelUnitBuf codingInfoBuf = storeCodingInfo ? m_cALF.callCodingInfoBuf( cs ) : PelUnitBuf();
+#if ECM_VULKAN
+  if( m_vkCore )
+  {
+    // The CPU walks the coding units and records the edge parameters; the GPU filters the samples.
+    m_vkLoopFilter.beginPicture( cs, m_vkCheck );
+    m_cLoopFilter.setEdgeMaps( &m_vkLoopFilter.edgeMaps() );
+  }
+#endif
   m_cLoopFilter.loopFilterPic( cs, codingInfoBuf, storeCodingInfo );
 #else
   m_cLoopFilter.loopFilterPic( cs );
+#endif
+#if ECM_VULKAN
+  if( m_vkCore )
+  {
+    m_cLoopFilter.setEdgeMaps( nullptr );
+    m_vkLoopFilter.deblock( cs );
+    m_vkGpuMs += m_vkLoopFilter.lastGpuMs();
+    PelUnitBuf reco = cs.picture->getRecoBuf();
+    if( m_vkCheck )
+    {
+      std::string diff;
+      int         comp, x, y;
+      if( !m_vkLoopFilter.picture().compare( reco, diff, comp, x, y ) )
+      {
+        THROW( "GPU deblocking differs from the CPU in POC " << cs.slice->getPOC() << ": " << diff
+               << ( comp == 0 ? m_vkLoopFilter.describeLuma( x, y, reco ) : std::string() ) );
+      }
+    }
+    else
+    {
+      m_vkLoopFilter.picture().download( reco );
+    }
+  }
 #endif
 
 #if JVET_AK0121_LOOPFILTER_OFFSET_REFINEMENT

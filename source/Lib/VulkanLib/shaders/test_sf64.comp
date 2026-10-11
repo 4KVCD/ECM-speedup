@@ -1,0 +1,46 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+#include "sf64.glsl"
+
+// Test kernel of the software double arithmetic: applies op[i] to a[i] and b[i] and writes the result bits.
+
+layout( local_size_x = 64 ) in;
+
+layout( buffer_reference, scalar, buffer_reference_align = 8 ) buffer Cases { u64vec2 v[]; };
+
+layout( push_constant, scalar ) uniform Push
+{
+  I32Buf ops;
+  Cases  args;
+  U64Buf res;
+  int    count;
+} pc;
+
+void main()
+{
+  const int i = int( gl_GlobalInvocationID.x );
+  if( i >= pc.count )
+  {
+    return;
+  }
+  const uint64_t a = pc.args.v[i].x, b = pc.args.v[i].y;
+  uint64_t r = 0UL;
+  switch( pc.ops.v[i] )
+  {
+  case 0: r = f64Add( a, b ); break;
+  case 1: r = f64Sub( a, b ); break;
+  case 2: r = f64Mul( a, b ); break;
+  case 3: r = f64Div( a, b ); break;
+  case 4: r = f64Sqrt( a ); break;
+  case 5: r = f64FromI64( int64_t( a ) ); break;
+  case 6: r = uint64_t( f64ToI64( a ) ); break;
+  case 7: r = uint64_t( int64_t( f64ToI32( a ) ) ); break;
+  case 8: r = f64Lt( a, b ) ? 1UL : 0UL; break;
+  case 9: r = f64Le( a, b ) ? 1UL : 0UL; break;
+  case 10: r = f64Eq( a, b ) ? 1UL : 0UL; break;
+  case 11: r = f64FromU64( a ); break;
+  case 12: r = f64FromI32( int( a ) ); break;
+  }
+  pc.res.v[i] = r;
+}

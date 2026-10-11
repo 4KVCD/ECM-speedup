@@ -42,6 +42,9 @@ endif()
 
 target_include_directories( ${LIB_NAME} PUBLIC . )
 target_link_libraries( ${LIB_NAME} CommonLib )
+if( ECM_VULKAN )
+  target_link_libraries( ${LIB_NAME} VulkanLib )
+endif()
 
 # example: place header files in different folders
 source_group( "Natvis Files" FILES ${NATVIS_FILES} )

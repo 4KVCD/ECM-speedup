@@ -64,6 +64,10 @@
 #if JVET_AL0153_ALF_CCCM
 #include "CommonLib/LoopFilterCccm.h"
 #endif
+#if ECM_VULKAN
+#include "VkCore.h"
+#include "VkLoopFilter.h"
+#endif
 class InputNALUnit;
 
 //! \ingroup DecoderLib
@@ -231,6 +235,20 @@ private:
 public:
   int                     m_targetSubPicIdx;
 
+#if ECM_VULKAN
+private:
+  vkd::Core*              m_vkCore  = nullptr;
+  vkd::VkLoopFilter       m_vkLoopFilter;
+  bool                    m_vkCheck = false;   ///< run the CPU filters too and require identical results
+  double                  m_vkGpuMs = 0;       ///< GPU time of all pictures
+
+public:
+  /// Moves the in-loop filters to the GPU. With check set, the CPU also filters and every picture must match.
+  /// Returns false with a message in error if no usable GPU is found.
+  bool initVulkan( bool check, bool validate, int device, std::string& error );
+  double vulkanGpuMs() const { return m_vkGpuMs; }
+#endif
+
   DCI*                    m_dci;
   ParameterSetMap<APS>*   m_apsMapEnc;
 #if GDR_LEAK_TEST
@@ -250,6 +268,9 @@ public:
 #endif  
 
   void  setDecodedPictureHashSEIEnabled(int enabled) { m_decodedPictureHashSEIEnabled=enabled; }
+  /// Parse all CTUs of a slice before reconstructing any of them. The output is the same, because parsing does not
+  /// depend on reconstructed samples; the GPU decoder relies on that.
+  void  setParseWholeSliceFirst( bool b ) { m_cSliceDecoder.setParseWholeSliceFirst( b ); }
 
   void  init(
 #if JVET_J0090_MEMORY_BANDWITH_MEASURE
