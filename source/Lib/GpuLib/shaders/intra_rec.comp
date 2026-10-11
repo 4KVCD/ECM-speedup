@@ -4,11 +4,12 @@
 // blocks; a block is ready when the blocks whose samples it reads are reconstructed (dependency lists and counts
 // from the host: geometry and decoding order only), so independent blocks (the three components, distant parts of
 // the picture) run at the same time and no workgroup waits on a block it holds.
-// Per block: reference samples (and their [1 2 1] filtering), prediction (planar, directional planar, DC, angular
-// with PDPC and intra fusion, MIP, the intra bilateral filter) and reconstruction with the residual intra_resi computed
-// beforehand for all blocks at once (with LMCS: scaled for chroma by the neighbouring luma, the bilateral filter on
-// inverse-mapped samples). Every step follows the C++ of IntraPrediction / MatrixIntraPrediction / DecCu.
-// Not yet: MRL, ISP, LFNST / NSPT, decoder-side intra modes.
+// Per block: reference samples of the block's reference line (MRL) and their [1 2 1] filtering, prediction (planar,
+// directional planar, DC, angular with PDPC and intra fusion, MIP, the intra bilateral filter) and reconstruction with
+// the residual intra_resi computed beforehand for all blocks at once (with LMCS: scaled for chroma by the neighbouring
+// luma, the bilateral filter on inverse-mapped samples). Every step follows the C++ of IntraPrediction /
+// MatrixIntraPrediction / DecCu.
+// Not yet: ISP, decoder-side intra modes.
 #extension GL_GOOGLE_include_directive : require
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
@@ -27,7 +28,8 @@ layout( buffer_reference, std430, buffer_reference_align = 4 ) coherent buffer C
 
 const int PAD     = 6;                        // interpFilterNumPadded (16 taps / 2 - 2)
 const int ANG     = 1792;                     // angular reference buffers (the CPU's are larger; blocks <= 128 use < 1700)
-const int MAX_REF = 2 * ( 8 * 128 + 2 ) + 16; // reference line: top row (stride predSize + 1 + mrl), then the left column
+const int MAX_MRL = 13;                       // the farthest reference line (multiRefIdx 12, its fusion line 13)
+const int MAX_REF = 2 * ( 8 * 128 + 2 + MAX_MRL ) + 16; // reference line: top row (stride predSize + 1 + mrl), then the left column
 const int WEAK4   = 5 * 32 * 16;              // offset of the weak 4-tap table in the filter buffer
 const int BF_LUT  = WEAK4 + 32 * 4;           // the bilateral filter's LUT rows (26 x 48), size and MAD factors
 const int BF_SIZE = BF_LUT + 26 * 48;
@@ -35,7 +37,7 @@ const int BF_MAD  = BF_SIZE + 64;
 const int BF_PRED = 0;                        // in s_tmp: the prediction (< 1024 samples: at most 512)
 const int BF_BLK  = 512;                      // in s_tmp: the padded block ((W + 4) x (H + 4) <= 720)
 
-shared int16_t s_ref[2][MAX_REF];             // refBufUnfiltered (line 0; filtered in place when refFilter), fusion line 1
+shared int16_t s_ref[2][MAX_REF];             // refBufUnfiltered: the block's line (filtered in place when refFilter), the fusion line
 shared int16_t s_tmp[MAX_REF];                // the reference filter's output; the bilateral filter's blocks
 shared int16_t s_angA[2][ANG];                // refAbove, refAbove2nd
 shared int16_t s_angL[2][ANG];                // refLeft, refLeft2nd
@@ -97,31 +99,40 @@ int scalePel( int val, int scale, int maxVal )
   return clip3i( -32768, 32767, tmp );
 }
 
-// xFillReferenceSamples, all invocations, no barrier (multiRefIdx 0 or 1, so no MRL units: lMU = aMU = 0). The units
-// available to the CPU are given per group (corner flag, the available prefix of the above, above-right, left and
-// below-left units: geometry and decoding order only), i.e. at most five intervals in the CPU's unit order (the
-// bottom-left unit first, up the left column, the corner, along the top). The CPU's padding is "an unavailable unit
-// takes the nearest available sample before it in that order; units before the first available one take its first
-// sample"; every sample is fetched by its own invocation.
+// xFillReferenceSamples of reference line `line` (multiRefIdx mrl), all invocations, no barrier. The units available
+// to the CPU are given per group (corner flag, the available prefix of the above, above-right, left, below-left and
+// MRL units: geometry and decoding order only), i.e. at most seven intervals in the CPU's unit order: the bottom-left
+// unit first, up the left column, the left MRL units, the corner, the above MRL units, along the top. A line beyond
+// the first unit has lM MRL units on the left and aM above (JVET-Y0116); the corner unit keeps entries 0 .. cLen of
+// both arms (the host requires square units, for which the CPU's two arm lengths agree). The CPU's padding is "an
+// unavailable unit takes the last sample of the unit before it in that order; units before the first available one
+// take its first sample"; every sample is fetched by its own invocation.
 void fillReferencePar( Tu t, int line, int mrl, int lid, int NT )
 {
   const int predSize  = t.w << 3, predHSize = t.h << 3;
   const int predStride = predSize + 1 + mrl;
   const int uW = t.unitW, uH = t.unitH;
   const int tAU = predSize / uW, tLU = predHSize / uH;   // multiples (8x the block size)
-  const int totalUnits = tAU + tLU + 1;
+  const int lM = mrl / uH, aM = mrl / uW, cLen = mrl - lM * uH, C = tLU + lM;   // MRL units, corner unit
+  const int totalUnits = tAU + tLU + 1 + lM + aM;
   const int numAbove = max( t.w / uW, 1 ), numLeft = max( t.h / uH, 1 );
   const int x0 = t.x - 1 - mrl, y0 = t.y - 1 - mrl;
-  const int corner = t.avail[line][0], pA = t.avail[line][1], pAR = t.avail[line][2], pL = t.avail[line][3], pBL = t.avail[line][4];
-  // the available intervals [start, end] in unit order (empty when the prefix is 0)
+  const int corner = t.avail[line][0], pA = t.avail[line][1], pAR = t.avail[line][2], pL = t.avail[line][3];
+  const int pBL = t.avail[line][4], pLM = t.avail[line][5], pAM = t.avail[line][6];
+  // the available intervals [start, end] in unit order (empty when the prefix is 0); the MRL groups are scanned from
+  // the corner on
   const int blS = tLU - numLeft - pBL, blE = tLU - 1 - numLeft;
   const int lS = tLU - pL, lE = tLU - 1;
-  const int aS = tLU + 1, aE = tLU + pA;
-  const int arS = tLU + 1 + numAbove, arE = tLU + numAbove + pAR;
+  const int lmS = C - pLM, lmE = C - 1;
+  const int amS = C + 1, amE = C + pAM;
+  const int aS = C + 1 + aM, aE = C + aM + pA;
+  const int arS = C + 1 + aM + numAbove, arE = C + aM + numAbove + pAR;
   int firstAvail = totalUnits;
   if( pAR > 0 ) firstAvail = arS;
   if( pA > 0 ) firstAvail = aS;
-  if( corner != 0 ) firstAvail = tLU;
+  if( pAM > 0 ) firstAvail = amS;
+  if( corner != 0 ) firstAvail = C;
+  if( pLM > 0 ) firstAvail = lmS;
   if( pL > 0 ) firstAvail = lS;
   if( pBL > 0 ) firstAvail = blS;
   const int valueDC = 1 << ( t.bitDepth - 1 );
@@ -132,7 +143,7 @@ void fillReferencePar( Tu t, int line, int mrl, int lid, int NT )
   {
     const bool top = e < numTop;
     const int idx = top ? e : e - numTop;
-    const int u = idx <= mrl ? tLU : top ? tLU + 1 + ( idx - 1 - mrl ) / uW : tLU - 1 - ( idx - 1 - mrl ) / uH;
+    const int u = idx <= cLen ? C : top ? C + 1 + ( idx - 1 - cLen ) / uW : C - 1 - ( idx - 1 - cLen ) / uH;
     int v;
     if( firstAvail >= totalUnits )
     {
@@ -144,7 +155,9 @@ void fillReferencePar( Tu t, int line, int mrl, int lid, int NT )
       int pm = -1;
       if( pBL > 0 && blS <= u ) pm = max( pm, min( u, blE ) );
       if( pL > 0 && lS <= u ) pm = max( pm, min( u, lE ) );
-      if( corner != 0 && tLU <= u ) pm = max( pm, tLU );
+      if( pLM > 0 && lmS <= u ) pm = max( pm, min( u, lmE ) );
+      if( corner != 0 && C <= u ) pm = max( pm, C );
+      if( pAM > 0 && amS <= u ) pm = max( pm, min( u, amE ) );
       if( pA > 0 && aS <= u ) pm = max( pm, min( u, aE ) );
       if( pAR > 0 && arS <= u ) pm = max( pm, min( u, arE ) );
       int sx, sy;
@@ -157,20 +170,20 @@ void fillReferencePar( Tu t, int line, int mrl, int lid, int NT )
       {
         const bool before = pm >= 0;    // the last sample of the unit before, else the first of the first available
         const int s = before ? pm : firstAvail;
-        if( s == tLU )
+        if( s == C )
         {
-          sx = before ? x0 + mrl : x0;
-          sy = before ? y0 : y0 + mrl;
+          sx = before ? x0 + cLen : x0;
+          sy = before ? y0 : y0 + cLen;
         }
-        else if( s > tLU )
+        else if( s > C )
         {
-          sx = x0 + ( before ? ( s - tLU ) * uW + mrl : ( s - tLU - 1 ) * uW + 1 + mrl );
+          sx = x0 + ( before ? ( s - C ) * uW + cLen : ( s - C - 1 ) * uW + 1 + cLen );
           sy = y0;
         }
         else
         {
           sx = x0;
-          sy = y0 + ( before ? ( tLU - s - 1 ) * uH + 1 + mrl : ( tLU - s ) * uH + mrl );
+          sy = y0 + ( before ? ( C - s - 1 ) * uH + 1 + cLen : ( C - s ) * uH + cLen );
         }
       }
       v = recoAt( t.comp, sx, sy );
@@ -373,7 +386,8 @@ void main()
     bool angClear2 = false;
     const int W = t.w, H = t.h, N = W * H;
     const int maxPel = ( 1 << t.bitDepth ) - 1;
-    const int predStride = ( W << 3 ) + 1, predSize = W << 3, predHSize = H << 3;
+    const int mrl = t.mrl;   // the reference line (MRL excludes planar, PDPC, the reference filter and MIP)
+    const int predStride = ( W << 3 ) + 1 + mrl, predSize = W << 3, predHSize = H << 3;
     const bool fusion = t.fusion != 0;
 
     // ----- LMCS chroma residual scaling (Reshape::calculateChromaAdjVpduNei with LMCS_CHROMA_CALC_CU): the rounded
@@ -394,10 +408,10 @@ void main()
     }
 
     // ----- reference samples (and the second line of intra fusion)
-    fillReferencePar( t, 0, 0, lid, NT );
+    fillReferencePar( t, 0, mrl, lid, NT );
     if( fusion )
     {
-      fillReferencePar( t, 1, 1, lid, NT );
+      fillReferencePar( t, 1, mrl + 1, lid, NT );
     }
     SYNC();
     if( t.refFilter != 0 )   // xFilterReferenceSamples (multiRefIdx 0), in place
@@ -484,12 +498,12 @@ void main()
     else if( t.dirMode == 0 || t.dirMode == 1 )   // planar / DC, then their PDPC
     {
       const int log2W = findMSB( W ), log2H = findMSB( H );
-      if( t.dirMode == 1 && lid == 0 )
+      if( t.dirMode == 1 && lid == 0 )   // xGetPredValDc: from entry multiRefIdx + 1 on
       {
         int denom = ( W == H ) ? ( W << 1 ) : max( W, H );
         int sum = 0;
-        if( W >= H ) for( int k = 0; k < W; k++ ) sum += int( s_ref[0][1 + k] );
-        if( W <= H ) for( int k = 0; k < H; k++ ) sum += int( s_ref[0][predStride + 1 + k] );
+        if( W >= H ) for( int k = 0; k < W; k++ ) sum += int( s_ref[0][mrl + 1 + k] );
+        if( W <= H ) for( int k = 0; k < H; k++ ) sum += int( s_ref[0][predStride + mrl + 1 + k] );
         s_dc = ( sum + ( denom >> 1 ) ) >> findMSB( denom );
       }
       SYNC();
@@ -531,24 +545,27 @@ void main()
       // computed directly from the reference lines (the CPU's copies, padding, end replication and negative-angle
       // extension), so one barrier suffices
       const int topRefLength = W << 3, leftRefLength = H << 3;
-      const int predStride2 = predStride + 1;   // the fusion line (multiRefIdx 1)
+      const int mrl2 = mrl + 1, predStride2 = predStride + 1;   // the fusion line (multiRefIdx2nd)
       const int sizeSide = isVer ? H : W;
       const int refLength = isVer ? topRefLength : leftRefLength;
+      const int log2Ratio = findMSB( W ) - findMSB( H );
+      const int sh = max( 0, isVer ? log2Ratio : -log2Ratio );
       int mainBase, sideBase, mainBase2, sideBase2;
       if( angle < 0 )
       {
         mainBase = ( isVer ? H : W ) + PAD;
         sideBase = ( isVer ? W : H ) + PAD;
-        for( int i = lid; i < W + PAD + 2; i += NT ) s_angA[0][H + PAD + i] = s_ref[0][i];
-        for( int i = lid; i < H + PAD + 2; i += NT ) s_angL[0][W + PAD + i] = s_ref[0][predStride + i];
+        for( int i = lid; i < W + PAD + 2 + mrl; i += NT ) s_angA[0][H + PAD + i] = s_ref[0][i];
+        for( int i = lid; i < H + PAD + 2 + mrl; i += NT ) s_angL[0][W + PAD + i] = s_ref[0][predStride + i];
         // side entry j (copied above) = the reference line itself
         const int sideOff = isVer ? predStride : 0;
+        const int sideRange = sizeSide + 2 + mrl;
         for( int k = -( sizeSide + PAD ) + lid; k <= -1; k += NT )
         {
           int frac32precision = ( -k * absInvAngle + 8 ) >> 4;
           int intpel = frac32precision >> 5, fracpel = frac32precision & 31;
-          int left  = int( s_ref[0][sideOff + clip3i( 0, sizeSide + 2, intpel ) ] );
-          int right = int( s_ref[0][sideOff + clip3i( 0, sizeSide + 2, intpel + 1 ) ] );
+          int left  = int( s_ref[0][sideOff + clip3i( 0, sideRange, intpel ) ] );
+          int right = int( s_ref[0][sideOff + clip3i( 0, sideRange, intpel + 1 ) ] );
           int v;
           if( t.disableRefFilter != 0 )
           {
@@ -556,8 +573,8 @@ void main()
           }
           else
           {
-            int lm1 = int( s_ref[0][sideOff + clip3i( 0, sizeSide + 2, intpel - 1 ) ] );
-            int rp1 = int( s_ref[0][sideOff + clip3i( 0, sizeSide + 2, intpel + 2 ) ] );
+            int lm1 = int( s_ref[0][sideOff + clip3i( 0, sideRange, intpel - 1 ) ] );
+            int rp1 = int( s_ref[0][sideOff + clip3i( 0, sideRange, intpel + 2 ) ] );
             v = clip3i( 0, maxPel, ( weak4( fracpel, 0 ) * lm1 + weak4( fracpel, 1 ) * left + weak4( fracpel, 2 ) * right + weak4( fracpel, 3 ) * rp1 + 32 ) >> 6 );
           }
           mainW( isVer, 0, mainBase + k, v );
@@ -566,10 +583,10 @@ void main()
         sideBase2 = sideBase + 1;
         if( fusion )
         {
-          for( int i = lid; i < topRefLength + PAD + 1; i += NT ) s_angA[1][H + PAD + 1 + i] = s_ref[1][i];
-          for( int i = lid; i < leftRefLength + PAD + 1; i += NT ) s_angL[1][W + PAD + 1 + i] = s_ref[1][predStride2 + i];
+          for( int i = lid; i < topRefLength + PAD + mrl2; i += NT ) s_angA[1][H + PAD + 1 + i] = s_ref[1][i];
+          for( int i = lid; i < leftRefLength + PAD + mrl2; i += NT ) s_angL[1][W + PAD + 1 + i] = s_ref[1][predStride2 + i];
           const int sideOff2 = isVer ? predStride2 : 0;
-          const int sizeSideRange = ( isVer ? leftRefLength : topRefLength ) + 1;
+          const int sizeSideRange = ( isVer ? leftRefLength : topRefLength ) + mrl2;
           for( int k = -( sizeSide + 1 + PAD ) + lid; k <= -1; k += NT )
           {
             int frac32precision = ( -k * absInvAngle + 8 ) >> 4;
@@ -590,56 +607,57 @@ void main()
             mainW( isVer, 1, mainBase2 + k, v );
           }
         }
-        mainBase2 += 1;   // refMain2nd += multiRefIdx2nd
-        sideBase2 += 1;
       }
       else
       {
         mainBase = PAD;
         sideBase = PAD;
         // above: PAD copies of entry 0, then the top row (read on past the row, as the CPU's memcpy does); left alike;
-        // the main array's end is replicated over 12 entries (maxIndex 6 + PAD)
-        const int end0 = PAD + refLength;
-        const int val  = int( s_ref[0][( isVer ? 0 : predStride ) + refLength] );
-        for( int j = lid; j < PAD + topRefLength + PAD + ( isVer ? 7 : 0 ); j += NT )
+        // the main array's end (entry refLength + multiRefIdx) is replicated over maxIndex + PAD entries
+        const int maxIndex = ( mrl << sh ) + 6;
+        const int end0 = PAD + refLength + mrl;
+        const int val  = int( s_ref[0][( isVer ? 0 : predStride ) + refLength + mrl] );
+        const int lenA = isVer ? end0 + maxIndex + PAD + 1 : PAD + topRefLength + mrl + PAD;
+        const int lenL = isVer ? PAD + leftRefLength + mrl + PAD : end0 + maxIndex + PAD + 1;
+        for( int j = lid; j < lenA; j += NT )
         {
-          int v = j < PAD ? int( s_ref[0][0] ) : int( s_ref[0][j - PAD] );
-          if( isVer && j > end0 ) v = val;
+          const int v = isVer && j > end0 ? val : j < PAD ? int( s_ref[0][0] ) : int( s_ref[0][j - PAD] );
           s_angA[0][j] = int16_t( v );
         }
-        for( int j = lid; j < PAD + leftRefLength + PAD + ( isVer ? 0 : 7 ); j += NT )
+        for( int j = lid; j < lenL; j += NT )
         {
-          int v = j < PAD ? int( s_ref[0][predStride] ) : int( s_ref[0][predStride + j - PAD] );
-          if( !isVer && j > end0 ) v = val;
+          const int v = !isVer && j > end0 ? val : j < PAD ? int( s_ref[0][predStride] ) : int( s_ref[0][predStride + j - PAD] );
           s_angL[0][j] = int16_t( v );
         }
         if( fusion )
         {
-          const int log2Ratio = findMSB( W ) - findMSB( H );
-          const int sh = max( 0, isVer ? log2Ratio : -log2Ratio );
-          const int maxIndex2 = ( 1 << sh ) + 6 + 4;
-          const int end1 = PAD + refLength + 1;
-          const int val2 = int( s_ref[1][( isVer ? 0 : predStride2 ) + refLength + 1] );
-          const int lenA = isVer ? end1 + maxIndex2 + PAD + 1 : PAD + topRefLength + 1 + PAD;
-          const int lenL = isVer ? PAD + leftRefLength + 1 + PAD : end1 + maxIndex2 + PAD + 1;
-          for( int j = lid; j < lenA; j += NT )
+          const int maxIndex2 = ( mrl2 << sh ) + 6 + 4;
+          const int end1 = PAD + refLength + mrl2;
+          const int val2 = int( s_ref[1][( isVer ? 0 : predStride2 ) + refLength + mrl2] );
+          const int lenA2 = isVer ? end1 + maxIndex2 + PAD + 1 : PAD + topRefLength + mrl2 + PAD;
+          const int lenL2 = isVer ? PAD + leftRefLength + mrl2 + PAD : end1 + maxIndex2 + PAD + 1;
+          for( int j = lid; j < lenA2; j += NT )
           {
-            int v = j < PAD ? int( s_ref[1][0] ) : j < PAD + topRefLength + 1 + PAD ? int( s_ref[1][j - PAD] ) : 0;
-            if( isVer && j > end1 ) v = val2;
+            const int v = isVer && j > end1 ? val2 : j < PAD ? int( s_ref[1][0] ) : int( s_ref[1][j - PAD] );
             s_angA[1][j] = int16_t( v );
           }
-          for( int j = lid; j < lenL; j += NT )
+          for( int j = lid; j < lenL2; j += NT )
           {
-            int v = j < PAD ? int( s_ref[1][predStride2] ) : j < PAD + leftRefLength + 1 + PAD ? int( s_ref[1][predStride2 + j - PAD] ) : 0;
-            if( !isVer && j > end1 ) v = val2;
+            const int v = !isVer && j > end1 ? val2 : j < PAD ? int( s_ref[1][predStride2] ) : int( s_ref[1][predStride2 + j - PAD] );
             s_angL[1][j] = int16_t( v );
           }
         }
-        mainBase2 = PAD + 1;   // refMain2nd += multiRefIdx2nd
-        sideBase2 = PAD + 1;
+        mainBase2 = PAD;
+        sideBase2 = PAD;
       }
-      // cleared after the block (IntraPrediction's angRefClearEnd with multiRefIdx 0)
-      angClear = min( ANG, 2 * ( W + H ) + max( topRefLength, leftRefLength ) + 2 * PAD + 2 + ( 1 << abs( findMSB( W ) - findMSB( H ) ) ) + 16 );
+      // the prediction reads the arrays from the reference line's own corner on (refMain += multiRefIdx, refMain2nd +=
+      // multiRefIdx2nd)
+      mainBase += mrl;
+      sideBase += mrl;
+      mainBase2 += mrl2;
+      sideBase2 += mrl2;
+      // cleared after the block (IntraPrediction's angRefClearEnd)
+      angClear = min( ANG, 2 * ( W + H ) + max( topRefLength, leftRefLength ) + 2 * PAD + 2 * mrl2 + ( mrl2 << abs( log2Ratio ) ) + 16 );
       angClear2 = fusion;
       SYNC();
       // rows along the main direction (width/height swapped for horizontal modes)
@@ -672,7 +690,7 @@ void main()
         }
         else
         {
-          const int deltaPos = angle * ( y + 1 );
+          const int deltaPos = angle * ( y + 1 + mrl );
           const int deltaInt = deltaPos >> 5, deltaFract = deltaPos & 31;
           if( intSlope )
           {
@@ -758,7 +776,7 @@ void main()
         // the bottom one and the above units but the last one, as the CPU copies them)
         const int PW = W + 4;
         const int numAbove = max( W / t.unitW, 1 ), numLeft = max( H / t.unitH, 1 );
-        const int corner = t.avail[0][0], pA = t.avail[0][1], pL = t.avail[0][3];
+        const int corner = t.bfAvail[0], pA = t.bfAvail[1], pL = t.bfAvail[2];
         const bool all = corner != 0 && pA == numAbove && pL == numLeft;
         const int topRec  = all ? W : min( pA, numAbove - 1 ) * t.unitW;
         const int leftRec = all ? H : min( pL, numLeft - 1 ) * t.unitH;

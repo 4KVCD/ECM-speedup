@@ -78,31 +78,32 @@ void dependencies( int comp )
   Tu t = BufTu( P.tus ).v[g_i];
   const int availComp = t.comp == 0 ? 0 : 1;
   const int numAbove = max( t.w / t.unitW, 1 ), numLeft = max( t.h / t.unitH, 1 );
-  const int tAU = ( t.w << 3 ) / t.unitW, tLU = ( t.h << 3 ) / t.unitH, totalUnits = tAU + tLU + 1;
-  for( int mrl = 0; mrl < 2; mrl++ )
+  const int tAU = ( t.w << 3 ) / t.unitW, tLU = ( t.h << 3 ) / t.unitH;
+  if( g_pass == 1 )
   {
-    if( g_pass == 1 )
+    for( int ln = 0; ln < 2; ln++ )
     {
-      for( int k = 0; k < 5; k++ ) BufTu( P.tus ).v[g_i].avail[mrl][k] = 0;
-      BufTu( P.tus ).v[g_i].readMax[mrl][0] = 0;
-      BufTu( P.tus ).v[g_i].readMax[mrl][1] = 0;
+      for( int k = 0; k < 7; k++ ) BufTu( P.tus ).v[g_i].avail[ln][k] = 0;
+      BufTu( P.tus ).v[g_i].readMax[ln][0] = 0;
+      BufTu( P.tus ).v[g_i].readMax[ln][1] = 0;
     }
-    if( mrl == 1 && t.fusion == 0 )
-    {
-      break;
-    }
-    // the read range
+    for( int k = 0; k < 3; k++ ) BufTu( P.tus ).v[g_i].bfAvail[k] = 0;
+  }
+  for( int ln = 0; ln <= ( t.fusion != 0 ? 1 : 0 ); ln++ )
+  {
+    const int mrl = t.mrl + ln;   // the reference line (multiRefIdx; the fusion line is the next one)
+    // the read range: the main line (multiRefIdx k = t.mrl), or the fusion line (k + 1, non-integer slopes)
     const int W = t.w, H = t.h, rf = t.refFilter != 0 ? 1 : 0;
     int topMax, leftMax;
-    if( t.dirMode == 0 )
+    if( t.dirMode == 0 )   // never with MRL
     {
       topMax  = W + 1 + rf;
       leftMax = H + 1 + rf;
     }
-    else if( t.dirMode == 1 )
+    else if( t.dirMode == 1 )   // from entry multiRefIdx + 1 on
     {
-      topMax  = W + 1;
-      leftMax = H + 1;
+      topMax  = W + 1 + mrl;
+      leftMax = H + 1 + mrl;
     }
     else
     {
@@ -110,22 +111,22 @@ void dependencies( int comp )
       const int  w = ver ? W : H, h = ver ? H : W, refLength = 8 * w, sideLength = 8 * h;
       const int  angle = t.intraPredAngle;
       int mainMax, sideMax;
-      if( mrl == 0 )
+      if( ln == 0 )
       {
         if( angle == 0 )
         {
-          mainMax = w + 1;
-          sideMax = t.applyPDPC != 0 ? h + 1 : 1;
+          mainMax = w + 1 + mrl;
+          sideMax = t.applyPDPC != 0 ? h + 1 : 1 + mrl;
         }
         else if( angle < 0 )
         {
-          mainMax = w + PAD + 2;
-          sideMax = h + PAD + 2;
+          mainMax = w + PAD + 2 + mrl;
+          sideMax = h + PAD + 2 + mrl;
         }
         else
         {
-          mainMax = min( refLength, ( ( angle * h ) >> 5 ) + w + 10 );
-          sideMax = 1;
+          mainMax = min( refLength + mrl, ( ( angle * ( h + mrl ) ) >> 5 ) + w + 10 + mrl );
+          sideMax = 1 + mrl;
           if( t.applyPDPC != 0 )
           {
             const int limit = min( 3 << t.angularScale, w );
@@ -139,19 +140,19 @@ void dependencies( int comp )
       {
         if( angle < 0 )
         {
-          mainMax = w + PAD + 10;
-          sideMax = min( sideLength + 1, ( ( ( h + 1 + PAD ) * t.absInvAngle + 8 ) >> 4 >> 5 ) + 3 );
+          mainMax = w + PAD + 9 + mrl;
+          sideMax = min( sideLength + mrl, ( ( ( h + 1 + PAD ) * t.absInvAngle + 8 ) >> 4 >> 5 ) + 2 + mrl );
         }
         else
         {
-          mainMax = min( refLength + 1, ( ( angle * ( h + 1 ) ) >> 5 ) + w + 12 );
-          sideMax = 1;
+          mainMax = min( refLength + mrl, ( ( angle * ( h + mrl ) ) >> 5 ) + w + 11 + mrl );
+          sideMax = mrl;
         }
       }
       topMax  = ver ? mainMax : sideMax;
       leftMax = ver ? sideMax : mainMax;
     }
-    if( t.bf == 2 && mrl == 0 )
+    if( t.bf == 2 && ln == 0 )
     {
       topMax  = 8 * W;
       leftMax = 8 * H;
@@ -160,6 +161,10 @@ void dependencies( int comp )
     const int readLeft = max( mrl, min( leftMax, 8 * H + mrl ) );
 
     const int x0 = t.x - 1 - mrl, y0 = t.y - 1 - mrl;
+    // the MRL units (intra_rec's fillReferencePar): lM left of and aM above the corner unit C, which keeps the
+    // entries up to cLen
+    const int lM = mrl / t.unitH, aM = mrl / t.unitW, cLen = mrl - lM * t.unitH, C = tLU + lM;
+    const int totalUnits = tAU + tLU + 1 + lM + aM;
     const int unitsTop  = readTop >= 1 + mrl ? ( readTop - 1 - mrl ) / t.unitW + 1 : 0;
     const int unitsLeft = readLeft >= 1 + mrl ? ( readLeft - 1 - mrl ) / t.unitH + 1 : 0;
     const int limA  = max( 1, min( numAbove, unitsTop ) );
@@ -176,32 +181,49 @@ void dependencies( int comp )
     const int pL = k;
     for( k = 0; k < limBL && availAt( availComp, x0, t.y + t.h - 1 + t.unitH + k * t.unitH ); k++ ) {}
     const int pBL = k;
+    for( k = 0; k < lM && availAt( availComp, x0, t.y - lM * t.unitH + k * t.unitH ); k++ ) {}   // left MRL, downwards
+    const int pLM = k;
+    for( k = 0; k < aM && availAt( availComp, t.x - aM * t.unitW + k * t.unitW, y0 ); k++ ) {}   // above MRL, rightwards
+    const int pAM = k;
     if( g_pass == 1 )
     {
-      BufTu( P.tus ).v[g_i].readMax[mrl][0] = readTop;
-      BufTu( P.tus ).v[g_i].readMax[mrl][1] = readLeft;
-      BufTu( P.tus ).v[g_i].avail[mrl][0]   = corner;
-      BufTu( P.tus ).v[g_i].avail[mrl][1]   = pA;
-      BufTu( P.tus ).v[g_i].avail[mrl][2]   = pAR;
-      BufTu( P.tus ).v[g_i].avail[mrl][3]   = pL;
-      BufTu( P.tus ).v[g_i].avail[mrl][4]   = pBL;
+      BufTu( P.tus ).v[g_i].readMax[ln][0] = readTop;
+      BufTu( P.tus ).v[g_i].readMax[ln][1] = readLeft;
+      BufTu( P.tus ).v[g_i].avail[ln][0]   = corner;
+      BufTu( P.tus ).v[g_i].avail[ln][1]   = pA;
+      BufTu( P.tus ).v[g_i].avail[ln][2]   = pAR;
+      BufTu( P.tus ).v[g_i].avail[ln][3]   = pL;
+      BufTu( P.tus ).v[g_i].avail[ln][4]   = pBL;
+      BufTu( P.tus ).v[g_i].avail[ln][5]   = pLM;
+      BufTu( P.tus ).v[g_i].avail[ln][6]   = pAM;
     }
 
-    if( t.bf != 0 && mrl == 0 )   // the bilateral filter's neighbours (rows y-2, y-1; columns x-2, x-1)
+    if( t.bf != 0 && ln == 0 )   // the bilateral filter's neighbours (rows y-2, y-1; columns x-2, x-1)
     {
-      if( corner != 0 )
+      // its padding: line 0's corner and above / left units (bilateralFilterPredDiamond5x5Clip), also with MRL
+      const int bfCorner = availAt( availComp, t.x - 1, t.y - 1 ) ? 1 : 0;
+      int bfA, bfL;
+      for( bfA = 0; bfA < numAbove && availAt( availComp, t.x + bfA * t.unitW, t.y - 1 ); bfA++ ) {}
+      for( bfL = 0; bfL < numLeft && availAt( availComp, t.x - 1, t.y + bfL * t.unitH ); bfL++ ) {}
+      if( g_pass == 1 )
+      {
+        BufTu( P.tus ).v[g_i].bfAvail[0] = bfCorner;
+        BufTu( P.tus ).v[g_i].bfAvail[1] = bfA;
+        BufTu( P.tus ).v[g_i].bfAvail[2] = bfL;
+      }
+      if( bfCorner != 0 )
       {
         addDep( ownerAt( comp, t.x - 2, t.y - 2 ) );
         addDep( ownerAt( comp, t.x - 1, t.y - 2 ) );
         addDep( ownerAt( comp, t.x - 2, t.y - 1 ) );
         addDep( ownerAt( comp, t.x - 1, t.y - 1 ) );
       }
-      for( int x = 0; x < pA * t.unitW && x < t.w; x++ )
+      for( int x = 0; x < bfA * t.unitW && x < t.w; x++ )
       {
         addDep( ownerAt( comp, t.x + x, t.y - 2 ) );
         addDep( ownerAt( comp, t.x + x, t.y - 1 ) );
       }
-      for( int y = 0; y < pL * t.unitH && y < t.h; y++ )
+      for( int y = 0; y < bfL * t.unitH && y < t.h; y++ )
       {
         addDep( ownerAt( comp, t.x - 2, t.y + y ) );
         addDep( ownerAt( comp, t.x - 1, t.y + y ) );
@@ -209,11 +231,14 @@ void dependencies( int comp )
     }
     // the owners of the samples in range (intra_rec's fill rule)
     const int blS = tLU - numLeft - pBL, blE = tLU - 1 - numLeft, lS = tLU - pL, lE = tLU - 1;
-    const int aS = tLU + 1, aE = tLU + pA, arS = tLU + 1 + numAbove, arE = tLU + numAbove + pAR;
+    const int lmS = C - pLM, lmE = C - 1, amS = C + 1, amE = C + pAM;
+    const int aS = C + 1 + aM, aE = C + aM + pA, arS = C + 1 + aM + numAbove, arE = C + aM + numAbove + pAR;
     int firstAvail = totalUnits;
     if( pAR > 0 ) firstAvail = arS;
     if( pA > 0 ) firstAvail = aS;
-    if( corner != 0 ) firstAvail = tLU;
+    if( pAM > 0 ) firstAvail = amS;
+    if( corner != 0 ) firstAvail = C;
+    if( pLM > 0 ) firstAvail = lmS;
     if( pL > 0 ) firstAvail = lS;
     if( pBL > 0 ) firstAvail = blS;
     if( firstAvail >= totalUnits )
@@ -227,11 +252,13 @@ void dependencies( int comp )
       int lastKey = -1;
       for( int idx = 0; idx <= readMax; idx++ )
       {
-        const int u = idx <= mrl ? tLU : top ? tLU + 1 + ( idx - 1 - mrl ) / t.unitW : tLU - 1 - ( idx - 1 - mrl ) / t.unitH;
+        const int u = idx <= cLen ? C : top ? C + 1 + ( idx - 1 - cLen ) / t.unitW : C - 1 - ( idx - 1 - cLen ) / t.unitH;
         int pm = -1;
         if( pBL > 0 && blS <= u ) pm = max( pm, min( u, blE ) );
         if( pL > 0 && lS <= u ) pm = max( pm, min( u, lE ) );
-        if( corner != 0 && tLU <= u ) pm = max( pm, tLU );
+        if( pLM > 0 && lmS <= u ) pm = max( pm, min( u, lmE ) );
+        if( corner != 0 && C <= u ) pm = max( pm, C );
+        if( pAM > 0 && amS <= u ) pm = max( pm, min( u, amE ) );
         if( pA > 0 && aS <= u ) pm = max( pm, min( u, aE ) );
         if( pAR > 0 && arS <= u ) pm = max( pm, min( u, arE ) );
         int sx, sy;
@@ -255,20 +282,20 @@ void dependencies( int comp )
           lastKey = u * 2 + 1;
           const bool before = pm >= 0;
           const int  s = before ? pm : firstAvail;
-          if( s == tLU )
+          if( s == C )
           {
-            sx = before ? x0 + mrl : x0;
-            sy = before ? y0 : y0 + mrl;
+            sx = before ? x0 + cLen : x0;
+            sy = before ? y0 : y0 + cLen;
           }
-          else if( s > tLU )
+          else if( s > C )
           {
-            sx = x0 + ( before ? ( s - tLU ) * t.unitW + mrl : ( s - tLU - 1 ) * t.unitW + 1 + mrl );
+            sx = x0 + ( before ? ( s - C ) * t.unitW + cLen : ( s - C - 1 ) * t.unitW + 1 + cLen );
             sy = y0;
           }
           else
           {
             sx = x0;
-            sy = y0 + ( before ? ( tLU - s - 1 ) * t.unitH + 1 + mrl : ( tLU - s ) * t.unitH + mrl );
+            sy = y0 + ( before ? ( C - s - 1 ) * t.unitH + 1 + cLen : ( C - s ) * t.unitH + cLen );
           }
         }
         addDep( ownerAt( comp, sx, sy ) );

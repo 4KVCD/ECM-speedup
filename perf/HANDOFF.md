@@ -13,7 +13,7 @@ wall-clock gains with threads are "the easy baseline". Decoder status: single-th
 (`--GpuLoopFilter=1`: ALF, SAO, BIF, CCSAO, LF-CCCM, offset refinement on Vulkan). The user then asked for **a full
 GPU decoder in Vulkan, optimized until nothing is left** ("The GPU decoder needs to fully decode the frame on the
 GPU"; "Your first Vulkan version is going to be slow. That's OK"). That work is branch `dec-gpurecon`: intra
-reconstruction on the GPU (`--GpuRecon`), tool levels M1-M11 done and verified bit-exact; it is **not yet faster than
+reconstruction on the GPU (`--GpuRecon`), tool levels M1-M12 done and verified bit-exact; it is **not yet faster than
 the CPU decoder** (see section 8) and supports only a restricted tool set (all real CTC streams fall back to the CPU,
 first reason: sign prediction).
 
@@ -23,8 +23,8 @@ Correctness / testing
 - A speed-up must never change the output. Prove it on real files (identical decoded frames / md5, identical
   bitstreams). If output moves, report it and let the user decide; never accept a difference yourself.
 - Find the real cause before fixing; no guessed fixes. A reproducible failure is a real bug: fix the code, not the test.
-- Test on real, long, full-resolution content (1080p and 4K), not only small crops. (So far the GPU work only used
-  CIF/720p; see section 9.)
+- Test on real, long, full-resolution content (1080p and 4K), not only small crops. (The GPU test streams have three
+  short 1080p ones since 2026-10-11; long 1080p/4K runs are still to do, see section 9.)
 - Tests must not depend on elapsed time or machine load. Canary builds when shrinking/reusing buffers. Fair CPU
   comparisons (same input/build type, paired runs, all processes counted). A QA round after every task (re-read the
   diff for bugs, run the real path, check performance).
@@ -121,9 +121,8 @@ commands that combine `Remove-Item` with `//` text. `perf\gpu\crlf.ps1 <worktree
 ## 5. Test material
 
 - Sources in C:\Code\ECM\seq (not in git): foreman_352x288.yuv, ParkJoy_1280x720.yuv (62 frames),
-  FourPeople_1280x720.yuv; y4m originals in seq\y4m. 1080p/4K: none of our own yet; the VVenc-Vulkan session on the
-  old PC had crowd_run/ducks/park_joy 1080p50 y4m in C:\Code\VVenc-Vulkan\data (another session's folder: ask
-  first). The user wants 1080p/4K testing.
+  FourPeople_1280x720.yuv, CrowdRun / Ducks / ParkJoy_1920x1080.yuv (60 frames each, from crowd_run / ducks /
+  park_joy_1080p.y4m); y4m originals in seq\y4m. 4K: none yet. The user wants 1080p/4K testing.
 - GPU test streams (C:\Code\ECM\streams_gpu, not in git, regenerate with the scripts; all-intra, ECM tools off except the
   level's tools, `perf\gpu\enc_m1.ps1` lists the disabled tools; it uses the bit-exact optimized encoder build qaCpu, which writes the same bitstream as stock):
   - `enc_set.ps1 m1`                                         M1: planar/DC/angular, DCT-II only
@@ -153,6 +152,13 @@ commands that combine `Remove-Item` with `//` text. `perf\gpu\crlf.ps1 <worktree
     supported yet): `m11`; its foreman streams: lfnstIdx 1-3 on all components, 382 blocks with separable LFNST and
     3348 NSPT blocks (4x4 to 32x8) among 7896 coded blocks. `m11m_fore32` (`enc_m1.ps1`, also `--MIP=1`): has MIP
     blocks with LFNST, so its pictures fall back to the CPU ("LFNST of MIP").
+  - 1080p (m11's arguments, 2 pictures, QP 32): `h11_crowd`, `h11_ducks`, `h11_park` (`enc_m1.ps1 h11_crowd
+    C:\Code\ECM\seq\CrowdRun_1920x1080.yuv 1920 1080 2 --TemporalSubsampleRatio=1 -q 32 <m11 args>`; ~20 min each).
+  - M12 (m11's arguments plus `--MRL=1`; TMRL and MIP stay off): `m12`; its fore32 and fore22 streams have 1292 MRL
+    blocks on all lines (1: 690, 3: 320, 5: 128, 7: 92, 12: 62), 817 with the fusion line, 45 DC (40 with the
+    bilateral filter), all angle signs, and MRL unit groups unavailable at the picture's edges. `enc_m12_edges.ps1`:
+    `m12e_*` (64x64 / 128x64 crops via `crop.py`: many blocks at the edges) and `m12s_*` (synthetic content via
+    `gen_mrl_edge.py` on which the encoder picks lines 5-12 near the top).
   - each set: fore22/32/37 (CIF), park720, four720 (2-4 pictures). Longer ones: m2_fore33, m2_park16, m3_park16
     (`enc_m1.ps1 <name> <yuv> 1280 720 16 --TemporalSubsampleRatio=1 -q 32 <level args>`), m3_park60 (60 frames,
     `enc_long.ps1 m3_park60 ...\ParkJoy_1280x720.yuv 1280 720 4 15 -q 32 --IntraToolControlMode=1 --IntraPredBf=1`:
@@ -175,6 +181,7 @@ commands that combine `Remove-Item` with `//` text. `perf\gpu\crlf.ps1 <worktree
 | `walls.py <build> <stream> <reps> -- args \| args ...` | wall time per configuration (no output check) |
 | `enc_m1.ps1`, `enc_set.ps1`, `enc_long.ps1` | test stream encoding (section 5) |
 | `gen_screen.py <out.yuv> [w h frames]` | synthetic screen-like 4:2:0 content (transform skip / BDPCM test streams) |
+| `crop.py`, `gen_mrl_edge.py`, `enc_m12_edges.ps1` | small crops of the test sequences and synthetic MRL content; the M12 edge-case streams |
 | `qa.ps1` | the full QA before a push of `dec` (3 builds, 12 decoder modes on the 19 streams, encoder suite); paths point at wt-dec |
 | `buildgpu.ps1`, `cleanlibs.ps1`, `cleanlibs_gr.ps1`, `crlf.ps1` | build helpers (paths: wt-dec / wt-gr) |
 
@@ -206,7 +213,7 @@ everything that depends on samples runs on the GPU, implemented line by line aft
 TrQuant.cpp, BilateralFilter.cpp). `supported()` must reject every tool whose mode derivation or prediction reads
 reconstructed samples or that the kernels lack.
 
-Files: `source/Lib/GpuLib/GpuIntraRec.{h,cpp}`, `shaders/intra_common.glsl` (Tu = 67 ints and Params layouts,
+Files: `source/Lib/GpuLib/GpuIntraRec.{h,cpp}`, `shaders/intra_common.glsl` (Tu = 75 ints and Params layouts,
 static_asserts on the host), `intra_resi.comp`, `intra_rec.comp`, `intra_deps.comp`, `scan.comp`, `VkCompute.*`
 (device with vulkanMemoryModel + optional shader clock; up to 8 queues round-robin); `DecoderLib/DecCu.cpp`
 (record calls), `DecSlice.cpp` (parse-first, derive pass, CPU fallback), `DecLib.cpp` (setGpuRecon,
@@ -226,7 +233,9 @@ M8: explicit intra MTS (TrQuant::getInvTransformTypes per block; every transform
 TrQuant::getInvTransformMatrix; Tu::mtxV, mtxH). M9: transform skip and BDPCM (Tu::transformSkip; invResDPCM on
 the host; BDPCM blocks predict as mode 18 / 50 with the filters off). M10: MIP (Tu::mipMatrix etc.; recorded with the
 DC mode for the read range and the bilateral filter). M11: LFNST / NSPT on the host side (Tu::precomputed: 1 the
-host's dequantized, inverse-LFNST'ed coefficients, 2 the host's residual for NSPT).
+host's dequantized, inverse-LFNST'ed coefficients, 2 the host's residual for NSPT). M12: MRL (Tu::mrl; the MRL unit
+groups left of and above the corner in avail[line][5..6]; Tu::bfAvail, line 0's availability for the bilateral
+filter of MRL DC blocks).
 
 ## 8. Numbers (i7-10700 8C/16T, Win11, GCC 16.2, RTX 3070 driver 616.92)
 
@@ -249,24 +258,24 @@ Profile of a GPU-on decode (non-LTO, m2_park16, share of all samples): parsing ~
 
 1. Time 180ccabc (paired grL builds, `walls.py` with `--GpuRecon=3`, CPU vs GPU, FT8; use m3_park60).
 2. Done (2026-10-11): M4 dual tree, M5 LMCS, M6 dependent quantization and QCS, M7 joint CbCr, M8 explicit MTS,
-   M9 transform skip and BDPCM, M10 MIP, M11 LFNST / NSPT (computed by the host: move to the GPU for speed).
+   M9 transform skip and BDPCM, M10 MIP, M11 LFNST / NSPT (computed by the host: move to the GPU for speed), M12 MRL.
    All 19 regular streams now stop at "sign prediction" (the next sequence-level check; the block-level tools of
    step 4 follow).
 3. Make the GPU path win on CPU time per picture: the derive-only pass (record during parsing or a leaner pass;
    speed up getSpatialIpm/getPURestricted, which also helps the CPU decoder), GPU behaviour with frame threads
    (8 contexts x 32 persistent workgroups oversubscribe the GPU; spinning workgroups; try fewer groups per context,
    more frame threads than cores to hide GPU waits, overlapping a picture's GPU work with the next picture's parse).
-4. More tool levels, roughly in the order CTC AI needs them: MRL/TMRL, ISP (references shifted from the CU's, the
+4. More tool levels, roughly in the order CTC AI needs them: ISP (references shifted from the CU's, the
    bilateral filter padded at the CU's origin, 4-wide prediction regions over 1- and 2-wide blocks, 1-D transforms),
    LFNST of MIP (with the MIP prediction's DIMD mode), implicit MTS (with
-   DIMD), sign prediction (reads reconstruction: GPU), CCLM/CCCM and the other
+   DIMD), TMRL (template-selected lines: GPU), sign prediction (reads reconstruction: GPU), CCLM/CCCM and the other
    cross-component tools (GPU), DIMD/TIMD/MPM sorting/chroma reordering/DBV (mode derivations that read the
    reconstruction: these have to move to the GPU too), IntraTMP/IBC, then inter pictures. Each level: new test set
    with exactly that tool on, verify mode identical, canaries, commit.
 5. In-loop filters in ON mode on the GPU without a CPU round trip (deblocking: see dec-gpu-dbf-wip; ALF/SAO/... are
    on the GPU already via --GpuLoopFilter, but on the CPU's picture).
-6. 1080p/4K verification and timing once sources are agreed with the user; check on other GPU makers (AMD, Intel)
-   before any release.
+6. 1080p/4K verification and timing on long streams once sources are agreed with the user (three short 1080p
+   streams verify identical since M12); check on other GPU makers (AMD, Intel) before any release.
 
 ## 10. Findings worth knowing
 

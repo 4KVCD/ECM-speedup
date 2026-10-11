@@ -2,7 +2,7 @@
 #ifndef INTRA_COMMON_GLSL
 #define INTRA_COMMON_GLSL
 
-// one transform block of one component (67 int32, layout shared with GpuIntraRec.cpp)
+// one transform block of one component (75 int32, layout shared with GpuIntraRec.cpp)
 struct Tu
 {
   int comp, x, y, w, h;
@@ -17,7 +17,9 @@ struct Tu
   int dbgOffset;                                 // sample offset of the block in the debug buffers
   int plIdx;                                     // directional planar (luma): 1 horizontal, 2 vertical
   int refFilter, applyPDPC, gradPDPC, angularScale, fusion, disableRefFilter;
-  int avail[2][5];   // per reference line (multiRefIdx 0, 1): corner, available prefix of the above / above-right / left / below-left units
+  // per reference line (the block's multiRefIdx and the fusion line after it): the corner flag, then the available
+  // prefix of the above / above-right / left / below-left units and of the MRL units left of and above the corner
+  int avail[2][7];
   int readMax[2][2];   // per reference line: the highest top / left index the prediction reads (a superset)
   int nzRows, nzCols;   // the nonzero coefficient levels lie in rows < nzRows and columns < nzCols
   int bf;               // intra prediction bilateral filter possible: 1 planar / DC, 2 angular (also gated by the references)
@@ -33,6 +35,8 @@ struct Tu
   int mipMatrix;        // MIP: the mode's matrix in the matrices buffer (-1: no MIP; dirMode is then DC)
   int mipTransposed, mipSizeId;
   int precomputed;      // the host's coefficients are 1: dequantized and inverse-LFNST'ed, 2: the residual (NSPT)
+  int mrl;              // multiRefIdx: the reference line (0, 1, 3, 5, 7, 12; luma)
+  int bfAvail[3];       // the bilateral filter's padding: the corner flag, the available above / left units (line 0)
 };
 layout( buffer_reference, std430, buffer_reference_align = 4 ) buffer BufTu { Tu v[]; };
 

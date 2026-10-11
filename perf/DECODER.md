@@ -9,7 +9,8 @@ Machine: i7-10700 8C/16T, Windows 11, GCC 16.2 (WinLibs), static builds with lin
 Tests: `perf/decbench.py` decodes the streams in `C:/Code/ECM/streams` (ECM streams made with the bit-exact encoder,
 several with MD5 picture-hash SEI) and compares the md5 of every output frame with the stock decoder; timings
 are wall time and the CPU time of all processes, paired (both builds at the same time) unless noted. The streams
-so far are short (128x128 to 720p, 1-4 s); the 1080p/4K benchmark plan is pending.
+so far are short (128x128 to 720p, 1-4 s; the GPU test streams also three 1080p ones of 2 pictures); the 1080p/4K
+benchmark plan is pending.
 
 Stock decoder speed (single thread, without its ~0.29 s process start-up): 720p AI 2.4 fps, CIF RA (one GOP of
 33 frames) 21.8 fps, CIF LD 29 fps, 128x128 RA 120-150 fps.
@@ -281,13 +282,20 @@ the reconstruction buffer; works in every frame-thread context):
   host computes the residual with TrQuant::invTransformNxN. That keeps them exact by construction, but NSPT blocks are
   many (in m11 ~40 % of the coded blocks), so the host does much of the transform work there: NSPT (and LFNST) on the
   GPU is a speed-up still to do. LFNST of MIP blocks stays on the CPU (its kernel follows a DIMD mode derived from the
-  MIP prediction). GpuIntraRec::supported() rejects every tool whose mode derivation or prediction reads
-  reconstructed samples or that the kernels lack, before anything is skipped. All 19 regular streams now fall back to
-  the CPU at sign prediction, the next sequence-level check (before M6: QCS, before M5: LMCS, before M4: dual tree);
-  many block-level tools follow.
+  MIP prediction); M12 adds MRL (multiple reference lines 1, 3, 5, 7 and 12 with JVET-Y0116's extended list; the
+  fusion line is the next one, up to 13): the reference fill follows xFillReferenceSamples' unit model, where a line
+  beyond the first unit has extra units left of and above the corner (7 availability groups per line instead of 5),
+  DC averages from entry multiRefIdx + 1, the angular prediction reads the arrays from the line's own corner on
+  (refMain + multiRefIdx) with deltaPos starting at angle * (1 + multiRefIdx) and the main array's end replicated over
+  (multiRefIdx << s) + 6 entries, and the bilateral filter, which xPredIntraAng turns off for MRL but the DC
+  prediction keeps, pads from line 0's availability (Tu::bfAvail). MRL with non-square availability units (the CPU
+  counts the corner samples of both arms by the unit height) and TMRL stay on the CPU. GpuIntraRec::supported()
+  rejects every tool whose mode derivation or prediction reads reconstructed samples or that the kernels lack, before
+  anything is skipped. All 19 regular streams now fall back to the CPU at sign prediction, the next sequence-level
+  check (before M6: QCS, before M5: LMCS, before M4: dual tree); many block-level tools follow.
 - kernels: intra_resi (all residuals of the picture at once, dequantization folded into the first DCT-II stage,
   only the nonzero coefficient region) and intra_rec (persistent workgroups take ready blocks from a queue; the
-  host gives each block its dependency count, its dependents and the availability the CPU sees as five numbers per
+  host gives each block its dependency count, its dependents and the availability the CPU sees as seven numbers per
   reference line, all from syntax and decoding order; the dependencies are the owners of exactly the reference
   samples the block's mode reads; the last dependency of a block to finish continues with it; Vulkan memory model)
 
