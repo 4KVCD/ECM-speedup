@@ -160,7 +160,11 @@ void VkLoopFilter::destroy()
   }
   m_pic.destroy( *m_core );
   m_tmp.destroy( *m_core );
-  for( Buffer* b: { &m_edgeBuf, &m_saoParams, &m_bifBlocks, &m_bifTables, &m_ccSaoSets, &m_ctuBytes, &m_ccSaoTables } )
+  m_db.destroy( *m_core );
+  m_src.destroy( *m_core );
+  m_resi.destroy( *m_core );
+  for( Buffer* b: { &m_edgeBuf, &m_saoParams, &m_bifBlocks, &m_bifTables, &m_ccSaoSets, &m_ctuBytes, &m_ccSaoTables,
+                    &m_alfCi, &m_alfRes, &m_alfCls, &m_alfTables, &m_alfParams } )
   {
     m_core->destroyBuffer( *b );
   }
@@ -184,6 +188,7 @@ void VkLoopFilter::beginPicture( CodingStructure& cs )
     // Deblocking and SAO read at most 8 samples beyond an edge, inside the picture; CCSAO clamps its reads.
     m_pic.create( *m_core, format, width, height, 16 );
     m_tmp.create( *m_core, format, width, height, 16 );
+    m_db.create( *m_core, format, width, height, 16 );
   }
   m_cpuCurrent = true;
   m_gpuCurrent = false;
@@ -317,6 +322,9 @@ void VkLoopFilter::deblock( CodingStructure& cs )
   }
   m_core->begin();
   const int t0 = m_core->timestamp();
+  // ALF reads the picture before deblocking
+  m_core->copy( m_pic.buffer(), m_db.buffer(), 0, 0, m_pic.buffer().size );
+  m_core->barrier();
   for( int dir = 0; dir < 2; dir++ )
   {
     // one invocation per strip of 4 lines (vertical edges) or 4 columns (horizontal edges)

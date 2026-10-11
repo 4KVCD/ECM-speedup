@@ -1,0 +1,41 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+#include "alf_common.glsl"
+
+// The mirrored padding of the ALF result planes that ALFProcess recorded (the padding loops of the CtuBoundary
+// functions): each tile lies beyond one picture edge and copies the samples mirrored at that edge. One workgroup per
+// tile of up to 16x16 samples.
+
+layout( local_size_x = 16, local_size_y = 16 ) in;
+
+layout( push_constant, scalar ) uniform Push
+{
+  AlfParamsRef params;
+  AlfTiles     tiles;
+} pc;
+
+void main()
+{
+  const AlfTile tile = pc.tiles.t[gl_WorkGroupID.x];
+  const int lx = int( gl_LocalInvocationID.x ), ly = int( gl_LocalInvocationID.y );
+  if( lx >= tile.w || ly >= tile.h )
+  {
+    return;
+  }
+  AlfParams P = pc.params.p;
+  const bool chroma = tile.plane >= PLANE_FIX_CB && tile.plane < PLANE_FIX_RESI;
+  const int  w = chroma ? P.widthC : P.width, h = chroma ? P.heightC : P.height;
+  const int  x = tile.x + lx, y = tile.y + ly;
+  int sx = x, sy = y;
+  if( tile.arg == 0 )
+  {
+    sx = x < 0 ? -1 - x : 2 * w - 1 - x;
+  }
+  else
+  {
+    sy = y < 0 ? -1 - y : 2 * h - 1 - y;
+  }
+  const int o = P.resOrigin[tile.plane], s = P.resStride[tile.plane];
+  P.res.v[o + y * s + x] = P.res.v[o + sy * s + sx];
+}

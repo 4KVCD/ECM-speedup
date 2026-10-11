@@ -642,22 +642,25 @@ void DecApp::xDestroyDecLib()
     if( m_cDecLib.vulkanCheck() )
     {
       const auto& n = m_cDecLib.vulkanCounts();
-      std::string sao, band, edge;
-      for( uint64_t v: n.saoCtus )
-      {
-        sao += " " + std::to_string( v );
-      }
-      for( uint64_t v: n.ccSaoBand )
-      {
-        band += " " + std::to_string( v );
-      }
-      for( uint64_t v: n.ccSaoEdge )
-      {
-        edge += " " + std::to_string( v );
-      }
-      msg( INFO, " GPU stages checked on %llu pictures: deblocking segments %llu, SAO CTUs by type%s, bilateral filter blocks %llu, CCSAO CTUs by band candidate%s, by edge direction%s\n",
-           (unsigned long long) n.pictures, (unsigned long long) n.deblockSegments, sao.c_str(), (unsigned long long) n.bifBlocks,
-           band.c_str(), edge.c_str() );
+      auto list = []( const uint64_t* v, int num ) {
+        std::string s;
+        for( int i = 0; i < num; i++ )
+        {
+          s += " " + std::to_string( v[i] );
+        }
+        return s;
+      };
+      // perf/vkcoverage.py reads the numbers of this line in order
+      msg( INFO, " GPU stages checked on %llu pictures: deblocking segments %llu, SAO CTUs by type%s, bilateral filter blocks %llu, CCSAO CTUs by band candidate%s, by edge direction%s,"
+                 " ALF pictures %llu, luma CTUs by fixed set and APS filter type%s, by classifier%s, with scaling %llu, chroma CTUs by type%s, CCALF CTUs %llu, chroma scaling pictures %llu, mirrored regions %llu\n",
+           (unsigned long long) n.pictures, (unsigned long long) n.deblockSegments, list( n.saoCtus, 5 ).c_str(), (unsigned long long) n.bifBlocks,
+           list( n.ccSaoBand, 9 ).c_str(), list( n.ccSaoEdge, 4 ).c_str(), (unsigned long long) n.alfPictures, list( n.alfLumaCtus, 6 ).c_str(),
+           list( n.alfClassifier, 3 ).c_str(), (unsigned long long) n.alfScaleCtus, list( n.alfChromaCtus, 2 ).c_str(),
+           (unsigned long long) n.ccAlfCtus, (unsigned long long) n.alfChromaScalePictures, (unsigned long long) n.alfMirrors );
+    }
+    for( const auto& r: m_cDecLib.vulkanAlfCpuReasons() )
+    {
+      msg( INFO, " ALF on the CPU: %llu pictures, %s\n", (unsigned long long) r.second, r.first.c_str() );
     }
   }
 #endif

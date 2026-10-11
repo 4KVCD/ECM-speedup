@@ -1,0 +1,148 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+#include "alf_common.glsl"
+#include "alf_taps.glsl"
+
+// The luma ALF of the CTUs with ALF on: a fixed filter result (copyFixedFilterResults), or an APS filter
+// (filterBlk of ALF_FILTER_13_EXT_DB_RESI_DIRECT, _13_EXT_DB_RESI, _13_DB_RESI_DIRECT, _13_DB_RESI) followed by the
+// residual scaling correction (alfAddCorrect). One workgroup per tile of up to 16x16 samples of one CTU.
+
+layout( local_size_x = 16, local_size_y = 16 ) in;
+
+layout( push_constant, scalar ) uniform Push
+{
+  AlfParamsRef params;
+  AlfTiles     tiles;
+} pc;
+
+AlfParams P;
+
+int src( int x, int y ) { return int( P.src.v[P.srcOrigin[0] + y * P.srcStride[0] + x] ); }
+int db( int x, int y ) { return int( P.db.v[P.dbOrigin[0] + y * P.dbStride[0] + x] ); }
+int res( int plane, int x, int y ) { return int( P.res.v[P.resOrigin[plane] + y * P.resStride[plane] + x] ); }
+
+const int scaleFactor[16] = { 16, 17, 18, 19, 21, 23, 25, 27, 29, 15, 14, 13, 12, 11, 10, 9 };
+const int shiftPrecis = 3;
+const int shiftCorr   = 3;
+
+void main()
+{
+  const AlfTile tile = pc.tiles.t[gl_WorkGroupID.x];
+  const int lx = int( gl_LocalInvocationID.x ), ly = int( gl_LocalInvocationID.y );
+  if( lx >= tile.w || ly >= tile.h )
+  {
+    return;
+  }
+  P = pc.params.p;
+  const int x = tile.x + lx, y = tile.y + ly;
+  const AlfCtu ctu = AlfCtus( P.ctus ).c[tile.plane];
+  const int setIdx = P.fixedSetIdx[0];
+  int result;
+  if( ctu.lumaMode == 1 || ctu.lumaMode == 2 )
+  {
+    result = res( PLANE_FIX_LUMA + ( ctu.lumaMode - 1 ) * 2 + setIdx, x, y );
+  }
+  else
+  {
+    AlfLumaFilters filters = AlfLumaFilters( P.lumaFilters );
+    const int f = int( ctu.lumaFilter );
+    const int type = filters.f[f].type;
+    const int cls = int( P.cls.v[( CLS_FINAL + filters.f[f].classifier ) * P.clsPlane + ( y >> 1 ) * P.clsStride + ( x >> 1 )] );
+    const int classIdx = cls >> 2, t = cls & 3;
+    const int cb = classIdx * MAX_NUM_ALF_LUMA_COEFF;
+    const int curr = src( x, y );
+
+    int sum = 0;
+    for( int k = 0; k < 10; k++ )
+    {
+      const ivec2 d = transposeTap( tapAps13[k], t );
+      sum += int( filters.f[f].coeff[cb + k] ) * clipAlf2( int( filters.f[f].clip[cb + k] ), curr, src( x + d.y, y + d.x ), src( x - d.y, y - d.x ) );
+    }
+    const int f0 = PLANE_FIX_LUMA + setIdx, f1 = PLANE_FIX_LUMA + 2 + setIdx;
+    if( type == ALF_FILTER_13_EXT_DB_RESI || type == ALF_FILTER_13_EXT_DB_RESI_DIRECT )
+    {
+      for( int k = 0; k < 18; k++ )
+      {
+        const ivec2 d = transposeTap( tapApsFixed[k], t );
+        sum += int( filters.f[f].coeff[cb + 10 + k] ) * clipAlf2( int( filters.f[f].clip[cb + 10 + k] ), curr, res( f1, x + d.y, y + d.x ), res( f1, x - d.y, y - d.x ) );
+      }
+    }
+#define C( k ) int( filters.f[f].coeff[cb + ( k )] )
+#define L( k ) int( filters.f[f].clip[cb + ( k )] )
+#define G( dx, dy ) res( PLANE_GAUSS, x + ( dx ), y + ( dy ) )
+#define LAP( dx, dy ) res( PLANE_LAPLACIAN, x + ( dx ), y + ( dy ) )
+    const int r = int( P.resi.v[P.resiOrigin + y * P.resiStride + x] );
+    if( type == ALF_FILTER_13_EXT_DB_RESI_DIRECT )
+    {
+      sum += C( 28 ) * clipAlf2( L( 28 ), curr, G( 0, -2 ), G( 0, 2 ) );
+      sum += C( 29 ) * clipAlf2( L( 29 ), curr, G( 0, -1 ), G( 0, 1 ) );
+      sum += C( 30 ) * clipAlf2( L( 30 ), curr, G( -2, 0 ), G( 2, 0 ) );
+      sum += C( 31 ) * clipAlf2( L( 31 ), curr, G( -1, 0 ), G( 1, 0 ) );
+      sum += C( 32 ) * clipAlf2( L( 32 ), curr, db( x, y - 1 ), db( x, y + 1 ) );
+      sum += C( 33 ) * clipAlf2( L( 33 ), curr, db( x - 1, y ), db( x + 1, y ) );
+      sum += C( 34 ) * clipAlf1( L( 34 ), curr, res( f0, x, y ) );
+      sum += C( 35 ) * clipAlf1( L( 35 ), curr, res( f1, x, y ) );
+      sum += C( 36 ) * clipAlf1( L( 36 ), curr, db( x, y ) );
+      sum += C( 37 ) * clipAlf1( L( 37 ), 0, r );
+      sum += C( 38 ) * clipAlf1( L( 38 ), curr, G( 0, 0 ) );
+    }
+    else if( type == ALF_FILTER_13_EXT_DB_RESI )
+    {
+      sum += C( 28 ) * clipAlf2( L( 28 ), 0, LAP( 0, 2 ), LAP( 0, -2 ) );
+      sum += C( 29 ) * clipAlf2( L( 29 ), 0, LAP( 0, 1 ), LAP( 0, -1 ) );
+      sum += C( 30 ) * clipAlf2( L( 30 ), 0, LAP( 2, 0 ), LAP( -2, 0 ) );
+      sum += C( 31 ) * clipAlf2( L( 31 ), 0, LAP( 1, 0 ), LAP( -1, 0 ) );
+      sum += C( 32 ) * clipAlf2( L( 32 ), curr, db( x, y - 1 ), db( x, y + 1 ) );
+      sum += C( 33 ) * clipAlf2( L( 33 ), curr, db( x - 1, y ), db( x + 1, y ) );
+      sum += C( 34 ) * clipAlf1( L( 34 ), curr, res( f0, x, y ) );
+      sum += C( 35 ) * clipAlf1( L( 35 ), curr, res( f1, x, y ) );
+      sum += C( 36 ) * clipAlf1( L( 36 ), 0, res( PLANE_FIX_RESI + 1 - setIdx, x, y ) );
+      sum += C( 37 ) * clipAlf1( L( 37 ), curr, db( x, y ) );
+      sum += C( 38 ) * clipAlf1( L( 38 ), 0, r );
+      sum += C( 39 ) * clipAlf1( L( 39 ), curr, G( 0, 0 ) );
+      sum += C( 40 ) * clipAlf1( L( 40 ), 0, LAP( 0, 0 ) );
+    }
+    else if( type == ALF_FILTER_13_DB_RESI_DIRECT )
+    {
+      sum += C( 10 ) * clipAlf2( L( 10 ), curr, G( 0, -2 ), G( 0, 2 ) );
+      sum += C( 11 ) * clipAlf2( L( 11 ), curr, G( 0, -1 ), G( 0, 1 ) );
+      sum += C( 12 ) * clipAlf2( L( 12 ), curr, G( -2, 0 ), G( 2, 0 ) );
+      sum += C( 13 ) * clipAlf2( L( 13 ), curr, G( -1, 0 ), G( 1, 0 ) );
+      sum += C( 14 ) * clipAlf2( L( 14 ), curr, db( x, y - 1 ), db( x, y + 1 ) );
+      sum += C( 15 ) * clipAlf2( L( 15 ), curr, db( x - 1, y ), db( x + 1, y ) );
+      sum += C( 16 ) * clipAlf1( L( 16 ), curr, db( x, y ) );
+      sum += C( 17 ) * clipAlf1( L( 17 ), 0, r );
+      sum += C( 18 ) * clipAlf1( L( 18 ), curr, G( 0, 0 ) );
+    }
+    else
+    {
+      sum += C( 10 ) * clipAlf2( L( 10 ), curr, db( x, y - 1 ), db( x, y + 1 ) );
+      sum += C( 11 ) * clipAlf2( L( 11 ), curr, db( x - 1, y ), db( x + 1, y ) );
+      sum += C( 12 ) * clipAlf1( L( 12 ), curr, db( x, y ) );
+      sum += C( 13 ) * clipAlf1( L( 13 ), 0, r );
+      sum += C( 14 ) * clipAlf1( L( 14 ), curr, G( 0, 0 ) );
+    }
+#undef C
+#undef L
+#undef G
+#undef LAP
+    // With the scale mode the filter output is the correction alone, around the middle of the sample range.
+    const bool scaleMode = P.lumaScaleMode != 0;
+    const int  currBase = 1 << ( P.bitDepth[0] - 1 );
+    const int  shift = filters.f[f].coeffBits - 1 - ( scaleMode ? shiftPrecis : 0 ) + 4;
+    sum *= scaleFactor[filters.f[f].scaleIdx[classIdx]];
+    sum = ( sum + ( 1 << ( shift - 1 ) ) ) >> shift;
+    result = clamp( sum + ( scaleMode ? currBase : curr ), P.clpMin[0], P.clpMax[0] );
+    if( scaleMode )
+    {
+      // alfAddCorrect, in Pel arithmetic
+      const int corr = result - currBase;
+      const int sCorr = filters.f[f].scaleCorr[classIdx];
+      const int offsetN = 1 << ( shiftCorr + shiftPrecis - 1 );
+      const int dstS = int( int16_t( curr + ( ( corr * sCorr + ( corr > 0 ? offsetN - 1 : offsetN ) ) >> ( shiftCorr + shiftPrecis ) ) ) );
+      result = clamp( dstS, P.clpMin[0], P.clpMax[0] );
+    }
+  }
+  P.dst.v[P.dstOrigin[0] + y * P.dstStride[0] + x] = int16_t( result );
+}

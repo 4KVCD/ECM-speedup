@@ -42,6 +42,7 @@
 
 #include "Unit.h"
 #include "UnitTools.h"
+#include "AlfGpuPlan.h"
 
 #if ALF_IMPROVEMENT
 typedef       short           AlfClassifier;         
@@ -132,6 +133,7 @@ public:
 #if JVET_AK0121_LOOPFILTER_OFFSET_REFINEMENT
   PelUnitBuf callRecAfterSaoBuf() { return m_tempBufSAO; }
   PelUnitBuf callRecBeforeAlfBuf() { return m_tempBuf; }
+  PelUnitBuf callRecResiBuf() { return m_tempBufResi; }
   PelUnitBuf callRecBeforeDbfBuf(){ return  m_tempBufBeforeDb; }
 #endif
 
@@ -163,6 +165,32 @@ public:
   void reconstructCoeffAPSs(CodingStructure& cs, bool luma, bool chroma, bool isRdo);
   void reconstructCoeff(AlfParam& alfParam, ChannelType channel, const bool isRdo, const bool isRedo = false);
   void ALFProcess(CodingStructure& cs);
+  /// Lets the following ALFProcess calls record their work into plan, see AlfGpuPlan; nullptr stops recording.
+  void setGpuPlan( AlfGpuPlan* plan ) { m_gpuPlan = plan; }
+  /// A result plane that persists between pictures: its rows, and its width and height including the padding.
+  struct ResultPlane
+  {
+    Pel** rows   = nullptr;   ///< nullptr if the plane does not exist, e.g. chroma in 4:0:0
+    int   width  = 0;
+    int   height = 0;
+  };
+  /// The result planes in the order of AlfGpuPlan::Plane.
+  void resultPlanes( ResultPlane planes[AlfGpuPlan::NUM_PLANES] ) const;
+  /// The fixed filter tables: class to filter index [NUM_SETS_FIXED_FILTERS][NUM_CLASSES_FIX], coefficients and
+  /// clipping indices [NUM_SETS_FIXED_FILTERS][NUM_FIXED_FILTERS][number of coefficients].
+  struct FixedFilterTables
+  {
+    const short* classIdn9Db9;
+    const short* coeff9Db9;
+    const short* clip9Db9;
+    const short* classIdn13Db9;
+    const short* coeff13Db9;
+    const short* clip13Db9;
+  };
+  static FixedFilterTables fixedFilterTables();
+  /// The classes of the last picture per luma sample, for diagnosing the GPU decoder: 0-4 m_classifier, 5 the coding
+  /// information classes.
+  const AlfClassifier* const* classifierRows( int i ) const { return i < ALF_NUM_CLASSIFIER + 2 ? m_classifier[i] : m_classifierCodingInfo[0]; }
 #if FIXFILTER_CFG 
   void create(const int picWidth, const int picHeight, const ChromaFormat format, const int maxCUWidth, const int maxCUHeight, const int maxCUDepth, const int inputBitDepth[MAX_NUM_CHANNEL_TYPE], bool useFixedFilter = true);
 #else
@@ -1030,6 +1058,25 @@ public:
 #endif
 
 protected:
+  void alfProcessCtus( CodingStructure& cs );
+  void alfProcessFinish( CodingStructure& cs );
+  /// Whether the GPU can process the picture; records the picture parameters into m_gpuPlan.
+  bool gpuPlanSupported( CodingStructure& cs );
+  void gpuRecordLumaCtu( int ctuIdx, int filterSetIndex, int alt );
+  void gpuRecordChromaCtu( int ctuIdx, int compIdx, int alt );
+  void gpuRecordCcAlfCtu( int ctuIdx, int compIdx, int filterIdx );
+  /// Records the mirrored padding that a CtuBoundary function writes for the CTU at blk; the arguments are those
+  /// of the function's padding loops.
+  void gpuRecordBoundaryPadding( int plane, const Area& blk, int planeWidth, int planeHeight, int padSize, int extraSizeH, int extraSizeV, const bool isBoundaryValid[8], bool corners );
+  int  gpuFixedPlane( Pel*** fixedFilterResults ) const;
+  bool gpuSkipSamples() const { return m_gpuPlan && m_gpuPlan->skipSamples; }
+
+  AlfGpuPlan*                  m_gpuPlan = nullptr;
+  int16_t                      m_gpuLumaFilterIdx[ALF_CTB_MAX_NUM_APS][MAX_NUM_ALF_ALTERNATIVES_LUMA];
+  int16_t                      m_gpuChromaFilterIdx[MAX_NUM_ALF_ALTERNATIVES_CHROMA];
+  int16_t                      m_gpuCcAlfFilterIdx[2][MAX_NUM_CC_ALF_FILTERS];
+  int                          m_gpuCurLumaFilter = -1;
+
   bool isCrossedByVirtualBoundaries( const CodingStructure& cs, const int xPos, const int yPos, const int width, const int height, bool& clipTop, bool& clipBottom, bool& clipLeft, bool& clipRight, int& numHorVirBndry, int& numVerVirBndry, int horVirBndryPos[], int verVirBndryPos[], int& rasterSliceAlfPad );
 #if !JVET_AH0057_CCALF_COEFF_PRECISION
   static constexpr int   m_scaleBits = 7; // 8-bits

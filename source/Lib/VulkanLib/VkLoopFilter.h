@@ -42,10 +42,14 @@
 #include "CommonLib/Unit.h"
 #include "CommonLib/Buffer.h"
 #include "CommonLib/LoopFilter.h"
+#include "CommonLib/AlfGpuPlan.h"
+
+#include <map>
 
 #include <string>
 #include <vector>
 
+class AdaptiveLoopFilter;
 class CodingStructure;
 class SampleAdaptiveOffset;
 
@@ -115,6 +119,13 @@ public:
   /// SAO, bilateral filter, CCSAO and their joint clipping, as SAOProcess, CCSAOProcess and jointClipSaoBifCcSao.
   void sao( CodingStructure& cs, SampleAdaptiveOffset& sao );
 
+  /// ALF, as AdaptiveLoopFilter::ALFProcess. alfPrepare lets ALFProcess record the picture into a plan (and, outside
+  /// check mode, skip the sample work); after ALFProcess, alf runs the plan on the GPU and returns true. Pictures that
+  /// the plan does not cover keep the CPU's result, and alf returns false. The CPU picture must be current before
+  /// ALFProcess.
+  void alfPrepare( CodingStructure& cs, AdaptiveLoopFilter& alf );
+  bool alf( CodingStructure& cs, AdaptiveLoopFilter& alf );
+
   /// Check mode: compares the GPU result of the last stage with the CPU picture; throws on a difference.
   void checkAgainstCpu( CodingStructure& cs, const char* stage );
 
@@ -129,8 +140,19 @@ public:
     uint64_t bifBlocks      = 0;
     uint64_t ccSaoBand[9]   = {};  ///< CTU components with CCSAO on, by band candidate position
     uint64_t ccSaoEdge[4]   = {};  ///< and by edge direction
+    uint64_t alfPictures    = 0;   ///< pictures whose ALF ran on the GPU
+    uint64_t alfCpuPictures = 0;   ///< pictures with ALF that the plan does not cover (alfCpuReasons)
+    uint64_t alfLumaCtus[6] = {};  ///< luma CTUs: fixed filter set 0 or 1 only, APS filter types 9-12
+    uint64_t alfClassifier[3] = {};   ///< luma CTUs with an APS filter, by classifier
+    uint64_t alfScaleCtus   = 0;   ///< luma CTUs with the residual scaling correction
+    uint64_t alfChromaCtus[2] = {};   ///< chroma CTUs with ALF_FILTER_9, ALF_FILTER_9_NO_FIX
+    uint64_t ccAlfCtus      = 0;
+    uint64_t alfChromaScalePictures = 0;
+    uint64_t alfMirrors     = 0;   ///< mirrored padding regions of the result planes
   };
   const Counts& counts() const { return m_counts; }
+  /// Why ALF stayed on the CPU, with the number of pictures.
+  const std::map<std::string, uint64_t>& alfCpuReasons() const { return m_alfCpuReasons; }
 
 private:
   void ensureOnGpu( CodingStructure& cs );
@@ -158,6 +180,25 @@ private:
   Buffer           m_ctuBytes;          ///< CCSAO set per CTU and component, CTU availability, clip flags
   Buffer           m_ccSaoTables;
   std::vector<uint8_t> m_scratch;
+
+  // ALF
+  void alfBuffers( CodingStructure& cs, AdaptiveLoopFilter& alf );
+  bool alfComparePlanes( AdaptiveLoopFilter& alf, std::string& diff );
+  void alfRun( CodingStructure& cs, AdaptiveLoopFilter& alf );
+
+  AlfGpuPlan       m_alfPlan;
+  GpuPicture       m_db;                ///< the picture before deblocking
+  GpuPicture       m_src;               ///< the ALF input
+  GpuPicture       m_resi;              ///< the luma residual
+  Buffer           m_alfCi;             ///< the deblocking's coding information, luma
+  Buffer           m_alfRes;            ///< the result planes of AlfGpuPlan::Plane
+  size_t           m_alfResOffset[AlfGpuPlan::NUM_PLANES] = {};
+  int              m_alfResWidth[AlfGpuPlan::NUM_PLANES]  = {};
+  int              m_alfResHeight[AlfGpuPlan::NUM_PLANES] = {};
+  Buffer           m_alfCls;            ///< luma and chroma classes
+  Buffer           m_alfTables;         ///< the fixed filter tables
+  Buffer           m_alfParams;         ///< per picture: parameters, CTUs, filters, tiles
+  std::map<std::string, uint64_t> m_alfCpuReasons;
 
   double           m_gpuMs = 0;
   Counts           m_counts;

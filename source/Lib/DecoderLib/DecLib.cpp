@@ -1151,7 +1151,24 @@ void DecLib::executeLoopFilters()
     // ALF decodes the differentially coded coefficients and stores them in the parameters structure.
     // Code could be restructured to do directly after parsing. So far we just pass a fresh non-const
     // copy in case the APS gets used more than once.
+#if ECM_VULKAN
+    if( m_vkCore )
+    {
+      // ALFProcess records the picture for the GPU; the CPU picture is current here
+      m_vkLoopFilter.alfPrepare( cs, m_cALF );
+    }
+#endif
     m_cALF.ALFProcess(cs);
+#if ECM_VULKAN
+    if( m_vkCore )
+    {
+      if( m_vkLoopFilter.alf( cs, m_cALF ) )
+      {
+        m_vkLoopFilter.checkAgainstCpu( cs, "ALF" );
+      }
+      m_vkLoopFilter.syncToCpu( cs );
+    }
+#endif
   }
 
 #if JVET_AL0153_ALF_CCCM

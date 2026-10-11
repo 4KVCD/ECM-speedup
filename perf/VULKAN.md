@@ -66,6 +66,38 @@ with pointers that it advances differently per case, and band case 6 starts its 
 4:2:0 luma line y reads chroma line (y + 1) / 2. The GPU replays the CPU's pointer advances per line to get every
 case right.
 
+### ALF
+
+ALFProcess stays the master of each picture: it walks the CTUs as before, derives the filters, and keeps all the
+state that later pictures depend on. With a GPU plan set (`AlfGpuPlan`) it records each CTU's filter choice and
+every region it computes of its intermediate result planes (first and second stage fixed filters, the residual
+fixed filter, gauss and laplacian results, chroma fixed filters) and their mirrored padding, and skips the sample
+work. The GPU then computes:
+
+- the classes of every 2x2 luma block: the CPU's sliding window sums are sums over fixed windows around the block
+  (4x4 and 12x12 laplacians, a 10x10 variance), computed with the laplacian cells in shared memory;
+- the recorded regions of the result planes, then their mirrored padding, in the CPU's stage order;
+- the luma filter per CTU (the four APS filter types the decoder can receive, or a fixed filter result alone), with
+  the residual scaling correction, and chroma ALF, CCALF and the chroma scaling correction in one pass.
+
+The transpose index of a class turns the filter taps geometrically: transposed, mirrored horizontally or rotated by
+90 degrees. The shaders therefore keep one tap table per filter instead of the CPU's 4 hand-written coefficient
+orders.
+
+In check mode the GPU's result planes must also equal the CPU's in every region the picture wrote, and a
+difference is traced to the classes that feed it.
+
+The decoder creates ALF anew for every picture (`DecLib` calls `AdaptiveLoopFilter::create`), so the result planes
+start uninitialized in every picture. In some layouts of CTU filter types ALFProcess would read samples of them that
+the picture did not write. The plan tracks every write and read; such a picture is filtered on the CPU, as stock
+does. No corpus stream does this: with the result planes overwritten by a picture-dependent pattern at the start of
+every ALFProcess, all 48 streams still decode identically.
+
+The plan covers one-slice pictures in 4:2:0 and 4:0:0. ALF of other pictures runs on the CPU: 4:2:2 and 4:4:4,
+several slices, virtual boundaries, loop filtering disabled across slice, tile or subpicture boundaries, CU-level
+QP for the fixed filters (`cuQpDeltaSubdiv`) and the NN loop filter. The decoder prints how many pictures took the
+CPU path and why.
+
 ## Status
 
 | stage | GPU | checked on the corpus |
@@ -74,13 +106,16 @@ case right.
 | deblocking with LADF or the asymmetric GDR filter | yes | not exercised: no corpus stream uses them |
 | SAO (all 4 edge classes, band offset), bilateral filter luma and chroma, CCSAO edge directions 0-3 and band candidates 4-8, joint clipping | yes | 48 streams identical |
 | CCSAO band candidates 0-3, virtual boundaries | yes | not exercised |
+| ALF luma: fixed filter sets alone, APS filter types 13_EXT_DB_RESI_DIRECT, 13_EXT_DB_RESI, 13_DB_RESI_DIRECT, 13_DB_RESI, classifiers 0-2, residual scaling; chroma ALF_FILTER_9, CCALF, chroma scaling | yes | 48 streams identical, 320 pictures on the GPU |
+| ALF chroma ALF_FILTER_9_NO_FIX | yes | not exercised |
+| ALF in pictures the plan does not cover (see ALF) | CPU | - |
 | everything else | CPU | - |
 
 Speed: on the hybrid path the per-picture copies and the synchronous waits cost more than the GPU saves. ra_cif
-(289 frames CIF, Core Ultra 7 265K iGPU), decoder time:
+(289 frames CIF, decoder pinned to one core of the Core Ultra 7 265K, Intel iGPU), 3 runs each:
 
 | stages on the GPU | total | GPU time |
 |---|---|---|
-| none | 5.8-6.0 s | - |
-| deblocking | 6.4 s | 0.105 s |
-| deblocking, SAO, BIF, CCSAO | 7.1-7.4 s | 0.45 s |
+| none | 6.1-6.3 s | - |
+| deblocking, SAO, BIF, CCSAO | 7.3-8.0 s | 0.35-0.44 s |
+| deblocking, SAO, BIF, CCSAO, ALF | 8.5-9.3 s | 1.2-2.1 s |

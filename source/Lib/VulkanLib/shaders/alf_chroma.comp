@@ -1,0 +1,143 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+#include "alf_common.glsl"
+#include "alf_taps.glsl"
+
+// Chroma ALF of a CTU: the APS filter (filterBlk of ALF_FILTER_9 or ALF_FILTER_9_NO_FIX), then CCALF
+// (filterBlkCcAlf), then the residual scaling correction of the whole picture (alfAddCorrectChroma). All three work
+// per sample and read only the ALF input, so one pass does them in the CPU's order. One workgroup per tile of up to
+// 16x16 samples of one CTU and component (arg).
+
+layout( local_size_x = 16, local_size_y = 16 ) in;
+
+layout( push_constant, scalar ) uniform Push
+{
+  AlfParamsRef params;
+  AlfTiles     tiles;
+} pc;
+
+AlfParams P;
+
+int src( int c, int x, int y ) { return int( P.src.v[P.srcOrigin[c] + y * P.srcStride[c] + x] ); }
+int res( int plane, int x, int y ) { return int( P.res.v[P.resOrigin[plane] + y * P.resStride[plane] + x] ); }
+
+const int scaleFactor[16] = { 16, 17, 18, 19, 21, 23, 25, 27, 29, 15, 14, 13, 12, 11, 10, 9 };
+
+void main()
+{
+  const AlfTile tile = pc.tiles.t[gl_WorkGroupID.x];
+  const int lx = int( gl_LocalInvocationID.x ), ly = int( gl_LocalInvocationID.y );
+  if( lx >= tile.w || ly >= tile.h )
+  {
+    return;
+  }
+  P = pc.params.p;
+  const int c = tile.arg;
+  const int x = tile.x + lx, y = tile.y + ly;
+  const AlfCtu ctu = AlfCtus( P.ctus ).c[tile.plane];
+  const int curr = src( c, x, y );
+  int result = curr;
+
+  const int cf = int( ctu.chromaFilter[c - 1] );
+  if( cf >= 0 )
+  {
+    AlfChromaFilters filters = AlfChromaFilters( P.chromaFilters );
+    int sum = 0;
+    for( int k = 0; k < 20; k++ )
+    {
+      const ivec2 d = tap9[k];
+      sum += int( filters.f[cf].coeff[k] ) * clipAlf2( int( filters.f[cf].clip[k] ), curr, src( c, x + d.y, y + d.x ), src( c, x - d.y, y - d.x ) );
+    }
+    if( filters.f[cf].type == ALF_FILTER_9 )
+    {
+      const int fp = ( c == 1 ? PLANE_FIX_CB : PLANE_FIX_CR ) + P.fixedSetIdx[c];
+#define C( k ) int( filters.f[cf].coeff[k] )
+#define L( k ) int( filters.f[cf].clip[k] )
+      sum += C( 20 ) * clipAlf2( L( 20 ), curr, res( fp, x, y - 2 ), res( fp, x, y + 2 ) );
+      sum += C( 21 ) * clipAlf2( L( 21 ), curr, res( fp, x, y - 1 ), res( fp, x, y + 1 ) );
+      sum += C( 22 ) * clipAlf2( L( 22 ), curr, res( fp, x - 2, y ), res( fp, x + 2, y ) );
+      sum += C( 23 ) * clipAlf2( L( 23 ), curr, res( fp, x - 1, y ), res( fp, x + 1, y ) );
+      sum += C( 24 ) * clipAlf1( L( 24 ), curr, res( fp, x, y ) );
+#undef C
+#undef L
+    }
+    // chroma filters have m_NUM_BITS_CHROMA bits
+    const int shift = 8 - 1 + 4;
+    sum *= scaleFactor[filters.f[cf].scaleIdx];
+    sum = ( sum + ( 1 << ( shift - 1 ) ) ) >> shift;
+    result = clamp( sum + curr, P.clpMin[c], P.clpMax[c] );
+  }
+
+  const int ccf = int( ctu.ccAlfFilter[c - 1] );
+  if( ccf >= 0 )
+  {
+    AlfCcFilters filters = AlfCcFilters( P.ccAlfFilters );
+#define F( k ) int( filters.f[ccf].coeff[k] )
+    // luma of the ALF input around the co-located luma sample (4:2:0)
+    const int lx0 = x << 1, ly0 = y << 1;
+#define Y( dx, dy ) src( 0, lx0 + ( dx ), ly0 + ( dy ) )
+    const int cy = Y( 0, 0 );
+    int sum = 0;
+    sum += F( 0 ) * ( Y( 0, -4 ) - cy + Y( 0, 4 ) - cy );
+    sum += F( 1 ) * ( Y( 0, -3 ) - cy );
+    sum += F( 2 ) * ( Y( 0, -2 ) - cy );
+    sum += F( 3 ) * ( Y( 0, -1 ) - cy );
+    sum += F( 4 ) * ( Y( -4, 0 ) - cy );
+    sum += F( 5 ) * ( Y( -3, 0 ) - cy );
+    sum += F( 6 ) * ( Y( -2, 0 ) - cy );
+    sum += F( 7 ) * ( Y( -1, 0 ) - cy );
+    sum += F( 8 ) * ( Y( 1, 0 ) - cy );
+    sum += F( 9 ) * ( Y( 2, 0 ) - cy );
+    sum += F( 10 ) * ( Y( 3, 0 ) - cy );
+    sum += F( 11 ) * ( Y( 4, 0 ) - cy );
+    sum += F( 12 ) * ( Y( -4, 1 ) - cy + Y( 4, 1 ) - cy );
+    sum += F( 13 ) * ( Y( -3, 1 ) - cy );
+    sum += F( 14 ) * ( Y( -2, 1 ) - cy );
+    sum += F( 15 ) * ( Y( -1, 1 ) - cy );
+    sum += F( 16 ) * ( Y( 0, 1 ) - cy );
+    sum += F( 17 ) * ( Y( 1, 1 ) - cy );
+    sum += F( 18 ) * ( Y( 2, 1 ) - cy );
+    sum += F( 19 ) * ( Y( 3, 1 ) - cy );
+    sum += F( 20 ) * ( Y( 0, 2 ) - cy );
+    sum += F( 21 ) * ( Y( 0, 3 ) - cy );
+#undef Y
+    // the luma residual, clipped
+    const int clip = P.clipValues[1];
+#define R( dx, dy ) clipAlf1( clip, 0, int( P.resi.v[P.resiOrigin + ( ly0 + ( dy ) ) * P.resiStride + lx0 + ( dx )] ) )
+    sum += F( 22 ) * R( 0, -1 );
+    sum += F( 23 ) * R( -1, 0 );
+    sum += F( 24 ) * R( 0, 0 );
+    sum += F( 25 ) * R( 1, 0 );
+    sum += F( 26 ) * R( 0, 1 );
+#undef R
+    // the same chroma component after SAO, and the other one before deblocking
+    const int s0 = curr;
+    sum += F( 27 ) * ( src( c, x, y - 1 ) - s0 );
+    sum += F( 28 ) * ( src( c, x - 1, y ) - s0 );
+    sum += F( 29 ) * ( src( c, x + 1, y ) - s0 );
+    sum += F( 30 ) * ( src( c, x, y + 1 ) - s0 );
+    const int oc = 3 - c;
+    const int dbo = P.dbOrigin[oc], dbs = P.dbStride[oc];
+#define X( dx, dy ) int( P.db.v[dbo + ( y + ( dy ) ) * dbs + x + ( dx )] )
+    sum += F( 31 ) * ( X( 0, -1 ) + X( 0, 1 ) - X( 0, 0 ) * 2 );
+    sum += F( 32 ) * ( X( -1, 0 ) + X( 1, 0 ) - X( 0, 0 ) * 2 );
+#undef X
+#undef F
+    const int prec = filters.f[ccf].coeffPrec;
+    sum = ( sum + ( ( 1 << prec ) >> 1 ) ) >> prec;
+    const int offset = ( 1 << P.bitDepth[1] ) >> 1;
+    sum = clamp( sum + offset, P.clpMin[c], P.clpMax[c] ) - offset;
+    result = clamp( sum + result, P.clpMin[c], P.clpMax[c] );
+  }
+
+  const int sCorr = P.chromaScaleCorr[c - 1];
+  if( sCorr != 0 )
+  {
+    // alfAddCorrectChroma: the ALF change scaled, around the ALF input
+    const int corr = result - curr;
+    const int dstS = int( int16_t( curr + ( ( corr * sCorr + ( corr > 0 ? 3 : 4 ) ) >> 3 ) ) );
+    result = clamp( dstS, P.clpMin[c], P.clpMax[c] );
+  }
+  P.dst.v[P.dstOrigin[c] + y * P.dstStride[c] + x] = int16_t( result );
+}

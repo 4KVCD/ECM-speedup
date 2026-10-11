@@ -673,6 +673,28 @@ void AdaptiveLoopFilter::applyCcAlfFilter(CodingStructure &cs, ComponentID compI
 
 void AdaptiveLoopFilter::ALFProcess(CodingStructure& cs)
 {
+  AlfGpuPlan* plan = m_gpuPlan;
+  if( plan && !gpuPlanSupported( cs ) )
+  {
+    m_gpuPlan = nullptr;
+  }
+  alfProcessCtus( cs );
+  if( m_gpuPlan && plan->stale )
+  {
+    // The picture read result samples that it had not written; the GPU cannot reproduce such reads.
+    plan->unsupported( "reads result samples that the picture did not write" );
+    m_gpuPlan = nullptr;
+    if( plan->skipSamples )
+    {
+      alfProcessCtus( cs );
+    }
+  }
+  alfProcessFinish( cs );
+  m_gpuPlan = plan;
+}
+
+void AdaptiveLoopFilter::alfProcessCtus( CodingStructure& cs )
+{
   // set clipping range
   m_clpRngs = cs.slice->getClpRngs();
 
@@ -704,19 +726,26 @@ void AdaptiveLoopFilter::ALFProcess(CodingStructure& cs)
   uint32_t lastSliceIdx = 0xFFFFFFFF;
 
 #if JVET_AI0084_ALF_RESIDUALS_SCALING
-  if ( cs.slice->getAlfScaleChroma(COMPONENT_Cb) || cs.slice->getAlfScaleChroma(COMPONENT_Cr) )
+  if ( ( !gpuSkipSamples() || m_gpuPlan->keepCpuInputs ) && ( cs.slice->getAlfScaleChroma(COMPONENT_Cb) || cs.slice->getAlfScaleChroma(COMPONENT_Cr) ) )
   {
     m_tempBuf3.copyFrom( cs.getRecoBuf(), false, true );
   }
-  PelUnitBuf recYuvSao = m_tempBuf3.getBuf( cs.area );
 #endif
 
+  // With a GPU plan that skips the samples, the copies and paddings of the inputs are skipped as well.
+  const bool copyInputs = !gpuSkipSamples() || m_gpuPlan->keepCpuInputs;
   PelUnitBuf recYuv = cs.getRecoBuf();
-  m_tempBuf.copyFrom( recYuv );
+  if( copyInputs )
+  {
+    m_tempBuf.copyFrom( recYuv );
+  }
   PelUnitBuf tmpYuv = m_tempBuf.getBuf( cs.area );
 #if ALF_IMPROVEMENT
 #if JVET_AA0095_ALF_LONGER_FILTER 
-  mirroredPaddingForAlf(cs, tmpYuv, MAX_FILTER_LENGTH_FIXED >> 1, true, true);
+  if( copyInputs )
+  {
+    mirroredPaddingForAlf(cs, tmpYuv, MAX_FILTER_LENGTH_FIXED >> 1, true, true);
+  }
 #else
   tmpYuv.extendBorderPel( MAX_FILTER_LENGTH_FIXED >> 1 );
 #endif
@@ -731,7 +760,10 @@ void AdaptiveLoopFilter::ALFProcess(CodingStructure& cs)
   PelUnitBuf tmpYuvBeforeDb = m_tempBufBeforeDb.getBuf(cs.area);
 #if JVET_AD0222_ADDITONAL_ALF_FIXFILTER
 #if JVET_AG0157_ALF_CHROMA_FIXED_FILTER
-  mirroredPaddingForAlf(cs, tmpYuvBeforeDb, NUM_DB_PAD, true, true);
+  if( copyInputs )
+  {
+    mirroredPaddingForAlf(cs, tmpYuvBeforeDb, NUM_DB_PAD, true, true);
+  }
 #else
   mirroredPaddingForAlf(cs, tmpYuvBeforeDb, NUM_DB_PAD, true, false);
 #endif
@@ -741,18 +773,30 @@ void AdaptiveLoopFilter::ALFProcess(CodingStructure& cs)
 #endif
 #if JVET_AC0162_ALF_RESIDUAL_SAMPLES_INPUT
   PelUnitBuf tmpYuvResi = m_tempBufResi.getBuf(cs.area);
-  mirroredPaddingForAlf(cs, tmpYuvResi, MAX_FILTER_LENGTH_FIXED >> 1, true, false);
+  if( copyInputs )
+  {
+    mirroredPaddingForAlf(cs, tmpYuvResi, MAX_FILTER_LENGTH_FIXED >> 1, true, false);
+  }
 #endif
 
 #if NNLF_ALF_POS_INTERFACE
   PelUnitBuf tmpYuvNNVC = m_tempBufAfterNNVC.getBuf(cs.area);
-  mirroredPaddingForAlf(cs, tmpYuvNNVC, NUM_DB_PAD, true, true);
+  if( copyInputs )
+  {
+    mirroredPaddingForAlf(cs, tmpYuvNNVC, NUM_DB_PAD, true, true);
+  }
 #endif
 
 #if JVET_AI0166_CCALF_CHROMA_SAO_INPUT
-  m_tempBufSAO.copyFrom(recYuv);
+  if( copyInputs )
+  {
+    m_tempBufSAO.copyFrom(recYuv);
+  }
   PelUnitBuf tmpYuvSAO = m_tempBufSAO.getBuf(cs.area);
-  mirroredPaddingForAlf(cs, tmpYuvSAO, MAX_FILTER_LENGTH_FIXED >> 1, false, true);
+  if( copyInputs )
+  {
+    mirroredPaddingForAlf(cs, tmpYuvSAO, MAX_FILTER_LENGTH_FIXED >> 1, false, true);
+  }
 #endif
 #if JVET_AB0184_ALF_MORE_FIXED_FILTER_OUTPUT_TAPS
   m_isFixedFilterPaddedPerCtu = cs.picHeader->getVirtualBoundariesPresentFlag() || cs.slice->getCuQpDeltaSubdiv();
@@ -1410,11 +1454,18 @@ void AdaptiveLoopFilter::ALFProcess(CodingStructure& cs)
         {
           Area blk( xPos, yPos, width, height );
           short filterSetIndex = alfCtuFilterIndex[ctuIdx];
+          if( m_gpuPlan )
+          {
+            gpuRecordLumaCtu( ctuIdx, filterSetIndex, m_ctuAlternative[COMPONENT_Y][ctuIdx] );
+          }
 #if FIXFILTER_CFG
           bool useFixedFilter = filterSetIndex < NUM_FIXED_FILTER_SETS || m_filterTypeApsLuma[filterSetIndex - NUM_FIXED_FILTER_SETS] == ALF_FILTER_13_EXT_DB_RESI || m_filterTypeApsLuma[filterSetIndex - NUM_FIXED_FILTER_SETS] == ALF_FILTER_13_EXT_DB_RESI_DIRECT;
 #endif
 #if JVET_AJ0188_CODING_INFO_CLASSIFICATION
-          calcAlfLumaCodingInfoBlk(cs, m_classifierCodingInfo[0], blk, blk, recYuv.get(COMPONENT_Y), 2, 2, m_inputBitDepth[CHANNEL_TYPE_LUMA], tmpYuvResi.get(COMPONENT_Y), m_laplacian[0], tmpYuvCodingInfo.get(COMPONENT_Y) );
+          if( !gpuSkipSamples() )
+          {
+            calcAlfLumaCodingInfoBlk(cs, m_classifierCodingInfo[0], blk, blk, recYuv.get(COMPONENT_Y), 2, 2, m_inputBitDepth[CHANNEL_TYPE_LUMA], tmpYuvResi.get(COMPONENT_Y), m_laplacian[0], tmpYuvCodingInfo.get(COMPONENT_Y) );
+          }
 #endif
 #if JVET_X0071_ALF_BAND_CLASSIFIER
           deriveClassification( m_classifier, tmpYuv.get(COMPONENT_Y),
@@ -1669,6 +1720,10 @@ void AdaptiveLoopFilter::ALFProcess(CodingStructure& cs)
           {
             Area    blk(xPos >> chromaScaleX, yPos >> chromaScaleY, width >> chromaScaleX, height >> chromaScaleY);
             uint8_t alt_num = m_ctuAlternative[compIdx][ctuIdx];
+            if( m_gpuPlan )
+            {
+              gpuRecordChromaCtu( ctuIdx, compIdx, alt_num );
+            }
 #if JVET_AG0157_ALF_CHROMA_FIXED_FILTER
 #if FIXFILTER_CFG
             if(m_filterTypeApsChroma == ALF_FILTER_9)
@@ -1756,10 +1811,16 @@ void AdaptiveLoopFilter::ALFProcess(CodingStructure& cs)
               Area blkSrc(xPos, yPos, width, height);
 
               const int16_t *filterCoeff = m_ccAlfFilterParam.ccAlfCoeff[compIdx - 1][filterIdx - 1];
+              if( m_gpuPlan )
+              {
+                gpuRecordCcAlfCtu( ctuIdx, compIdx, filterIdx );
+              }
 
 #if ALF_IMPROVEMENT
 #if JVET_AF0197_LUMA_RESIDUAL_TAP_IN_CCALF
 #if JVET_AH0057_CCALF_COEFF_PRECISION
+              if( !gpuSkipSamples() )
+              {
               m_filterCcAlf( recYuv.get( compID ), tmpYuv, blkDst, blkSrc, compID, filterCoeff, m_clpRngs, cs, tmpYuvResi, m_alfClippingValues[CHANNEL_TYPE_LUMA], m_ccAlfFilterParam.ccAlfCoeffPrec[compIdx - 1] 
 #if JVET_AI0166_CCALF_CHROMA_SAO_INPUT
                 , tmpYuvSAO
@@ -1768,6 +1829,7 @@ void AdaptiveLoopFilter::ALFProcess(CodingStructure& cs)
                 , tmpYuvBeforeDb
 #endif
               );
+              }
 #else
               m_filterCcAlf( recYuv.get( compID ), tmpYuv, blkDst, blkSrc, compID, filterCoeff, m_clpRngs, cs, tmpYuvResi, m_alfClippingValues[CHANNEL_TYPE_LUMA] 
 #if JVET_AI0166_CCALF_CHROMA_SAO_INPUT
@@ -1800,8 +1862,10 @@ void AdaptiveLoopFilter::ALFProcess(CodingStructure& cs)
       ctuIdx++;
     }
   }
+}
 
-
+void AdaptiveLoopFilter::alfProcessFinish( CodingStructure& cs )
+{
 #if JVET_AI0084_ALF_RESIDUALS_SCALING
   if ( cs.slice->getUseAlfScale() && cs.slice->getTileGroupAlfEnabledFlag(COMPONENT_Y) )
   {
@@ -1809,6 +1873,7 @@ void AdaptiveLoopFilter::ALFProcess(CodingStructure& cs)
   }
   if ( cs.slice->getAlfScaleChroma(COMPONENT_Cb) || cs.slice->getAlfScaleChroma(COMPONENT_Cr) )
   {
+    PelUnitBuf recYuvSao = m_tempBuf3.getBuf( cs.area );
     alfAddCorrectChroma( cs, recYuvSao );
   }
 #endif
@@ -1843,6 +1908,302 @@ void AdaptiveLoopFilter::ALFProcess(CodingStructure& cs)
   }
 #endif
 
+}
+
+// ---- recording for the GPU decoder (AlfGpuPlan) ---------------------------------------------------------------------
+
+void AdaptiveLoopFilter::resultPlanes( ResultPlane planes[AlfGpuPlan::NUM_PLANES] ) const
+{
+  const int pad = ALF_PADDING_SIZE_FIXED_RESULTS;
+  for( int i = 0; i < AlfGpuPlan::NUM_PLANES; i++ )
+  {
+    planes[i] = ResultPlane();
+  }
+  for( int comp = 0; comp < MAX_NUM_COMPONENT; comp++ )
+  {
+    if( !m_fixFilterResult[comp] )
+    {
+      continue;
+    }
+    const int first = comp == 0 ? AlfGpuPlan::PLANE_FIX_LUMA : comp == 1 ? AlfGpuPlan::PLANE_FIX_CB : AlfGpuPlan::PLANE_FIX_CR;
+    const int num   = comp == 0 ? ( EXT_LENGTH << 1 ) : 2;
+    for( int i = 0; i < num; i++ )
+    {
+      planes[first + i] = { m_fixFilterResult[comp][i], ( comp ? m_picWidthChroma : m_picWidth ) + 2 * pad,
+                            ( comp ? m_picHeightChroma : m_picHeight ) + 2 * pad };
+    }
+  }
+  for( int i = 0; i < EXT_LENGTH && m_fixFilterResiResult; i++ )
+  {
+    planes[AlfGpuPlan::PLANE_FIX_RESI + i] = { m_fixFilterResiResult[i], m_picWidth, m_picHeight };
+  }
+  planes[AlfGpuPlan::PLANE_GAUSS] = { m_gaussPic[0], m_picWidth + 2 * ALF_PADDING_SIZE_GAUSS_RESULTS,
+                                      m_picHeight + 2 * ALF_PADDING_SIZE_GAUSS_RESULTS };
+  planes[AlfGpuPlan::PLANE_LAPLACIAN] = { m_laplacianPic[0], m_picWidth + 2 * ALF_PADDING_SIZE_LAPLACIAN_RESULTS,
+                                          m_picHeight + 2 * ALF_PADDING_SIZE_LAPLACIAN_RESULTS };
+}
+
+AdaptiveLoopFilter::FixedFilterTables AdaptiveLoopFilter::fixedFilterTables()
+{
+  return { &m_classIdnFixedFilter9Db9[0][0],  &m_filterCoeffFixed9Db9[0][0][0],  &m_clippingFixed9Db9[0][0][0],
+           &m_classIdnFixedFilter13Db9[0][0], &m_filterCoeffFixed13Db9[0][0][0], &m_clippingFixed13Db9[0][0][0] };
+}
+
+bool AdaptiveLoopFilter::gpuPlanSupported( CodingStructure& cs )
+{
+  AlfGpuPlan& plan = *m_gpuPlan;
+  const PreCalcValues& pcv = *cs.pcv;
+  plan.begin( pcv.lumaWidth, pcv.lumaHeight, m_chromaFormat, m_numCTUsInPic );
+  for( auto& a: m_gpuLumaFilterIdx )
+  {
+    std::fill( std::begin( a ), std::end( a ), -1 );
+  }
+  std::fill( std::begin( m_gpuChromaFilterIdx ), std::end( m_gpuChromaFilterIdx ), -1 );
+  for( auto& a: m_gpuCcAlfFilterIdx )
+  {
+    std::fill( std::begin( a ), std::end( a ), -1 );
+  }
+  m_gpuCurLumaFilter = -1;
+
+  if( m_chromaFormat != CHROMA_420 && m_chromaFormat != CHROMA_400 )
+  {
+    plan.unsupported( "chroma format" );
+    return false;
+  }
+  if( !m_fixFilterResult[COMPONENT_Y] || !m_fixFilterResiResult )
+  {
+    plan.unsupported( "fixed filters off" );
+    return false;
+  }
+  if( cs.picHeader->getVirtualBoundariesPresentFlag() )
+  {
+    plan.unsupported( "virtual boundaries" );
+    return false;
+  }
+  const Slice* slice = cs.slice;
+  if( slice->getCuQpDeltaSubdiv() )
+  {
+    plan.unsupported( "CU QP for the fixed filters" );
+    return false;
+  }
+#if NNLF_ALF_POS_INTERFACE
+  if( cs.slice[0].getNnlfUnifiedParameters().mode != -1 )
+  {
+    plan.unsupported( "NN loop filter" );
+    return false;
+  }
+#endif
+  for( int c = 0; c < MAX_NUM_COMPONENT; c++ )
+  {
+    if( slice->getTileGroupAlfFixedFilterSetIdx( ComponentID( c ) ) & ~1 )
+    {
+      plan.unsupported( "fixed filter set index" );
+      return false;
+    }
+  }
+
+  // one slice, and no CTU whose filtering ALFProcess splits at slice, tile or subpicture boundaries
+  bool clipTop = false, clipBottom = false, clipLeft = false, clipRight = false;
+  int  numHorVirBndry = 0, numVerVirBndry = 0, rasterSliceAlfPad = 0;
+  int  horVirBndryPos[] = { 0, 0, 0 };
+  int  verVirBndryPos[] = { 0, 0, 0 };
+  for( int yPos = 0; yPos < pcv.lumaHeight; yPos += pcv.maxCUHeight )
+  {
+    for( int xPos = 0; xPos < pcv.lumaWidth; xPos += pcv.maxCUWidth )
+    {
+      const CodingUnit* cu = cs.getCU( Position( xPos, yPos ), CHANNEL_TYPE_LUMA );
+      if( cu->slice != slice )
+      {
+        plan.unsupported( "several slices" );
+        return false;
+      }
+      const int width  = std::min<int>( pcv.maxCUWidth, pcv.lumaWidth - xPos );
+      const int height = std::min<int>( pcv.maxCUHeight, pcv.lumaHeight - yPos );
+      if( isCrossedByVirtualBoundaries( cs, xPos, yPos, width, height, clipTop, clipBottom, clipLeft, clipRight, numHorVirBndry,
+                                        numVerVirBndry, horVirBndryPos, verVirBndryPos, rasterSliceAlfPad ) )
+      {
+        plan.unsupported( "filtering split at slice, tile or subpicture boundaries" );
+        return false;
+      }
+    }
+  }
+
+  const SPS& sps = *cs.sps;
+  plan.bitDepth[CHANNEL_TYPE_LUMA]   = m_inputBitDepth[CHANNEL_TYPE_LUMA];
+  plan.bitDepth[CHANNEL_TYPE_CHROMA] = m_inputBitDepth[CHANNEL_TYPE_CHROMA];
+  plan.intraSlice        = slice->isIntra();
+  plan.fixedFilterAdjust = sps.getAlfLumaFixedFilterAdjust();
+  plan.lumaScaleMode     = sps.getAlfScaleMode() != 0;
+  for( int c = 0; c < MAX_NUM_COMPONENT; c++ )
+  {
+    const ComponentID comp = ComponentID( c );
+    plan.fixedSetIdx[c] = slice->getTileGroupAlfFixedFilterSetIdx( comp );
+    const int qp = slice->getSliceQp() + ( c ? slice->getSliceChromaQpDelta( comp ) : 0 );
+    int setMin = ( qp - 22 ) / 4, setMax = ( qp - 18 ) / 4;
+    if( setMin <= 0 )
+    {
+      setMin = 0;
+      setMax = 1;
+    }
+    if( setMax > NUM_SETS_FIXED_FILTERS - 1 )
+    {
+      setMin = NUM_SETS_FIXED_FILTERS - 2;
+      setMax = NUM_SETS_FIXED_FILTERS - 1;
+    }
+    plan.fixedSet[c][0] = setMin;
+    plan.fixedSet[c][1] = setMax;
+  }
+  for( int ch = 0; ch < MAX_NUM_CHANNEL_TYPE; ch++ )
+  {
+    for( int i = 0; i < 4; i++ )
+    {
+      plan.clipValues[ch][i] = m_alfClippingValues[ch][i];
+    }
+  }
+  return true;
+}
+
+void AdaptiveLoopFilter::gpuRecordLumaCtu( int ctuIdx, int filterSetIndex, int alt )
+{
+  AlfGpuPlan::Ctu& ctu = m_gpuPlan->ctus[ctuIdx];
+  if( filterSetIndex < NUM_FIXED_FILTER_SETS )
+  {
+    ctu.lumaMode = filterSetIndex == 0 ? AlfGpuPlan::LUMA_COPY_STAGE1 : AlfGpuPlan::LUMA_COPY_STAGE2;
+    return;
+  }
+  const int apsIdx = filterSetIndex - NUM_FIXED_FILTER_SETS;
+  int16_t&  idx    = m_gpuLumaFilterIdx[apsIdx][alt];
+  if( idx < 0 )
+  {
+    idx = int16_t( m_gpuPlan->lumaFilters.size() );
+    m_gpuPlan->lumaFilters.emplace_back();
+    AlfGpuPlan::LumaFilter& f = m_gpuPlan->lumaFilters.back();
+    f.type       = m_filterTypeApsLuma[apsIdx];
+    f.classifier = m_classifierIdxApsLuma[apsIdx][alt];
+    f.coeffBits  = m_coeffBitsApsLuma[apsIdx][alt];
+    std::copy_n( m_coeffApsLuma[apsIdx][alt], MAX_NUM_ALF_CLASSES * MAX_NUM_ALF_LUMA_COEFF, f.coeff );
+    std::copy_n( m_clippApsLuma[apsIdx][alt], MAX_NUM_ALF_CLASSES * MAX_NUM_ALF_LUMA_COEFF, f.clip );
+    for( int c = 0; c < MAX_NUM_ALF_CLASSES; c++ )
+    {
+      f.scaleIdx[c]  = m_scaleIdxApsLuma[apsIdx][alt][c];
+      f.scaleCorr[c] = 0;   // alfAddCorrect fills it in with the scale mode
+    }
+  }
+  ctu.lumaMode       = AlfGpuPlan::LUMA_FILTER;
+  ctu.lumaFilter     = idx;
+  m_gpuCurLumaFilter = idx;
+}
+
+void AdaptiveLoopFilter::gpuRecordChromaCtu( int ctuIdx, int compIdx, int alt )
+{
+  int16_t& idx = m_gpuChromaFilterIdx[alt];
+  if( idx < 0 )
+  {
+    idx = int16_t( m_gpuPlan->chromaFilters.size() );
+    m_gpuPlan->chromaFilters.emplace_back();
+    AlfGpuPlan::ChromaFilter& f = m_gpuPlan->chromaFilters.back();
+    f.type     = m_filterTypeApsChroma;
+    f.scaleIdx = m_chromaScaleIdxFinal[alt][0];
+    std::copy_n( m_chromaCoeffFinal[alt], MAX_NUM_ALF_CHROMA_COEFF, f.coeff );
+    std::copy_n( m_chromaClippFinal[alt], MAX_NUM_ALF_CHROMA_COEFF, f.clip );
+  }
+  m_gpuPlan->ctus[ctuIdx].chromaFilter[compIdx - 1] = idx;
+}
+
+void AdaptiveLoopFilter::gpuRecordCcAlfCtu( int ctuIdx, int compIdx, int filterIdx )
+{
+  int16_t& idx = m_gpuCcAlfFilterIdx[compIdx - 1][filterIdx - 1];
+  if( idx < 0 )
+  {
+    idx = int16_t( m_gpuPlan->ccAlfFilters.size() );
+    m_gpuPlan->ccAlfFilters.emplace_back();
+    AlfGpuPlan::CcAlfFilter& f = m_gpuPlan->ccAlfFilters.back();
+    f.coeffPrec = m_ccAlfFilterParam.ccAlfCoeffPrec[compIdx - 1];
+    std::copy_n( m_ccAlfFilterParam.ccAlfCoeff[compIdx - 1][filterIdx - 1], MAX_NUM_CC_ALF_CHROMA_COEFF, f.coeff );
+  }
+  m_gpuPlan->ctus[ctuIdx].ccAlfFilter[compIdx - 1] = idx;
+}
+
+void AdaptiveLoopFilter::gpuRecordBoundaryPadding( int plane, const Area& blk, int planeWidth, int planeHeight, int padSize, int cornerRows, int cornerCols, const bool valid[8], bool corners )
+{
+  AlfGpuPlan& p = *m_gpuPlan;
+  const int   x = blk.x, y = blk.y, w = blk.width, h = blk.height;
+  // the picture edges next to the CTU: index 0-3 left, right, top, bottom
+  if( !valid[0] )
+  {
+    p.mirror( plane, 0, -padSize, y, padSize, h );
+  }
+  if( !valid[1] )
+  {
+    p.mirror( plane, 0, planeWidth, y, padSize, h );
+  }
+  if( !valid[2] )
+  {
+    p.mirror( plane, 1, x, -padSize, w, padSize );
+  }
+  if( !valid[3] )
+  {
+    p.mirror( plane, 1, x, planeHeight, w, padSize );
+  }
+  if( !corners )
+  {
+    return;
+  }
+  // The corners, index 4-7 top-left, top-right, bottom-left, bottom-right. With the top or bottom neighbour inside
+  // the picture, the padding next to its rows is mirrored horizontally; otherwise the columns beyond the CTU are
+  // mirrored vertically: cornerCols of them next to a neighbour, padSize at a picture edge.
+  const int colsL = valid[0] ? cornerCols : padSize, colsR = valid[1] ? cornerCols : padSize;
+  if( !valid[4] )
+  {
+    if( valid[2] )
+    {
+      p.mirror( plane, 0, -padSize, y - cornerRows, padSize, cornerRows );
+    }
+    else
+    {
+      p.mirror( plane, 1, x - colsL, -padSize, colsL, padSize );
+    }
+  }
+  if( !valid[5] )
+  {
+    if( valid[2] )
+    {
+      p.mirror( plane, 0, x + w, y - cornerRows, padSize, cornerRows );
+    }
+    else
+    {
+      p.mirror( plane, 1, x + w, -padSize, colsR, padSize );
+    }
+  }
+  if( !valid[6] )
+  {
+    if( valid[3] )
+    {
+      p.mirror( plane, 0, -padSize, y + h, padSize, cornerRows );
+    }
+    else
+    {
+      p.mirror( plane, 1, x - colsL, planeHeight, colsL, padSize );
+    }
+  }
+  if( !valid[7] )
+  {
+    if( valid[3] )
+    {
+      p.mirror( plane, 0, x + w, y + h, padSize, cornerRows );
+    }
+    else
+    {
+      p.mirror( plane, 1, x + w, planeHeight, colsR, padSize );
+    }
+  }
+}
+
+int AdaptiveLoopFilter::gpuFixedPlane( Pel*** fixedFilterResults ) const
+{
+  return fixedFilterResults == m_fixFilterResult[COMPONENT_Cb]   ? AlfGpuPlan::PLANE_FIX_CB
+         : fixedFilterResults == m_fixFilterResult[COMPONENT_Cr] ? AlfGpuPlan::PLANE_FIX_CR
+                                                                 : AlfGpuPlan::PLANE_FIX_LUMA;
 }
 
 #if JVET_AK0065_TALF
@@ -2975,6 +3336,14 @@ void AdaptiveLoopFilter::destroy()
 #if ALF_IMPROVEMENT
 void  AdaptiveLoopFilter::copyFixedFilterResults( const PelUnitBuf &recDst, const Area &blkDst, ComponentID compId, Pel*** fixedFilterResults, const int fixedFilterSetIdx, const int classifierIdx )
 {
+  if( m_gpuPlan )
+  {
+    m_gpuPlan->readRect( AlfGpuPlan::PLANE_FIX_LUMA + classifierIdx * NUM_FIXED_FILTER_SETS + fixedFilterSetIdx, blkDst.x, blkDst.y, blkDst.width, blkDst.height );
+    if( m_gpuPlan->skipSamples )
+    {
+      return;
+    }
+  }
   PelBuf dstLuma = recDst.get( compId );
   const int dstStride = dstLuma.stride;
   Pel* dst = dstLuma.buf + blkDst.y * dstStride + blkDst.x;
@@ -2999,6 +3368,18 @@ void  AdaptiveLoopFilter::copyFixedFilterResults( const PelUnitBuf &recDst, cons
 #if JVET_AI0084_ALF_RESIDUALS_SCALING
 void  AdaptiveLoopFilter::alfAddCorrect( AlfClassifier** classifier, const PelUnitBuf& recDst, const CPelUnitBuf& recSrc, const Area& blkDst, const Area& blk, const ComponentID compId, char coeffBits, int* idxCorr )
 {
+  if( m_gpuPlan )
+  {
+    AlfGpuPlan::LumaFilter& f = m_gpuPlan->lumaFilters[m_gpuCurLumaFilter];
+    for( int c = 0; c < MAX_NUM_ALF_CLASSES; c++ )
+    {
+      f.scaleCorr[c] = getScaleCorrInt( idxCorr[c] );
+    }
+    if( m_gpuPlan->skipSamples )
+    {
+      return;
+    }
+  }
   const CPelBuf srcLuma = recSrc.get(compId);
   PelBuf dstLuma = recDst.get(compId);
   const ClpRng& clpRng = m_clpRngs.comp[COMPONENT_Y];
@@ -3101,6 +3482,18 @@ void  AdaptiveLoopFilter::alfAddCorrectChroma( CodingStructure& cs, PelUnitBuf& 
   alfUsedFlag[0] = cs.slice->getTileGroupAlfEnabledFlag(COMPONENT_Y) ? 1 : 0;
   alfUsedFlag[1] = cs.slice->getTileGroupAlfEnabledFlag(COMPONENT_Cb) ? 1 : ccAlfUsedFlag[1];
   alfUsedFlag[2] = cs.slice->getTileGroupAlfEnabledFlag(COMPONENT_Cr) ? 1 : ccAlfUsedFlag[2];
+
+  if( m_gpuPlan )
+  {
+    for( int comp = 1; comp < MAX_NUM_COMPONENT; comp++ )
+    {
+      m_gpuPlan->chromaScaleCorr[comp - 1] = alfUsedFlag[comp] && sBest[comp - 1] ? m_scaleCorrChroma[sBest[comp - 1]] : 0;
+    }
+    if( m_gpuPlan->skipSamples )
+    {
+      return;
+    }
+  }
 
   int offset = (1 << (shiftCorrChroma - 1));
 
@@ -3342,6 +3735,43 @@ void  AdaptiveLoopFilter::alfFiltering( AlfClassifier **classifier, const PelUni
 #endif
   )
 {
+  if( m_gpuPlan )
+  {
+    AlfGpuPlan& plan = *m_gpuPlan;
+    const int   x = blkDst.x, y = blkDst.y, w = blkDst.width, h = blkDst.height;
+    if( isLuma( compId ) )
+    {
+      // with the scale mode, fixedFilterSetIdx arrives as -fixedFilterSetIdx - 1
+      const int setIdx = fixedFilterSetIdx < 0 ? -fixedFilterSetIdx - 1 : fixedFilterSetIdx;
+      if( filterType == ALF_FILTER_13_EXT_DB_RESI || filterType == ALF_FILTER_13_EXT_DB_RESI_DIRECT )
+      {
+        plan.readCross( AlfGpuPlan::PLANE_FIX_LUMA + NUM_FIXED_FILTER_SETS + setIdx, x, y, w, h, MAX_FILTER_LENGTH_FIXED >> 1, 2 );
+        plan.readRect( AlfGpuPlan::PLANE_FIX_LUMA + setIdx, x, y, w, h );
+      }
+      if( filterType == ALF_FILTER_13_EXT_DB_RESI )
+      {
+        plan.readRect( AlfGpuPlan::PLANE_GAUSS, x, y, w, h );
+        plan.readCross( AlfGpuPlan::PLANE_LAPLACIAN, x, y, w, h, 2, 0 );
+        plan.readRect( AlfGpuPlan::PLANE_FIX_RESI + 1 - setIdx, x, y, w, h );
+      }
+      else if( filterType == ALF_FILTER_13_DB_RESI )
+      {
+        plan.readRect( AlfGpuPlan::PLANE_GAUSS, x, y, w, h );
+      }
+      else
+      {
+        plan.readCross( AlfGpuPlan::PLANE_GAUSS, x, y, w, h, 2, 0 );
+      }
+    }
+    else if( filterType == ALF_FILTER_9 )
+    {
+      plan.readCross( gpuFixedPlane( fixedFilterResults ) + fixedFilterSetIdx, x, y, w, h, 2, 0 );
+    }
+    if( plan.skipSamples )
+    {
+      return;
+    }
+  }
 #if JVET_AC0162_ALF_RESIDUAL_SAMPLES_INPUT
   if (filterType == ALF_FILTER_9)
   {
@@ -3802,6 +4232,14 @@ double AdaptiveLoopFilter::getScaleCorrDouble( const int s )
 #if JVET_AG0157_ALF_CHROMA_FIXED_FILTER
 void AdaptiveLoopFilter::deriveFixFilterResultsBlkChroma(AlfClassifier ***classifier, Pel ***fixedFilterResults, const CPelBuf &src, const CPelBuf &srcBeforeDb, const Area &blkDst, const Area &blk, const int bits, CodingStructure& cs, const ClpRng &clpRng, const Pel clippingValues[4], int qp, int fixedFilterSetIdx, int mappingDir[NUM_DIR_FIX][NUM_DIR_FIX], uint32_t **laplacian[NUM_DIRECTIONS])
 {
+  if( m_gpuPlan )
+  {
+    m_gpuPlan->write( gpuFixedPlane( fixedFilterResults ) + fixedFilterSetIdx, blkDst.x, blkDst.y, blkDst.width, blkDst.height );
+    if( m_gpuPlan->skipSamples )
+    {
+      return;
+    }
+  }
 #if JVET_AJ0237_INTERNAL_12BIT
   m_deriveVariance(src, blkDst, blk, laplacian, bits);
 #else
@@ -5692,6 +6130,26 @@ void AdaptiveLoopFilter::deriveClassificationAndFixFilterResultsBlk( AlfClassifi
 void AdaptiveLoopFilter::deriveClassificationAndFixFilterResultsBlk( AlfClassifier **classifier, Pel ***fixedFilterResults, const CPelBuf &srcLuma, const Area &blkDst, const Area &blk, const int bits, CodingStructure& cs, const ClpRng &clpRng, const Pel clippingValues[4], int qp, int fixedFilterSetIdx, int mappingDir[NUM_DIR_FIX][NUM_DIR_FIX], uint32_t **laplacian[NUM_DIRECTIONS], const int classifierIdx )
 #endif
 {
+#if JVET_AE0139_ALF_IMPROVED_FIXFILTER && FIXFILTER_CFG
+  if( m_gpuPlan )
+  {
+    // The first-stage fixed filter of the target set, apart from the columns and rows that the left and top
+    // neighbours computed beyond their CTU (ctuPadFlag), and the fixed filter of the residual with the other set.
+    if( useFixedFilter && classifierIdx == -1 )
+    {
+      const int xShift = ( ctuPadFlag & 0x01 ) ? 16 : 0, yShift = ( ctuPadFlag & 0x02 ) ? 16 : 0;
+      m_gpuPlan->write( AlfGpuPlan::PLANE_FIX_LUMA + fixedFilterSetIdx, blkDst.x + xShift, blkDst.y + yShift, blkDst.width - xShift, blkDst.height - yShift );
+      if( bResiFixed )
+      {
+        m_gpuPlan->write( AlfGpuPlan::PLANE_FIX_RESI + 1 - fixedFilterSetIdx, blkDst.x, blkDst.y, blkDst.width, blkDst.height );
+      }
+    }
+    if( m_gpuPlan->skipSamples )
+    {
+      return;
+    }
+  }
+#endif
 #if JVET_AE0139_ALF_IMPROVED_FIXFILTER
 #if FIXFILTER_CFG
   if( useFixedFilter )
@@ -8035,6 +8493,18 @@ void AdaptiveLoopFilter::deriveVariance(const CPelBuf &srcLuma, const Area &blkD
 }
 void AdaptiveLoopFilter::deriveFixedFilterResultsBlk(AlfClassifier*** classifier, const CPelBuf& srcLuma, const CPelBuf& srcLumaBeforeDb, const Area& blkDst, const Area& blk, const int bits, CodingStructure &cs, const ClpRng &clpRng, const Pel clippingValues[4], int qp, int winIdx, int fixedFilterSetIdx)
 {
+  if( m_gpuPlan )
+  {
+    if( winIdx == 1 )
+    {
+      m_gpuPlan->readDiamond( AlfGpuPlan::PLANE_FIX_LUMA + fixedFilterSetIdx, blkDst.x, blkDst.y, blkDst.width, blkDst.height, MAX_FILTER_LENGTH_FIXED >> 1 );
+    }
+    m_gpuPlan->write( AlfGpuPlan::PLANE_FIX_LUMA + winIdx * NUM_FIXED_FILTER_SETS + fixedFilterSetIdx, blkDst.x, blkDst.y, blkDst.width, blkDst.height );
+    if( m_gpuPlan->skipSamples )
+    {
+      return;
+    }
+  }
   int fixedFiltSetIndMin = (qp - 22) / 4;
   int fixedFiltSetIndMax = (qp - 18) / 4;
 
@@ -8089,6 +8559,14 @@ void AdaptiveLoopFilter::deriveFixedFilterResults(AlfClassifier*** classifier, c
 #if JVET_AG0157_ALF_CHROMA_FIXED_FILTER
 void AdaptiveLoopFilter::deriveFixedFilterResultsPerBlkChroma(AlfClassifier ***classifier, Pel ***fixedFilterResults, const CPelBuf &src, const CPelBuf &srcBeforeDb, const Area &blk, const int bits, CodingStructure& cs, const ClpRng &clpRng, const Pel clippingValues[4], int qp, int fixedFilterSetIdx, int mappingDir[NUM_DIR_FIX][NUM_DIR_FIX], uint32_t **laplacian[NUM_DIRECTIONS])
 {
+  if( m_gpuPlan )
+  {
+    m_gpuPlan->write( gpuFixedPlane( fixedFilterResults ) + fixedFilterSetIdx, blk.x, blk.y, blk.width, blk.height );
+    if( m_gpuPlan->skipSamples )
+    {
+      return;
+    }
+  }
   bool useSimd = (blk.size().width % 8 == 0) && (blk.size().height % 2 == 0) ? true : false;
 
   int fixedFiltSetIndMin = (qp - 22) / 4;
@@ -8176,6 +8654,16 @@ void AdaptiveLoopFilter::deriveFixedFilterResultsCtuBoundaryChroma(AlfClassifier
     if(isBoundaryValid[boundaryIdx] && !isNeighborAvai[boundaryIdx])
     {
       deriveFixedFilterResultsPerBlkChroma(classifier, fixedFilterResults, src, srcBeforeDb, blkCur[boundaryIdx], bits, cs, clpRng, clippingValues, qp, fixedFilterSetIdx, m_mappingDir, laplacian);
+    }
+  }
+
+  if( m_gpuPlan )
+  {
+    const bool valid[8] = { isBoundaryValid[0], isBoundaryValid[1], isBoundaryValid[2], isBoundaryValid[3] };
+    gpuRecordBoundaryPadding( gpuFixedPlane( fixedFilterResults ) + fixedFilterSetIdx, blkDst, m_picWidthChroma, m_picHeightChroma, padSize, 0, 0, valid, false );
+    if( m_gpuPlan->skipSamples )
+    {
+      return;
     }
   }
 
@@ -8311,7 +8799,10 @@ void AdaptiveLoopFilter::deriveFixedFilterResultsCtuBoundary(AlfClassifier **cla
       //classifierIdx = 1 can reuse coding info results
       if( classifierIdx == 0 )
       {
-        calcAlfLumaCodingInfoBlk(cs, m_classifierCodingInfo[0], blkCur[boundaryIdx], blkCur[boundaryIdx], srcLuma, 2, 2, m_inputBitDepth[CHANNEL_TYPE_LUMA], srcResi, m_laplacian[0], srcCodingInfo);
+        if( !gpuSkipSamples() )
+        {
+          calcAlfLumaCodingInfoBlk(cs, m_classifierCodingInfo[0], blkCur[boundaryIdx], blkCur[boundaryIdx], srcLuma, 2, 2, m_inputBitDepth[CHANNEL_TYPE_LUMA], srcResi, m_laplacian[0], srcCodingInfo);
+        }
       }
 #endif
 #if JVET_AE0139_ALF_IMPROVED_FIXFILTER
@@ -8327,6 +8818,15 @@ void AdaptiveLoopFilter::deriveFixedFilterResultsCtuBoundary(AlfClassifier **cla
 #else
       deriveFixedFilterResultsPerBlk(classifier, fixedFilterResults, srcLuma, blkCur[boundaryIdx], bits, cs, clpRng, clippingValues, qp, fixedFilterSetIdx, m_mappingDir, laplacian, classifierIdx);
 #endif
+    }
+  }
+
+  if( m_gpuPlan )
+  {
+    gpuRecordBoundaryPadding( AlfGpuPlan::PLANE_FIX_LUMA + classifierIdx * NUM_FIXED_FILTER_SETS + fixedFilterSetIdx, blkDst, m_picWidth, m_picHeight, padSize, extraSize, extraSize, isBoundaryValid, true );
+    if( m_gpuPlan->skipSamples )
+    {
+      return;
     }
   }
 
@@ -8610,6 +9110,21 @@ void AdaptiveLoopFilter::deriveFixedFilterResultsPerBlk( AlfClassifier **classif
 #endif
 {
 #if JVET_AE0139_ALF_IMPROVED_FIXFILTER
+  if( m_gpuPlan )
+  {
+    // a strip beyond the CTU: the first-stage fixed filter, or the second stage, which reads the first
+    if( classifierIdx == 1 )
+    {
+      m_gpuPlan->readDiamond( AlfGpuPlan::PLANE_FIX_LUMA + fixedFilterSetIdx, blkCur.x, blkCur.y, blkCur.width, blkCur.height, MAX_FILTER_LENGTH_FIXED >> 1 );
+    }
+    m_gpuPlan->write( AlfGpuPlan::PLANE_FIX_LUMA + classifierIdx * NUM_FIXED_FILTER_SETS + fixedFilterSetIdx, blkCur.x, blkCur.y, blkCur.width, blkCur.height );
+    if( m_gpuPlan->skipSamples )
+    {
+      return;
+    }
+  }
+#endif
+#if JVET_AE0139_ALF_IMPROVED_FIXFILTER
   bool useSimd = (blkCur.size().width % 8 == 0) && (blkCur.size().height % 2 == 0) ? true : false;
 #else
   bool useSimd = (blkCur.size().width % 8 == 0) && (blkCur.size().height % ALF_PADDING_SIZE_FIXED_RESULTS == 0) ? true : false;
@@ -8869,10 +9384,22 @@ void AdaptiveLoopFilter::deriveGaussResultsCtuBoundary(Pel*** gaussPic, const CP
 #if JVET_AJ0188_CODING_INFO_CLASSIFICATION && FIXFILTER_CFG
       if( !useFixedFilter )
       {
-        calcAlfLumaCodingInfoBlk(cs, m_classifierCodingInfo[0], blkCur[boundaryIdx], blkCur[boundaryIdx], srcLuma, 2, 2, m_inputBitDepth[CHANNEL_TYPE_LUMA], srcResi, m_laplacian[0], srcCodingInfo);
+        if( !gpuSkipSamples() )
+        {
+          calcAlfLumaCodingInfoBlk(cs, m_classifierCodingInfo[0], blkCur[boundaryIdx], blkCur[boundaryIdx], srcLuma, 2, 2, m_inputBitDepth[CHANNEL_TYPE_LUMA], srcResi, m_laplacian[0], srcCodingInfo);
+        }
       }
 #endif
       deriveGaussResultsBlk(gaussPic, srcLuma, blkCur[boundaryIdx], blkCur[boundaryIdx], cs, clpRng, clippingValues, filterSetIdx, storeIdx );
+    }
+  }
+
+  if( m_gpuPlan )
+  {
+    gpuRecordBoundaryPadding( AlfGpuPlan::PLANE_GAUSS + storeIdx, blkDst, m_picWidth, m_picHeight, padSize, padSize, padSize, isBoundaryValid, true );
+    if( m_gpuPlan->skipSamples )
+    {
+      return;
     }
   }
 
@@ -9044,6 +9571,14 @@ void AdaptiveLoopFilter::deriveGaussResults( const CPelBuf& srcLumaBeforeDb, con
 
 void AdaptiveLoopFilter::deriveGaussResultsBlk(Pel ***gaussPic, const CPelBuf &srcLuma, const Area &blkDst, const Area &blk, CodingStructure& cs, const ClpRng &clpRng, const Pel clippingValues[4], int filterSetIdx, const int storeIdx )
 {
+  if( m_gpuPlan )
+  {
+    m_gpuPlan->write( AlfGpuPlan::PLANE_GAUSS + storeIdx, blkDst.x, blkDst.y, blkDst.width, blkDst.height );
+    if( m_gpuPlan->skipSamples )
+    {
+      return;
+    }
+  }
   bool useSimd = blkDst.size().width % 8 == 0 ? true : false;
   if( useSimd )
   {
@@ -10130,6 +10665,15 @@ void AdaptiveLoopFilter::deriveLaplacianResultsCtuBoundary(Pel*** laplacianPic, 
     }
   }
 
+  if( m_gpuPlan )
+  {
+    gpuRecordBoundaryPadding( AlfGpuPlan::PLANE_LAPLACIAN + storeIdx, blkDst, m_picWidth, m_picHeight, padSize, padSize, padSize, isBoundaryValid, true );
+    if( m_gpuPlan->skipSamples )
+    {
+      return;
+    }
+  }
+
   int xPosTmp = xPos;
   int yPosTmp = yPos;
 
@@ -10298,6 +10842,14 @@ void AdaptiveLoopFilter::deriveLaplacianResults( const CPelBuf& srcLuma, const A
 
 void AdaptiveLoopFilter::deriveLaplacianResultsBlk(Pel ***laplacianPic, const CPelBuf &srcLuma, const Area &blkDst, const Area &blk, CodingStructure& cs, const ClpRng &clpRng, const Pel clippingValues[4], int filterSetIdx, const int storeIdx, const CPelBuf &srcCodingInfo)
 {
+  if( m_gpuPlan )
+  {
+    m_gpuPlan->write( AlfGpuPlan::PLANE_LAPLACIAN + storeIdx, blkDst.x, blkDst.y, blkDst.width, blkDst.height );
+    if( m_gpuPlan->skipSamples )
+    {
+      return;
+    }
+  }
   bool useSimd = blkDst.size().width % 8 == 0 ? true : false;
 
   if( useSimd )

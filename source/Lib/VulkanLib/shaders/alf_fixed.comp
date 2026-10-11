@@ -1,0 +1,220 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+#include "alf_common.glsl"
+#include "alf_taps.glsl"
+
+// The ALF result planes that persist between pictures, over the regions that ALFProcess recorded: the fixed filters
+// (fixedFilterBlk 9x9 and 13x13, fixedFilteringResi, chroma), and the gauss (gaussFiltering) and laplacian results
+// (laplacianFiltering). One workgroup per tile of up to 16x16 samples, one invocation per sample; the tile's plane
+// says which result to compute.
+
+layout( local_size_x = 16, local_size_y = 16 ) in;
+
+layout( push_constant, scalar ) uniform Push
+{
+  AlfParamsRef params;
+  AlfTiles     tiles;
+} pc;
+
+AlfParams P;
+
+int src( int c, int x, int y ) { return int( P.src.v[P.srcOrigin[c] + y * P.srcStride[c] + x] ); }
+int db( int c, int x, int y ) { return int( P.db.v[P.dbOrigin[c] + y * P.dbStride[c] + x] ); }
+int resi( int x, int y ) { return int( P.resi.v[P.resiOrigin + y * P.resiStride + x] ); }
+int res( int plane, int x, int y ) { return int( P.res.v[P.resOrigin[plane] + y * P.resStride[plane] + x] ); }
+int tab( int i ) { return int( P.tables.v[i] ); }
+
+// The coding information conditions of fixedFilterBlk, fixedFilteringResi and gaussFiltering: the filter result
+// grows at boundaries (classIdxBs) and with residuals (classIdxResi).
+int applyCodingInfo( int sum, int ci, bool useBoun, bool useResi, int boundFactor, int resiFactor, int bitDepth )
+{
+  const int offsetClip = 1 << ( bitDepth - 1 );
+  if( useBoun )
+  {
+    sum = clamp( sum, -offsetClip, offsetClip );
+    const int sign = sum < 0 ? -1 : 1;
+    sum = ( ci >> 1 ) != 0 ? sign * ( ( abs( sum ) * ( 16 + boundFactor ) + 8 ) >> 4 ) : sum;
+  }
+  if( useResi )
+  {
+    sum = clamp( sum, -offsetClip, offsetClip );
+    const int sign = sum < 0 ? -1 : 1;
+    sum = ( ci & 1 ) != 0 ? sign * ( ( abs( sum ) * ( 16 + resiFactor ) + 8 ) >> 4 ) : sum;
+  }
+  return sum;
+}
+
+// fixedFilterBlk<ALF_FIXED_FILTER_9_DB_9> for luma (c 0) or chroma, at (x, y) with the class of its 2x2 block
+int fixed9( int c, int x, int y, int cls, int set, int ci )
+{
+  const int bitDepth = P.bitDepth[c > 0 ? 1 : 0];
+  const int filterIdx = tab( P.idn9 + set * 7168 + ( cls >> 2 ) );
+  const int base = ( set * 512 + filterIdx ) * 41;
+  const int t = cls & 3;
+  const int clipBase = c > 0 ? 4 : 0;
+  const int curr = src( c, x, y );
+  int sum = 0;
+  for( int k = 0; k < 20; k++ )
+  {
+    const ivec2 d = transposeTap( tap9[k], t );
+    sum += tab( P.coeff9 + base + k ) * clipAlf2( P.clipValues[clipBase + tab( P.clip9 + base + k )], curr, src( c, x + d.y, y + d.x ), src( c, x - d.y, y - d.x ) );
+    sum += tab( P.coeff9 + base + k + 20 ) * clipAlf2( P.clipValues[clipBase + tab( P.clip9 + base + k + 20 )], curr, db( c, x + d.y, y + d.x ), db( c, x - d.y, y - d.x ) );
+  }
+  sum += tab( P.coeff9 + base + 40 ) * clipAlf1( P.clipValues[clipBase + tab( P.clip9 + base + 40 )], curr, db( c, x, y ) );
+  sum = ( sum + 1024 ) >> 11;
+  if( c == 0 )
+  {
+    // luma: useBounCondition and useResiCondition of fixedFilterBlk
+    const bool intra = P.intraSlice != 0;
+    sum = applyCodingInfo( sum, ci, !( P.fixedFilterAdjust == 0 && intra ), !intra, intra ? 4 : 3,
+                           intra ? 0 : ( 3 >> ( P.fixedFilterAdjust == 0 ? 1 : 0 ) ), bitDepth );
+  }
+  return clamp( sum + curr, P.clpMin[c], P.clpMax[c] );
+}
+
+// fixedFilterBlk<ALF_FIXED_FILTER_13_DB_9> of the second stage: the 13x13 taps read the first-stage result
+int fixed13( int x, int y, int cls, int set, int setIdx, int ci )
+{
+  const int filterIdx = tab( P.idn13 + set * 7168 + ( cls >> 2 ) );
+  const int base = ( set * 512 + filterIdx ) * 64;
+  const int t = cls & 3;
+  const int curr = src( 0, x, y );
+  const int f0 = PLANE_FIX_LUMA + setIdx;
+  int sum = 0;
+  for( int k = 0; k < 42; k++ )
+  {
+    const ivec2 d = transposeTap( tap13[k], t );
+    sum += tab( P.coeff13 + base + k ) * clipAlf2( P.clipValues[tab( P.clip13 + base + k )], curr, res( f0, x + d.y, y + d.x ), res( f0, x - d.y, y - d.x ) );
+  }
+  for( int k = 0; k < 20; k++ )
+  {
+    const ivec2 d = transposeTap( tap9[k], t );
+    sum += tab( P.coeff13 + base + 42 + k ) * clipAlf2( P.clipValues[tab( P.clip13 + base + 42 + k )], curr, db( 0, x + d.y, y + d.x ), db( 0, x - d.y, y - d.x ) );
+  }
+  sum += tab( P.coeff13 + base + 62 ) * clipAlf1( P.clipValues[tab( P.clip13 + base + 62 )], curr, db( 0, x, y ) );
+  sum += tab( P.coeff13 + base + 63 ) * clipAlf1( P.clipValues[tab( P.clip13 + base + 63 )], curr, res( f0, x, y ) );
+  sum = ( sum + 1024 ) >> 11;
+  const bool intra = P.intraSlice != 0;
+  sum = applyCodingInfo( sum, ci, !( P.fixedFilterAdjust == 0 && intra ), !intra, intra ? 4 : 3,
+                         intra ? 0 : ( 3 >> ( P.fixedFilterAdjust == 0 ? 1 : 0 ) ), P.bitDepth[0] );
+  return clamp( sum + curr, P.clpMin[0], P.clpMax[0] );
+}
+
+// fixedFilteringResi: the 9x9 fixed filter on the residual, with the before-deblocking coefficients added to the
+// reconstruction ones
+int fixedResi( int x, int y, int cls, int set, int ci )
+{
+  const int filterIdx = tab( P.idn9 + set * 7168 + ( cls >> 2 ) );
+  const int base = ( set * 512 + filterIdx ) * 41;
+  const int t = cls & 3;
+  const int curr = resi( x, y );
+  int sum = 0;
+  for( int k = 0; k < 20; k++ )
+  {
+    const ivec2 d = transposeTap( tap9[k], t );
+    // filterCoeff and filterClipp are shorts on the CPU
+    const int coeff = int( int16_t( tab( P.coeff9 + base + k ) + tab( P.coeff9 + base + k + 20 ) ) );
+    const int clipIdx = ( tab( P.clip9 + base + k ) + tab( P.clip9 + base + k + 20 ) + 1 ) >> 1;
+    sum += coeff * clipAlf2( P.clipValues[clipIdx], curr, resi( x + d.y, y + d.x ), resi( x - d.y, y - d.x ) );
+  }
+  sum += tab( P.coeff9 + base + 40 ) * clipAlf1( P.clipValues[tab( P.clip9 + base + 40 )], curr, 0 );
+  sum = ( sum + 1024 ) >> 11;
+  const bool intra = P.intraSlice != 0;
+  const bool adjust = P.fixedFilterAdjust != 0;
+  sum = applyCodingInfo( sum, ci, adjust, adjust && !intra, intra ? 4 : 3, intra ? 0 : 3, P.bitDepth[0] );
+  return clamp( sum + curr, -P.clpMax[0], P.clpMax[0] );
+}
+
+// The 12-tap gauss filter of gaussFiltering (c 0 on the picture before deblocking, with the coding information) or
+// of localGaussianFiltering (on the ALF input)
+int gauss( bool local, int x, int y, int ci )
+{
+  const int curr = local ? src( 0, x, y ) : db( 0, x, y );
+  int sum = 0;
+  for( int k = 0; k < 12; k++ )
+  {
+    const ivec2 d = tapGauss[k];
+    const int clip = P.clipValues[gaussClipIdx[k]];
+    const int r = local ? clipAlf2( clip, curr, src( 0, x + d.y, y + d.x ), src( 0, x - d.y, y - d.x ) )
+                        : clipAlf2( clip, curr, db( 0, x + d.y, y + d.x ), db( 0, x - d.y, y - d.x ) );
+    sum += r * gaussWeight[k];
+  }
+  sum = ( sum + 512 ) >> 10;
+  const int bdShift = max( 0, P.bitDepth[0] - 10 );
+  int diffTh;
+  if( local )
+  {
+    diffTh = ( P.highRes != 0 ? 1024 : 96 ) << bdShift;
+  }
+  else
+  {
+    const bool intra = P.intraSlice != 0;
+    sum = applyCodingInfo( sum, ci, !( P.fixedFilterAdjust == 0 && intra ), false, intra ? 6 : 5, 0, P.bitDepth[0] );
+    diffTh = 32 << bdShift;
+  }
+  return clamp( curr + clamp( sum, -diffTh, diffTh ), P.clpMin[0], P.clpMax[0] );
+}
+
+// laplacianFiltering: a vertical and a horizontal laplacian, on gauss-filtered samples next to block boundaries
+int laplacian( int x, int y )
+{
+  const int clip = P.clipValues[0];
+  int sum;
+  if( P.ci.v[P.ciOrigin + y * P.ciStride + x] == 0 )
+  {
+    const int curr = src( 0, x, y );
+    sum = clipAlf2( clip, curr, src( 0, x, y - 1 ), src( 0, x, y + 1 ) ) + clipAlf2( clip, curr, src( 0, x - 1, y ), src( 0, x + 1, y ) );
+  }
+  else
+  {
+    const int g = gauss( true, x, y, 0 );
+    sum = clipAlf2( clip, g, gauss( true, x, y - 1, 0 ), gauss( true, x, y + 1, 0 ) )
+        + clipAlf2( clip, g, gauss( true, x - 1, y, 0 ), gauss( true, x + 1, y, 0 ) );
+  }
+  const int diffTh = ( P.highRes != 0 ? 128 : 96 ) << max( 0, P.bitDepth[0] - 10 );
+  return clamp( sum, -diffTh, diffTh );
+}
+
+void main()
+{
+  const AlfTile tile = pc.tiles.t[gl_WorkGroupID.x];
+  const int lx = int( gl_LocalInvocationID.x ), ly = int( gl_LocalInvocationID.y );
+  if( lx >= tile.w || ly >= tile.h )
+  {
+    return;
+  }
+  P = pc.params.p;
+  const int x = tile.x + lx, y = tile.y + ly;
+  const int plane = tile.plane;
+  const int blk = ( y >> 1 ) * P.clsStride + ( x >> 1 );
+  int v;
+  if( plane < PLANE_FIX_CB )
+  {
+    const int ci = int( P.cls.v[blk + CLS_CI * P.clsPlane] );
+    const int setIdx = plane & 1;
+    const int set = P.fixedSet[setIdx];
+    v = plane < 2 ? fixed9( 0, x, y, int( P.cls.v[blk + CLS_FIX1 * P.clsPlane] ), set, ci )
+                  : fixed13( x, y, int( P.cls.v[blk + CLS_FIX2 * P.clsPlane] ), set, setIdx, ci );
+  }
+  else if( plane < PLANE_FIX_RESI )
+  {
+    const int c = plane < PLANE_FIX_CR ? 1 : 2;
+    const int cls = int( P.ccls.v[( c - 1 ) * P.cclsPlane + ( y >> 1 ) * P.cclsStride + ( x >> 1 )] );
+    v = fixed9( c, x, y, cls, P.fixedSet[c * 2 + ( plane & 1 )], 0 );
+  }
+  else if( plane < PLANE_GAUSS )
+  {
+    const int ci = int( P.cls.v[blk + CLS_CI * P.clsPlane] );
+    v = fixedResi( x, y, int( P.cls.v[blk + CLS_FIX1 * P.clsPlane] ), P.fixedSet[plane & 1], ci );
+  }
+  else if( plane == PLANE_GAUSS )
+  {
+    v = gauss( false, x, y, int( P.cls.v[blk + CLS_CI * P.clsPlane] ) );
+  }
+  else
+  {
+    v = laplacian( x, y );
+  }
+  P.res.v[P.resOrigin[plane] + y * P.resStride[plane] + x] = int16_t( v );
+}

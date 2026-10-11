@@ -248,6 +248,7 @@ public:
   double vulkanGpuMs() const { return m_vkLoopFilter.gpuMs(); }
   const vkd::VkLoopFilter::Counts& vulkanCounts() const { return m_vkLoopFilter.counts(); }
   bool vulkanCheck() const { return m_vkCheck; }
+  const std::map<std::string, uint64_t>& vulkanAlfCpuReasons() const { return m_vkLoopFilter.alfCpuReasons(); }
 #endif
 
   DCI*                    m_dci;

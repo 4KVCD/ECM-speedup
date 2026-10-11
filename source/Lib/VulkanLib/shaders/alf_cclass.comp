@@ -1,0 +1,116 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+#include "alf_common.glsl"
+
+// The class of the chroma fixed filter for every 2x2 block of Cb (z 0) or Cr (z 1), as deriveFixFilterResultsBlkChroma:
+// calcClass0Var with window ALF_CLASSIFIER_FL_CHROMA + 10, over the laplacians of the 4x4 samples around the block
+// and the variance of the 10x10 samples around it. One invocation per block.
+
+layout( local_size_x = 16, local_size_y = 16 ) in;
+
+layout( push_constant, scalar ) uniform Push
+{
+  AlfParamsRef params;
+} pc;
+
+AlfParams P;
+int       C, W, H;
+
+int srcC( int x, int y )
+{
+  x = clamp( x, -8, W + 7 );
+  y = clamp( y, -8, H + 7 );
+  return int( P.src.v[P.srcOrigin[C] + y * P.srcStride[C] + x] );
+}
+
+const int divShift2[16] = { 2, 2, 4, 4, 6, 6, 6, 6, 8, 8, 8, 8, 10, 10, 10, 10 };
+const int sqrtSum[50]   = { 0, 1, 1, 1, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 4, 4, 4, 4, 4, 4, 4, 4, 4, 5, 5, 5, 5, 5,
+                            5, 5, 5, 5, 5, 5, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 7 };
+const int transposeTable[8] = { 0, 1, 0, 2, 2, 3, 1, 3 };
+
+int th193( int i )
+{
+  return i < 4 ? i : i < 6 ? 4 : i < 8 ? 5 : i < 12 ? 6 : i < 16 ? 7 : i < 24 ? 8 : i < 32 ? 9 : i < 48 ? 10 : i < 64 ? 11
+       : i < 96 ? 12 : i < 128 ? 13 : i < 192 ? 14 : 15;
+}
+int mappingDir( int i, int j ) { return j <= i ? i * ( i + 1 ) / 2 + j : 0; }
+int edgeStrength( int a1, int a0 )
+{
+  return a1 > 8 * a0 ? 6 : a1 * 2 > 9 * a0 ? 5 : a1 > 3 * a0 ? 4 : a1 > 2 * a0 ? 3 : a1 * 2 > 3 * a0 ? 2 : a1 * 4 > 5 * a0 ? 1 : 0;
+}
+
+void main()
+{
+  P = pc.params.p;
+  C = int( gl_GlobalInvocationID.z ) + 1;
+  W = P.widthC;
+  H = P.heightC;
+  const int bx = int( gl_GlobalInvocationID.x ) * 2, by = int( gl_GlobalInvocationID.y ) * 2;
+  if( bx >= W || by >= H )
+  {
+    return;
+  }
+  const int bitDepth = P.bitDepth[1];
+
+  int sumH = 0, sumV = 0, sumD0 = 0, sumD1 = 0;
+  for( int y = by - 1; y < by + 3; y++ )
+  {
+    for( int x = bx - 1; x < bx + 3; x++ )
+    {
+      const int c2 = srcC( x, y ) << 1;
+      sumV  += abs( c2 - srcC( x, y - 1 ) - srcC( x, y + 1 ) );
+      sumH  += abs( c2 - srcC( x - 1, y ) - srcC( x + 1, y ) );
+      sumD0 += abs( c2 - srcC( x - 1, y - 1 ) - srcC( x + 1, y + 1 ) );
+      sumD1 += abs( c2 - srcC( x + 1, y - 1 ) - srcC( x - 1, y + 1 ) );
+    }
+  }
+  int64_t sum = 0, sumSq = 0;
+  for( int y = by - 4; y < by + 6; y++ )
+  {
+    for( int x = bx - 4; x < bx + 6; x++ )
+    {
+      const int64_t v = int64_t( srcC( x, y ) );
+      sum += v;
+      sumSq += v * v;
+    }
+  }
+  const uint variance = uint( ( 13 * ( ( 100 * sumSq - sum * sum + 8192 ) >> 3 ) ) >> ( 14 + 2 * max( 0, bitDepth - 10 ) ) );
+
+  // calcClass0Var with classDir 1, NUM_DIR_FIX directions and NUM_ACT_FIX activities; window 11 uses multTab[1]
+  const int s = sumV + sumH;
+  int hv1, hv0, d1, d0, dirTempHV, dirTempD;
+  if( sumV > sumH )
+  {
+    hv1 = sumV; hv0 = sumH; dirTempHV = 1;
+  }
+  else
+  {
+    hv1 = sumH; hv0 = sumV; dirTempHV = 3;
+  }
+  if( sumD0 > sumD1 )
+  {
+    d1 = sumD0; d0 = sumD1; dirTempD = 0;
+  }
+  else
+  {
+    d1 = sumD1; d0 = sumD0; dirTempD = 2;
+  }
+  int mainDirection, secondaryDirection;
+  if( uint64_t( d1 ) * uint64_t( hv0 ) > uint64_t( d0 ) * uint64_t( hv1 ) )
+  {
+    mainDirection = dirTempD; secondaryDirection = dirTempHV;
+  }
+  else
+  {
+    mainDirection = dirTempHV; secondaryDirection = dirTempD;
+  }
+  const int activity = th193( min( ( 1407 * s ) >> ( 9 + bitDepth - 4 ), 192 ) );
+  const int esHV = edgeStrength( hv1, hv0 ), esD = edgeStrength( d1, d0 );
+  const int direction = uint64_t( hv1 ) * uint64_t( d0 ) > uint64_t( hv0 ) * uint64_t( d1 ) ? mappingDir( esHV, esD )
+                                                                                           : 28 + mappingDir( esD, esHV );
+  const uint sum2 = min( variance >> divShift2[activity], 49u );
+  const int actDirInd = sqrtSum[sum2] * ( 7 * 8 * 16 ) + 7 * 8 * activity + direction;
+  const int cls = ( actDirInd << 2 ) + transposeTable[mainDirection * 2 + ( secondaryDirection >> 1 )];
+  P.ccls.v[( C - 1 ) * P.cclsPlane + ( by >> 1 ) * P.cclsStride + ( bx >> 1 )] = int16_t( cls );
+}

@@ -1,0 +1,36 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+// Mirrored padding of a plane, as AdaptiveLoopFilter::mirroredPaddingForAlf: the sample at x = -1 - i repeats x = i,
+// the sample at width + i repeats width - 1 - i, and the same for rows, corners included.
+// One invocation per sample of the padded plane; samples inside the picture stay as they are.
+
+layout( local_size_x = 16, local_size_y = 16 ) in;
+
+layout( push_constant, scalar ) uniform Push
+{
+  I16Buf buf;
+  int    origin;
+  int    stride;
+  int    width;
+  int    height;
+  int    pad;
+} pc;
+
+int mirror( int v, int n ) { return v < 0 ? -1 - v : v >= n ? 2 * n - 1 - v : v; }
+
+void main()
+{
+  const int x = int( gl_GlobalInvocationID.x ) - pc.pad;
+  const int y = int( gl_GlobalInvocationID.y ) - pc.pad;
+  if( x >= pc.width + pc.pad || y >= pc.height + pc.pad )
+  {
+    return;
+  }
+  if( x >= 0 && x < pc.width && y >= 0 && y < pc.height )
+  {
+    return;
+  }
+  pc.buf.v[pc.origin + y * pc.stride + x] = pc.buf.v[pc.origin + mirror( y, pc.height ) * pc.stride + mirror( x, pc.width )];
+}
