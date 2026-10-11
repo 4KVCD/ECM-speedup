@@ -389,6 +389,12 @@ bool GpuIntraRec::supported( const Slice& slice, std::string& why )
   if( !slice.isIntra() )                                                                  why = "not an intra slice";
   else if( sps.getChromaFormatIdc() != CHROMA_420 && sps.getChromaFormatIdc() != CHROMA_400 ) why = "chroma format";
   else if( sps.getLog2MaxTbSize() > 7 )                                                   why = "transform blocks above 128";
+  // the reference availability of the kernels is "decoded earlier"; the CPU's (CodingStructure::getCURestricted) also
+  // excludes the CUs of other tiles, with wavefronts the CTUs right of the current one in the CTU row above, and with
+  // GDR the dirty area (several slices are rejected by DecSlice)
+  else if( slice.getPPS()->getNumTiles() > 1 )                                            why = "tiles";
+  else if( sps.getEntropyCodingSyncEnabledFlag() )                                        why = "wavefronts";
+  else if( sps.getGDREnabledFlag() )                                                      why = "GDR";
   // implicit MTS selects by modes that only DIMD derives (TrQuant::getTrTypes, candModeListForTransform): with DIMD
   // off the stock encoder stops at a CHECK, so it can be neither supported nor tested before DIMD
   else if( sps.getUseImplicitMTS() )                                                      why = "implicit MTS";

@@ -159,6 +159,9 @@ commands that combine `Remove-Item` with `//` text. `perf\gpu\crlf.ps1 <worktree
     bilateral filter), all angle signs, and MRL unit groups unavailable at the picture's edges. `enc_m12_edges.ps1`:
     `m12e_*` (64x64 / 128x64 crops via `crop.py`: many blocks at the edges) and `m12s_*` (synthetic content via
     `gen_mrl_edge.py` on which the encoder picks lines 5-12 near the top).
+  - `fx_wpp_park720`, `fx_tiles_park720` (m11's arguments plus `--WaveFrontSynchro=1`, resp. `--EnablePicPartitioning=1
+    --TileColumnWidthArray=3 --TileRowHeightArray=2 --RasterScanSlices=1 --RasterSliceSizes=100`: one slice of 4x3
+    tiles): must fall back to the CPU ("wavefronts", "tiles").
   - each set: fore22/32/37 (CIF), park720, four720 (2-4 pictures). Longer ones: m2_fore33, m2_park16, m3_park16
     (`enc_m1.ps1 <name> <yuv> 1280 720 16 --TemporalSubsampleRatio=1 -q 32 <level args>`), m3_park60 (60 frames,
     `enc_long.ps1 m3_park60 ...\ParkJoy_1280x720.yuv 1280 720 4 15 -q 32 --IntraToolControlMode=1 --IntraPredBf=1`:
@@ -289,6 +292,11 @@ Profile of a GPU-on decode (non-LTO, m2_park16, share of all samples): parsing ~
   path the GPU replaces (dequantization, transforms, clipping): dependent quantization was not rejected until M6,
   and the reconstruction on decoded such streams wrong. With a new level, look through the CPU path it replaces for
   flags the GPU ignores, and encode a test set with each such flag on.
+- The kernels' reference availability is "decoded earlier" (owner maps); the CPU's (`CodingStructure::
+  getCURestricted`) also excludes other slices and tiles, with wavefronts the CTUs right of the current one in the
+  row above, and with GDR the dirty area. Tiles, wavefronts and GDR were not rejected until 2026-10-11: a stream with
+  tiles or WPP decoded wrong with the reconstruction on (test streams `fx_tiles_park720`, `fx_wpp_park720`, now
+  skipped). Any new availability rule of the CPU must be mirrored or rejected.
 - Class layouts must not depend on `ECM_VULKAN`: the define reaches only the targets that link DecoderLib or GpuLib,
   not EncoderLib, and EncCu derives from DecCu. GPU members under `#if ECM_VULKAN` in DecCu made the encoder of every
   Vulkan build of dec-gpurecon crash at start-up (fixed 2026-10-11). Run the encoder suite on a Vulkan build too.

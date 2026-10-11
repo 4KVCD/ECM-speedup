@@ -292,7 +292,11 @@ the reconstruction buffer; works in every frame-thread context):
   counts the corner samples of both arms by the unit height) and TMRL stay on the CPU. GpuIntraRec::supported()
   rejects every tool whose mode derivation or prediction reads reconstructed samples or that the kernels lack, before
   anything is skipped. All 19 regular streams now fall back to the CPU at sign prediction, the next sequence-level
-  check (before M6: QCS, before M5: LMCS, before M4: dual tree); many block-level tools follow.
+  check (before M6: QCS, before M5: LMCS, before M4: dual tree); many block-level tools follow. The kernels' reference
+  availability is "decoded earlier", while the CPU's (CodingStructure::getCURestricted) also excludes other tiles,
+  with wavefronts the CTUs right of the current one in the row above, and with GDR the dirty area: until that fix
+  pictures with tiles or wavefronts were not rejected and decoded wrong with the reconstruction on (their verification
+  showed prediction differences at the tile and CTU boundaries); now tiles, wavefronts and GDR fall back to the CPU.
 - kernels: intra_resi (all residuals of the picture at once, dequantization folded into the first DCT-II stage,
   only the nonzero coefficient region) and intra_rec (persistent workgroups take ready blocks from a queue; the
   host gives each block its dependency count, its dependents and the availability the CPU sees as seven numbers per
