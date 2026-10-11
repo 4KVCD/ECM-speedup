@@ -146,6 +146,7 @@ commands that combine `Remove-Item` with `//` text. `perf\gpu\crlf.ps1 <worktree
 |---|---|
 | `gpucheck.py <build> [streams] -- <decoder args>` | decodes every GPU stream with the build and with the stock decoder (cached), compares all frames, prints the `[gpu-intra]` lines. Use `--GpuRecon=2` (verify) and `--GpuRecon=3`, also with `--FrameThreads=8`. |
 | `stress.py <build> <reps> [args]` | repeats verify decodes, saves the output of any run that is not "all verified, 0 differences, 0 skipped" (caught the m_timdMrg bug, 1 in ~650 runs) |
+| `gpuload.py <build> <seconds>` | keeps the GPU busy (decodes with `--GpuRecon=3 --FrameThreads=8`); run it beside stress.py, GPU synchronization bugs needed the load to show (intra_resi scratch, 2026-10-11) |
 | `gpubench.py <build> [reps]` | GPU kernel time per stream (verify mode, best of reps) |
 | `e2e.py <build> <streams>` | wall time CPU / CPU FT8 / GPU on / GPU on FT8, output checked |
 | `walls.py <build> <stream> <reps> -- args \| args ...` | wall time per configuration (no output check) |
@@ -234,6 +235,9 @@ Profile of a GPU-on decode (non-LTO, m2_park16, share of all samples): parsing ~
 - RTX 3070: plain loads through `coherent`/`volatile` buffer references returned stale L1 data across workgroups;
   use `#pragma use_vulkan_memory_model` + GL_KHR_memory_scope_semantics. Persistent workgroups + an atomic ready
   queue are deadlock-free dependency scheduling.
+- RTX 3070, also with the memory model: data passed between the invocations of one workgroup through a global buffer
+  and a barrier was read stale by whole warps while another process loaded the GPU (intra_resi, fixed by shared
+  memory). Pass data inside a workgroup through shared memory, and stress-test with `gpuload.py` running.
 - The NVIDIA GPU drops to a low clock between pictures (kernels ~3x slower); power settings are off limits.
 - `BilateralFilter` derives its LUTs in `create()`, not in the constructor.
 - ECM intra reconstruction is raster-serial within a picture once intra/IBC CUs exist (JVET_AJ0172 IBC/IntraTMP

@@ -4,14 +4,18 @@
 // (Quant::dequant without scaling lists) folded into the first inverse DCT-II stage, then the second stage
 // (TrQuant::xIT: two clipped matrix stages, equal to the partial butterflies in integer arithmetic); the result
 // goes to the residual buffer intra_rec adds to its prediction. Persistent workgroups take blocks by index.
+// Don't keep the first stage's output in a global scratch buffer: while other processes shared the GPU (RTX 3070),
+// whole warps of the second stage read it before the other warps' writes had reached it, although the barrier between
+// the stages had workgroup and even device scope.
 #extension GL_GOOGLE_include_directive : require
-#extension GL_KHR_memory_scope_semantics : require
 #include "common.glsl"
 #include "intra_common.glsl"
 
 layout( local_size_x = 256 ) in;
 
-layout( buffer_reference, std430, buffer_reference_align = 4 ) workgroupcoherent buffer WBufI32 { int v[]; };
+// the first stage's output, clipped to the transform range (16 bits without extended precision, which the host
+// rejects): column xf of the levels at xf * H + y
+shared int16_t s_stage1[128 * 128];
 
 int clip3i( int lo, int hi, int v )
 {
@@ -23,7 +27,6 @@ void main()
   const int lid = int( gl_LocalInvocationID.x );
   const int NT  = int( gl_WorkGroupSize.x );
   Params P = BufParams( pc.params ).p;
-  WBufI32 tmp = WBufI32( P.scratch + uint64_t( gl_WorkGroupID.x ) * uint64_t( 4 * 16384 ) );
   BufI32 cf = BufI32( P.coeffs );
   BufI32 mt = BufI32( P.matrices );
   BufI16 resi = BufI16( P.dbgResi );
@@ -43,7 +46,7 @@ void main()
     // the levels lie in rows < nzRows, columns < nzCols: the skipped terms are zero, and so is the first stage of an
     // all-zero column ((0 + rnd1) >> shift1), which the second stage then needs not read
     const int nzR = t.nzRows, nzC = t.nzCols;
-    // first stage (vertical): tmp[xf * H + y] from the dequantized coefficient column xf
+    // first stage (vertical): s_stage1[xf * H + y] from the dequantized coefficient column xf
     for( int i = lid; i < nzC * H; i += NT )
     {
       const int xf = i / H, y = i % H;
@@ -58,17 +61,17 @@ void main()
           sum += mt.v[offH + k * H + y] * clip3i( t.trMin, t.trMax, c );
         }
       }
-      tmp.v[xf * H + y] = clip3i( t.trMin, t.trMax, ( sum + rnd1 ) >> t.shift1 );
+      s_stage1[xf * H + y] = int16_t( clip3i( t.trMin, t.trMax, ( sum + rnd1 ) >> t.shift1 ) );
     }
-    controlBarrier( gl_ScopeWorkgroup, gl_ScopeWorkgroup, gl_StorageSemanticsBuffer, gl_SemanticsAcquireRelease );
+    barrier();
     // second stage (horizontal): residual[y * W + x]
     for( int i = lid; i < N; i += NT )
     {
       const int y = i / W, x = i % W;
       int sum = 0;
-      for( int k = 0; k < nzC; k++ ) sum += mt.v[offW + k * W + x] * tmp.v[k * H + y];
+      for( int k = 0; k < nzC; k++ ) sum += mt.v[offW + k * W + x] * int( s_stage1[k * H + y] );
       resi.v[t.dbgOffset + i] = int16_t( clip3i( t.trMin, t.trMax, ( sum + rnd2 ) >> t.shift2 ) );
     }
-    controlBarrier( gl_ScopeWorkgroup, gl_ScopeWorkgroup, gl_StorageSemanticsBuffer, gl_SemanticsAcquireRelease );
+    barrier();
   }
 }

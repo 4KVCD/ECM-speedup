@@ -94,7 +94,6 @@ struct Params
   uint64_t owner[3];
   uint64_t filters;
   uint64_t matrices;
-  uint64_t scratch;
   uint64_t dbgPred;
   uint64_t dbgResi;
   uint64_t depCount;
@@ -117,7 +116,7 @@ struct Params
   int32_t  edgeCap;
   int32_t  pad;
 };
-static_assert( offsetof( Params, origin ) == 168 && offsetof( Params, matrixOffset ) == 248 && sizeof( Params ) == 288,
+static_assert( offsetof( Params, origin ) == 160 && offsetof( Params, matrixOffset ) == 240 && sizeof( Params ) == 280,
                "Params layout" );
 
 struct Push
@@ -135,8 +134,7 @@ struct PushScan
 };
 
 constexpr int FILTER_TAPS[5] = { 6, 8, 10, 12, 16 };
-constexpr int SCRATCH_INTS   = 16384;   // per workgroup of intra_resi
-constexpr int RESI_GROUPS    = 256;
+constexpr int RESI_GROUPS    = 256;   // persistent workgroups of intra_resi
 
 // the kernels and the constant tables, created once and shared by every instance (the decoder contexts of the frame
 // threads); never destroyed, like the device
@@ -227,7 +225,6 @@ struct GpuIntraRec::Impl
   gpu::Context*               ctx = nullptr;
   const Shared*               sh  = nullptr;
   std::unique_ptr<gpu::Stream> stream;
-  gpu::Buffer                 scratch;
   gpu::Buffer                 params, tus, coeffs, planes[3], owner[3], sched, dbgPred, dbgResi;
   int                         numGroups = 0;
   size_t                      edgeCap   = 0;   // dependency edges per picture the scheduling buffer holds
@@ -254,7 +251,7 @@ struct GpuIntraRec::Impl
     {
       return;
     }
-    for( gpu::Buffer* b: { &scratch, &params, &tus, &coeffs, &planes[0], &planes[1], &planes[2],
+    for( gpu::Buffer* b: { &params, &tus, &coeffs, &planes[0], &planes[1], &planes[2],
                            &owner[0], &owner[1], &owner[2], &sched, &dbgPred, &dbgResi, &upload, &download } )
     {
       b->destroy( *ctx );
@@ -277,7 +274,6 @@ GpuIntraRec* GpuIntraRec::create()
   m.stream.reset( new gpu::Stream( *ctx ) );
   // persistent workgroups of intra_rec (ECM_GPU_GROUPS overrides)
   m.numGroups = getenv( "ECM_GPU_GROUPS" ) ? std::max( 1, atoi( getenv( "ECM_GPU_GROUPS" ) ) ) : 32;
-  m.scratch.create( *ctx, size_t( SCRATCH_INTS ) * 4 * RESI_GROUPS, gpu::Buffer::DEVICE );
   m.params.create( *ctx, sizeof( Params ), gpu::Buffer::DEVICE );
   return r;
 }
@@ -482,6 +478,11 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
   t.dqInMax      = ( 1 << ( targetInputBitDepth - 1 ) ) - 1;
   t.trMin        = -( 1 << maxLog2TrDynamicRange );
   t.trMax        = ( 1 << maxLog2TrDynamicRange ) - 1;
+  if( t.trMin < INT16_MIN || t.trMax > INT16_MAX )   // intra_resi keeps the first transform stage in 16 bits
+  {
+    unsupported( "transform range above 16 bits" );
+    return;
+  }
   // TrQuant::xIT
   const int transformMatrixShift = g_transformMatrixShift[TRANSFORM_INVERSE];
   t.shift1 = transformMatrixShift + 1 + COM16_C806_TRANS_PREC;
@@ -864,7 +865,6 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
   P.filters  = m.sh->filters.addr;
   P.matrices = m.sh->matrices.addr;
   memcpy( P.matrixOffset, m.sh->matrixOffset, sizeof( P.matrixOffset ) );
-  P.scratch  = m.scratch.addr;
   P.dbgPred  = m.dbgPred.addr;
   P.dbgResi  = m.dbgResi.addr;
 

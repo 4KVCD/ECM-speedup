@@ -34,7 +34,6 @@ struct Params
   uint64_t owner[3];    // int32 per unit and component: the block covering it (-1: none); 4x4 luma, 2x2 chroma units
   uint64_t filters;     // int32: [taps 6,8,10,12,16][32][16] cubic tables, then the weak 4-tap table [32][4]
   uint64_t matrices;    // int32: DCT-II inverse matrices N = 2..128 at matrixOffset[log2N - 1]
-  uint64_t scratch;     // int32 per workgroup of the residual kernel: the first-stage transform output (16384)
   uint64_t dbgPred;     // int16 per block w*h at dbgOffset
   uint64_t dbgResi;     // int16 residual per block w*h at dbgOffset (written by intra_resi, added by intra_rec)
   uint64_t depCount;    // int32 per block: dependencies not reconstructed yet

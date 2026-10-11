@@ -273,6 +273,17 @@ Found on the way: plain loads through coherent / volatile buffer references retu
 (the kernel uses the Vulkan memory model since); a block that hands its released dependent to its own workgroup
 saves the queue round trip; prefetching the dependents' block records into shared memory was slower (dropped).
 
+Fix (2026-10-11): intra_resi passed the first transform stage to the second through a global scratch buffer with a
+workgroup barrier in between. While other work kept the GPU busy, whole warps of the second stage read the scratch
+before the other warps' writes had reached it: in a failing verification decode of m3_park60 the residuals of hundreds
+to thousands of blocks per picture were wrong for a few consecutive pictures, in whole warps (sample indices of a
+block such as 128-255, 64-127 or 32-63); the prediction and the scheduling data were never wrong. A device-scope
+barrier and coherence did not help. It depends on the load: with `perf/gpu/gpuload.py` (decodes with the GPU
+reconstruction on and 8 frame threads, i.e. 256 spinning workgroups) running beside the verification loop, 5 of 40
+decodes differed; without it, 9 of 88 in an hour with other work on the PC and 0 of 60 in a quiet hour. The first
+stage now stays in shared memory (int16, exact because it is clipped to the 16-bit transform range; extended precision
+is rejected by the host): 0 of 40 differed under the same load, and the global 16 MB scratch buffer is gone.
+
 ## Fixes found on the way
 
 - Decoding that starts at a CRA in the middle of an RA stream (`-s`, random access) crashed the stock decoder:
