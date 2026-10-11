@@ -676,7 +676,7 @@ void EncCu::init( EncLib* pcEncLib, EncSearchStack& stack, const SPS& sps PARL_P
   m_pcEncLib           = pcEncLib;
   m_dataId             = tId;
 #endif
-  m_pcLoopFilter       = pcEncLib->getLoopFilter();
+  m_pcLoopFilter       = &stack.loopFilter;
 
 #if !JVET_AG0164_AFFINE_GPM
   m_GeoCostList.init(GEO_NUM_PARTITION_MODE, m_pcEncCfg->getMaxNumGeoCand());

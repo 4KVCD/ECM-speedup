@@ -88,6 +88,24 @@ RA parallel efficiency is ~60 % (1.15x single-thread x 8 workers would be 9.2x):
 lower all-core turbo, one duplicated intra frame per chunk, unequal chunk complexity. With intra period 32 a
 257-frame sequence has only 8 chunks, so hyperthreads cannot be used.
 
+## Frame threads (`--FrameThreads=N`)
+
+- The pictures of a GOP run in threads of their own, at most N with a search stack at a time; setups and finishes
+  (loop filters, slice writing) take turns in coding order, and a search starts when its references and the pictures
+  it takes coding-order state from are done (`perf/HANDOFF_MULTITHREADING.md`, P1). Output identical at every N.
+- The temporal CABAC context store chains each picture to the previous picture of its temporal layer and QP, and the
+  finishes run in coding order, so RA gains about 1.35x at most (`perf/mt/ft_sim.py` predicts the measured times
+  within 1 %). LD and AI gain little. `--ParallelSegments` combines with it.
+- Core Ultra 7 265K (8P + 12E), ra_long's configuration (foreman 128x128, QP 32, intra period 32), first 65 frames,
+  one run each on an otherwise idle machine:
+
+| FrameThreads | wall | CPU | speedup | bit-exact |
+|---|---|---|---|---|
+| 1 | 559.8 s | 557.3 s | - | yes |
+| 2 | 522.2 s | 557.5 s | 1.07x | yes |
+| 4 | 449.4 s | 559.7 s | 1.25x | yes |
+| 8 | 414.8 s | 568.7 s | 1.35x | yes |
+
 ## Notes
 - GCC 16 needed two build fixes (missing `<cstdint>`; `-fno-aggressive-loop-optimizations`, because
   `EncAdaptiveLoopFilter.cpp` reads `m_chromaScaleIdxFinal[4][1]` with alternative index up to 7).

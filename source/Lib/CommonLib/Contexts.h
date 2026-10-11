@@ -1535,7 +1535,42 @@ public:
     m_stateBuf[1].clear();
   }
 
+  /// The state stored for the slice's type, temporal layer and QP, or null.
+  const CtxStateArray* findCtx( const Slice* slice ) const
+  {
+    const int t = typeIdx( slice );
+    if( t < 0 )
+    {
+      return nullptr;
+    }
+    const auto it = m_stateBuf[t].find( std::pair<int, int>( slice->getTLayer(), slice->getSliceQp() ) );
+    return it == m_stateBuf[t].end() ? nullptr : &it->second;
+  }
+
+  /// Makes the store hold one entry: the given state for the slice's key (null: nothing).
+  void setOnlyCtx( const Slice* slice, const CtxStateArray* state )
+  {
+    clearValid();
+    const int t = typeIdx( slice );
+    if( state && t >= 0 )
+    {
+      m_stateBuf[t][std::pair<int, int>( slice->getTLayer(), slice->getSliceQp() )] = *state;
+    }
+  }
+
 private:
+  // the buffer of the slice type (as storeCtx and loadCtx choose it), -1 for I slices
+  static int typeIdx( const Slice* slice )
+  {
+#if JVET_AH0176_LOW_DELAY_B_CTX
+    const SliceType s = slice->getSliceType();
+    return s == I_SLICE ? -1 : ( s == P_SLICE ? 1 : 0 );
+#else
+    const SliceType t = slice->getSliceType();
+    return t == I_SLICE ? -1 : int( t );
+#endif
+  }
+
   std::map<std::pair<int, int>, CtxStateArray> m_stateBuf[2];
 };
 
@@ -1549,6 +1584,8 @@ public:
   bool loadCtxStates( const Slice* slice, Ctx& ctx ) { return m_ctxStateStore.loadCtx( slice, ctx ); }
 #endif
   void storeCtxStates( const Slice* slice, const Ctx& ctx ) { m_ctxStateStore.storeCtx( slice, ctx ); }
+  const CtxStateArray* findCtxStates( const Slice* slice ) const { return m_ctxStateStore.findCtx( slice ); }
+  void setOnlyCtxStates( const Slice* slice, const CtxStateArray* state ) { m_ctxStateStore.setOnlyCtx( slice, state ); }
 
   void updateBufferState( const Slice* slice )
   {

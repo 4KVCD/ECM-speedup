@@ -54,8 +54,9 @@
 // ====================================================================================================================
 
 EncSlice::EncSlice()
+ : m_encCABACTableIdx(I_SLICE)
 #if ENABLE_QPA
- : m_adaptedLumaQP(-1)
+ , m_adaptedLumaQP(-1)
 #endif
 {
 }
@@ -102,6 +103,7 @@ void EncSlice::init( EncLib* pcEncLib, EncSearchStack& stack, const SPS& sps )
   m_CABACEstimator    = stack.cabacEncoder.getCABACEstimator(&sps);
   m_pcTrQuant         = &stack.trQuant;
   m_pcRdCost          = &stack.rdCost;
+  m_pcReshaper        = &stack.reshaper;
 #if JVET_AG0098_AMVP_WITH_SBTMVP
   m_CABACWriter->m_amvpSbTmvpEnabledArea = &m_picAmvpSbTmvpEnabledArea;
 #endif
@@ -2389,7 +2391,7 @@ void EncSlice::encodeCtus( Picture* pcPic, const bool bCompressEntireSlice, cons
     if (pcSlice->getSPS()->getUseLmcs())
 #endif
     {
-      m_pcCuEncoder->setDecCuReshaperInEncCU(m_pcLib->getReshaper(), pcSlice->getSPS()->getChromaFormatIdc());
+      m_pcCuEncoder->setDecCuReshaperInEncCU(m_pcReshaper, pcSlice->getSPS()->getChromaFormatIdc());
 
 #if ENABLE_SPLIT_PARALLELISM
       for (int jId = 1; jId < m_pcLib->getNumCuEncStacks(); jId++)
@@ -2710,11 +2712,11 @@ void EncSlice::encodeSlice   ( Picture* pcPic, OutputBitstream* pcSubstreams, ui
   } // CTU-loop
   if(pcSlice->getPPS()->getCabacInitPresentFlag())
   {
-    m_carry->encCABACTableIdx = m_CABACWriter->getCtxInitId( *pcSlice );
+    m_encCABACTableIdx = m_CABACWriter->getCtxInitId( *pcSlice );
   }
   else
   {
-    m_carry->encCABACTableIdx = pcSlice->getSliceType();
+    m_encCABACTableIdx = pcSlice->getSliceType();
   }
   numBinsCoded += m_CABACWriter->getNumBins();
 

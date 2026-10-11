@@ -798,6 +798,7 @@ protected:
   int       m_numSplitThreads;
   bool      m_forceSplitSequential;
   int       m_searchStackCount;
+  int       m_frameThreads;
   int       m_numWppThreads;
   int       m_numWppExtraLines;
   bool      m_ensureWppBitEqual;

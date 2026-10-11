@@ -37,6 +37,7 @@
 
 #pragma once
 
+#include "CommonLib/LoopFilter.h"
 #include "CommonLib/TrQuant.h"
 #include "CommonLib/RdCost.h"
 #if JVET_V0094_BILATERAL_FILTER || JVET_X0071_CHROMA_BILATERAL_FILTER
@@ -45,13 +46,15 @@
 
 #include "CABACWriter.h"
 #include "EncCu.h"
+#include "EncReshape.h"
 #include "EncSlice.h"
 #include "InterSearch.h"
 #include "IntraSearch.h"
 
 /// The objects that EncSlice::compressSlice and everything below it use for one picture: the slice and CU
-/// encoders, the inter and intra searches with their transform, rate and context objects. Pictures searched at the
-/// same time need a stack each; EncLib holds them.
+/// encoders, the inter and intra searches with their transform, rate and context objects, the picture's copies of the
+/// reshaper and the picture header (EncGOP copies the ones of the setup at its end) and the loop filter of the
+/// deblocking-aware RDO. Pictures searched at the same time need a stack each; EncLib holds them.
 struct EncSearchStack
 {
   EncSlice        sliceEncoder;
@@ -65,4 +68,7 @@ struct EncSearchStack
   CABACEncoder    cabacEncoder;
   RdCost          rdCost;
   CtxCache        ctxCache;
+  EncReshape      reshaper;
+  PicHeader       picHeader;
+  LoopFilter      loopFilter;
 };

@@ -2,7 +2,7 @@
 
 Written 2026-10-11 by the Claude session on the i7-10700 PC, which now switches to the Vulkan decoder port. The
 multithreading work moves to the other computer. This file has the user's request, the measurements, the
-dependency analysis and a plan ranked by expected gain. No encoder code has been changed yet.
+dependency analysis and a plan ranked by expected gain. The Progress section records the work done since.
 
 ## The request
 
@@ -30,11 +30,41 @@ User rules that shaped this work, besides the usual commit/push/QA rules in `per
 - Line numbers below refer to `enc-mt` (= `dec` 2912a239). Those marked "(agent)" come from a read-only code
   analysis by agents and should be re-checked before they are relied on.
 
+## Progress (Core Ultra 7 265K PC, from 2026-10-11)
+
+Commits on `enc-mt`, all bit-exact with stock ECM-20.0 (bitstream md5 of the suite), not pushed:
+- P0: `c10f520f` one `EncSearchStack`; `03aa9a96` the globals and statics the mode search writes become stack
+  members; `f6ef8708` RdCost's LMCS weights per object; `fba9e8f2` `--SearchStacks=K` (pictures use K stacks in
+  turn on one thread, the check of the stacks).
+- P1: `--FrameThreads=N` (the commit after `fba9e8f2`). What the P1 table below missed, found by bisecting threaded
+  mismatches (a setup made to wait at checkpoints for the previous picture's search or finish):
+  - **The picture header**: `EncLib::m_picHeader` is one object every picture points to, so the next setup
+    overwrote fields the current search and slice writing read. Each stack holds a copy taken at the end of the setup.
+    The values `HLSWriter::codePictureHeader` infers reach the next pictures only through the shared header; of
+    those, only `MaxNumAffineMergeCand` is read before a setup sets it (field-level diffs of the header between
+    setups, offsets mapped with an `offsetof` program built with `#define private public`).
+  - **`Slice::generateIntersectingMv`** (MVP extension) in the setup reads the reference pictures' motion: moved to
+    the search start.
+  - `Picture::referenced` (only the log's b/B) and EncLib's APS map (setup LMCS/scaling-list lookups vs the
+    finish's ALF APS insertions).
+  - `perf/mt/phase_audit.py` lists the `EncGOP` members each phase writes and reads; `perf/mt/ft_sim.py` simulates
+    the frame-thread schedule from a serial log.
+- P1 result: as expected from the same-layer CABAC chain, plus the finishes in coding order (the next intra period's
+  CRA finishes after the whole previous period, and all its pictures reference it), frame threads alone give about
+  1.3x on RA (`ft_sim.py` on the serial ra_long log: at most ~1.35x with any number of threads). The larger gains
+  are P2 (all configs) and, for long RA encodes, `--ParallelSegments`, which overlaps intra periods with processes
+  and combines with frame threads.
+
 ## Tools in perf/mt
 
 - `classify_profile.py samples.txt EncoderApp.exe`: splits an sprof profile into the classes used below.
 - `static_audit.py <mingw bin> out.txt <obj dirs>`: lists every mutable global, class static, function static and
   `thread_local` in the object files of a non-LTO build.
+- `phase_audit.py <compressGOP start> <setup end> <finish start> <picture end>`: per `EncGOP` member, which phases of
+  `compressGOP` (setup, search, finish, with the helpers they call) write and read it, flagged where frame threads
+  could see another picture's value. Heuristic: check each flag by hand.
+- `ft_sim.py <serial log> [finish fraction] [GOP size]`: frame-thread schedule simulation (references, same-layer
+  CABAC chain reset at IRAPs, stacks in coding order, finishes in coding order) for 1-32 threads.
 - `grain_probe/insert_grain_probes.py <tree>`: adds timers to every candidate loop in a throwaway checkout of 2912a239
   and prints, at exit, the speed-up a 2/4/8/16-worker pool would reach with 2 us overhead per task. The probed tree
   compiled; the measurement itself was stopped before it ran (next step 1).
@@ -258,6 +288,5 @@ AI-latency ~2-2.5x.
 1. Run the loop-grain probe on RA/LD/AI and compare each loop's measured speed-up with the estimates above. Use a
    build of `perf/mt/grain_probe` on a throwaway worktree of 2912a239, pinned runs. Then finalise the plan with the
    user, at most 3 review rounds.
-2. Implement P0 with one stack (no behaviour change, bit-exact, same speed), then the round-robin test with K stacks,
-   then P1.
+2. P0 and P1 are done (see Progress). Next is P2, starting with the loop the grain probe ranks first.
 3. Report each step as step % and cumulative % with before/after numbers and commit hashes, one commit per step.

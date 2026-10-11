@@ -112,7 +112,7 @@ void EncLib::create( const int layerId )
   m_cGOPEncoder.m_cBilateralFilter.setInternalBitDepth(m_bitDepth[COMPONENT_Y]);
 #endif
   m_searchStacks.clear();
-  for( int i = 0; i < getSearchStackCount(); i++ )
+  for( int i = 0; i < std::max( getSearchStackCount(), getFrameThreads() ); i++ )
   {
     m_searchStacks.emplace_back( new EncSearchStack );
   }
@@ -131,10 +131,18 @@ void EncLib::create( const int layerId )
   }
 
   m_cLoopFilter.create(floorLog2(m_maxCUWidth) - MIN_CU_LOG2);
+  for( auto& stack: m_searchStacks )
+  {
+    stack->loopFilter.create( floorLog2( m_maxCUWidth ) - MIN_CU_LOG2 );
+  }
 
   if (!m_bLoopFilterDisable && m_encDbOpt)
   {
     m_cLoopFilter.initEncPicYuvBuffer(m_chromaFormatIDC, Size(getSourceWidth(), getSourceHeight()), getMaxCUWidth());
+    for( auto& stack: m_searchStacks )
+    {
+      stack->loopFilter.initEncPicYuvBuffer( m_chromaFormatIDC, Size( getSourceWidth(), getSourceHeight() ), getMaxCUWidth() );
+    }
   }
 
 #if ENABLE_SPLIT_PARALLELISM
@@ -150,6 +158,10 @@ void EncLib::create( const int layerId )
 #else
     m_cReshaper.createEnc( getSourceWidth(), getSourceHeight(), m_maxCUWidth, m_maxCUHeight, m_bitDepth[COMPONENT_Y]);
 #endif
+  }
+  for( auto& stack: m_searchStacks )
+  {
+    stack->reshaper = m_cReshaper;
   }
   if ( m_RCEnableRateControl )
   {
@@ -233,6 +245,10 @@ void EncLib::destroy ()
   }
   m_cEncSAO.            destroy();
   m_cLoopFilter.        destroy();
+  for( auto& stack: m_searchStacks )
+  {
+    stack->loopFilter.destroy();
+  }
   m_cRateCtrl.          destroy();
 #if ENABLE_SPLIT_PARALLELISM
   for (int jId = 0; jId < m_numCuEncStacks; jId++)
@@ -651,7 +667,7 @@ void EncLib::init( bool isFieldCoding, AUWriterIf* auWriterIf )
                             &stack.rdCost,
                             cabacEstimator,
                             &stack.ctxCache, m_maxCUWidth, m_maxCUHeight, floorLog2(m_maxCUWidth) - m_log2MinCUSize
-                          , &m_cReshaper
+                          , &stack.reshaper
                           , sps0.getBitDepth(CHANNEL_TYPE_LUMA)
     );
     stack.interSearch.init( this,
@@ -664,7 +680,7 @@ void EncLib::init( bool isFieldCoding, AUWriterIf* auWriterIf )
                             m_motionEstimationSearchMethod,
                             getUseCompositeRef(),
       m_maxCUWidth, m_maxCUHeight, floorLog2(m_maxCUWidth) - m_log2MinCUSize, &stack.rdCost, cabacEstimator, &stack.ctxCache
-                          , &m_cReshaper
+                          , &stack.reshaper
 #if JVET_Z0153_IBC_EXT_REF
                           , pps0.getPicWidthInLumaSamples()
 #if JVET_AJ0172_IBC_ITMP_ALIGN_REF_AREA
@@ -682,14 +698,6 @@ void EncLib::init( bool isFieldCoding, AUWriterIf* auWriterIf )
 #if JVET_AH0200_INTRA_TMP_BV_REORDER
     stack.intraSearch.setInterPrediction( &stack.interSearch );
 #endif
-  }
-  // what passes from picture to picture in coding order lives in the first stack
-  for( int i = 1; i < getNumSearchStacks(); i++ )
-  {
-#if JVET_Z0135_TEMP_CABAC_WIN_WEIGHT
-    m_searchStacks[i]->cabacEncoder.shareCABACDataStore( m_searchStacks[0]->cabacEncoder );
-#endif
-    m_searchStacks[i]->sliceEncoder.shareCarry( m_searchStacks[0]->sliceEncoder );
   }
   m_iMaxRefPicNum = 0;
 
@@ -1170,12 +1178,28 @@ bool EncLib::encodePrep(bool flush, PelStorage* pcPicYuvOrg, const InputColourSp
 bool EncLib::encode( const InputColourSpaceConversion snrCSC, std::list<PelUnitBuf*>& rcListPicYuvRecOut, int& iNumEncoded )
 {
   // compress GOP
-  m_cGOPEncoder.compressGOP(m_iPOCLast, m_iNumPicRcvd, m_cListPic, rcListPicYuvRecOut, false, false, snrCSC,
-                            m_printFrameMSE,
+  if( getFrameThreads() > 1 )
+  {
+    // the first call encodes all pictures of the GOP (the first picture of the sequence is a GOP of its own)
+    if( m_picIdInGOP == 0 )
+    {
+      m_cGOPEncoder.compressGOPFrameThreads( m_iPOCLast ? m_iGOPSize : 1, m_iPOCLast, m_iNumPicRcvd, m_cListPic,
+                                             rcListPicYuvRecOut, false, false, snrCSC, m_printFrameMSE,
 #if MSSIM_UNIFORM_METRICS_LOG
-                            m_printMSSSIM,
+                                             m_printMSSSIM,
 #endif
-                            false, m_picIdInGOP);
+                                             false );
+    }
+  }
+  else
+  {
+    m_cGOPEncoder.compressGOP(m_iPOCLast, m_iNumPicRcvd, m_cListPic, rcListPicYuvRecOut, false, false, snrCSC,
+                              m_printFrameMSE,
+#if MSSIM_UNIFORM_METRICS_LOG
+                              m_printMSSSIM,
+#endif
+                              false, m_picIdInGOP);
+  }
 
   m_picIdInGOP++;
 

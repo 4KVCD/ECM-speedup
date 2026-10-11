@@ -1989,6 +1989,7 @@ bool EncAppCfg::parseCfg( int argc, char* argv[] )
   ("ForceSingleSplitThread",                          m_forceSplitSequential,                   false, "Force single thread execution even if taking the parallelized path")
   ("NumWppThreads",                                   m_numWppThreads,                              1, "Number of threads used to run WPP-style parallelization")
   ("SearchStacks",                                    m_searchStackCount,                           1, "Check of the multithreading infrastructure: number of mode-search stacks, which the pictures use in turn (one thread; the output does not change)")
+  ("FrameThreads",                                    m_frameThreads,                               1, "Number of pictures of a GOP encoded at the same time (threads); the output does not change")
   ("NumWppExtraLines",                                m_numWppExtraLines,                           0, "Number of additional wpp lines to switch when threads are blocked")
   ("DebugCTU",                                        m_debugCTU,                                  -1, "If DebugBitstream is present, load frames up to this POC from this bitstream. Starting with DebugPOC-frame at CTUline containin debug CTU.")
   ("EnsureWppBitEqual",                               m_ensureWppBitEqual,                      false, "Ensure the results are equal to results with WPP-style parallelism, even if WPP is off")
@@ -3935,6 +3936,30 @@ bool EncAppCfg::xCheckParameter()
 
   xConfirmPara( m_numWppThreads != 1, "ENABLE_WPP_PARALLELISM is disabled, numWppThreads has to be 1" );
   xConfirmPara( m_searchStackCount < 1 || m_searchStackCount > 64, "SearchStacks must be in the range 1..64" );
+  xConfirmPara( m_frameThreads < 1 || m_frameThreads > 64, "FrameThreads must be in the range 1..64" );
+  if( m_frameThreads > 1 )
+  {
+    // frame threads keep every picture's state apart; these tools share state between pictures in other ways
+    xConfirmPara( m_RCEnableRateControl, "FrameThreads does not support rate control" );
+    xConfirmPara( m_isField, "FrameThreads does not support field coding" );
+    xConfirmPara( m_compositeRefEnabled, "FrameThreads does not support the composite reference" );
+    xConfirmPara( m_HashME, "FrameThreads does not support hash motion estimation" );
+    xConfirmPara( m_bUsePerceptQPA, "FrameThreads does not support PerceptQPA" );
+    xConfirmPara( m_uiDeltaQpRD > 0, "FrameThreads does not support DeltaQpRD" );
+    xConfirmPara( m_subPicInfoPresentFlag, "FrameThreads does not support subpictures" );
+    xConfirmPara( m_resChangeInClvsEnabled || m_scalingRatioHor != 1.0 || m_scalingRatioVer != 1.0, "FrameThreads does not support reference picture resampling" );
+    xConfirmPara( !m_decodeBitstreams[0].empty() || !m_decodeBitstreams[1].empty(), "FrameThreads does not support DecodeBitstream" );
+    xConfirmPara( m_maxLayers > 1, "FrameThreads supports one layer" );
+#if JVET_Z0118_GDR
+    xConfirmPara( m_gdrEnabled, "FrameThreads does not support GDR" );
+#endif
+#if JVET_Y0240_BIM
+    xConfirmPara( m_bimEnabled, "FrameThreads does not support BIM" );
+#endif
+#if NN_LF_UNIFIED
+    xConfirmPara( m_nnlfUnified, "FrameThreads does not support the NN loop filter" );
+#endif
+  }
   xConfirmPara( m_ensureWppBitEqual, "ENABLE_WPP_PARALLELISM is disabled, cannot ensure being WPP bit-equal" );
 
 

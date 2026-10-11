@@ -1134,6 +1134,7 @@ protected:
 
   CfgVPSParameters m_cfgVPSParameters;
   int         m_searchStackCount = 1;   ///< number of mode-search stacks (EncSearchStack), used by the pictures in turn
+  int         m_frameThreads     = 1;   ///< pictures of a GOP encoded at the same time (each needs a search stack)
 
 #if ENABLE_SPLIT_PARALLELISM
   int         m_numSplitThreads;
@@ -3097,6 +3098,8 @@ public:
   int          getDebugCTU()                                   const { return m_debugCTU; }
   void         setSearchStackCount( int n )                          { m_searchStackCount = n; }
   int          getSearchStackCount()                           const { return m_searchStackCount; }
+  void         setFrameThreads( int n )                              { m_frameThreads = n; }
+  int          getFrameThreads()                               const { return m_frameThreads; }
 
 #if ENABLE_SPLIT_PARALLELISM
   void         setNumSplitThreads( int n )                           { m_numSplitThreads = n; }

@@ -57,16 +57,6 @@ class EncGOP;
 // Class definition
 // ====================================================================================================================
 
-/// What a slice encoder passes on to the next picture in coding order; the slice encoders of all search stacks
-/// share one (EncLib::init).
-struct EncSliceCarry
-{
-  SliceType               encCABACTableIdx = I_SLICE;   ///< CABAC init table of the last slice written (cabac_init_flag)
-#if JVET_AG0098_AMVP_WITH_SBTMVP
-  std::map<int, uint32_t> amvpSbTmvpArea;               ///< AMVP-SbTMVP area of the last picture per temporal layer
-#endif
-};
-
 /// slice encoder class
 class EncSlice
   : public WeightPredAnalysis
@@ -102,8 +92,8 @@ private:
   RateCtrl*               m_pcRateCtrl;                         ///< Rate control manager
   uint32_t                    m_uiSliceSegmentIdx;
   Ctx                     m_entropyCodingSyncContextState;      ///< context storage for state of contexts at the wavefront/WPP/entropy-coding-sync second CTU of tile-row
-  EncSliceCarry           m_ownCarry;
-  EncSliceCarry*          m_carry = &m_ownCarry;
+  EncReshape*             m_pcReshaper = nullptr;   ///< the reshaper of the search stack
+  SliceType               m_encCABACTableIdx;
   PLTBuf                  m_palettePredictorSyncState;
 #if SHARP_LUMA_DELTA_QP || ENABLE_QPA_SUB_CTU
   int                     m_gopID;
@@ -158,33 +148,41 @@ public:
   uint32_t    getSliceSegmentIdx  ()                    { return m_uiSliceSegmentIdx;       }
   void    setSliceSegmentIdx  (uint32_t i)              { m_uiSliceSegmentIdx = i;          }
 
-  SliceType getEncCABACTableIdx() const             { return m_carry->encCABACTableIdx; }
-  void    setEncCABACTableIdx (SliceType b)         { m_carry->encCABACTableIdx = b; }
-  /// From now on, this slice encoder reads and writes the carry-over state of another one.
-  void    shareCarry          ( EncSlice& other )   { m_carry = other.m_carry; }
+  SliceType getEncCABACTableIdx() const             { return m_encCABACTableIdx;        }
+  void    setEncCABACTableIdx (SliceType b)         { m_encCABACTableIdx = b; }
 
 #if JVET_Z0135_TEMP_CABAC_WIN_WEIGHT
   CABACDataStore* getCABACDataStore()                  { return m_CABACWriter->m_CABACDataStore; }
 #endif
 
 #if JVET_AG0098_AMVP_WITH_SBTMVP
+  std::map<int, uint32_t> m_amvpSbTmvpArea;
   uint32_t                m_picAmvpSbTmvpEnabledArea = 0;   ///< area of the AMVP-SbTMVP blocks the slice writer coded
   void clearAmvpSbTmvpStatArea(const Slice* slice)
   {
     if (slice->getPendingRasInit() || slice->isInterGDR())
     {
-      m_carry->amvpSbTmvpArea.clear();
+      m_amvpSbTmvpArea.clear();
+    }
+  }
+  /// Makes the stored areas one entry: the given area for the temporal layer (exists false: nothing).
+  void setOnlyAmvpSbTmvpStatArea(const int Tlayer, const bool exists, const uint32_t enabledArea)
+  {
+    m_amvpSbTmvpArea.clear();
+    if (exists)
+    {
+      m_amvpSbTmvpArea[Tlayer] = enabledArea;
     }
   }
   void storeAmvpSbTmvpStatArea(const int Tlayer, const uint32_t enabledArea)
   {
-    m_carry->amvpSbTmvpArea[Tlayer] = enabledArea;
+    m_amvpSbTmvpArea[Tlayer] = enabledArea;
   }
   bool loadAmvpSbTmvpStatArea(const int Tlayer, uint32_t& enabledArea)
   {
-    if (m_carry->amvpSbTmvpArea.find(Tlayer) != m_carry->amvpSbTmvpArea.end())
+    if (m_amvpSbTmvpArea.find(Tlayer) != m_amvpSbTmvpArea.end())
     {
-      enabledArea = m_carry->amvpSbTmvpArea[Tlayer];
+      enabledArea = m_amvpSbTmvpArea[Tlayer];
       return true;
     }
     return false;

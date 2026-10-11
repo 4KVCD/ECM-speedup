@@ -37,8 +37,8 @@
     The RD search allocates and frees many small, short-lived std::vector buffers; the Windows heap spends ~1.3 %
     of the encoding time on them. Blocks of up to 1 KB come from per-size-class free lists (memory is kept for reuse,
     never returned), larger ones from malloc. Every block starts with a 16-byte header holding its size class, so
-    blocks stay 16-byte aligned and delete knows where a block came from. A spinlock makes it thread-safe (the
-    encoder itself is single-threaded, so the lock is uncontended). Over-aligned new/delete keep their defaults.
+    blocks stay 16-byte aligned and delete knows where a block came from. A spinlock makes it thread-safe (with
+    FrameThreads the pictures' threads share it). Over-aligned new/delete keep their defaults.
 
     Canary build (-DFASTALLOC_CANARY=1, for testing only): every block gets 16 guard bytes right after the requested
     size and a magic word in its header; fresh blocks are filled with 0xCB and freed blocks poisoned with 0xDD. Delete
