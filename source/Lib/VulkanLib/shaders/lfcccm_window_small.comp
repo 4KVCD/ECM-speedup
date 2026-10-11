@@ -1,0 +1,9 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+// LF-CCCM windows whose regression window has at most SMALL_SAMPLES samples, see lfcccm_window.glsl.
+#define WG    64
+#define SMALL 1
+layout( local_size_x = WG ) in;
+#include "lfcccm_window.glsl"

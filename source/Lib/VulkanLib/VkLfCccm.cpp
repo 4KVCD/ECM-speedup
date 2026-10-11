@@ -47,7 +47,7 @@
 namespace vkd
 {
 
-// Layouts shared with lfcccm_down.comp, lfcccm_window.comp and lfcccm_apply.comp.
+// Layouts shared with lfcccm_down.comp, lfcccm_window.glsl and lfcccm_apply.comp.
 struct LfCccmDownPush
 {
   uint64_t luma, dst;
@@ -63,6 +63,7 @@ struct LfCccmWindowPush
   int32_t  downOrigin, downStride, picOrigin[2], picStride[2], updOrigin[2], updStride;
   int32_t  bitDepthC, lumaOffset, clpMax[2], clpMin[2], impMode, badThr[3];
   uint64_t stats;
+  int32_t  numWindows;   // lfcccm_window_tiny only
 };
 struct LfCccmApplyPush
 {
@@ -115,7 +116,10 @@ void VkLoopFilter::lfCccm( CodingStructure& cs, int impMode )
   // the windows of the CTUs with LF-CCCM on, without those that lfCccmWindowProcess skips
   static const Size windowSizes[8] = { Size( 4, 4 ), Size( 8, 2 ), Size( 2, 8 ), Size( 8, 8 ), Size( 16, 16 ), Size( 32, 32 ), Size( 64, 64 ), Size( 128, 128 ) };
   static const int  modelSizes[8]  = { 7, 2, 3, 6, 5, 5, 11, 10 };
-  std::vector<GpuLfCccmWindow> windows;
+  // By the size of the regression window: lfcccm_window_tiny runs one window per invocation (up to 100 samples,
+  // windows up to 8x8), lfcccm_window_small one per workgroup of 64 (SMALL_SAMPLES in lfcccm_window.glsl),
+  // lfcccm_window one per workgroup of 256. m_lfWindows holds them in this order.
+  std::vector<GpuLfCccmWindow> windows, small, large;
   for( int ctu = 0; ctu < pcv.sizeInCtus; ctu++ )
   {
     if( !slice.m_lfCccmEnabled.at( ctu ) )
@@ -154,10 +158,13 @@ void VkLoopFilter::lfCccm( CodingStructure& cs, int impMode )
         {
           continue;
         }
-        windows.push_back( w );
+        ( w.rw * w.rh <= 100 ? windows : w.rw * w.rh <= 1024 ? small : large ).push_back( w );
       }
     }
   }
+  const size_t numTiny = windows.size(), numSmall = small.size();
+  windows.insert( windows.end(), small.begin(), small.end() );
+  windows.insert( windows.end(), large.begin(), large.end() );
   ensureBuffer( m_lfWindows, std::max<size_t>( windows.size(), 1 ) * sizeof( GpuLfCccmWindow ), Mem::HostWrite );
   if( !windows.empty() )
   {
@@ -217,9 +224,26 @@ void VkLoopFilter::lfCccm( CodingStructure& cs, int impMode )
   m_core->copy( m_pic.buffer(), m_lfCorr, 0, 0, m_pic.buffer().size );
   m_core->dispatch( "lfcccm_down", uint32_t( ( widthC + 2 + 15 ) / 16 ), uint32_t( ( heightC + 2 + 15 ) / 16 ), 1, &down, sizeof( down ), true );
   m_core->barrier();
+  if( numTiny )
+  {
+    LfCccmWindowPush wpTiny = wp;
+    wpTiny.numWindows = int32_t( numTiny );
+    m_core->dispatch( "lfcccm_window_tiny", uint32_t( ( numTiny + 63 ) / 64 ), 1, 1, &wpTiny, sizeof( wpTiny ), true );
+  }
+  if( numSmall )
+  {
+    LfCccmWindowPush wpSmall = wp;
+    wpSmall.windows += numTiny * sizeof( GpuLfCccmWindow );
+    m_core->dispatch( "lfcccm_window_small", uint32_t( numSmall ), 1, 1, &wpSmall, sizeof( wpSmall ), true );
+  }
+  if( windows.size() > numTiny + numSmall )
+  {
+    LfCccmWindowPush wpLarge = wp;
+    wpLarge.windows += ( numTiny + numSmall ) * sizeof( GpuLfCccmWindow );
+    m_core->dispatch( "lfcccm_window", uint32_t( windows.size() - numTiny - numSmall ), 1, 1, &wpLarge, sizeof( wpLarge ), true );
+  }
   if( !windows.empty() )
   {
-    m_core->dispatch( "lfcccm_window", uint32_t( windows.size() ), 1, 1, &wp, sizeof( wp ), true );
     m_core->barrier();
   }
   m_core->dispatch( "lfcccm_apply", uint32_t( ( widthC + 15 ) / 16 ), uint32_t( ( heightC + 15 ) / 16 ), 2, &ap, sizeof( ap ) );

@@ -17,7 +17,9 @@ layout( push_constant, scalar ) uniform Push
   AlfTiles     tiles;
 } pc;
 
-AlfParams P;
+// The parameters are read in place: a copy of AlfParams in a global variable loads every field in every invocation,
+// which took as long as the filtering itself.
+#define P pc.params.p
 
 int src( int c, int x, int y ) { return int( P.src.v[P.srcOrigin[c] + y * P.srcStride[c] + x] ); }
 int db( int c, int x, int y ) { return int( P.db.v[P.dbOrigin[c] + y * P.dbStride[c] + x] ); }
@@ -184,7 +186,6 @@ void main()
   {
     return;
   }
-  P = pc.params.p;
   const int x = tile.x + lx, y = tile.y + ly;
   const int plane = tile.plane;
   const int blk = ( y >> 1 ) * P.clsStride + ( x >> 1 );

@@ -1,0 +1,467 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+// LF-CCCM windows with small regression windows (VkLoopFilter::lfCccm sends those of up to 100 samples, the windows
+// up to 8x8), one window per invocation: LoopFilterCccm::lfCccmWindowProcess run sequentially, as on the CPU. Any
+// size gives the right result; larger ones would only leave the other invocations of the subgroup waiting. See
+// lfcccm_window.glsl for the sequence of model fits and the quirks kept.
+
+layout( local_size_x = 64 ) in;
+
+struct LfCccmWindow
+{
+  int wx, wy, ww, wh;
+  int rx, ry, rw, rh;
+  int modelType;
+  int skip;
+};
+layout( buffer_reference, scalar, buffer_reference_align = 4 ) buffer LfCccmWindows { LfCccmWindow w[]; };
+
+layout( push_constant, scalar ) uniform Push
+{
+  I16Buf        down;
+  I16Buf        pic;
+  I16Buf        update;
+  LfCccmWindows windows;
+  int           downOrigin, downStride;
+  int           picOrigin[2], picStride[2];
+  int           updOrigin[2], updStride;
+  int           bitDepthC;
+  int           lumaOffset;
+  int           clpMax[2];
+  int           clpMin[2];
+  int           impMode;
+  int           badThr[3];
+  U32Buf        stats;
+  int           numWindows;
+} pc;
+
+const int MAXP = 11;
+
+const int STAT_FEW_SAMPLES   = 0;
+const int STAT_TOO_FEW       = 1;
+const int STAT_INVALID_MODEL = 2;
+const int STAT_STOPPED       = 3;
+const int STAT_SUB_MODELS    = 4;
+const int STAT_STEPS         = 5;
+
+void count( int stat )
+{
+  if( uint64_t( pc.stats ) != 0 )
+  {
+    atomicAdd( pc.stats.v[stat], 1 );
+  }
+}
+
+LfCccmWindow W;
+int          bdC, decimBits;
+int          modelType, modelSize, modelTypeTmp;
+int          multiModel, multiModelSR, threshold, thresholdSR, badThr;
+bool         isFR, bad, badSR, lessThan;
+int64_t      C[MAXP][MAXP + 2];
+int64_t      params[2][MAXP];
+
+int down( int x, int y ) { return int( pc.down.v[pc.downOrigin + y * pc.downStride + x] ); }
+int chroma( int c, int x, int y ) { return int( pc.pic.v[pc.picOrigin[c] + y * pc.picStride[c] + x] ); }
+void setUpdate( int c, int x, int y, int v ) { pc.update.v[pc.updOrigin[c] + y * pc.updStride + x] = int16_t( v ); }
+
+int modelSizeOf( int type )
+{
+  const int sizes[8] = { 7, 2, 3, 6, 5, 5, 11, 10 };
+  return sizes[type];
+}
+
+int nonlinear( int v ) { return int( int16_t( ( v * v + ( 1 << ( bdC - 1 ) ) ) >> bdC ) ); }
+
+// lfCccmCollectData for all inputs of a sample
+void aValues( int type, int x, int y, out int a[MAXP] )
+{
+  const int c = down( x, y );
+  const int n = down( x, y - 1 ), s = down( x, y + 1 ), w = down( x - 1, y ), e = down( x + 1, y );
+  switch( type )
+  {
+  case 0: a[0] = c; a[1] = n; a[2] = s; a[3] = w; a[4] = e; a[5] = nonlinear( c ); break;
+  case 1: a[0] = c; break;
+  case 2: a[0] = c; a[1] = nonlinear( c ); break;
+  case 3: a[0] = c; a[1] = n; a[2] = s; a[3] = w; a[4] = e; break;
+  case 4: a[0] = c; a[1] = w; a[2] = e; a[3] = nonlinear( c ); break;
+  case 5: a[0] = c; a[1] = n; a[2] = s; a[3] = nonlinear( c ); break;
+  case 6:
+  case 7:
+    a[0] = c; a[1] = n; a[2] = s; a[3] = w; a[4] = e;
+    a[5] = down( x - 1, y - 1 ); a[6] = down( x + 1, y - 1 ); a[7] = down( x - 1, y + 1 ); a[8] = down( x + 1, y + 1 );
+    if( type == 6 )
+    {
+      a[9] = nonlinear( c );
+    }
+    break;
+  }
+  a[modelSizeOf( type ) - 1] = pc.lumaOffset;
+}
+
+bool selected( int v )
+{
+  if( multiModel == 1 && v >= threshold ) return false;
+  if( multiModel == 2 && v < threshold ) return false;
+  if( multiModelSR == 1 && v >= thresholdSR ) return false;
+  if( multiModelSR == 2 && v < thresholdSR ) return false;
+  return true;
+}
+
+int floorLog2U64( uint64_t v )
+{
+  const uint hi = uint( v >> 32 );
+  return hi != 0 ? 32 + findMSB( hi ) : findMSB( uint( v ) );
+}
+
+int ceilLog2( int v ) { return v == 0 ? -1 : findMSB( uint( v - 1 ) ) + 1; }
+
+// xGetDivScaleRoundShift, with x86's shift count modulo 32 in the int rounding term
+void divScaleRoundShift( int64_t denom, out int scale, out int round, out int shift )
+{
+  const int pow2W[8] = { 214, 153, 113, 86, 67, 53, 43, 35 };
+  const int pow2O[8] = { 4822, 5952, 6624, 6792, 6408, 5424, 3792, 1466 };
+  const int pow2B[8] = { 12784, 12054, 11670, 11583, 11764, 12195, 12870, 13782 };
+  shift = floorLog2U64( uint64_t( denom ) );
+  round = ( 1 << ( shift & 31 ) ) >> 1;
+  const int normDiff  = int( ( ( ( denom << 14 ) + int64_t( round ) ) >> shift ) & int64_t( ( 1 << 14 ) - 1 ) );
+  const int diffFull  = normDiff >> 11;
+  const int normDiff2 = normDiff - pow2O[diffFull];
+  scale = ( ( pow2W[diffFull] * ( ( normDiff2 * normDiff2 ) >> 14 ) ) >> 8 ) - ( normDiff2 >> 1 ) + pow2B[diffFull];
+  scale <<= decimBits - 14;
+}
+
+int64_t fixedMult( int64_t x, int64_t y, int64_t round, int bits ) { return ( x * y + round ) >> bits; }
+
+// CccmCovariance::solve3 with interCccmMode; C holds ATA (upper triangle) and ATCb, ATCr in its last 2 columns
+void solve3( int n, int offsetCb, int offsetCr, bool hasNonLinearTerm, bool regularization )
+{
+  const int np = modelSize;
+  int regParam = 0;
+  if( regularization )
+  {
+    const int sampleNums[5] = { 16, 32, 64, 256, 1024 };
+    const int regParams[6]  = { 192, 160, 128, 96, 64, 32 };
+    int cnt = 0;
+    while( cnt < 5 && n > sampleNums[cnt] )
+    {
+      cnt++;
+    }
+    regParam = regParams[cnt] * np;
+  }
+  const int loopNum = hasNonLinearTerm ? np - 2 : np - 1;
+  for( int i = 0; i < loopNum; i++ )
+  {
+    C[i][i] += regParam;
+  }
+  for( int i = 0; i < np; i++ )
+  {
+    C[i][np]     -= ( C[i][np - 1] * int64_t( offsetCb ) ) >> ( bdC - 1 );
+    C[i][np + 1] -= ( C[i][np - 1] * int64_t( offsetCr ) ) >> ( bdC - 1 );
+  }
+  const int matrixShift = ( bdC > 10 ? 32 : 28 ) - 2 * bdC - ceilLog2( n );
+  for( int i = 0; i < np; i++ )
+  {
+    for( int j = i; j < np + 2; j++ )
+    {
+      C[i][j] = matrixShift > 0 ? C[i][j] << matrixShift : C[i][j] >> -matrixShift;
+    }
+  }
+  // gaussElimination: the lower triangle from the upper one, regularization 1
+  for( int i = 0; i < np; i++ )
+  {
+    for( int j = 0; j < i; j++ )
+    {
+      C[i][j] = C[j][i];
+    }
+    C[i][i] += 1;
+  }
+  const int64_t decimRound = int64_t( 1 ) << ( decimBits - 1 );
+  for( int i = 0; i < np; i++ )
+  {
+    const int64_t diag = C[i][i] < 1 ? 1 : C[i][i];
+    int scale, round, shift;
+    divScaleRoundShift( diag, scale, round, shift );
+    for( int j = i + 1; j < np + 2; j++ )
+    {
+      C[i][j] = ( C[i][j] * int64_t( scale ) + int64_t( round ) ) >> shift;
+    }
+    for( int j = i + 1; j < np; j++ )
+    {
+      const int64_t s = C[j][i];
+      for( int k = i + 1; k < np + 2; k++ )
+      {
+        C[j][k] -= fixedMult( s, C[i][k], decimRound, decimBits );
+      }
+    }
+  }
+  for( int f = 0; f < 2; f++ )
+  {
+    const int col = np + f;
+    params[f][np - 1] = C[np - 1][col];
+    for( int i = np - 2; i >= 0; i-- )
+    {
+      int64_t x = C[i][col];
+      for( int j = i + 1; j < np; j++ )
+      {
+        x -= fixedMult( C[i][j], params[f][j], decimRound, decimBits );
+      }
+      params[f][i] = x;
+    }
+  }
+  params[0][np - 1] += int64_t( offsetCb ) << ( decimBits - ( bdC - 1 ) );
+  params[1][np - 1] += int64_t( offsetCr ) << ( decimBits - ( bdC - 1 ) );
+}
+
+int convolve( int f, int a[MAXP] )
+{
+  int64_t sum = 0;
+  for( int i = 0; i < modelSize; i++ )
+  {
+    sum += params[f][i] * int64_t( a[i] );
+  }
+  const int v = int( int16_t( ( sum + ( int64_t( 1 ) << ( decimBits - 1 ) ) ) >> decimBits ) );
+  return clamp( v, pc.clpMin[f], pc.clpMax[f] );
+}
+
+int updateValue( int cur, int out_ )
+{
+  switch( pc.impMode )
+  {
+  case 0: return ( cur + out_ + 1 ) >> 1;
+  case 1: return ( cur + 3 * out_ + 2 ) >> 2;
+  case 2: return ( 3 * cur + 5 * out_ + 4 ) >> 3;
+  case 3: return ( 5 * cur + 3 * out_ + 4 ) >> 3;
+  default: return ( 3 * cur + out_ + 2 ) >> 2;
+  }
+}
+
+void markBad()
+{
+  if( isFR )
+  {
+    bad = true;
+  }
+  else
+  {
+    badSR = true;
+  }
+}
+
+// lfCccmFiltersConvolution
+void step( bool hasNonLinearTerm, bool regularization )
+{
+  lessThan = false;
+  int n = 0, sumCb = 0, sumCr = 0;
+  for( int y = W.ry; y < W.ry + W.rh; y++ )
+  {
+    for( int x = W.rx; x < W.rx + W.rw; x++ )
+    {
+      if( selected( down( x, y ) ) )
+      {
+        n++;
+        sumCb += chroma( 0, x, y );
+        sumCr += chroma( 1, x, y );
+      }
+    }
+  }
+  count( STAT_STEPS );
+  if( n < modelSize )
+  {
+    // lfCccmUpdateStatus
+    lessThan = true;
+    modelTypeTmp = modelType;
+    count( STAT_FEW_SAMPLES );
+    if( n >= 7 )
+    {
+      modelType = 0;
+      modelSize = 7;
+    }
+    else if( n >= 3 )
+    {
+      modelType = 2;
+      modelSize = 3;
+    }
+    if( n < modelSize )
+    {
+      count( STAT_TOO_FEW );
+      markBad();
+      return;
+    }
+  }
+  const int offsetCb = int( int16_t( ( int( int16_t( sumCb ) ) + n / 2 ) / n ) );
+  const int offsetCr = int( int16_t( ( int( int16_t( sumCr ) ) + n / 2 ) / n ) );
+
+  const int np = modelSize;
+  for( int i = 0; i < np; i++ )
+  {
+    for( int j = i; j < np + 2; j++ )
+    {
+      C[i][j] = 0;
+    }
+  }
+  for( int y = W.ry; y < W.ry + W.rh; y++ )
+  {
+    for( int x = W.rx; x < W.rx + W.rw; x++ )
+    {
+      if( selected( down( x, y ) ) )
+      {
+        int a[MAXP];
+        aValues( modelType, x, y, a );
+        const int cb = chroma( 0, x, y ), cr = chroma( 1, x, y );
+        for( int i = 0; i < np; i++ )
+        {
+          for( int j = i; j < np; j++ )
+          {
+            C[i][j] += int64_t( a[i] * a[j] );
+          }
+          C[i][np]     += int64_t( a[i] * cb );
+          C[i][np + 1] += int64_t( a[i] * cr );
+        }
+      }
+    }
+  }
+  solve3( n, offsetCb, offsetCr, hasNonLinearTerm, regularization );
+  bool valid = true;
+  for( int f = 0; f < 2; f++ )
+  {
+    for( int i = 0; i < np; i++ )
+    {
+      const int64_t p = params[f][i];
+      valid = valid && ( p < 0 ? -p : p ) <= ( int64_t( 4 ) << decimBits );
+    }
+  }
+  if( !valid )
+  {
+    count( STAT_INVALID_MODEL );
+    if( lessThan )
+    {
+      modelType = modelTypeTmp;
+      modelSize = modelSizeOf( modelType );
+    }
+    markBad();
+    return;
+  }
+
+  bool stop = false;
+  for( int y = W.wy; y < W.wy + W.wh && !stop; y++ )
+  {
+    for( int x = W.wx; x < W.wx + W.ww && !stop; x++ )
+    {
+      if( !selected( down( x, y ) ) )
+      {
+        continue;
+      }
+      int a[MAXP];
+      aValues( modelType, x, y, a );
+      const int curCb = chroma( 0, x, y ), curCr = chroma( 1, x, y );
+      const int outCb = convolve( 0, a ), outCr = convolve( 1, a );
+      if( abs( curCb - outCb ) > badThr || abs( curCr - outCr ) > badThr )
+      {
+        markBad();
+        stop = true;
+        count( STAT_STOPPED );
+      }
+      setUpdate( 0, x, y, updateValue( curCb, outCb ) );
+      setUpdate( 1, x, y, updateValue( curCr, outCr ) );
+    }
+  }
+  if( lessThan )
+  {
+    // lfCccmRecoverStatus
+    modelType = modelTypeTmp;
+    modelSize = modelSizeOf( modelType );
+  }
+}
+
+void dealWithBadWindow()
+{
+  if( !isFR && !badSR )
+  {
+    return;
+  }
+  for( int y = W.wy; y < W.wy + W.wh; y++ )
+  {
+    for( int x = W.wx; x < W.wx + W.ww; x++ )
+    {
+      if( selected( down( x, y ) ) )
+      {
+        setUpdate( 0, x, y, chroma( 0, x, y ) );
+        setUpdate( 1, x, y, chroma( 1, x, y ) );
+      }
+    }
+  }
+}
+
+void setThresholdSR()
+{
+  int n = 0, sum = 0;
+  for( int y = W.ry; y < W.ry + W.rh; y++ )
+  {
+    for( int x = W.rx; x < W.rx + W.rw; x++ )
+    {
+      const int v = down( x, y );
+      if( ( multiModel == 1 && v >= threshold ) || ( multiModel == 2 && v < threshold ) )
+      {
+        continue;
+      }
+      n++;
+      sum += v;
+    }
+  }
+  thresholdSR = n == 0 ? 0 : int( int16_t( ( int( int16_t( sum ) ) + ( n >> 1 ) ) / n ) );
+}
+
+void main()
+{
+  if( int( gl_GlobalInvocationID.x ) >= pc.numWindows )
+  {
+    return;
+  }
+  W   = pc.windows.w[gl_GlobalInvocationID.x];
+  bdC = pc.bitDepthC;
+  decimBits = bdC > 10 ? 22 : 16;
+  const bool regularization = W.rw * W.rh <= 4096;
+  const bool hasNonLinearTerm = W.modelType != 1 && W.modelType != 3 && W.modelType != 7;
+  modelType = W.modelType;
+  modelSize = modelSizeOf( W.modelType );
+
+  int sum = 0;
+  for( int y = W.ry; y < W.ry + W.rh; y++ )
+  {
+    for( int x = W.rx; x < W.rx + W.rw; x++ )
+    {
+      sum += down( x, y );
+    }
+  }
+  const int nReg = W.rw * W.rh;
+  threshold = int( int16_t( ( int64_t( sum ) + int64_t( nReg >> 1 ) ) / int64_t( nReg ) ) );
+  badThr = pc.badThr[regularization ? 2 : 0];
+
+  for( int mm = 1; mm <= 2; mm++ )
+  {
+    bad = false;
+    multiModel = mm;
+    isFR = true;
+    multiModelSR = -1;
+    step( hasNonLinearTerm, regularization );
+    if( W.skip == 0 && !lessThan && bad )
+    {
+      isFR = false;
+      count( STAT_SUB_MODELS );
+      setThresholdSR();
+      for( int sr = 1; sr <= 2; sr++ )
+      {
+        badSR = false;
+        multiModelSR = sr;
+        step( hasNonLinearTerm, regularization );
+        dealWithBadWindow();
+      }
+    }
+    else if( bad )
+    {
+      dealWithBadWindow();
+    }
+  }
+}

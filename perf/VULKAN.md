@@ -116,10 +116,19 @@ CTUs with luma ALF off.
 ### LF-CCCM
 
 LF-CCCM (`LoopFilterCccm`) fits linear models of chroma from the downsampled luma per window of each CTU and adds
-the change after ALF. The GPU computes the downsampled luma for the whole picture, then one workgroup per window
-runs the CPU's sequence of up to 6 model fits: the statistics over the regression window are spread over the
-invocations, the integer Gaussian elimination of `CccmCovariance::solve3` runs on one, and the model is applied in
-parallel up to the first sample (in raster order) that deviates too much, which is where the CPU's loop stops.
+the change after ALF. The GPU computes the downsampled luma for the whole picture, then runs the CPU's sequence of
+up to 6 model fits per window, with one of three kernels chosen by the size of the regression window:
+
+- `lfcccm_window_tiny`, up to 100 samples (windows up to 8x8, most of them): one window per invocation, sequential
+  as on the CPU. A workgroup per window would leave most of its invocations idle.
+- `lfcccm_window_small`, up to 1024 samples: one workgroup of 64 per window; each invocation sums whole statistics
+  terms, the rows of the integer Gaussian elimination of `CccmCovariance::solve3` are updated in parallel one pivot
+  at a time, and the model outputs stay in shared memory.
+- `lfcccm_window`, larger: one workgroup of 256 per window; each invocation sums all terms over its share of the
+  samples.
+
+The model is applied in parallel up to the first sample (in raster order) that deviates too much, which is where the
+CPU's loop stops.
 Quirks kept: the chroma offsets and the sub-model threshold are summed in 16-bit variables on the CPU and wrap; the
 rounding term of `xGetDivScaleRoundShift` shifts by the bit count modulo 32, as x86 does; the regression window at a
 CTU's left or top edge keeps its start and still grows by 2 samples; `clipArea` clips only at the right and bottom.
@@ -141,10 +150,17 @@ CTU's left or top edge keeps its start and still grows by 2 samples; `clipArea` 
 | everything else | CPU | - |
 
 Speed: on the hybrid path the per-picture copies and the synchronous waits cost more than the GPU saves. ra_cif
-(289 frames CIF, decoder pinned to one core of the Core Ultra 7 265K, Intel iGPU), 3 runs each:
+(289 frames CIF, decoder pinned to one core of the Core Ultra 7 265K, Intel iGPU), `perf/vkbench.py`, minimum and
+median of paired runs:
 
-| stages on the GPU | total | GPU time |
+| build | total | GPU time |
 |---|---|---|
-| none | 6.1-6.3 s | - |
-| deblocking, SAO, BIF, CCSAO | 7.3-8.0 s | 0.35-0.44 s |
-| deblocking, SAO, BIF, CCSAO, ALF | 8.5-9.3 s | 1.2-2.1 s |
+| stock ECM-20.0 | 6.53 s, median 6.53 | - |
+| this branch, CPU path | 5.72 s, median 5.91 | - |
+| GPU: deblocking, SAO, BIF, CCSAO | 7.3-8.0 s (3 runs) | 0.35-0.44 s |
+| GPU: + ALF | 8.5-9.3 s (3 runs) | 1.2-2.1 s |
+| GPU: + offset refinement, LF-CCCM with one workgroup per window | 10.10 s, median 10.44 | 3.78 s, median 3.83 |
+| GPU: + LF-CCCM kernels by window size, ALF parameters read in place | 7.94 s, median 8.00 | 1.88 s, median 1.91 |
+
+The GPU time of a stage depends on how busy the GPU is: the iGPU clocks down between submissions, so with less
+work per picture the unchanged stages (deblocking, SAO) take longer.
