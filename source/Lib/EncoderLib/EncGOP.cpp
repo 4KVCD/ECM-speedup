@@ -256,17 +256,26 @@ void EncGOP::init ( EncLib* pcEncLib )
 
 
 #if WCG_EXT
-  if (m_pcCfg->getLmcs())
+  // m_lmcsWeights holds the luma level weights in coding order; every search stack starts with the same
+  std::vector<RdCost*> lumaWeightOwners = { &m_lmcsWeights };
+  for( int i = 0; i < pcEncLib->getNumSearchStacks(); i++ )
   {
-    pcEncLib->getRdCost()->setReshapeInfo(m_pcCfg->getReshapeSignalType(), m_pcCfg->getBitDepth(CHANNEL_TYPE_LUMA));
-    pcEncLib->getRdCost()->initLumaLevelToWeightTableReshape();
+    lumaWeightOwners.push_back( &pcEncLib->getSearchStack( i ).rdCost );
   }
-  else if (m_pcCfg->getLumaLevelToDeltaQPMapping().mode)
+  for( RdCost* rdCost: lumaWeightOwners )
   {
-    pcEncLib->getRdCost()->setReshapeInfo(RESHAPE_SIGNAL_PQ, m_pcCfg->getBitDepth(CHANNEL_TYPE_LUMA));
-    pcEncLib->getRdCost()->initLumaLevelToWeightTableReshape();
+    if (m_pcCfg->getLmcs())
+    {
+      rdCost->setReshapeInfo(m_pcCfg->getReshapeSignalType(), m_pcCfg->getBitDepth(CHANNEL_TYPE_LUMA));
+      rdCost->initLumaLevelToWeightTableReshape();
+    }
+    else if (m_pcCfg->getLumaLevelToDeltaQPMapping().mode)
+    {
+      rdCost->setReshapeInfo(RESHAPE_SIGNAL_PQ, m_pcCfg->getBitDepth(CHANNEL_TYPE_LUMA));
+      rdCost->initLumaLevelToWeightTableReshape();
+    }
   }
-  pcEncLib->getALF()->getLumaLevelWeightTable() = pcEncLib->getRdCost()->getLumaLevelWeightTable();
+  pcEncLib->getALF()->getLumaLevelWeightTable() = m_lmcsWeights.getLumaLevelWeightTable();
   int alfWSSD = 0;
   if (m_pcCfg->getLmcs() && m_pcCfg->getReshapeSignalType() == RESHAPE_SIGNAL_PQ )
   {
@@ -1925,14 +1934,14 @@ void EncGOP::xPicInitLMCS(Picture *pic, PicHeader *picHeader, Slice *slice)
       if (m_pcCfg->getReshapeSignalType() == RESHAPE_SIGNAL_PQ)
       {
         m_pcReshaper->initLUTfromdQPModel();
-        m_pcEncLib->getRdCost()->updateReshapeLumaLevelToWeightTableChromaMD(m_pcReshaper->getInvLUT());
+        m_lmcsWeights.updateReshapeLumaLevelToWeightTableChromaMD(m_pcReshaper->getInvLUT());
       }
       else if (m_pcCfg->getReshapeSignalType() == RESHAPE_SIGNAL_SDR || m_pcCfg->getReshapeSignalType() == RESHAPE_SIGNAL_HLG)
       {
         if (m_pcReshaper->getReshapeFlag())
         {
           m_pcReshaper->constructReshaperLMCS();
-          m_pcEncLib->getRdCost()->updateReshapeLumaLevelToWeightTable(m_pcReshaper->getSliceReshaperInfo(), m_pcReshaper->getWeightTable(), m_pcReshaper->getCWeight());
+          m_lmcsWeights.updateReshapeLumaLevelToWeightTable(m_pcReshaper->getSliceReshaperInfo(), m_pcReshaper->getWeightTable(), m_pcReshaper->getCWeight());
         }
       }
       else
@@ -1959,7 +1968,7 @@ void EncGOP::xPicInitLMCS(Picture *pic, PicHeader *picHeader, Slice *slice)
 
       if (m_pcCfg->getReshapeSignalType() == RESHAPE_SIGNAL_PQ)
       {
-        m_pcEncLib->getRdCost()->restoreReshapeLumaLevelToWeightTable();
+        m_lmcsWeights.restoreReshapeLumaLevelToWeightTable();
       }
       else if (m_pcCfg->getReshapeSignalType() == RESHAPE_SIGNAL_SDR || m_pcCfg->getReshapeSignalType() == RESHAPE_SIGNAL_HLG)
       {
@@ -1974,7 +1983,7 @@ void EncGOP::xPicInitLMCS(Picture *pic, PicHeader *picHeader, Slice *slice)
         {
           m_pcReshaper->getSliceReshaperInfo().setSliceReshapeModelPresentFlag(true);
           m_pcReshaper->constructReshaperLMCS();
-          m_pcEncLib->getRdCost()->updateReshapeLumaLevelToWeightTable(m_pcReshaper->getSliceReshaperInfo(), m_pcReshaper->getWeightTable(), m_pcReshaper->getCWeight());
+          m_lmcsWeights.updateReshapeLumaLevelToWeightTable(m_pcReshaper->getSliceReshaperInfo(), m_pcReshaper->getWeightTable(), m_pcReshaper->getCWeight());
         }
       }
       else
@@ -1982,6 +1991,9 @@ void EncGOP::xPicInitLMCS(Picture *pic, PicHeader *picHeader, Slice *slice)
         THROW("Reshaper for other signal currently not defined!");
       }
     }
+
+    // the picture's search uses the weights as they are after its LMCS setup
+    m_pcEncLib->getRdCost()->copyReshapeLumaLevelWeights( m_lmcsWeights );
 
     //set all necessary information in LMCS APS and picture header
     picHeader->setLmcsEnabledFlag(m_pcReshaper->getSliceReshaperInfo().getUseSliceReshaper());
@@ -5918,7 +5930,7 @@ double EncGOP::xFindDistortionPlaneWPSNR(const CPelBuf& pic0, const CPelBuf& pic
       for (int x = 0; x < pic0.width; x++)
       {
         Intermediate_Int iTemp = pSrc0[x] - pSrc1[x];
-        double dW = m_pcEncLib->getRdCost()->getWPSNRLumaLevelWeight(pSrcLuma[(x << getComponentScaleX(compID, chfmt))]);
+        double dW = m_lmcsWeights.getWPSNRLumaLevelWeight(pSrcLuma[(x << getComponentScaleX(compID, chfmt))]);
         uiTotalDiffWPSNR += ((dW * (double)iTemp * (double)iTemp)) * (double)(1 >> rshift);
       }
       pSrc0 += pic0.stride;
@@ -5934,7 +5946,7 @@ double EncGOP::xFindDistortionPlaneWPSNR(const CPelBuf& pic0, const CPelBuf& pic
       for (int x = 0; x < pic0.width; x++)
       {
         Intermediate_Int iTemp = pSrc0[x] - pSrc1[x];
-        double dW = m_pcEncLib->getRdCost()->getWPSNRLumaLevelWeight(pSrcLuma[x << getComponentScaleX(compID, chfmt)]);
+        double dW = m_lmcsWeights.getWPSNRLumaLevelWeight(pSrcLuma[x << getComponentScaleX(compID, chfmt)]);
         uiTotalDiffWPSNR += dW * (double)iTemp * (double)iTemp;
       }
       pSrc0 += pic0.stride;

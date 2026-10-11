@@ -82,6 +82,7 @@ struct EstBvdBitsStruct
 
 class DistParam;
 class EncCfg;
+class RdCost;
 
 // ====================================================================================================================
 // Type definition
@@ -127,6 +128,9 @@ public:
 #if TM_AMVP || TM_MRG || JVET_Z0084_IBC_TM
   int                   tmWeightIdx;
 #endif
+#if WCG_EXT
+  const RdCost*         rdCost = nullptr;   ///< owner of the luma level weights (the weighted SSE functions)
+#endif
   DistParam() :
   org(), cur(),
   mask( nullptr ),
@@ -156,11 +160,12 @@ private:
 #if WCG_EXT
   double                  m_dLambda_unadjusted; // TODO: check is necessary
   double                  m_DistScaleUnadjusted;
-  static std::vector<double> m_reshapeLumaLevelToWeightPLUT;
-  static std::vector<double> m_lumaLevelToWeightPLUT;
-  static uint32_t         m_signalType;
-  static double           m_chromaWeight;
-  static int              m_lumaBD;
+  // luma level weights of the weighted SSE; set at init, the reshaper table and chroma weight per picture (LMCS)
+  std::vector<double>     m_reshapeLumaLevelToWeightPLUT;
+  std::vector<double>     m_lumaLevelToWeightPLUT;
+  uint32_t                m_signalType   = RESHAPE_SIGNAL_NULL;
+  double                  m_chromaWeight = 1.0;
+  int                     m_lumaBD       = 10;
   ChromaFormat            m_cf;
 #endif
   double                  m_DistScale;
@@ -1036,6 +1041,12 @@ public:
   void           setReshapeInfo                              (uint32_t type, int lumaBD) { m_signalType = type; m_lumaBD = lumaBD; }
   void           updateReshapeLumaLevelToWeightTable         (SliceReshapeInfo &sliceReshape, Pel *wtTable, double cwt);
   inline std::vector<double>& getLumaLevelWeightTable        ()                   { return m_lumaLevelToWeightPLUT; }
+  /// Takes the per-picture luma level weights (reshaper table, chroma weight) of another RdCost.
+  void           copyReshapeLumaLevelWeights                 ( const RdCost& other )
+  {
+    m_reshapeLumaLevelToWeightPLUT = other.m_reshapeLumaLevelToWeightPLUT;
+    m_chromaWeight                 = other.m_chromaWeight;
+  }
 #endif
 
 #if JVET_S0234_ACT_CRS_FIX
@@ -1056,7 +1067,7 @@ private:
   static Distortion xGetSSE16N        ( const DistParam& pcDtParam );
 
 #if WCG_EXT
-  static Distortion getWeightedMSE    (int compIdx, const Pel org, const Pel cur, const uint32_t uiShift, const Pel orgLuma);
+  Distortion        getWeightedMSE    (int compIdx, const Pel org, const Pel cur, const uint32_t uiShift, const Pel orgLuma) const;
   static Distortion xGetSSE_WTD       ( const DistParam& pcDtParam );
   static Distortion xGetSSE2_WTD      ( const DistParam& pcDtParam );
   static Distortion xGetSSE4_WTD      ( const DistParam& pcDtParam );

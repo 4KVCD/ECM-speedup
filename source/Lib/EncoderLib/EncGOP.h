@@ -174,6 +174,7 @@ private:
   EncSampleAdaptiveOffset*  m_pcSAO;
   EncAdaptiveLoopFilter*    m_pcALF;
   EncReshape*               m_pcReshaper;
+  RdCost                    m_lmcsWeights;   ///< luma level weights of the weighted SSE in coding order (LMCS updates them per picture)
   RateCtrl*                 m_pcRateCtrl;
 #if JVET_AL0153_ALF_CCCM
   EncLoopFilterCccm*        m_pcLoopFilterCccm;
