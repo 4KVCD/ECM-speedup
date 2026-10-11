@@ -63,7 +63,7 @@
 
 namespace
 {
-// layout shared with intra_rec.comp (struct Tu): 60 int32
+// layout shared with intra_rec.comp (struct Tu): 62 int32
 struct Tu
 {
   int32_t comp, x, y, w, h;
@@ -88,8 +88,9 @@ struct Tu
   int32_t crsAvail;
   int32_t quant;
   int32_t jccr, jccrOffset;
+  int32_t mtxV, mtxH;
 };
-static_assert( sizeof( Tu ) == 60 * 4, "Tu layout" );
+static_assert( sizeof( Tu ) == 62 * 4, "Tu layout" );
 
 // Tu::lmcs
 constexpr int LMCS_BF_INVERSE  = 1;   // the intra bilateral filter works on inverse-mapped samples
@@ -131,14 +132,13 @@ struct Params
   int32_t  ownerH[2];
   int32_t  unitLog2X[2];
   int32_t  unitLog2Y[2];
-  int32_t  matrixOffset[8];
   int32_t  edgeCap;
   int32_t  lmcsLutSize;
   int32_t  lumaClipMin, lumaClipMax;
   int32_t  qcsOffset;
   int32_t  pad;
 };
-static_assert( offsetof( Params, origin ) == 168 && offsetof( Params, matrixOffset ) == 248 && sizeof( Params ) == 304,
+static_assert( offsetof( Params, origin ) == 168 && offsetof( Params, edgeCap ) == 248 && sizeof( Params ) == 272,
                "Params layout" );
 
 struct Push
@@ -164,8 +164,8 @@ struct Shared
 {
   gpu::Kernel                      kernel, kernelResi, kernelDeps, kernelScan;
   gpu::Buffer                      filters, matrices;
-  int32_t                          matrixOffset[8] = {};
-  int32_t                          qcsOffset       = 0;   // of the QCS weights in matrices
+  int32_t                          trOffset[NUM_TRANS_TYPE][7];   // of the inverse transform matrices of sizes 2..128 in matrices (-1: none)
+  int32_t                          qcsOffset = 0;                 // of the QCS weights in matrices
   std::unique_ptr<BilateralFilter> bif;   // the intra prediction bilateral filter's tables
 };
 
@@ -206,16 +206,26 @@ Shared* createShared( gpu::Context& ctx )
     for( int i = 0; i < 64; i++ ) bt[26 * 48 + i] = sh->bif->m_tuSizeFactor[0][i];
     for( int i = 0; i < 16; i++ ) bt[26 * 48 + 64 + i] = sh->bif->m_tuMADFactor[0][i];
   }
+  // the inverse transform matrices of every type and size the CPU has (TrQuant::xIT's transform functions)
   std::vector<int32_t> mat;
-  const TMatrixCoeff* tables[7] = { g_trCoreDCT2P2[TRANSFORM_INVERSE][0],  g_trCoreDCT2P4[TRANSFORM_INVERSE][0],
-                                    g_trCoreDCT2P8[TRANSFORM_INVERSE][0],  g_trCoreDCT2P16[TRANSFORM_INVERSE][0],
-                                    g_trCoreDCT2P32[TRANSFORM_INVERSE][0], g_trCoreDCT2P64[TRANSFORM_INVERSE][0],
-                                    g_trCoreDCT2P128[TRANSFORM_INVERSE][0] };
-  for( int l = 0; l < 7; l++ )
   {
-    const int n          = 2 << l;
-    sh->matrixOffset[l]  = (int32_t) mat.size();
-    mat.insert( mat.end(), tables[l], tables[l] + n * n );
+    // Don't put the TrQuant on the stack: it holds coefficient buffers of the largest transform, beyond the stack of
+    // the thread that creates the device
+    std::unique_ptr<TrQuant> trQuant( new TrQuant );
+    trQuant->init( nullptr, MAX_TB_SIZEY, false, false, false, false );
+    std::vector<TCoeff> m;
+    for( int type = 0; type < NUM_TRANS_TYPE; type++ )
+    {
+      for( int l = 0; l < 7; l++ )
+      {
+        sh->trOffset[type][l] = -1;
+        if( trQuant->getInvTransformMatrix( type, l + 1, m ) )
+        {
+          sh->trOffset[type][l] = (int32_t) mat.size();
+          mat.insert( mat.end(), m.begin(), m.end() );
+        }
+      }
+    }
   }
   sh->qcsOffset = (int32_t) mat.size();   // read by intra_resi's dequantization with QCS
   mat.insert( mat.end(), m_coeffShift64, m_coeffShift64 + 64 );
@@ -252,6 +262,7 @@ struct GpuIntraRec::Impl
   std::unique_ptr<gpu::Stream> stream;
   gpu::Buffer                 params, tus, coeffs, planes[3], owner[3], sched, dbgPred, dbgResi, lmcs;
   Reshape*                    reshape = nullptr;   // the decoder's reshaper (LMCS state of the picture being decoded)
+  TrQuant*                    trQuant = nullptr;   // the decoder's TrQuant (transform types of the blocks)
   int                         numGroups = 0;
   size_t                      edgeCap   = 0;   // dependency edges per picture the scheduling buffer holds
   gpu::Buffer                 upload, download;
@@ -335,6 +346,11 @@ void GpuIntraRec::setReshape( Reshape* reshape )
   m_impl->reshape = reshape;
 }
 
+void GpuIntraRec::setTrQuant( TrQuant* trQuant )
+{
+  m_impl->trQuant = trQuant;
+}
+
 bool GpuIntraRec::on() const
 {
   return m_impl->on;
@@ -354,6 +370,9 @@ bool GpuIntraRec::supported( const Slice& slice, std::string& why )
   if( !slice.isIntra() )                                                                  why = "not an intra slice";
   else if( sps.getChromaFormatIdc() != CHROMA_420 && sps.getChromaFormatIdc() != CHROMA_400 ) why = "chroma format";
   else if( sps.getLog2MaxTbSize() > 7 )                                                   why = "transform blocks above 128";
+  // implicit MTS selects by modes that only DIMD derives (TrQuant::getTrTypes, candModeListForTransform): with DIMD
+  // off the stock encoder stops at a CHECK, so it can be neither supported nor tested before DIMD
+  else if( sps.getUseImplicitMTS() )                                                      why = "implicit MTS";
   else if( sps.getScalingListFlag() )                                                     why = "scaling lists";
   else if( sps.getSpsRangeExtension().getExtendedPrecisionProcessingFlag() )               why = "extended precision";
   else if( sps.getUseColorTrans() )                                                       why = "ACT";
@@ -362,7 +381,6 @@ bool GpuIntraRec::supported( const Slice& slice, std::string& why )
   else if( sps.getUseISP() )                                                              why = "ISP";
   else if( sps.getUseMRL() || sps.getUseTmrl() )                                          why = "MRL / TMRL";
   else if( sps.getUseIntraLFNSTISlice() || sps.getUseIntraLFNSTPBSlice() || sps.getUseNSPT() ) why = "LFNST / NSPT";
-  else if( sps.getUseIntraMTS() || sps.getUseImplicitMTS() )                              why = "MTS";
   else if( sps.getTransformSkipEnabledFlag() || sps.getBDPCMEnabledFlag() )               why = "transform skip / BDPCM";
   else if( sps.getUseLMChroma() || sps.getUseCcpMerge() || sps.getUseDdCcpFusion() || sps.getUseBvgCccm() ) why = "cross-component prediction";
   else if( sps.getUseChromaReordering() || sps.getUseIntraDBV() )                         why = "chroma reordering / DBV";
@@ -425,8 +443,8 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
   else if( cu.mipFlag )                                             why = "MIP";
   else if( cu.ispMode )                                             why = "ISP";
   else if( cu.lfnstIdx )                                            why = "LFNST";
-  else if( tu.mtsIdx[compID] != MTS_DCT2_DCT2 )                     why = "MTS / transform skip";
-  else if( tu.jointCbCr && tu.mtsIdx[COMPONENT_Cr] != MTS_DCT2_DCT2 ) why = "transform skip of joint CbCr";
+  else if( tu.mtsIdx[compID] == MTS_SKIP )                          why = "transform skip";
+  else if( tu.jointCbCr && tu.mtsIdx[COMPONENT_Cr] == MTS_SKIP )    why = "transform skip of joint CbCr";
   else if( cu.tmpFlag )                                             why = "IntraTMP";
   else if( cu.dimd )                                                why = "DIMD";
   else if( cu.timd )                                                why = "TIMD";
@@ -519,6 +537,25 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
   }
   const QpParam resiQp = resiComp == compID ? qp : QpParam( tu, resiComp );
   t.cbf = t.jccr != JCCR_DERIVED && TU::getCbf( tu, resiComp ) ? 1 : 0;
+
+  // TrQuant::xIT's transform types (DCT-II, or those of explicit or implicit MTS) and their matrices
+  t.mtxV = t.mtxH = 0;
+  if( t.cbf )
+  {
+    int trTypeHor, trTypeVer;
+    if( !m.trQuant || !m.trQuant->getInvTransformTypes( tu, resiComp, trTypeHor, trTypeVer ) )
+    {
+      unsupported( m.trQuant ? "NSPT or a 1-D transform" : "transform types without the decoder's TrQuant" );
+      return;
+    }
+    t.mtxV = m.sh->trOffset[trTypeVer][floorLog2( area.height ) - 1];
+    t.mtxH = m.sh->trOffset[trTypeHor][floorLog2( area.width ) - 1];
+    if( t.mtxV < 0 || t.mtxH < 0 )
+    {
+      unsupported( "a transform type without a matrix of this size" );
+      return;
+    }
+  }
 
   // dequantization without scaling lists, transform skip or extended precision: DepQuant::dequant (dequantBlock) with
   // dependent quantization, else Quant::dequant; QCS blends either with the dequantization of the next larger index
@@ -1027,7 +1064,6 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
   P.coeffs   = m.coeffs.addr;
   P.filters  = m.sh->filters.addr;
   P.matrices = m.sh->matrices.addr;
-  memcpy( P.matrixOffset, m.sh->matrixOffset, sizeof( P.matrixOffset ) );
   P.dbgPred  = m.dbgPred.addr;
   P.dbgResi  = m.dbgResi.addr;
   P.lumaClipMin = cs.slice->clpRng( COMPONENT_Y ).min;

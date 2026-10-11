@@ -80,6 +80,12 @@ public:
                     const bool bEnc
   );
   void getTrTypes(const TransformUnit& tu, const ComponentID compID, int &trTypeHor, int &trTypeVer);
+  /// the transform types xIT applies to the block (xGetInvTrParams); false where xIT does not apply a separable 2-D
+  /// transform of these types (NSPT, a side of 1). Read by the decoder's GPU reconstruction.
+  bool getInvTransformTypes( const TransformUnit &tu, const ComponentID compID, int &trTypeHor, int &trTypeVer );
+  /// the matrix of xIT's inverse transform of type trType and size 2^log2Size, read back from its transform function:
+  /// m[k * size + i] is the contribution of coefficient k to sample i; false where there is no such function
+  bool getInvTransformMatrix( const int trType, const int log2Size, std::vector<TCoeff> &m ) const;
 
 #if AHG7_LN_TOOLOFF_CFG
 #if JVET_R0351_HIGH_BIT_DEPTH_SUPPORT

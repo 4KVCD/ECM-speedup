@@ -2,8 +2,9 @@
 #pragma use_vulkan_memory_model
 // residuals of all intra transform blocks of a picture at once (they depend on no other block): dequantization
 // (Quant::dequant, or DepQuant's dequantBlock with dependent quantization, either with QCS; without scaling lists)
-// folded into the first inverse DCT-II stage, then the second stage
-// (TrQuant::xIT: two clipped matrix stages, equal to the partial butterflies in integer arithmetic); the result
+// folded into the first inverse transform stage, then the second stage (TrQuant::xIT: two clipped matrix stages with
+// the matrices the host reads back from xIT's transform functions, DCT-II or the MTS types, whose integer sums and
+// single rounding equal those of the functions, butterflies included); the result
 // goes to the residual buffer intra_rec adds to its prediction, with joint CbCr together with the other chroma
 // component's residual derived from it. Persistent workgroups take blocks by index.
 // Don't keep the first stage's output in a global scratch buffer: while other processes shared the GPU (RTX 3070),
@@ -103,7 +104,7 @@ void main()
       for( int i = lid; t.jccr != 0 && i < N; i += NT ) resi.v[t.jccrOffset + i] = int16_t( 0 );
       continue;
     }
-    const int offH = P.matrixOffset[findMSB( H ) - 1], offW = P.matrixOffset[findMSB( W ) - 1];
+    const int offH = t.mtxV, offW = t.mtxH;
     const int rnd1 = 1 << ( t.shift1 - 1 ), rnd2 = 1 << ( t.shift2 - 1 );
     const int addDq = t.dqRightShift > 0 ? 1 << ( t.dqRightShift - 1 ) : 0;
     // the levels lie in rows < nzRows, columns < nzCols: the skipped terms are zero, and so is the first stage of an

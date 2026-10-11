@@ -39,6 +39,8 @@
 #include "CommonDefX86.h"
 #include "../TrQuant.h"
 
+#include <mutex>
+
 #ifdef TARGET_SIMD_X86
 
 #include <nmmintrin.h>
@@ -810,11 +812,12 @@ void TrQuant::_initTrQuantX86()
 #endif
 #if TRANSFORM_SIMD_OPT
   // the kernel tables are static: written once, as the decoder initializes its transforms for every picture while
-  // other pictures are decoded in other threads
-  static bool s_kernelsSet = false;
-  if( !s_kernelsSet )
+  // other pictures are decoded in other threads. Don't guard them with a plain flag: a second thread initializing at the
+  // same time (a frame thread, or the GPU reconstruction reading the transform matrices) would skip the writes and use
+  // the tables before the first thread has written them; std::call_once makes it wait.
+  static std::once_flag s_kernelsOnce;
+  std::call_once( s_kernelsOnce, []
   {
-  s_kernelsSet = true;
 #if TU_256
   m_forwardTransformKernels =
   { {
@@ -849,7 +852,7 @@ void TrQuant::_initTrQuantX86()
 #endif
 #endif
   } };
-  }
+  } );
 
   fastFwdTrans[0][0] = fastForwardTransform_SIMD<DCT2, 2>;
   fastFwdTrans[0][1] = fastForwardTransform_SIMD<DCT2, 4>;
@@ -1032,7 +1035,7 @@ void TrQuant::_initTrQuantX86()
     { nullptr,                              g_trCoreDCT8P4[TRANSFORM_INVERSE][0], g_trCoreDCT8P8[TRANSFORM_INVERSE][0], g_trCoreDCT8P16[TRANSFORM_INVERSE][0], g_trCoreDCT8P32[TRANSFORM_INVERSE][0], nullptr },
     { nullptr,                              g_trCoreDST7P4[TRANSFORM_INVERSE][0], g_trCoreDST7P8[TRANSFORM_INVERSE][0], g_trCoreDST7P16[TRANSFORM_INVERSE][0], g_trCoreDST7P32[TRANSFORM_INVERSE][0], nullptr },
   } };
-  }
+  } );
 
   fastFwdTrans[0][0] = fastForwardTransform_SIMD<DCT2, 2>;
   fastFwdTrans[0][1] = fastForwardTransform_SIMD<DCT2, 4>;

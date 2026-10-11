@@ -2860,6 +2860,46 @@ void TrQuant::xTransformSkip(const TransformUnit &tu, const ComponentID &compID,
   }
 }
 
+bool TrQuant::getInvTransformTypes( const TransformUnit &tu, const ComponentID compID, int &trTypeHor, int &trTypeVer )
+{
+#if JVET_AL0181_ASBT
+  const CompArea &area = tu.blocksResidual[compID];
+#else
+  const CompArea &area = tu.blocks[compID];
+#endif
+  int  skipWidth, skipHeight;
+  bool allowNSPT;
+  xGetInvTrParams( tu, compID, area.width, area.height, trTypeHor, trTypeVer, skipWidth, skipHeight, allowNSPT );
+#if JVET_AC0130_NSPT
+  if( CU::nsptApplyCond( tu, compID, allowNSPT ) )
+  {
+    return false;
+  }
+#endif
+  return area.width > 1 && area.height > 1;
+}
+
+// as in xSignPredBorderTemplate: the transform functions form exact int32 sums of products, rounded and clipped once,
+// so an impulse of 2 per line with shift 1 gives (2 * k + 1) >> 1 = k, the kernel value itself
+bool TrQuant::getInvTransformMatrix( const int trType, const int log2Size, std::vector<TCoeff> &m ) const
+{
+  if( trType < 0 || trType >= NUM_TRANS_TYPE || log2Size < 1 || log2Size > g_numTransformMatrixSizes
+      || !fastInvTrans[trType][log2Size - 1] )
+  {
+    return false;
+  }
+  const int           size = 1 << log2Size;
+  std::vector<TCoeff> impulses( size * size, 0 );
+  for( int k = 0; k < size; k++ )
+  {
+    impulses[k * size + k] = 2;   // line k holds coefficient k
+  }
+  m.assign( size * size, 0 );
+  fastInvTrans[trType][log2Size - 1]( impulses.data(), m.data(), 1, size, 0, 0, std::numeric_limits<TCoeff>::min(),
+                                      std::numeric_limits<TCoeff>::max() );
+  return true;
+}
+
 #if SIGN_PREDICTION && JVET_Y0141_SIGN_PRED_IMPROVE
 // perf: the sign-prediction template of predCoeffSigns() (createTemplate): for each of the numPosX x numPosY lowest-
 // frequency positions, the first column (bottom to top) and the first row of xIT's output for an impulse of the given

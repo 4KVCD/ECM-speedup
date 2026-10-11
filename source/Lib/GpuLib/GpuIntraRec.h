@@ -57,6 +57,7 @@
 class CodingStructure;
 class QpParam;
 class Reshape;
+class TrQuant;
 
 class GpuIntraRec
 {
@@ -71,6 +72,8 @@ public:
   bool on() const;
   /// the decoder's reshaper, whose LMCS state (LUTs, chroma scales, slice flags) is that of the picture being decoded
   void setReshape( Reshape* reshape );
+  /// the decoder's TrQuant, which selects the transform types of each block (TrQuant::getInvTransformTypes)
+  void setTrQuant( TrQuant* trQuant );
   /// whether the GPU path supports the slice's tools (sequence- and slice-level settings; per block record() checks)
   static bool supported( const Slice& slice, std::string& why );
 

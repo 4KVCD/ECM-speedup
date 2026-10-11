@@ -2,7 +2,7 @@
 #ifndef INTRA_COMMON_GLSL
 #define INTRA_COMMON_GLSL
 
-// one transform block of one component (60 int32, layout shared with GpuIntraRec.cpp)
+// one transform block of one component (62 int32, layout shared with GpuIntraRec.cpp)
 struct Tu
 {
   int comp, x, y, w, h;
@@ -28,6 +28,7 @@ struct Tu
   int quant;            // bit 0: dependent quantization (the coefficients are quantization indices), bit 1: QCS
   int jccr;             // joint CbCr: the Cb block's ICT mode (+-1..+-3; it computes both residuals), 4 for the Cr block
   int jccrOffset;       // the Cr block's dbgOffset (in the Cb block)
+  int mtxV, mtxH;       // the inverse transform matrices (DCT-II or MTS) of the columns (size h) and the rows (size w)
 };
 layout( buffer_reference, std430, buffer_reference_align = 4 ) buffer BufTu { Tu v[]; };
 
@@ -38,7 +39,7 @@ struct Params
   uint64_t plane[3];    // int16 reconstruction (written), origin/stride below
   uint64_t owner[3];    // int32 per unit and component: the block covering it (-1: none); 4x4 luma, 2x2 chroma units
   uint64_t filters;     // int32: [taps 6,8,10,12,16][32][16] cubic tables, then the weak 4-tap table [32][4]
-  uint64_t matrices;    // int32: DCT-II inverse matrices N = 2..128 at matrixOffset[log2N - 1], QCS weights at qcsOffset
+  uint64_t matrices;    // int32: the inverse transform matrices (each [k * N + i], at Tu::mtxV / mtxH), QCS weights at qcsOffset
   uint64_t dbgPred;     // int16 per block w*h at dbgOffset
   uint64_t dbgResi;     // int16 residual per block w*h at dbgOffset (written by intra_resi, added by intra_rec)
   uint64_t depCount;    // int32 per block: dependencies not reconstructed yet
@@ -58,7 +59,6 @@ struct Params
   int      ownerH[2];
   int      unitLog2X[2];
   int      unitLog2Y[2];
-  int      matrixOffset[8];
   int      edgeCap;     // the capacity of depList / depTmp
   int      lmcsLutSize;              // entries of each LMCS table (1 << luma bit depth)
   int      lumaClipMin, lumaClipMax; // the slice's luma clipping range (the average luma of chroma residual scaling)

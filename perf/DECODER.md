@@ -260,7 +260,15 @@ the reconstruction buffer; works in every frame-thread context):
   stream had that combination); M7 adds joint coding of the chroma residuals (JCCR): intra_resi computes the coded
   residual of a pair (Cb, or Cr with its own QP) at the Cb block and writes the other component's residual derived
   from it (TrQuant::invTransformICT, all six ICT modes); the Cr block, which the decoder records right after its Cb
-  block, takes it from there. GpuIntraRec::supported() rejects every tool whose mode derivation or prediction reads
+  block, takes it from there; M8 adds explicit intra MTS with ECM's extension (the transform pairs of all seven intra
+  types DCT-II, DCT-VIII, DST-VII, DCT-V, DST-IV, DST-I and identity): the host takes each block's pair from the
+  decoder's own TrQuant (getInvTransformTypes, i.e. xGetInvTrParams) and the GPU multiplies with matrices read back
+  from xIT's transform functions by impulses (getInvTransformMatrix; the functions form exact integer sums with one
+  rounding, butterflies included), so intra_resi has one code path for every type and size. Implicit MTS stays on
+  the CPU: it selects by modes only DIMD derives, and without DIMD the encoder stops at a CHECK. The static kernel
+  tables of TrQuant's x86 transforms are now set up under std::call_once, as the GPU path initializes a TrQuant on
+  its device-creation thread while the decoder initializes its own. GpuIntraRec::supported() rejects every tool
+  whose mode derivation or prediction reads
   reconstructed samples or that the kernels lack, before anything is skipped. All 19 regular streams now fall back to
   the CPU at sign prediction, the next sequence-level check (before M6: QCS, before M5: LMCS, before M4: dual tree);
   many block-level tools follow.
