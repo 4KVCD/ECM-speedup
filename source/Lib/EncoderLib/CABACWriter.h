@@ -662,10 +662,23 @@ public:
 
   virtual ~CABACEncoder()
   {
-    if( m_CABACDataStore )
+    if( m_ownsCABACDataStore )
     {
       delete m_CABACDataStore;
     }
+  }
+
+  /// From now on, the writers use the temporal context store of another CABACEncoder (which keeps owning it).
+  void shareCABACDataStore( CABACEncoder& other )
+  {
+    if( m_ownsCABACDataStore )
+    {
+      delete m_CABACDataStore;
+    }
+    m_CABACDataStore     = other.m_CABACDataStore;
+    m_ownsCABACDataStore = false;
+    m_CABACWriterStd.m_CABACDataStore    = m_CABACDataStore;
+    m_CABACEstimatorStd.m_CABACDataStore = m_CABACDataStore;
   }
 #else
   CABACEncoder()
@@ -700,6 +713,7 @@ private:
 
 #if JVET_Z0135_TEMP_CABAC_WIN_WEIGHT
   CABACDataStore*         m_CABACDataStore;
+  bool                    m_ownsCABACDataStore = true;
 #endif
 };
 

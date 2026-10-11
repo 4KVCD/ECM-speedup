@@ -1133,6 +1133,7 @@ protected:
   bool        m_bs2ModPOCAndType;
 
   CfgVPSParameters m_cfgVPSParameters;
+  int         m_searchStackCount = 1;   ///< number of mode-search stacks (EncSearchStack), used by the pictures in turn
 
 #if ENABLE_SPLIT_PARALLELISM
   int         m_numSplitThreads;
@@ -3094,6 +3095,8 @@ public:
   bool         getBs2ModPOCAndType()                           const { return m_bs2ModPOCAndType; }
   void         setDebugCTU( int i )                                  { m_debugCTU = i; }
   int          getDebugCTU()                                   const { return m_debugCTU; }
+  void         setSearchStackCount( int n )                          { m_searchStackCount = n; }
+  int          getSearchStackCount()                           const { return m_searchStackCount; }
 
 #if ENABLE_SPLIT_PARALLELISM
   void         setNumSplitThreads( int n )                           { m_numSplitThreads = n; }

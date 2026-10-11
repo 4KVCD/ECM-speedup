@@ -1993,7 +1993,7 @@ void EncGOP::xPicInitLMCS(Picture *pic, PicHeader *picHeader, Slice *slice)
     }
 
     // the picture's search uses the weights as they are after its LMCS setup
-    m_pcEncLib->getRdCost()->copyReshapeLumaLevelWeights( m_lmcsWeights );
+    m_pcSearchStack->rdCost.copyReshapeLumaLevelWeights( m_lmcsWeights );
 
     //set all necessary information in LMCS APS and picture header
     picHeader->setLmcsEnabledFlag(m_pcReshaper->getSliceReshaperInfo().getUseSliceReshaper());
@@ -2161,6 +2161,10 @@ void EncGOP::compressGOP(int iPOCLast, int iNumPicRcvd, PicList &rcListPic, std:
     {
       m_iLastIDR = pocCurr;
     }
+
+    // the pictures use the search stacks in turn
+    m_pcSearchStack  = &m_pcEncLib->getSearchStack( int( m_numPicsStarted++ % m_pcEncLib->getNumSearchStacks() ) );
+    m_pcSliceEncoder = &m_pcSearchStack->sliceEncoder;
 
     // start a new access unit: create an entry in the list of output access units
     AccessUnit accessUnit;
@@ -3794,7 +3798,7 @@ void EncGOP::compressGOP(int iPOCLast, int iNumPicRcvd, PicList &rcListPic, std:
 #if JVET_AJ0158_SUBBLOCK_INTER_EXTENSION
           clipMv2 = clipMvInSubpic2;
 #endif
-          m_pcEncLib->getInterSearch()->setClipMvInSubPic(true);
+          m_pcSearchStack->interSearch.setClipMvInSubPic(true);
         }
         else
         {
@@ -3802,7 +3806,7 @@ void EncGOP::compressGOP(int iPOCLast, int iNumPicRcvd, PicList &rcListPic, std:
 #if JVET_AJ0158_SUBBLOCK_INTER_EXTENSION
           clipMv2 = clipMvInPic2;
 #endif
-          m_pcEncLib->getInterSearch()->setClipMvInSubPic(false);
+          m_pcSearchStack->interSearch.setClipMvInSubPic(false);
         }
 
         m_pcSliceEncoder->precompressSlice( pcPic );
@@ -4152,7 +4156,7 @@ void EncGOP::compressGOP(int iPOCLast, int iNumPicRcvd, PicList &rcListPic, std:
           m_pcALF->copyPreNNVCDataToTemp(cs);
         }
 #endif
-        m_nnfilterUnified.initCabac( m_pcEncLib->getCABACEncoder(), m_pcEncLib->getCtxCache(), *pcSlice);
+        m_nnfilterUnified.initCabac( &m_pcSearchStack->cabacEncoder, &m_pcSearchStack->ctxCache, *pcSlice);
         m_nnfilterUnified.setPicprms(&pcPic->m_picprm);
         {
           m_nnfilterUnified.chooseParameters(*pcPic);
@@ -4209,13 +4213,13 @@ void EncGOP::compressGOP(int iPOCLast, int iNumPicRcvd, PicList &rcListPic, std:
 #endif
       {
         bool sliceEnabled[MAX_NUM_COMPONENT];
-        m_pcSAO->initCABACEstimator( m_pcEncLib->getCABACEncoder(), m_pcEncLib->getCtxCache(), pcSlice );
+        m_pcSAO->initCABACEstimator( &m_pcSearchStack->cabacEncoder, &m_pcSearchStack->ctxCache, pcSlice );
 #if JVET_V0094_BILATERAL_FILTER
-        BIFCabacEstImp est(m_pcEncLib->getCABACEncoder()->getCABACEstimator(cs.slice->getSPS()));
+        BIFCabacEstImp est(m_pcSearchStack->cabacEncoder.getCABACEstimator(cs.slice->getSPS()));
 #endif      
         m_pcSAO->SAOProcess( cs, sliceEnabled, pcSlice->getLambdas(),
 #if ENABLE_QPA
-                             (m_pcCfg->getUsePerceptQPA() && !m_pcCfg->getUseRateCtrl() && pcSlice->getPPS()->getUseDQP() ? m_pcEncLib->getRdCost (PARL_PARAM0 (0))->getChromaWeight() : 0.0),
+                             (m_pcCfg->getUsePerceptQPA() && !m_pcCfg->getUseRateCtrl() && pcSlice->getPPS()->getUseDQP() ? (&m_pcSearchStack->rdCost)->getChromaWeight() : 0.0),
 #endif
                              m_pcCfg->getTestSAODisableAtPictureLevel(), m_pcCfg->getSaoEncodingRate(), m_pcCfg->getSaoEncodingRateChroma(), m_pcCfg->getSaoCtuBoundary(), m_pcCfg->getSaoGreedyMergeEnc()
 #if JVET_V0094_BILATERAL_FILTER
@@ -4252,7 +4256,7 @@ void EncGOP::compressGOP(int iPOCLast, int iNumPicRcvd, PicList &rcListPic, std:
 #if JVET_W0066_CCSAO
       if ( pcSlice->getSPS()->getCCSAOEnabledFlag() )
       {
-        m_pcSAO->initCABACEstimator( m_pcEncLib->getCABACEncoder(), m_pcEncLib->getCtxCache(), pcSlice );
+        m_pcSAO->initCABACEstimator( &m_pcSearchStack->cabacEncoder, &m_pcSearchStack->ctxCache, pcSlice );
         m_pcSAO->CCSAOProcess( cs, pcSlice->getLambdas(), m_pcCfg->getIntraPeriod() );
 
         //assign CCSAO slice header
@@ -4297,13 +4301,13 @@ void EncGOP::compressGOP(int iPOCLast, int iNumPicRcvd, PicList &rcListPic, std:
         cccmCorrection.create(cs.pcv->chrFormat, Area(0,0, cs.pcv->lumaWidth, cs.pcv->lumaHeight));
         cccmCorrection.copyFrom(cs.getRecoBuf());
 #endif
-        m_pcLoopFilterCccm->lfCccmInitIntraPred(m_pcEncLib->getIntraSearch());
+        m_pcLoopFilterCccm->lfCccmInitIntraPred(&m_pcSearchStack->intraSearch);
 #if JVET_AM0063_ALF_CCCM_ADAPTIVE_FACTOR
         pcSlice->setLfCccmImpEnabledFlag(false);
         pcSlice->setLfCccmImpFactorIdx(0);
-        m_pcLoopFilterCccm->lfCccmRDO(cs, cs.getRecoBuf(), m_pcEncLib->getCtxCache(), m_pcEncLib->getCABACEncoder(), pcSlice);
+        m_pcLoopFilterCccm->lfCccmRDO(cs, cs.getRecoBuf(), &m_pcSearchStack->ctxCache, &m_pcSearchStack->cabacEncoder, pcSlice);
 #else
-        m_pcLoopFilterCccm->lfCccmRDO(cs, cs.getRecoBuf(), cccmCorrection, m_pcEncLib->getCtxCache(), m_pcEncLib->getCABACEncoder(), pcSlice);
+        m_pcLoopFilterCccm->lfCccmRDO(cs, cs.getRecoBuf(), cccmCorrection, &m_pcSearchStack->ctxCache, &m_pcSearchStack->cabacEncoder, pcSlice);
 #endif
         if(pcSlice->getLfCccmEnabledFlag())
         {
@@ -4353,7 +4357,7 @@ void EncGOP::compressGOP(int iPOCLast, int iNumPicRcvd, PicList &rcListPic, std:
           pcPic->slices[s]->setTileGroupAlfEnabledFlag(COMPONENT_Y, false);
         }
 
-        m_pcALF->initCABACEstimator(m_pcEncLib->getCABACEncoder(), m_pcEncLib->getCtxCache(), pcSlice, m_pcEncLib->getApsMap());
+        m_pcALF->initCABACEstimator(&m_pcSearchStack->cabacEncoder, &m_pcSearchStack->ctxCache, pcSlice, m_pcEncLib->getApsMap());
 
 #if JVET_AL0153_ALF_CCCM
         if(pcSlice->getLfCccmEnabledFlag())
@@ -4363,7 +4367,7 @@ void EncGOP::compressGOP(int iPOCLast, int iNumPicRcvd, PicList &rcListPic, std:
 #endif
         m_pcALF->ALFProcess(cs, pcSlice->getLambdas()
 #if ENABLE_QPA
-          , (m_pcCfg->getUsePerceptQPA() && !m_pcCfg->getUseRateCtrl() && pcSlice->getPPS()->getUseDQP() ? m_pcEncLib->getRdCost(PARL_PARAM0(0))->getChromaWeight() : 0.0)
+          , (m_pcCfg->getUsePerceptQPA() && !m_pcCfg->getUseRateCtrl() && pcSlice->getPPS()->getUseDQP() ? (&m_pcSearchStack->rdCost)->getChromaWeight() : 0.0)
 #endif
           , pcPic, uiNumSliceSegments
 #if JVET_AC0162_ALF_RESIDUAL_SAMPLES_INPUT
@@ -5353,7 +5357,7 @@ void EncGOP::compressGOP(int iPOCLast, int iNumPicRcvd, PicList &rcListPic, std:
     if(!(pcPic->getUseTMBP() && pcPic->cs->sps->getTMBP()))
 #endif
     {
-      m_pcFrameMcPadPrediction->init(m_pcEncLib->getRdCost(), pcSlice->getSPS()->getChromaFormatIdc(),
+      m_pcFrameMcPadPrediction->init(&m_pcSearchStack->rdCost, pcSlice->getSPS()->getChromaFormatIdc(),
 #if JVET_AJ0172_IBC_ITMP_ALIGN_REF_AREA
 #if JVET_AJ0237_INTERNAL_12BIT
                                    pcSlice->getSPS()->getMaxCUHeight(), NULL, pcPic->getPicWidthInLumaSamples(),pcPic->getPicHeightInLumaSamples(), pcSlice->getSPS()->getBitDepth(CHANNEL_TYPE_LUMA));

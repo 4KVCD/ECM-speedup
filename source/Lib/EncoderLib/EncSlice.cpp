@@ -54,9 +54,8 @@
 // ====================================================================================================================
 
 EncSlice::EncSlice()
- : m_encCABACTableIdx(I_SLICE)
 #if ENABLE_QPA
- , m_adaptedLumaQP(-1)
+ : m_adaptedLumaQP(-1)
 #endif
 {
 }
@@ -1912,9 +1911,9 @@ void EncSlice::encodeCtus( Picture* pcPic, const bool bCompressEntireSlice, cons
 #if ENABLE_SPLIT_PARALLELISM
   const int       dataId          = 0;
 #endif
-  CABACWriter*    pCABACWriter    = pEncLib->getCABACEncoder( PARL_PARAM0( dataId ) )->getCABACEstimator( pcSlice->getSPS() );
-  TrQuant*        pTrQuant        = pEncLib->getTrQuant( PARL_PARAM0( dataId ) );
-  RdCost*         pRdCost         = pEncLib->getRdCost( PARL_PARAM0( dataId ) );
+  CABACWriter*    pCABACWriter    = m_CABACEstimator;   // the objects of this slice encoder's search stack
+  TrQuant*        pTrQuant        = m_pcTrQuant;
+  RdCost*         pRdCost         = m_pcRdCost;
   EncCfg*         pCfg            = pEncLib;
   RateCtrl*       pRateCtrl       = pEncLib->getRateCtrl();
   pRdCost->setLosslessRDCost(pcSlice->isLossless());
@@ -2711,11 +2710,11 @@ void EncSlice::encodeSlice   ( Picture* pcPic, OutputBitstream* pcSubstreams, ui
   } // CTU-loop
   if(pcSlice->getPPS()->getCabacInitPresentFlag())
   {
-    m_encCABACTableIdx = m_CABACWriter->getCtxInitId( *pcSlice );
+    m_carry->encCABACTableIdx = m_CABACWriter->getCtxInitId( *pcSlice );
   }
   else
   {
-    m_encCABACTableIdx = pcSlice->getSliceType();
+    m_carry->encCABACTableIdx = pcSlice->getSliceType();
   }
   numBinsCoded += m_CABACWriter->getNumBins();
 

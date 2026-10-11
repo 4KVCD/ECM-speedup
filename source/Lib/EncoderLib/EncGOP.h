@@ -86,6 +86,7 @@
 //! \{
 
 class EncLib;
+struct EncSearchStack;
 
 // ====================================================================================================================
 // Class definition
@@ -144,7 +145,9 @@ private:
   //  Access channel
   EncLib*                 m_pcEncLib;
   EncCfg*                 m_pcCfg;
-  EncSlice*               m_pcSliceEncoder;
+  EncSlice*               m_pcSliceEncoder;           ///< the slice encoder of the picture's search stack
+  EncSearchStack*         m_pcSearchStack = nullptr;  ///< search stack of the picture being encoded
+  int64_t                 m_numPicsStarted = 0;       ///< pictures started so far (they use the stacks in turn)
   PicList*                m_pcListPic;
 #if NN_LF_UNIFIED
   EncNNFilterUnified      m_nnfilterUnified;

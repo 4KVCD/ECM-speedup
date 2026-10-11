@@ -80,7 +80,6 @@ EncLib::EncLib( EncLibCommon* encLibCommon )
   m_uiNumAllPicCoded  =  0;
 
   m_iMaxRefPicNum     = 0;
-  m_searchStacks.emplace_back( new EncSearchStack );
 
 #if ENABLE_SIMD_OPT_BUFFER && defined(TARGET_SIMD_X86)
   g_pelBufOP.initPelBufOpsX86();
@@ -112,6 +111,11 @@ void EncLib::create( const int layerId )
 #if JVET_AJ0237_INTERNAL_12BIT
   m_cGOPEncoder.m_cBilateralFilter.setInternalBitDepth(m_bitDepth[COMPONENT_Y]);
 #endif
+  m_searchStacks.clear();
+  for( int i = 0; i < getSearchStackCount(); i++ )
+  {
+    m_searchStacks.emplace_back( new EncSearchStack );
+  }
   for( auto& stack: m_searchStacks )
   {
     stack->cuEncoder.create( this );
@@ -679,6 +683,14 @@ void EncLib::init( bool isFieldCoding, AUWriterIf* auWriterIf )
     stack.intraSearch.setInterPrediction( &stack.interSearch );
 #endif
   }
+  // what passes from picture to picture in coding order lives in the first stack
+  for( int i = 1; i < getNumSearchStacks(); i++ )
+  {
+#if JVET_Z0135_TEMP_CABAC_WIN_WEIGHT
+    m_searchStacks[i]->cabacEncoder.shareCABACDataStore( m_searchStacks[0]->cabacEncoder );
+#endif
+    m_searchStacks[i]->sliceEncoder.shareCarry( m_searchStacks[0]->sliceEncoder );
+  }
   m_iMaxRefPicNum = 0;
 
 #if ER_CHROMA_QP_WCG_PPS
@@ -771,22 +783,22 @@ void EncLib::xInitScalingLists( SPS &sps, APS &aps )
     sps.getMaxLog2TrDynamicRange(CHANNEL_TYPE_CHROMA)
   };
 
-  Quant* quant = getTrQuant()->getQuant();
-
+  // every stack's quantizer runs the setup: the stacks share the scaling-list tables, but each quantizer keeps its
+  // own error scales without scaling list (QuantRDOQ::m_errScaleNoScalingList)
   if(getUseScalingListId() == SCALING_LIST_OFF)
   {
-    quant->setFlatScalingList(maxLog2TrDynamicRange, sps.getBitDepths());
     for( auto& stack: m_searchStacks )
     {
+      stack->trQuant.getQuant()->setFlatScalingList( maxLog2TrDynamicRange, sps.getBitDepths() );
       stack->trQuant.getQuant()->setUseScalingList( false );
     }
   }
   else if(getUseScalingListId() == SCALING_LIST_DEFAULT)
   {
     aps.getScalingList().setDefaultScalingList ();
-    quant->setScalingList( &( aps.getScalingList() ), maxLog2TrDynamicRange, sps.getBitDepths() );
     for( auto& stack: m_searchStacks )
     {
+      stack->trQuant.getQuant()->setScalingList( &( aps.getScalingList() ), maxLog2TrDynamicRange, sps.getBitDepths() );
       stack->trQuant.getQuant()->setUseScalingList( true );
     }
   }
@@ -800,9 +812,9 @@ void EncLib::xInitScalingLists( SPS &sps, APS &aps )
       setUseScalingListId( SCALING_LIST_DEFAULT );
     }
     aps.getScalingList().setChromaScalingListPresentFlag((sps.getChromaFormatIdc()!=CHROMA_400));
-    quant->setScalingList( &( aps.getScalingList() ), maxLog2TrDynamicRange, sps.getBitDepths() );
     for( auto& stack: m_searchStacks )
     {
+      stack->trQuant.getQuant()->setScalingList( &( aps.getScalingList() ), maxLog2TrDynamicRange, sps.getBitDepths() );
       stack->trQuant.getQuant()->setUseScalingList( true );
     }
 
