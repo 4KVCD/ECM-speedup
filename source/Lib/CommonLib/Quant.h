@@ -62,6 +62,10 @@
 extern const int m_coeffShift64[64];
 #endif
 
+/// BDPCM: the levels of the block accumulated along its rows (horizontal) or columns (vertical), clipped to the transform
+/// range, as Quant::dequant dequantizes them; also called by the decoder's GPU reconstruction
+void invResDPCM( const TransformUnit &tu, const ComponentID &compID, CoeffBuf &dstBuf );
+
 // ====================================================================================================================
 // Class definition
 // ====================================================================================================================

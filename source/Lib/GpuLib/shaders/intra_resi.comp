@@ -4,7 +4,8 @@
 // (Quant::dequant, or DepQuant's dequantBlock with dependent quantization, either with QCS; without scaling lists)
 // folded into the first inverse transform stage, then the second stage (TrQuant::xIT: two clipped matrix stages with
 // the matrices the host reads back from xIT's transform functions, DCT-II or the MTS types, whose integer sums and
-// single rounding equal those of the functions, butterflies included); the result
+// single rounding equal those of the functions, butterflies included), or with transform skip the dequantized levels
+// themselves (BDPCM: the host accumulates the levels first); the result
 // goes to the residual buffer intra_rec adds to its prediction, with joint CbCr together with the other chroma
 // component's residual derived from it. Persistent workgroups take blocks by index.
 // Don't keep the first stage's output in a global scratch buffer: while other processes shared the GPU (RTX 3070),
@@ -110,6 +111,21 @@ void main()
     // the levels lie in rows < nzRows, columns < nzCols: the skipped terms are zero, and so is the first stage of an
     // all-zero column ((0 + rnd1) >> shift1), which the second stage then needs not read
     const int nzR = t.nzRows, nzC = t.nzCols;
+    if( t.transformSkip != 0 )   // TrQuant::xITransformSkip: the residual is the dequantized level (clipped to 16 bits)
+    {
+      for( int i = lid; i < N; i += NT )
+      {
+        const int y = i / W, x = i % W;
+        const int q = y < nzR && x < nzC ? cf.v[t.coeffOffset + y * nzC + x] : 0;
+        const int r = q != 0 ? dequant( t, q, addDq, mt, P.qcsOffset ) : 0;
+        resi.v[codedOffset + i] = int16_t( r );
+        if( t.jccr != 0 )
+        {
+          resi.v[derivedOffset + i] = int16_t( jccrDerived( t.jccr, r ) );
+        }
+      }
+      continue;
+    }
     // first stage (vertical): s_stage1[xf * H + y] from the dequantized coefficient column xf
     for( int i = lid; i < nzC * H; i += NT )
     {

@@ -267,8 +267,12 @@ the reconstruction buffer; works in every frame-thread context):
   rounding, butterflies included), so intra_resi has one code path for every type and size. Implicit MTS stays on
   the CPU: it selects by modes only DIMD derives, and without DIMD the encoder stops at a CHECK. The static kernel
   tables of TrQuant's x86 transforms are now set up under std::call_once, as the GPU path initializes a TrQuant on
-  its device-creation thread while the decoder initializes its own. GpuIntraRec::supported() rejects every tool
-  whose mode derivation or prediction reads
+  its device-creation thread while the decoder initializes its own; M9 adds transform skip (the dequantized levels,
+  with the QP of transform skip and no transform shift, are the residual; also for joint CbCr) and BDPCM (the host
+  accumulates the levels with the CPU's own invResDPCM; the prediction copies the unfiltered left column or above row,
+  which is the GPU's mode 18 / 50 prediction with reference filter, PDPC, fusion and bilateral filter off). Transform
+  skip with the regular residual coding (dequantized by DepQuant) stays on the CPU. GpuIntraRec::supported() rejects
+  every tool whose mode derivation or prediction reads
   reconstructed samples or that the kernels lack, before anything is skipped. All 19 regular streams now fall back to
   the CPU at sign prediction, the next sequence-level check (before M6: QCS, before M5: LMCS, before M4: dual tree);
   many block-level tools follow.
