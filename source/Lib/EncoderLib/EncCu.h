@@ -290,6 +290,9 @@ private:
   int                   m_cuChromaQpOffsetIdxPlus1; // if 0, then cu_chroma_qp_offset_flag will be 0, otherwise cu_chroma_qp_offset_flag will be 1.
 
   XUCache               m_unitCache;
+#if JVET_AI0136_ADAPTIVE_DUAL_TREE
+  Partitioner*          m_partitionerSST = nullptr;   ///< separate-tree partitioner, created per CTU in compressCtu
+#endif
 
   CodingStructure    ***m_pTempCS;
   CodingStructure    ***m_pBestCS;

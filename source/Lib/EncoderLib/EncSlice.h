@@ -155,6 +155,7 @@ public:
 #endif
 
 #if JVET_AG0098_AMVP_WITH_SBTMVP
+  uint32_t                m_picAmvpSbTmvpEnabledArea = 0;   ///< area of the AMVP-SbTMVP blocks the slice writer coded
   std::map<int, uint32_t> m_amvpSbTmvpArea;
   void clearAmvpSbTmvpStatArea(const Slice* slice)
   {

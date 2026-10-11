@@ -701,6 +701,7 @@ void EncLib::init( bool isFieldCoding, AUWriterIf* auWriterIf )
   if (getUseCompositeRef())
   {
     Picture *picBg = new Picture;
+    picBg->unitCache = new XUCache;
 
     picBg->create(
       sps0.getRprEnabledFlag(),
@@ -727,6 +728,7 @@ void EncLib::init( bool isFieldCoding, AUWriterIf* auWriterIf )
     picBg->createSpliceIdx(pps0.pcv->sizeInCtus);
     m_cGOPEncoder.setPicBg(picBg);
     Picture *picOrig = new Picture;
+    picOrig->unitCache = new XUCache;
 
     picOrig->create(
       sps0.getRprEnabledFlag(),
@@ -1384,6 +1386,7 @@ void EncLib::xGetNewPicBuffer ( std::list<PelUnitBuf*>& rcListPicYuvRecOut, Pict
   if (rpcPic==0)
   {
     rpcPic = new Picture;
+    rpcPic->unitCache = new XUCache;   // own CU / PU / TU cache: pictures may be searched in parallel threads
 
     rpcPic->create(
       isRprEnabled(),

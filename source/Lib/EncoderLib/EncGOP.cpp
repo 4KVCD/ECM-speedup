@@ -4499,7 +4499,7 @@ void EncGOP::compressGOP(int iPOCLast, int iNumPicRcvd, PicList &rcListPic, std:
         {
           pcSlice->setAmvpSbTmvpEnabledFlag(true);
 
-          g_picAmvpSbTmvpEnabledArea = 0;
+          m_pcSliceEncoder->m_picAmvpSbTmvpEnabledArea = 0;
           uint32_t prevEnabledArea;
           bool isExist = m_pcSliceEncoder->loadAmvpSbTmvpStatArea(pcSlice->getTLayer(), prevEnabledArea);
           if (isExist)

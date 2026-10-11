@@ -103,6 +103,9 @@ void EncSlice::init( EncLib* pcEncLib, EncSearchStack& stack, const SPS& sps )
   m_CABACEstimator    = stack.cabacEncoder.getCABACEstimator(&sps);
   m_pcTrQuant         = &stack.trQuant;
   m_pcRdCost          = &stack.rdCost;
+#if JVET_AG0098_AMVP_WITH_SBTMVP
+  m_CABACWriter->m_amvpSbTmvpEnabledArea = &m_picAmvpSbTmvpEnabledArea;
+#endif
 
   // create lambda and QP arrays
   m_vdRdPicLambda.resize(m_pcCfg->getDeltaQpRD() * 2 + 1 );
@@ -1676,7 +1679,7 @@ void EncSlice::compressSlice( Picture* pcPic, const bool bCompressEntireSlice, c
     {
       pcSlice->setAmvpSbTmvpEnabledFlag(true);
 
-      g_picAmvpSbTmvpEnabledArea = 0;
+      m_picAmvpSbTmvpEnabledArea = 0;
       uint32_t prevEnabledArea;
       bool isExist = loadAmvpSbTmvpStatArea(pcSlice->getTLayer(), prevEnabledArea);
       if (isExist)
@@ -1805,11 +1808,11 @@ void EncSlice::compressSlice( Picture* pcPic, const bool bCompressEntireSlice, c
 #endif
   m_pcInterSearch->resetAffineMVList();
   m_pcInterSearch->resetUniMvList();
-  ::memset(g_isReusedUniMVsFilled, 0, sizeof(g_isReusedUniMVsFilled));
+  m_pcInterSearch->resetReusedUniMvs( false );
 #if INTER_LIC
   if (pcSlice->getUseLIC())
   {
-    ::memset(g_isReusedUniMVsFilledLIC, 0, sizeof(g_isReusedUniMVsFilledLIC));
+    m_pcInterSearch->resetReusedUniMvs( true );
   }
 #endif
   encodeCtus( pcPic, bCompressEntireSlice, bFastDeltaQP, m_pcLib );
@@ -2726,7 +2729,7 @@ void EncSlice::encodeSlice   ( Picture* pcPic, OutputBitstream* pcSubstreams, ui
 #if JVET_AG0098_AMVP_WITH_SBTMVP
   if (!pcSlice->isIntra())
   {
-    storeAmvpSbTmvpStatArea(pcSlice->getTLayer(), g_picAmvpSbTmvpEnabledArea);
+    storeAmvpSbTmvpStatArea(pcSlice->getTLayer(), m_picAmvpSbTmvpEnabledArea);
   }
 #endif
 }

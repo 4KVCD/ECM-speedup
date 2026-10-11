@@ -208,6 +208,14 @@ private:
   std::array<std::array<uint32_t, NUM_INDICES_REP>, MAX_NUM_COMPONENT> m_indicesRepresentationPnn;
 #endif
   XUCache         m_unitCache;
+#if JVET_AG0059_CCP_MERGE_ENHANCEMENT
+  std::vector<CccmModel> m_ccpMrgFusionCccmModel;   ///< getPredForCCPMrgFusion: Cb 0, Cb 1, Cr 0, Cr 1
+#endif
+#if JVET_AL0126_CCP_MERGE_WITH_ADJUST
+  // estIntraPredChromaQT, per CCP-merge-adjust site
+  CCPModelCandidate m_ccpMergeAdjustCandList[2][MAX_CCP_CAND_LIST_INIT_SIZE << 1];
+  CCPModelCandidate m_ccpMergeAdjustCand[2][MAX_NUM_DERIVED_CCP_ADJUST_CAND];
+#endif
 
   CodingStructure ****m_pSplitCS;
   CodingStructure ****m_pFullCS;

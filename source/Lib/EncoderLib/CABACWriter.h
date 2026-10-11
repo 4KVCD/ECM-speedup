@@ -42,12 +42,28 @@
 #include "CommonLib/ContextModelling.h"
 #include "BinEncoder.h"
 
+#include <vector>
+
 
 //! \ingroup EncoderLib
 //! \{
 
 
 class EncCu;
+#if SIGN_PREDICTION
+struct SignCombInfo
+{
+  unsigned idx;
+  bool     sign;
+  bool     isSignPred;
+
+  SignCombInfo(const unsigned _sign, const unsigned _idx, const bool _isPred)
+    : idx(_idx), sign(_sign), isSignPred(_isPred)
+  {
+  }
+};
+#endif
+
 class CABACWriter
 {
 public:
@@ -566,6 +582,12 @@ public:
 #if JVET_Z0135_TEMP_CABAC_WIN_WEIGHT
   CABACDataStore*         m_CABACDataStore;
 #endif
+#if JVET_AI0136_ADAPTIVE_DUAL_TREE
+  Partitioner*            m_partitionerSST = nullptr;          ///< shared by the writers of one CABACEncoder
+#endif
+#if JVET_AG0098_AMVP_WITH_SBTMVP
+  uint32_t*               m_amvpSbTmvpEnabledArea = nullptr;   ///< where encoding adds the area of AMVP-SbTMVP blocks
+#endif
 
 
 private:
@@ -591,6 +613,12 @@ private:
   Ctx               m_TestCtx;
   EncCu*            m_EncCu;
   ScanElement*      m_scanOrder;
+#if SIGN_PREDICTION
+  // codePredictedSigns scratch
+  std::vector<SignCombInfo> m_signCombList;
+  std::vector<SignCombInfo> m_signCombPlaced;
+  std::vector<uint8_t>      m_signCombUsed;
+#endif
 #if JVET_AL0181_ASBT    
   TCoeff            m_coeffTmp[MAX_NUM_COMPONENT][MAX_CU_SIZE * MAX_CU_SIZE];
   SIGN_PRED_TYPE    m_signPredTypeTmp[MAX_NUM_COMPONENT][MAX_CU_SIZE * MAX_CU_SIZE];
@@ -626,6 +654,10 @@ public:
     m_BinEncoderStd.initBufferer  (CABAC_SPATIAL_MAX_BINS, Ctx::NumberOfContexts, CABAC_SPATIAL_MAX_BINS_PER_CTX);
     m_BitEstimatorStd.initBufferer(CABAC_SPATIAL_MAX_BINS, Ctx::NumberOfContexts, CABAC_SPATIAL_MAX_BINS_PER_CTX);
 #endif
+#if JVET_AI0136_ADAPTIVE_DUAL_TREE
+    m_CABACWriterStd.m_partitionerSST    = &m_partitionerSST;
+    m_CABACEstimatorStd.m_partitionerSST = &m_partitionerSST;
+#endif
   }
 
   virtual ~CABACEncoder()
@@ -646,6 +678,10 @@ public:
     m_BinEncoderStd.initBufferer  (CABAC_SPATIAL_MAX_BINS, Ctx::NumberOfContexts, CABAC_SPATIAL_MAX_BINS_PER_CTX);
     m_BitEstimatorStd.initBufferer(CABAC_SPATIAL_MAX_BINS, Ctx::NumberOfContexts, CABAC_SPATIAL_MAX_BINS_PER_CTX);
 #endif
+#if JVET_AI0136_ADAPTIVE_DUAL_TREE
+    m_CABACWriterStd.m_partitionerSST    = &m_partitionerSST;
+    m_CABACEstimatorStd.m_partitionerSST = &m_partitionerSST;
+#endif
   }
 #endif
 
@@ -658,6 +694,9 @@ private:
   CABACWriter         m_CABACEstimatorStd;
   CABACWriter*        m_CABACWriter   [BPM_NUM-1];
   CABACWriter*        m_CABACEstimator[BPM_NUM-1];
+#if JVET_AI0136_ADAPTIVE_DUAL_TREE
+  QTBTPartitioner     m_partitionerSST;
+#endif
 
 #if JVET_Z0135_TEMP_CABAC_WIN_WEIGHT
   CABACDataStore*         m_CABACDataStore;

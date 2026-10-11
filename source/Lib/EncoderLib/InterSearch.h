@@ -55,6 +55,9 @@
 #include "CommonLib/AffineGradientSearch.h"
 #include "CommonLib/IbcHashMap.h"
 #include "CommonLib/Hash.h"
+#include <cstdlib>
+#include <cstring>
+#include <memory>
 #include <unordered_map>
 #include <vector>
 #include "EncReshape.h"
@@ -811,6 +814,9 @@ private:
   int             m_affMVListSize;
   int             m_affMVListMaxSize;
   BlkUniMvInfo*   m_uniMvList;
+#if JVET_AD0208_IBC_ADAPT_FOR_CAM_CAPTURED_CONTENTS
+  std::vector<Mv> m_ibcMvdDerivedVec;   ///< predIBCSearch scratch
+#endif
   int             m_uniMvListIdx;
   int             m_uniMvListSize;
   int             m_uniMvListMaxSize;
@@ -1098,6 +1104,26 @@ public:
     m_uniMvListSizeLIC = tempInt;
   }
 #endif
+  /// Uni-prediction MVs of the motion search per block position and size, reused by later tests of the slice.
+  struct ReusedUniMvs
+  {
+#if CTU_256
+    Mv   mv    [MAX_CU_SIZE >> MIN_CU_LOG2][MAX_CU_SIZE >> MIN_CU_LOG2][MAX_CU_DEPTH + 1][MAX_CU_DEPTH + 1][2][33];
+    bool filled[MAX_CU_SIZE >> MIN_CU_LOG2][MAX_CU_SIZE >> MIN_CU_LOG2][MAX_CU_DEPTH + 1][MAX_CU_DEPTH + 1];
+#else
+    Mv   mv    [32][32][8][8][2][33];
+    bool filled[32][32][8][8];
+#endif
+  };
+  ReusedUniMvs& getReusedUniMvs( bool lic ) { return *m_reusedUniMvs[lic ? 1 : 0]; }
+  void          resetReusedUniMvs( bool lic ) { ::memset( m_reusedUniMvs[lic ? 1 : 0]->filled, 0, sizeof( ReusedUniMvs::filled ) ); }
+private:
+  struct FreeDeleter
+  {
+    void operator()( void* p ) const { std::free( p ); }
+  };
+  std::unique_ptr<ReusedUniMvs, FreeDeleter> m_reusedUniMvs[2];   ///< [LIC]; calloc'ed, so only touched pages get memory
+public:
   void resetUniMvList() { m_uniMvListIdx = 0; m_uniMvListSize = 0; 
 #if INTER_LIC
                           m_uniMvListIdxLIC = 0; m_uniMvListSizeLIC = 0; 

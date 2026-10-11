@@ -7814,8 +7814,12 @@ void IntraSearch::getPredForCCPMrgFusion(PredictionUnit& pu, PelBuf& predCb, Pel
   if (pu.ccpMergeFusionType == 0)
   {
     const int                         bitDepth = pu.cu->slice->getSPS()->getBitDepth(CHANNEL_TYPE_LUMA);
-    static CccmModel cccmModelCb[2] = { CccmModel(CCCM_NUM_PARAMS, bitDepth), CccmModel(CCCM_NUM_PARAMS, bitDepth) };
-    static CccmModel cccmModelCr[2] = { CccmModel(CCCM_NUM_PARAMS, bitDepth), CccmModel(CCCM_NUM_PARAMS, bitDepth) };
+    if( m_ccpMrgFusionCccmModel.empty() )
+    {
+      m_ccpMrgFusionCccmModel.assign( 4, CccmModel( CCCM_NUM_PARAMS, bitDepth ) );
+    }
+    CccmModel* cccmModelCb = &m_ccpMrgFusionCccmModel[0];
+    CccmModel* cccmModelCr = &m_ccpMrgFusionCccmModel[2];
     pu2.cccmFlag = 1;
 #if JVET_AC0054_GLCCCM
     pu2.glCccmFlag = 0;
@@ -7825,9 +7829,7 @@ void IntraSearch::getPredForCCPMrgFusion(PredictionUnit& pu, PelBuf& predCb, Pel
 #endif
 #if MMLM
     pu2.intraDir[1] = MMLM_CHROMA_IDX;
-    static int modelThr = 0;
-
-    modelThr = xCccmCalcRefAver(pu2);
+    const int modelThr = xCccmCalcRefAver(pu2);
     xCccmCalcModels(pu2, cccmModelCb[0], cccmModelCr[0], 1, modelThr);
     xCccmCalcModels(pu2, cccmModelCb[1], cccmModelCr[1], 2, modelThr);
 
@@ -9731,7 +9733,7 @@ void IntraSearch::estIntraPredChromaQT( CodingUnit &cu, Partitioner &partitioner
 #endif
 #if JVET_AL0126_CCP_MERGE_WITH_ADJUST
       int numPosAdjust = 0;
-      static CCPModelCandidate ccpMergeAdjustCandList[MAX_CCP_CAND_LIST_INIT_SIZE << 1];
+      CCPModelCandidate* ccpMergeAdjustCandList = m_ccpMergeAdjustCandList[0];
       double orderedAdjustCCPcost[MAX_CCP_CAND_LIST_SIZE<<1];
       int orderedAdjustCCPCand[MAX_CCP_CAND_LIST_SIZE<<1];
       PelUnitBuf ccpMergeAdjustCandStorage[MAX_CCP_CAND_LIST_SIZE<<1];
@@ -9799,7 +9801,7 @@ void IntraSearch::estIntraPredChromaQT( CodingUnit &cu, Partitioner &partitioner
         if (PU::hasCcpMergeAdjustFlag(pu) && (!m_skipCcpMergeAdjustListConstruction || cs.slice->getSliceType() != I_SLICE))
         {
           pu.ccpMergeAdjustFlag = 1;
-          static CCPModelCandidate cand[MAX_NUM_DERIVED_CCP_ADJUST_CAND];
+          CCPModelCandidate* cand = m_ccpMergeAdjustCand[0];
           int candFlyNum = 0;
           numPosAdjust = PU::getCCPModelCandidateList(pu, ccpMergeAdjustCandList, false, 0, NULL, -1, &cand[0], candFlyNum);
           if (numPosAdjust < MAX_CCP_CAND_LIST_INIT_SIZE)
@@ -12342,7 +12344,7 @@ void IntraSearch::estIntraPredChromaQT( CodingUnit &cu, Partitioner &partitioner
 
 #if JVET_AL0126_CCP_MERGE_WITH_ADJUST
         bool isCcpMergeAdjustEnabledInRdo[MAX_CCP_CAND_LIST_SIZE << 1] = { false };
-        static CCPModelCandidate ccpMergeAdjustCandList[MAX_CCP_CAND_LIST_INIT_SIZE << 1];
+        CCPModelCandidate* ccpMergeAdjustCandList = m_ccpMergeAdjustCandList[1];
         double orderedAdjustCCPcost[MAX_CCP_CAND_LIST_SIZE<<1];
         int orderedAdjustCCPCand[MAX_CCP_CAND_LIST_SIZE<<1];
         PelUnitBuf ccpMergeAdjustCandStorage[MAX_CCP_CAND_LIST_SIZE<<1];
@@ -12358,7 +12360,7 @@ void IntraSearch::estIntraPredChromaQT( CodingUnit &cu, Partitioner &partitioner
         if (PU::hasCcpMergeAdjustFlag(pu) && (!m_skipCcpMergeAdjustListConstruction || cs.slice->getSliceType() != I_SLICE))
         {
           pu.ccpMergeAdjustFlag = 1;
-          static CCPModelCandidate cand[MAX_NUM_DERIVED_CCP_ADJUST_CAND];
+          CCPModelCandidate* cand = m_ccpMergeAdjustCand[1];
           int candFlyNum = 0;
           numPosAdjust = PU::getCCPModelCandidateList(pu, ccpMergeAdjustCandList, false, 0, NULL, -1, &cand[0], candFlyNum);
           if (numPosAdjust < MAX_CCP_CAND_LIST_INIT_SIZE)

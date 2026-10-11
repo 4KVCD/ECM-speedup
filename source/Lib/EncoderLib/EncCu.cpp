@@ -55,9 +55,6 @@
 
 
 
-#if JVET_AI0136_ADAPTIVE_DUAL_TREE
-Partitioner *g_compressPartitionerSST;
-#endif
 
 //! \ingroup EncoderLib
 //! \{
@@ -764,7 +761,7 @@ void EncCu::compressCtu( CodingStructure& cs, const UnitArea& area, const unsign
   // init the partitioning manager
   QTBTPartitioner partitioner;
 #if JVET_AI0136_ADAPTIVE_DUAL_TREE
-  g_compressPartitionerSST = new QTBTPartitioner; 
+  m_partitionerSST = new QTBTPartitioner;
 #endif
   partitioner.initCtu(area, CH_L, *cs.slice);
 
@@ -846,7 +843,7 @@ void EncCu::compressCtu( CodingStructure& cs, const UnitArea& area, const unsign
   m_CurrCtx                  = 0;
 
 #if JVET_AI0136_ADAPTIVE_DUAL_TREE
-  delete g_compressPartitionerSST;
+  delete m_partitionerSST;
 #endif
 
   // Ensure that a coding was found
@@ -3325,7 +3322,7 @@ void EncCu::xCheckRDCostSeparateTreeIntra( CodingStructure *&tempCS, CodingStruc
   CHECK( !tempCS->slice->getSeparateTreeEnabled(),   "Invoked xCheckRDCostSeparateTreeIntra() when SST is disabled" );
 
   m_modeCtrl->setNonIntraCUECtx( m_modeCtrl->getComprCUCtx() );
-  Partitioner *& partitionerSST = g_compressPartitionerSST;
+  Partitioner *& partitionerSST = m_partitionerSST;
 
   bool inferredSeparateTreeFlag = false;
   int startFlagVal     = 0;
@@ -3932,13 +3929,13 @@ bool EncCu::xCheckRDCostIntra(CodingStructure *&tempCS, CodingStructure *&bestCS
 #if JVET_AJ0061_TIMD_MERGE
     for (int i = 0; i <= EXT_VDIA_IDX; i++)
     {
-      g_timdMrgCost[i] = MAX_UINT64;
+      m_pcIntraSearch->m_timdMrgCost[i] = MAX_UINT64;
     }
 #endif
 #if JVET_AK0059_MDIP
     for (int i = 0; i <= EXT_VDIA_IDX; i++)
     {
-      g_intraModeCost[i] = MAX_UINT64;
+      m_pcIntraSearch->m_intraModeCost[i] = MAX_UINT64;
     }
     if (CU::allowMdip(cu))
     { 

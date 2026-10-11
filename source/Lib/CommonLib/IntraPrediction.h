@@ -443,6 +443,12 @@ public:
 #if JVET_AK0061_PDP_MPM
   bool m_mpmIncludedPdpMode[NUM_LUMA_MODE] = { false };
 #endif
+#if JVET_AK0059_MDIP
+  uint64_t m_intraModeCost[EXT_VDIA_IDX + 1] = {};   ///< template cost per intra mode of the current CU (MAX_UINT64: not computed yet)
+#endif
+#if JVET_AJ0061_TIMD_MERGE
+  uint64_t m_timdMrgCost[EXT_VDIA_IDX + 1] = {};     ///< the same for the TIMD merge candidates
+#endif
 #if JVET_AH0209_PDP
   Pel* m_pdpIntraPredBufIP[NUM_LUMA_MODE];
   bool m_pdpIntraPredReady[NUM_LUMA_MODE];
