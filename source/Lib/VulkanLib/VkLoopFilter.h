@@ -108,8 +108,9 @@ public:
 
   /// Starts a picture whose reconstruction is on the CPU.
   void beginPicture( CodingStructure& cs );
-  /// Makes the CPU picture current, before a stage that runs on the CPU. The GPU copy is stale afterwards.
-  void syncToCpu( CodingStructure& cs );
+  /// Makes the CPU picture current, before a stage that runs on the CPU. Unless cpuWrites is false, the GPU copy is
+  /// stale afterwards outside check mode.
+  void syncToCpu( CodingStructure& cs, bool cpuWrites = true );
 
   /// The edge maps for LoopFilter::setEdgeMaps, cleared, before LoopFilter::loopFilterPic.
   DeblockEdgeMaps& deblockPrepare( CodingStructure& cs );
@@ -125,6 +126,12 @@ public:
   /// ALFProcess.
   void alfPrepare( CodingStructure& cs, AdaptiveLoopFilter& alf );
   bool alf( CodingStructure& cs, AdaptiveLoopFilter& alf );
+
+  /// LF-CCCM (LoopFilterCccm::lfCccmCtuProcess for every CTU) on the picture after SAO: the chroma correction that
+  /// lfCccmApply adds after ALF. lfCccmCheck compares the correction with the CPU's in check mode.
+  void lfCccm( CodingStructure& cs, int impMode );
+  void lfCccmApply( CodingStructure& cs );
+  void lfCccmCheck( CodingStructure& cs, const PelUnitBuf& cpuCorrection );
 
   /// The deblocking's coding information (luma), which the offset refinement and ALF read; after loopFilterPic.
   void uploadCodingInfo( const CPelBuf& ci );
@@ -156,6 +163,13 @@ public:
     uint64_t alfChromaScalePictures = 0;
     uint64_t alfMirrors     = 0;   ///< mirrored padding regions of the result planes
     uint64_t refinePictures[2] = {};  ///< pictures with the offset refinement after deblocking, after ALF
+    uint64_t lfCccmPictures = 0;
+    uint64_t lfCccmWindows  = 0;
+    uint64_t lfCccmModelTypes[8]  = {};   ///< CTUs by model type
+    uint64_t lfCccmWindowSizes[8] = {};   ///< CTUs by window size index
+    uint64_t lfCccmImpModes[5]    = {};   ///< pictures by update factor (impMode)
+    uint64_t lfCccmBranches[6]    = {};   ///< steps with a smaller model, too few samples, an invalid model, a stop at
+                                          ///< a deviating sample, halves with sub-models, all steps
   };
   const Counts& counts() const { return m_counts; }
   /// Why ALF stayed on the CPU, with the number of pictures.
@@ -198,6 +212,10 @@ private:
   GpuPicture       m_src;               ///< the ALF input
   GpuPicture       m_resi;              ///< the luma residual
   Buffer           m_codingInfo;        ///< the deblocking's coding information, luma
+  Buffer           m_lfCorr;            ///< LF-CCCM: the updated chroma, then the correction; the picture's layout
+  Buffer           m_lfDown;            ///< LF-CCCM: the downsampled luma, padded by 1
+  Buffer           m_lfWindows;
+  Buffer           m_lfStats;           ///< check mode: lfcccm_window.comp branch counters
   Buffer           m_refineCtus;        ///< offset refinement after ALF: CTUs with luma ALF on
   bool             m_alfInputOnGpu = false;   ///< m_src holds this picture's ALF input
   Buffer           m_alfRes;            ///< the result planes of AlfGpuPlan::Plane

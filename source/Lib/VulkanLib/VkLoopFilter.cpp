@@ -164,7 +164,8 @@ void VkLoopFilter::destroy()
   m_src.destroy( *m_core );
   m_resi.destroy( *m_core );
   for( Buffer* b: { &m_edgeBuf, &m_saoParams, &m_bifBlocks, &m_bifTables, &m_ccSaoSets, &m_ctuBytes, &m_ccSaoTables,
-                    &m_codingInfo, &m_refineCtus, &m_alfRes, &m_alfCls, &m_alfTables, &m_alfParams } )
+                    &m_codingInfo, &m_refineCtus, &m_alfRes, &m_alfCls, &m_alfTables, &m_alfParams,
+                    &m_lfCorr, &m_lfDown, &m_lfWindows, &m_lfStats } )
   {
     m_core->destroyBuffer( *b );
   }
@@ -212,7 +213,7 @@ void VkLoopFilter::ensureOnGpu( CodingStructure& cs )
   }
 }
 
-void VkLoopFilter::syncToCpu( CodingStructure& cs )
+void VkLoopFilter::syncToCpu( CodingStructure& cs, bool cpuWrites )
 {
   if( !m_cpuCurrent )
   {
@@ -220,7 +221,7 @@ void VkLoopFilter::syncToCpu( CodingStructure& cs )
     m_pic.download( reco );
     m_cpuCurrent = true;
   }
-  if( !m_check )
+  if( !m_check && cpuWrites )
   {
     m_gpuCurrent = false;
   }

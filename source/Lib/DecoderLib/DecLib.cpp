@@ -1123,8 +1123,8 @@ void DecLib::executeLoopFilters()
   if( m_vkCore )
   {
     m_vkLoopFilter.checkAgainstCpu( cs, "SAO, bilateral filter and CCSAO" );
-    // The stages after this one run on the CPU.
-    m_vkLoopFilter.syncToCpu( cs );
+    // ALF reads the CPU picture, without changing it unless it falls back to the CPU
+    m_vkLoopFilter.syncToCpu( cs, false );
   }
 #endif
 
@@ -1133,6 +1133,15 @@ void DecLib::executeLoopFilters()
   m_cLoopFilterCccm.lfCccmSetFrameLevelInheritedParameters(cs);
   if(cs.slice->getLfCccmEnabledFlag())
   {
+#if ECM_VULKAN && JVET_AM0063_ALF_CCCM_ADAPTIVE_FACTOR
+    if( m_vkCore )
+    {
+      m_vkLoopFilter.lfCccm( cs, cs.slice->getLfCccmImpEnabledFlag() ? 1 + cs.slice->getLfCccmImpFactorIdx() : 0 );
+    }
+  }
+  if( cs.slice->getLfCccmEnabledFlag() && ( !m_vkCore || m_vkCheck ) )
+  {
+#endif
     m_cLoopFilterCccm.lfCccmInitIntraPred(&m_cIntraPred);
     cccmCorrection.create(CHROMA_ONLY_420, Area(0, 0, cs.picture->lwidth(), cs.picture->lheight()));
     cccmCorrection.copyFrom(cs.getRecoBuf(),false,true);
@@ -1156,6 +1165,12 @@ void DecLib::executeLoopFilters()
     }
     cccmCorrection.getBuf(COMPONENT_Cb).subtract( cs.getRecoBuf(COMPONENT_Cb) );
     cccmCorrection.getBuf(COMPONENT_Cr).subtract( cs.getRecoBuf(COMPONENT_Cr) );
+#if ECM_VULKAN
+    if( m_vkCore )
+    {
+      m_vkLoopFilter.lfCccmCheck( cs, cccmCorrection );
+    }
+#endif
 #if JVET_AM0063_ALF_CCCM_ADAPTIVE_FACTOR
     m_cLoopFilterCccm.lfCccmDestroyPelStorage();
     for (int factorIdx = 0; factorIdx < MAX_NUM_FACTOR_LF_CCCM; factorIdx++)
@@ -1186,7 +1201,6 @@ void DecLib::executeLoopFilters()
       {
         m_vkLoopFilter.checkAgainstCpu( cs, "ALF" );
       }
-      m_vkLoopFilter.syncToCpu( cs );
     }
 #endif
   }
@@ -1194,11 +1208,33 @@ void DecLib::executeLoopFilters()
 #if JVET_AL0153_ALF_CCCM
   if(cs.slice->getLfCccmEnabledFlag())
   {
-    cs.getRecoBuf(COMPONENT_Cb).reconstruct(cs.getRecoBuf(COMPONENT_Cb), cccmCorrection.getBuf(COMPONENT_Cb), cs.slice->clpRng(COMPONENT_Cb));
-    cs.getRecoBuf(COMPONENT_Cr).reconstruct(cs.getRecoBuf(COMPONENT_Cr), cccmCorrection.getBuf(COMPONENT_Cr), cs.slice->clpRng(COMPONENT_Cr));
+#if ECM_VULKAN
+    if( m_vkCore )
+    {
+      m_vkLoopFilter.lfCccmApply( cs );
+    }
+    if( !m_vkCore || m_vkCheck )
+#endif
+    {
+      cs.getRecoBuf(COMPONENT_Cb).reconstruct(cs.getRecoBuf(COMPONENT_Cb), cccmCorrection.getBuf(COMPONENT_Cb), cs.slice->clpRng(COMPONENT_Cb));
+      cs.getRecoBuf(COMPONENT_Cr).reconstruct(cs.getRecoBuf(COMPONENT_Cr), cccmCorrection.getBuf(COMPONENT_Cr), cs.slice->clpRng(COMPONENT_Cr));
+    }
 #if JVET_AM0063_ALF_CCCM_ADAPTIVE_FACTOR
     cccmCorrection.destroy();
 #endif
+#if ECM_VULKAN
+    if( m_vkCore )
+    {
+      m_vkLoopFilter.checkAgainstCpu( cs, "LF-CCCM" );
+    }
+#endif
+  }
+#endif
+#if ECM_VULKAN
+  if( m_vkCore )
+  {
+    // the temporal ALF runs on the CPU
+    m_vkLoopFilter.syncToCpu( cs );
   }
 #endif
 #if JVET_AK0065_TALF

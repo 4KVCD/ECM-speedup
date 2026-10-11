@@ -1,0 +1,51 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+// LF-CCCM: the luma after SAO downsampled to the chroma grid and centred (LoopFilterCccm::lfCccmDownsampleType0/1/2),
+// with the edge samples repeated once around the picture as lfCccmFillDownsampledLumaBuffers pads them. One
+// invocation per sample of the padded plane.
+
+layout( local_size_x = 16, local_size_y = 16 ) in;
+
+layout( push_constant, scalar ) uniform Push
+{
+  I16Buf luma;
+  I16Buf dst;
+  int    lumaOrigin, lumaStride;
+  int    dstOrigin, dstStride;
+  int    width, height;   // chroma size
+  int    type;            // downsampling filter 0, 1 or 2
+  int    lumaOffset;      // 1 << ( luma bit depth - 1 )
+} pc;
+
+int L( int x, int y ) { return int( pc.luma.v[pc.lumaOrigin + y * pc.lumaStride + x] ); }
+
+void main()
+{
+  const int px = int( gl_GlobalInvocationID.x ) - 1, py = int( gl_GlobalInvocationID.y ) - 1;
+  if( px > pc.width || py > pc.height )
+  {
+    return;
+  }
+  const int x = clamp( px, 0, pc.width - 1 ), y = clamp( py, 0, pc.height - 1 );
+  int s;
+  if( pc.type == 2 )
+  {
+    const int offLeft = x > 0 ? -1 : 0, offAbove = y > 0 ? -1 : 0;
+    s = 4 + L( 2 * x, 2 * y ) * 4 + L( 2 * x + offLeft, 2 * y ) + L( 2 * x + 1, 2 * y ) + L( 2 * x, 2 * y + 1 ) + L( 2 * x, 2 * y + offAbove );
+    s >>= 3;
+  }
+  else if( pc.type == 1 )
+  {
+    s = ( 2 + L( 2 * x, 2 * y ) + L( 2 * x + 1, 2 * y ) + L( 2 * x, 2 * y + 1 ) + L( 2 * x + 1, 2 * y + 1 ) ) >> 2;
+  }
+  else
+  {
+    const int offLeft = x > 0 ? -1 : 0;
+    s = 4 + L( 2 * x, 2 * y ) * 2 + L( 2 * x + offLeft, 2 * y ) + L( 2 * x + 1, 2 * y ) + L( 2 * x, 2 * y + 1 ) * 2
+      + L( 2 * x + offLeft, 2 * y + 1 ) + L( 2 * x + 1, 2 * y + 1 );
+    s >>= 3;
+  }
+  pc.dst.v[pc.dstOrigin + py * pc.dstStride + px] = int16_t( s - pc.lumaOffset );
+}

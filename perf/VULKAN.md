@@ -105,6 +105,17 @@ correction against the stage's change, from the log2 of its magnitude, with a th
 deblocking's coding information, which the GPU receives once per picture after deblocking). After ALF it skips the
 CTUs with luma ALF off.
 
+### LF-CCCM
+
+LF-CCCM (`LoopFilterCccm`) fits linear models of chroma from the downsampled luma per window of each CTU and adds
+the change after ALF. The GPU computes the downsampled luma for the whole picture, then one workgroup per window
+runs the CPU's sequence of up to 6 model fits: the statistics over the regression window are spread over the
+invocations, the integer Gaussian elimination of `CccmCovariance::solve3` runs on one, and the model is applied in
+parallel up to the first sample (in raster order) that deviates too much, which is where the CPU's loop stops.
+Quirks kept: the chroma offsets and the sub-model threshold are summed in 16-bit variables on the CPU and wrap; the
+rounding term of `xGetDivScaleRoundShift` shifts by the bit count modulo 32, as x86 does; the regression window at a
+CTU's left or top edge keeps its start and still grows by 2 samples; `clipArea` clips only at the right and bottom.
+
 ## Status
 
 | stage | GPU | checked on the corpus |
@@ -117,6 +128,8 @@ CTUs with luma ALF off.
 | ALF chroma ALF_FILTER_9_NO_FIX | yes | not exercised |
 | ALF in pictures the plan does not cover (see ALF) | CPU | - |
 | offset refinement after deblocking and after ALF | yes | 48 streams identical, 34 and 84 pictures |
+| LF-CCCM: CTU model types 0, 1, 3-6, window sizes 0-2, 4, 5, all update factors, every branch of the window process | yes | 48 streams identical, 73 pictures, 31612 windows |
+| LF-CCCM CTU model types 2 and 7, window sizes 3, 6, 7 | yes | not exercised |
 | everything else | CPU | - |
 
 Speed: on the hybrid path the per-picture copies and the synchronous waits cost more than the GPU saves. ra_cif

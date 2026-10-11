@@ -1,0 +1,39 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+// LF-CCCM correction of the chroma planes (DecLib::executeLoopFilters). Mode 0, after the windows: the correction
+// is the updated chroma minus the picture after SAO, in place. Mode 1, after ALF: the picture plus the correction,
+// clipped (AreaBuf::reconstruct). One invocation per chroma sample, z the component.
+
+layout( local_size_x = 16, local_size_y = 16 ) in;
+
+layout( push_constant, scalar ) uniform Push
+{
+  I16Buf pic;
+  I16Buf corr;          // Cb then Cr
+  int    picOrigin[2], picStride[2];
+  int    corrOrigin[2], corrStride;
+  int    width, height; // chroma size
+  int    clpMin[2], clpMax[2];
+  int    mode;
+} pc;
+
+void main()
+{
+  const int x = int( gl_GlobalInvocationID.x ), y = int( gl_GlobalInvocationID.y ), c = int( gl_GlobalInvocationID.z );
+  if( x >= pc.width || y >= pc.height )
+  {
+    return;
+  }
+  const int p = pc.picOrigin[c] + y * pc.picStride[c] + x;
+  const int q = pc.corrOrigin[c] + y * pc.corrStride + x;
+  if( pc.mode == 0 )
+  {
+    pc.corr.v[q] = int16_t( int( pc.corr.v[q] ) - int( pc.pic.v[p] ) );
+  }
+  else
+  {
+    pc.pic.v[p] = int16_t( clamp( int( pc.pic.v[p] ) + int( pc.corr.v[q] ), pc.clpMin[c], pc.clpMax[c] ) );
+  }
+}
