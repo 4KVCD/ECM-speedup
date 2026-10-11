@@ -25,7 +25,7 @@ struct Tu
   int lmcs;             // LMCS: bit 0 the bilateral filter works on inverse-mapped samples, bit 1 chroma residual scaling
   int crsX, crsY, crsW, crsH;   // chroma residual scaling: the CU's luma area (its left column and above row are averaged)
   int crsAvail;         // bit 0: there is a luma CU left of the area, bit 1: above it
-  int pad[1];
+  int quant;            // bit 0: dependent quantization (the coefficients are quantization indices), bit 1: QCS
 };
 layout( buffer_reference, std430, buffer_reference_align = 4 ) buffer BufTu { Tu v[]; };
 
@@ -36,7 +36,7 @@ struct Params
   uint64_t plane[3];    // int16 reconstruction (written), origin/stride below
   uint64_t owner[3];    // int32 per unit and component: the block covering it (-1: none); 4x4 luma, 2x2 chroma units
   uint64_t filters;     // int32: [taps 6,8,10,12,16][32][16] cubic tables, then the weak 4-tap table [32][4]
-  uint64_t matrices;    // int32: DCT-II inverse matrices N = 2..128 at matrixOffset[log2N - 1]
+  uint64_t matrices;    // int32: DCT-II inverse matrices N = 2..128 at matrixOffset[log2N - 1], QCS weights at qcsOffset
   uint64_t dbgPred;     // int16 per block w*h at dbgOffset
   uint64_t dbgResi;     // int16 residual per block w*h at dbgOffset (written by intra_resi, added by intra_rec)
   uint64_t depCount;    // int32 per block: dependencies not reconstructed yet
@@ -60,6 +60,8 @@ struct Params
   int      edgeCap;     // the capacity of depList / depTmp
   int      lmcsLutSize;              // entries of each LMCS table (1 << luma bit depth)
   int      lumaClipMin, lumaClipMax; // the slice's luma clipping range (the average luma of chroma residual scaling)
+  int      qcsOffset;   // Quant's m_coeffShift64: the weight (of 1024) of the next larger index, per index magnitude < 64
+  int      pad;
 };
 layout( buffer_reference, std430, buffer_reference_align = 8 ) buffer BufParams { Params p; };
 

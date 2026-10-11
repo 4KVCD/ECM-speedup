@@ -250,10 +250,17 @@ the reconstruction buffer; works in every frame-thread context):
   gate skips the filter), and the chroma residual is scaled by the rounded mean of the luma column left of and the
   row above the CU (Reshape::calculateChromaAdjVpduNei with LMCS_CHROMA_CALC_CU; the host records the CU's luma area
   and which neighbours exist, the GPU averages, and the chroma block depends on the luma blocks it reads); the host
-  uploads the picture's forward and inverse LUTs and the chroma scale of every luma value. GpuIntraRec::supported()
-  rejects every tool whose mode derivation or prediction reads reconstructed samples or that the kernels lack, before
-  anything is skipped. All 19 regular streams now fall back to the CPU at QCS, the next sequence-level check (before
-  M5: LMCS, before M4: dual tree); many block-level tools follow.
+  uploads the picture's forward and inverse LUTs and the chroma scale of every luma value; M6 adds dependent
+  quantization (4 and 8 states) and QCS (quantization center shift): the host walks the quantizer states down each
+  block's scan (they depend on the levels' parities only) and records quantization indices instead of levels;
+  intra_resi dequantizes them like DepQuant's dequantBlock (64-bit arithmetic) and the levels of the other blocks like
+  Quant::dequant (32-bit), with QCS blending in the dequantization of the next larger index. Until M6 dependent
+  quantization was not rejected although the kernel dequantized every level as a scalar one: a stream with dependent
+  quantization and otherwise supported tools decoded wrong with the reconstruction on (no test set and no regular
+  stream had that combination). GpuIntraRec::supported() rejects every tool whose mode derivation or prediction reads
+  reconstructed samples or that the kernels lack, before anything is skipped. All 19 regular streams now fall back to
+  the CPU at sign prediction, the next sequence-level check (before M6: QCS, before M5: LMCS, before M4: dual tree);
+  many block-level tools follow.
 - kernels: intra_resi (all residuals of the picture at once, dequantization folded into the first DCT-II stage,
   only the nonzero coefficient region) and intra_rec (persistent workgroups take ready blocks from a queue; the
   host gives each block its dependency count, its dependents and the availability the CPU sees as five numbers per

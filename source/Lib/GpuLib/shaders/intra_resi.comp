@@ -1,7 +1,8 @@
 #version 460
 #pragma use_vulkan_memory_model
 // residuals of all intra transform blocks of a picture at once (they depend on no other block): dequantization
-// (Quant::dequant without scaling lists) folded into the first inverse DCT-II stage, then the second stage
+// (Quant::dequant, or DepQuant's dequantBlock with dependent quantization, either with QCS; without scaling lists)
+// folded into the first inverse DCT-II stage, then the second stage
 // (TrQuant::xIT: two clipped matrix stages, equal to the partial butterflies in integer arithmetic); the result
 // goes to the residual buffer intra_rec adds to its prediction. Persistent workgroups take blocks by index.
 // Don't keep the first stage's output in a global scratch buffer: while other processes shared the GPU (RTX 3070),
@@ -20,6 +21,40 @@ shared int16_t s_stage1[128 * 128];
 int clip3i( int lo, int hi, int v )
 {
   return min( max( v, lo ), hi );
+}
+
+// Quant::dequant of a clipped nonzero level, in 32-bit arithmetic like the CPU's Intermediate_Int
+int dequantScalar( Tu t, int qc, int add )
+{
+  return t.dqRightShift > 0 ? ( qc * t.dqScale + add ) >> t.dqRightShift : ( qc * t.dqScale ) << ( -t.dqRightShift );
+}
+
+// the dequantized coefficient of a nonzero level (Tu::quant bit 0: a quantization index of dependent quantization),
+// clipped to the transform range; QCS (bit 1) weighs in the dequantization of the next larger index magnitude with
+// the weight table at qcsOffset in the matrices buffer
+int dequant( Tu t, int q, int add, BufI32 mt, int qcsOffset )
+{
+  const bool qcs = ( t.quant & 2 ) != 0;
+  if( ( t.quant & 1 ) != 0 )   // DepQuant's dequantBlock, in 64-bit arithmetic; the indices are not clipped
+  {
+    int64_t c = ( int64_t( q ) * t.dqScale + add ) >> t.dqRightShift;
+    if( qcs )
+    {
+      const int64_t c2 = ( int64_t( q + ( q > 0 ? 1 : -1 ) ) * t.dqScale + add ) >> t.dqRightShift;
+      const int     w  = abs( q ) < 64 ? mt.v[qcsOffset + abs( q )] : 0;
+      c = ( int64_t( 1024 - w ) * c + int64_t( w ) * c2 ) >> 10;
+    }
+    return int( min( max( c, int64_t( t.trMin ) ), int64_t( t.trMax ) ) );
+  }
+  const int qc = clip3i( t.dqInMin, t.dqInMax, q );
+  int       c  = dequantScalar( t, qc, add );
+  if( qcs )
+  {
+    const int c2 = dequantScalar( t, qc + ( qc > 0 ? 1 : -1 ), add );
+    const int w  = abs( qc ) < 64 ? mt.v[qcsOffset + abs( qc )] : 0;
+    c = ( ( 1024 - w ) * c + w * c2 ) >> 10;
+  }
+  return clip3i( t.trMin, t.trMax, c );
 }
 
 void main()
@@ -56,9 +91,7 @@ void main()
         const int q = cf.v[t.coeffOffset + k * nzC + xf];
         if( q != 0 )
         {
-          const int qc = clip3i( t.dqInMin, t.dqInMax, q );
-          const int c  = t.dqRightShift > 0 ? ( qc * t.dqScale + addDq ) >> t.dqRightShift : ( qc * t.dqScale ) << ( -t.dqRightShift );
-          sum += mt.v[offH + k * H + y] * clip3i( t.trMin, t.trMax, c );
+          sum += mt.v[offH + k * H + y] * dequant( t, q, addDq, mt, P.qcsOffset );
         }
       }
       s_stage1[xf * H + y] = int16_t( clip3i( t.trMin, t.trMax, ( sum + rnd1 ) >> t.shift1 ) );

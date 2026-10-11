@@ -45,6 +45,7 @@
 #include "CommonLib/BilateralFilter.h"
 #include "CommonLib/InterpolationFilter.h"
 #include "CommonLib/Picture.h"
+#include "CommonLib/Quant.h"
 #include "CommonLib/Reshape.h"
 #include "CommonLib/Rom.h"
 #include "CommonLib/Slice.h"
@@ -85,13 +86,17 @@ struct Tu
   int32_t lmcs;
   int32_t crsX, crsY, crsW, crsH;
   int32_t crsAvail;
-  int32_t pad[1];
+  int32_t quant;
 };
 static_assert( sizeof( Tu ) == 58 * 4, "Tu layout" );
 
 // Tu::lmcs
 constexpr int LMCS_BF_INVERSE  = 1;   // the intra bilateral filter works on inverse-mapped samples
 constexpr int LMCS_CHROMA_SCALE = 2;   // the chroma residual is scaled by the CU's neighbouring luma
+
+// Tu::quant
+constexpr int QUANT_DEP = 1;   // dependent quantization: the coefficients are quantization indices (DepQuant)
+constexpr int QUANT_QCS = 2;   // quantization center shift (JVET-AN0095 / JVET-AE0125)
 
 // layout shared with intra_rec.comp (struct Params, std430)
 struct Params
@@ -125,8 +130,10 @@ struct Params
   int32_t  edgeCap;
   int32_t  lmcsLutSize;
   int32_t  lumaClipMin, lumaClipMax;
+  int32_t  qcsOffset;
+  int32_t  pad;
 };
-static_assert( offsetof( Params, origin ) == 168 && offsetof( Params, matrixOffset ) == 248 && sizeof( Params ) == 296,
+static_assert( offsetof( Params, origin ) == 168 && offsetof( Params, matrixOffset ) == 248 && sizeof( Params ) == 304,
                "Params layout" );
 
 struct Push
@@ -153,6 +160,7 @@ struct Shared
   gpu::Kernel                      kernel, kernelResi, kernelDeps, kernelScan;
   gpu::Buffer                      filters, matrices;
   int32_t                          matrixOffset[8] = {};
+  int32_t                          qcsOffset       = 0;   // of the QCS weights in matrices
   std::unique_ptr<BilateralFilter> bif;   // the intra prediction bilateral filter's tables
 };
 
@@ -204,6 +212,8 @@ Shared* createShared( gpu::Context& ctx )
     sh->matrixOffset[l]  = (int32_t) mat.size();
     mat.insert( mat.end(), tables[l], tables[l] + n * n );
   }
+  sh->qcsOffset = (int32_t) mat.size();   // read by intra_resi's dequantization with QCS
+  mat.insert( mat.end(), m_coeffShift64, m_coeffShift64 + 64 );
   sh->filters.create( ctx, filt.size() * 4, gpu::Buffer::DEVICE );
   sh->matrices.create( ctx, mat.size() * 4, gpu::Buffer::DEVICE );
   gpu::Buffer upload;
@@ -339,7 +349,6 @@ bool GpuIntraRec::supported( const Slice& slice, std::string& why )
   if( !slice.isIntra() )                                                                  why = "not an intra slice";
   else if( sps.getChromaFormatIdc() != CHROMA_420 && sps.getChromaFormatIdc() != CHROMA_400 ) why = "chroma format";
   else if( sps.getLog2MaxTbSize() > 7 )                                                   why = "transform blocks above 128";
-  else if( sps.getUseQcs() )                                                              why = "QCS";
   else if( sps.getScalingListFlag() )                                                     why = "scaling lists";
   else if( sps.getSpsRangeExtension().getExtendedPrecisionProcessingFlag() )               why = "extended precision";
   else if( sps.getUseColorTrans() )                                                       why = "ACT";
@@ -423,11 +432,11 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
   else if( pu.multiRefIdx || ipa.multiRefIndex )                    why = "MRL";
   else if( dirMode >= NUM_LUMA_MODE )                               why = "intra mode beyond 66 (LM / NN / ...)";
   else if( sps.getUseLmcs() && !m.reshape )                         why = "LMCS without the decoder's reshaper";
-  else if( sps.getUseQcs() )                                        why = "QCS";
   else if( sps.getScalingListFlag() )                               why = "scaling lists";
   else if( sps.getSpsRangeExtension().getExtendedPrecisionProcessingFlag() ) why = "extended precision";
   else if( sps.getNumPredSigns() > 0 )                              why = "sign prediction";
   else if( area.width < 2 || area.height < 2 || area.width > 128 || area.height > 128 ) why = "block size";
+  else if( ( area.width & ( area.width - 1 ) ) || ( area.height & ( area.height - 1 ) ) ) why = "block size not a power of 2";
   if( why )
   {
     unsupported( why );
@@ -482,17 +491,38 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
   t.bitDepth = sps.getBitDepth( chType );
   t.cbf      = TU::getCbf( tu, compID ) ? 1 : 0;
 
-  // Quant::dequant without scaling lists, transform skip, extended precision or QCS
-  const int  maxLog2TrDynamicRange = sps.getMaxLog2TrDynamicRange( chType );
-  const bool needSqrtAdjustment    = TU::needsBlockSizeTrafoScale( tu, compID );
-  const int  iTransformShift = getTransformShift( t.bitDepth, area.size(), maxLog2TrDynamicRange ) + ( needSqrtAdjustment ? -1 : 0 );
-  const int  rightShift      = IQUANT_SHIFT - ( iTransformShift + qp.per( false ) );
-  const int  scaleBits       = IQUANT_SHIFT + 1;
-  const int  targetInputBitDepth = std::min<int>( maxLog2TrDynamicRange + 1, 32 + rightShift - scaleBits );
-  t.dqScale      = g_invQuantScales[needSqrtAdjustment ? 1 : 0][qp.rem( false )];
-  t.dqRightShift = rightShift;
-  t.dqInMin      = -( 1 << ( targetInputBitDepth - 1 ) );
-  t.dqInMax      = ( 1 << ( targetInputBitDepth - 1 ) ) - 1;
+  // dequantization without scaling lists, transform skip or extended precision: DepQuant::dequant (dequantBlock) with
+  // dependent quantization, else Quant::dequant; QCS blends either with the dequantization of the next larger index
+  const int maxLog2TrDynamicRange = sps.getMaxLog2TrDynamicRange( chType );
+  t.quant = ( slice.getDepQuantEnabledIdc() ? QUANT_DEP : 0 ) | ( sps.getUseQcs() ? QUANT_QCS : 0 );
+  if( t.quant & QUANT_DEP )
+  {
+    // the index of a level depends on the quantizer state (the indices are derived with the levels below); QP + 1,
+    // and the scale is shifted left instead of a negative right shift, without rounding
+    const bool sqrt2          = TU::needsSqrt2Scale( tu, compID );
+    const int  qpDQ           = qp.Qp( false ) + 1;
+    const int  qpPer          = qpDQ / 6;
+    const int  qpRem          = qpDQ - 6 * qpPer;
+    const int  transformShift = getTransformShift( t.bitDepth, area.size(), maxLog2TrDynamicRange ) + ( sqrt2 ? -1 : 0 );
+    const int  shift          = IQUANT_SHIFT + 1 - qpPer - transformShift;
+    const int  scale          = g_invQuantScales[sqrt2 ? 1 : 0][qpRem];
+    t.dqScale      = shift < 0 ? scale << -shift : scale;
+    t.dqRightShift = std::max( shift, 0 );
+    t.dqInMin      = INT32_MIN;   // the indices are not clipped
+    t.dqInMax      = INT32_MAX;
+  }
+  else
+  {
+    const bool needSqrtAdjustment  = TU::needsBlockSizeTrafoScale( tu, compID );
+    const int  iTransformShift     = getTransformShift( t.bitDepth, area.size(), maxLog2TrDynamicRange ) + ( needSqrtAdjustment ? -1 : 0 );
+    const int  rightShift          = IQUANT_SHIFT - ( iTransformShift + qp.per( false ) );
+    const int  scaleBits           = IQUANT_SHIFT + 1;
+    const int  targetInputBitDepth = std::min<int>( maxLog2TrDynamicRange + 1, 32 + rightShift - scaleBits );
+    t.dqScale      = g_invQuantScales[needSqrtAdjustment ? 1 : 0][qp.rem( false )];
+    t.dqRightShift = rightShift;
+    t.dqInMin      = -( 1 << ( targetInputBitDepth - 1 ) );
+    t.dqInMax      = ( 1 << ( targetInputBitDepth - 1 ) ) - 1;
+  }
   t.trMin        = -( 1 << maxLog2TrDynamicRange );
   t.trMax        = ( 1 << maxLog2TrDynamicRange ) - 1;
   if( t.trMin < INT16_MIN || t.trMax > INT16_MAX )   // intra_resi keeps the first transform stage in 16 bits
@@ -590,6 +620,31 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
     {
       const TCoeff* row = c.bufAt( 0, y );
       m.coef.insert( m.coef.end(), row, row + t.nzCols );
+    }
+    if( t.quant & QUANT_DEP )
+    {
+      // DepQuant's dequantBlock: from the last nonzero level down the diagonal scan, the quantizer state (a function
+      // of the levels' parities only) turns each level into its quantization index
+      CHECK( c.stride != area.width, "coefficients of a TU are contiguous" );
+      const ScanElement* scan = g_scanOrder[SCAN_GROUPED_4x4][SCAN_DIAG][gp_sizeIdxInfo->idxFrom( area.width )]
+                                           [gp_sizeIdxInfo->idxFrom( area.height )];
+      const uint64_t     stateTransTab = g_stateTransTab[slice.getDepQuantEnabledIdc()];
+      int                lastScanIdx   = (int) area.area() - 1;
+      while( lastScanIdx >= 0 && c.buf[scan[lastScanIdx].idx] == 0 )
+      {
+        lastScanIdx--;
+      }
+      for( int state = 0, scanIdx = lastScanIdx; scanIdx >= 0; scanIdx-- )
+      {
+        const unsigned rasterPos = scan[scanIdx].idx;
+        const TCoeff   level     = c.buf[rasterPos];
+        if( level )
+        {
+          m.coef[t.coeffOffset + ( rasterPos / area.width ) * t.nzCols + rasterPos % area.width] =
+            ( level << 1 ) + ( level > 0 ? -( state & 1 ) : ( state & 1 ) );
+        }
+        state = int( ( stateTransTab >> ( ( state << 3 ) + ( ( level & 1 ) << 2 ) ) ) & 15 );
+      }
     }
   }
   if( pred && resi )   // the CPU's prediction and residual, for the comparison
@@ -944,6 +999,7 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
   P.dbgResi  = m.dbgResi.addr;
   P.lumaClipMin = cs.slice->clpRng( COMPONENT_Y ).min;
   P.lumaClipMax = cs.slice->clpRng( COMPONENT_Y ).max;
+  P.qcsOffset   = m.sh->qcsOffset;
   // the picture's LMCS tables: the forward and inverse LUTs and the chroma scale of every average luma value
   // (Reshape::calculateChromaAdj itself)
   std::vector<int32_t> lmcsTable;

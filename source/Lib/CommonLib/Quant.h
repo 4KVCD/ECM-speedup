@@ -55,6 +55,13 @@
 
 #define QP_BITS                 15
 
+#if JVET_AN0095_QUANTIZATION_CENTER_SHIFT
+/// QCS: per quantization index magnitude below 64, the weight (of 1024) of the next larger magnitude's
+/// dequantization (Quant::dequant; DepQuant's dequantBlock holds an identical table); also read by the GPU
+/// reconstruction
+extern const int m_coeffShift64[64];
+#endif
+
 // ====================================================================================================================
 // Class definition
 // ====================================================================================================================
