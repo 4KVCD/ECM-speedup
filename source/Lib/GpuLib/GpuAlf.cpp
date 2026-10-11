@@ -789,8 +789,12 @@ bool GpuAlf::gather( const AdaptiveLoopFilter& alf, const CodingStructure& cs )
   p.chromaFixed = alf.m_filterTypeApsChroma == ALF_FILTER_9;
   if( p.chromaAlf[0] || p.chromaAlf[1] )
   {
-    const char* scaleIdx = &alf.m_chromaScaleIdxFinal[0][0];   // indexed by alternatives up to 7, as ALFProcess does
-    for( int alt = 0; alt < MAX_NUM_ALF_ALTERNATIVES_CHROMA; alt++ )
+    // Only the alternatives of the slice's chroma APS are filled, because a CTU selects no other. Past them
+    // m_chromaScaleIdxFinal holds no scale index, and the m_SCALE_FACTOR lookup would read out of bounds.
+    APS*        chromaAps       = cs.slice->getAlfAPSs()[slice.getTileGroupApsIdChroma()];
+    const int   numAlternatives = chromaAps->getAlfAPSParam().numAlternativesChroma;
+    const char* scaleIdx        = &alf.m_chromaScaleIdxFinal[0][0];   // indexed by alternatives up to 7, as ALFProcess does
+    for( int alt = 0; alt < numAlternatives; alt++ )
     {
       int16_t* s = &p.chroma[alt * CHROMA_STRIDE];
       for( int k = 0; k < MAX_NUM_ALF_CHROMA_COEFF; k++ )
