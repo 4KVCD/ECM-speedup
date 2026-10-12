@@ -12041,6 +12041,45 @@ void IntraPrediction::initTimdIntraPatternLuma(const CodingUnit &cu, const CompA
 #endif 
 }
 
+#if JVET_AJ0146_TIMDSAD && JVET_AC0094_REF_SAMPLES_OPT && JVET_AG0146_DIMD_ITMP_IBC && JVET_AM0074_INTRA_MERGE
+// xFillTimdReferenceSamples' step 1 for a luma template of tw x th left of and above area with both arms (keep in step
+// with it): the units of its reference line and which are available, for the GPU reconstruction
+void IntraPrediction::timdReferenceUnits( const CodingUnit& cu, const CompArea& area, int tw, int th, int refW, int refH, TimdReferenceUnits& u )
+{
+  const CodingStructure& cs  = *cu.cs;
+  const PreCalcValues&   pcv = *cs.pcv;
+  const ChannelType   chType = CHANNEL_TYPE_LUMA;
+  const int predSize  = refW << 3;   // m_topRefLength, m_leftRefLength of initTimdIntraPatternLuma with both arms
+  const int predHSize = refH << 3;
+  u.unitWidth        = pcv.minCUWidth;
+  u.unitHeight       = pcv.minCUHeight;
+  u.leftTempUnitNum  = th >= 4 ? th / u.unitHeight : 0;
+  u.aboveTempUnitNum = tw >= 4 ? tw / u.unitWidth : 0;
+  u.totalAboveUnits  = ( predSize + ( u.unitWidth - 1 ) ) / u.unitWidth - u.aboveTempUnitNum;
+  u.totalLeftUnits   = ( predHSize + ( u.unitHeight - 1 ) ) / u.unitHeight - u.leftTempUnitNum;
+  u.totalUnits       = u.totalAboveUnits + u.totalLeftUnits + 1 + u.aboveTempUnitNum + u.leftTempUnitNum;
+  const int numAboveUnits      = std::max<int>( area.width / u.unitWidth, 1 );
+  const int numLeftUnits       = std::max<int>( area.height / u.unitHeight, 1 );
+  const int numAboveRightUnits = u.totalAboveUnits - numAboveUnits;
+  const int numLeftBelowUnits  = u.totalLeftUnits - numLeftUnits;
+  CHECK( u.totalUnits > (int) sizeof( u.flags ), "TIMD reference units" );
+  const Position posLT = area;
+  const Position posRT = area.topRight();
+  const Position posLB = area.bottomLeft();
+  bool* const    f     = u.flags;
+  memset( f, 0, u.totalUnits );
+  const int tl = u.totalLeftUnits, lt = u.leftTempUnitNum, at = u.aboveTempUnitNum;
+  f[tl + lt] = isAboveLeftAvailable( cu, chType, posLT.offset( -tw, -th ) );
+  u.numIntraNeighbor = f[tl + lt] ? 1 : 0;
+  u.numIntraNeighbor += isLeftAvailable( cu, chType, posLT.offset( -tw, -lt * u.unitHeight ), lt, u.unitHeight, f + tl + lt - 1 );
+  u.numIntraNeighbor += isAboveAvailable( cu, chType, posLT.offset( -at * u.unitWidth, -th ), at, u.unitWidth, f + tl + 1 + lt );
+  u.numIntraNeighbor += isAboveAvailable( cu, chType, posLT.offset( 0, -th ), numAboveUnits, u.unitWidth, f + tl + 1 + lt + at );
+  u.numIntraNeighbor += isAboveRightAvailable( cu, chType, posRT.offset( 0, -th ), numAboveRightUnits, u.unitWidth, f + tl + 1 + lt + at + numAboveUnits );
+  u.numIntraNeighbor += isLeftAvailable( cu, chType, posLT.offset( -tw, 0 ), numLeftUnits, u.unitHeight, f + tl - 1 );
+  u.numIntraNeighbor += isBelowLeftAvailable( cu, chType, posLB.offset( -tw, 0 ), numLeftBelowUnits, u.unitHeight, f + tl - 1 - numLeftUnits );
+}
+#endif
+
 void IntraPrediction::xFillTimdReferenceSamples(const CPelBuf &recoBuf, Pel* refBufUnfiltered, const CompArea &area, const CodingUnit &cu, int iTemplateWidth, int iTemplateHeight)
 {
   const ChannelType      chType = toChannelType( area.compID );
@@ -19396,8 +19435,101 @@ int IntraPrediction::deriveIntraMergeCand(CodingUnit &cu, IntraMergeCandidate* d
   return cnt;
 }
 
+// the neighbours deriveIntraMergeCand tries, in its order (keep in step with it): the intra CUs at its positions, the
+// same CU again where it covers several; its candidates are the first five of them that are valid (a validity the GPU
+// derives: dimdBlending), new and of new parameters - the list goes on to the end, the GPU stops at five
+void IntraPrediction::intraMergeNeighbours( const CodingUnit& cu, std::vector<const CodingUnit*>& nbrs )
+{
+  nbrs.clear();
+  const CodingStructure& cs = *cu.cs;
+  auto add = [&]( const CodingUnit* c )
+  {
+    if( c && CU::isIntra( *c ) )
+    {
+      nbrs.push_back( c );
+      return true;
+    }
+    return false;
+  };
+  // the left column and the top row, CU by CU
+  const CodingUnit* cuLeft = nullptr;
+  for( int i = 0; i <= (int) cu.lheight(); i += 4 )
+  {
+    cuLeft = cs.getCURestricted( cu.lumaPos().offset( -1, i ), cu, CH_L );
+    if( add( cuLeft ) )
+    {
+      i = cuLeft->ly() + (int) cuLeft->lheight() - 4 - cu.ly();
+    }
+  }
+  const CodingUnit* cuTop = nullptr;
+  for( int i = 0; i <= (int) cu.lwidth(); i += 4 )
+  {
+    cuTop = cs.getCURestricted( cu.lumaPos().offset( i, -1 ), cu, CH_L );
+    if( add( cuTop ) )
+    {
+      i = cuTop->lx() + (int) cuTop->lwidth() - 4 - cu.lx();
+    }
+  }
+  // above-left, then below the last left CU and right of the last top CU, twice
+  add( cs.getCURestricted( cu.lumaPos().offset( -1, -1 ), cu, CH_L ) );
+  auto below = [&]( const CodingUnit* c ) { return c ? cs.getCURestricted( c->lumaPos().offset( c->lwidth() - 1, c->lheight() ), cu, CH_L ) : nullptr; };
+  auto right = [&]( const CodingUnit* c ) { return c ? cs.getCURestricted( c->lumaPos().offset( c->lwidth(), c->lheight() - 1 ), cu, CH_L ) : nullptr; };
+  const CodingUnit* cuLeft2 = below( cuLeft );
+  const CodingUnit* cuTop2  = right( cuTop );
+  add( cuLeft2 );
+  add( cuTop2 );
+  add( below( cuLeft2 ) );
+  add( right( cuTop2 ) );
+  // the non-adjacent positions at seven distances (the offsets carry over from position to position, as the CPU's)
+  const Position topLeft  = cu.Y().topLeft();
+  int offsetX = 0, offsetY = 0;
+  int offsetX0 = 0, offsetX1 = 0;
+  const int offsetX2 = cu.Y().width >> 1;
+  int offsetY0 = 0, offsetY1 = 0;
+  const int offsetY2 = cu.Y().height >> 1;
+  const int numNACandidate[7] = { 7, 9, 9, 9, 9, 9, 9 };
+  for( int distanceIdx = 0; distanceIdx < 7; distanceIdx++ )
+  {
+    const int distanceHor = cu.Y().width * ( distanceIdx + 1 );
+    const int distanceVer = cu.Y().height * ( distanceIdx + 1 );
+    for( int k = 0; k < numNACandidate[distanceIdx]; k++ )
+    {
+      switch( k )
+      {
+      case 0: offsetX = offsetX0 = -distanceHor - 1;               offsetY = offsetY0 = cu.Y().height + distanceVer - 1; break;
+      case 1: offsetX = offsetX1 = cu.Y().width + distanceHor - 1; offsetY = offsetY1 = -distanceVer - 1; break;
+      case 2: offsetX = offsetX2;                                  offsetY = offsetY1; break;
+      case 3: offsetX = offsetX0;                                  offsetY = offsetY2; break;
+      case 4: offsetX = offsetX0;                                  offsetY = offsetY1; break;
+      case 5: offsetX = -1;                                        offsetY = offsetY0; break;
+      case 6: offsetX = offsetX1;                                  offsetY = -1; break;
+      case 7: offsetX = offsetX0 >> 1;                             offsetY = offsetY0; break;
+      default: offsetX = offsetX1;                                 offsetY = offsetY1 >> 1; break;
+      }
+      add( cs.getCURestricted( topLeft.offset( offsetX, offsetY ), cu, CH_L ) );
+    }
+  }
+  for( int distanceIdx = 0; distanceIdx < 7; distanceIdx++ )
+  {
+    const int distanceHor = cu.Y().width * ( distanceIdx + 1 );
+    const int distanceVer = cu.Y().height * ( distanceIdx + 1 );
+    for( int k = 0; k < 4; k++ )
+    {
+      switch( k )
+      {
+      case 0: offsetX = offsetX0 = -distanceHor - 1;                       offsetY = ( offsetY2 + cu.Y().height + distanceVer - 1 ) >> 1; break;
+      case 1: offsetX = ( offsetX2 + cu.Y().width + distanceHor - 1 ) >> 1; offsetY = offsetY0 = -distanceVer - 1; break;
+      case 2: offsetX = offsetX0;                                          offsetY = ( offsetY0 + offsetY2 ) >> 1; break;
+      default: offsetX = ( offsetX0 + offsetX2 ) >> 1;                     offsetY = offsetY0; break;
+      }
+      add( cs.getCURestricted( topLeft.offset( offsetX, offsetY ), cu, CH_L ) );
+    }
+  }
+}
+
 void IntraPrediction::reorderIntraMergeCand(const CompArea& area, CodingUnit& cu, IntraMergeCandidate* ddIntraFusionCand, int& validCandSize, const bool needDerive)
 {
+  m_mergeTmCostValid = false;
   if (validCandSize < 2)
   {
     // Reset motion info
@@ -19492,6 +19624,12 @@ void IntraPrediction::reorderIntraMergeCand(const CompArea& area, CodingUnit& cu
       }
     }
   }
+  // a copy for the GPU reconstruction's comparison
+  for (int i = 0; i < NUM_LUMA_MODE; i++)
+  {
+    m_mergeTmCost[i] = includedMode[i] ? modeTmCost[i] : MAX_UINT64;
+  }
+  m_mergeTmCostValid = true;
 
   // Loop over candidates to identify the best candidate
   int log2WeightSum = 6;

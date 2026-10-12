@@ -13,7 +13,8 @@ wall-clock gains with threads are "the easy baseline". Decoder status: single-th
 (`--GpuLoopFilter=1`: ALF, SAO, BIF, CCSAO, LF-CCCM, offset refinement on Vulkan). The user then asked for **a full
 GPU decoder in Vulkan, optimized until nothing is left** ("The GPU decoder needs to fully decode the frame on the
 GPU"; "Your first Vulkan version is going to be slow. That's OK"). That work is branch `dec-gpurecon`: intra
-reconstruction on the GPU (`--GpuRecon`), tool levels M1-M20 done and verified bit-exact (M19: DIMD, M20: OBIC); it is **not yet
+reconstruction on the GPU (`--GpuRecon`), tool levels M1-M21 done and verified bit-exact (M19: DIMD, M20: OBIC, M21:
+intra merge); it is **not yet
 faster than the CPU decoder** (see section 8) and supports only a restricted tool set (all real CTC streams fall back
 to the CPU, first reason: TMRL).
 
@@ -331,8 +332,33 @@ loops) and adds planar (`Params::obicOut`). Its histogram reuses `s_dimdHist` (s
 `s_blendW`, `s_blendClass`; DIMD's filter length by weight only for DIMD); an OBIC CU always blends (no fusion, the
 bilateral filter on the blend). With the reconstruction on, the CPU's OBIC can lack a mode (its neighbours' DIMD
 comes from samples it has not reconstructed) and its later MPM lists would index with -1: DecCu then keeps a
-placeholder (ECM_VULKAN, ON mode only). Not yet: intra merge (record() rejects its CUs), DIMD CUs with LFNST / MTS /
-several transform blocks, MTSS, implicit MTS.
+placeholder (ECM_VULKAN, ON mode only).
+M21: intra merge (JVET-AM0074). An intra merge CU (`CU_MERGE`, a DIMD CU with intraMergeMode; no DIMD of its own) takes
+the parameters of a neighbour: its node (`intra_merge.glsl`) walks deriveIntraMergeCand's neighbours in the CPU's order
+(the host lists them, `IntraPrediction::intraMergeNeighbours`, with how each may be a candidate: an intra merge or OBIC
+CU always, a DIMD or MPM CU where its DIMD blends - which the GPU derives, so the list is whole and the GPU stops at
+five) and keeps a valid entry at a new position with new parameters (an OBIC neighbour's converted as
+setIntraMergeCandParam does). Two or more are ranked as reorderIntraMergeCand does, by template costs
+(`intra_timd.glsl`, the base for TIMD): the template of 2 or 4 lines left of and above the CU, its reference line (8 x
+the template's block, filled from the host's unit availability, `IntraPrediction::timdReferenceUnits`, padded in the
+CPU's order), every mode of the candidates predicted on the template at 1/64 precision (initPredTimdIntraParams'
+wide angles and tables, the cubic filter g_aiExtIntraCubicFilter, the PDPC kinds of predTimdIntraAng), the SATD of the
+reconstruction against it with xGetHADs_SIMD's kernels (2x2, 4x4, 8x4, 4x8; the double `sad / sqrt(32) * 2` of 8x4 /
+4x8 is exactly isqrt(sad^2 / 8), checked for every sad below 2^24), then each candidate's weighted cost (unsigned 64-bit
+products, planar blend modes free, the first of equal costs); all modes at once where `s_tmp` holds their templates.
+The choice goes into the CU's DimdOut slot in DIMD's layout, so its blocks (`DERIVE_MERGE`) blend like DIMD's (always,
+regular filter lengths, the bilateral filter on the blend). The CPU derives DIMD for every MPM CU, also where the list
+starts with planar (only intra merge reads it): the host keeps those CUs' DIMD histograms aside (`pendingDimd`) and
+puts them to use when an intra merge CU lists the CU. OBIC counts an intra merge neighbour's modes without a class
+(`s_obicPlain`); a mode only those gave has obicLocDep -1, whose weight the CPU adds to the first class's total but to
+no class's blend (and its class-blend shortcuts let the last prediction take it): `blendTotals`. An OBIC CU counting
+such a neighbour indexes `histoLocDep[mode][-1]`, which in the CPU's row-major array is `[mode - 1][2]`, and the GPU
+counts it there (`obicCount`; no test stream has it: checked by a temporary test that forced class -1 on CPU and GPU
+alike, 216 such counts identical, and failed with the GPU counting elsewhere). Verification also compares the template
+costs (`IntraPrediction::m_mergeTmCost`, a copy reorderIntraMergeCand keeps). A picture with intra merge CUs runs a
+fourth intra_rec pipeline (`WITH_MERGE`); in the one with DIMD, intra merge's code made pictures without it ~11 %
+slower. Rejected: intra merge above 10 bits (the CPU's SATD adds in 16-bit lanes), with a block vector, CUs above 128
+(the node's shared arrays). Not yet: DIMD CUs with LFNST / MTS / several transform blocks, MTSS, implicit MTS.
 
 ## 8. Numbers (i7-10700 8C/16T, Win11, GCC 16.2, RTX 3070 driver 616.92)
 
@@ -358,8 +384,8 @@ Profile of a GPU-on decode (non-LTO, m2_park16, share of all samples): parsing ~
    M9 transform skip and BDPCM, M10 MIP, M11 LFNST / NSPT (computed by the host until M15), M12 MRL, M13 ISP, M14 sign
    prediction, M15 LFNST / NSPT on the GPU (the VVC kernels, LFNSTExt=0, rejected), M16 sign prediction of LFNST /
    NSPT blocks. 2026-10-12: M17 intra modes derived on the GPU (tested with `ECM_GPU_MODES=1`), M18 the transforms of
-   derived modes on the GPU, M19 DIMD (the m19d test set; the m19 set, encoded by the stock encoder, falls back at
-   "intra merge"), M20 OBIC (the m20 and m20o test sets).
+   derived modes on the GPU, M19 DIMD (the m19d test set), M20 OBIC (the m20 and m20o test sets), M21 intra merge
+   (the m19 set, encoded by the stock encoder with DIMD: OBIC and intra merge everywhere).
    All 19 regular streams now stop at "TMRL" (the next sequence-level check; the block-level tools of step 4 follow).
 3. Make the GPU path win on CPU time per picture: the derive-only pass (record during parsing or a leaner pass;
    speed up getSpatialIpm/getPURestricted, which also helps the CPU decoder), GPU behaviour with frame threads
@@ -368,22 +394,24 @@ Profile of a GPU-on decode (non-LTO, m2_park16, share of all samples): parsing ~
 4. More tool levels. CTC turns on DIMD, TIMD, TMRL, MPM sorting, MDIP, PDP and chroma reordering together, and every
    one of them makes the intra modes depend on reconstructed samples (DIMD's modes are in every MPM list), so with
    CTC the GPU derives every mode (M17's nodes) and everything that depends on a mode moves to the GPU too (M18 did
-   the transforms, M19 DIMD, M20 OBIC). Next intra merge (JVET-AM0074: ECM's encoder uses it wherever it is allowed
-   and has no switch for it; OBIC is available only where intra merge is not). The test streams come from test
-   encoders built with a local patch to IntraSearch.cpp that is not committed (`perf/gpu/enc_m1.ps1` with ECM_ENC_EXE):
+   the transforms, M19 DIMD, M20 OBIC, M21 intra merge). ECM's encoder uses OBIC and intra merge whenever DIMD is on
+   and has no switch for them; for tests of fewer tools, test encoders built with a local patch to IntraSearch.cpp
+   that is not committed (`perf/gpu/enc_m1.ps1` with ECM_ENC_EXE):
    `bin\encNoOM` (m19d: ECM_TEST_NO_OBIC_MERGE skips both), `bin\encTest` (m20: ECM_TEST_NO_INTRA_MERGE;
    ECM_TEST_NO_OBIC skips OBIC), `bin\encTest2` (the same, and for m20o ECM_TEST_PREFER_OBIC, which skips plain DIMD
    where OBIC is available, for many more OBIC CUs) - the patch adds `&& !getenv(...)` to `testObic` /
-   `testIntraMerge` and sets `m_skipDimdMode` / `m_skipDimdLfnstMtsPass` where OBIC is tested. Then the transform
-   rules of DIMD CUs
-   (getFinalIntraModeForTransform's DIMD branch, NSPT buckets, MTSS' candModeListForTransform, implicit MTS), then MPM
-   sorting / MDIP / PDP, TIMD, TMRL, CCLM/CCCM and the other cross-component tools, chroma reordering / DBV, LFNST of
-   MIP, IntraTMP / IBC, then inter pictures. Each level: new test set with exactly that tool on, verify mode
-   identical, ON mode identical (and `ECM_GPU_DUMP` + `perf/gpu/dumpdiff.py`: the records of both runs agree),
-   canaries, commit. Speed of derived modes: with `ECM_GPU_MODES=1` the
-   GPU time of four 720p pictures sets is 25.3 instead of 14.0 ms per picture (the union of the read ranges lengthens
-   the dependency chains, the residuals of derived transforms are computed in the chain); exact ranges would need
-   dependencies a node registers once it knows the mode (a dependents list per block, closed when the block finishes).
+   `testIntraMerge` and sets `m_skipDimdMode` / `m_skipDimdLfnstMtsPass` where OBIC is tested. Next the transform
+   rules of DIMD CUs (getFinalIntraModeForTransform's DIMD branch, NSPT buckets, MTSS' candModeListForTransform,
+   implicit MTS), then TIMD (its template costs exist since M21: intra_timd.glsl), MPM sorting / MDIP / PDP, TMRL,
+   CCLM/CCCM and the other cross-component tools, chroma reordering / DBV, LFNST of MIP, IntraTMP / IBC, then inter
+   pictures. Intra merge's GPU time (m19: park720 152, four720 183 ms per picture, from 347 / 392 at first) has room:
+   the candidate walk and the reference padding are single-invocation steps on the dependency chain. Each level: new
+   test set with exactly that tool on, verify mode identical, ON mode identical (and `ECM_GPU_DUMP` +
+   `perf/gpu/dumpdiff.py`: the records of both runs agree), canaries, commit. Speed of derived modes: with
+   `ECM_GPU_MODES=1` the GPU time of four 720p pictures sets is 25.3 instead of 14.0 ms per picture (the union of the
+   read ranges lengthens the dependency chains, the residuals of derived transforms are computed in the chain); exact
+   ranges would need dependencies a node registers once it knows the mode (a dependents list per block, closed when
+   the block finishes).
 5. In-loop filters in ON mode on the GPU without a CPU round trip (deblocking: see dec-gpu-dbf-wip; ALF/SAO/... are
    on the GPU already via --GpuLoopFilter, but on the CPU's picture).
 6. 1080p/4K verification and timing on long streams once sources are agreed with the user (three short 1080p
@@ -403,11 +431,12 @@ Profile of a GPU-on decode (non-LTO, m2_park16, share of all samples): parsing ~
   makes them visible (likely intra_resi's old failure); 120 stress decodes of such blocks under load were identical.
   Code a kernel never runs still costs: M18's in-chain paths made intra_rec ~4 % slower on pictures that never take
   them (a per-sample test of a global flag in storeRecon cost as much again; folded into Tu::resiFrom), M19's DIMD
-  blending ~15 % (spread over the loop around the prediction and the code inside it; no single part). Since M19
-  intra_rec is built as several pipelines with specialization constants (`WITH_DIMD`, `WITH_DERIVED_TRANSFORMS`;
-  `gpu::Kernel::create`'s specialization, GpuIntraRec.cpp's `IntraRecVariant`) and a picture runs the one without the
-  features it does not use. The compiler is not monotonic here: the pipeline with DIMD alone was slower than the one
-  with DIMD and the derived transforms in every case measured, so that one is not built. Measure each new variant.
+  blending ~15 % (spread over the loop around the prediction and the code inside it; no single part), M21's intra
+  merge ~11 % on pictures with DIMD. Since M19 intra_rec is built as several pipelines with specialization constants
+  (`WITH_DIMD`, `WITH_DERIVED_TRANSFORMS`, `WITH_MERGE`; `gpu::Kernel::create`'s specialization, GpuIntraRec.cpp's
+  `IntraRecVariant`) and a picture runs the one without the features it does not use. The compiler is not monotonic
+  here: the pipeline with DIMD alone was slower than the one with DIMD and the derived transforms in every case
+  measured, so that one is not built. Measure each new variant.
 - `supported()` / `record()` must reject every tool the kernels lack, including tools that only change a CPU code
   path the GPU replaces (dequantization, transforms, clipping): dependent quantization was not rejected until M6,
   and the reconstruction on decoded such streams wrong. With a new level, look through the CPU path it replaces for
@@ -461,7 +490,16 @@ Profile of a GPU-on decode (non-LTO, m2_park16, share of all samples): parsing ~
   parameter snapshot after DIMD / OBIC blending is the last blended mode's, not the main mode's (record() restates
   them). Garbage modes can also be out of range for the CPU's own later code: OBIC without a mode left -1, which
   getSpatialIpm writes an array with (DecCu keeps a placeholder in ON mode).
-- Shared memory of intra_rec is nearly full (by the declarations, about 48 200 of the 49 152 bytes Vulkan gives a
-  workgroup on the RTX 3070): OBIC's histogram reuses DIMD's.
+- Shared memory of intra_rec is nearly full (by the declarations, about 48 500 of the 49 152 bytes Vulkan gives a
+  workgroup on the RTX 3070): OBIC's histogram reuses DIMD's, intra merge's candidates and costs live in s_spCost
+  and s_tmp (free in a node).
+- Verification reports the first difference by kind of check (scheduling, intra merge costs, DIMD / merge
+  parameters, OBIC, block parameters, samples), not in decoding order: a node's output can differ only because an
+  earlier block's samples did (M21's first mismatch was an MPM CU's DIMD, caused by an earlier OBIC block). Find the
+  earliest differing block before chasing the reported one.
+- A rare case no encoder setting reaches (OBIC's class -1 counted by another OBIC CU: ECM's encoder picks OBIC a few
+  times per picture where intra merge is allowed) can be tested by forcing the rare value on the CPU and the GPU alike
+  with temporary edits on streams rich in the surrounding tool: a counter on the CPU shows the case runs, verification
+  must stay identical, and a canary on the GPU side must be reported.
 - A double-precision expression of the CPU (xLocationdepBlending's clip ranges) can be reproduced exactly in integers
   when its inputs are small: `dimdScaledWeight` (checked exhaustively against IEEE doubles for inputs below 200).

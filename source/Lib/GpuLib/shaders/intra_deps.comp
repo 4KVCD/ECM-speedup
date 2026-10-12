@@ -157,6 +157,22 @@ void readRange( Tu t, int ln, int topLen, int leftLen, out int topMax, out int l
   }
 }
 
+// a dependency on the blocks owning the samples of component comp in [x0, x1] x [y0, y1]
+void addAreaDeps( int comp, int x0, int y0, int x1, int y1 )
+{
+  const int ch = comp == 0 ? 0 : 1;
+  for( int uy = y0 >> P.unitLog2Y[ch]; uy <= y1 >> P.unitLog2Y[ch]; uy++ )
+  {
+    for( int ux = x0 >> P.unitLog2X[ch]; ux <= x1 >> P.unitLog2X[ch]; ux++ )
+    {
+      if( ux >= 0 && uy >= 0 && ux < P.ownerW[ch] && uy < P.ownerH[ch] )
+      {
+        addDep( BufI32( P.owner[comp] ).v[uy * P.ownerW[ch] + ux] );
+      }
+    }
+  }
+}
+
 // GpuIntraRec::endPicture's dependency loop for block g_i (passes 1 and 2); pass 1 writes the availability, read
 // ranges and ISP side flag into the block record, which refSource reads (from the local copy) and pass 2 reloads
 void dependencies( int comp )
@@ -192,21 +208,28 @@ void dependencies( int comp )
     for( int n = 0; n < c.dimdNum; n++ )
     {
       const DimdCall k = BufDimdCall( P.dimdCalls ).v[c.dimd + n];
-      if( k.kind == 0 )
+      if( k.kind != 0 )
       {
-        continue;
+        addAreaDeps( k.comp, k.x - 1, k.y - 1, k.x + k.width, k.y + k.height );
       }
-      const int ch = k.comp == 0 ? 0 : 1;
-      const int x0 = k.x - 1, y0 = k.y - 1, x1 = k.x + k.width, y1 = k.y + k.height;
-      for( int uy = y0 >> P.unitLog2Y[ch]; uy <= y1 >> P.unitLog2Y[ch]; uy++ )
+    }
+    // intra merge: the parameters of its neighbours (their nodes), its template and the template's reference row and
+    // column (GpuIntraRec.cpp's mergeReadAreas)
+    if( c.merge >= 0 )
+    {
+      BufI32    md     = BufI32( P.mergeData );
+      const int nbrNum = md.v[c.merge + 1], tw = md.v[c.merge + 2], th = md.v[c.merge + 3];
+      for( int k = 0; k < nbrNum; k++ )
       {
-        for( int ux = x0 >> P.unitLog2X[ch]; ux <= x1 >> P.unitLog2X[ch]; ux++ )
-        {
-          if( ux >= 0 && uy >= 0 && ux < P.ownerW[ch] && uy < P.ownerH[ch] )
-          {
-            addDep( BufI32( P.owner[k.comp] ).v[uy * P.ownerW[ch] + ux] );
-          }
-        }
+        addDep( BufCu( P.cus ).v[md.v[c.merge + MERGE_HEAD + 2 * k]].node );
+      }
+      if( tw > 0 )
+      {
+        const int x0 = c.x - tw - 1, y0 = c.y - th - 1;
+        addAreaDeps( 0, x0, y0, x0 + ( ( c.w + tw ) << 3 ), y0 );
+        addAreaDeps( 0, x0, y0, x0, y0 + ( ( c.h + th ) << 3 ) );
+        addAreaDeps( 0, c.x - tw, c.y - th, c.x + c.w - 1, c.y - 1 );
+        addAreaDeps( 0, c.x - tw, c.y, c.x - 1, c.y + c.h - 1 );
       }
     }
     return;

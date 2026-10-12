@@ -1386,6 +1386,27 @@ public:
   void deriveIntraMergeCandFromNeighbor(CodingUnit& cu, const CodingUnit* cuNeighbour, int& cnt, IntraMergeCandidate* tempIntraFusionCand);
   int deriveIntraMergeCand(CodingUnit &cu, IntraMergeCandidate* ddIntraFusionCand = NULL, bool isDecoder = false);
   void reorderIntraMergeCand(const CompArea &area, CodingUnit &cu, IntraMergeCandidate *ddIntraFusionCand, int &validCandSize, const bool needDerive = true);
+  /// deriveIntraMergeCand's neighbours in its order, for the GPU reconstruction
+  static void intraMergeNeighbours( const CodingUnit& cu, std::vector<const CodingUnit*>& nbrs );
+#if JVET_AJ0146_TIMDSAD && JVET_AC0094_REF_SAMPLES_OPT
+  /// the units of the reference line of a luma template with both arms (xFillTimdReferenceSamples' layout) and which of
+  /// them are available
+  struct TimdReferenceUnits
+  {
+    int  unitWidth, unitHeight;
+    int  leftTempUnitNum, aboveTempUnitNum;   // units beside the template's arms (templates of 4 or more)
+    int  totalLeftUnits, totalAboveUnits, totalUnits;
+    int  numIntraNeighbor;                     // available units
+    bool flags[4 * ( MAX_NUM_PART_IDXS_IN_CTU_WIDTH << 2 ) + 1];
+  };
+  /// xFillTimdReferenceSamples' step 1 for a template of tw x th around area, its block refW x refH, for the GPU
+  /// reconstruction
+  static void timdReferenceUnits( const CodingUnit& cu, const CompArea& area, int tw, int th, int refW, int refH, TimdReferenceUnits& u );
+#endif
+  /// the template cost of each mode reorderIntraMergeCand ranked the candidates of the last CU with (MAX_UINT64: not
+  /// a candidate's mode), where it computed costs (m_mergeTmCostValid), for the GPU reconstruction's comparison
+  uint64_t m_mergeTmCost[NUM_LUMA_MODE];
+  bool     m_mergeTmCostValid = false;
   void generateDimdBuffersForLocDepBlending(const PredictionUnit& pu, PelBuf& piPred, PelBuf* predAngExtra, bool* blendModes, const int8_t* modeWeights, const int* modeLocDep);
   void generateEncIntraMergeBlending(PelBuf &piPred, const PredictionUnit &pu, const IntraMergeCandidate &intraMergeCandidate, PelBuf *piBlock, PelBuf& plnBlock);
 #endif

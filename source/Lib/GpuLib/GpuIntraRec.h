@@ -43,8 +43,8 @@
     4:2:0 or 4:0:0. A picture with anything else is skipped and counted. The GPU derives the intra modes itself (the
     MPM lists, chroma DM and candidates, in a node per CU before its blocks) where they depend on reconstructed
     samples, i.e. with DIMD: DIMD CUs (their blended prediction), DIMD's modes in every MPM list, DIMD chroma, OBIC CUs
-    (the modes of their neighbours, blended); and the transforms that depend on a derived mode. ECM_GPU_MODES=1 makes
-    it derive every MPM mode on any stream.
+    (the modes of their neighbours, blended), intra merge CUs (a neighbour's parameters, ranked by template costs);
+    and the transforms that depend on a derived mode. ECM_GPU_MODES=1 makes it derive every MPM mode on any stream.
 */
 
 #ifndef __GPUINTRAREC__
@@ -81,6 +81,8 @@ public:
   void setReshape( Reshape* reshape );
   /// the decoder's TrQuant, which selects the transform types of each block (TrQuant::getInvTransformTypes)
   void setTrQuant( TrQuant* trQuant );
+  /// the decoder's intra prediction: verification compares its template costs of each intra merge CU's ranking
+  void setIntraPrediction( const IntraPrediction* intraPred );
   /// whether the GPU path supports the slice's tools (sequence- and slice-level settings; per block record() checks)
   static bool supported( const Slice& slice, std::string& why );
 

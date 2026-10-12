@@ -760,6 +760,7 @@ void DecLib::xPollGpuRecon()
   m_gpuIntraRec->setOn( m_gpuReconMode != 2 );
   m_gpuIntraRec->setReshape( &m_cReshaper );
   m_gpuIntraRec->setTrQuant( &m_cTrQuant );
+  m_gpuIntraRec->setIntraPrediction( &m_cIntraPred );
   m_cCuDecoder.setGpuIntraRec( m_gpuIntraRec.get() );
 }
 

@@ -12,8 +12,9 @@
 // prediction and the neighbours, and the residual computed again where a sign is negative. Every step follows the C++
 // of IntraPrediction / MatrixIntraPrediction / TrQuant / DecCu.
 // Modes the CPU cannot know without the reconstruction are derived in a node per CU before its blocks: the MPM lists
-// (intra_modes.glsl), DIMD (intra_dimd.glsl) and OBIC (intra_obic.glsl); the blocks of DIMD and OBIC CUs blend the
-// predictions of several modes.
+// (intra_modes.glsl), DIMD (intra_dimd.glsl), OBIC (intra_obic.glsl) and intra merge (intra_merge.glsl, with the
+// template costs of intra_timd.glsl); the blocks of DIMD, OBIC and intra merge CUs blend the predictions of several
+// modes.
 #extension GL_GOOGLE_include_directive : require
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
@@ -34,6 +35,7 @@ layout( buffer_reference, std430, buffer_reference_align = 4 ) coherent buffer C
 // a picture without them runs a pipeline without their code, whose mere presence slows every block (~15 % for DIMD)
 layout( constant_id = 0 ) const bool WITH_DIMD = true;                 // DIMD and OBIC in nodes, their blending
 layout( constant_id = 1 ) const bool WITH_DERIVED_TRANSFORMS = true;   // blocks with DERIVE_TRANSFORM
+layout( constant_id = 2 ) const bool WITH_MERGE = true;                // intra merge CUs (and OBIC's merge neighbours)
 
 const int PAD     = 6;                        // interpFilterNumPadded (16 taps / 2 - 2)
 const int ANG     = 1792;                     // angular reference buffers (the CPU's are larger; blocks <= 128 use < 1700)
@@ -43,6 +45,7 @@ const int WEAK4   = 5 * 32 * 16;              // offset of the weak 4-tap table 
 const int BF_LUT  = WEAK4 + 32 * 4;           // the bilateral filter's LUT rows (26 x 48), size and MAD factors
 const int BF_SIZE = BF_LUT + 26 * 48;
 const int BF_MAD  = BF_SIZE + 64;
+const int EXT_CUBIC = BF_MAD + 16;            // the 1/64 cubic filter of template predictions (64 x 4; intra_timd.glsl)
 const int BF_PRED = 0;                        // in s_tmp: the prediction (< 1024 samples: at most 512)
 const int BF_BLK  = 512;                      // in s_tmp: the padded block ((W + 4) x (H + 4) <= 720)
 
@@ -83,15 +86,17 @@ Params P;      // the parameter block (loaded once)
 int    g_ti;   // the block being reconstructed
 bool   g_crs;       // LMCS chroma residual scaling of the block
 int    g_crsScale;  // its scale (Reshape::calculateChromaAdj)
-// blending (a DERIVE_DIMD block whose CU's DIMD blends, a DERIVE_OBIC block): the predictions of the CU's modes
-// (s_blendMode: DIMD's main mode, planar and blend modes, OBIC's modes) are summed per location dependence class
-// (emitPred), weighted, in the workgroup's BLEND_ACC sums (each class's N samples)
+// blending (a DERIVE_DIMD block whose CU's DIMD blends, a DERIVE_OBIC or DERIVE_MERGE block): the predictions of the
+// CU's modes (s_blendMode: DIMD's or the intra merge candidate's main mode, planar and blend modes, OBIC's modes) are
+// summed per location dependence class (emitPred), weighted, in the workgroup's BLEND_ACC sums (each class's N samples)
 const int BLEND_ACC = 3 * 128 * 128;
 const int BLEND_MAX = 8;
 shared int s_blendNum;                 // the block's predictions (0: no blending)
 shared int s_blendMode[BLEND_MAX];     // their modes,
 shared int s_blendW[BLEND_MAX];        // weights (0: not predicted; dimdRelWeight, obicFusionWeight)
-shared int s_blendClass[BLEND_MAX];    // and classes (dimdLocDep, obicLocDep: 0 none, 1 vertical, 2 horizontal)
+shared int s_blendClass[BLEND_MAX];    // and classes (dimdLocDep, obicLocDep: 0 none, 1 vertical, 2 horizontal; OBIC's
+                                       // -1, see blendTotals)
+shared int s_blendTot[3];              // the classes' total weights (blendTotals)
 bool   g_blendSum;     // emitPred adds to the sums
 bool   g_blendFirst;   // the first prediction (the main mode) sets them, the other classes' to 0
 int    g_blendW;       // the prediction's weight
@@ -99,6 +104,45 @@ int    g_blendClass;   // its class
 bool   g_blendTaps;    // DIMD: the prediction's filter length by its weight (JVET-AN0158)
 
 #include "intra_modes.glsl"
+
+// the classes' totals of the block's predictions as predIntraAng / generateDimdBuffersForLocDepBlending take them, one
+// invocation: a class other than 1 (vertical) or 2 (horizontal) weighs in the first class's total, also one no class's
+// blend takes - OBIC's -1, a mode only intra merge neighbours gave (DIMD's and intra merge's classes are 0 to 2); its
+// blend then divides by more, unless the CPU blends that class by a shortcut - one prediction as it is, two or three
+// by weights scaled to 64 where the total is a power of two, the last of them (in OBIC's order, as here) taking the
+// rest - which the weights reproduce here. An intra merge candidate of no weights (no candidate at all) blends nothing
+// and keeps the main mode's prediction. merge: a block of an intra merge CU
+void blendTotals( bool merge )
+{
+  int tot[3] = int[3]( 0, 0, 0 );
+  for( int k = 0; k < BLEND_MAX; k++ ) tot[s_blendClass[k] == 1 ? 1 : s_blendClass[k] == 2 ? 2 : 0] += s_blendW[k];
+  if( merge && tot[0] == 0 && tot[1] == 0 && tot[2] == 0 )
+  {
+    s_blendW[0]     = 64;
+    s_blendClass[0] = 0;
+    tot[0]          = 64;
+  }
+  int num = 0, sum = 0, last = -1;   // the first class's predictions in its blend
+  for( int k = 0; k < BLEND_MAX; k++ )
+  {
+    if( s_blendClass[k] == 0 && s_blendW[k] != 0 )
+    {
+      num++;
+      sum += s_blendW[k];
+      last = k;
+    }
+  }
+  const int rest = WITH_MERGE ? tot[0] - sum : 0;   // the weight of class -1 (only with intra merge CUs)
+  if( rest != 0 && num == 1 )
+  {
+    s_blendW[last] = tot[0];
+  }
+  else if( rest != 0 && num >= 2 && num <= 3 && ( tot[0] & ( tot[0] - 1 ) ) == 0 )
+  {
+    s_blendW[last] += rest;
+  }
+  for( int c = 0; c < 3; c++ ) s_blendTot[c] = tot[c];
+}
 
 // the mode of CU n: the host's (CU_KNOWN), or published by the CU's node, on which the reading block or node depends
 int cuModeOf( int n )
@@ -387,6 +431,9 @@ ivec2 wgSum2( int a, int b, int slot )
   SYNC();
   return ivec2( s_red[slot], s_red[slot + 1] );
 }
+
+#include "intra_timd.glsl"
+#include "intra_merge.glsl"
 
 // bifApplyLut (the LUT row in s_bfLut, offset base: 0 distance 1, 16 diagonal, 32 distance 2)
 int bfLut( int diff, int base, int cutBits, int bdShift )
@@ -940,7 +987,8 @@ void main()
     // the co-located luma CU's, the host's or published by the nodes of those CUs, on which it depends), published for
     // the CU's blocks and the CUs reading it; first the CU's DIMD (intra_dimd.glsl: from the reconstruction around the
     // CU, on whose blocks it depends), the mode of a DIMD CU and the first entries of an MPM list; an OBIC CU's modes
-    // then from its neighbours' (intra_obic.glsl: published by the nodes of those CUs, on which it depends)
+    // then from its neighbours' (intra_obic.glsl: published by the nodes of those CUs, on which it depends); an intra
+    // merge CU's parameters from its neighbours', ranked by template costs (intra_merge.glsl)
     if( ( t.derive & DERIVE_NODE ) != 0 )
     {
       const Cu c = BufCu( P.cus ).v[t.cu];
@@ -981,6 +1029,14 @@ void main()
           CBufI32( P.cuMode ).v[t.cu] = obicSelect( c, d );
         }
       }
+      else if( WITH_DIMD && WITH_MERGE && c.kind == CU_MERGE )   // intra_merge.glsl (no DIMD of its own)
+      {
+        const int mode = mergeNode( c, t.cu, t.bitDepth, ( t.derive & DERIVE_NO_PDPC ) != 0, lid, NT );
+        if( lid == 0 )
+        {
+          CBufI32( P.cuMode ).v[t.cu] = mode;
+        }
+      }
       else if( lid == 0 )
       {
         int modes[MPM_NEIGHBOURS];
@@ -1000,12 +1056,14 @@ void main()
       {
         s_mode = cuModeOf( t.cu );
       }
-      // a DIMD CU's predictions where its DIMD blends (dimdPrediction), an OBIC CU's: its modes but those not set
-      const bool dimdCu = WITH_DIMD && ( t.derive & DERIVE_DIMD ) != 0, obicCu = WITH_DIMD && ( t.derive & DERIVE_OBIC ) != 0;
-      if( ( dimdCu || obicCu ) && lid < BLEND_MAX )
+      // a DIMD CU's predictions where its DIMD blends (dimdPrediction), an intra merge CU's alike from its chosen
+      // candidate (always), an OBIC CU's: its modes but those not set
+      const bool dimdCu  = WITH_DIMD && ( t.derive & DERIVE_DIMD ) != 0, obicCu = WITH_DIMD && ( t.derive & DERIVE_OBIC ) != 0;
+      const bool mergeCu = WITH_DIMD && WITH_MERGE && ( t.derive & DERIVE_MERGE ) != 0;
+      if( ( dimdCu || obicCu || mergeCu ) && lid < BLEND_MAX )
       {
         int mode = -1, w = 0, cls = 0;
-        if( dimdCu )
+        if( dimdCu || mergeCu )
         {
           dimdPrediction( t.cu, lid, mode, w, cls );
         }
@@ -1022,16 +1080,24 @@ void main()
         s_blendClass[lid] = cls;
         if( lid == 0 )
         {
-          s_blendNum = obicCu ? OBIC_MODES : CBufI32( P.dimdOut ).v[t.cu * DIMD_OUT + DIMD_OUT_BLENDING] != 0 ? DIMD_FUSION_NUM : 0;
+          s_blendNum = obicCu ? OBIC_MODES : mergeCu || CBufI32( P.dimdOut ).v[t.cu * DIMD_OUT + DIMD_OUT_BLENDING] != 0 ? DIMD_FUSION_NUM : 0;
         }
       }
       SYNC();
-      applyModeParams( t, s_mode, BufCu( P.cus ).v[t.cu].plIdx );
-      if( dimdCu || obicCu )
+      if( dimdCu || obicCu || mergeCu )   // (the block's: the same for the whole workgroup)
       {
-        // the main mode of DIMD and OBIC has no bilateral filter; blending (always with OBIC: planar is added) has no
-        // intra fusion (initIntraPatternChType's fetchRef2nd) and filters the blended prediction (predIntraAng; the host
-        // checked the size and QP)
+        if( lid == 0 )
+        {
+          blendTotals( mergeCu );
+        }
+        SYNC();
+      }
+      applyModeParams( t, s_mode, BufCu( P.cus ).v[t.cu].plIdx );
+      if( dimdCu || obicCu || mergeCu )
+      {
+        // the main mode of DIMD, OBIC and intra merge has no bilateral filter; blending (always with OBIC: planar is
+        // added, and intra merge) has no intra fusion (initIntraPatternChType's fetchRef2nd) and filters the blended
+        // prediction (predIntraAng, generateDimdBuffersForLocDepBlending; the host checked the size and QP)
         const bool blending = s_blendNum != 0;
         t.fusion = blending ? 0 : t.fusion;
         t.bf     = blending && ( t.derive & DERIVE_BF ) != 0 ? 1 : 0;
@@ -1096,9 +1162,10 @@ void main()
       fillReferencePar( t, 1, predStride + 1, lid, NT );
     }
     SYNC();
-    // DIMD / OBIC blending (predIntraAng): each mode predicts from the filtered or the unfiltered references as its own
-    // parameters say, so both are kept: the unfiltered in s_ref[1] (blending has no fusion line), the filtered in s_tmp
-    const bool blend = WITH_DIMD && ( t.derive & ( DERIVE_DIMD | DERIVE_OBIC ) ) != 0 && s_blendNum != 0;
+    // DIMD / OBIC / intra merge blending (predIntraAng): each mode predicts from the filtered or the unfiltered
+    // references as its own parameters say, so both are kept: the unfiltered in s_ref[1] (blending has no fusion line),
+    // the filtered in s_tmp
+    const bool blend = WITH_DIMD && ( t.derive & ( DERIVE_DIMD | DERIVE_OBIC | DERIVE_MERGE ) ) != 0 && s_blendNum != 0;
     if( t.refFilter != 0 || blend )   // xFilterReferenceSamples (multiRefIdx 0): in place, or for blending beside them
     {
       for( int i = lid; i <= predStride + predHSize; i += NT )
@@ -1481,15 +1548,11 @@ void main()
     }
     if( blend )
     {
-      // each class's prediction (predIntraAng): its sum over the sum of its weights (truncated, as the division and the
-      // shift of timdBlending / dimdBlending give it); the classes' weights are weightNonLocDep (with DIMD's planar),
-      // weightVer and weightHor
+      // each class's prediction (predIntraAng): its sum over the class's total (truncated, as the division and the
+      // shift of timdBlending / dimdBlending give it); the totals are weightNonLocDep (with DIMD's planar), weightVer
+      // and weightHor (blendTotals)
       g_blendSum = false;
-      int wt[3] = int[3]( 0, 0, 0 );
-      for( int sub = 0; sub < s_blendNum; sub++ )
-      {
-        wt[s_blendClass[sub]] += s_blendW[sub];
-      }
+      const int wt[3] = int[3]( s_blendTot[0], s_blendTot[1], s_blendTot[2] );
       // with location dependence, xLocationdepBlending (range 10, doubled across blocks above 64): the vertical
       // class's weight falls down the rows, the horizontal one's along the columns (mode 0 both, clipped to their
       // shares of the rest, mode 1 vertical, mode 2 horizontal), the rest is the first class's

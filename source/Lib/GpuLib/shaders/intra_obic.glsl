@@ -6,24 +6,35 @@
 #ifndef INTRA_OBIC_GLSL
 #define INTRA_OBIC_GLSL
 
-// histoLocDep[mode][cls] += amount (in s_dimdHist: class-major, as DIMD's three histograms)
+// the counts deriveObicMode adds to its histogram directly, without a location dependence class (an intra merge CU's
+// modes): they add to the totals, not to the classes
+shared int s_obicPlain[NUM_LUMA_MODE];
+
+// histoLocDep[mode][cls] += amount (in s_dimdHist: class-major, as DIMD's three histograms). An OBIC neighbour's mode
+// can have class -1 (obicSelect): the CPU indexes histoLocDep[mode][-1] then, which in its row-major [mode][3] array is
+// histoLocDep[mode - 1][2] (such a mode is above DC)
 void obicCount( int mode, int cls, int amount )
 {
   if( amount != 0 )
   {
-    atomicAdd( s_dimdHist[cls * NUM_LUMA_MODE + mode], amount );
+    atomicAdd( s_dimdHist[cls >= 0 ? cls * NUM_LUMA_MODE + mode : 2 * NUM_LUMA_MODE + mode - 1], amount );
   }
 }
 
 // deriveObicMode's step 4 over the neighbours of OBIC CU c, one invocation each, all invocations (ends with a barrier).
 // A DIMD CU counts its main mode, planar and its blend modes, those but the main one by their weights relative to the
-// main one's; an OBIC CU its modes, each with all the samples; another intra CU its mode (MIP CUs, which count nothing
-// in intra slices, are not in the list)
+// main one's; an OBIC CU its modes, each with all the samples; an intra merge CU its modes, each with all the samples,
+// without a class (s_obicPlain); another intra CU its mode (MIP CUs, which count nothing in intra slices, are not in
+// the list)
 void obicHistogram( Cu c, int lid, int NT )
 {
   for( int i = lid; i < 3 * NUM_LUMA_MODE; i += NT )
   {
     s_dimdHist[i] = 0;
+  }
+  for( int i = lid; WITH_MERGE && i < NUM_LUMA_MODE; i += NT )
+  {
+    s_obicPlain[i] = 0;
   }
   SYNC();
   const ObicNbr nb = lid < OBIC_NBRS ? BufObicNbr( P.obicNbrs ).v[c.obic * OBIC_NBRS + lid] : ObicNbr( -1, 0 );
@@ -53,6 +64,24 @@ void obicHistogram( Cu c, int lid, int NT )
         if( m >= 0 && m < NUM_LUMA_MODE && w > 0 )
         {
           obicCount( m, d.v[o + DIMD_OUT_LOC_DEP + k + 1], ns * w / w0 );
+        }
+      }
+    }
+    else if( WITH_MERGE && kind == CU_MERGE )   // its merge parameters (its DimdOut slot), all samples to each mode, no class
+    {
+      CBufI32   d        = CBufI32( P.dimdOut );
+      const int o        = nb.cu * DIMD_OUT;
+      const int mainMode = d.v[o + DIMD_OUT_MODE];
+      if( mainMode >= 0 && mainMode < NUM_LUMA_MODE )
+      {
+        atomicAdd( s_obicPlain[mainMode], ns );
+      }
+      for( int k = 0; k < DIMD_FUSION_NUM - 2; k++ )
+      {
+        const int m = d.v[o + DIMD_OUT_BLEND_MODE + k];
+        if( m >= 0 && m < NUM_LUMA_MODE && d.v[o + DIMD_OUT_REL_WEIGHT + k + 2] > 0 )
+        {
+          atomicAdd( s_obicPlain[m], ns );
         }
       }
     }
@@ -95,7 +124,7 @@ int obicSelect( Cu c, DimdOut d )
   }
   for( int m = PLANAR_IDX + 1; m < NUM_LUMA_MODE; m++ )
   {
-    int h = s_dimdHist[m] + s_dimdHist[NUM_LUMA_MODE + m] + s_dimdHist[2 * NUM_LUMA_MODE + m];
+    int h = s_dimdHist[m] + s_dimdHist[NUM_LUMA_MODE + m] + s_dimdHist[2 * NUM_LUMA_MODE + m] + ( WITH_MERGE ? s_obicPlain[m] : 0 );
     h >>= m == d.mode ? 1 : 0;
     h >>= d.blending != 0 && m == d.blendMode[0] && d.relWeight[1] > 0 ? 1 : 0;
     for( int j = 0; j < OBIC_MODES; j++ )
@@ -121,8 +150,8 @@ int obicSelect( Cu c, DimdOut d )
     weight[i] = 0;
     locDep[i] = 0;
     count += best[i] >= 0 ? 1 : 0;
-    if( best[i] > DC_IDX )   // the class with the most of the mode's count (the first of equal ones)
-    {
+    if( best[i] > DC_IDX )   // the class with the most of the mode's count (the first of equal ones; -1 where the
+    {                        // mode has only counts without a class, s_obicPlain)
       int top = 0, cls = -1;
       for( int j = 0; j < 3; j++ )
       {
