@@ -8,7 +8,8 @@
 #define INTRA_MERGE_GLSL
 
 // in s_spCost (free in a node): the candidates (IntraMergeCandidate), MERGE_CAND int32 each, their number, the modes
-// to rank by (MC_MODES, their number at MC_NUM_MODES) and the template cost of each mode (MC_COST + mode)
+// to rank by (MC_MODES: intra_timd.glsl's timdCand words, their number at MC_NUM_MODES) and the template cost of each
+// mode (MC_COST + mode)
 const int MERGE_CANDS  = 5;    // MAX_NUM_INITIAL_INTRA_MERGE_CAND
 const int MERGE_CAND   = 24;
 const int MC_MODE      = 0;    // dimdModeMerge
@@ -225,57 +226,20 @@ bool mergeHas( uvec3 inc, int m )
   return ( ( inc[m >> 5] >> ( m & 31 ) ) & 1u ) != 0u;
 }
 
-// the template costs of the modes listed at MC_MODES for CU c with template h (all invocations), into MC_COST + mode:
-// as many modes at once as s_tmp holds their templates (each the above arm's rows of c.w, then the left arm's rows of
-// tw), predicted in parallel, then the SATD of the reconstruction against each, block by block in parallel
-void mergeTemplateCosts( Cu c, MergeHead h, int dc, int maxPel, bool noPdpc, int lid, int NT )
-{
-  const int   numModes = int( s_spCost[MC_NUM_MODES] );
-  const int   nA = c.w * h.th, T = nA + h.tw * c.h;   // template samples per mode
-  const int   perPass = max( 1, MAX_REF / T );
-  const ivec2 ka = timdKernel( c.w, h.th ), kl = timdKernel( h.tw, c.h );
-  const int   colsA = c.w / ka.x, colsL = h.tw / kl.x;
-  const int   nbA = colsA * ( h.th / ka.y ), B = nbA + colsL * ( c.h / kl.y );   // SATD blocks per mode
-  for( int first = 0; first < numModes; first += perPass )
-  {
-    const int n = min( perPass, numModes - first );
-    for( int i = lid; i < n * T; i += NT )
-    {
-      const int        s    = i % T;
-      const int        mode = timdMode131( int( s_spCost[MC_MODES + first + i / T] ) );
-      const TimdParams p    = timdParams( mode, c.w, c.h, noPdpc );
-      const int x = s < nA ? h.tw + s % c.w : ( s - nA ) % h.tw;
-      const int y = s < nA ? s / c.w : h.th + ( s - nA ) / h.tw;
-      s_tmp[i] = int16_t( timdPredict( mode, p, x, y, c.w, c.h, h.tw, h.th, dc, maxPel ) );
-    }
-    SYNC();
-    for( int i = lid; i < n * B; i += NT )
-    {
-      const int m = i / B, b = i % B, k = b - nbA;
-      const int satd = b < nbA ? timdHad( c.x, c.y - h.th, m * T, c.w, ( b % colsA ) * ka.x, ( b / colsA ) * ka.y, ka.x, ka.y )
-                               : timdHad( c.x - h.tw, c.y, m * T + nA, h.tw, ( k % colsL ) * kl.x, ( k / colsL ) * kl.y, kl.x, kl.y );
-      atomicAdd( s_spCost[MC_COST + s_spCost[MC_MODES + first + m]], uint( satd ) );
-    }
-    SYNC();
-  }
-}
-
 // the node of intra merge CU c (record cuIdx), all invocations: the candidates, the template costs of their modes
 // where they are ranked (with verification also into Params::mergeCost, ~0 where none), the choice into its DimdOut
 // slot; returns its mode (invocation 0)
 int mergeNode( Cu c, int cuIdx, int bitDepth, bool noPdpc, int lid, int NT )
 {
   BufI32    md = BufI32( P.mergeData );
-  MergeHead h  = MergeHead( md.v[c.merge], md.v[c.merge + 1], md.v[c.merge + 2], md.v[c.merge + 3], md.v[c.merge + 4],
-                            md.v[c.merge + 5], md.v[c.merge + 6], md.v[c.merge + 7], md.v[c.merge + 8],
-                            md.v[c.merge + 9], md.v[c.merge + 10], md.v[c.merge + 11] );
+  MergeHead h  = MergeHead( md.v[c.merge], md.v[c.merge + 1], templateUnitsAt( md, c.merge + MERGE_HEAD_T ) );
   mergeCandidates( c.merge, h.nbrNum, lid, NT );
   SYNC();
   const int  num  = int( s_spCost[MC_NUM] );
-  const bool rank = num >= 2 && h.tw > 0;   // else candidate 0 (reorderIntraMergeCand without costs)
+  const bool rank = num >= 2 && h.t.tw > 0;   // else candidate 0 (reorderIntraMergeCand without costs)
   if( rank )
   {
-    if( lid == 0 )   // the modes to rank by, their costs zero
+    if( lid == 0 )   // the modes to rank by (both arms' costs into the mode's slot), their costs zero
     {
       const uvec3 inc = mergeIncluded( num );
       int n = 0;
@@ -284,14 +248,15 @@ int mergeNode( Cu c, int cuIdx, int bitDepth, bool noPdpc, int lid, int NT )
         s_spCost[MC_COST + m] = 0u;
         if( mergeHas( inc, m ) )
         {
-          s_spCost[MC_MODES + n++] = uint( m );
+          s_spCost[MC_MODES + n++] = timdCand( timdMode131( m ), timdMode131( m ), true, m );
         }
       }
       s_spCost[MC_NUM_MODES] = uint( n );
     }
-    timdFillReference( h, c.merge + MERGE_HEAD + 2 * h.nbrNum, c.x, c.y, c.w, c.h, bitDepth, lid, NT );
-    const int dc = timdDc( h, c.w, c.h, lid, NT );
-    mergeTemplateCosts( c, h, dc, ( 1 << bitDepth ) - 1, noPdpc, lid, NT );
+    timdFillReference( h.t, md, c.merge + MERGE_HEAD + 2 * h.nbrNum, c.x, c.y, c.w, c.h, bitDepth, lid, NT );
+    const int dc = timdDc( h.t, c.w, c.h, lid, NT );
+    timdTemplateCosts( c, h.t, MC_MODES, int( s_spCost[MC_NUM_MODES] ), MC_COST, MC_COST, dc, ( 1 << bitDepth ) - 1, noPdpc,
+                       lid, NT );
   }
   if( pc.verify != 0 )   // the costs, which verification compares (~0 for the modes not ranked by)
   {

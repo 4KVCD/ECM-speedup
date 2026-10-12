@@ -183,6 +183,21 @@ void addAreaDeps( int comp, int x0, int y0, int x1, int y1 )
   }
 }
 
+// a dependency on the blocks owning the samples the template predictions of CU c read, its template's arms tw, th (0:
+// none; GpuIntraRec.cpp's templateReadAreas): the reference row and column of the template's block (8 x its sides),
+// the template above the CU with the corner and the template left of it
+void addTemplateDeps( Cu c, int tw, int th )
+{
+  if( tw > 0 || th > 0 )
+  {
+    const int x0 = c.x - tw - 1, y0 = c.y - th - 1;
+    addAreaDeps( 0, x0, y0, x0 + ( ( c.w + tw ) << 3 ), y0 );
+    addAreaDeps( 0, x0, y0, x0, y0 + ( ( c.h + th ) << 3 ) );
+    addAreaDeps( 0, c.x - tw, c.y - th, c.x + c.w - 1, c.y - 1 );
+    addAreaDeps( 0, c.x - tw, c.y, c.x - 1, c.y + c.h - 1 );
+  }
+}
+
 // GpuIntraRec::endPicture's dependency loop for block g_i (passes 1 and 2); pass 1 writes the availability, read
 // ranges and ISP side flag into the block record, which refSource reads (from the local copy) and pass 2 reloads
 void dependencies( int comp )
@@ -191,7 +206,7 @@ void dependencies( int comp )
   if( ( t.derive & DERIVE_NODE ) != 0 )   // a CU's mode: the derived modes it reads, from those CUs' nodes
   {
     const Cu c = BufCu( P.cus ).v[t.cu];
-    if( c.kind == CU_MPM )
+    if( c.kind == CU_MPM || c.kind == CU_TIMD )
     {
       for( int k = 0; k < MPM_NEIGHBOURS; k++ )
       {
@@ -224,24 +239,21 @@ void dependencies( int comp )
         addAreaDeps( k.comp, k.x - 1, k.y - 1, k.x + k.width, k.y + k.height );
       }
     }
-    // intra merge: the parameters of its neighbours (their nodes), its template and the template's reference row and
-    // column (GpuIntraRec.cpp's mergeReadAreas)
+    // intra merge: the parameters of its neighbours (their nodes), its template
     if( c.merge >= 0 )
     {
       BufI32    md     = BufI32( P.mergeData );
-      const int nbrNum = md.v[c.merge + 1], tw = md.v[c.merge + 2], th = md.v[c.merge + 3];
+      const int nbrNum = md.v[c.merge + 1];
       for( int k = 0; k < nbrNum; k++ )
       {
         addDep( BufCu( P.cus ).v[md.v[c.merge + MERGE_HEAD + 2 * k]].node );
       }
-      if( tw > 0 )
-      {
-        const int x0 = c.x - tw - 1, y0 = c.y - th - 1;
-        addAreaDeps( 0, x0, y0, x0 + ( ( c.w + tw ) << 3 ), y0 );
-        addAreaDeps( 0, x0, y0, x0, y0 + ( ( c.h + th ) << 3 ) );
-        addAreaDeps( 0, c.x - tw, c.y - th, c.x + c.w - 1, c.y - 1 );
-        addAreaDeps( 0, c.x - tw, c.y, c.x - 1, c.y + c.h - 1 );
-      }
+      addTemplateDeps( c, md.v[c.merge + MERGE_HEAD_T], md.v[c.merge + MERGE_HEAD_T + 1] );
+    }
+    if( c.timd >= 0 )   // TIMD: its template
+    {
+      BufI32 td = BufI32( P.timdData );
+      addTemplateDeps( c, td.v[c.timd + TIMD_HEAD_T], td.v[c.timd + TIMD_HEAD_T + 1] );
     }
     return;
   }
@@ -269,19 +281,23 @@ void dependencies( int comp )
   }
   // a mode intra_rec derives is not known here: the union of the read ranges of the modes the syntax leaves (Cu::modes,
   // else all), the fusion line where one of them reads it, the bilateral filter's neighbours where it applies to one
-  const bool derived = ( t.derive & DERIVE_MODE ) != 0;
+  // A TIMD block's modes are of the 131-mode set, with wide angles beyond the regular ones, and blend, fused from the
+  // next line also where the CU's fetchRef2nd is off: the whole arms of both lines, the filter's neighbours where it may
+  // filter a blend
+  const bool derived   = ( t.derive & DERIVE_MODE ) != 0;
+  const bool timdBlock = ( t.derive & DERIVE_TIMD ) != 0;
   Cu         c;
   int        numModes = 1;
   if( derived )
   {
     c        = BufCu( P.cus ).v[t.cu];
-    numModes = c.modes[0] < 0 ? NUM_LUMA_MODE : c.modes[1] < 0 ? 1 : 2;
+    numModes = timdBlock ? 0 : c.modes[0] < 0 ? NUM_LUMA_MODE : c.modes[1] < 0 ? 1 : 2;
   }
-  bool bfNeeded = !derived && t.bf != 0;
+  bool bfNeeded = ( !derived && t.bf != 0 ) || ( timdBlock && ( t.derive & DERIVE_BF ) != 0 );
   for( int ln = 0; ln < 2; ln++ )
   {
     const int mrl = t.mrl + ln;   // the reference line (multiRefIdx; the fusion line is the next one)
-    int topMax = -1, leftMax = -1;   // -1: the line is not read
+    int topMax = timdBlock ? topLen + mrl : -1, leftMax = timdBlock ? leftLen + mrl : -1;   // -1: the line is not read
     for( int k = 0; k < numModes; k++ )
     {
       Tu tm = t;

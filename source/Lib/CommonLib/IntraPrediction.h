@@ -643,6 +643,14 @@ public:
   /// copy of it
   static int wideAngle( int width, int height, int predMode ) { return getModifiedWideAngle( width, height, predMode ); }
   static int intraFilterThreshold( int log2Size ) { return m_aucIntraFilter[log2Size]; }
+#if JVET_W0123_TIMD_FUSION && JVET_AB0155_SGPM && JVET_AC0094_REF_SAMPLES_OPT
+  /// a TIMD block's wide angle of a mode of the 131-mode set (initPredIntraParams with bExtIntraDir): getWideAngleExt's,
+  /// or without checkWideAngle getTimdWideAngleExt's
+  static int timdWideAngle( int width, int height, int predMode, bool checkWideAngle )
+  {
+    return checkWideAngle ? getWideAngleExt( width, height, predMode ) : getTimdWideAngleExt( width, height, predMode );
+  }
+#endif
 #if ENABLE_DIMD && JVET_AJ0267_ADAPTIVE_HOG && JVET_AJ0203_DIMD_2X2_EDGE_OP && JVET_AC0098_LOC_DEP_DIMD
   /// one gradient histogram deriveDimdMode / deriveDimdModeAdaptive / deriveDimdChromaMode / deriveDimdModeList builds
   /// (buildHistogram or buildHistogramAdaptive), for the GPU reconstruction: its arguments, with pReco relative to the
@@ -1390,8 +1398,8 @@ public:
   /// deriveIntraMergeCand's neighbours in its order, for the GPU reconstruction
   static void intraMergeNeighbours( const CodingUnit& cu, std::vector<const CodingUnit*>& nbrs );
 #if JVET_AJ0146_TIMDSAD && JVET_AC0094_REF_SAMPLES_OPT
-  /// the units of the reference line of a luma template with both arms (xFillTimdReferenceSamples' layout) and which of
-  /// them are available
+  /// the units of the reference line of a luma template (xFillTimdReferenceSamples' layout) and which of them are
+  /// available
   struct TimdReferenceUnits
   {
     int  unitWidth, unitHeight;
@@ -1400,8 +1408,8 @@ public:
     int  numIntraNeighbor;                     // available units
     bool flags[4 * ( MAX_NUM_PART_IDXS_IN_CTU_WIDTH << 2 ) + 1];
   };
-  /// xFillTimdReferenceSamples' step 1 for a template of tw x th around area, its block refW x refH, for the GPU
-  /// reconstruction
+  /// xFillTimdReferenceSamples' step 1 for a template of tw columns left of area and th rows above it (0: no such arm),
+  /// its block refW x refH, for the GPU reconstruction
   static void timdReferenceUnits( const CodingUnit& cu, const CompArea& area, int tw, int th, int refW, int refH, TimdReferenceUnits& u );
 #endif
   /// the template cost of each mode reorderIntraMergeCand ranked the candidates of the last CU with (MAX_UINT64: not

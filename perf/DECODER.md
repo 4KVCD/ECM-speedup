@@ -380,7 +380,15 @@ the reconstruction buffer; works in every frame-thread context):
   choice once; where an entry of the list qualifies, the CPU's loop over it takes its last entry, not the first that
   qualifies, which the GPU reproduces). M23 is LFNST / NSPT of MIP blocks, whose mode is a DIMD of the block's own MIP
   prediction: the block derives it from its reduced prediction, then chooses its transforms and computes its residual
-  before predicting the samples (with MTSS from a mode list its CU's node derives).
+  before predicting the samples (with MTSS from a mode list its CU's node derives). M24 is TIMD: a TIMD CU's node
+  finds its modes as deriveTimdMode does, from the template costs of M21 (also of one-arm templates at the picture's
+  edges, and per arm) of planar, DC, the angular modes of its full MPM list and the wide angles beyond the regular
+  ones that its neighbourhood lets the reference reach, then of the neighbours of the two best: all costs of a batch
+  computed at once, the CPU's sequential choice with its early ends replayed afterwards, then the blend of the best,
+  the secondary and planar or DC with the CPU's weights (its doubles done exactly in integers). Its blocks predict
+  at 1/64-sample angles with TIMD's wide angles and 1/64 filters of up to 16 taps, and blend those modes per location
+  dependence class like DIMD's (the secondary from the next reference line alone where both are close), the
+  bilateral filter on the blend; neighbours read its mode in the 67-mode set.
   GpuIntraRec::supported()
   rejects every tool whose mode derivation or prediction reads reconstructed samples or that the kernels lack, before
   anything is skipped. All 19 regular streams now fall back to the CPU at TMRL, the next sequence-level check (before

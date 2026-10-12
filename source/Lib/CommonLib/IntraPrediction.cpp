@@ -12042,14 +12042,15 @@ void IntraPrediction::initTimdIntraPatternLuma(const CodingUnit &cu, const CompA
 }
 
 #if JVET_AJ0146_TIMDSAD && JVET_AC0094_REF_SAMPLES_OPT && JVET_AG0146_DIMD_ITMP_IBC && JVET_AM0074_INTRA_MERGE
-// xFillTimdReferenceSamples' step 1 for a luma template of tw x th left of and above area with both arms (keep in step
-// with it): the units of its reference line and which are available, for the GPU reconstruction
+// xFillTimdReferenceSamples' step 1 for a luma template of tw columns left of area and th rows above it (0: no such
+// arm; keep in step with it): the units of the reference line of the template's block, refW x refH (area extended by
+// the arms), and which are available, for the GPU reconstruction
 void IntraPrediction::timdReferenceUnits( const CodingUnit& cu, const CompArea& area, int tw, int th, int refW, int refH, TimdReferenceUnits& u )
 {
   const CodingStructure& cs  = *cu.cs;
   const PreCalcValues&   pcv = *cs.pcv;
   const ChannelType   chType = CHANNEL_TYPE_LUMA;
-  const int predSize  = refW << 3;   // m_topRefLength, m_leftRefLength of initTimdIntraPatternLuma with both arms
+  const int predSize  = refW << 3;   // initTimdIntraPatternLuma's m_topRefLength, m_leftRefLength
   const int predHSize = refH << 3;
   u.unitWidth        = pcv.minCUWidth;
   u.unitHeight       = pcv.minCUHeight;

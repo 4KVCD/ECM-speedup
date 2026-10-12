@@ -12,9 +12,9 @@
 // prediction and the neighbours, and the residual computed again where a sign is negative. Every step follows the C++
 // of IntraPrediction / MatrixIntraPrediction / TrQuant / DecCu.
 // Modes the CPU cannot know without the reconstruction are derived in a node per CU before its blocks: the MPM lists
-// (intra_modes.glsl), DIMD (intra_dimd.glsl), OBIC (intra_obic.glsl) and intra merge (intra_merge.glsl, with the
-// template costs of intra_timd.glsl); the blocks of DIMD, OBIC and intra merge CUs blend the predictions of several
-// modes.
+// (intra_modes.glsl), DIMD (intra_dimd.glsl), OBIC (intra_obic.glsl), intra merge (intra_merge.glsl, with the template
+// costs of intra_timd.glsl) and TIMD (intra_timd.glsl); the blocks of DIMD, OBIC, intra merge and TIMD CUs blend the
+// predictions of several modes.
 #extension GL_GOOGLE_include_directive : require
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
@@ -36,6 +36,7 @@ layout( buffer_reference, std430, buffer_reference_align = 4 ) coherent buffer C
 layout( constant_id = 0 ) const bool WITH_DIMD = true;                 // DIMD and OBIC in nodes, their blending
 layout( constant_id = 1 ) const bool WITH_DERIVED_TRANSFORMS = true;   // blocks with DERIVE_TRANSFORM
 layout( constant_id = 2 ) const bool WITH_MERGE = true;                // intra merge CUs (and OBIC's merge neighbours)
+layout( constant_id = 3 ) const bool WITH_TIMD = true;                 // TIMD CUs (with DIMD and intra merge)
 
 const int PAD     = 6;                        // interpFilterNumPadded (16 taps / 2 - 2)
 const int ANG     = 1792;                     // angular reference buffers (the CPU's are larger; blocks <= 128 use < 1700)
@@ -46,6 +47,7 @@ const int BF_LUT  = WEAK4 + 32 * 4;           // the bilateral filter's LUT rows
 const int BF_SIZE = BF_LUT + 26 * 48;
 const int BF_MAD  = BF_SIZE + 64;
 const int EXT_CUBIC = BF_MAD + 16;            // the 1/64 cubic filter of template predictions (64 x 4; intra_timd.glsl)
+const int EXT_NTAP  = EXT_CUBIC + 64 * 4;     // the 1/64 N-tap tables of TIMD blocks ([taps 6,8,10,12,16][64][16])
 const int BF_PRED = 0;                        // in s_tmp: the prediction (< 1024 samples: at most 512)
 const int BF_BLK  = 512;                      // in s_tmp: the padded block ((W + 4) x (H + 4) <= 720)
 
@@ -155,7 +157,7 @@ int cuModeOf( int n )
 // positions (-1: none), chroma the co-located luma CU's in entry 0
 int modeRead( Cu c, int k )
 {
-  const int n = c.kind == CU_MPM ? c.nbr[k] : k == 0 ? c.lumaCu : -1;
+  const int n = c.kind == CU_MPM || c.kind == CU_TIMD ? c.nbr[k] : k == 0 ? c.lumaCu : -1;
   return n >= 0 ? cuModeOf( n ) : -1;
 }
 
@@ -601,6 +603,103 @@ ivec2 wgSum2( int a, int b, int slot )
 #include "intra_timd.glsl"
 #include "intra_merge.glsl"
 
+// ----- a TIMD block's prediction parameters (TIMD's luma path of initPredIntraParams, bExtIntraDir)
+
+// the start of CU cu's TimdOut
+int timdOutBase( int cu )
+{
+  return BufI32( P.timdData ).v[BufCu( P.cus ).v[cu].timd] * TIMD_OUT;   // TimdHead::index
+}
+
+// the parameters of a mode of the 131-mode set: its wide angle getWideAngleExt's (checkWA) or getTimdWideAngleExt's,
+// angles in 1/64 samples, PDPC as for the regular modes, planar's reference filter, none for angular modes (JVET-AM0104)
+// and always the cubic filter (JVET-AM0163); fusion and the bilateral filter apart (GpuIntraRec.cpp's copy:
+// applyTimdModeParams)
+void timdModeParams( inout Tu t, int mode, bool checkWA )
+{
+  const int W = t.regW, H = t.h;
+  const int predMode = checkWA ? timdWideAngle( W, H, mode ) : timdWaipAngle( W, H, mode );
+  t.dirMode        = mode;
+  t.isModeVer      = predMode >= EXT_DIA_IDX ? 1 : 0;
+  t.intraPredAngle = 0;
+  t.absInvAngle    = 0;
+  t.angularScale   = 0;
+  t.gradPDPC       = 0;
+  bool pdpc = W >= 4 && H >= 4 && t.mrl == 0;
+  const int angMode = t.isModeVer != 0 ? predMode - EXT_VER_IDX : -( predMode - EXT_HOR_IDX );
+  if( mode > DC_IDX && mode <= EXT_VDIA_IDX )
+  {
+    const int absAng = EXT_ANG_TABLE[abs( angMode )];
+    t.absInvAngle    = EXT_INV_ANG_TABLE[abs( angMode )];
+    t.intraPredAngle = angMode < 0 ? -absAng : absAng;
+    if( angMode < 0 )
+    {
+      pdpc = false;
+    }
+    else if( angMode > 0 )
+    {
+      t.angularScale = min( 2, findMSB( t.isModeVer != 0 ? H : W ) - ( findMSB( 3 * t.absInvAngle - 2 ) - 8 ) );
+      if( t.angularScale < 0 )
+      {
+        t.angularScale = ( findMSB( W ) + findMSB( H ) - 2 ) >> 2;
+        t.gradPDPC     = 1;
+      }
+    }
+  }
+  if( ( t.derive & DERIVE_NO_PDPC ) != 0 )
+  {
+    pdpc       = false;
+    t.gradPDPC = 0;
+  }
+  const bool smoothing = ( t.derive & DERIVE_NO_SMOOTHING ) == 0 && t.mrl == 0 && t.disableRefFilter == 0;
+  t.refFilter = mode == PLANAR_IDX && smoothing && W * H > 32 ? 1 : 0;
+  t.useCubic  = 1;
+  t.applyPDPC = pdpc ? 1 : 0;
+  t.plIdx     = 0;
+}
+
+// a TIMD block's blend (xGetNumTapsTIMD): the filter lengths of its mode (x) and its secondary mode (y), from its modes
+// of nonzero weight: one angular mode alone 8, with DC 16, else 12 (the CPU's TIMD-SAD / merge counterparts aside)
+ivec2 timdBlendTaps( int base )
+{
+  CBufI32    o       = CBufI32( P.timdOut );
+  const int  mode    = o.v[base + TIMD_OUT_MODE];
+  const bool primAng = mode > DC_IDX;
+  int angCnt = primAng ? 1 : 0, nonAngNonDc = !primAng && mode != DC_IDX ? 1 : 0, total = 1;
+  if( o.v[base + TIMD_OUT_WEIGHT + 1] > 0 )
+  {
+    const int sec = o.v[base + TIMD_OUT_SECONDARY];
+    angCnt += sec > DC_IDX ? 1 : 0;
+    nonAngNonDc += sec == PLANAR_IDX ? 1 : 0;
+    total++;
+  }
+  if( o.v[base + TIMD_OUT_WEIGHT + 2] > 0 )
+  {
+    nonAngNonDc += o.v[base + TIMD_OUT_NON_ANG] != DC_IDX ? 1 : 0;
+    total++;
+  }
+  if( angCnt == 1 && nonAngNonDc == 0 )
+  {
+    const int taps = total == angCnt ? 8 : 16;   // (no DC: 8)
+    return primAng ? ivec2( taps, 0 ) : ivec2( 0, taps );
+  }
+  return ivec2( 12, 12 );
+}
+
+// TIMD's fusion of a blend (JVET-AG0128): the secondary mode predicted from the next reference line only where both
+// modes are angular, of wide angles at most 8 apart (4 for blocks up to 128 samples) on one side of the horizontal and the
+// vertical, or the mode blends with itself; the main mode without fusion
+bool timdBlendFusion( int base, int W, int H )
+{
+  CBufI32    o    = CBufI32( P.timdOut );
+  const int  mode = o.v[base + TIMD_OUT_MODE], sec = o.v[base + TIMD_OUT_SECONDARY];
+  const int  pm   = o.v[base + TIMD_OUT_CHECK_WA] != 0 ? timdWideAngle( W, H, mode ) : timdWaipAngle( W, H, mode );
+  const int  pm2  = o.v[base + TIMD_OUT_SEC_CHECK_WA] != 0 ? timdWideAngle( W, H, sec ) : timdWaipAngle( W, H, sec );
+  const bool close = abs( pm - pm2 ) <= ( W * H > 128 ? 8 : 4 ) && ( pm - EXT_HOR_IDX ) * ( pm2 - EXT_HOR_IDX ) >= 0
+                     && ( pm - EXT_VER_IDX ) * ( pm2 - EXT_VER_IDX ) >= 0;
+  return ( mode > DC_IDX && sec > DC_IDX && close ) || ( mode == sec && mode > DC_IDX );
+}
+
 // bifApplyLut (the LUT row in s_bfLut, offset base: 0 distance 1, 16 diagonal, 32 distance 2)
 int bfLut( int diff, int base, int cutBits, int bdShift )
 {
@@ -613,16 +712,35 @@ int bfLut( int diff, int base, int cutBits, int bdShift )
   return diff < 0 ? -w0 : w0;
 }
 
+// the reference lines an angular prediction reads (xPredIntraAng's weightMode): the block's (4), the block's and the
+// next one weighed 3 : 1 (intra fusion, 3), or the next one alone (0: a TIMD blend's secondary mode)
+const int FUSE_NONE   = 0;
+const int FUSE_BOTH   = 1;
+const int FUSE_SECOND = 2;
+
+// planar's reference sample i of the block's line: the filtered one in s_tmp where a TIMD blend keeps both
+int planarRef( int i, bool filtered )
+{
+  return filtered ? int( s_tmp[i] ) : int( s_ref[0][i] );
+}
+
 // main / side reference arrays of line l (main = above for vertical modes)
 int mainR( bool isVer, int l, int i ) { return isVer ? int( s_angA[l][i] ) : int( s_angL[l][i] ); }
 int sideR( bool isVer, int l, int i ) { return isVer ? int( s_angL[l][i] ) : int( s_angA[l][i] ); }
 void mainW( bool isVer, int l, int i, int v ) { if( isVer ) s_angA[l][i] = int16_t( v ); else s_angL[l][i] = int16_t( v ); }
 
-// the luma interpolation filter of xPredIntraAng for fraction frac (cubic N-tap table or the Gaussian formulas)
-int lumaConv( bool isVer, int l, int base, int taps, bool cubic, bool big, int frac )
+// the luma interpolation filter of xPredIntraAng for fraction frac (cubic N-tap table or the Gaussian formulas); ext:
+// a TIMD block's 1/64 fractions (its N-tap tables, read from the filter buffer)
+int lumaConv( bool isVer, int l, int base, int taps, bool cubic, bool big, int frac, bool ext )
 {
   int sum = 0;
-  if( cubic )
+  if( WITH_TIMD && ext )
+  {
+    const int t = taps == 6 ? 0 : taps == 8 ? 1 : taps == 10 ? 2 : taps == 12 ? 3 : 4;
+    BufI32    f = BufI32( P.filters );
+    for( int k = 0; k < taps; k++ ) sum += mainR( isVer, l, base + k ) * f.v[EXT_NTAP + ( t * 64 + frac ) * 16 + k];
+  }
+  else if( cubic )
   {
     for( int k = 0; k < taps; k++ ) sum += mainR( isVer, l, base + k ) * filterTap( taps, frac, k );
   }
@@ -1155,8 +1273,9 @@ void main()
     // the CU's blocks and the CUs reading it; first the CU's DIMD (intra_dimd.glsl: from the reconstruction around the
     // CU, on whose blocks it depends), the mode of a DIMD CU and the first entries of an MPM list; an OBIC CU's modes
     // then from its neighbours' (intra_obic.glsl: published by the nodes of those CUs, on which it depends); an intra
-    // merge CU's parameters from its neighbours', ranked by template costs (intra_merge.glsl); with MTSS the LFNST /
-    // NSPT mode of the CU's block (mtssList, mtssChoice)
+    // merge CU's parameters from its neighbours', ranked by template costs (intra_merge.glsl); a TIMD CU's modes from
+    // template costs of its MPM list's modes and more (intra_timd.glsl); with MTSS the LFNST / NSPT mode of the CU's
+    // block (mtssList, mtssChoice)
     if( ( t.derive & DERIVE_NODE ) != 0 )
     {
       const Cu c = BufCu( P.cus ).v[t.cu];
@@ -1188,7 +1307,8 @@ void main()
           dimdModes = int[3]( d.mode, d.blendMode[0], d.blendMode[1] );
         }
       }
-      int cuMode = -1;   // invocation 0's
+      int cuMode = -1;       // invocation 0's
+      int timdSecond = -1;   // a TIMD CU's second mode for MTSS (invocation 0's)
       if( WITH_DIMD && c.kind == CU_OBIC )
       {
         SYNC();   // dimdSelect has read the histograms whose memory OBIC's takes
@@ -1201,6 +1321,15 @@ void main()
       else if( WITH_DIMD && WITH_MERGE && c.kind == CU_MERGE )   // intra_merge.glsl (no DIMD of its own)
       {
         cuMode = mergeNode( c, t.cu, t.bitDepth, ( t.derive & DERIVE_NO_PDPC ) != 0, lid, NT );
+      }
+      else if( WITH_TIMD && c.kind == CU_TIMD )   // intra_timd.glsl, its MPM list with its DIMD
+      {
+        int modes[MPM_NEIGHBOURS];
+        for( int k = 0; k < MPM_NEIGHBOURS; k++ )
+        {
+          modes[k] = s_modesRead[k];
+        }
+        cuMode = timdNode( c, modes, dimdModes, t.bitDepth, ( t.derive & DERIVE_NO_PDPC ) != 0, timdSecond, lid, NT );
       }
       else if( lid == 0 && c.kind != CU_KNOWN )
       {
@@ -1215,7 +1344,7 @@ void main()
       {
         CBufI32( P.cuMode ).v[t.cu] = cuMode;
       }
-      // MTSS (a DIMD, OBIC, intra merge or MIP CU with mdirIdx): its mode list from histograms of its own
+      // MTSS (a DIMD, OBIC, intra merge, TIMD or MIP CU with mdirIdx): its mode list from histograms of its own
       // (deriveDimdModeList), once dimdSelect and obicSelect have read theirs, then the LFNST / NSPT mode and bucket of its
       // luma block (a MIP block chooses them itself, from its prediction: mipTransformMode)
       if( WITH_DIMD && WITH_DERIVED_TRANSFORMS && c.mtss >= 0 )
@@ -1232,12 +1361,13 @@ void main()
         }
         else if( lid == 0 )
         {
-          // the mode without MTSS (a DIMD or OBIC CU's DIMD main mode, intra merge's) and the one MTSS tries first:
-          // DIMD's second strongest, an OBIC CU's second OBIC mode (-1 only without OBIC modes, which no decodable
-          // stream has: planar keeps it in range), none for intra merge
-          const int   mode   = c.kind == CU_MERGE ? cuMode : d.mode;
+          // the mode without MTSS (a DIMD or OBIC CU's DIMD main mode, intra merge's, TIMD's) and the one MTSS tries
+          // first: DIMD's second strongest, an OBIC CU's second OBIC mode (-1 only without OBIC modes, which no
+          // decodable stream has: planar keeps it in range), a blended TIMD CU's secondary, none for intra merge
+          const int   mode   = c.kind == CU_MERGE || c.kind == CU_TIMD ? cuMode : d.mode;
           const int   second = c.kind == CU_DIMD ? d.trSecond
-                               : c.kind == CU_OBIC ? max( CBufI32( P.obicOut ).v[c.obic * OBIC_OUT + OBIC_OUT_MODE + 1], PLANAR_IDX ) : -1;
+                               : c.kind == CU_OBIC ? max( CBufI32( P.obicOut ).v[c.obic * OBIC_OUT + OBIC_OUT_MODE + 1], PLANAR_IDX )
+                               : c.kind == CU_TIMD ? timdSecond : -1;
           const ivec3 list   = mtssList();
           const ivec2 choice = mtssChoice( c, mode, second, list );
           CBufI32     o      = CBufI32( P.dimdOut );
@@ -1261,13 +1391,26 @@ void main()
         s_mode = cuModeOf( t.cu );
       }
       // a DIMD CU's predictions where its DIMD blends (dimdPrediction), an intra merge CU's alike from its chosen
-      // candidate (always), an OBIC CU's: its modes but those not set
+      // candidate (always), an OBIC CU's: its modes but those not set; a TIMD CU's where its modes blend: its mode, its
+      // secondary mode and its non-angular one (TimdOut; the weight of one not blended 0)
       const bool dimdCu  = WITH_DIMD && ( t.derive & DERIVE_DIMD ) != 0, obicCu = WITH_DIMD && ( t.derive & DERIVE_OBIC ) != 0;
       const bool mergeCu = WITH_DIMD && WITH_MERGE && ( t.derive & DERIVE_MERGE ) != 0;
-      if( ( dimdCu || obicCu || mergeCu ) && lid < BLEND_MAX )
+      const bool timdCu  = WITH_TIMD && ( t.derive & DERIVE_TIMD ) != 0;
+      const int  timdOut = timdCu ? timdOutBase( t.cu ) : 0;
+      if( ( dimdCu || obicCu || mergeCu || timdCu ) && lid < BLEND_MAX )
       {
         int mode = -1, w = 0, cls = 0;
-        if( dimdCu || mergeCu )
+        if( timdCu )
+        {
+          CBufI32 o = CBufI32( P.timdOut );
+          if( lid < 3 && o.v[timdOut + TIMD_OUT_BLENDED] != 0 )
+          {
+            mode = o.v[timdOut + ( lid == 0 ? TIMD_OUT_MODE : lid == 1 ? TIMD_OUT_SECONDARY : TIMD_OUT_NON_ANG )];
+            w    = max( o.v[timdOut + TIMD_OUT_WEIGHT + lid], 0 );
+            cls  = o.v[timdOut + TIMD_OUT_LOC_DEP + lid];
+          }
+        }
+        else if( dimdCu || mergeCu )
         {
           dimdPrediction( t.cu, lid, mode, w, cls );
         }
@@ -1284,11 +1427,13 @@ void main()
         s_blendClass[lid] = cls;
         if( lid == 0 )
         {
-          s_blendNum = obicCu ? OBIC_MODES : mergeCu || CBufI32( P.dimdOut ).v[t.cu * DIMD_OUT + DIMD_OUT_BLENDING] != 0 ? DIMD_FUSION_NUM : 0;
+          s_blendNum = obicCu ? OBIC_MODES
+                       : timdCu ? ( CBufI32( P.timdOut ).v[timdOut + TIMD_OUT_BLENDED] != 0 ? 3 : 0 )
+                       : mergeCu || CBufI32( P.dimdOut ).v[t.cu * DIMD_OUT + DIMD_OUT_BLENDING] != 0 ? DIMD_FUSION_NUM : 0;
         }
       }
       SYNC();
-      if( dimdCu || obicCu || mergeCu )   // (the block's: the same for the whole workgroup)
+      if( dimdCu || obicCu || mergeCu || timdCu )   // (the block's: the same for the whole workgroup)
       {
         if( lid == 0 )
         {
@@ -1296,7 +1441,22 @@ void main()
         }
         SYNC();
       }
-      applyModeParams( t, s_mode, BufCu( P.cus ).v[t.cu].plIdx );
+      if( timdCu )
+      {
+        // TIMD (the 131-mode set): its mode with its wide angle; fusion where the modes do not blend as the CU's
+        // fetchRef2nd and the slope allow it, where they blend TIMD's rule (the main mode then without fusion, the
+        // secondary from the next line alone: timdBlendFusion); the bilateral filter only on a blend
+        CBufI32 o = CBufI32( P.timdOut );
+        timdModeParams( t, o.v[timdOut + TIMD_OUT_MODE], o.v[timdOut + TIMD_OUT_CHECK_WA] != 0 );
+        const bool blending = s_blendNum != 0;
+        t.fusion = blending ? ( ( t.derive & DERIVE_NO_FUSION ) == 0 && timdBlendFusion( timdOut, t.regW, t.h ) ? 1 : 0 )
+                            : ( t.derive & DERIVE_FETCH2ND ) != 0 && t.dirMode > DC_IDX && ( abs( t.intraPredAngle ) & 63 ) != 0 ? 1 : 0;
+        t.bf     = blending && ( t.derive & DERIVE_BF ) != 0 ? 1 : 0;   // (of the blend)
+      }
+      else
+      {
+        applyModeParams( t, s_mode, BufCu( P.cus ).v[t.cu].plIdx );
+      }
       if( dimdCu || obicCu || mergeCu )
       {
         // the main mode of DIMD, OBIC and intra merge has no bilateral filter; blending (always with OBIC: planar is
@@ -1354,8 +1514,10 @@ void main()
     SYNC();
     // DIMD / OBIC / intra merge blending (predIntraAng): each mode predicts from the filtered or the unfiltered
     // references as its own parameters say, so both are kept: the unfiltered in s_ref[1] (blending has no fusion line),
-    // the filtered in s_tmp
-    const bool blend = WITH_DIMD && ( t.derive & ( DERIVE_DIMD | DERIVE_OBIC | DERIVE_MERGE ) ) != 0 && s_blendNum != 0;
+    // the filtered in s_tmp. A TIMD blend, which can fuse, keeps the unfiltered ones in s_ref[0], its planar
+    // predictions read the filtered ones in s_tmp (planarRef)
+    const bool timdBlend = WITH_TIMD && ( t.derive & DERIVE_TIMD ) != 0 && s_blendNum != 0;
+    const bool blend     = ( WITH_DIMD && ( t.derive & ( DERIVE_DIMD | DERIVE_OBIC | DERIVE_MERGE ) ) != 0 && s_blendNum != 0 ) || timdBlend;
     if( t.refFilter != 0 || blend )   // xFilterReferenceSamples (multiRefIdx 0): in place, or for blending beside them
     {
       for( int i = lid; i <= predStride + predHSize; i += NT )
@@ -1377,7 +1539,7 @@ void main()
       }
       SYNC();
       for( int i = lid; i <= predStride + predHSize && !blend; i += NT ) s_ref[0][i] = s_tmp[i];
-      for( int i = lid; i <= predStride + predHSize && blend; i += NT ) s_ref[1][i] = s_ref[0][i];
+      for( int i = lid; i <= predStride + predHSize && blend && !timdBlend; i += NT ) s_ref[1][i] = s_ref[0][i];
       SYNC();
     }
 
@@ -1471,11 +1633,16 @@ void main()
     // main mode, planar and blend modes; OBIC's modes), each with the parameters of its mode (initPredIntraParams for
     // the CU, no fusion, no bilateral filter), its references and its filter length (DIMD's by its weight), summed
     // (emitPred), then blended
+    // A TIMD blend (predIntraAng's TIMD branch): its mode without fusion, its secondary (with the secondary's wide-angle
+    // choice; its non-angular mode with it) from the next line alone where TIMD's rule fuses them, their filter lengths
+    // by the modes blended (timdBlendTaps)
     g_blendSum  = false;
     g_blendTaps = ( t.derive & DERIVE_DIMD ) != 0;
+    const ivec2 timdTaps = timdBlend ? timdBlendTaps( timdOutBase( t.cu ) ) : ivec2( 0, 0 );
     bool blendFirst = true;
     for( int sub = 0; sub < ( blend ? s_blendNum : 1 ); sub++ )
     {
+      int fuse = fusion ? FUSE_BOTH : FUSE_NONE;   // the lines the angular prediction reads
       if( blend )
       {
         g_blendW     = s_blendW[sub];
@@ -1484,17 +1651,23 @@ void main()
         {
           continue;
         }
-        if( sub > 0 )
+        if( sub > 0 && timdBlend )
+        {
+          timdModeParams( t, s_blendMode[sub], CBufI32( P.timdOut ).v[timdOutBase( t.cu ) + TIMD_OUT_SEC_CHECK_WA] != 0 );
+        }
+        else if( sub > 0 )
         {
           applyModeParams( t, s_blendMode[sub], 0 );
-          t.fusion = 0;
         }
+        fuse         = timdBlend && sub == 1 && fusion ? FUSE_SECOND : FUSE_NONE;
         g_blendSum   = true;
         g_blendFirst = blendFirst;
         blendFirst   = false;
-        for( int i = lid; i <= predStride + predHSize; i += NT ) s_ref[0][i] = t.refFilter != 0 ? s_tmp[i] : s_ref[1][i];
+        for( int i = lid; i <= predStride + predHSize && !timdBlend; i += NT ) s_ref[0][i] = t.refFilter != 0 ? s_tmp[i] : s_ref[1][i];
         SYNC();
       }
+      // a TIMD blend's planar with the reference filter: the filtered line (in s_tmp)
+      const bool planarFiltered = timdBlend && t.refFilter != 0;
       if( t.mipMatrix >= 0 )   // MIP: predictionUpsampling of the reduced prediction
       {
         for( int i = lid; i < N; i += NT ) emitPred( t, i % W, i / W, mipSample( i % W, i / W, mipPs, mipUpH, mipUpV, predStride ), bf );
@@ -1511,13 +1684,13 @@ void main()
           s_dc = ( sum + ( denom >> 1 ) ) >> findMSB( denom );
         }
         SYNC();
-        const int topRight = int( s_ref[0][1 + W] ), bottomLeft = int( s_ref[0][predStride + 1 + H] );
+        const int topRight = planarRef( 1 + W, planarFiltered ), bottomLeft = planarRef( predStride + 1 + H, planarFiltered );
         const int offset = 1 << ( log2W + log2H ), finalShift = 1 + log2W + log2H;
         const int pdpcScale = ( log2W - 2 + log2H - 2 + 2 ) >> 2;
         for( int i = lid; i < N; i += NT )
         {
           int x = i % W, y = i / W;
-          int T = int( s_ref[0][1 + x] ), L = int( s_ref[0][predStride + 1 + y] );
+          int T = planarRef( 1 + x, planarFiltered ), L = planarRef( predStride + 1 + y, planarFiltered );
           int v;
           if( t.dirMode == 1 )
           {
@@ -1664,9 +1837,12 @@ void main()
         angClear = min( ANG, 2 * ( W + H ) + max( topRefLength, leftRefLength ) + 2 * PAD + 2 * mrl2 + ( mrl2 << abs( log2Ratio ) ) + 16 );
         angClear2 = fusion;
         SYNC();
-        // rows along the main direction (width/height swapped for horizontal modes)
+        // rows along the main direction (width/height swapped for horizontal modes); a TIMD block's angles in 1/64
+        // samples (bExtIntraDir)
         const int w = isVer ? W : H, h = isVer ? H : W;
         const bool isLuma = t.comp == 0;
+        const bool ext = WITH_TIMD && ( t.derive & DERIVE_TIMD ) != 0;
+        const int  fracBits = ext ? 6 : 5, fracMask = ( 1 << fracBits ) - 1;
         int taps = 0;
         if( isLuma )
         {
@@ -1675,6 +1851,11 @@ void main()
           if( byWeight )   // JVET-AN0158: a DIMD blend's prediction by its weight
           {
             taps = g_blendW >= 32 ? 8 : 16;
+          }
+          const int timdBlendTaps = sub == 0 ? timdTaps.x : timdTaps.y;
+          if( timdBlend && timdBlendTaps != 0 )   // a TIMD blend's (where it gives one; TIMD's 8 stay 8: JVET-AM0163)
+          {
+            taps = timdBlendTaps;
           }
           if( w < 8 && taps > 10 ) taps = 10;
           if( byWeight && taps == 8 )   // JVET-AK0087: 8 taps for slopes away from H / V in small blocks
@@ -1685,9 +1866,11 @@ void main()
           }
         }
         const int numExtra = taps / 2 - 2;
-        const bool intSlope = ( abs( angle ) & 31 ) == 0;
+        const bool intSlope = ( abs( angle ) & fracMask ) == 0;
         const bool big = W >= 32 && H >= 32;
-        const int pdpcLimit = t.applyPDPC != 0 ? min( 3 << ( angle == 0 ? ( ( findMSB( w ) + findMSB( h ) - 2 ) >> 2 ) : t.angularScale ), w ) : 0;
+        // (PDPC: none for a prediction from the next line alone, but of the vertical / horizontal mode)
+        const bool pdpc = t.applyPDPC != 0 && ( angle == 0 || !WITH_TIMD || fuse != FUSE_SECOND );
+        const int pdpcLimit = pdpc ? min( 3 << ( angle == 0 ? ( ( findMSB( w ) + findMSB( h ) - 2 ) >> 2 ) : t.angularScale ), w ) : 0;
         for( int i = lid; i < N; i += NT )
         {
           int x = i % w, y = i / w;   // position in the (possibly transposed) block
@@ -1706,25 +1889,32 @@ void main()
           else
           {
             const int deltaPos = angle * ( y + 1 + mrl );
-            const int deltaInt = deltaPos >> 5, deltaFract = deltaPos & 31;
-            if( intSlope )
+            const int deltaInt = deltaPos >> fracBits, deltaFract = deltaPos & fracMask;
+            if( intSlope )   // (also from the next line alone: the block's line, as the CPU's copy)
             {
               v = mainR( isVer, 0, mainBase + deltaInt + 1 + x );
             }
             else if( isLuma )
             {
               const bool cubic = t.useCubic != 0;
-              const int c0 = lumaConv( isVer, 0, mainBase + deltaInt + x - numExtra, taps, cubic, big, deltaFract );
+              const int  deltaInt2 = ( deltaPos + angle ) >> fracBits, deltaFract2 = ( deltaPos + angle ) & fracMask;
               int val32;
-              if( fusion )
+              if( WITH_TIMD && fuse == FUSE_SECOND )
               {
-                const int deltaInt2 = ( deltaPos + angle ) >> 5, deltaFract2 = ( deltaPos + angle ) & 31;
-                const int c1 = lumaConv( isVer, 1, mainBase2 + deltaInt2 + x - numExtra, taps, cubic, big, deltaFract2 );
-                val32 = ( 3 * c0 + 1 * c1 + 128 * 4 ) >> ( 8 + 2 );
+                val32 = ( lumaConv( isVer, 1, mainBase2 + deltaInt2 + x - numExtra, taps, cubic, big, deltaFract2, ext ) + 128 ) >> 8;
               }
               else
               {
-                val32 = ( c0 + 128 ) >> 8;
+                const int c0 = lumaConv( isVer, 0, mainBase + deltaInt + x - numExtra, taps, cubic, big, deltaFract, ext );
+                if( fuse == FUSE_BOTH )
+                {
+                  const int c1 = lumaConv( isVer, 1, mainBase2 + deltaInt2 + x - numExtra, taps, cubic, big, deltaFract2, ext );
+                  val32 = ( 3 * c0 + 1 * c1 + 128 * 4 ) >> ( 8 + 2 );
+                }
+                else
+                {
+                  val32 = ( c0 + 128 ) >> 8;
+                }
               }
               v = clip3i( 0, maxPel, clip3i( 0, maxPel, val32 ) );
             }
@@ -1742,7 +1932,7 @@ void main()
               {
                 const int left = sideR( isVer, 0, sideBase + 1 + y );
                 const int m0 = mainR( isVer, 0, mainBase + deltaInt ), m1 = mainR( isVer, 0, mainBase + deltaInt + 1 );
-                const int topLeft = asPel( m0 + ( ( deltaFract * ( m1 - m0 ) + 16 ) >> 5 ) );
+                const int topLeft = asPel( m0 + ( ( deltaFract * ( m1 - m0 ) + ( 1 << ( fracBits - 1 ) ) ) >> fracBits ) );
                 v = clip3i( 0, maxPel, v + ( ( wL * ( left - topLeft ) + 32 ) >> 6 ) );
               }
               else
@@ -1764,6 +1954,11 @@ void main()
         {
           s_angA[0][i] = int16_t( 0 );
           s_angL[0][i] = int16_t( 0 );
+          if( angClear2 )   // (a TIMD blend's next line)
+          {
+            s_angA[1][i] = int16_t( 0 );
+            s_angL[1][i] = int16_t( 0 );
+          }
         }
         angClear = 0;
         controlBarrier( gl_ScopeWorkgroup, gl_ScopeWorkgroup, gl_StorageSemanticsBuffer | gl_StorageSemanticsShared,
@@ -1777,13 +1972,14 @@ void main()
       // and weightHor (blendTotals)
       g_blendSum = false;
       const int wt[3] = int[3]( s_blendTot[0], s_blendTot[1], s_blendTot[2] );
-      // with location dependence, xLocationdepBlending (range 10, doubled across blocks above 64): the vertical
-      // class's weight falls down the rows, the horizontal one's along the columns (mode 0 both, clipped to their
-      // shares of the rest, mode 1 vertical, mode 2 horizontal), the rest is the first class's
+      // with location dependence, xLocationdepBlending (range 10, a TIMD blend's 8 from 128 samples on; doubled across
+      // blocks above 64): the vertical class's weight falls down the rows, the horizontal one's along the columns (mode
+      // 0 both, clipped to their shares of the rest, mode 1 vertical, mode 2 horizontal), the rest is the first class's
       const int  wNon = wt[0], wVer = wt[1], wHor = wt[2];
       const bool locDep = wVer != 0 || wHor != 0;
       const int  ldMode = wHor > 0 && wVer > 0 ? 0 : wVer > 0 ? 1 : 2;
-      const int  rangeVer = H > 64 ? 20 : 10, rangeHor = W > 64 ? 20 : 10;
+      const int  range = timdBlend && W * H > 127 ? 8 : 10;
+      const int  rangeVer = H > 64 ? 2 * range : range, rangeHor = W > 64 ? 2 * range : range;
       int clipVer = 64, clipHor = 64;
       if( locDep && ldMode == 0 )
       {

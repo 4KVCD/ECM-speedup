@@ -52,16 +52,13 @@ bool modeValid( Cu c, int mode )
   return mode <= DC_IDX || ( mode > DC_IDX + c.nbFirst && mode < NUM_LUMA_MODE - c.nbLast );
 }
 
-// the mode of a regular intra luma CU (DecCu's "redo prediction dir derivation"): PU::getIntraMPMs without MPM sorting,
-// MDIP, PDP or NN (getSpatialIpm: planar, the CU's DIMD modes, then the modes of the neighbours not included yet, those
-// of invalid modes kept aside and added after them; fillMPMList: the neighbouring angles of each angular mode, then the
-// defaults; fillNonMPMList: the other modes in order), then the entry the parsed syntax selects; nbrMode: modeRead's;
-// dimdModes: the CU's dimdMode and dimdBlendMode[0..1] (-1: none, also without DIMD)
-int deriveLumaMode( Cu c, int nbrMode[MPM_NEIGHBOURS], int dimdModes[3] )
+// PU::getIntraMPMs' getSpatialIpm without MPM sorting, MDIP, PDP or NN, into mpm (its number returned): planar, the
+// CU's DIMD modes, then the modes of the neighbours not included yet; without forcedValid (isForcedValid, TIMD's) the
+// modes of invalid angles (modeValid) kept aside and added after them. nbrMode: modeRead's; dimdModes: the CU's dimdMode
+// and dimdBlendMode[0..1] (-1: none, also without DIMD)
+int mpmSpatial( Cu c, int nbrMode[MPM_NEIGHBOURS], int dimdModes[3], bool forcedValid, inout int mpm[NUM_MPM], inout uint included[3] )
 {
-  int  mpm[NUM_MPM];
-  uint included[3] = uint[3]( 0u, 0u, 0u );
-  int  num = 0;
+  int num = 0;
   mpm[num++] = PLANAR_IDX;
   modeAdd( included, PLANAR_IDX );
   for( int k = 0; k < 3; k++ )   // JVET-AL0125: the DIMD modes first, without the validity check
@@ -84,7 +81,7 @@ int deriveLumaMode( Cu c, int nbrMode[MPM_NEIGHBOURS], int dimdModes[3] )
     }
     if( !modeIn( included, mode ) )
     {
-      if( modeValid( c, mode ) )
+      if( forcedValid || modeValid( c, mode ) )
       {
         mpm[num++] = mode;
         modeAdd( included, mode );
@@ -103,11 +100,13 @@ int deriveLumaMode( Cu c, int nbrMode[MPM_NEIGHBOURS], int dimdModes[3] )
       modeAdd( included, reserved[i] );
     }
   }
-  if( c.mpmFlag != 0 && c.ipredIdx < num )
-  {
-    return mpm[c.ipredIdx];
-  }
-  // fillMPMList (offset NUM_LUMA_MODE - 6, modulo + 3: the angles next to each one, wrapping around 2 .. 66)
+  return num;
+}
+
+// fillMPMList after mpmSpatial's num entries (offset NUM_LUMA_MODE - 6, modulo + 3: the angles next to each one,
+// wrapping around 2 .. 66), then the defaults, up to NUM_MPM
+void mpmFill( int num, inout int mpm[NUM_MPM], inout uint included[3] )
+{
   const int numSpatial = num;
   for( int i = 0; i < numSpatial; i++ )
   {
@@ -138,6 +137,20 @@ int deriveLumaMode( Cu c, int nbrMode[MPM_NEIGHBOURS], int dimdModes[3] )
       modeAdd( included, MPM_DEFAULT[i] );
     }
   }
+}
+
+// the mode of a regular intra luma CU (DecCu's "redo prediction dir derivation"): PU::getIntraMPMs (mpmSpatial,
+// mpmFill; fillNonMPMList: the other modes in order), then the entry the parsed syntax selects
+int deriveLumaMode( Cu c, int nbrMode[MPM_NEIGHBOURS], int dimdModes[3] )
+{
+  int  mpm[NUM_MPM];
+  uint included[3] = uint[3]( 0u, 0u, 0u );
+  const int num = mpmSpatial( c, nbrMode, dimdModes, false, mpm, included );
+  if( c.mpmFlag != 0 && c.ipredIdx < num )
+  {
+    return mpm[c.ipredIdx];
+  }
+  mpmFill( num, mpm, included );
   if( c.mpmFlag != 0 || c.secondMpmFlag != 0 )
   {
     return mpm[c.ipredIdx];

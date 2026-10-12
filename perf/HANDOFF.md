@@ -13,8 +13,8 @@ wall-clock gains with threads are "the easy baseline". Decoder status: single-th
 (`--GpuLoopFilter=1`: ALF, SAO, BIF, CCSAO, LF-CCCM, offset refinement on Vulkan). The user then asked for **a full
 GPU decoder in Vulkan, optimized until nothing is left** ("The GPU decoder needs to fully decode the frame on the
 GPU"; "Your first Vulkan version is going to be slow. That's OK"). That work is branch `dec-gpurecon`: intra
-reconstruction on the GPU (`--GpuRecon`), tool levels M1-M23 done and verified bit-exact (M19: DIMD, M20: OBIC, M21:
-intra merge, M22: the transforms of DIMD CUs, M23: LFNST of MIP); it is **not yet
+reconstruction on the GPU (`--GpuRecon`), tool levels M1-M24 done and verified bit-exact (M19: DIMD, M20: OBIC, M21:
+intra merge, M22: the transforms of DIMD CUs, M23: LFNST of MIP, M24: TIMD); it is **not yet
 faster than the CPU decoder** (see section 8) and supports only a restricted tool set (all real CTC streams fall back
 to the CPU, first reason: TMRL).
 
@@ -389,6 +389,42 @@ Verification compares mipDimdMode, the second mode, the list and choice (the CU'
 transforms. Test set m23: the m22 arguments with MIP. MTS of MIP takes planar's kernels (getTrTypes), unchanged.
 Rejected: LFNST of MIP without DIMD in the SPS (the CPU's mode is planar then; no test), of a MIP CU of several blocks
 and of chroma MIP (4:4:4).
+M24: TIMD (plain: TIMD-SAD and TIMD merge are rejected per CU). A TIMD CU (`CU_TIMD`, with the DIMD its MPM list starts
+with) gets a node (`intra_timd.glsl`'s `timdNode`) that does deriveTimdMode: M21's template costs, generalised to
+templates of one arm (`TemplateUnits`, also in intra merge's record: at the picture's left / top edge the CPU takes the
+above / left arm alone, with its own DC) and to costs per arm (the location dependence compares them), for planar, DC,
+the angular modes of the MPM list built with isForcedValid (all 22 entries, then HOR / VER where missing:
+`mpmSpatial` / `mpmFill`, shared with deriveLumaMode) and the wide angles beyond the regular ones that the host's four
+PU checks let the reference reach (getTimdRegularAngleExt / getTimdWideAngleExt: `timdRegularAngle`, `timdWaipAngle`;
+the CPU's loop skips the regular range by jumping to maxModeOrig - 1, so the next one is maxModeOrig + 4). All of them
+are costed at once, then invocation 0 replays the CPU's sequential scan with its early ends (computing more costs
+than the CPU changes no choice); a second batch costs the neighbours of the best and the secondary mode, replayed
+with the CPU's quirks (the secondary's refinement on the best cost's condition, a refined best that does not demote the
+old one). The final choice maps wide angles back, swaps, lets an angular best blend with itself where the secondary
+costs twice as much (JVET-AG0092), and weighs three modes with planar / DC as the CPU's doubles do (exactly in
+integers: floor((64 (sum - c) + sum) / (2 sum)) for costs far below 2^40) or two by X0149's table. Its TimdOut holds
+every CodingUnit field deriveTimdMode sets and the initial values of those it leaves (location dependences of a
+non-blended CU are the scan's leftovers), compared with the CPU's in verification; the published mode is MAP131TO67's
+(what neighbours' MPM lists and chroma DM read). The blocks (`DERIVE_TIMD`) predict with 1/64-sample angles (TIMD's
+tables, its wide angles where checkWA is off), the 1/64 N-tap filters from the filter buffer (`EXT_NTAP`), planar's
+reference filter only, no reference filter or Gaussian interpolation for angular modes (JVET-AM0104 / AM0163); a blend
+of the mode, the secondary and planar / DC goes through DIMD's per-class path with xGetNumTapsTIMD's filter lengths,
+its location-dependent range 8 from 128 samples on, the secondary predicted from the next reference line alone
+(no PDPC but of horizontal / vertical) where JVET-AG0128's rule fuses the two, which also overrides the CU's
+fetchRef2nd (the next line is read in a CTU's first row too), and the bilateral filter on the blend only. Such a block
+keeps its unfiltered line in `s_ref[0]` and the next line in `s_ref[1]`; its planar reads the filtered line from
+`s_tmp`. The read ranges of TIMD blocks are both lines' whole arms. Transforms: explicit MTS and LFNST / NSPT by the
+published mode, MTSS with the secondary (MAP131TO67) where the CU blends. The pictures with TIMD run a fifth pipeline
+(`WITH_TIMD`). Rejected: TIMD-SAD, TIMD merge, TIMD with ISP or MRL (no test stream: the stock encoder's TIMD-MRL
+candidates hardly ever survive its SATD checks, none in the m24 set), TIMD CUs of several blocks, TIMD above 10 bits, OBIC
+and intra merge CUs with TIMD neighbours (the CPU's OBIC and intra merge read a TIMD neighbour's TIMD, the GPU's not
+yet), IntraTMP / IBC (the only sources of TIMD's block vector candidates). Test sets: m24, encTest4 (ECM_TEST_NO_OBIC,
+NO_INTRA_MERGE, NO_TIMD_SAD) with the m23 arguments and `--EnableTMnoninterTools=1 --TIMD=1 --TIMDMerge=0` (without
+EnableTMnoninterTools the encoder turns TIMD off); m24s, the same on screen_352x288, whose flat templates give angular
+TIMD CUs of template cost 0, which do not blend (an angular best mode otherwise always does, with itself where the
+secondary costs twice as much). GPU time of the m24 set: 47 to 68 ms per CIF picture, 133 (park720) and 195 (four720)
+per 720p picture; without the TIMD nodes' template costs (an experiment) ~15 ms less per CIF picture, the first
+candidate for the speed work. The other sets are unchanged within 1 %.
 
 ## 8. Numbers (i7-10700 8C/16T, Win11, GCC 16.2, RTX 3070 driver 616.92)
 
@@ -416,7 +452,7 @@ Profile of a GPU-on decode (non-LTO, m2_park16, share of all samples): parsing ~
    NSPT blocks. 2026-10-12: M17 intra modes derived on the GPU (tested with `ECM_GPU_MODES=1`), M18 the transforms of
    derived modes on the GPU, M19 DIMD (the m19d test set), M20 OBIC (the m20 and m20o test sets), M21 intra merge
    (the m19 set, encoded by the stock encoder with DIMD: OBIC and intra merge everywhere), M22 the transforms of DIMD
-   CUs and MTSS (the m22 and m22o sets), M23 LFNST / NSPT of MIP (the m23 set).
+   CUs and MTSS (the m22 and m22o sets), M23 LFNST / NSPT of MIP (the m23 set), M24 TIMD (the m24 and m24s sets).
    All 19 regular streams now stop at "TMRL" (the next sequence-level check; the block-level tools of step 4 follow).
 3. Make the GPU path win on CPU time per picture: the derive-only pass (record during parsing or a leaner pass;
    speed up getSpatialIpm/getPURestricted, which also helps the CPU decoder), GPU behaviour with frame threads
@@ -431,9 +467,12 @@ Profile of a GPU-on decode (non-LTO, m2_park16, share of all samples): parsing ~
    `bin\encNoOM` (m19d: ECM_TEST_NO_OBIC_MERGE skips both), `bin\encTest` (m20: ECM_TEST_NO_INTRA_MERGE;
    ECM_TEST_NO_OBIC skips OBIC), `bin\encTest2` (the same, and for m20o ECM_TEST_PREFER_OBIC, which skips plain DIMD
    where OBIC is available, for many more OBIC CUs) - the patch adds `&& !getenv(...)` to `testObic` /
-   `testIntraMerge` and sets `m_skipDimdMode` / `m_skipDimdLfnstMtsPass` where OBIC is tested. Next TIMD (its
-   template costs exist since M21: intra_timd.glsl), MPM sorting / MDIP / PDP, TMRL, CCLM/CCCM and the other
-   cross-component tools, chroma reordering / DBV, IntraTMP / IBC, implicit MTS (not in CTC), then inter pictures.
+   `testIntraMerge` and sets `m_skipDimdMode` / `m_skipDimdLfnstMtsPass` where OBIC is tested; `bin\encTest4` (m24)
+   adds ECM_TEST_NO_TIMD_SAD (to `testTimdSad`, in estIntraPredLumaQT and reduceHadCandList). Next OBIC and intra
+   merge with TIMD neighbours (deriveObicMode counts their TIMD modes and weights, the intra merge conversion of
+   setIntraMergeCandParam their TIMD or their own DIMD), TIMD-SAD, TIMD merge, MPM sorting / MDIP / PDP, TMRL,
+   CCLM/CCCM and the other cross-component tools, chroma reordering / DBV, IntraTMP / IBC, implicit MTS (not in CTC),
+   then inter pictures.
    Intra merge's GPU time (m19: park720 152, four720 183 ms per picture, from 347 / 392 at first) has room: the
    candidate walk and the reference padding are single-invocation steps on the dependency chain. Each level: new
    test set with exactly that tool on, verify mode identical, ON mode identical (and `ECM_GPU_DUMP` +

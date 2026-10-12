@@ -89,6 +89,10 @@ const int DERIVE_MTSS = 1024;
 // a MIP block with LFNST / NSPT: intra_rec derives their mode from a DIMD of its prediction (mipDimdMode), then its
 // residual
 const int DERIVE_MIP_DIMD = 2048;
+// a block of a TIMD CU (CU_TIMD): the prediction of the CU's TIMD modes (the node's TimdOut), blended where they blend
+const int DERIVE_TIMD = 4096;
+// the SPS disables intra fusion (DisableIntraFusion), also blended TIMD's fusion of close modes
+const int DERIVE_NO_FUSION = 8192;
 
 // Params::dbgParams per block: the derived dirMode, isModeVer, intraPredAngle, absInvAngle, useCubic, refFilter,
 // applyPDPC, gradPDPC, angularScale, fusion, bf, plIdx, then mtxV, mtxH, secMatrix, secTranspose, secLayout
@@ -98,7 +102,7 @@ const int DBG_PARAMS = 17;
 // the non-adjacent ones
 const int MPM_NEIGHBOURS = 23;
 
-// a coding unit of one channel type whose blocks were recorded (45 int32, layout shared with GpuIntraRec.cpp)
+// a coding unit of one channel type whose blocks were recorded (46 int32, layout shared with GpuIntraRec.cpp)
 struct Cu
 {
   int kind;              // CU_*: how its intra mode is found
@@ -120,6 +124,7 @@ struct Cu
   int merge;             // an intra merge CU's record in Params::mergeData (MergeHead; -1: not intra merge)
   int mtss;              // with MTSS the first of the MTSS_CALLS histograms of its mode list in Params::dimdCalls (-1: none)
   int mtssNspt;          // with MTSS: its luma block may use NSPT (CU::isNSPTAllowed)
+  int timd;              // a TIMD CU's record in Params::timdData (TimdHead; -1: not TIMD)
 };
 layout( buffer_reference, std430, buffer_reference_align = 4 ) buffer BufCu { Cu v[]; };
 
@@ -132,6 +137,7 @@ const int CU_DIMD        = 4;   // luma: a DIMD CU, its mode DIMD's (cu.dimd; in
 const int CU_CHROMA_DIMD = 5;   // chroma: DIMD chroma (DIMD_CHROMA_IDX), compared with the co-located luma mode
 const int CU_OBIC        = 6;   // luma: an OBIC CU, its mode OBIC's first (from its neighbours' modes; intra_obic.glsl)
 const int CU_MERGE       = 7;   // luma: an intra merge CU, its mode its chosen candidate's (intra_merge.glsl)
+const int CU_TIMD        = 8;   // luma: a TIMD CU, its modes from template costs (intra_timd.glsl), with its DIMD
 
 // one gradient histogram of a CU's DIMD (16 int32, layout shared with GpuIntraRec.cpp; IntraPrediction's
 // DimdHistogramCall, the arguments deriveDimdMode / deriveDimdModeAdaptive / deriveDimdChromaMode call buildHistogram
@@ -188,18 +194,67 @@ const int OBIC_OUT_MODE       = 0;
 const int OBIC_OUT_WEIGHT     = OBIC_MODES;
 const int OBIC_OUT_LOC_DEP    = 2 * OBIC_MODES;
 
-// an intra merge CU's record in Params::mergeData (layout shared with GpuIntraRec.cpp): this header, then nbrNum pairs
-// (neighbour record, MERGE_NBR_*) in deriveIntraMergeCand's order, then the availability bits of its template's
-// reference units (IntraPrediction::TimdReferenceUnits, 32 per word)
-struct MergeHead
+// a template of TIMD's kind (10 int32, layout shared with GpuIntraRec.cpp): its arms, tw columns left of the CU and th
+// rows above it (0: no such arm), and the units of the reference line of its block, the CU extended by the arms
+// (IntraPrediction::TimdReferenceUnits), whose availability bits follow the record holding it (32 per word)
+struct TemplateUnits
 {
-  int index;             // its index among the intra merge CUs (Params::mergeCost)
-  int nbrNum;
-  int tw, th;            // reorderIntraMergeCand's template (0: none, the CU at the picture's left or top edge)
+  int tw, th;
   int unitW, unitH;
   int leftTempUnitNum, aboveTempUnitNum, totalLeftUnits, totalAboveUnits, totalUnits, numIntraNeighbor;
 };
-const int MERGE_HEAD      = 12;
+const int TEMPLATE_UNITS = 10;
+
+TemplateUnits templateUnitsAt( BufI32 b, int at )
+{
+  return TemplateUnits( b.v[at], b.v[at + 1], b.v[at + 2], b.v[at + 3], b.v[at + 4], b.v[at + 5], b.v[at + 6],
+                        b.v[at + 7], b.v[at + 8], b.v[at + 9] );
+}
+
+// an intra merge CU's record in Params::mergeData (layout shared with GpuIntraRec.cpp): this header, then nbrNum pairs
+// (neighbour record, MERGE_NBR_*) in deriveIntraMergeCand's order, then the availability bits of its template's
+// reference units
+struct MergeHead
+{
+  int           index;   // its index among the intra merge CUs (Params::mergeCost)
+  int           nbrNum;
+  TemplateUnits t;       // reorderIntraMergeCand's template (none: tw 0, the CU at the picture's left or top edge)
+};
+const int MERGE_HEAD_T    = 2;                         // the offset of MergeHead::t
+const int MERGE_HEAD      = MERGE_HEAD_T + TEMPLATE_UNITS;
+
+// a TIMD CU's record in Params::timdData (layout shared with GpuIntraRec.cpp): this header, then the availability
+// bits of its template's reference units
+struct TimdHead
+{
+  int           index;   // its index among the TIMD CUs (Params::timdOut)
+  int           type;    // its template (CU::deriveTimdRefType): TIMD_NONE (the picture's top-left CU), TIMD_ABOVE,
+                         // TIMD_LEFT, TIMD_BOTH
+  int           waip;    // where deriveTimdMode's wide angles beyond the regular ones may reach: TIMD_WAIP_* bits
+  TemplateUnits t;       // its template, an arm it lacks 0
+};
+const int TIMD_HEAD_T = 3;                             // the offset of TimdHead::t
+const int TIMD_HEAD   = TIMD_HEAD_T + TEMPLATE_UNITS;
+const int TIMD_NONE   = 0;
+const int TIMD_ABOVE  = 1;
+const int TIMD_LEFT   = 2;
+const int TIMD_BOTH   = 3;
+const int TIMD_WAIP_MAX_CLOSE = 1;   // increaseMaxClose: a PU above the CU's last column
+const int TIMD_WAIP_MAX_FAR   = 2;   // increaseMaxFar: a PU above, a CU width further right
+const int TIMD_WAIP_MIN_CLOSE = 4;   // decreaseMinClose: a PU left of the CU's last row
+const int TIMD_WAIP_MIN_FAR   = 8;   // decreaseMinFar: a PU left, a CU height further down
+
+// a TIMD CU's TIMD as its node derives it (TIMD_OUT int32 per TIMD CU in Params::timdOut): the CodingUnit fields
+// deriveTimdMode sets, those it does not at their initial values (-1 modes and weights, 0 location dependence)
+const int TIMD_OUT                 = 12;
+const int TIMD_OUT_MODE            = 0;    // timdMode (131-mode set; the regular mode of a wide angle beyond them)
+const int TIMD_OUT_SECONDARY       = 1;    // timdModeSecondary
+const int TIMD_OUT_NON_ANG         = 2;    // timdModeNonAng (planar / DC)
+const int TIMD_OUT_BLENDED         = 3;    // timdIsBlended
+const int TIMD_OUT_WEIGHT          = 4;    // timdFusionWeight, 3 entries: the mode's, the secondary's, the non-angular one's
+const int TIMD_OUT_LOC_DEP         = 7;    // timdLocDep, 3 entries
+const int TIMD_OUT_CHECK_WA        = 10;   // timdModeCheckWA: 0 for a wide angle beyond the regular ones
+const int TIMD_OUT_SEC_CHECK_WA    = 11;   // timdModeSecondaryCheckWA
 const int MERGE_NBR_MERGE = 1;   // an intra merge CU: always a candidate, its merge parameters (its DimdOut slot)
 const int MERGE_NBR_OBIC  = 2;   // an OBIC CU: always, its OBIC converted
 const int MERGE_NBR_DIMD  = 3;   // a DIMD CU or an MPM CU: where its DIMD blends, its DIMD
@@ -355,7 +410,8 @@ struct Params
   uint64_t coeffs;      // int32 levels of each block's nonzero region (nzRows x nzCols, row-major) at coeffOffset
   uint64_t plane[3];    // int16 reconstruction (written), origin/stride below
   uint64_t owner[3];    // int32 per unit and component: the block covering it (-1: none); 4x4 luma, 2x2 chroma units
-  uint64_t filters;     // int32: [taps 6,8,10,12,16][32][16] cubic tables, then the weak 4-tap table [32][4]
+  uint64_t filters;     // int32: [taps 6,8,10,12,16][32][16] cubic tables, then the weak 4-tap table [32][4], the bilateral
+                        // filter's tables, TIMD's 1/64 tables (intra_rec.comp's BF_LUT .. EXT_NTAP)
   uint64_t matrices;    // int32: the inverse transform matrices (each [k * N + i], at Tu::mtxV / mtxH), QCS weights at qcsOffset
   uint64_t dbgPred;     // int16 per block w*h at dbgOffset
   uint64_t dbgResi;     // int16 residual per block w*h at dbgOffset (written by intra_resi, added by intra_rec)
@@ -382,6 +438,8 @@ struct Params
   uint64_t blendAcc;    // int32 per intra_rec workgroup: 3 x 128 x 128 sums of DIMD / OBIC / merge blending (BLEND_ACC)
   uint64_t mergeData;   // the intra merge CUs' records (Cu::merge, MergeHead)
   uint64_t mergeCost;   // uint64 per intra merge CU: the template cost of each mode (NUM_LUMA_MODE; ~0: none)
+  uint64_t timdData;    // the TIMD CUs' records (Cu::timd, TimdHead)
+  uint64_t timdOut;     // int32 per TIMD CU (TIMD_OUT): its TIMD, written by its node (for its blocks, the comparison)
   int      origin[3];
   int      stride[3];
   int      width[3];
