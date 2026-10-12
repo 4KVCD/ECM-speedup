@@ -1,7 +1,8 @@
 # gpucheck.py <build> [stream names...] [-- extra decoder args]
 # decodes C:/Code/ECM/streams_gpu/<name>.bin with the stock decoder (cached) and with C:/Code/ECM/bin/<build>/DecoderApp.exe,
-# compares every frame; prints the decoder's own timing lines
-import hashlib, os, subprocess, sys, time
+# compares every frame and, with --GpuRecon=2, requires the GPU's verification to report no differences; prints the
+# decoder's own timing lines
+import hashlib, os, re, subprocess, sys, time
 
 ROOT = "C:/Code/ECM/streams_gpu"
 REF = "C:/Code/ECM/bin/ref/DecoderApp.exe"
@@ -48,11 +49,16 @@ def main():
         test = f"{OUT}/{n}.{build}.yuv"
         rc, sec = decode(exe, stream, test, f"{OUT}/{n}.{build}.log", extra)
         a, b = open(ref, "rb").read(), open(test, "rb").read() if os.path.exists(test) else b""
-        ok = rc == 0 and a == b
+        log = open(f"{OUT}/{n}.{build}.log", errors="replace").read()
+        # verification (--GpuRecon=2) outputs the CPU's pictures: the GPU's differences are only in the summary lines
+        # (one per decoder context with frame threads)
+        gpuDiffs = sum(int(d) for d in re.findall(r"verified \((\d+) with differences\)", log))
+        ok = rc == 0 and a == b and gpuDiffs == 0
         allok &= ok
-        extra_lines = [l.strip() for l in open(f"{OUT}/{n}.{build}.log", errors="replace") if l.startswith("[gpu") or "Total Time" in l]
-        print(f"{n:16s} {sec:7.2f}s  {'ok' if ok else f'MISMATCH (rc {rc}, {len(a)} vs {len(b)} bytes)'}  " + " | ".join(extra_lines[-3:]))
-        if not ok and len(a) == len(b) and a:
+        extra_lines = [l.strip() for l in log.splitlines() if l.startswith("[gpu") or "Total Time" in l]
+        status = "ok" if ok else f"{gpuDiffs} GPU PICTURES DIFFER" if rc == 0 and a == b else f"MISMATCH (rc {rc}, {len(a)} vs {len(b)} bytes)"
+        print(f"{n:16s} {sec:7.2f}s  {status}  " + " | ".join(extra_lines[-3:]))
+        if not ok and len(a) == len(b) and a and a != b:
             # first differing byte -> frame
             i = next(k for k in range(len(a)) if a[k] != b[k])
             print(f"   first difference at byte {i}")

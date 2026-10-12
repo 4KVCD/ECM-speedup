@@ -348,6 +348,8 @@ Profile of a GPU-on decode (non-LTO, m2_park16, share of all samples): parsing ~
   transforms read coefficients; the loop filters read none).
 - The scheduling allows a dependency on a later block: with joint CbCr whose Cr is coded, the Cr block decides the
   signs and writes the Cb block's residual (Tu::resiFrom). Statistics over the graph must not assume earlier blocks.
+- `gpucheck.py --GpuRecon=2` compares the output, which in verification is the CPU's: it also requires the summary's
+  "0 with differences" since 2026-10-12 (before, only the ON modes caught a wrong GPU reconstruction).
 - The owner maps have 4x4 luma units; ISP sub-partitions 1 or 2 wide or high share them. The last block owning a
   unit must win everywhere (intra_deps pass 0 writes with atomicMax: plain parallel writes raced), and a block
   reading a shared unit only waits for that last owner, so the sub-partitions of a CU are chained (Tu::ispPrev;
