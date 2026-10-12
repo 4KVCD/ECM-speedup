@@ -485,6 +485,7 @@ protected:
   // of the search and of the finish, results recorded at the end of the finish
   void xSetupPicOrder ( Slice* slice, const std::shared_ptr<EncPicOrder>& order );
   void xStartPicSearch( Picture* pic, PicHeader* picHeader, Slice* slice, EncPicOrder& order, bool decPic );
+  bool xUseFilteredOrig() const;   // whether the pictures keep a filtered original (temporal filter or BIM)
   void xStartPicFinish( Slice* slice, EncPicOrder& order, std::unique_lock<std::mutex>& apsMapLock );
   void xEndPicFinish  ( Slice* slice, EncPicOrder& order, std::unique_lock<std::mutex>& apsMapLock );
   void xApplyAMaxBT   ( Picture* pic, PicHeader* picHeader, Slice* slice, EncPicOrder& order );

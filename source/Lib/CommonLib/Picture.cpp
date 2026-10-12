@@ -407,11 +407,14 @@ void Picture::createTempBuffers( const unsigned _maxCUSize, bool useFilterFrame,
 
     if (!decoder)
     {
+      if( M_BUFS( jId, PIC_TRUE_ORIGINAL ).bufs.empty() )   // createTrueOrigBuf may have made it
+      {
 #if JVET_AC0162_ALF_RESIDUAL_SAMPLES_INPUT && !KEEP_PRED_AND_RESI_SIGNALS
-      M_BUFS(jId, PIC_TRUE_ORIGINAL).create(chromaFormat, aOld, _maxCUSize);
+        M_BUFS(jId, PIC_TRUE_ORIGINAL).create(chromaFormat, aOld, _maxCUSize);
 #else
-      M_BUFS(jId, PIC_TRUE_ORIGINAL).create(chromaFormat, a, _maxCUSize);
+        M_BUFS(jId, PIC_TRUE_ORIGINAL).create(chromaFormat, a, _maxCUSize);
 #endif
+      }
       if (useFilterFrame)
       {
 #if JVET_AC0162_ALF_RESIDUAL_SAMPLES_INPUT && !KEEP_PRED_AND_RESI_SIGNALS
@@ -442,6 +445,16 @@ void Picture::createTempBuffers( const unsigned _maxCUSize, bool useFilterFrame,
   {
     cs->rebindPicBufs();
   }
+}
+
+void Picture::createTrueOrigBuf( const unsigned _maxCUSize )
+{
+#if KEEP_PRED_AND_RESI_SIGNALS || JVET_AC0162_ALF_RESIDUAL_SAMPLES_INPUT
+  const Area a( Position{ 0, 0 }, lumaSize() );
+#else
+  const Area a = m_ctuArea.Y();
+#endif
+  M_BUFS( 0, PIC_TRUE_ORIGINAL ).create( chromaFormat, a, _maxCUSize );
 }
 
 void Picture::destroyTempBuffers()

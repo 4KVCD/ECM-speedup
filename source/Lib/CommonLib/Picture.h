@@ -120,6 +120,9 @@ void create(
 
   void createTempBuffers( const unsigned _maxCUSize, bool useFilterFrame, bool resChange, bool decoder );
   void destroyTempBuffers();
+  /// the true original alone, as createTempBuffers makes it (which then leaves it): with frame threads, the encoder's
+  /// setup makes only this one, and only for a picture whose original the temporal filter changes
+  void createTrueOrigBuf( const unsigned _maxCUSize );
   /// frame threads: a picture that waits for its search holds neither its reconstruction nor its coding structure's
   /// per-4x4 arrays (EncLib::encodePrep releases them, EncGOP::xStartPicSearch creates them)
   void releaseSearchBuffers();

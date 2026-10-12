@@ -165,6 +165,12 @@ Commits on `enc-mt`, all bit-exact with stock ECM-20.0 (bitstream md5 of the sui
   reads the picture's area instead of the reconstruction. RA 1080p with 8 threads and 8 periods, minutes 2.5-5:
   34.0 -> 23.6 GB on average (peaks 38.7 -> 27.7 GB). The automatic FramePeriods counts a waiting picture at 17 bytes
   per luma sample (measured about 13).
+- P5 RAM step T: a waiting picture holds of its temporary buffers only the true original, and only if the temporal
+  filter changed its original (`EncTemporalFilter::filtersFrame`, `Picture::createTrueOrigBuf`); `xStartPicSearch`
+  makes the residual, prediction, true and filtered originals (copies of the original, which nothing changes in
+  between: a check build compared them on 168 pictures). 1080p: about 25 -> 7 MB a waiting picture; RA 1080p with 8
+  threads and 8 periods on six E-cores, minutes 2.5-5: 22.3 -> 17.4 GB on average. The automatic FramePeriods counts a
+  waiting picture at 6 bytes per luma sample.
 - P2 for LD, motion search per reference picture (not committed; `C:\Code\work\mt\me_patch.py`, `me_job.cpp`):
   the AMVP and search of each reference picture of predInterSearch's uni-prediction loop on the CuThreads helpers
   (an InterSearch per helper stack), the loop replaying the results with the PU fields, RdCost predictor and cost

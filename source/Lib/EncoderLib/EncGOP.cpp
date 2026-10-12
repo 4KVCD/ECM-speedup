@@ -2714,14 +2714,21 @@ void EncGOP::compressGOP(int iPOCLast, int iNumPicRcvd, PicList &rcListPic, std:
 #if ENABLE_SPLIT_PARALLELISM
     pcPic->scheduler.init( pcPic->cs->pcv->heightInCtus, pcPic->cs->pcv->widthInCtus, 1                          , 0                             , m_pcCfg->getNumSplitThreads() );
 #endif
-#if JVET_Y0240_BIM
-    const bool isCurrentFrameFiltered = m_pcCfg->getGopBasedTemporalFilterEnabled() || m_pcCfg->getBIM();
-#else
-    const bool isCurrentFrameFiltered = m_pcCfg->getGopBasedTemporalFilterEnabled();
-#endif
+    const bool isCurrentFrameFiltered = xUseFilteredOrig();
     const SPS& sps = *pcPic->cs->sps;
-    pcPic->createTempBuffers(pcPic->cs->pps->pcv->maxCUWidth, isCurrentFrameFiltered, m_pcEncLib->isResChangeInClvsEnabled(), false);
-    pcPic->getTrueOrigBuf().copyFrom(pcPic->getOrigBuf());
+    // frame threads: a picture that waits for its search holds of the temporary buffers only the true original, and
+    // that only if the temporal filter changes its original; the search start creates the others (xStartPicSearch)
+    const bool tempBuffersAtSearch = m_ftActive;   // (frame threads reject RPR's resolution change)
+    if( !tempBuffersAtSearch )
+    {
+      pcPic->createTempBuffers(pcPic->cs->pps->pcv->maxCUWidth, isCurrentFrameFiltered, m_pcEncLib->isResChangeInClvsEnabled(), false);
+      pcPic->getTrueOrigBuf().copyFrom(pcPic->getOrigBuf());
+    }
+    else if( isCurrentFrameFiltered && m_pcEncLib->getTemporalFilter().filtersFrame( pocCurr ) )
+    {
+      pcPic->createTrueOrigBuf( pcPic->cs->pps->pcv->maxCUWidth );
+      pcPic->getTrueOrigBuf().copyFrom( pcPic->getOrigBuf() );
+    }
     if (m_pcEncLib->isResChangeInClvsEnabled())
     {
       pcPic->M_BUFS(0, PIC_TRUE_ORIGINAL_INPUT).copyFrom(pcPic->M_BUFS(0, PIC_ORIGINAL_INPUT));
@@ -2751,7 +2758,10 @@ void EncGOP::compressGOP(int iPOCLast, int iNumPicRcvd, PicList &rcListPic, std:
       {
         m_pcEncLib->getTemporalFilter().filter(pcPic->M_BUFS(0, PIC_ORIGINAL), pocCurr);
       }
-      pcPic->getFilteredOrigBuf().copyFrom(pcPic->getOrigBuf());
+      if( !tempBuffersAtSearch )
+      {
+        pcPic->getFilteredOrigBuf().copyFrom(pcPic->getOrigBuf());
+      }
     }
     if( !m_ftActive )   // with frame threads, the search start creates the search data (xStartPicSearch)
     {
@@ -7626,6 +7636,18 @@ void EncGOP::xStartPicSearch( Picture* pic, PicHeader* picHeader, Slice* slice, 
     m_pcSliceEncoder = &m_pcSearchStack->sliceEncoder;
     m_pcSliceEncoder->loadSetup( *order.setup, *pic );
     order.setup.reset();
+    // the temporary buffers the setup left out: the true original of a picture the temporal filter left as it was,
+    // and the filtered original, are copies of the original, which nothing changes between the setup and here
+    const bool trueOrigMade = !pic->getTrueOrigBuf().bufs.empty();
+    pic->createTempBuffers( pic->cs->pps->pcv->maxCUWidth, xUseFilteredOrig(), false, false );
+    if( !trueOrigMade )
+    {
+      pic->getTrueOrigBuf().copyFrom( pic->getOrigBuf() );
+    }
+    if( xUseFilteredOrig() )
+    {
+      pic->getFilteredOrigBuf().copyFrom( pic->getOrigBuf() );
+    }
     // the picture's search data (reconstruction, per-4x4 arrays, CU, PU and TU maps, coefficients, refined TMVP
     // motion), which the setup does not create with frame threads: a picture holds it only from here, not while it
     // waits for its inputs and a stack
@@ -7672,6 +7694,15 @@ void EncGOP::xStartPicSearch( Picture* pic, PicHeader* picHeader, Slice* slice, 
   CHECK( decPic, "Several search stacks do not support decoding pictures from a debug bitstream" );
   CHECK( slice->getSliceQp() != order.ctxKeyQp, "The slice QP changed after the setup" );
   xLoadCodingOrderState( slice, order );
+}
+
+bool EncGOP::xUseFilteredOrig() const
+{
+#if JVET_Y0240_BIM
+  return m_pcCfg->getGopBasedTemporalFilterEnabled() || m_pcCfg->getBIM();
+#else
+  return m_pcCfg->getGopBasedTemporalFilterEnabled();
+#endif
 }
 
 void EncGOP::xLoadCodingOrderState( Slice* slice, EncPicOrder& order )

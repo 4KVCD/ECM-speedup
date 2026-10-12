@@ -137,6 +137,8 @@ public:
              );
 
   bool filter(PelStorage &orgPic, int frame);
+  /// whether filter() filters the frame (and changes orgPic)
+  bool filtersFrame( int receivedPoc ) const;
 
 private:
   // Private static member variables
