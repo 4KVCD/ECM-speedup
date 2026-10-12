@@ -144,6 +144,9 @@ public:
   void    create              ( int iWidth, int iHeight, ChromaFormat chromaFormat, uint32_t iMaxCUWidth, uint32_t iMaxCUHeight, uint8_t uhTotalDepth );
   void    destroy             ();
   void    init                ( EncLib* pcEncLib, EncSearchStack& stack, const SPS& sps );
+  /// frame threads: a finish stack's slice encoder, which only writes slices
+  void    initFinish          ( EncLib* pcEncLib, CABACEncoder& cabacEncoder, RdCost& rdCost, EncReshape& reshaper,
+                                const SPS& sps );
   /// frame threads: the state the picture's setup left in this slice encoder and its stack (the setup stack)
   void    saveSetup           ( EncSliceSetup& setup ) const;
   /// frame threads: takes over the state of a setup, for the picture's search on this slice encoder's stack
@@ -215,6 +218,8 @@ public:
 #endif
 private:
   double  xGetQPValueAccordingToLambda ( double lambda );
+  void    xInit               ( EncLib* pcEncLib, EncCu* cuEncoder, InterSearch* interSearch, CABACEncoder& cabacEncoder,
+                                TrQuant* trQuant, RdCost* rdCost, EncReshape* reshaper, const SPS& sps );
 };
 
 //! \}

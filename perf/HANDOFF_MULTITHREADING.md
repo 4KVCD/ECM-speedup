@@ -125,6 +125,17 @@ Commits on `enc-mt`, all bit-exact with stock ECM-20.0 (bitstream md5 of the sui
     frames 2.48-2.64x with 8 (two runs).
   - Not covered by the tests: ALF APSs (ECM embeds APSs in the picture header, and no test sequence signalled an ALF
     APS; LMCS APSs appear at every intra picture and are covered).
+- P5 stage B-3: a picture gives its search stack back when its search ends. A timeline of RA 129 frames with B-2
+  (temporary `ECM_FT_TRACE` build, `C:\Code\work\mt\trace_*.py`) showed 3.35 of the 8 stacks held on average by
+  pictures that had searched and waited for their period's earlier finishes, only 2.46 searching. Each finish context
+  now has a finish stack (`EncFinishStack`: slice encoder, CABAC encoder, context cache, IntraPrediction for ALF-CCCM,
+  RdCost and reshaper copies); the finish reaches it through EncGOP's `m_pcFinish*` pointers. What the finish needs
+  of the search stack moves with the picture: RdCost, reshaper, the slice encoder's AMVP-SbTMVP area count (the
+  writer counts into it; only the search start resets it), the separate-tree partitioner of the CABAC encoder.
+  - Results: RA 129 frames 4.10x with 8 threads (B-2 2.48-2.64x), RA 65 2.74x with 4 (1.70x) and 2.79x with 8.
+  - A full `EncSearchStack` object is 343 MB even when nothing in it is initialised (InterSearch 279 MB, of which
+    `m_gpmacsSplitModeTmSel` is 250 MB; EncCu 51 MB). The finish stacks are therefore small structs; the setup stack
+    (B-1) is still a full EncSearchStack and costs 343 MB.
 - Found by the matrix of stage A: `--FrameThreads` >= 3 stopped with "PDP predictor unavailable" on ra_cif (bug of
   cfe3c39a, fixed in its own commit): a search stack's first picture used IntraPrediction's PDP buffer pointers before
   any CU of that stack had set them.
@@ -379,8 +390,7 @@ AI-latency ~2-2.5x.
    - More P2 for LD, the only configuration nothing else speeds up: merge SATD pass, ME per reference, the GPM stages,
      intra RMD in chunks, then P3 speculation for the merge/GPM full RD and the intra MTS pass. Expected 1.1-1.2x on
      LD in all, each loop a step like the first (state sync, record and compare, shadow check).
-2. P0, P1, the first P2 step and P5 (stages A, B-1, B-2) are done (see Progress). Open in P5: the model loses with
-   a larger in-flight window at 4 threads (later periods' pictures take the stacks and hold them while their finishes
-   wait); a stack could be released at the end of the search if the finish used its context's objects only. Next by
-   the user's order: more P2 for LD.
+2. P0, P1, the first P2 step and P5 (stages A, B-1, B-2, B-3) are done (see Progress). Open in P5: the setup stack
+   as a small struct (-343 MB); `m_gpmacsSplitModeTmSel` (250 MB per stack) sparse or allocated on use; more periods
+   by default for long RA (memory). Next by the user's order: more P2 for LD.
 3. Report each step as step % and cumulative % with before/after numbers and commit hashes, one commit per step.

@@ -74,6 +74,22 @@
 #endif
 class EncLibCommon;
 
+/// Frame threads: what a finish uses besides the filter encoders: the slice writing and the CABAC estimators, the intra
+/// prediction ALF-CCCM computes in, and the picture's RdCost and reshaper (copied from its search stack). A finish
+/// without frame threads uses the search stack's.
+struct EncFinishStack
+{
+  EncSlice        sliceEncoder;
+  CABACEncoder    cabacEncoder;
+  CtxCache        ctxCache;
+#if JVET_V0094_BILATERAL_FILTER || JVET_X0071_CHROMA_BILATERAL_FILTER
+  BilateralFilter bilateralFilter;   ///< the intra prediction's (not used by ALF-CCCM)
+#endif
+  IntraPrediction intraPred;
+  RdCost          rdCost;
+  EncReshape      reshaper;
+};
+
 /// Frame threads: the objects whose state the finishes (loop filters, APSs, slice writing) of an intra period carry from
 /// picture to picture. A period starts at a RAS-init picture, whose finish resets that state, so periods in flight each
 /// take a context (EncGOP, FramePeriods); context 0 is EncLib's own objects.
@@ -90,6 +106,8 @@ struct EncFinishContext
 #endif
   HLSWriter*               hlsWriter  = nullptr;
   ParameterSetMap<APS>*    apsMap     = nullptr;
+  EncFinishStack*          stack      = nullptr;   ///< frame threads: so a picture's search stack is free once it has
+                                                   ///< searched
 };
 
 /// The objects of a finish context other than the first
@@ -150,6 +168,8 @@ private:
   // frame threads: the finish contexts of the intra periods in flight (FramePeriods); the first is EncLib's own objects
   std::vector<EncFinishContext>                  m_finishContexts;
   std::vector<std::unique_ptr<EncFinishObjects>> m_finishObjects;
+  // frame threads: the finish stacks of the contexts
+  std::vector<std::unique_ptr<EncFinishStack>>   m_finishStacks;
   // frame threads: the stack of the picture setups, of which only the objects a setup uses are initialised (the slice
   // encoder, the rate and quantizer lambdas, the adaptive search ranges, the IBC hash map, the reshaper)
   std::unique_ptr<EncSearchStack> m_setupStack;

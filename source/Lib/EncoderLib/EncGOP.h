@@ -139,6 +139,14 @@ struct EncPicOrder
   std::unique_ptr<EncSliceSetup> setup;                         ///< frame threads: what the setup left in the setup
                                                                 ///< stack, until the search stack takes it over
   std::vector<const Picture*>   refs;                           ///< frame threads: the reference pictures (until done)
+  std::unique_ptr<RdCost>       finishRdCost;                   ///< frame threads: the search stack's RdCost and reshaper
+  std::unique_ptr<EncReshape>   finishReshaper;                 ///< at the end of the search, for the finish stack
+#if JVET_AI0136_ADAPTIVE_DUAL_TREE
+  std::unique_ptr<QTBTPartitioner> finishPartitionerSST;        ///< and the CABAC encoder's separate-tree partitioner
+#endif
+#if JVET_AG0098_AMVP_WITH_SBTMVP
+  uint32_t                      finishAmvpSbTmvpArea = 0;       ///< and the slice encoder's AMVP-SbTMVP area count
+#endif
   // frame threads: the finishes of an intra period (from a RAS-init IRAP on) run in coding order with the period's
   // finish context; periods in flight at the same time use different contexts (FramePeriods)
   int                           finishCtx = 0;                  ///< EncLib::getFinishContext
@@ -214,6 +222,12 @@ private:
   static thread_local EncSlice*       m_pcSliceEncoder;   ///< the slice encoder of the picture's search stack
   static thread_local EncSearchStack* m_pcSearchStack;    ///< search stack of the picture being encoded
   static thread_local EncPicOrder*    m_pcPicOrder;       ///< order record of the picture being encoded
+  // the objects of the picture's finish: its search stack's, or with frame threads the finish stack of its context
+  static thread_local CABACEncoder*    m_pcFinishCabac;
+  static thread_local CtxCache*        m_pcFinishCtxCache;
+  static thread_local IntraPrediction* m_pcFinishIntraPred;
+  static thread_local RdCost*          m_pcFinishRdCost;
+  static thread_local EncReshape*      m_pcFinishReshaper;
   int64_t                 m_numPicsStarted = 0;       ///< pictures started so far (they use the stacks in turn)
   // coding-order sources of the pictures (EncPicOrder), as the setup of the next picture sees them
   std::shared_ptr<EncPicOrder> m_lastPicOrder;
@@ -489,6 +503,9 @@ protected:
   int64_t                  m_ftOutputTurn = 0;         ///< several periods: the turn whose output runs next (xFtOutput)
   std::mutex               m_ftParamSetMutex;          ///< the parameter sets' changed flags, set and written in a finish
   std::mutex               m_ftSeiMutex;               ///< the SEI writer
+#if JVET_AI0136_ADAPTIVE_DUAL_TREE
+  std::unique_ptr<QTBTPartitioner> m_ftWriterPartitionerSST;   ///< as the last slice writing left it, for the next search
+#endif
   int64_t                  m_ftNumTurns   = 0;         ///< turns started (pictures and GOP indices without one)
   int64_t                  m_ftNumDone    = 0;         ///< turns whose thread has returned
   static thread_local int64_t m_ftTurn;                ///< the turn of the running compressGOP call
@@ -505,6 +522,8 @@ protected:
   void xFtRunInPool       ( std::function<void()> job );   ///< runs job on a worker thread
   void xFtSkip            ( int64_t turn );            ///< a GOP index without a picture passes both turns
   void xFtAcquireStack    ( EncPicOrder& order );
+  void xFtReleaseStack    ( EncPicOrder& order );     ///< at the end of the search (the finish has a stack of its own)
+  void xLoadCodingOrderState( Slice* slice, EncPicOrder& order );   ///< CABAC store and AMVP-SbTMVP areas into the stack
   void xFtMarkFinished    ( int64_t turn );            ///< m_ftMutex held
   void xFtOutput          ( EncPicOrder& order );
   void xUseFinishContext  ( const EncFinishContext& ctx );

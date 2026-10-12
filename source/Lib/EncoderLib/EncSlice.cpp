@@ -92,18 +92,31 @@ void EncSlice::destroy()
 
 void EncSlice::init( EncLib* pcEncLib, EncSearchStack& stack, const SPS& sps )
 {
+  xInit( pcEncLib, &stack.cuEncoder, &stack.interSearch, stack.cabacEncoder, &stack.trQuant, &stack.rdCost, &stack.reshaper,
+         sps );
+}
+
+void EncSlice::initFinish( EncLib* pcEncLib, CABACEncoder& cabacEncoder, RdCost& rdCost, EncReshape& reshaper,
+                           const SPS& sps )
+{
+  xInit( pcEncLib, nullptr, nullptr, cabacEncoder, nullptr, &rdCost, &reshaper, sps );
+}
+
+void EncSlice::xInit( EncLib* pcEncLib, EncCu* cuEncoder, InterSearch* interSearch, CABACEncoder& cabacEncoder,
+                      TrQuant* trQuant, RdCost* rdCost, EncReshape* reshaper, const SPS& sps )
+{
   m_pcCfg             = pcEncLib;
   m_pcLib             = pcEncLib;
   m_pcListPic         = pcEncLib->getListPic();
 
   m_pcGOPEncoder      = pcEncLib->getGOPEncoder();
-  m_pcCuEncoder       = &stack.cuEncoder;
-  m_pcInterSearch     = &stack.interSearch;
-  m_CABACWriter       = stack.cabacEncoder.getCABACWriter   (&sps);
-  m_CABACEstimator    = stack.cabacEncoder.getCABACEstimator(&sps);
-  m_pcTrQuant         = &stack.trQuant;
-  m_pcRdCost          = &stack.rdCost;
-  m_pcReshaper        = &stack.reshaper;
+  m_pcCuEncoder       = cuEncoder;
+  m_pcInterSearch     = interSearch;
+  m_CABACWriter       = cabacEncoder.getCABACWriter   (&sps);
+  m_CABACEstimator    = cabacEncoder.getCABACEstimator(&sps);
+  m_pcTrQuant         = trQuant;
+  m_pcRdCost          = rdCost;
+  m_pcReshaper        = reshaper;
 #if JVET_AG0098_AMVP_WITH_SBTMVP
   m_CABACWriter->m_amvpSbTmvpEnabledArea = &m_picAmvpSbTmvpEnabledArea;
 #endif

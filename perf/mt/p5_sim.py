@@ -7,7 +7,8 @@ fraction of a picture's time and run in coding order within an intra period (fro
 finish waits for the period C before it (its finish context), so C=1 is the global coding order.
 Stack policies: 'fifo' = stacks taken in coding order before the search inputs are done (stage A); 'ready' = taken
 by pictures whose inputs are done, earliest first, while the earliest picture not done has one or one stays free for
-it (stage B). The last intra period can be repeated to model a longer sequence.
+it (stage B), held to the end of the finish (B-2) or released at the end of the search (B-3, the finish uses its
+period's context). The last intra period can be repeated to model a longer sequence.
 usage: p5_sim.py <serial encoder log> [finish fraction, default 0.03] [intra periods to extend to]"""
 import heapq
 import re
@@ -55,7 +56,7 @@ for i in range(n):
     period_last[period_of[i]] = i
 
 
-def simulate(K, S, C, W, policy):
+def simulate(K, S, C, W, policy, release=False):
     done = [None] * n
     search_end = [None] * n
     has_stack = [False] * n
@@ -106,9 +107,12 @@ def simulate(K, S, C, W, policy):
         t, kind, i = heapq.heappop(events)
         if kind == 0:
             search_end[i] = t
+            if release:
+                stacks += 1
         else:
             done[i] = t
-            stacks += 1
+            if not release:
+                stacks += 1
         threads += 1
         try_start(t)
     assert all(d is not None for d in done), "deadlock"
@@ -122,3 +126,5 @@ for K in (4, 8):
     for C in (1, 2, 4, 8):
         print(f"K=S={K}  ready, C={C}:          " + "  ".join(f"W={W}: {total / simulate(K, K, C, W, 'ready'):4.2f}x"
                                                           for W in (32, 64, 128)))
+        print(f"        released at search end: " + "  ".join(
+            f"W={W}: {total / simulate(K, K, C, W, 'ready', True):4.2f}x" for W in (32, 64, 128)))

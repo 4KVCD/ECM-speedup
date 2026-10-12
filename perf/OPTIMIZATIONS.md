@@ -90,11 +90,11 @@ lower all-core turbo, one duplicated intra frame per chunk, unequal chunk comple
 
 ## Frame threads (`--FrameThreads=N`, `--FramePeriods=M`)
 
-- The pictures run in threads of their own, at most N with a search stack at a time. The setups take turns in coding
-  order on a setup stack of their own; a picture takes a search stack once the pictures it reads are done, the
-  earliest such picture first (`perf/HANDOFF_MULTITHREADING.md`, P1 and P5). The GOPs overlap: the next GOPs are read
-  and started while a GOP's pictures are in flight, and the reconstructions are written in output order as they are
-  done.
+- The pictures run in threads of their own, at most N searching at a time. The setups take turns in coding order on
+  a setup stack of their own; a picture takes a search stack once the pictures it reads are done, the earliest such
+  picture first, and gives it back when its search ends: its finish uses its intra period's finish stack
+  (`perf/HANDOFF_MULTITHREADING.md`, P1 and P5). The GOPs overlap: the next GOPs are read and started while a GOP's
+  pictures are in flight, and the reconstructions are written in output order as they are done.
 - The finishes (loop filters, APSs, slice writing) of an intra period run in coding order. With M > 1 the finishes of
   up to M intra periods run at the same time, each period with its own copy of the filter encoders and APSs, while the
   log lines, access units and PSNR sums still go out in coding order. A period starts at a RAS-init intra picture
@@ -103,24 +103,30 @@ lower all-core turbo, one duplicated intra frame per chunk, unequal chunk comple
 - M = 0 (default) uses min(N, 4) periods, and 1 for one long period (IntraPeriod -1, LD) and for the options whose
   finishes share state between periods (buffering period, picture timing, decoding unit, frame-field, frame packing,
   scalable nesting and DRAP SEIs, DeblockingFilterMetric, a scaling-list file, HDR metrics), which M > 1 rejects.
-- AI pictures are independent, so AI scales with N. In RA the temporal CABAC context store chains each picture to the
-  previous one of its temporal layer, so a single intra period gains about 1.4x; the periods then overlap. LD gains
-  nothing. `perf/mt/p5_sim.py` models the schedule. `--ParallelSegments` combines with it.
-- Memory: a search stack commits about 1.1 GB whatever the resolution. Each period beyond the first adds about 33 MB
-  at 128x128 and 75 MB at CIF (about 1 GB at 1080p by the same rate, mostly picture-size ALF and SAO buffers), and up
-  to max(N, GOPSize) x M pictures are in flight.
+- AI pictures are independent, so AI scales with N, also onto the efficiency cores: 33 pictures unpinned on all 20
+  cores of the 265K took 27.1 s with N = 12, 25.8 s with 16 and 23.7 s with 20 (7.96x, 8.37x, 9.12x; 24.7 GB at 20).
+  In RA the temporal CABAC context store chains each picture to the previous one of its temporal layer, so a single
+  intra period gains about 1.4x; the periods then overlap. The dependency chains inside the periods bound RA at about
+  4.4x for 129 frames (5 periods) whatever N; longer RA sequences gain from more periods (`perf/mt/p5_sim.py` models
+  10 periods at 4.4x with M = 4 and 5.9x with M = 8, at a cost in memory). LD gains nothing. `--ParallelSegments`
+  combines with it.
+- Memory: a search stack commits about 1.1 GB whatever the resolution (a quarter of it is one GPM cache of 250 MB in
+  InterSearch). Each period beyond the first adds about 33 MB at 128x128 and 75 MB at CIF (about 1 GB at 1080p by the
+  same rate, mostly picture-size ALF and SAO buffers), and up to max(N, GOPSize) x M pictures are in flight.
 - Core Ultra 7 265K, one run at a time on the 8 P-cores, foreman 128x128 QP 32 (ai_long's and ra_long's
   configurations), the previous commit's single-thread time as base, automatic M:
 
-| FrameThreads | AI, 33 pictures (TemporalSubsampleRatio 8) | RA, 65 frames (3 intra periods) | RA, 129 frames (5) | peak commit (AI / RA 65) |
+| FrameThreads | AI, 33 pictures (TemporalSubsampleRatio 8) | RA, 65 frames (3 intra periods) | RA, 129 frames (5) | peak commit (AI / RA 65 / RA 129) |
 |---|---|---|---|---|
 | 1 | 215.7 s | 556.2 s | 1064.5 s | |
-| 2 | 102.6 s, 2.10x | | | 3.0 GB / |
-| 4 | 55.9 s, 3.86x | 327.1 s, 1.70x | | 5.5 / 5.8 GB |
-| 8 | 31.6 s, 6.83x | 199.0 s, 2.79x | 403.4-429.2 s, 2.48-2.64x | 10.4 / 10.3 GB |
+| 2 | 104.0 s, 2.07x | | | 3.1 GB |
+| 4 | 56.0 s, 3.85x | 203.2 s, 2.74x | | 5.7 / 6.0 GB |
+| 8 | 30.9 s, 6.98x | 199.1 s, 2.79x | 259.8 s, 4.10x | 10.6 / 10.5 / 11.1 GB |
 
-  With the finishes in coding order (M = 1, P5 stage A and B-1) RA 65 took 387.6 s with 4 threads (1.44x) and 383.9 s
-  with 8 (1.45x), AI 33.8 s with 8 (6.39x). LD 13 frames: 118.5 s with one thread, 116.8 s with 8.
+  Earlier steps, same tests: finishes in coding order and stacks held to the end of the finish (P5 stage A, B-1): RA
+  65 387.6 s with 4 threads and 383.9 s with 8 (1.44x, 1.45x); finishes of several periods at the same time (B-2):
+  RA 65 327.1 s and 199.0 s (1.70x, 2.79x), RA 129 403.4-429.2 s with 8 (2.48-2.64x). LD 13 frames: 118.5 s with one
+  thread, 120.6 s with 8.
 
 ## CU threads (`--CuThreads=N`)
 

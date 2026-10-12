@@ -690,6 +690,11 @@ public:
 
   CABACWriter*                getCABACWriter          ( const SPS*   sps   )        { return m_CABACWriter   [0]; }
   CABACWriter*                getCABACEstimator       ( const SPS*   sps   )        { return m_CABACEstimator[0]; }
+#if JVET_AI0136_ADAPTIVE_DUAL_TREE
+  /// The writer and the estimator share it, and Partitioner::copyState leaves some of its fields (tree and mode type):
+  /// a slice writing reads what the estimator left at the end of the search, the next search what the writer left.
+  QTBTPartitioner&            getPartitionerSST       ()                          { return m_partitionerSST; }
+#endif
 private:
   BinEncoder_Std      m_BinEncoderStd;
   BitEstimator_Std    m_BitEstimatorStd;

@@ -232,6 +232,15 @@ void EncLib::create( const int layerId )
     context.apsMap         = &objects.apsMap;
     m_finishContexts.push_back( context );
   }
+  m_finishStacks.clear();
+  if( getFrameThreads() > 1 )
+  {
+    for( EncFinishContext& ctx: m_finishContexts )
+    {
+      m_finishStacks.emplace_back( new EncFinishStack );
+      ctx.stack = m_finishStacks.back().get();
+    }
+  }
 }
 
 void EncLib::xCreateFinishObjects( LoopFilter& loopFilter, EncAdaptiveLoopFilter& alf, EncSampleAdaptiveOffset& sao )
@@ -322,6 +331,7 @@ void EncLib::destroy ()
     objects->sao.destroy();
     objects->loopFilter.destroy();
   }
+  m_finishStacks.clear();
   m_finishObjects.clear();
   m_finishContexts.clear();
   for( auto& stack: m_searchStacks )
@@ -789,6 +799,21 @@ void EncLib::init( bool isFieldCoding, AUWriterIf* auWriterIf )
 #endif
 #if JVET_AH0200_INTRA_TMP_BV_REORDER
     stack.intraSearch.setInterPrediction( &stack.interSearch );
+#endif
+  }
+  for( auto& stack: m_finishStacks )
+  {
+    stack->sliceEncoder.initFinish( this, stack->cabacEncoder, stack->rdCost, stack->reshaper, sps0 );
+    // as IntraSearch::init
+#if JVET_AJ0249_NEURAL_NETWORK_BASED
+#if JVET_AK0118_BF_FOR_INTRA_PRED
+    stack->intraPred.init( m_chromaFormatIDC, getBitDepth( CHANNEL_TYPE_LUMA ), getNnipMode(), &stack->reshaper,
+                           &stack->bilateralFilter );
+#else
+    stack->intraPred.init( m_chromaFormatIDC, getBitDepth( CHANNEL_TYPE_LUMA ), getNnipMode() );
+#endif
+#else
+    stack->intraPred.init( m_chromaFormatIDC, getBitDepth( CHANNEL_TYPE_LUMA ) );
 #endif
   }
   if( m_setupStack )
