@@ -648,18 +648,13 @@ DecLib::~DecLib()
     m_pictureSeiNalus.pop_front();
   }
 #if ECM_VULKAN
-  m_cALF.setProcessHook( nullptr );
-  m_gpuAlf.reset();
-  if( m_gpuLoopFilter )
-  {
-    gpu::Context::joinPrefetch();
-  }
+  releaseGpu();
 #endif
 }
 
 #if ECM_VULKAN
 // the GPU reconstruction being created by a detached thread (the device and the kernels take ~0.3 s): the decoding
-// does not wait for it, and a process that ends first does not wait either
+// does not wait for it; releaseGpu() does
 struct GpuReconPending
 {
   std::mutex   mutex;
@@ -667,11 +662,52 @@ struct GpuReconPending
   GpuIntraRec* rec  = nullptr;
 };
 
-void DecLib::setGpuRecon( int mode )
+void DecLib::releaseGpu()
 {
+  m_cALF.setProcessHook( nullptr );
+  m_gpuAlf.reset();
+  if( m_gpuLoopFilter )
+  {
+    gpu::Context::joinPrefetch();
+  }
   m_cCuDecoder.setGpuIntraRec( nullptr );
   m_gpuIntraRec.reset();
-  m_gpuReconPending.reset();
+  if( m_gpuReconPending )   // no thread may be inside the driver when the device is destroyed
+  {
+    GpuReconPending& p = *m_gpuReconPending;
+    for( ;; )
+    {
+      {
+        std::lock_guard<std::mutex> lock( p.mutex );
+        if( p.done )
+        {
+          break;
+        }
+      }
+      std::this_thread::sleep_for( std::chrono::milliseconds( 1 ) );
+    }
+    delete p.rec;
+    p.rec = nullptr;
+    m_gpuReconPending.reset();
+  }
+}
+
+void DecLib::releaseGpuDevice()
+{
+  gpu::Context::joinPrefetch();
+  GpuIntraRec::releaseShared();
+  GpuAlf::releaseShared();
+  gpu::Context::release();
+  if( gpu::Stream::numLateSubmissions() || gpu::Stream::numRepeatedSubmissions() )   // gpu::Stream::wait
+  {
+    printf( "\n[gpu] %llu submissions ended after their fence, %llu were run again\n",
+            (unsigned long long) gpu::Stream::numLateSubmissions(), (unsigned long long) gpu::Stream::numRepeatedSubmissions() );
+  }
+}
+
+void DecLib::setGpuRecon( int mode )
+{
+  releaseGpu();
   m_gpuReconMode = mode >= 1 && mode <= 3 ? mode : 0;
   if( m_gpuReconMode )
   {

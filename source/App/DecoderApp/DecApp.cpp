@@ -570,6 +570,12 @@ uint32_t DecApp::decode()
   m_cDecLib.deletePicBuffer();
   // destroy internal classes
   xDestroyDecLib();
+#if ECM_VULKAN
+  // the GPU objects (the frame threads' contexts released theirs in deletePicBuffer), then the device: a device left
+  // to the end of the process now and then hung its termination (gpu::Context::release)
+  m_cDecLib.releaseGpu();
+  DecLib::releaseGpuDevice();
+#endif
 
 #if RExt__DECODER_DEBUG_STATISTICS
   CodingStatistics::DestroyInstance();

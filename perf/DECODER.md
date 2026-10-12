@@ -345,6 +345,28 @@ decodes differed; without it, 9 of 88 in an hour with other work on the PC and 0
 stage now stays in shared memory (int16, exact because it is clipped to the 16-bit transform range; extended precision
 is rejected by the host): 0 of 40 differed under the same load, and the global 16 MB scratch buffer is gone.
 
+Fix (2026-10-11): decodes with the reconstruction on and frame threads hung now and then for good (a gpuload.py child
+had run for 11 hours; m13c_25, 64x64, with a CPU load beside it: about one decode in 200 hung at a picture, one in 5
+to 100 at the end). Picture hangs were always the process's first submission: its work had run completely (every
+block reconstructed, every workgroup past its last step, the submission's tag seen by the kernels), but its fence
+never signalled, or vkGetQueryPoolResults with WAIT_BIT spun forever after it; meanwhile the other frame threads'
+contexts were being created in detached threads. Vulkan allows that; it looks like a race in the driver (616.92):
+with every context created before decoding, or with one frame thread, no hang. End-of-process hangs: the output was
+complete and the process hung in its termination, with the device left to the end of the process on purpose. Now no
+Vulkan object is created or destroyed while a submission is in flight (gpu::Context::inFlight(), shared from submit
+to wait, exclusive for creation), the timestamps are read without waiting, and the device is destroyed after
+decoding (DecLib::releaseGpu, releaseGpuDevice): 0 hangs in 1500 decodes under the same load. Later the same day one
+decode of m14_fore37 with 8 frame threads (gpuload.py running beside it) gave an all-zero second picture: a context's
+first submission whose fence had signalled while its timestamps were unwritten and its results were the buffers'
+initial contents (zero planes, a zero dependency count) - without WAIT_BIT that case, once a hang, had become a silent
+wrong picture. It happened once in ~1100 decodes with 8 frame threads that day and not again in 880 more of the same
+code and a diagnostic version (with and without GPU and CPU load). Since then the shared lock covers a stream from
+the recording of its commands on, and every
+submission ends with a full barrier and its number written into a host-visible word, which Stream::wait checks: a
+late end is waited for, a missing one makes a repeatable stream (GpuIntraRec's: every picture's commands upload and
+fill what they read) run the commands again after draining its queue, else wait() throws; the decoder prints the
+count of such submissions at the end when there were any.
+
 ## Fixes found on the way
 
 - Decoding that starts at a CRA in the middle of an RA stream (`-s`, random access) crashed the stock decoder:

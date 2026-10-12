@@ -49,6 +49,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <vector>
 
@@ -120,6 +121,9 @@ class Context
 public:
   /// the context (created on the first call), or nullptr when no Vulkan device can be used (reason in lastError())
   static Context*           get();
+  /// destroys the context get() created, once every object made with it is destroyed. Call it before the process
+  /// ends: a device left to the end of the process now and then hung its termination in the driver (NVIDIA 616.92)
+  static void               release();
   static const std::string& lastError();
   /// starts creating the context in a background thread (creating a Vulkan device takes ~0.3 s), then runs `then`
   /// with it (if there is a device); get() waits for the context
@@ -143,6 +147,11 @@ public:
 
   /// a queue for a stream: queues are handed out in turn and locked on submission
   VkQueue                   queue( std::mutex*& lock );
+  /// held shared by a stream from the recording of its commands until its wait has returned, and exclusively while a
+  /// stream, buffer or kernel is created or destroyed: with objects created while another thread's submission was in
+  /// flight (the frame threads' contexts are created in the background), NVIDIA's driver (616.92) now and then never
+  /// signalled the fence of a submission whose work had completed, about once in 200 decodes with 8 frame threads
+  std::shared_mutex&        inFlight() { return m_inFlight; }
   uint32_t                  queueFamily() const { return m_queueFamily; }
   uint32_t                  numQueues() const { return (uint32_t) m_queues.size(); }
 
@@ -171,6 +180,7 @@ private:
   std::unique_ptr<std::mutex[]> m_queueLocks;
   uint32_t                  m_nextQueue = 0;
   std::mutex                m_mutex;
+  std::shared_mutex         m_inFlight;
 };
 
 /// a buffer with its own memory; host-visible buffers stay mapped
@@ -242,8 +252,18 @@ public:
   uint32_t timestamp();
   /// submits the commands; the results are ready (and visible to the host) after wait()
   void submit();
+  /// waits for the fence, then checks that the commands ran to their end: each submission ends by writing its number
+  /// into a host-visible word. Once (2026-10-11, RTX 3070, driver 616.92, 8 frame threads, ~1 in 1000 decodes) the
+  /// fence of a frame-thread context's first submission signalled while its results were still the buffers' initial
+  /// contents and its timestamps unwritten. A late word is waited for; a missing one makes the commands of a
+  /// repeatable stream run again; throws when they do not complete
   void wait();
   void submitAndWait() { submit(); wait(); }
+  /// the commands may run twice (each submission's work depends only on what the host uploaded for it)
+  void setRepeatable( bool repeatable ) { m_repeatable = repeatable; }
+  /// submissions so far whose end came after their fence, or that were run again (all streams)
+  static uint64_t numLateSubmissions();
+  static uint64_t numRepeatedSubmissions();
   bool pending() const { return m_pending; }
   /// nanoseconds between two timestamps of the last submission (0 without timestamps)
   double   elapsedNs( uint32_t from, uint32_t to ) const;
@@ -262,8 +282,14 @@ private:
   uint32_t              m_maxTimestamps;
   uint32_t              m_numTimestamps = 0;
   std::vector<uint64_t> m_timestamps;
-  bool                  m_recording = false;
-  bool                  m_pending   = false;
+  bool                  m_recording  = false;
+  bool                  m_pending    = false;
+  bool                  m_repeatable = false;
+  Buffer                m_end;             ///< host-visible word the last command of a submission writes
+  uint32_t              m_submissions = 0; ///< the number the last submission writes there
+  std::shared_lock<std::shared_mutex> m_inFlightLock;   ///< Context::inFlight() from begin() until wait() returns
+
+  bool ended() const;
 };
 
 }   // namespace gpu

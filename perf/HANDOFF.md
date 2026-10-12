@@ -304,6 +304,15 @@ Profile of a GPU-on decode (non-LTO, m2_park16, share of all samples): parsing ~
   row above, and with GDR the dirty area. Tiles, wavefronts and GDR were not rejected until 2026-10-11: a stream with
   tiles or WPP decoded wrong with the reconstruction on (test streams `fx_tiles_park720`, `fx_wpp_park720`, now
   skipped). Any new availability rule of the CPU must be mirrored or rejected.
+- Vulkan objects are never created or destroyed while a stream records or has a submission in flight
+  (`gpu::Context::inFlight()`), and the device is destroyed after decoding (`DecLib::releaseGpu` /
+  `releaseGpuDevice`, called by DecApp): with the frame threads' contexts created in the background, NVIDIA's driver
+  (616.92) now and then never signalled the fence of a completed submission, and a device left to the end of the
+  process now and then hung its termination (2026-10-11, ~1 in 200 decodes of m13c_25 with 8 frame threads;
+  DECODER.md). Once a fence signalled before its submission's commands had run (an all-zero picture): every
+  submission now ends by writing its number into a host-visible word that `Stream::wait` checks (a late end is waited
+  for, a missing one runs the commands of a repeatable stream again, else throws). Keep new GPU code to these rules,
+  and test frame-thread changes with many repeated short decodes under load whose outputs are compared, not only once.
 - The owner maps have 4x4 luma units; ISP sub-partitions 1 or 2 wide or high share them. The last block owning a
   unit must win everywhere (intra_deps pass 0 writes with atomicMax: plain parallel writes raced), and a block
   reading a shared unit only waits for that last owner, so the sub-partitions of a CU are chained (Tu::ispPrev;

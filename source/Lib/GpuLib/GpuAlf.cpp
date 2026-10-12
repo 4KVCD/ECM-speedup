@@ -343,13 +343,13 @@ struct GpuAlf::Shared
   }
 };
 
+static std::once_flag s_alfSharedOnce;
+GpuAlf::Shared*       GpuAlf::s_shared = nullptr;   // destroyed by GpuAlf::releaseShared, before the device
+
 const GpuAlf::Shared& GpuAlf::shared( gpu::Context& ctx )
 {
-  // lives until the process ends, like the device
-  static std::once_flag once;
-  static Shared*        s = nullptr;
-  std::call_once( once, [&ctx] { s = new Shared( ctx ); } );
-  return *s;
+  std::call_once( s_alfSharedOnce, [&ctx] { s_shared = new Shared( ctx ); } );
+  return *s_shared;
 }
 
 // pictures compared with the CPU (GpuAlf::VERIFY), reported when the process ends
@@ -366,7 +366,7 @@ static struct VerifyReport
   }
 } s_verifyReport;
 
-/// the GpuAlf objects of the process, used by one picture at a time; they live until the process ends
+/// the GpuAlf objects of the process, used by one picture at a time; destroyed by GpuAlf::releaseShared
 struct GpuAlfPool
 {
   static constexpr size_t              maxSize = 2;   ///< a picture holds one for a few ms, decoding it takes far longer
@@ -379,6 +379,13 @@ struct GpuAlfPool
   {
     static GpuAlfPool* pool = new GpuAlfPool;
     return *pool;
+  }
+
+  void clear()
+  {
+    std::lock_guard<std::mutex> lock( mutex );
+    available.clear();
+    all.clear();
   }
 
   GpuAlf* acquire( gpu::Context& ctx, int mode )
@@ -430,6 +437,13 @@ void GpuAlf::prefetch( int mode, int width, int height, int ctuSize )
 bool GpuAlf::ready()
 {
   return gpu::Context::prefetchDone();
+}
+
+void GpuAlf::releaseShared()
+{
+  GpuAlfPool::get().clear();
+  delete s_shared;   // its tables and kernels
+  s_shared = nullptr;
 }
 
 GpuAlf::GpuAlf( gpu::Context& ctx, const Shared& shared, int mode ) : m_ctx( ctx ), m_k( shared ), m_mode( mode )

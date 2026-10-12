@@ -39,6 +39,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -88,12 +89,12 @@ const std::string& Context::lastError()
   return errorText();
 }
 
+static std::once_flag s_ctxOnce;
+static Context*       s_ctx = nullptr;
+
 Context* Context::get()
 {
-  // the device lives until the process ends: destroying it at exit takes ~45 ms, and the system frees it anyway
-  static std::once_flag s_once;
-  static Context*       s_ctx = nullptr;
-  std::call_once( s_once, []() {
+  std::call_once( s_ctxOnce, []() {
     std::unique_ptr<Context> ctx( new Context );
     try
     {
@@ -106,6 +107,12 @@ Context* Context::get()
     }
   } );
   return s_ctx;
+}
+
+void Context::release()
+{
+  delete s_ctx;   // waits for the device to be idle (~45 ms)
+  s_ctx = nullptr;
 }
 
 static std::mutex        s_prefetchMutex;
@@ -544,6 +551,7 @@ void Buffer::create( Context& ctx, VkDeviceSize bytes, Kind kind )
 {
   const VkFn& vk  = ctx.vk();
   VkDevice    dev = ctx.device();
+  std::unique_lock<std::shared_mutex> noSubmission( ctx.inFlight() );
   size            = std::max<VkDeviceSize>( ( bytes + 3 ) & ~VkDeviceSize( 3 ), 4 );
 
   VkBufferCreateInfo bufferInfo{};
@@ -608,8 +616,13 @@ void Buffer::create( Context& ctx, VkDeviceSize bytes, Kind kind )
 
 void Buffer::destroy( Context& ctx )
 {
+  if( buf == VK_NULL_HANDLE && mem == VK_NULL_HANDLE )
+  {
+    return;
+  }
   const VkFn& vk  = ctx.vk();
   VkDevice    dev = ctx.device();
+  std::unique_lock<std::shared_mutex> noSubmission( ctx.inFlight() );
   if( buf != VK_NULL_HANDLE )
   {
     vk.DestroyBuffer( dev, buf, nullptr );
@@ -648,6 +661,7 @@ void Kernel::create( Context& ctx, const uint32_t* spirv, size_t bytes, uint32_t
 {
   const VkFn& vk  = ctx.vk();
   VkDevice    dev = ctx.device();
+  std::unique_lock<std::shared_mutex> noSubmission( ctx.inFlight() );
   m_ctx           = &ctx;
   m_pushBytes     = pushBytes;
   m_name          = name;
@@ -688,6 +702,7 @@ Kernel::~Kernel()
   if( m_ctx )
   {
     const VkFn& vk = m_ctx->vk();
+    std::unique_lock<std::shared_mutex> noSubmission( m_ctx->inFlight() );
     if( m_pipeline != VK_NULL_HANDLE )
     {
       vk.DestroyPipeline( m_ctx->device(), m_pipeline, nullptr );
@@ -707,6 +722,9 @@ Stream::Stream( Context& ctx, uint32_t maxTimestamps ) : m_ctx( ctx ), m_maxTime
 {
   const VkFn& vk  = ctx.vk();
   VkDevice    dev = ctx.device();
+  m_end.create( ctx, 4, Buffer::DOWNLOAD );   // (takes Context::inFlight() itself)
+  *(volatile uint32_t*) m_end.mapped = 0;
+  std::unique_lock<std::shared_mutex> noSubmission( ctx.inFlight() );
   m_queue         = ctx.queue( m_queueLock );
 
   VkCommandPoolCreateInfo poolInfo{};
@@ -745,6 +763,9 @@ Stream::~Stream()
   {
     vk.WaitForFences( dev, 1, &m_fence, VK_TRUE, UINT64_MAX );
   }
+  m_inFlightLock = {};      // also when commands were recorded and never submitted
+  m_end.destroy( m_ctx );   // (takes Context::inFlight() itself)
+  std::unique_lock<std::shared_mutex> noSubmission( m_ctx.inFlight() );
   if( m_queries != VK_NULL_HANDLE )
   {
     vk.DestroyQueryPool( dev, m_queries, nullptr );
@@ -760,10 +781,15 @@ void Stream::begin()
   {
     wait();
   }
+  // no Vulkan object is created or destroyed from the recording of the commands until wait() has returned
+  if( !m_inFlightLock.owns_lock() )
+  {
+    m_inFlightLock = std::shared_lock<std::shared_mutex>( m_ctx.inFlight() );
+  }
   check( vk.ResetCommandPool( m_ctx.device(), m_pool, 0 ), "vkResetCommandPool" );
   VkCommandBufferBeginInfo beginInfo{};
   beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-  beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+  beginInfo.flags = 0;   // a repeatable stream may submit the commands twice (wait())
   check( vk.BeginCommandBuffer( m_cmd, &beginInfo ), "vkBeginCommandBuffer" );
   if( m_queries != VK_NULL_HANDLE )
   {
@@ -838,13 +864,19 @@ uint32_t Stream::timestamp()
 void Stream::submit()
 {
   const VkFn& vk = m_ctx.vk();
-  // the device writes become visible to the host once the fence has signalled
+  // the end of the commands: every earlier command complete, then the submission's number into m_end; the device
+  // writes become visible to the host once the fence has signalled
   VkMemoryBarrier mb{};
   mb.sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
   mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
-  mb.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+  mb.dstAccessMask = VK_ACCESS_HOST_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
   vk.CmdPipelineBarrier( m_cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
-                         VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr );
+                         VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr );
+  vk.CmdFillBuffer( m_cmd, m_end.buf, 0, 4, ++m_submissions );
+  mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+  mb.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+  vk.CmdPipelineBarrier( m_cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0, nullptr, 0,
+                         nullptr );
   check( vk.EndCommandBuffer( m_cmd ), "vkEndCommandBuffer" );
   m_recording = false;
 
@@ -859,6 +891,26 @@ void Stream::submit()
   m_pending = true;
 }
 
+bool Stream::ended() const
+{
+  return *(const volatile uint32_t*) m_end.mapped == m_submissions;
+}
+
+namespace
+{
+std::atomic<uint64_t> s_lateSubmissions{ 0 }, s_repeatedSubmissions{ 0 };
+}
+
+uint64_t Stream::numLateSubmissions()
+{
+  return s_lateSubmissions.load();
+}
+
+uint64_t Stream::numRepeatedSubmissions()
+{
+  return s_repeatedSubmissions.load();
+}
+
 void Stream::wait()
 {
   if( !m_pending )
@@ -867,16 +919,58 @@ void Stream::wait()
   }
   const VkFn& vk  = m_ctx.vk();
   VkDevice    dev = m_ctx.device();
-  check( vk.WaitForFences( dev, 1, &m_fence, VK_TRUE, UINT64_MAX ), "vkWaitForFences" );
-  check( vk.ResetFences( dev, 1, &m_fence ), "vkResetFences" );
+  for( int run = 0;; run++ )
+  {
+    check( vk.WaitForFences( dev, 1, &m_fence, VK_TRUE, UINT64_MAX ), "vkWaitForFences" );
+    check( vk.ResetFences( dev, 1, &m_fence ), "vkResetFences" );
+    int waitedMs = 0;   // for the end of the commands after the fence
+    while( !ended() && waitedMs < 1000 )
+    {
+      std::this_thread::sleep_for( std::chrono::milliseconds( 1 ) );
+      waitedMs++;
+    }
+    if( !ended() )
+    {
+      // the commands may still be queued: drain the queue before they run again
+      std::lock_guard<std::mutex> lock( *m_queueLock );
+      check( vk.QueueWaitIdle( m_queue ), "vkQueueWaitIdle" );
+    }
+    if( ended() )
+    {
+      s_lateSubmissions += waitedMs > 0 ? 1 : 0;
+      break;
+    }
+    if( !m_repeatable || run > 0 )
+    {
+      m_pending      = false;
+      m_inFlightLock = {};
+      throw std::runtime_error( "Vulkan: the commands of a submission did not complete" );
+    }
+    s_repeatedSubmissions++;
+    VkSubmitInfo submitInfo{};
+    submitInfo.sType              = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submitInfo.commandBufferCount = 1;
+    submitInfo.pCommandBuffers    = &m_cmd;
+    std::lock_guard<std::mutex> lock( *m_queueLock );
+    check( vk.QueueSubmit( m_queue, 1, &submitInfo, m_fence ), "vkQueueSubmit" );
+  }
   m_pending = false;
   if( m_numTimestamps )
   {
-    check( vk.GetQueryPoolResults( dev, m_queries, 0, m_numTimestamps, sizeof( uint64_t ) * m_numTimestamps,
-                                   m_timestamps.data(), sizeof( uint64_t ),
-                                   VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT ),
-           "vkGetQueryPoolResults" );
+    // the timestamps are written once the fence has signalled; don't wait for them (VK_QUERY_RESULT_WAIT_BIT): with
+    // the driver race described at Context::inFlight() that wait once spun forever
+    const VkResult r = vk.GetQueryPoolResults( dev, m_queries, 0, m_numTimestamps, sizeof( uint64_t ) * m_numTimestamps,
+                                               m_timestamps.data(), sizeof( uint64_t ), VK_QUERY_RESULT_64_BIT );
+    if( r == VK_NOT_READY )
+    {
+      m_numTimestamps = 0;   // elapsedNs() reports 0
+    }
+    else
+    {
+      check( r, "vkGetQueryPoolResults" );
+    }
   }
+  m_inFlightLock = {};
 }
 
 double Stream::elapsedNs( uint32_t from, uint32_t to ) const

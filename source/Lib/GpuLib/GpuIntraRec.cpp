@@ -284,7 +284,7 @@ constexpr int FILTER_TAPS[5] = { 6, 8, 10, 12, 16 };
 constexpr int RESI_GROUPS    = 256;   // persistent workgroups of intra_resi
 
 // the kernels and the constant tables, created once and shared by every instance (the decoder contexts of the frame
-// threads); never destroyed, like the device
+// threads); destroyed by GpuIntraRec::releaseShared, before the device
 struct Shared
 {
   gpu::Kernel                      kernel, kernelResi, kernelDeps, kernelScan;
@@ -380,14 +380,28 @@ Shared* createShared( gpu::Context& ctx )
   return sh;
 }
 
+std::once_flag s_sharedOnce;
+Shared*        s_shared = nullptr;
+
 Shared* shared( gpu::Context& ctx )
 {
-  static std::once_flag once;
-  static Shared*        sh = nullptr;
-  std::call_once( once, [&] { sh = createShared( ctx ); } );
-  return sh;
+  std::call_once( s_sharedOnce, [&] { s_shared = createShared( ctx ); } );
+  return s_shared;
 }
 }   // namespace
+
+void GpuIntraRec::releaseShared()
+{
+  if( !s_shared )   // never created (gpu::Context::get() would create the device)
+  {
+    return;
+  }
+  gpu::Context* ctx = gpu::Context::get();
+  s_shared->filters.destroy( *ctx );
+  s_shared->matrices.destroy( *ctx );
+  delete s_shared;   // the kernels
+  s_shared = nullptr;
+}
 
 struct GpuIntraRec::Impl
 {
@@ -445,6 +459,9 @@ GpuIntraRec* GpuIntraRec::create()
   m.ctx = ctx;
   m.sh  = shared( *ctx );
   m.stream.reset( new gpu::Stream( *ctx ) );
+  // a picture's commands upload its records and fill every buffer they read before writing it (owner maps, planes,
+  // scheduling counters): they may run twice (gpu::Stream::wait)
+  m.stream->setRepeatable( true );
   // persistent workgroups of intra_rec (ECM_GPU_GROUPS overrides)
   m.numGroups = getenv( "ECM_GPU_GROUPS" ) ? std::max( 1, atoi( getenv( "ECM_GPU_GROUPS" ) ) ) : 32;
   m.params.create( *ctx, sizeof( Params ), gpu::Buffer::DEVICE );

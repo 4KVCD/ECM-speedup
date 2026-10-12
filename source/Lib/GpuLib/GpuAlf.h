@@ -83,6 +83,9 @@ public:
   static void    prefetch( int mode, int width = 0, int height = 0, int ctuSize = 0 );
   /// prefetch() has finished: GpuAlfHook::create() does not wait
   static bool    ready();
+  /// destroys the pooled GpuAlf objects and the shared kernels and tables, after the last GpuAlfHook and the prefetch
+  /// thread (before gpu::Context::release)
+  static void    releaseShared();
 
   ~GpuAlf();
   /// with `sao`, SAO first; with `lfCccm`, also the LF-CCCM correction (the GPU adds it, or lfCccm->cpu() derives it
@@ -131,6 +134,7 @@ private:
   };
 
   struct Shared;   ///< kernels and fixed-filter tables, one set for every GpuAlf of the process
+  static Shared* s_shared;
 
   GpuAlf( gpu::Context& ctx, const Shared& shared, int mode );
   static const Shared& shared( gpu::Context& ctx );

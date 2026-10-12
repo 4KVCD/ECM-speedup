@@ -65,6 +65,8 @@ public:
   /// nullptr without a usable Vulkan device
   static GpuIntraRec* create();
   ~GpuIntraRec();
+  /// destroys the kernels and tables every instance shares, after the last instance (before gpu::Context::release)
+  static void releaseShared();
 
   /// on: the GPU reconstructs the supported pictures (the CPU only derives the block parameters); off: the CPU
   /// reconstructs every picture and the GPU's reconstruction of the supported ones is compared (verification)

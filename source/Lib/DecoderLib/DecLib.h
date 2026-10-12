@@ -334,6 +334,11 @@ public:
 #if ECM_VULKAN
   void  setGpuLoopFilter        ( int mode );   ///< GpuAlf::Mode; before setFrameThreads
   void  setGpuRecon             ( int mode );   ///< 0 off, 1 on, 2 verify, 3 on waiting for the device (the intra pictures the GPU path supports)
+  /// destroys this context's GPU objects, also one still being created (the destructor calls it too)
+  void  releaseGpu              ();
+  /// destroys the GPU state all contexts share and the device, after every context's releaseGpu(): before the
+  /// process ends (see gpu::Context::release)
+  static void releaseGpuDevice  ();
 #endif
 
   // frame-level threading
