@@ -63,8 +63,11 @@ shared int16_t s_spTempl[8 * 64];             // the templates of the predicted 
 shared int16_t s_spLow[64 * 16];
 shared int16_t s_spHigh[64 * 16];
 shared uint    s_spCost[256];                 // per sign hypothesis: its cost << 8 | the hypothesis
-shared int     s_spCoef[32 * 32];             // the dequantized coefficients with the decided signs (nonzero region)
+shared int16_t s_spCoef[32 * 32];             // the dequantized coefficients with the decided signs (nonzero region;
+                                              // clipped to the 16-bit transform range), with LFNST its outputs over them
 shared int16_t s_spStage1[32 * 32];           // their first inverse transform stage
+shared int     s_secIn[64];                   // the LFNST / NSPT inputs (dequantized, in scan order)
+shared int     s_lfnstOut[96];                // the LFNST outputs
 
 Params P;      // the parameter block (loaded once)
 int    g_ti;   // the block being reconstructed
@@ -284,9 +287,9 @@ int lumaConv( bool isVer, int l, int base, int taps, bool cubic, bool big, int f
 // shifted left by 8 with the hypothesis in the low bits (bit b: predicted coefficient n - 1 - b negative), rank the
 // hypotheses; the signs are then decided in order: the coded sign says whether the prediction from the best
 // hypothesis was right, and after a wrong one the best is searched again among the hypotheses that agree with the
-// signs decided. Where a decided sign is negative the residual is computed again (dequantization and both transform
-// stages as in intra_resi, with joint CbCr also the other component's, for the other block of the pair, which waits
-// for this one).
+// signs decided. Where a decided sign is negative the residual is computed again (dequantization, LFNST or NSPT and
+// both transform stages as in intra_resi, with joint CbCr also the other component's, for the other block of the pair,
+// which waits for this one).
 void signPrediction( Tu t, int lid, int NT )
 {
   const Tu  c = t.spCoded == g_ti ? t : BufTu( P.tus ).v[t.spCoded];   // the block with the coefficients
@@ -378,9 +381,12 @@ void signPrediction( Tu t, int lid, int NT )
   }
   const bool recompute = negative != 0;
   BufI32     mt        = BufI32( P.matrices );
+  BufI8      kernels   = BufI8( P.secKernels );
+  const int  nsptShift = c.shift1 + c.shift2 - 7;
   if( recompute )
   {
-    // the coefficients with the decided signs, dequantized, then the first stage
+    // the coefficients with the decided signs, dequantized (for NSPT only its inputs, in scan order), with LFNST its
+    // outputs over them (as in intra_resi), then the first stage
     BufI32    cf  = BufI32( P.coeffs );
     const int nzR = c.nzRows, nzC = c.nzCols, addDq = dequantAdd( c );
     int       negativeAt[8];   // the positions of the negative ones (x | y << 16), else -1
@@ -388,26 +394,65 @@ void signPrediction( Tu t, int lid, int NT )
     {
       negativeAt[k] = k < n && ( ( negative >> k ) & 1 ) != 0 ? sp.v[c.spOffset + SP_POS + k] : -1;
     }
-    for( int i = lid; i < nzR * nzC; i += NT )
+    if( c.secKind == SEC_NSPT )
     {
-      const int pos = ( i % nzC ) | ( ( i / nzC ) << 16 );
-      int       q   = cf.v[c.coeffOffset + i];
-      for( int k = 0; k < 8; k++ )
+      for( int i = lid; i < c.secNumIn; i += NT )
       {
-        q = negativeAt[k] == pos ? -q : q;
+        const int pos = mt.v[c.secScan + i], x = pos & 0xffff, y = pos >> 16;
+        int       q   = y < nzR && x < nzC ? cf.v[c.coeffOffset + y * nzC + x] : 0;
+        for( int k = 0; k < 8; k++ )
+        {
+          q = negativeAt[k] == pos ? -q : q;
+        }
+        s_secIn[i] = q != 0 ? dequant( c, q, addDq, mt, P.qcsOffset ) : 0;
       }
-      s_spCoef[i] = q != 0 ? dequant( c, q, addDq, mt, P.qcsOffset ) : 0;
+      SYNC();
     }
-    SYNC();
-    const int rnd1 = 1 << ( c.shift1 - 1 );
-    for( int i = lid; i < nzC * H; i += NT )
+    else
     {
-      const int xf = i / H, y = i % H;
-      int sum = 0;
-      for( int k = 0; k < nzR; k++ ) sum += mt.v[c.mtxV + k * H + y] * s_spCoef[k * nzC + xf];
-      s_spStage1[xf * H + y] = int16_t( clip3i( c.trMin, c.trMax, ( sum + rnd1 ) >> c.shift1 ) );
+      for( int i = lid; i < nzR * nzC; i += NT )
+      {
+        const int pos = ( i % nzC ) | ( ( i / nzC ) << 16 );
+        int       q   = cf.v[c.coeffOffset + i];
+        for( int k = 0; k < 8; k++ )
+        {
+          q = negativeAt[k] == pos ? -q : q;
+        }
+        s_spCoef[i] = int16_t( q != 0 ? dequant( c, q, addDq, mt, P.qcsOffset ) : 0 );
+      }
+      SYNC();
+      if( c.secKind == SEC_LFNST )
+      {
+        for( int i = lid; i < c.secNumIn; i += NT )
+        {
+          const int pos = mt.v[c.secScan + i];
+          s_secIn[i] = int( s_spCoef[( pos >> 16 ) * nzC + ( pos & 0xffff )] );
+        }
+        SYNC();
+        for( int j = lid; j < c.secRowLength; j += NT )
+        {
+          int sum = 0;
+          for( int k = 0; k < c.secNumIn; k++ ) sum += s_secIn[k] * int( kernels.v[c.secMatrix + k * c.secRowLength + j] );
+          s_lfnstOut[j] = clip3i( c.trMin, c.trMax, ( sum + 64 ) >> 7 );
+        }
+        SYNC();
+        for( int j = lid; j < c.secRowLength; j += NT )
+        {
+          const int pos = mt.v[c.secLayout + j];
+          s_spCoef[( pos >> 16 ) * nzC + ( pos & 0xffff )] = int16_t( s_lfnstOut[j] );
+        }
+        SYNC();
+      }
+      const int rnd1 = 1 << ( c.shift1 - 1 );
+      for( int i = lid; i < nzC * H; i += NT )
+      {
+        const int xf = i / H, y = i % H;
+        int sum = 0;
+        for( int k = 0; k < nzR; k++ ) sum += mt.v[c.mtxV + k * H + y] * int( s_spCoef[k * nzC + xf] );
+        s_spStage1[xf * H + y] = int16_t( clip3i( c.trMin, c.trMax, ( sum + rnd1 ) >> c.shift1 ) );
+      }
+      SYNC();
     }
-    SYNC();
   }
   // the second stage, sample by sample, and the reconstruction; the coded residual is this block's
   const int rnd2 = 1 << ( c.shift2 - 1 );
@@ -416,11 +461,21 @@ void signPrediction( Tu t, int lid, int NT )
   {
     const int x = i % W, y = i / W;
     int re;
-    if( recompute )
+    if( recompute && c.secKind == SEC_NSPT )   // NSPT's matrix gives the residual (intra_resi)
+    {
+      const int jj = c.secTranspose != 0 ? x * H + y : i;
+      int sum = 0;
+      for( int k = 0; k < c.secNumIn; k++ ) sum += s_secIn[k] * int( kernels.v[c.secMatrix + k * c.secRowLength + jj] );
+      re = clip3i( c.trMin, c.trMax, ( sum + ( 1 << ( nsptShift - 1 ) ) ) >> nsptShift );
+    }
+    else if( recompute )
     {
       int sum = 0;
       for( int k = 0; k < c.nzCols; k++ ) sum += mt.v[c.mtxH + k * W + x] * int( s_spStage1[k * H + y] );
       re = clip3i( c.trMin, c.trMax, ( sum + rnd2 ) >> c.shift2 );
+    }
+    if( recompute )
+    {
       if( c.jccr != 0 )
       {
         CBufI16( P.dbgResi ).v[derivedOffset + i] = int16_t( jccrDerived( c.jccr, re ) );

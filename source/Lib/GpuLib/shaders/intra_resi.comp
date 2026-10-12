@@ -129,6 +129,30 @@ void main()
           resi.v[derivedOffset + i] = int16_t( jccrDerived( t.jccr, r ) );
         }
       }
+      // sign prediction (TrQuant::predCoeffSigns' templates of LFNST / NSPT blocks, createTemplateLFNST): NSPT of a
+      // predicted coefficient alone (amplitude 1 << 8 at its scan index) is its residual; at the border, times the
+      // coefficient's dequantized magnitude, >> 8
+      if( t.spOffset >= 0 )
+      {
+        BufI32    sp  = BufI32( P.signPred );
+        const int len = W + H, num = sp.v[t.spOffset + SP_NUM];
+        for( int i = lid; i < num * len; i += NT )
+        {
+          const int k = i / len, j = i % len;
+          const int pos = sp.v[t.spOffset + SP_POS + k], px = pos & 0xffff, py = pos >> 16;
+          int       scanIdx = 0;   // its index in the scan (the predicted coefficients lie among the first 16)
+          while( scanIdx < t.secNumIn && mt.v[t.secScan + scanIdx] != pos )
+          {
+            scanIdx++;
+          }
+          const int r = j < H ? H - 1 - j : 0, c = j < H ? 0 : j - H;
+          const int jj = t.secTranspose != 0 ? c * H + r : r * W + c;
+          const int k8 = scanIdx < t.secNumIn ? int( kernels.v[t.secMatrix + scanIdx * t.secRowLength + jj] ) : 0;
+          const int basis    = clip3i( t.trMin, t.trMax, ( 256 * k8 + ( 1 << ( shift - 1 ) ) ) >> shift );
+          const int coeffVal = dequant( t, cf.v[t.coeffOffset + py * nzC + px], addDq, mt, P.qcsOffset );
+          sp.v[t.spOffset + SP_TEMPLATES + i] = int( int16_t( ( coeffVal * basis + 128 ) >> 8 ) );   // a Pel
+        }
+      }
       barrier();
       continue;
     }
@@ -165,9 +189,10 @@ void main()
     }
     // sign prediction (TrQuant::predCoeffSigns' templates, createTemplate): per predicted coefficient the left column
     // (bottom-up) and the top row of the residual of that coefficient alone with the amplitude 1 << 8 (xIT of one
-    // coefficient: one product per stage), times its dequantized magnitude, >> 8. The host gave the predicted
-    // coefficients positive: the residual below is the one the decision in intra_rec starts from
-    if( t.spOffset >= 0 )
+    // coefficient: one product per stage), times its dequantized magnitude, >> 8 (with LFNST after the residual, below).
+    // The host gave the predicted coefficients positive: the residual below is the one the decision in intra_rec
+    // starts from
+    if( t.spOffset >= 0 && t.secKind == SEC_NONE )
     {
       BufI32 sp = BufI32( P.signPred );
       const int len = W + H, num = sp.v[t.spOffset + SP_NUM];
@@ -217,5 +242,53 @@ void main()
       }
     }
     barrier();
+    // sign prediction's templates of an LFNST block (createTemplateLFNST): per predicted coefficient the region with the
+    // LFNST of that coefficient alone (amplitude 1 << 8 at its scan index, the others zero), its first stage and the
+    // second stage at the border, times the coefficient's dequantized magnitude, >> 8 (s_lfnst and s_stage1 are free
+    // again)
+    if( t.spOffset >= 0 && t.secKind == SEC_LFNST )
+    {
+      BufI32    sp  = BufI32( P.signPred );
+      const int len = W + H, num = sp.v[t.spOffset + SP_NUM];
+      for( int k = 0; k < num; k++ )
+      {
+        const int pos = sp.v[t.spOffset + SP_POS + k];
+        int       scanIdx = 0;   // its index in the scan (the predicted coefficients lie among the first 16)
+        while( scanIdx < t.secNumIn && mt.v[t.secScan + scanIdx] != pos )
+        {
+          scanIdx++;
+        }
+        for( int i = lid; i < nzR * nzC; i += NT )
+        {
+          s_lfnst[i] = 0;
+        }
+        barrier();
+        for( int j = lid; j < t.secRowLength && scanIdx < t.secNumIn; j += NT )
+        {
+          const int lp = mt.v[t.secLayout + j];
+          s_lfnst[( lp >> 16 ) * nzC + ( lp & 0xffff )] =
+            clip3i( t.trMin, t.trMax, ( 256 * int( kernels.v[t.secMatrix + scanIdx * t.secRowLength + j] ) + 64 ) >> 7 );
+        }
+        barrier();
+        for( int i = lid; i < nzC * H; i += NT )
+        {
+          const int xf = i / H, y = i % H;
+          int sum = 0;
+          for( int ky = 0; ky < nzR; ky++ ) sum += mt.v[offH + ky * H + y] * s_lfnst[ky * nzC + xf];
+          s_stage1[xf * H + y] = int16_t( clip3i( t.trMin, t.trMax, ( sum + rnd1 ) >> t.shift1 ) );
+        }
+        barrier();
+        const int coeffVal = dequant( t, cf.v[t.coeffOffset + ( pos >> 16 ) * nzC + ( pos & 0xffff )], addDq, mt, P.qcsOffset );
+        for( int j = lid; j < len; j += NT )
+        {
+          const int r = j < H ? H - 1 - j : 0, c = j < H ? 0 : j - H;
+          int sum = 0;
+          for( int xf = 0; xf < nzC; xf++ ) sum += mt.v[offW + xf * W + c] * int( s_stage1[xf * H + r] );
+          const int basis = clip3i( t.trMin, t.trMax, ( sum + rnd2 ) >> t.shift2 );
+          sp.v[t.spOffset + SP_TEMPLATES + k * len + j] = int( int16_t( ( coeffVal * basis + 128 ) >> 8 ) );   // a Pel
+        }
+        barrier();
+      }
+    }
   }
 }

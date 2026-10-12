@@ -1177,13 +1177,6 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
       }
     }
   }
-  // the decision recomputes the residual with the dequantization and primary transform of intra_resi, but not yet with
-  // LFNST / NSPT
-  if( signPred && t.secKind != SEC_NONE )
-  {
-    unsupported( "sign prediction of LFNST / NSPT blocks" );
-    return;
-  }
   if( signPred && ( !t.cbf || ts || area.width < 4 || area.height < 4 || area.width > 32 || area.height > 32 ) )
   {
     unsupported( "sign prediction of a block outside TU::getUseSignPred's conditions" );
