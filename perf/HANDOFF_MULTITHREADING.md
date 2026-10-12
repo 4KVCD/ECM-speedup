@@ -432,5 +432,8 @@ AI-latency ~2-2.5x.
    motion search per reference picture gained nothing on this CPU (see Progress); further P2 loops for LD are smaller
    still, so LD stays at the single-thread speed unless spinning workers get cheaper. RA with more threads than
    cores of one kind: RA 257 frames unpinned on all 20 cores took 283.5 s with 8 threads, 271.2 s with 12 and 272.7 s
-   with 16 (6.39x, 6.68x, 6.64x; 9.9, 13.9 and 17.8 GB): the periods' chains bound it.
+   with 16 (6.39x, 6.68x, 6.64x; 9.9, 13.9 and 17.8 GB): the periods' chains bound it. Frame threads with CU threads
+   for short RA, where the chains leave cores idle (8 P-cores): RA 65 frames 198.2 s with 8 frame threads, 203.9 s
+   with 4 x 2 CU threads and 198.7 s with 8 x 2; RA 33 frames 190.3 s with 8, 190.0 s with 4 x 2 and 197.2 s with
+   2 x 4: the CU helpers code intra candidates, little of an inter picture's work.
 3. Report each step as step % and cumulative % with before/after numbers and commit hashes, one commit per step.
