@@ -13,8 +13,8 @@ wall-clock gains with threads are "the easy baseline". Decoder status: single-th
 (`--GpuLoopFilter=1`: ALF, SAO, BIF, CCSAO, LF-CCCM, offset refinement on Vulkan). The user then asked for **a full
 GPU decoder in Vulkan, optimized until nothing is left** ("The GPU decoder needs to fully decode the frame on the
 GPU"; "Your first Vulkan version is going to be slow. That's OK"). That work is branch `dec-gpurecon`: intra
-reconstruction on the GPU (`--GpuRecon`), tool levels M1-M22 done and verified bit-exact (M19: DIMD, M20: OBIC, M21:
-intra merge, M22: the transforms of DIMD CUs); it is **not yet
+reconstruction on the GPU (`--GpuRecon`), tool levels M1-M23 done and verified bit-exact (M19: DIMD, M20: OBIC, M21:
+intra merge, M22: the transforms of DIMD CUs, M23: LFNST of MIP); it is **not yet
 faster than the CPU decoder** (see section 8) and supports only a restricted tool set (all real CTC streams fall back
 to the CPU, first reason: TMRL).
 
@@ -375,6 +375,20 @@ getFinalIntraModeForTransform, as the list and DIMD's second mode. Test sets: m2
 transforms, MIP off: MIP CUs with LFNST fall back, "LFNST of MIP") and m22o (encTest2, OBIC preferred, no intra merge).
 Rejected: DIMD CUs with several transform blocks (the CPU blends planar predicted from the CU's references at the
 block's size; the intra configuration's CTU 128 and transform blocks up to 128 leave none), implicit MTS (supported()).
+M23: LFNST / NSPT of MIP blocks. Their mode is a DIMD of the block's own MIP prediction (deriveIpmForTransform, run
+for every MIP block since OBIC: buildHistogram's 3x3 gradients inside the block, every second sample both ways from
+128 samples on, the strongest mode `mipDimdMode` and the second `dimdDerivedIntraDir2nd`), so a MIP block with LFNST
+(DERIVE_MIP_DIMD) derives it from its reduced prediction (`mipTransformMode`, the samples by `mipSample` as the
+upsampling gives them). Every block of derived transforms chooses them (`selectTransform`) and computes its residual
+(`inChainResidual`) in one place, after the references and MIP's reduced prediction, before predicting: a second copy
+of that code in the MIP branch made the pictures with DIMD ~7 % slower (code that is merely present; 1 to 3 % on most
+sets remain against M22, a candidate for the speed work). With MTSS (in 4 to
+15 % of them) the MIP CU gets a node although its mode is known (CU_KNOWN, the host's mode kept), which derives only
+MTSS's mode list; the block chooses with its second mode and the list (mtssChoice) and depends on that node.
+Verification compares mipDimdMode, the second mode, the list and choice (the CU's DimdOut) and the block's
+transforms. Test set m23: the m22 arguments with MIP. MTS of MIP takes planar's kernels (getTrTypes), unchanged.
+Rejected: LFNST of MIP without DIMD in the SPS (the CPU's mode is planar then; no test), of a MIP CU of several blocks
+and of chroma MIP (4:4:4).
 
 ## 8. Numbers (i7-10700 8C/16T, Win11, GCC 16.2, RTX 3070 driver 616.92)
 
@@ -402,7 +416,7 @@ Profile of a GPU-on decode (non-LTO, m2_park16, share of all samples): parsing ~
    NSPT blocks. 2026-10-12: M17 intra modes derived on the GPU (tested with `ECM_GPU_MODES=1`), M18 the transforms of
    derived modes on the GPU, M19 DIMD (the m19d test set), M20 OBIC (the m20 and m20o test sets), M21 intra merge
    (the m19 set, encoded by the stock encoder with DIMD: OBIC and intra merge everywhere), M22 the transforms of DIMD
-   CUs and MTSS (the m22 and m22o sets).
+   CUs and MTSS (the m22 and m22o sets), M23 LFNST / NSPT of MIP (the m23 set).
    All 19 regular streams now stop at "TMRL" (the next sequence-level check; the block-level tools of step 4 follow).
 3. Make the GPU path win on CPU time per picture: the derive-only pass (record during parsing or a leaner pass;
    speed up getSpatialIpm/getPURestricted, which also helps the CPU decoder), GPU behaviour with frame threads
@@ -417,13 +431,11 @@ Profile of a GPU-on decode (non-LTO, m2_park16, share of all samples): parsing ~
    `bin\encNoOM` (m19d: ECM_TEST_NO_OBIC_MERGE skips both), `bin\encTest` (m20: ECM_TEST_NO_INTRA_MERGE;
    ECM_TEST_NO_OBIC skips OBIC), `bin\encTest2` (the same, and for m20o ECM_TEST_PREFER_OBIC, which skips plain DIMD
    where OBIC is available, for many more OBIC CUs) - the patch adds `&& !getenv(...)` to `testObic` /
-   `testIntraMerge` and sets `m_skipDimdMode` / `m_skipDimdLfnstMtsPass` where OBIC is tested. Next LFNST of MIP (its
-   kernel from a DIMD of the MIP prediction, cu.mipDimdMode; the m22 arguments with --MIP=1 give such CUs, which
-   fall back at "LFNST of MIP"), then TIMD (its template costs exist since M21: intra_timd.glsl), MPM sorting / MDIP
-   / PDP, TMRL, CCLM/CCCM and the other cross-component tools, chroma reordering / DBV, IntraTMP / IBC, implicit MTS
-   (not in CTC), then inter pictures. Intra merge's GPU time (m19: park720 152, four720 183 ms per picture, from 347 /
-   392 at first) has room: the candidate walk and the reference padding are single-invocation steps on the dependency
-   chain. Each level: new
+   `testIntraMerge` and sets `m_skipDimdMode` / `m_skipDimdLfnstMtsPass` where OBIC is tested. Next TIMD (its
+   template costs exist since M21: intra_timd.glsl), MPM sorting / MDIP / PDP, TMRL, CCLM/CCCM and the other
+   cross-component tools, chroma reordering / DBV, IntraTMP / IBC, implicit MTS (not in CTC), then inter pictures.
+   Intra merge's GPU time (m19: park720 152, four720 183 ms per picture, from 347 / 392 at first) has room: the
+   candidate walk and the reference padding are single-invocation steps on the dependency chain. Each level: new
    test set with exactly that tool on, verify mode identical, ON mode identical (and `ECM_GPU_DUMP` +
    `perf/gpu/dumpdiff.py`: the records of both runs agree), canaries, commit. Speed of derived modes: with
    `ECM_GPU_MODES=1` the GPU time of four 720p pictures sets is 25.3 instead of 14.0 ms per picture (the union of the
@@ -450,7 +462,8 @@ Profile of a GPU-on decode (non-LTO, m2_park16, share of all samples): parsing ~
   Code a kernel never runs still costs: M18's in-chain paths made intra_rec ~4 % slower on pictures that never take
   them (a per-sample test of a global flag in storeRecon cost as much again; folded into Tu::resiFrom), M19's DIMD
   blending ~15 % (spread over the loop around the prediction and the code inside it; no single part), M21's intra
-  merge ~11 % on pictures with DIMD. Since M19 intra_rec is built as several pipelines with specialization constants
+  merge ~11 % on pictures with DIMD, a second call site of selectTransform and inChainResidual ~7 % (M23: one call
+  site each instead). Since M19 intra_rec is built as several pipelines with specialization constants
   (`WITH_DIMD`, `WITH_DERIVED_TRANSFORMS`, `WITH_MERGE`; `gpu::Kernel::create`'s specialization, GpuIntraRec.cpp's
   `IntraRecVariant`) and a picture runs the one without the features it does not use. The compiler is not monotonic
   here: the pipeline with DIMD alone was slower than the one with DIMD and the derived transforms in every case

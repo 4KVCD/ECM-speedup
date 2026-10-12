@@ -83,8 +83,12 @@ const int DERIVE_DIMD = 128;
 const int DERIVE_OBIC = 256;
 // a block of an intra merge CU (CU_MERGE): the prediction blends the chosen candidate's modes (the node's DimdOut slot)
 const int DERIVE_MERGE = 512;
-// MTSS (JVET-AK0217, mdirIdx): the LFNST / NSPT mode and bucket are those the CU's node chose (Cu::mtss, DIMD_OUT_MTSS_*)
+// MTSS (JVET-AK0217, mdirIdx): the LFNST / NSPT mode and bucket are those chosen into the CU's DimdOut (DIMD_OUT_MTSS_*)
+// by its node, or by a MIP block itself (mipTransformMode)
 const int DERIVE_MTSS = 1024;
+// a MIP block with LFNST / NSPT: intra_rec derives their mode from a DIMD of its prediction (mipDimdMode), then its
+// residual
+const int DERIVE_MIP_DIMD = 2048;
 
 // Params::dbgParams per block: the derived dirMode, isModeVer, intraPredAngle, absInvAngle, useCubic, refFilter,
 // applyPDPC, gradPDPC, angularScale, fusion, bf, plIdx, then mtxV, mtxH, secMatrix, secTranspose, secLayout
@@ -98,7 +102,8 @@ const int MPM_NEIGHBOURS = 23;
 struct Cu
 {
   int kind;              // CU_*: how its intra mode is found
-  int node;              // the record (DERIVE_NODE) that derives the mode and publishes it (Params::cuMode); -1 CU_KNOWN
+  int node;              // the record (DERIVE_NODE) that derives the mode and publishes it (Params::cuMode); -1 CU_KNOWN,
+                         // but a MIP CU with MTSS (CU_KNOWN), whose node derives only MTSS's mode list
   int x, y, w, h;        // the CU (luma samples for luma)
   int mpmFlag, secondMpmFlag, ipredIdx;   // luma: the parsed intra mode syntax
   int nbFirst, nbLast;   // luma: the modes CU::isIdxModeValid removes at the start / the end of the angular range
@@ -148,7 +153,9 @@ layout( buffer_reference, std430, buffer_reference_align = 4 ) buffer BufDimdCal
 // sets (dimdMode, dimdBlending, dimdBlendMode, dimdRelWeight, dimdLocDep: DIMD_OUT_PARAMS, which an intra merge CU's
 // node writes its choice in), the second strongest mode (candModeListForTransform[1]), with MTSS the mode list
 // (candModeListForTransformMtss) and getFinalIntraModeForTransform's result: the LFNST / NSPT mode in NSPT's numbering
-// and secondBucket; DIMD chroma's the final mode and the second one (dimdChromaMode, dimdChromaModeSecond)
+// and secondBucket; DIMD chroma's the final mode and the second one (dimdChromaMode, dimdChromaModeSecond). A MIP block
+// with LFNST / NSPT writes its CU's: mipDimdMode as the mode, dimdDerivedIntraDir2nd as the second, with MTSS the result
+// (its node the list)
 const int DIMD_OUT             = 30;
 const int DIMD_OUT_PARAMS      = 24;
 const int DIMD_OUT_MODE        = 0;
@@ -368,7 +375,8 @@ struct Params
                         // the final mode), the host's (CU_KNOWN) or written by the CU's node (-1 until then)
   uint64_t dbgParams;   // verification: per block the parameters intra_rec derived (DBG_PARAMS int32, DERIVE_MODE blocks)
   uint64_t dimdCalls;   // the DIMD histograms of the CUs (Cu::dimdNum DimdCall at Cu::dimd)
-  uint64_t dimdOut;     // int32 per CU (DIMD_OUT): its DIMD, written by its node (for its blocks, and the comparison)
+  uint64_t dimdOut;     // int32 per CU (DIMD_OUT): its DIMD, written by its node, a MIP CU's by its block (for its blocks,
+                        // and the comparison)
   uint64_t obicNbrs;    // per OBIC CU (Cu::obic) its neighbours (OBIC_NBRS ObicNbr)
   uint64_t obicOut;     // int32 per OBIC CU (OBIC_OUT): its OBIC, written by its node (for its blocks, the comparison)
   uint64_t blendAcc;    // int32 per intra_rec workgroup: 3 x 128 x 128 sums of DIMD / OBIC / merge blending (BLEND_ACC)

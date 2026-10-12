@@ -62,6 +62,7 @@ shared int     s_red[6];                      // workgroup sums
 shared int16_t s_bfLut[48];                   // the bilateral filter's LUT row of the block's QP
 shared int     s_mipBdry[8];                  // MIP: the reduced boundary (top, then left)
 shared int     s_mipRed[64];                  // MIP: the reduced prediction (4 x 4 or 8 x 8)
+shared int     s_mipDimdMode;                 // MIP with LFNST / NSPT: the DIMD mode of its prediction (mipDimdMode)
 // sign prediction (signPrediction; blocks of 4 x 4 to 32 x 32, at most 8 predicted signs)
 shared int16_t s_spPred[32 * 32];             // the block's prediction, reconstructed once the signs are decided
 shared int16_t s_spBorder[64];                // TU::predBorderResi: the residual the neighbours predict along the border
@@ -204,9 +205,10 @@ bool nsptTranspose( int im )
 // pair of ECM's explicit MTS (TrQuant::getTrTypes with MTSExt: the set of the size class and the mode's wide angle,
 // clamped to 2 .. 66, the identity transform near horizontal / vertical) and the LFNST / NSPT set, transposition and
 // matrix of getFinalIntraModeForTransform's mode (planar of a directional planar index as its direction, the wide
-// angle of the block, of the CU with ISP, in NSPT's numbering). mode: the CU's mode, which MTS takes; LFNST / NSPT
-// take a DIMD or OBIC CU's DIMD main mode instead (getFinalIntraModeForTransform's DIMD branch), with MTSS the mode
-// and NSPT bucket the CU's node chose. plIdx: the CU's directional planar index
+// angle of the block, of the CU with ISP, in NSPT's numbering). mode: the CU's mode, which MTS takes, or a MIP block's
+// mipDimdMode (MIP has no MTS with LFNST); LFNST / NSPT take a DIMD or OBIC CU's DIMD main mode instead
+// (getFinalIntraModeForTransform's DIMD branch), with MTSS the mode and NSPT bucket chosen into the CU's DimdOut.
+// plIdx: the CU's directional planar index
 void selectTransform( inout Tu t, int mode, int plIdx )
 {
   BufI32     mt      = BufI32( P.matrices );
@@ -275,6 +277,14 @@ void selectTransform( inout Tu t, int mode, int plIdx )
   }
 }
 
+// verification: the transforms block g_ti took with derived transforms (Params::dbgParams' last fields), one invocation
+void storeDbgTransforms( Tu t )
+{
+  const int o = g_ti * DBG_PARAMS;
+  BufI32 dp = BufI32( P.dbgParams );
+  dp.v[o + 12] = t.mtxV;  dp.v[o + 13] = t.mtxH;  dp.v[o + 14] = t.secMatrix;  dp.v[o + 15] = t.secTranspose;  dp.v[o + 16] = t.secLayout;
+}
+
 int filterTap( int taps, int frac, int i )
 {
   int t = taps == 6 ? 0 : taps == 8 ? 1 : taps == 10 ? 2 : taps == 12 ? 3 : 4;
@@ -323,8 +333,8 @@ ivec3 mtssList()
   return ivec3( mode[0], mode[1], mode[2] );
 }
 
-// getFinalIntraModeForTransform with MTSS for the luma block of CU c (a DIMD, OBIC or intra merge CU: one block of its
-// size, no directional planar index), one invocation: the LFNST / NSPT mode in NSPT's numbering and whether NSPT takes
+// getFinalIntraModeForTransform with MTSS for the luma block of CU c (a DIMD, OBIC, intra merge or MIP CU: one block of
+// its size, no directional planar index), one invocation: the LFNST / NSPT mode in NSPT's numbering and whether NSPT takes
 // its second bucket. mode1: the mode without MTSS; second: the mode MTSS tries first (-1: none); list: MTSS's mode
 // list. A mode whose LFNST set or transposition differs from the first one's is taken: second, else the list's last
 // entry where any entry differs (the CPU's loop over the list does not stop at the first), else its first; NSPT takes
@@ -513,6 +523,68 @@ int mipSample( int x, int y, int ps, int upH, int upV, int predStride )
   return ( before * ( upV - pos ) + mipHor( i, x, ps, upH, upV, predStride ) * pos + ( 1 << ( lg - 1 ) ) ) >> lg;
 }
 
+// buildHistogram's subsampling with MTSS: every second column and row of regions of this many samples or more
+const int MIN_MTSS_SIZE = 128;
+
+// the LFNST / NSPT mode of MIP block t of W x H (DERIVE_MIP_DIMD), all invocations, s_dimdHist's first histogram zeroed
+// before, ending with a barrier: deriveIpmForTransform over the prediction (buildHistogram's 3x3 gradients at the
+// samples inside the block, subsampled from MIN_MTSS_SIZE samples on; the strongest mode, mipDimdMode, and the second
+// strongest, dimdDerivedIntraDir2nd), into s_mipDimdMode and for the comparison the CU's DimdOut; with MTSS
+// (DERIVE_MTSS) MTSS's choice among them and the mode list of the CU's node, into the DimdOut that selectTransform reads
+void mipTransformMode( Tu t, int W, int H, int ps, int upH, int upV, int predStride, int lid, int NT )
+{
+  const int iw = W - 2, ih = H - 2, step = iw * ih >= MIN_MTSS_SIZE ? 2 : 1;
+  const int cols = ( iw + step - 1 ) / step, rows = ( ih + step - 1 ) / step;
+  for( int i = lid; i < cols * rows; i += NT )
+  {
+    const int   x = 1 + ( i % cols ) * step, y = 1 + ( i / cols ) * step;
+    const ivec2 g = sobel3x3( mipSample( x - 1, y - 1, ps, upH, upV, predStride ), mipSample( x, y - 1, ps, upH, upV, predStride ),
+                              mipSample( x + 1, y - 1, ps, upH, upV, predStride ),
+                              mipSample( x - 1, y, ps, upH, upV, predStride ), mipSample( x + 1, y, ps, upH, upV, predStride ),
+                              mipSample( x - 1, y + 1, ps, upH, upV, predStride ), mipSample( x, y + 1, ps, upH, upV, predStride ),
+                              mipSample( x + 1, y + 1, ps, upH, upV, predStride ) );
+    if( g.x != 0 || g.y != 0 )
+    {
+      atomicAdd( s_dimdHist[dimdAngle( g )], abs( g.x ) + abs( g.y ) );
+    }
+  }
+  SYNC();
+  if( lid == 0 )
+  {
+    int firstAmp = 0, secondAmp = 0, first = 0, second = 0;
+    for( int i = 0; i < NUM_LUMA_MODE; i++ )
+    {
+      const int amp = s_dimdHist[i];
+      if( amp > firstAmp )
+      {
+        secondAmp = firstAmp;
+        second    = first;
+        firstAmp  = amp;
+        first     = i;
+      }
+      else if( amp > secondAmp )
+      {
+        secondAmp = amp;
+        second    = i;
+      }
+    }
+    s_mipDimdMode = first;
+    CBufI32   o    = CBufI32( P.dimdOut );
+    const int base = t.cu * DIMD_OUT;
+    o.v[base + DIMD_OUT_MODE]      = first;
+    o.v[base + DIMD_OUT_TR_SECOND] = second;
+    if( ( t.derive & DERIVE_MTSS ) != 0 )
+    {
+      const ivec3 list   = ivec3( o.v[base + DIMD_OUT_MTSS_LIST], o.v[base + DIMD_OUT_MTSS_LIST + 1], o.v[base + DIMD_OUT_MTSS_LIST + 2] );
+      const ivec2 choice = mtssChoice( BufCu( P.cus ).v[t.cu], first, second, list );
+      o.v[base + DIMD_OUT_MTSS_MODE]   = choice.x;
+      o.v[base + DIMD_OUT_MTSS_BUCKET] = choice.y;
+    }
+  }
+  controlBarrier( gl_ScopeWorkgroup, gl_ScopeWorkgroup, gl_StorageSemanticsBuffer | gl_StorageSemanticsShared,
+                  gl_SemanticsAcquireRelease );
+}
+
 // workgroup sums of a and b (all invocations, uniform control flow; the slots are zero before)
 ivec2 wgSum2( int a, int b, int slot )
 {
@@ -696,9 +768,10 @@ int secondStage( Tu c, int x, int y, int y0, int rows )
 }
 
 // the residual of a block whose transforms depend on a derived mode (DERIVE_TRANSFORM, without sign prediction),
-// computed before its prediction in chunks of rows whose first stage fits s_spStage1 and stored (device-coherent) where
-// intra_resi stores the others', with joint CbCr also the other block's (which waits for this one); a barrier with
-// buffer semantics makes it visible to the invocations that read it at the reconstruction (storeRecon)
+// computed before its prediction (a MIP block's after it: mipTransformMode) in chunks of rows whose first stage fits
+// s_spStage1 and stored (device-coherent) where intra_resi stores the others', with joint CbCr also the other block's
+// (which waits for this one); a barrier with buffer semantics makes it visible to the invocations that read it at the
+// reconstruction (storeRecon)
 void inChainResidual( Tu t, int lid, int NT )
 {
   const bool prepared = t.secKind != SEC_NONE;   // LFNST / NSPT: their inputs and outputs in shared memory
@@ -841,7 +914,7 @@ void signPredData( Tu c, int n, int lid, int NT )
 // hypothesis was right, and after a wrong one the best is searched again among the hypotheses that agree with the
 // signs decided. Where a decided sign is negative the residual is computed again (dequantization, LFNST or NSPT and
 // both transform stages as in intra_resi, with joint CbCr also the other component's, for the other block of the pair,
-// which waits for this one). A block whose transforms depend on a derived mode (DERIVE_TRANSFORM; its mode is s_mode)
+// which waits for this one). A block whose transforms depend on a derived mode (DERIVE_TRANSFORM; chosen into t before)
 // gets its data here (signPredData) and its residual computed in any case.
 void signPrediction( Tu t, int lid, int NT )
 {
@@ -1129,7 +1202,7 @@ void main()
       {
         cuMode = mergeNode( c, t.cu, t.bitDepth, ( t.derive & DERIVE_NO_PDPC ) != 0, lid, NT );
       }
-      else if( lid == 0 )
+      else if( lid == 0 && c.kind != CU_KNOWN )
       {
         int modes[MPM_NEIGHBOURS];
         for( int k = 0; k < MPM_NEIGHBOURS; k++ )
@@ -1138,17 +1211,26 @@ void main()
         }
         cuMode = deriveCuMode( c, modes, dimdModes );
       }
-      if( lid == 0 )
+      if( lid == 0 && c.kind != CU_KNOWN )   // (a MIP CU's node, CU_KNOWN, keeps the host's mode)
       {
         CBufI32( P.cuMode ).v[t.cu] = cuMode;
       }
-      // MTSS (a DIMD, OBIC or intra merge CU with mdirIdx): its mode list from histograms of its own (deriveDimdModeList),
-      // once dimdSelect and obicSelect have read theirs, then the LFNST / NSPT mode and bucket of its luma block
+      // MTSS (a DIMD, OBIC, intra merge or MIP CU with mdirIdx): its mode list from histograms of its own
+      // (deriveDimdModeList), once dimdSelect and obicSelect have read theirs, then the LFNST / NSPT mode and bucket of its
+      // luma block (a MIP block chooses them itself, from its prediction: mipTransformMode)
       if( WITH_DIMD && WITH_DERIVED_TRANSFORMS && c.mtss >= 0 )
       {
         SYNC();
         dimdHistogramsOf( c.mtss, MTSS_CALLS, c.w, c.h, lid, NT );
-        if( lid == 0 )
+        if( lid == 0 && c.kind == CU_KNOWN )
+        {
+          const ivec3 list = mtssList();
+          for( int k = 0; k < 3; k++ )
+          {
+            CBufI32( P.dimdOut ).v[t.cu * DIMD_OUT + DIMD_OUT_MTSS_LIST + k] = list[k];
+          }
+        }
+        else if( lid == 0 )
         {
           // the mode without MTSS (a DIMD or OBIC CU's DIMD main mode, intra merge's) and the one MTSS tries first:
           // DIMD's second strongest, an OBIC CU's second OBIC mode (-1 only without OBIC modes, which no decodable
@@ -1224,13 +1306,6 @@ void main()
         t.fusion = blending ? 0 : t.fusion;
         t.bf     = blending && ( t.derive & DERIVE_BF ) != 0 ? 1 : 0;
       }
-      // its transforms, where they depend on the mode: the matrices of the mode, and (unless the residual comes from
-      // the other block of a joint CbCr pair) without sign prediction the residual's first stage now, its second
-      // stage sample by sample at the reconstruction (storeRecon); signPrediction computes all for its blocks
-      if( WITH_DERIVED_TRANSFORMS && ( t.derive & DERIVE_TRANSFORM ) != 0 )
-      {
-        selectTransform( t, s_mode, BufCu( P.cus ).v[t.cu].plIdx );
-      }
       if( pc.verify != 0 && lid == 0 )
       {
         const int o = g_ti * DBG_PARAMS;
@@ -1238,14 +1313,7 @@ void main()
         dp.v[o + 0] = t.dirMode;   dp.v[o + 1] = t.isModeVer;  dp.v[o + 2] = t.intraPredAngle;  dp.v[o + 3] = t.absInvAngle;
         dp.v[o + 4] = t.useCubic;  dp.v[o + 5] = t.refFilter;  dp.v[o + 6] = t.applyPDPC;       dp.v[o + 7] = t.gradPDPC;
         dp.v[o + 8] = t.angularScale; dp.v[o + 9] = t.fusion;  dp.v[o + 10] = t.bf;             dp.v[o + 11] = t.plIdx;
-        dp.v[o + 12] = t.mtxV;     dp.v[o + 13] = t.mtxH;      dp.v[o + 14] = t.secMatrix;      dp.v[o + 15] = t.secTranspose;
-        dp.v[o + 16] = t.secLayout;
       }
-    }
-    if( WITH_DERIVED_TRANSFORMS && ( t.derive & DERIVE_TRANSFORM ) != 0 && t.spCoded < 0 && t.resiFrom < 0 )
-    {
-      inChainResidual( t, lid, NT );
-      t.resiFrom = g_ti;   // storeRecon reads it device-coherent
     }
     int  angClear  = 0;
     bool angClear2 = false;
@@ -1329,6 +1397,76 @@ void main()
       bf = min( ( ( madT + madL + 1 ) >> 1 ) >> 4, 15 ) <= 10;
     }
 
+    // ----- MIP's reduced prediction (MatrixIntraPrediction::prepareInputForPred, computeReducedPred), which its
+    // upsampling reads (mipSample); a MIP block with LFNST / NSPT takes their mode from its prediction (mipTransformMode)
+    const int mipPs = t.mipSizeId < 2 ? 4 : 8, mipUpH = W / mipPs, mipUpV = H / mipPs;
+    if( t.mipMatrix >= 0 )
+    {
+      const int bs = t.mipSizeId == 0 ? 2 : 4, inSize = 2 * bs;
+      // the reduced boundary: the Haar-downsampled top (entries 0 .. bs - 1) and left (bs .. 2 bs - 1) references
+      if( lid < inSize )
+      {
+        const bool top = lid < bs;
+        const int  k = top ? lid : lid - bs, f = ( top ? W : H ) / bs, lg = findMSB( f );
+        int sum = 0;
+        for( int j = 0; j < f; j++ ) sum += int( s_ref[0][( top ? 1 : predStride + 1 ) + k * f + j] );
+        s_mipBdry[lid] = f > 1 ? ( sum + ( 1 << ( lg - 1 ) ) ) >> lg : sum;
+      }
+      const bool mipDimd = WITH_DERIVED_TRANSFORMS && WITH_DIMD && ( t.derive & DERIVE_MIP_DIMD ) != 0;
+      for( int i = lid; mipDimd && i < NUM_LUMA_MODE; i += NT )   // mipTransformMode's histogram
+      {
+        s_dimdHist[i] = 0;
+      }
+      SYNC();
+      // the matrix input: [top, left], transposed [left, top], rebased on its first entry; that entry becomes the
+      // difference to the mid level, or 0 for the large size class, whose matrices have no weight for it
+      const bool transposed = t.mipTransposed != 0;
+      int mipIn[8];
+      for( int i = 0; i < inSize; i++ ) mipIn[i] = s_mipBdry[transposed ? ( i < bs ? bs + i : i - bs ) : i];
+      const int inputOffset = mipIn[0];
+      mipIn[0] = t.mipSizeId < 2 ? ( 1 << ( t.bitDepth - 1 ) ) - inputOffset : 0;
+      int inSum = mipIn[0];
+      for( int i = 1; i < inSize; i++ )
+      {
+        mipIn[i] -= inputOffset;
+        inSum += mipIn[i];
+      }
+      // the reduced prediction, one sample per invocation (computed in the transposed order when transposed); the
+      // large class's rows hold the weights of inputs 1 ..
+      if( lid < mipPs * mipPs )
+      {
+        const int rowLen = t.mipSizeId == 2 ? inSize - 1 : inSize, first = t.mipSizeId == 2 ? 1 : 0;
+        int sum = 0;
+        for( int i = first; i < inSize; i++ ) sum += mipIn[i] * BufI32( P.matrices ).v[t.mipMatrix + lid * rowLen + i - first];
+        const int offset = ( 1 << ( 6 - 1 ) ) - 32 * inSum;   // MIP_SHIFT_MATRIX 6, MIP_OFFSET_MATRIX 32
+        s_mipRed[transposed ? ( lid % mipPs ) * mipPs + lid / mipPs : lid] = clip3i( 0, maxPel, ( ( sum + offset ) >> 6 ) + inputOffset );
+      }
+      SYNC();
+      if( mipDimd )
+      {
+        mipTransformMode( t, W, H, mipPs, mipUpH, mipUpV, predStride, lid, NT );
+      }
+    }
+
+    // ----- the transforms, where they depend on a derived mode or a MIP block's prediction: the matrices of the mode,
+    // and (unless the residual comes from the other block of a joint CbCr pair) without sign prediction the residual, its
+    // first stage now, its second sample by sample at the reconstruction (storeRecon); signPrediction computes all for
+    // its blocks
+    if( WITH_DERIVED_TRANSFORMS && ( t.derive & DERIVE_TRANSFORM ) != 0 )
+    {
+      const bool mipDimd = WITH_DIMD && ( t.derive & DERIVE_MIP_DIMD ) != 0;
+      selectTransform( t, mipDimd ? s_mipDimdMode : s_mode, mipDimd ? 0 : BufCu( P.cus ).v[t.cu].plIdx );
+      if( pc.verify != 0 && lid == 0 )
+      {
+        storeDbgTransforms( t );
+      }
+      if( t.spCoded < 0 && t.resiFrom < 0 )
+      {
+        inChainResidual( t, lid, NT );
+        t.resiFrom = g_ti;   // storeRecon reads it device-coherent
+      }
+    }
+
     // ----- prediction and reconstruction; with blending (predIntraAng) the predictions of the CU's modes in turn (DIMD's
     // main mode, planar and blend modes; OBIC's modes), each with the parameters of its mode (initPredIntraParams for
     // the CU, no fusion, no bilateral filter), its references and its filter length (DIMD's by its weight), summed
@@ -1357,45 +1495,9 @@ void main()
         for( int i = lid; i <= predStride + predHSize; i += NT ) s_ref[0][i] = t.refFilter != 0 ? s_tmp[i] : s_ref[1][i];
         SYNC();
       }
-      if( t.mipMatrix >= 0 )   // MIP (MatrixIntraPrediction::prepareInputForPred, computeReducedPred, predictionUpsampling)
+      if( t.mipMatrix >= 0 )   // MIP: predictionUpsampling of the reduced prediction
       {
-        const int bs = t.mipSizeId == 0 ? 2 : 4, ps = t.mipSizeId < 2 ? 4 : 8, inSize = 2 * bs;
-        // the reduced boundary: the Haar-downsampled top (entries 0 .. bs - 1) and left (bs .. 2 bs - 1) references
-        if( lid < inSize )
-        {
-          const bool top = lid < bs;
-          const int  k = top ? lid : lid - bs, f = ( top ? W : H ) / bs, lg = findMSB( f );
-          int sum = 0;
-          for( int j = 0; j < f; j++ ) sum += int( s_ref[0][( top ? 1 : predStride + 1 ) + k * f + j] );
-          s_mipBdry[lid] = f > 1 ? ( sum + ( 1 << ( lg - 1 ) ) ) >> lg : sum;
-        }
-        SYNC();
-        // the matrix input: [top, left], transposed [left, top], rebased on its first entry; that entry becomes the
-        // difference to the mid level, or 0 for the large size class, whose matrices have no weight for it
-        const bool transposed = t.mipTransposed != 0;
-        int mipIn[8];
-        for( int i = 0; i < inSize; i++ ) mipIn[i] = s_mipBdry[transposed ? ( i < bs ? bs + i : i - bs ) : i];
-        const int inputOffset = mipIn[0];
-        mipIn[0] = t.mipSizeId < 2 ? ( 1 << ( t.bitDepth - 1 ) ) - inputOffset : 0;
-        int inSum = mipIn[0];
-        for( int i = 1; i < inSize; i++ )
-        {
-          mipIn[i] -= inputOffset;
-          inSum += mipIn[i];
-        }
-        // the reduced prediction, one sample per invocation (computed in the transposed order when transposed); the
-        // large class's rows hold the weights of inputs 1 ..
-        if( lid < ps * ps )
-        {
-          const int rowLen = t.mipSizeId == 2 ? inSize - 1 : inSize, first = t.mipSizeId == 2 ? 1 : 0;
-          int sum = 0;
-          for( int i = first; i < inSize; i++ ) sum += mipIn[i] * BufI32( P.matrices ).v[t.mipMatrix + lid * rowLen + i - first];
-          const int offset = ( 1 << ( 6 - 1 ) ) - 32 * inSum;   // MIP_SHIFT_MATRIX 6, MIP_OFFSET_MATRIX 32
-          s_mipRed[transposed ? ( lid % ps ) * ps + lid / ps : lid] = clip3i( 0, maxPel, ( ( sum + offset ) >> 6 ) + inputOffset );
-        }
-        SYNC();
-        const int upH = W / ps, upV = H / ps;
-        for( int i = lid; i < N; i += NT ) emitPred( t, i % W, i / W, mipSample( i % W, i / W, ps, upH, upV, predStride ), bf );
+        for( int i = lid; i < N; i += NT ) emitPred( t, i % W, i / W, mipSample( i % W, i / W, mipPs, mipUpH, mipUpV, predStride ), bf );
       }
       else if( t.dirMode == 0 || t.dirMode == 1 )   // planar / DC, then their PDPC
       {

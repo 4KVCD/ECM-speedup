@@ -24,6 +24,13 @@ shared int s_dimdHi[DIMD_MAX_OUTER];
 shared int s_dimdStart[DIMD_MAX_OUTER + 1];
 shared int s_dimdSg[33];                    // per subgroup (at least 8 invocations each): a batch's prefix sums
 
+// DIMD's 3x3 Sobel gradient (iDx, iDy) from the eight samples around a position: the row above (tl, t, tr), left and
+// right (l, r), the row below (bl, b, br)
+ivec2 sobel3x3( int tl, int t, int tr, int l, int r, int bl, int b, int br )
+{
+  return ivec2( bl + 2 * b + br - tl - 2 * t - tr, tl + 2 * l + bl - tr - 2 * r - br );
+}
+
 // the gradient (iDx, iDy) of component comp's reconstruction at (x, y): DIMD's 3x3 Sobel operator, or its 2x2 one
 // (filterSizeIdx 1, JVET-AJ0203)
 ivec2 dimdGradient( int comp, int x, int y, int filterSizeIdx )
@@ -33,10 +40,9 @@ ivec2 dimdGradient( int comp, int x, int y, int filterSizeIdx )
     const int a = recoAt( comp, x - 1, y - 1 ), b = recoAt( comp, x, y - 1 ), c = recoAt( comp, x - 1, y ), d = recoAt( comp, x, y );
     return ivec2( c + d - a - b, a + c - b - d );
   }
-  const int tl = recoAt( comp, x - 1, y - 1 ), t = recoAt( comp, x, y - 1 ), tr = recoAt( comp, x + 1, y - 1 );
-  const int l  = recoAt( comp, x - 1, y ), r = recoAt( comp, x + 1, y );
-  const int bl = recoAt( comp, x - 1, y + 1 ), b = recoAt( comp, x, y + 1 ), br = recoAt( comp, x + 1, y + 1 );
-  return ivec2( bl + 2 * b + br - tl - 2 * t - tr, tl + 2 * l + bl - tr - 2 * r - br );
+  return sobel3x3( recoAt( comp, x - 1, y - 1 ), recoAt( comp, x, y - 1 ), recoAt( comp, x + 1, y - 1 ),
+                   recoAt( comp, x - 1, y ), recoAt( comp, x + 1, y ),
+                   recoAt( comp, x - 1, y + 1 ), recoAt( comp, x, y + 1 ), recoAt( comp, x + 1, y + 1 ) );
 }
 
 // the region of a gradient with both components nonzero (mapXgrY1 / mapXgrY0)

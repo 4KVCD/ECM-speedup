@@ -378,7 +378,9 @@ the reconstruction buffer; works in every frame-thread context):
   MTS by the CU's mode, LFNST / NSPT by its own DIMD's main mode, and MTSS, which picks another LFNST / NSPT mode from
   DIMD's second mode, OBIC's or a mode list of three more gradient histograms around the CU (the node derives the
   choice once; where an entry of the list qualifies, the CPU's loop over it takes its last entry, not the first that
-  qualifies, which the GPU reproduces).
+  qualifies, which the GPU reproduces). M23 is LFNST / NSPT of MIP blocks, whose mode is a DIMD of the block's own MIP
+  prediction: the block derives it from its reduced prediction, then chooses its transforms and computes its residual
+  before predicting the samples (with MTSS from a mode list its CU's node derives).
   GpuIntraRec::supported()
   rejects every tool whose mode derivation or prediction reads reconstructed samples or that the kernels lack, before
   anything is skipped. All 19 regular streams now fall back to the CPU at TMRL, the next sequence-level check (before
