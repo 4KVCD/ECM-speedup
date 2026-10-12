@@ -83,6 +83,8 @@ const int DERIVE_DIMD = 128;
 const int DERIVE_OBIC = 256;
 // a block of an intra merge CU (CU_MERGE): the prediction blends the chosen candidate's modes (the node's DimdOut slot)
 const int DERIVE_MERGE = 512;
+// MTSS (JVET-AK0217, mdirIdx): the LFNST / NSPT mode and bucket are those the CU's node chose (Cu::mtss, DIMD_OUT_MTSS_*)
+const int DERIVE_MTSS = 1024;
 
 // Params::dbgParams per block: the derived dirMode, isModeVer, intraPredAngle, absInvAngle, useCubic, refFilter,
 // applyPDPC, gradPDPC, angularScale, fusion, bf, plIdx, then mtxV, mtxH, secMatrix, secTranspose, secLayout
@@ -92,7 +94,7 @@ const int DBG_PARAMS = 17;
 // the non-adjacent ones
 const int MPM_NEIGHBOURS = 23;
 
-// a coding unit of one channel type whose blocks were recorded (43 int32, layout shared with GpuIntraRec.cpp)
+// a coding unit of one channel type whose blocks were recorded (45 int32, layout shared with GpuIntraRec.cpp)
 struct Cu
 {
   int kind;              // CU_*: how its intra mode is found
@@ -111,6 +113,8 @@ struct Cu
   int dimdNum;           // their number
   int obic;              // an OBIC CU's index among the OBIC CUs (Params::obicNbrs, obicOut; -1: not OBIC)
   int merge;             // an intra merge CU's record in Params::mergeData (MergeHead; -1: not intra merge)
+  int mtss;              // with MTSS the first of the MTSS_CALLS histograms of its mode list in Params::dimdCalls (-1: none)
+  int mtssNspt;          // with MTSS: its luma block may use NSPT (CU::isNSPTAllowed)
 };
 layout( buffer_reference, std430, buffer_reference_align = 4 ) buffer BufCu { Cu v[]; };
 
@@ -141,15 +145,23 @@ struct DimdCall
 layout( buffer_reference, std430, buffer_reference_align = 4 ) buffer BufDimdCall { DimdCall v[]; };
 
 // a CU's DIMD as its node derives it (DIMD_OUT int32 per CU in Params::dimdOut): the CodingUnit fields deriveDimdMode
-// sets (dimdMode, dimdBlending, dimdBlendMode, dimdRelWeight, dimdLocDep); DIMD chroma's the final mode and the second
-// one (dimdChromaMode, dimdChromaModeSecond)
-const int DIMD_OUT            = 24;
-const int DIMD_OUT_MODE       = 0;
-const int DIMD_OUT_SECOND     = 1;
-const int DIMD_OUT_BLENDING   = 1;
-const int DIMD_OUT_BLEND_MODE = 2;    // 7 entries, -1 where not set
-const int DIMD_OUT_REL_WEIGHT = 9;    // 8 entries, -1 where not set
-const int DIMD_OUT_LOC_DEP    = 17;   // 7 entries
+// sets (dimdMode, dimdBlending, dimdBlendMode, dimdRelWeight, dimdLocDep: DIMD_OUT_PARAMS, which an intra merge CU's
+// node writes its choice in), the second strongest mode (candModeListForTransform[1]), with MTSS the mode list
+// (candModeListForTransformMtss) and getFinalIntraModeForTransform's result: the LFNST / NSPT mode in NSPT's numbering
+// and secondBucket; DIMD chroma's the final mode and the second one (dimdChromaMode, dimdChromaModeSecond)
+const int DIMD_OUT             = 30;
+const int DIMD_OUT_PARAMS      = 24;
+const int DIMD_OUT_MODE        = 0;
+const int DIMD_OUT_SECOND      = 1;
+const int DIMD_OUT_BLENDING    = 1;
+const int DIMD_OUT_BLEND_MODE  = 2;    // 7 entries, -1 where not set
+const int DIMD_OUT_REL_WEIGHT  = 9;    // 8 entries, -1 where not set
+const int DIMD_OUT_LOC_DEP     = 17;   // 7 entries
+const int DIMD_OUT_TR_SECOND   = 24;
+const int DIMD_OUT_MTSS_LIST   = 25;   // 3 entries
+const int DIMD_OUT_MTSS_MODE   = 28;
+const int DIMD_OUT_MTSS_BUCKET = 29;
+const int MTSS_CALLS           = 3;    // the histograms of MTSS's mode list (deriveDimdModeList: left, above, above-left)
 
 // a neighbour of an OBIC CU whose mode its histogram counts (layout shared with GpuIntraRec.cpp, OBIC_NBRS per OBIC CU
 // in Params::obicNbrs; IntraPrediction::obicNeighbours): its record (-1: none) and the samples it counts

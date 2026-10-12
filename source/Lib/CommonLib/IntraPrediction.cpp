@@ -19733,8 +19733,9 @@ void IntraPrediction::reorderIntraMergeCand(const CompArea& area, CodingUnit& cu
 #if ENABLE_DIMD
 #if ENABLE_DIMD && JVET_AJ0267_ADAPTIVE_HOG && JVET_AJ0203_DIMD_2X2_EDGE_OP && JVET_AC0098_LOC_DEP_DIMD
 // the arguments of the histogram calls of deriveDimdMode (CUs below 128 samples) and deriveDimdModeAdaptive in an I
-// slice, from the same availability checks (keep in step with them)
-void IntraPrediction::dimdHistogramCalls( const CodingUnit& cu, const CompArea& area, DimdHistogramCall calls[3] )
+// slice, from the same availability checks (keep in step with them); with modeList those of deriveDimdModeList, which
+// are deriveDimdMode's with buildHistogram's default 3x3 operator
+void IntraPrediction::dimdHistogramCalls( const CodingUnit& cu, const CompArea& area, DimdHistogramCall calls[3], bool modeList )
 {
   for( int k = 0; k < 3; k++ )
   {
@@ -19761,12 +19762,12 @@ void IntraPrediction::dimdHistogramCalls( const CodingUnit& cu, const CompArea& 
   const Position posLT = area;
   bool neighborFlags[4 * MAX_NUM_PART_IDXS_IN_CTU_WIDTH + 1];
   memset( neighborFlags, 0, totalUnits );
-  const int edgeOperatorSizeIdx = static_cast<int>( use2x2EdgeOperator( area ) );
+  const int edgeOperatorSizeIdx = modeList ? 0 : static_cast<int>( use2x2EdgeOperator( area ) );
   const int numIntraAbove = isAboveAvailable( cu, chType, posLT, numAboveUnits, unitWidth, ( neighborFlags + totalLeftUnits + 1 ) );
   const int numIntraLeft  = isLeftAvailable( cu, chType, posLT, numLeftUnits, unitHeight, ( neighborFlags + totalLeftUnits - 1 ) );
   const int numIntraAboveRight = isAboveRightAvailable( cu, chType, area.topRight(), numAboveRightUnits, unitWidth, neighborFlags + totalLeftUnits + 1 + numAboveUnits );
   const int numIntraBottomLeft = isBelowLeftAvailable( cu, chType, area.bottomLeft(), numLeftBelowUnits, unitHeight, neighborFlags + totalLeftUnits - 1 - numLeftUnits );
-  const bool useAdaptive = ( cu.cs->slice->getSliceType() != I_SLICE ) || ( cu.lwidth() * cu.lheight() ) >= 128;
+  const bool useAdaptive = !modeList && ( ( cu.cs->slice->getSliceType() != I_SLICE ) || ( cu.lwidth() * cu.lheight() ) >= 128 );
   if( !useAdaptive )   // deriveDimdMode
   {
     const int recoLineOffset = edgeOperatorSizeIdx == 1 ? 0 : 1;

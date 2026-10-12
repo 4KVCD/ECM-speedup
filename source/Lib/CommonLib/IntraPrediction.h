@@ -644,9 +644,9 @@ public:
   static int wideAngle( int width, int height, int predMode ) { return getModifiedWideAngle( width, height, predMode ); }
   static int intraFilterThreshold( int log2Size ) { return m_aucIntraFilter[log2Size]; }
 #if ENABLE_DIMD && JVET_AJ0267_ADAPTIVE_HOG && JVET_AJ0203_DIMD_2X2_EDGE_OP && JVET_AC0098_LOC_DEP_DIMD
-  /// one gradient histogram deriveDimdMode / deriveDimdModeAdaptive / deriveDimdChromaMode builds (buildHistogram or
-  /// buildHistogramAdaptive), for the GPU reconstruction: its arguments, with pReco relative to the top-left sample of
-  /// the area of its component
+  /// one gradient histogram deriveDimdMode / deriveDimdModeAdaptive / deriveDimdChromaMode / deriveDimdModeList builds
+  /// (buildHistogram or buildHistogramAdaptive), for the GPU reconstruction: its arguments, with pReco relative to the
+  /// top-left sample of the area of its component
   struct DimdHistogramCall
   {
     int     kind = 0;        // 0: none, 1: buildHistogram, 2: buildHistogramAdaptive
@@ -660,8 +660,9 @@ public:
     int64_t maxAmp = 0;
   };
   /// the histograms DIMD derives a luma CU's modes from (the availability checks of deriveDimdMode /
-  /// deriveDimdModeAdaptive, I slices)
-  static void dimdHistogramCalls( const CodingUnit& cu, const CompArea& area, DimdHistogramCall calls[3] );
+  /// deriveDimdModeAdaptive, I slices); with modeList those of deriveDimdModeList (MTSS's list: deriveDimdMode's calls
+  /// with the 3x3 operator, whatever the CU's size)
+  static void dimdHistogramCalls( const CodingUnit& cu, const CompArea& area, DimdHistogramCall calls[3], bool modeList = false );
 #if JVET_Z0050_DIMD_CHROMA_FUSION && JVET_AC0094_REF_SAMPLES_OPT
   /// the histograms deriveDimdChromaMode derives a chroma CU's DIMD modes from (pReco relative to the CU's co-located
   /// luma area and its Cb / Cr area); returns their number

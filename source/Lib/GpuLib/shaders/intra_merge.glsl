@@ -39,7 +39,7 @@ const int MT_ENTRY    = 3;
 const int MT_ENTRIES  = 192;   // deriveIntraMergeCand's positions of a CU up to 128 x 128 (the host's limit): at most
                                // 2 x 33 + 5 + 61 + 28
 const int MT_PREFETCH = 16;
-const int MT_WORDS    = DIMD_OUT;
+const int MT_WORDS    = DIMD_OUT_PARAMS;
 const int MT_LIST     = MT_ENTRY * MT_ENTRIES;
 const int MT_DATA     = MT_LIST + MT_PREFETCH + 1;
 

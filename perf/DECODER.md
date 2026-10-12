@@ -374,7 +374,11 @@ the reconstruction buffer; works in every frame-thread context):
   their SATD against the reconstruction (the CPU's SIMD Hadamard kernels, its double-precision scaling done exactly
   in integers); its blocks blend the chosen candidate's modes like a DIMD CU's. Its code slowed pictures with DIMD but
   without intra merge by ~11 %, so those run a pipeline without it (a fourth one). Stock-encoder streams with DIMD now
-  reconstruct on the GPU (they fell back at OBIC / intra merge before).
+  reconstruct on the GPU (they fell back at OBIC / intra merge before). M22 adds the transforms of those CUs: explicit
+  MTS by the CU's mode, LFNST / NSPT by its own DIMD's main mode, and MTSS, which picks another LFNST / NSPT mode from
+  DIMD's second mode, OBIC's or a mode list of three more gradient histograms around the CU (the node derives the
+  choice once; where an entry of the list qualifies, the CPU's loop over it takes its last entry, not the first that
+  qualifies, which the GPU reproduces).
   GpuIntraRec::supported()
   rejects every tool whose mode derivation or prediction reads reconstructed samples or that the kernels lack, before
   anything is skipped. All 19 regular streams now fall back to the CPU at TMRL, the next sequence-level check (before

@@ -290,27 +290,34 @@ void dimdHistogramAdaptive( DimdCall k, int cuW, int cuH, int lid, int NT )
   }
 }
 
-// the histograms of CU c (its dimdNum calls), all invocations, ending with a barrier
-void dimdHistograms( Cu c, int lid, int NT )
+// the histograms of calls first .. first + num - 1 of a CU of w x h into s_dimdHist (zeroed first), all invocations,
+// ending with a barrier
+void dimdHistogramsOf( int first, int num, int w, int h, int lid, int NT )
 {
   for( int i = lid; i < 3 * NUM_LUMA_MODE; i += NT )
   {
     s_dimdHist[i] = 0;
   }
   SYNC();
-  for( int n = 0; n < c.dimdNum; n++ )
+  for( int n = 0; n < num; n++ )
   {
-    const DimdCall k = BufDimdCall( P.dimdCalls ).v[c.dimd + n];
+    const DimdCall k = BufDimdCall( P.dimdCalls ).v[first + n];
     if( k.kind == 1 )
     {
       dimdHistogram( k, lid, NT );
     }
     else if( k.kind == 2 )
     {
-      dimdHistogramAdaptive( k, c.w, c.h, lid, NT );
+      dimdHistogramAdaptive( k, w, h, lid, NT );
     }
   }
   SYNC();
+}
+
+// the histograms of CU c's DIMD (its dimdNum calls), all invocations, ending with a barrier
+void dimdHistograms( Cu c, int lid, int NT )
+{
+  dimdHistogramsOf( c.dimd, c.dimdNum, c.w, c.h, lid, NT );
 }
 
 // DIMD chroma's mode (deriveDimdChromaMode with JVET-AC0094, then DecCu at the Cb block): the strongest mode of its one
@@ -347,6 +354,7 @@ struct DimdOut
   int blendMode[7];
   int relWeight[8];
   int locDep[7];
+  int trSecond;   // the second strongest mode (candModeListForTransform[1]; 0 where fewer modes have an amplitude)
 };
 
 // the DIMD modes, blending and weights of a luma CU of w x h from its histograms (deriveDimdMode's and
@@ -396,7 +404,8 @@ DimdOut dimdSelect( int w, int h )
       d.locDep[i] = s_dimdHist[m] < ampAll / 3 ? 1 : s_dimdHist[NUM_LUMA_MODE + m] < ampAll / 3 ? 2 : 0;
     }
   }
-  d.mode = mode[0];
+  d.mode     = mode[0];
+  d.trSecond = mode[1];
   bool blending = amp[1] > 0 && mode[1] > DC_IDX && mode[0] > DC_IDX;
   if( d.locDep[0] != 0 && amp[1] == 0 )   // one location-dependent mode: blended with planar
   {
@@ -513,8 +522,9 @@ void dimdStore( int cu, DimdOut d )
 {
   CBufI32   o    = CBufI32( P.dimdOut );
   const int base = cu * DIMD_OUT;
-  o.v[base + DIMD_OUT_MODE]     = d.mode;
-  o.v[base + DIMD_OUT_BLENDING] = d.blending;
+  o.v[base + DIMD_OUT_MODE]      = d.mode;
+  o.v[base + DIMD_OUT_BLENDING]  = d.blending;
+  o.v[base + DIMD_OUT_TR_SECOND] = d.trSecond;
   for( int i = 0; i < 7; i++ )
   {
     o.v[base + DIMD_OUT_BLEND_MODE + i] = d.blendMode[i];

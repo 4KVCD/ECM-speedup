@@ -44,7 +44,8 @@
     MPM lists, chroma DM and candidates, in a node per CU before its blocks) where they depend on reconstructed
     samples, i.e. with DIMD: DIMD CUs (their blended prediction), DIMD's modes in every MPM list, DIMD chroma, OBIC CUs
     (the modes of their neighbours, blended), intra merge CUs (a neighbour's parameters, ranked by template costs);
-    and the transforms that depend on a derived mode. ECM_GPU_MODES=1 makes it derive every MPM mode on any stream.
+    and the transforms that depend on a derived mode, also those of DIMD, OBIC and intra merge CUs (with MTSS, from a
+    DIMD mode list of their own). ECM_GPU_MODES=1 makes it derive every MPM mode on any stream.
 */
 
 #ifndef __GPUINTRAREC__

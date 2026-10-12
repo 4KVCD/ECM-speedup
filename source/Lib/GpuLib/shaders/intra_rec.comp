@@ -184,17 +184,34 @@ int puWideAngle( int w, int h, int mode )
   return mode;
 }
 
+// PU::getNSPTIntraMode( PU::getWideAngle ) of a mode for a block of w x h: its wide angle in NSPT's numbering (the
+// extended angles after the regular modes)
+int nsptMode( int w, int h, int mode )
+{
+  const int extHalf = trTab( TR_TAB_EXT_MODES ) >> 1;
+  const int wide    = puWideAngle( w, h, mode );
+  return wide < 0 ? wide + extHalf + NUM_LUMA_MODE : wide >= NUM_LUMA_MODE ? wide + extHalf : wide;
+}
+
+// PU::getTransposeFlag of a mode in NSPT's numbering
+bool nsptTranspose( int im )
+{
+  const int extHalf = trTab( TR_TAB_EXT_MODES ) >> 1;
+  return ( im >= NUM_LUMA_MODE && im >= NUM_LUMA_MODE + extHalf ) || ( im < NUM_LUMA_MODE && im > DIA_IDX );
+}
+
 // the transforms of a derived mode (Tu::derive & DERIVE_TRANSFORM), as the host chooses them otherwise: the kernel
 // pair of ECM's explicit MTS (TrQuant::getTrTypes with MTSExt: the set of the size class and the mode's wide angle,
 // clamped to 2 .. 66, the identity transform near horizontal / vertical) and the LFNST / NSPT set, transposition and
 // matrix of getFinalIntraModeForTransform's mode (planar of a directional planar index as its direction, the wide
-// angle of the block, of the CU with ISP, in NSPT's numbering); plIdx: the CU's directional planar index
+// angle of the block, of the CU with ISP, in NSPT's numbering). mode: the CU's mode, which MTS takes; LFNST / NSPT
+// take a DIMD or OBIC CU's DIMD main mode instead (getFinalIntraModeForTransform's DIMD branch), with MTSS the mode
+// and NSPT bucket the CU's node chose. plIdx: the CU's directional planar index
 void selectTransform( inout Tu t, int mode, int plIdx )
 {
   BufI32     mt      = BufI32( P.matrices );
   const bool luma    = t.comp == 0;
   const int  W = t.w, H = t.h;
-  const int  extHalf = trTab( TR_TAB_EXT_MODES ) >> 1;
   if( t.mtsSet != 0 )
   {
     const int trIdx = t.mtsSet - 1;
@@ -222,16 +239,27 @@ void selectTransform( inout Tu t, int mode, int plIdx )
   }
   if( t.secKind != SEC_NONE )
   {
-    int m = mode;
-    if( luma && m == PLANAR_IDX )
+    int im, bucket = t.secBucket;
+    if( WITH_DIMD && ( t.derive & DERIVE_MTSS ) != 0 )
     {
-      m = plIdx == 2 ? HOR_IDX : plIdx == 1 ? VER_IDX : m;
+      CBufI32 d = CBufI32( P.dimdOut );
+      im = d.v[t.cu * DIMD_OUT + DIMD_OUT_MTSS_MODE];
+      if( d.v[t.cu * DIMD_OUT + DIMD_OUT_MTSS_BUCKET] != 0 )   // PU::getNSPTBucket's second bucket
+      {
+        bucket = bucket == 0 ? 1 : 0;
+      }
     }
-    const bool ispLuma = luma && t.isp != 0;
-    const int  wide    = puWideAngle( ispLuma ? t.cuW : W, ispLuma ? t.cuH : H, m );
-    const int  im      = wide < 0 ? wide + extHalf + NUM_LUMA_MODE : wide >= NUM_LUMA_MODE ? wide + extHalf : wide;   // getNSPTIntraMode
-    // PU::getTransposeFlag
-    t.secTranspose = ( im >= NUM_LUMA_MODE && im >= NUM_LUMA_MODE + extHalf ) || ( im < NUM_LUMA_MODE && im > DIA_IDX ) ? 1 : 0;
+    else
+    {
+      int m = WITH_DIMD && ( t.derive & ( DERIVE_DIMD | DERIVE_OBIC ) ) != 0 ? CBufI32( P.dimdOut ).v[t.cu * DIMD_OUT + DIMD_OUT_MODE] : mode;
+      if( luma && m == PLANAR_IDX )
+      {
+        m = plIdx == 2 ? HOR_IDX : plIdx == 1 ? VER_IDX : m;
+      }
+      const bool ispLuma = luma && t.isp != 0;
+      im = nsptMode( ispLuma ? t.cuW : W, ispLuma ? t.cuH : H, m );
+    }
+    t.secTranspose = nsptTranspose( im ) ? 1 : 0;
     if( t.secKind == SEC_LFNST )
     {
       const int set = mt.v[trTab( TR_TAB_LFNST_LUT ) + im], size = findMSB( t.secSize ) - 2;
@@ -242,7 +270,7 @@ void selectTransform( inout Tu t, int mode, int plIdx )
     {
       const int set   = mt.v[trTab( TR_TAB_NSPT_LUT ) + im];
       const int shape = t.secTranspose != 0 ? nsptShape( H, W ) : nsptShape( W, H );   // the kernel's block
-      t.secMatrix = mt.v[trTab( TR_TAB_NSPT_MATRIX ) + ( ( shape * 35 + set ) * 3 + t.secIdx ) * 3 + t.secBucket];
+      t.secMatrix = mt.v[trTab( TR_TAB_NSPT_MATRIX ) + ( ( shape * 35 + set ) * 3 + t.secIdx ) * 3 + bucket];
     }
   }
 }
@@ -266,6 +294,72 @@ int recoAt( int comp, int x, int y )
 
 #include "intra_dimd.glsl"
 #include "intra_obic.glsl"
+
+// MTSS's mode list (deriveDimdModeList's end) from its histograms in s_dimdHist: the three strongest modes of their
+// sum, the first of equal ones first (updateCandListB2S moves a mode ahead of strictly weaker ones only, and fills the
+// list with the first modes: all zero gives planar, DC, 2); one invocation
+ivec3 mtssList()
+{
+  int amp[3]  = int[3]( -1, -1, -1 );
+  int mode[3] = int[3]( 0, 0, 0 );
+  for( int i = 0; i < NUM_LUMA_MODE; i++ )
+  {
+    const int h = s_dimdHist[i] + s_dimdHist[NUM_LUMA_MODE + i] + s_dimdHist[2 * NUM_LUMA_MODE + i];
+    for( int j = 0; j < 3; j++ )
+    {
+      if( h > amp[j] )
+      {
+        for( int k = 2; k > j; k-- )
+        {
+          amp[k]  = amp[k - 1];
+          mode[k] = mode[k - 1];
+        }
+        amp[j]  = h;
+        mode[j] = i;
+        break;
+      }
+    }
+  }
+  return ivec3( mode[0], mode[1], mode[2] );
+}
+
+// getFinalIntraModeForTransform with MTSS for the luma block of CU c (a DIMD, OBIC or intra merge CU: one block of its
+// size, no directional planar index), one invocation: the LFNST / NSPT mode in NSPT's numbering and whether NSPT takes
+// its second bucket. mode1: the mode without MTSS; second: the mode MTSS tries first (-1: none); list: MTSS's mode
+// list. A mode whose LFNST set or transposition differs from the first one's is taken: second, else the list's last
+// entry where any entry differs (the CPU's loop over the list does not stop at the first), else its first; NSPT takes
+// the first mode in its second bucket instead where the chosen one is within 2 of it
+ivec2 mtssChoice( Cu c, int mode1, int second, ivec3 list )
+{
+  BufI32     mt         = BufI32( P.matrices );
+  const int  lut        = trTab( TR_TAB_LFNST_LUT );
+  const int  im         = nsptMode( c.w, c.h, mode1 );
+  const bool transposed = nsptTranspose( im );
+  int  test = 0, mode2 = mode1;
+  bool valid = false;
+  if( second >= 0 )
+  {
+    mode2 = second;
+    test  = nsptMode( c.w, c.h, second );
+    valid = mt.v[lut + test] != mt.v[lut + im] || nsptTranspose( test ) != transposed;
+  }
+  if( !valid )
+  {
+    for( int i = 0; i < 3; i++ )
+    {
+      mode2 = list[i];
+      test  = nsptMode( c.w, c.h, list[i] );
+      valid = valid || mt.v[lut + test] != mt.v[lut + im] || nsptTranspose( test ) != transposed;
+    }
+  }
+  if( !valid )
+  {
+    mode2 = list[0];
+    test  = nsptMode( c.w, c.h, list[0] );
+  }
+  const bool secondBucket = c.mtssNspt != 0 && abs( mode2 - mode1 ) <= 2;
+  return ivec2( secondBucket ? im : test, secondBucket ? 1 : 0 );
+}
 
 int clip3i( int lo, int hi, int v )
 {
@@ -988,7 +1082,8 @@ void main()
     // the CU's blocks and the CUs reading it; first the CU's DIMD (intra_dimd.glsl: from the reconstruction around the
     // CU, on whose blocks it depends), the mode of a DIMD CU and the first entries of an MPM list; an OBIC CU's modes
     // then from its neighbours' (intra_obic.glsl: published by the nodes of those CUs, on which it depends); an intra
-    // merge CU's parameters from its neighbours', ranked by template costs (intra_merge.glsl)
+    // merge CU's parameters from its neighbours', ranked by template costs (intra_merge.glsl); with MTSS the LFNST /
+    // NSPT mode of the CU's block (mtssList, mtssChoice)
     if( ( t.derive & DERIVE_NODE ) != 0 )
     {
       const Cu c = BufCu( P.cus ).v[t.cu];
@@ -1020,22 +1115,19 @@ void main()
           dimdModes = int[3]( d.mode, d.blendMode[0], d.blendMode[1] );
         }
       }
+      int cuMode = -1;   // invocation 0's
       if( WITH_DIMD && c.kind == CU_OBIC )
       {
         SYNC();   // dimdSelect has read the histograms whose memory OBIC's takes
         obicHistogram( c, lid, NT );
         if( lid == 0 )
         {
-          CBufI32( P.cuMode ).v[t.cu] = obicSelect( c, d );
+          cuMode = obicSelect( c, d );
         }
       }
       else if( WITH_DIMD && WITH_MERGE && c.kind == CU_MERGE )   // intra_merge.glsl (no DIMD of its own)
       {
-        const int mode = mergeNode( c, t.cu, t.bitDepth, ( t.derive & DERIVE_NO_PDPC ) != 0, lid, NT );
-        if( lid == 0 )
-        {
-          CBufI32( P.cuMode ).v[t.cu] = mode;
-        }
+        cuMode = mergeNode( c, t.cu, t.bitDepth, ( t.derive & DERIVE_NO_PDPC ) != 0, lid, NT );
       }
       else if( lid == 0 )
       {
@@ -1044,7 +1136,37 @@ void main()
         {
           modes[k] = s_modesRead[k];
         }
-        CBufI32( P.cuMode ).v[t.cu] = deriveCuMode( c, modes, dimdModes );
+        cuMode = deriveCuMode( c, modes, dimdModes );
+      }
+      if( lid == 0 )
+      {
+        CBufI32( P.cuMode ).v[t.cu] = cuMode;
+      }
+      // MTSS (a DIMD, OBIC or intra merge CU with mdirIdx): its mode list from histograms of its own (deriveDimdModeList),
+      // once dimdSelect and obicSelect have read theirs, then the LFNST / NSPT mode and bucket of its luma block
+      if( WITH_DIMD && WITH_DERIVED_TRANSFORMS && c.mtss >= 0 )
+      {
+        SYNC();
+        dimdHistogramsOf( c.mtss, MTSS_CALLS, c.w, c.h, lid, NT );
+        if( lid == 0 )
+        {
+          // the mode without MTSS (a DIMD or OBIC CU's DIMD main mode, intra merge's) and the one MTSS tries first:
+          // DIMD's second strongest, an OBIC CU's second OBIC mode (-1 only without OBIC modes, which no decodable
+          // stream has: planar keeps it in range), none for intra merge
+          const int   mode   = c.kind == CU_MERGE ? cuMode : d.mode;
+          const int   second = c.kind == CU_DIMD ? d.trSecond
+                               : c.kind == CU_OBIC ? max( CBufI32( P.obicOut ).v[c.obic * OBIC_OUT + OBIC_OUT_MODE + 1], PLANAR_IDX ) : -1;
+          const ivec3 list   = mtssList();
+          const ivec2 choice = mtssChoice( c, mode, second, list );
+          CBufI32     o      = CBufI32( P.dimdOut );
+          const int   base   = t.cu * DIMD_OUT;
+          for( int k = 0; k < 3; k++ )
+          {
+            o.v[base + DIMD_OUT_MTSS_LIST + k] = list[k];
+          }
+          o.v[base + DIMD_OUT_MTSS_MODE]   = choice.x;
+          o.v[base + DIMD_OUT_MTSS_BUCKET] = choice.y;
+        }
       }
       releaseDependents( d0, d1, lid, NT );
       continue;
