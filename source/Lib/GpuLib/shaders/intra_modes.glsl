@@ -53,16 +53,26 @@ bool modeValid( Cu c, int mode )
 }
 
 // the mode of a regular intra luma CU (DecCu's "redo prediction dir derivation"): PU::getIntraMPMs without MPM sorting,
-// DIMD, MDIP, PDP or NN (getSpatialIpm: planar, then the modes of the neighbours not included yet, those of invalid
-// modes kept aside and added after them; fillMPMList: the neighbouring angles of each angular mode, then the defaults;
-// fillNonMPMList: the other modes in order), then the entry the parsed syntax selects; nbrMode: modeRead's
-int deriveLumaMode( Cu c, int nbrMode[MPM_NEIGHBOURS] )
+// MDIP, PDP or NN (getSpatialIpm: planar, the CU's DIMD modes, then the modes of the neighbours not included yet, those
+// of invalid modes kept aside and added after them; fillMPMList: the neighbouring angles of each angular mode, then the
+// defaults; fillNonMPMList: the other modes in order), then the entry the parsed syntax selects; nbrMode: modeRead's;
+// dimdModes: the CU's dimdMode and dimdBlendMode[0..1] (-1: none, also without DIMD)
+int deriveLumaMode( Cu c, int nbrMode[MPM_NEIGHBOURS], int dimdModes[3] )
 {
   int  mpm[NUM_MPM];
   uint included[3] = uint[3]( 0u, 0u, 0u );
   int  num = 0;
   mpm[num++] = PLANAR_IDX;
   modeAdd( included, PLANAR_IDX );
+  for( int k = 0; k < 3; k++ )   // JVET-AL0125: the DIMD modes first, without the validity check
+  {
+    const int mode = dimdModes[k];
+    if( mode >= 0 && !modeIn( included, mode ) )
+    {
+      mpm[num++] = mode;
+      modeAdd( included, mode );
+    }
+  }
   int reserved[MPM_NEIGHBOURS];
   int numReserved = 0;
   for( int k = 0; k < MPM_NEIGHBOURS && num < NUM_MPM; k++ )
@@ -160,10 +170,12 @@ int deriveChromaMode( Cu c, int luma )
   return cand == luma ? VDIA_IDX : cand;
 }
 
-// the CU's mode from the modes it reads (modeRead)
-int deriveCuMode( Cu c, int modes[MPM_NEIGHBOURS] )
+// the CU's mode from the modes it reads (modeRead) and its DIMD modes (deriveLumaMode's dimdModes; the mode of a DIMD
+// CU, luma or chroma, is the first)
+int deriveCuMode( Cu c, int modes[MPM_NEIGHBOURS], int dimdModes[3] )
 {
-  return c.kind == CU_MPM ? deriveLumaMode( c, modes ) : deriveChromaMode( c, modes[0] );
+  return c.kind == CU_MPM ? deriveLumaMode( c, modes, dimdModes )
+       : c.kind == CU_DIMD || c.kind == CU_CHROMA_DIMD ? dimdModes[0] : deriveChromaMode( c, modes[0] );
 }
 
 // IntraPrediction::getModifiedWideAngle: the angular modes a non-square block replaces by wide angles

@@ -348,7 +348,24 @@ the reconstruction buffer; works in every frame-thread context):
   rows whose first stage fits shared memory; ECM's TU_256 keeps every coefficient of a 128 x 128 MTS block, which
   the first stage then dequantizes from the levels buffer), stored device-coherent where intra_resi stores the
   others' and made visible by a workgroup barrier with buffer semantics; with sign prediction the base border and the
-  templates too. GpuIntraRec::supported()
+  templates too; M19 is DIMD, which makes every mode depend on the reconstruction (DIMD's modes head every MPM list),
+  so with DIMD the GPU derives all modes the syntax does not give: a node runs DIMD's histograms of the gradients
+  around the CU (buildHistogram in parallel with shared atomics; buildHistogramAdaptive in the CPU's sample order,
+  each batch's amplitudes prefix-summed over subgroups to stop at the sample that reaches the limit, and for CUs of 64
+  or more the first template line's region rule, which carries state from sample to sample, by one invocation over
+  gradients computed in parallel) with the arguments the host takes from IntraPrediction::dimdHistogramCalls (the
+  same availability checks), then the modes, blending, weights and location dependence; a DIMD CU's blocks blend the
+  predictions of the main mode, planar and up to six more modes (each with its own parameters, references and JVET-
+  AN0158 filter length), summed per location-dependence class in a global per-workgroup buffer, and filter the blend;
+  DIMD chroma is a node too (luma inside the co-located area, Cb and Cr around). Verification compares every node's
+  DIMD with the CPU's. ON mode found a field the host took from the CPU's mode (the bilateral filter's LMCS flag):
+  there the CPU derives modes from samples it has not reconstructed, which verification cannot see;
+  ECM_GPU_DUMP with perf/gpu/dumpdiff.py compares the records of both runs. The blending code slowed every block of
+  intra_rec by ~15 % even where nothing blends, so intra_rec is now built as three pipelines (specialization
+  constants): a picture without DIMD runs one without its code, and without M18's derived transforms where it has
+  none. OBIC and intra merge, which ECM's encoder uses whenever DIMD is on, are not done yet (M19's test streams come
+  from an encoder that skips them).
+  GpuIntraRec::supported()
   rejects every tool whose mode derivation or prediction reads reconstructed samples or that the kernels lack, before
   anything is skipped. All 19 regular streams now fall back to the CPU at TMRL, the next sequence-level check (before
   M14: sign prediction, before M6: QCS, before M5: LMCS, before M4: dual tree); many block-level tools follow. The

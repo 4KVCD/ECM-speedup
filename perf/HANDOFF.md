@@ -13,9 +13,9 @@ wall-clock gains with threads are "the easy baseline". Decoder status: single-th
 (`--GpuLoopFilter=1`: ALF, SAO, BIF, CCSAO, LF-CCCM, offset refinement on Vulkan). The user then asked for **a full
 GPU decoder in Vulkan, optimized until nothing is left** ("The GPU decoder needs to fully decode the frame on the
 GPU"; "Your first Vulkan version is going to be slow. That's OK"). That work is branch `dec-gpurecon`: intra
-reconstruction on the GPU (`--GpuRecon`), tool levels M1-M18 done and verified bit-exact; it is **not yet faster than
-the CPU decoder** (see section 8) and supports only a restricted tool set (all real CTC streams fall back to the CPU,
-first reason: TMRL).
+reconstruction on the GPU (`--GpuRecon`), tool levels M1-M19 done and verified bit-exact (M19: DIMD); it is **not yet
+faster than the CPU decoder** (see section 8) and supports only a restricted tool set (all real CTC streams fall back
+to the CPU, first reason: TMRL).
 
 ## 2. The user's rules (follow them exactly)
 
@@ -299,7 +299,26 @@ computes the residual before the prediction in chunks of rows whose first stage 
 NSPT it dequantizes from the levels buffer: with TU_256 a 128 x 128 MTS block keeps all its coefficients) and stores it
 device-coherent where intra_resi would, followed by a workgroup barrier with buffer semantics (with joint CbCr the Cr
 block reads its residual like resiFrom); signPrediction computes the base border and templates itself (signPredData)
-and always recomputes. Without ECM_GPU_MODES no block has DERIVE_TRANSFORM.
+and always recomputes. Without ECM_GPU_MODES and DIMD no block has DERIVE_TRANSFORM.
+M19: DIMD. With DIMD every MPM list starts with DIMD's modes, so the GPU derives all modes the syntax does not give
+(`Impl::deriveModes` whenever the SPS has DIMD). A CU's node computes its DIMD first (`intra_dimd.glsl`): the
+gradient histograms around the CU with the arguments of `IntraPrediction::dimdHistogramCalls` (the CPU's own
+availability checks; `Cu::dimd`, `dimdNum` index the `DimdCall`s) - buildHistogram in parallel, buildHistogramAdaptive
+in the CPU's sample order with a per-batch subgroup prefix sum that stops at the sample reaching maxAmp, and for CUs
+of 64 or more its first template line by one invocation (a region state carried from sample to sample) over
+gradients computed in parallel - then the modes, blending, weights and location dependence (`dimdSelect`, into
+`Params::dimdOut`), which the MPM list (JVET-AL0125: DIMD's modes after planar) or a DIMD CU (`CU_DIMD`) takes. A DIMD
+CU's block (`DERIVE_DIMD`) with blending predicts the main mode, planar and the blend modes one after the other, each
+with its own parameters, filtered or unfiltered references (both kept) and JVET-AN0158 filter length, sums them per
+location-dependence class into a global per-workgroup buffer (`DIMD_ACC`; another invocation may handle a sample in
+the next prediction: coherent, with buffer barriers), then divides and blends location-dependently
+(xLocationdepBlending; its double-precision clip ranges are reproduced exactly in integers, `dimdScaledWeight`) and
+applies the bilateral filter to the blend. DIMD chroma (`CU_CHROMA_DIMD`) is a node too: one histogram of the luma
+inside the co-located area and the Cb / Cr neighbours (`dimdChromaHistogramCalls`), then the co-located luma mode's
+substitution. Nodes depend on the owners of their histograms' samples. Verification compares every node's DIMD with
+the CPU's. A picture with DIMD runs the full intra_rec pipeline, one without DIMD a pipeline without its code (and
+without M18's derived transforms where it has none; `IntraRecVariant`, section 10). Not yet: OBIC and intra merge (ECM's encoder uses them whenever DIMD is on; record() rejects their CUs),
+DIMD CUs with LFNST / MTS / several transform blocks, MTSS, implicit MTS.
 
 ## 8. Numbers (i7-10700 8C/16T, Win11, GCC 16.2, RTX 3070 driver 616.92)
 
@@ -325,7 +344,8 @@ Profile of a GPU-on decode (non-LTO, m2_park16, share of all samples): parsing ~
    M9 transform skip and BDPCM, M10 MIP, M11 LFNST / NSPT (computed by the host until M15), M12 MRL, M13 ISP, M14 sign
    prediction, M15 LFNST / NSPT on the GPU (the VVC kernels, LFNSTExt=0, rejected), M16 sign prediction of LFNST /
    NSPT blocks. 2026-10-12: M17 intra modes derived on the GPU (tested with `ECM_GPU_MODES=1`), M18 the transforms of
-   derived modes on the GPU.
+   derived modes on the GPU, M19 DIMD (the m19d test set; the m19 set, encoded by the stock encoder, falls back at
+   "intra merge").
    All 19 regular streams now stop at "TMRL" (the next sequence-level check; the block-level tools of step 4 follow).
 3. Make the GPU path win on CPU time per picture: the derive-only pass (record during parsing or a leaner pass;
    speed up getSpatialIpm/getPURestricted, which also helps the CPU decoder), GPU behaviour with frame threads
@@ -334,11 +354,15 @@ Profile of a GPU-on decode (non-LTO, m2_park16, share of all samples): parsing ~
 4. More tool levels. CTC turns on DIMD, TIMD, TMRL, MPM sorting, MDIP, PDP and chroma reordering together, and every
    one of them makes the intra modes depend on reconstructed samples (DIMD's modes are in every MPM list), so with
    CTC the GPU derives every mode (M17's nodes) and everything that depends on a mode moves to the GPU too (M18 did
-   the transforms). Next DIMD (histogram of gradients over the template, the blended prediction, its modes in the MPM
-   lists, DIMD chroma, the transform rules of DIMD CUs: getFinalIntraModeForTransform's DIMD branch, NSPT buckets,
-   MTSS' candModeListForTransform), then MPM sorting / MDIP / PDP, TIMD, TMRL, CCLM/CCCM and the other cross-component
-   tools, chroma reordering / DBV, LFNST of MIP, IntraTMP / IBC, then inter pictures. Each level: new test set with
-   exactly that tool on, verify mode identical, canaries, commit. Speed of derived modes: with `ECM_GPU_MODES=1` the
+   the transforms, M19 DIMD). Next OBIC and intra merge (JVET-AH0076, JVET-AM0074: ECM's encoder uses both whenever
+   DIMD is on and has no switch for them; the m19d streams come from a test encoder, `bin\encNoOM`, built with a local
+   patch that skips them in IntraSearch when ECM_TEST_NO_OBIC_MERGE is set - its two `testObic` / `testIntraMerge`
+   conditions - and `perf/gpu/enc_m1.ps1` with ECM_ENC_EXE), then the transform rules of DIMD CUs
+   (getFinalIntraModeForTransform's DIMD branch, NSPT buckets, MTSS' candModeListForTransform, implicit MTS), then MPM
+   sorting / MDIP / PDP, TIMD, TMRL, CCLM/CCCM and the other cross-component tools, chroma reordering / DBV, LFNST of
+   MIP, IntraTMP / IBC, then inter pictures. Each level: new test set with exactly that tool on, verify mode
+   identical, ON mode identical (and `ECM_GPU_DUMP` + `perf/gpu/dumpdiff.py`: the records of both runs agree),
+   canaries, commit. Speed of derived modes: with `ECM_GPU_MODES=1` the
    GPU time of four 720p pictures sets is 25.3 instead of 14.0 ms per picture (the union of the read ranges lengthens
    the dependency chains, the residuals of derived transforms are computed in the chain); exact ranges would need
    dependencies a node registers once it knows the mode (a dependents list per block, closed when the block finishes).
@@ -360,7 +384,12 @@ Profile of a GPU-on decode (non-LTO, m2_park16, share of all samples): parsing ~
   gl_SemanticsAcquireRelease )` between: without `coherent` the memory model's accesses are private and no barrier
   makes them visible (likely intra_resi's old failure); 120 stress decodes of such blocks under load were identical.
   Code a kernel never runs still costs: M18's in-chain paths made intra_rec ~4 % slower on pictures that never take
-  them (a per-sample test of a global flag in storeRecon cost as much again; folded into Tu::resiFrom).
+  them (a per-sample test of a global flag in storeRecon cost as much again; folded into Tu::resiFrom), M19's DIMD
+  blending ~15 % (spread over the loop around the prediction and the code inside it; no single part). Since M19
+  intra_rec is built as several pipelines with specialization constants (`WITH_DIMD`, `WITH_DERIVED_TRANSFORMS`;
+  `gpu::Kernel::create`'s specialization, GpuIntraRec.cpp's `IntraRecVariant`) and a picture runs the one without the
+  features it does not use. The compiler is not monotonic here: the pipeline with DIMD alone was slower than the one
+  with DIMD and the derived transforms in every case measured, so that one is not built. Measure each new variant.
 - `supported()` / `record()` must reject every tool the kernels lack, including tools that only change a CPU code
   path the GPU replaces (dequantization, transforms, clipping): dependent quantization was not rejected until M6,
   and the reconstruction on decoded such streams wrong. With a new level, look through the CPU path it replaces for
@@ -405,3 +434,12 @@ Profile of a GPU-on decode (non-LTO, m2_park16, share of all samples): parsing ~
 - A dependent per-CU decision chain runs ~7x slower on one GPU workgroup than on one CPU core.
 - Edge capacity of the GPU dependency graph: 8 per block at first, grows to 1.25x the largest seen; an overflow
   makes all kernels stand down and the host resubmits the picture (tested with capacity 16).
+- With the reconstruction on, the CPU's derive-only pass derives DIMD (and every later sample-based mode) from samples
+  it has not reconstructed, so its modes are garbage there and right in verification. A field the host takes from the
+  CPU's mode of a block whose mode the GPU derives is therefore wrong only with the reconstruction on, which
+  verification cannot see: M19's first ON run differed almost everywhere because the bilateral filter's LMCS flag came
+  from the CPU's mode. Check every new level with `ECM_GPU_DUMP=<prefix>` on a verification and an ON decode and
+  `perf/gpu/dumpdiff.py <prefix> <POCs>` (the records agree apart from the fields intra_rec derives). The CPU's
+  parameter snapshot after DIMD blending is the last blended mode's, not the main mode's (record() restates them).
+- A double-precision expression of the CPU (xLocationdepBlending's clip ranges) can be reproduced exactly in integers
+  when its inputs are small: `dimdScaledWeight` (checked exhaustively against IEEE doubles for inputs below 200).

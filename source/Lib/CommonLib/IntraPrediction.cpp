@@ -19593,6 +19593,256 @@ void IntraPrediction::reorderIntraMergeCand(const CompArea& area, CodingUnit& cu
 #endif
 
 #if ENABLE_DIMD
+#if ENABLE_DIMD && JVET_AJ0267_ADAPTIVE_HOG && JVET_AJ0203_DIMD_2X2_EDGE_OP && JVET_AC0098_LOC_DEP_DIMD
+// the arguments of the histogram calls of deriveDimdMode (CUs below 128 samples) and deriveDimdModeAdaptive in an I
+// slice, from the same availability checks (keep in step with them)
+void IntraPrediction::dimdHistogramCalls( const CodingUnit& cu, const CompArea& area, DimdHistogramCall calls[3] )
+{
+  for( int k = 0; k < 3; k++ )
+  {
+    calls[k] = DimdHistogramCall();
+  }
+  const CodingStructure& cs  = *cu.cs;
+  const SPS&             sps = *cs.sps;
+  const PreCalcValues&   pcv = *cs.pcv;
+  const ChannelType   chType = toChannelType( area.compID );
+  const uint32_t uiWidth  = area.width;
+  const uint32_t uiHeight = area.height;
+  const int predSize  = uiWidth + 1;
+  const int predHSize = uiHeight + 1;
+  const bool noShift    = pcv.noChroma2x2 && uiWidth == 4;
+  const int  unitWidth  = pcv.minCUWidth >> ( noShift ? 0 : getComponentScaleX( area.compID, sps.getChromaFormatIdc() ) );
+  const int  unitHeight = pcv.minCUHeight >> ( noShift ? 0 : getComponentScaleY( area.compID, sps.getChromaFormatIdc() ) );
+  const int  totalAboveUnits    = ( predSize + ( unitWidth - 1 ) ) / unitWidth;
+  const int  totalLeftUnits     = ( predHSize + ( unitHeight - 1 ) ) / unitHeight;
+  const int  totalUnits         = totalAboveUnits + totalLeftUnits + 1;
+  const int  numAboveUnits      = std::max<int>( uiWidth / unitWidth, 1 );
+  const int  numLeftUnits       = std::max<int>( uiHeight / unitHeight, 1 );
+  const int  numAboveRightUnits = totalAboveUnits - numAboveUnits;
+  const int  numLeftBelowUnits  = totalLeftUnits - numLeftUnits;
+  const Position posLT = area;
+  bool neighborFlags[4 * MAX_NUM_PART_IDXS_IN_CTU_WIDTH + 1];
+  memset( neighborFlags, 0, totalUnits );
+  const int edgeOperatorSizeIdx = static_cast<int>( use2x2EdgeOperator( area ) );
+  const int numIntraAbove = isAboveAvailable( cu, chType, posLT, numAboveUnits, unitWidth, ( neighborFlags + totalLeftUnits + 1 ) );
+  const int numIntraLeft  = isLeftAvailable( cu, chType, posLT, numLeftUnits, unitHeight, ( neighborFlags + totalLeftUnits - 1 ) );
+  const int numIntraAboveRight = isAboveRightAvailable( cu, chType, area.topRight(), numAboveRightUnits, unitWidth, neighborFlags + totalLeftUnits + 1 + numAboveUnits );
+  const int numIntraBottomLeft = isBelowLeftAvailable( cu, chType, area.bottomLeft(), numLeftBelowUnits, unitHeight, neighborFlags + totalLeftUnits - 1 - numLeftUnits );
+  const bool useAdaptive = ( cu.cs->slice->getSliceType() != I_SLICE ) || ( cu.lwidth() * cu.lheight() ) >= 128;
+  if( !useAdaptive )   // deriveDimdMode
+  {
+    const int recoLineOffset = edgeOperatorSizeIdx == 1 ? 0 : 1;
+    if( numIntraLeft )
+    {
+      DimdHistogramCall& c = calls[0];
+      c.kind = 1;
+      c.histogram = 0;
+      c.x = -1 - recoLineOffset;
+      c.y = !numIntraAbove ? 1 : 0;
+      c.height = ( numIntraLeft + numIntraBottomLeft ) * unitHeight - recoLineOffset - ( !numIntraAbove ? 1 : 0 );
+      c.width = 1;
+      c.direction = 1;
+      c.filterSizeIdx = edgeOperatorSizeIdx;
+    }
+    if( numIntraAbove )
+    {
+      DimdHistogramCall& c = calls[1];
+      c.kind = 1;
+      c.histogram = 1;
+      c.x = !numIntraLeft ? 1 : 0;
+      c.y = -( 1 + recoLineOffset );
+      c.height = 1;
+      c.width = ( numIntraAbove + numIntraAboveRight ) * unitWidth - recoLineOffset - ( !numIntraLeft ? 1 : 0 );
+      c.direction = 2;
+      c.filterSizeIdx = edgeOperatorSizeIdx;
+    }
+    if( numIntraLeft && numIntraAbove )
+    {
+      DimdHistogramCall& c = calls[2];
+      c.kind = 1;
+      c.histogram = 2;
+      c.x = -1 - recoLineOffset;
+      c.y = -1 - recoLineOffset;
+      c.height = c.width = edgeOperatorSizeIdx == 1 ? 1 : 2;
+      c.direction = edgeOperatorSizeIdx == 1 ? 0 : 3;
+      c.filterSizeIdx = edgeOperatorSizeIdx;
+    }
+    return;
+  }
+  // deriveDimdModeAdaptive
+  const int templateSizeLeft  = numIntraLeft ? ( ( numIntraLeft + numIntraBottomLeft ) * unitHeight - 1 - ( !numIntraAbove ? 1 : 0 ) ) : 0;
+  const int templateSizeAbove = numIntraAbove ? ( ( numIntraAbove + numIntraAboveRight ) * unitWidth - 1 - ( !numIntraLeft ? 1 : 0 ) ) : 0;
+  int  numIntraAboveExt[MAX_DIMD_TEMPLATE_SIZE >> 2], numIntraLeftExt[MAX_DIMD_TEMPLATE_SIZE >> 2];
+  int  numIntraAboveRightExt[MAX_DIMD_TEMPLATE_SIZE >> 2], numIntraBottomLeftExt[MAX_DIMD_TEMPLATE_SIZE >> 2];
+  bool isAboveLeft[MAX_DIMD_TEMPLATE_SIZE >> 2], isLeftAbove[MAX_DIMD_TEMPLATE_SIZE >> 2];
+  for( int i = 0; i < MAX_DIMD_TEMPLATE_SIZE >> 2; i++ )
+  {
+    numIntraAboveExt[i] = isAboveAvailable( cu, chType, posLT.offset( 0, -4 * ( i ) ), numAboveUnits, unitWidth, ( neighborFlags + totalLeftUnits + 1 ) );
+    numIntraLeftExt[i]  = isLeftAvailable( cu, chType, posLT.offset( -4 * ( i ), 0 ), numLeftUnits, unitHeight, ( neighborFlags + totalLeftUnits - 1 ) );
+    numIntraAboveRightExt[i] = ( i > 0 ? 0 : isAboveRightAvailable( cu, chType, area.topRight().offset( 0, -4 * ( i ) ), numAboveRightUnits, unitWidth, neighborFlags + totalLeftUnits + 1 + numAboveUnits ) );
+    numIntraBottomLeftExt[i] = ( i > 0 ? 0 : isBelowLeftAvailable( cu, chType, area.bottomLeft().offset( -4 * ( i ), 0 ), numLeftBelowUnits, unitHeight, neighborFlags + totalLeftUnits - 1 - numLeftUnits ) );
+    isAboveLeft[i] = isAboveAvailable( cu, chType, posLT.offset( -4 * ( i ) - 1, 0 ), 1, unitWidth, ( neighborFlags + totalLeftUnits + 1 ) );
+    isLeftAbove[i] = isLeftAvailable( cu, chType, posLT.offset( 0, -4 * ( i ) - 1 ), 1, unitHeight, ( neighborFlags + totalLeftUnits - 1 ) );
+  }
+  const int  numIntraAboveLarger = isAboveAvailable( cu, chType, posLT.offset( 0, -4 ), numAboveUnits, unitWidth, ( neighborFlags + totalLeftUnits + 1 ) );
+  const int  numIntraLeftLarger  = isLeftAvailable( cu, chType, posLT.offset( -4, 0 ), numLeftUnits, unitHeight, ( neighborFlags + totalLeftUnits - 1 ) );
+  const bool isAboveLeftAvailLargerABV = isAboveLeftAvailable( cu, chType, posLT.offset( 0, -4 ) );
+  const bool isAboveLeftAvailLargerLFT = isAboveLeftAvailable( cu, chType, posLT.offset( -4, 0 ) );
+  const bool isAboveLeftAvailLargerAL  = isAboveLeftAvailable( cu, chType, posLT.offset( -4, -4 ) );
+  const bool useLargerTmp = cu.lwidth() * cu.lheight() >= 512;
+  if( numIntraLeft )
+  {
+    DimdHistogramCall& c = calls[0];
+    int maxLeftTemplate = 0, maxHeightLeft = 0;
+    for( int i = 0; i < MAX_DIMD_TEMPLATE_SIZE >> 2; i++ )
+    {
+      if( numIntraLeftExt[i] == 0 )
+      {
+        break;
+      }
+      c.sizeExt[i]  = ( numIntraLeftExt[i] + numIntraBottomLeftExt[i] ) * unitHeight;
+      maxHeightLeft = std::max( maxHeightLeft, c.sizeExt[i] );
+      maxLeftTemplate += 4;
+    }
+    for( int i = 0; i < MAX_DIMD_TEMPLATE_SIZE >> 2; i++ )
+    {
+      c.extra[i] = isAboveLeft[i] ? 1 : 0;
+    }
+    c.maxAmp = int64_t( templateSizeLeft ) * DIMD_MAX_AMP;
+    const CodingUnit* cuNeigh = cu.cs->getCURestricted( cu.lumaPos().offset( -1, 0 ), cu, CH_L );
+    if( cuNeigh->lheight() >= cu.lheight() && cuNeigh->lwidth() > 8 )
+    {
+      c.maxAmp += int64_t( templateSizeLeft ) * 500;
+    }
+    c.kind = 2;
+    c.histogram = 0;
+    c.x = -maxLeftTemplate;
+    c.y = 0;
+    c.height = maxHeightLeft;
+    c.width = maxLeftTemplate;
+    c.direction = 1;
+    c.filterSizeIdx = edgeOperatorSizeIdx;
+  }
+  if( numIntraAbove )
+  {
+    DimdHistogramCall& c = calls[1];
+    int maxAboveTemplate = 0, maxWidthAbove = 0;
+    for( int i = 0; i < MAX_DIMD_TEMPLATE_SIZE >> 2; i++ )
+    {
+      if( numIntraAboveExt[i] == 0 )
+      {
+        break;
+      }
+      c.sizeExt[i]  = ( numIntraAboveExt[i] + numIntraAboveRightExt[i] ) * unitWidth;
+      maxWidthAbove = std::max( maxWidthAbove, c.sizeExt[i] );
+      maxAboveTemplate += 4;
+    }
+    for( int i = 0; i < MAX_DIMD_TEMPLATE_SIZE >> 2; i++ )
+    {
+      c.extra[i] = isLeftAbove[i] ? 1 : 0;
+    }
+    c.maxAmp = int64_t( templateSizeAbove ) * DIMD_MAX_AMP;
+    const CodingUnit* cuNeigh = cu.cs->getCURestricted( cu.lumaPos().offset( 0, -1 ), cu, CH_L );
+    if( cuNeigh->lwidth() >= cu.lwidth() && cuNeigh->lheight() > 8 )
+    {
+      c.maxAmp += int64_t( templateSizeAbove ) * 500;
+    }
+    c.kind = 2;
+    c.histogram = 1;
+    c.x = 0;
+    c.y = -maxAboveTemplate;
+    c.height = maxAboveTemplate;
+    c.width = maxWidthAbove;
+    c.direction = 2;
+    c.filterSizeIdx = edgeOperatorSizeIdx;
+  }
+  bool useAL = numIntraLeft && numIntraAbove;
+  if( useLargerTmp )
+  {
+    useAL = isAboveLeftAvailLargerABV && isAboveLeftAvailLargerLFT && isAboveLeftAvailLargerAL && numIntraAboveLarger && numIntraLeftLarger;
+  }
+  if( useAL )   // buildHistogram with the default 3x3 operator
+  {
+    DimdHistogramCall& c = calls[2];
+    const int offst = useLargerTmp ? 3 : 1;
+    c.kind = 1;
+    c.histogram = 2;
+    c.x = c.y = -1 - offst;
+    c.height = c.width = 1 + offst;
+    c.direction = 3;
+    c.filterSizeIdx = 0;
+  }
+}
+
+#if JVET_Z0050_DIMD_CHROMA_FUSION && JVET_AC0094_REF_SAMPLES_OPT
+// the histogram calls of deriveDimdChromaMode, in its order, from the same availability checks (keep in step with it):
+// the luma columns and rows inside the co-located area, then per chroma component the left column, the above row and
+// the above-left corner where available
+int IntraPrediction::dimdChromaHistogramCalls( const CodingUnit& cu, const CompArea& areaCb, DimdHistogramCall calls[8] )
+{
+  const CodingStructure& cs  = *cu.cs;
+  const SPS&             sps = *cs.sps;
+  const PreCalcValues&   pcv = *cs.pcv;
+  const uint32_t uiWidthCb  = areaCb.width;
+  const uint32_t uiHeightCb = areaCb.height;
+  const int predSize  = ( uiWidthCb << 1 );
+  const int predHSize = ( uiHeightCb << 1 );
+  const bool noShift    = pcv.noChroma2x2 && uiWidthCb == 4;
+  const int  unitWidth  = pcv.minCUWidth >> ( noShift ? 0 : getComponentScaleX( areaCb.compID, sps.getChromaFormatIdc() ) );
+  const int  unitHeight = pcv.minCUHeight >> ( noShift ? 0 : getComponentScaleY( areaCb.compID, sps.getChromaFormatIdc() ) );
+  const int  totalAboveUnits    = ( predSize + ( unitWidth - 1 ) ) / unitWidth;
+  const int  totalLeftUnits     = ( predHSize + ( unitHeight - 1 ) ) / unitHeight;
+  const int  totalUnits         = totalAboveUnits + totalLeftUnits + 1;
+  const int  numAboveUnits      = std::max<int>( uiWidthCb / unitWidth, 1 );
+  const int  numLeftUnits       = std::max<int>( uiHeightCb / unitHeight, 1 );
+  const int  numAboveRightUnits = totalAboveUnits - numAboveUnits;
+  const int  numLeftBelowUnits  = totalLeftUnits - numLeftUnits;
+  const Position posLT = areaCb;
+  bool neighborFlags[4 * MAX_NUM_PART_IDXS_IN_CTU_WIDTH + 1];
+  memset( neighborFlags, 0, totalUnits );
+  const int numIntraAbove = isAboveAvailable( cu, CHANNEL_TYPE_CHROMA, posLT.offset( 0, -2 ), numAboveUnits, unitWidth, ( neighborFlags + totalLeftUnits + 1 ) );
+  const int numIntraLeft  = isLeftAvailable( cu, CHANNEL_TYPE_CHROMA, posLT.offset( -2, 0 ), numLeftUnits, unitHeight, ( neighborFlags + totalLeftUnits - 1 ) );
+  const int numIntraAboveRight = std::min( isAboveRightAvailable( cu, CHANNEL_TYPE_CHROMA, areaCb.topRight().offset( 0, -2 ), numAboveRightUnits, unitWidth, neighborFlags + totalLeftUnits + 1 + numAboveUnits ),
+                                           isAboveRightAvailable( cu, CHANNEL_TYPE_CHROMA, areaCb.topRight(), numAboveRightUnits, unitWidth, neighborFlags + totalLeftUnits + 1 + numAboveUnits ) );
+  const int numIntraBottomLeft = std::min( isBelowLeftAvailable( cu, CHANNEL_TYPE_CHROMA, areaCb.bottomLeft().offset( -2, 0 ), numLeftBelowUnits, unitHeight, neighborFlags + totalLeftUnits - 1 - numLeftUnits ),
+                                           isBelowLeftAvailable( cu, CHANNEL_TYPE_CHROMA, areaCb.bottomLeft(), numLeftBelowUnits, unitHeight, neighborFlags + totalLeftUnits - 1 - numLeftUnits ) );
+  int num = 0;
+  auto add = [&]( const int comp, const int x, const int y, const int height, const int width, const int direction )
+  {
+    DimdHistogramCall& c = calls[num++];
+    c = DimdHistogramCall();
+    c.kind      = 1;
+    c.comp      = comp;
+    c.x         = x;
+    c.y         = y;
+    c.height    = height;
+    c.width     = width;
+    c.direction = direction;
+  };
+  add( COMPONENT_Y, 1, 1, ( numLeftUnits * unitHeight << getChannelTypeScaleY( CHANNEL_TYPE_CHROMA, sps.getChromaFormatIdc() ) ) - 2, 2, 1 );
+  if( numIntraLeft )
+  {
+    const int heightLeft = ( numIntraLeft + numIntraBottomLeft ) * unitHeight - 1 - ( !numIntraAbove ? 1 : 0 );
+    add( COMPONENT_Cb, -2, !numIntraAbove ? 1 : 0, heightLeft, 1, 1 );
+    add( COMPONENT_Cr, -2, !numIntraAbove ? 1 : 0, heightLeft, 1, 1 );
+  }
+  add( COMPONENT_Y, 3, 1, 2, ( numAboveUnits * unitWidth << getChannelTypeScaleX( CHANNEL_TYPE_CHROMA, sps.getChromaFormatIdc() ) ) - 4, 2 );
+  if( numIntraAbove )
+  {
+    const int widthAbove = ( numIntraAbove + numIntraAboveRight ) * unitWidth - 1 - ( !numIntraLeft ? 1 : 0 );
+    add( COMPONENT_Cb, !numIntraLeft ? 1 : 0, -2, 1, widthAbove, 2 );
+    add( COMPONENT_Cr, !numIntraLeft ? 1 : 0, -2, 1, widthAbove, 2 );
+  }
+  if( numIntraLeft && numIntraAbove )
+  {
+    add( COMPONENT_Cb, -2, -2, 2, 2, 3 );
+    add( COMPONENT_Cr, -2, -2, 2, 2, 3 );
+  }
+  return num;
+}
+#endif
+#endif
+
 void IntraPrediction::deriveDimdMode(const CPelBuf &recoBuf, const CompArea &area, CodingUnit &cu
 #if JVET_AK0059_MDIP
   , bool useExcludingMode

@@ -28,6 +28,11 @@ layout( buffer_reference, std430, buffer_reference_align = 4 ) coherent buffer C
 
 #define SYNC() barrier()
 
+// the features of a picture the pipeline is built for (specialization constants; GpuIntraRec.cpp's IntraRecVariant):
+// a picture without them runs a pipeline without their code, whose mere presence slows every block (~15 % for DIMD)
+layout( constant_id = 0 ) const bool WITH_DIMD = true;                 // DIMD in nodes, the blending of DIMD CUs
+layout( constant_id = 1 ) const bool WITH_DERIVED_TRANSFORMS = true;   // blocks with DERIVE_TRANSFORM
+
 const int PAD     = 6;                        // interpFilterNumPadded (16 taps / 2 - 2)
 const int ANG     = 1792;                     // angular reference buffers (the CPU's are larger; blocks <= 128 use < 1700)
 const int MAX_MRL = 13;                       // the farthest reference line (multiRefIdx 12, its fusion line 13)
@@ -76,6 +81,13 @@ Params P;      // the parameter block (loaded once)
 int    g_ti;   // the block being reconstructed
 bool   g_crs;       // LMCS chroma residual scaling of the block
 int    g_crsScale;  // its scale (Reshape::calculateChromaAdj)
+// DIMD blending (a DERIVE_DIMD block whose CU blends): the predictions of its modes are summed per location dependence
+// class (emitPred), weighted by their dimdRelWeight, in the workgroup's DIMD_ACC sums (each class's N samples)
+const int DIMD_ACC = 3 * 128 * 128;
+bool   g_dimdSum;     // emitPred adds to the sums
+bool   g_dimdFirst;   // the first prediction (the main mode) sets them, the other classes' to 0
+int    g_dimdW;       // the prediction's weight
+int    g_dimdClass;   // its class (dimdLocDep: 0 none, 1 vertical, 2 horizontal)
 
 #include "intra_modes.glsl"
 
@@ -199,6 +211,8 @@ int recoAt( int comp, int x, int y )
   return int( CBufI16( P.plane[comp] ).v[P.origin[comp] + y * P.stride[comp] + x] );
 }
 
+#include "intra_dimd.glsl"
+
 int clip3i( int lo, int hi, int v )
 {
   return min( max( v, lo ), hi );
@@ -290,9 +304,29 @@ void storeRegion( Tu t, int x, int y, int pr )
   }
 }
 
-// a predicted sample of the region: reconstructed now, or kept for the bilateral filter
+// a predicted sample of the region: reconstructed now, kept for the bilateral filter, or added to DIMD's sums (stored
+// and loaded device-coherent: another invocation may handle the sample in the next prediction)
 void emitPred( Tu t, int x, int y, int pr, bool bf )
 {
+  if( WITH_DIMD && g_dimdSum )
+  {
+    CBufI32   acc = CBufI32( P.dimdAcc );
+    const int o   = int( gl_WorkGroupID.x ) * DIMD_ACC + y * t.regW + x;
+    const int N   = t.regW * t.h;
+    for( int c = 0; c < 3; c++ )
+    {
+      const int add = c == g_dimdClass ? pr * g_dimdW : 0;
+      if( g_dimdFirst )
+      {
+        acc.v[o + c * N] = add;
+      }
+      else if( add != 0 )
+      {
+        acc.v[o + c * N] += add;
+      }
+    }
+    return;
+  }
   if( bf )
   {
     s_tmp[BF_PRED + y * t.regW + x] = int16_t( pr );
@@ -661,7 +695,7 @@ void signPredData( Tu c, int n, int lid, int NT )
 void signPrediction( Tu t, int lid, int NT )
 {
   Tu c = t.spCoded == g_ti ? t : BufTu( P.tus ).v[t.spCoded];   // the block with the coefficients
-  const bool inChain = ( c.derive & DERIVE_TRANSFORM ) != 0;
+  const bool inChain = WITH_DERIVED_TRANSFORMS && ( c.derive & DERIVE_TRANSFORM ) != 0;
   if( inChain && t.spCoded != g_ti )   // the other block of a joint CbCr pair, in the same CU
   {
     selectTransform( c, s_mode, BufCu( P.cus ).v[c.cu].plIdx );
@@ -894,7 +928,8 @@ void main()
     }
     // ----- a CU's node (intra_modes.glsl): the mode from the parsed syntax and the modes it reads (the neighbours' or
     // the co-located luma CU's, the host's or published by the nodes of those CUs, on which it depends), published for
-    // the CU's blocks and the CUs reading it
+    // the CU's blocks and the CUs reading it; first the CU's DIMD (intra_dimd.glsl: from the reconstruction around the
+    // CU, on whose blocks it depends), the mode of a DIMD CU and the first entries of an MPM list
     if( ( t.derive & DERIVE_NODE ) != 0 )
     {
       const Cu c = BufCu( P.cus ).v[t.cu];
@@ -902,15 +937,34 @@ void main()
       {
         s_modesRead[lid] = modeRead( c, lid );
       }
+      const bool dimd = WITH_DIMD && c.dimd >= 0;
+      if( dimd )
+      {
+        dimdHistograms( c, lid, NT );
+      }
       SYNC();
       if( lid == 0 )
       {
+        int dimdModes[3] = int[3]( -1, -1, -1 );
+        if( dimd && c.kind == CU_CHROMA_DIMD )   // its mode, after the co-located luma mode's (s_modesRead[0])
+        {
+          int second;
+          dimdModes[0] = dimdChromaSelect( s_modesRead[0], second );
+          CBufI32( P.dimdOut ).v[t.cu * DIMD_OUT + DIMD_OUT_MODE]   = dimdModes[0];
+          CBufI32( P.dimdOut ).v[t.cu * DIMD_OUT + DIMD_OUT_SECOND] = second;
+        }
+        else if( dimd )
+        {
+          const DimdOut d = dimdSelect( c.w, c.h );
+          dimdStore( t.cu, d );
+          dimdModes = int[3]( d.mode, d.blendMode[0], d.blendMode[1] );
+        }
         int modes[MPM_NEIGHBOURS];
         for( int k = 0; k < MPM_NEIGHBOURS; k++ )
         {
           modes[k] = s_modesRead[k];
         }
-        CBufI32( P.cuMode ).v[t.cu] = deriveCuMode( c, modes );
+        CBufI32( P.cuMode ).v[t.cu] = deriveCuMode( c, modes, dimdModes );
       }
       releaseDependents( d0, d1, lid, NT );
       continue;
@@ -922,12 +976,25 @@ void main()
       {
         s_mode = cuModeOf( t.cu );
       }
+      const bool dimdCu = WITH_DIMD && ( t.derive & DERIVE_DIMD ) != 0;
+      if( dimdCu && lid < DIMD_OUT )   // a DIMD CU's: its DIMD
+      {
+        s_dimdOut[lid] = CBufI32( P.dimdOut ).v[t.cu * DIMD_OUT + lid];
+      }
       SYNC();
       applyModeParams( t, s_mode, BufCu( P.cus ).v[t.cu].plIdx );
+      if( dimdCu )
+      {
+        // DIMD's main mode has no bilateral filter; blending has no intra fusion (initIntraPatternChType's fetchRef2nd)
+        // and filters the blended prediction (predIntraAng; the host checked the size and QP)
+        const bool blending = s_dimdOut[DIMD_OUT_BLENDING] != 0;
+        t.fusion = blending ? 0 : t.fusion;
+        t.bf     = blending && ( t.derive & DERIVE_BF ) != 0 ? 1 : 0;
+      }
       // its transforms, where they depend on the mode: the matrices of the mode, and (unless the residual comes from
       // the other block of a joint CbCr pair) without sign prediction the residual's first stage now, its second
       // stage sample by sample at the reconstruction (storeRecon); signPrediction computes all for its blocks
-      if( ( t.derive & DERIVE_TRANSFORM ) != 0 )
+      if( WITH_DERIVED_TRANSFORMS && ( t.derive & DERIVE_TRANSFORM ) != 0 )
       {
         selectTransform( t, s_mode, BufCu( P.cus ).v[t.cu].plIdx );
       }
@@ -942,7 +1009,7 @@ void main()
         dp.v[o + 16] = t.secLayout;
       }
     }
-    if( ( t.derive & DERIVE_TRANSFORM ) != 0 && t.spCoded < 0 && t.resiFrom < 0 )
+    if( WITH_DERIVED_TRANSFORMS && ( t.derive & DERIVE_TRANSFORM ) != 0 && t.spCoded < 0 && t.resiFrom < 0 )
     {
       inChainResidual( t, lid, NT );
       t.resiFrom = g_ti;   // storeRecon reads it device-coherent
@@ -984,7 +1051,10 @@ void main()
       fillReferencePar( t, 1, predStride + 1, lid, NT );
     }
     SYNC();
-    if( t.refFilter != 0 )   // xFilterReferenceSamples (multiRefIdx 0), in place
+    // DIMD blending (predIntraAng): each mode predicts from the filtered or the unfiltered references as its own
+    // parameters say, so both are kept: the unfiltered in s_ref[1] (blending has no fusion line), the filtered in s_tmp
+    const bool dimdBlend = WITH_DIMD && ( t.derive & DERIVE_DIMD ) != 0 && s_dimdOut[DIMD_OUT_BLENDING] != 0;
+    if( t.refFilter != 0 || dimdBlend )   // xFilterReferenceSamples (multiRefIdx 0): in place, or for DIMD beside them
     {
       for( int i = lid; i <= predStride + predHSize; i += NT )
       {
@@ -1004,7 +1074,8 @@ void main()
         s_tmp[i] = int16_t( v );
       }
       SYNC();
-      for( int i = lid; i <= predStride + predHSize; i += NT ) s_ref[0][i] = s_tmp[i];
+      for( int i = lid; i <= predStride + predHSize && !dimdBlend; i += NT ) s_ref[0][i] = s_tmp[i];
+      for( int i = lid; i <= predStride + predHSize && dimdBlend; i += NT ) s_ref[1][i] = s_ref[0][i];
       SYNC();
     }
 
@@ -1024,145 +1095,143 @@ void main()
       bf = min( ( ( madT + madL + 1 ) >> 1 ) >> 4, 15 ) <= 10;
     }
 
-    // ----- prediction and reconstruction
-    if( t.mipMatrix >= 0 )   // MIP (MatrixIntraPrediction::prepareInputForPred, computeReducedPred, predictionUpsampling)
+    // ----- prediction and reconstruction; with DIMD blending (predIntraAng) the predictions of the main mode, planar and
+    // the blend modes in turn, each with the parameters of its mode (initPredIntraParams for the CU, no fusion, no
+    // bilateral filter), its references and its filter length, summed (emitPred), then blended
+    g_dimdSum = false;
+    bool dimdFirst = true;
+    for( int sub = 0; sub < ( dimdBlend ? DIMD_FUSION_NUM : 1 ); sub++ )
     {
-      const int bs = t.mipSizeId == 0 ? 2 : 4, ps = t.mipSizeId < 2 ? 4 : 8, inSize = 2 * bs;
-      // the reduced boundary: the Haar-downsampled top (entries 0 .. bs - 1) and left (bs .. 2 bs - 1) references
-      if( lid < inSize )
+      if( dimdBlend )
       {
-        const bool top = lid < bs;
-        const int  k = top ? lid : lid - bs, f = ( top ? W : H ) / bs, lg = findMSB( f );
-        int sum = 0;
-        for( int j = 0; j < f; j++ ) sum += int( s_ref[0][( top ? 1 : predStride + 1 ) + k * f + j] );
-        s_mipBdry[lid] = f > 1 ? ( sum + ( 1 << ( lg - 1 ) ) ) >> lg : sum;
-      }
-      SYNC();
-      // the matrix input: [top, left], transposed [left, top], rebased on its first entry; that entry becomes the
-      // difference to the mid level, or 0 for the large size class, whose matrices have no weight for it
-      const bool transposed = t.mipTransposed != 0;
-      int mipIn[8];
-      for( int i = 0; i < inSize; i++ ) mipIn[i] = s_mipBdry[transposed ? ( i < bs ? bs + i : i - bs ) : i];
-      const int inputOffset = mipIn[0];
-      mipIn[0] = t.mipSizeId < 2 ? ( 1 << ( t.bitDepth - 1 ) ) - inputOffset : 0;
-      int inSum = mipIn[0];
-      for( int i = 1; i < inSize; i++ )
-      {
-        mipIn[i] -= inputOffset;
-        inSum += mipIn[i];
-      }
-      // the reduced prediction, one sample per invocation (computed in the transposed order when transposed); the
-      // large class's rows hold the weights of inputs 1 ..
-      if( lid < ps * ps )
-      {
-        const int rowLen = t.mipSizeId == 2 ? inSize - 1 : inSize, first = t.mipSizeId == 2 ? 1 : 0;
-        int sum = 0;
-        for( int i = first; i < inSize; i++ ) sum += mipIn[i] * BufI32( P.matrices ).v[t.mipMatrix + lid * rowLen + i - first];
-        const int offset = ( 1 << ( 6 - 1 ) ) - 32 * inSum;   // MIP_SHIFT_MATRIX 6, MIP_OFFSET_MATRIX 32
-        s_mipRed[transposed ? ( lid % ps ) * ps + lid / ps : lid] = clip3i( 0, maxPel, ( ( sum + offset ) >> 6 ) + inputOffset );
-      }
-      SYNC();
-      const int upH = W / ps, upV = H / ps;
-      for( int i = lid; i < N; i += NT ) emitPred( t, i % W, i / W, mipSample( i % W, i / W, ps, upH, upV, predStride ), bf );
-    }
-    else if( t.dirMode == 0 || t.dirMode == 1 )   // planar / DC, then their PDPC
-    {
-      const int log2W = findMSB( W ), log2H = findMSB( H );
-      if( t.dirMode == 1 && lid == 0 )   // xGetPredValDc: from entry multiRefIdx + 1 on
-      {
-        int denom = ( W == H ) ? ( W << 1 ) : max( W, H );
-        int sum = 0;
-        if( W >= H ) for( int k = 0; k < W; k++ ) sum += int( s_ref[0][mrl + 1 + k] );
-        if( W <= H ) for( int k = 0; k < H; k++ ) sum += int( s_ref[0][predStride + mrl + 1 + k] );
-        s_dc = ( sum + ( denom >> 1 ) ) >> findMSB( denom );
-      }
-      SYNC();
-      const int topRight = int( s_ref[0][1 + W] ), bottomLeft = int( s_ref[0][predStride + 1 + H] );
-      const int offset = 1 << ( log2W + log2H ), finalShift = 1 + log2W + log2H;
-      const int pdpcScale = ( log2W - 2 + log2H - 2 + 2 ) >> 2;
-      for( int i = lid; i < N; i += NT )
-      {
-        int x = i % W, y = i / W;
-        int T = int( s_ref[0][1 + x] ), L = int( s_ref[0][predStride + 1 + y] );
-        int v;
-        if( t.dirMode == 1 )
+        int mode;
+        dimdPrediction( sub, mode, g_dimdW, g_dimdClass );
+        if( g_dimdW == 0 )
         {
-          v = s_dc;
+          continue;
         }
-        else
+        if( sub > 0 )
         {
-          int horPred  = ( L << log2W ) + ( x + 1 ) * ( topRight - L );
-          int vertPred = ( T << log2H ) + ( y + 1 ) * ( bottomLeft - T );
-          if( t.plIdx == 1 )      v = ( horPred + ( 1 << ( log2W - 1 ) ) ) >> log2W;
-          else if( t.plIdx == 2 ) v = ( vertPred + ( 1 << ( log2H - 1 ) ) ) >> log2H;
-          else                    v = ( ( horPred << log2H ) + ( vertPred << log2W ) + offset ) >> finalShift;
+          applyModeParams( t, mode, 0 );
+          t.fusion = 0;
         }
-        v = asPel( v );
-        if( t.applyPDPC != 0 )   // xIntraPredPlanarDcPdpc
-        {
-          const int wT = 32 >> min( 31, ( y << 1 ) >> pdpcScale );
-          const int wL = 32 >> min( 31, ( x << 1 ) >> pdpcScale );
-          v = asPel( v + ( ( wL * ( L - v ) + wT * ( T - v ) + 32 ) >> 6 ) );
-        }
-        emitPred( t, i % W, i / W, v, bf );
+        g_dimdSum   = true;
+        g_dimdFirst = dimdFirst;
+        dimdFirst   = false;
+        for( int i = lid; i <= predStride + predHSize; i += NT ) s_ref[0][i] = t.refFilter != 0 ? s_tmp[i] : s_ref[1][i];
+        SYNC();
       }
-    }
-    else   // angular (xPredIntraAng)
-    {
-      const bool isVer = t.isModeVer != 0;
-      const int angle = t.intraPredAngle, absInvAngle = t.absInvAngle;
-      // the arrays are zero on entry (cleared after use, like the CPU's persistent buffers); every entry below is
-      // computed directly from the reference lines (the CPU's copies, padding, end replication and negative-angle
-      // extension), so one barrier suffices
-      const int topRefLength = topLen, leftRefLength = leftLen;
-      const int mrl2 = mrl + 1, predStride2 = predStride + 1;   // the fusion line (multiRefIdx2nd)
-      const int sizeSide = isVer ? H : W;
-      const int refLength = isVer ? topRefLength : leftRefLength;
-      const int log2Ratio = findMSB( W ) - findMSB( H );
-      const int sh = max( 0, isVer ? log2Ratio : -log2Ratio );
-      int mainBase, sideBase, mainBase2, sideBase2;
-      if( angle < 0 )
+      if( t.mipMatrix >= 0 )   // MIP (MatrixIntraPrediction::prepareInputForPred, computeReducedPred, predictionUpsampling)
       {
-        mainBase = ( isVer ? H : W ) + PAD;
-        sideBase = ( isVer ? W : H ) + PAD;
-        for( int i = lid; i < W + PAD + 2 + mrl; i += NT ) s_angA[0][H + PAD + i] = s_ref[0][i];
-        for( int i = lid; i < H + PAD + 2 + mrl; i += NT ) s_angL[0][W + PAD + i] = s_ref[0][predStride + i];
-        // side entry j (copied above) = the reference line itself
-        const int sideOff = isVer ? predStride : 0;
-        const int sideRange = sizeSide + 2 + mrl;
-        for( int k = -( sizeSide + PAD ) + lid; k <= -1; k += NT )
+        const int bs = t.mipSizeId == 0 ? 2 : 4, ps = t.mipSizeId < 2 ? 4 : 8, inSize = 2 * bs;
+        // the reduced boundary: the Haar-downsampled top (entries 0 .. bs - 1) and left (bs .. 2 bs - 1) references
+        if( lid < inSize )
         {
-          int frac32precision = ( -k * absInvAngle + 8 ) >> 4;
-          int intpel = frac32precision >> 5, fracpel = frac32precision & 31;
-          int left  = int( s_ref[0][sideOff + clip3i( 0, sideRange, intpel ) ] );
-          int right = int( s_ref[0][sideOff + clip3i( 0, sideRange, intpel + 1 ) ] );
+          const bool top = lid < bs;
+          const int  k = top ? lid : lid - bs, f = ( top ? W : H ) / bs, lg = findMSB( f );
+          int sum = 0;
+          for( int j = 0; j < f; j++ ) sum += int( s_ref[0][( top ? 1 : predStride + 1 ) + k * f + j] );
+          s_mipBdry[lid] = f > 1 ? ( sum + ( 1 << ( lg - 1 ) ) ) >> lg : sum;
+        }
+        SYNC();
+        // the matrix input: [top, left], transposed [left, top], rebased on its first entry; that entry becomes the
+        // difference to the mid level, or 0 for the large size class, whose matrices have no weight for it
+        const bool transposed = t.mipTransposed != 0;
+        int mipIn[8];
+        for( int i = 0; i < inSize; i++ ) mipIn[i] = s_mipBdry[transposed ? ( i < bs ? bs + i : i - bs ) : i];
+        const int inputOffset = mipIn[0];
+        mipIn[0] = t.mipSizeId < 2 ? ( 1 << ( t.bitDepth - 1 ) ) - inputOffset : 0;
+        int inSum = mipIn[0];
+        for( int i = 1; i < inSize; i++ )
+        {
+          mipIn[i] -= inputOffset;
+          inSum += mipIn[i];
+        }
+        // the reduced prediction, one sample per invocation (computed in the transposed order when transposed); the
+        // large class's rows hold the weights of inputs 1 ..
+        if( lid < ps * ps )
+        {
+          const int rowLen = t.mipSizeId == 2 ? inSize - 1 : inSize, first = t.mipSizeId == 2 ? 1 : 0;
+          int sum = 0;
+          for( int i = first; i < inSize; i++ ) sum += mipIn[i] * BufI32( P.matrices ).v[t.mipMatrix + lid * rowLen + i - first];
+          const int offset = ( 1 << ( 6 - 1 ) ) - 32 * inSum;   // MIP_SHIFT_MATRIX 6, MIP_OFFSET_MATRIX 32
+          s_mipRed[transposed ? ( lid % ps ) * ps + lid / ps : lid] = clip3i( 0, maxPel, ( ( sum + offset ) >> 6 ) + inputOffset );
+        }
+        SYNC();
+        const int upH = W / ps, upV = H / ps;
+        for( int i = lid; i < N; i += NT ) emitPred( t, i % W, i / W, mipSample( i % W, i / W, ps, upH, upV, predStride ), bf );
+      }
+      else if( t.dirMode == 0 || t.dirMode == 1 )   // planar / DC, then their PDPC
+      {
+        const int log2W = findMSB( W ), log2H = findMSB( H );
+        if( t.dirMode == 1 && lid == 0 )   // xGetPredValDc: from entry multiRefIdx + 1 on
+        {
+          int denom = ( W == H ) ? ( W << 1 ) : max( W, H );
+          int sum = 0;
+          if( W >= H ) for( int k = 0; k < W; k++ ) sum += int( s_ref[0][mrl + 1 + k] );
+          if( W <= H ) for( int k = 0; k < H; k++ ) sum += int( s_ref[0][predStride + mrl + 1 + k] );
+          s_dc = ( sum + ( denom >> 1 ) ) >> findMSB( denom );
+        }
+        SYNC();
+        const int topRight = int( s_ref[0][1 + W] ), bottomLeft = int( s_ref[0][predStride + 1 + H] );
+        const int offset = 1 << ( log2W + log2H ), finalShift = 1 + log2W + log2H;
+        const int pdpcScale = ( log2W - 2 + log2H - 2 + 2 ) >> 2;
+        for( int i = lid; i < N; i += NT )
+        {
+          int x = i % W, y = i / W;
+          int T = int( s_ref[0][1 + x] ), L = int( s_ref[0][predStride + 1 + y] );
           int v;
-          if( t.disableRefFilter != 0 )
+          if( t.dirMode == 1 )
           {
-            v = fracpel > 15 ? right : left;
+            v = s_dc;
           }
           else
           {
-            int lm1 = int( s_ref[0][sideOff + clip3i( 0, sideRange, intpel - 1 ) ] );
-            int rp1 = int( s_ref[0][sideOff + clip3i( 0, sideRange, intpel + 2 ) ] );
-            v = clip3i( 0, maxPel, ( weak4( fracpel, 0 ) * lm1 + weak4( fracpel, 1 ) * left + weak4( fracpel, 2 ) * right + weak4( fracpel, 3 ) * rp1 + 32 ) >> 6 );
+            int horPred  = ( L << log2W ) + ( x + 1 ) * ( topRight - L );
+            int vertPred = ( T << log2H ) + ( y + 1 ) * ( bottomLeft - T );
+            if( t.plIdx == 1 )      v = ( horPred + ( 1 << ( log2W - 1 ) ) ) >> log2W;
+            else if( t.plIdx == 2 ) v = ( vertPred + ( 1 << ( log2H - 1 ) ) ) >> log2H;
+            else                    v = ( ( horPred << log2H ) + ( vertPred << log2W ) + offset ) >> finalShift;
           }
-          mainW( isVer, 0, mainBase + k, v );
+          v = asPel( v );
+          if( t.applyPDPC != 0 )   // xIntraPredPlanarDcPdpc
+          {
+            const int wT = 32 >> min( 31, ( y << 1 ) >> pdpcScale );
+            const int wL = 32 >> min( 31, ( x << 1 ) >> pdpcScale );
+            v = asPel( v + ( ( wL * ( L - v ) + wT * ( T - v ) + 32 ) >> 6 ) );
+          }
+          emitPred( t, i % W, i / W, v, bf );
         }
-        mainBase2 = mainBase + 1;
-        sideBase2 = sideBase + 1;
-        if( fusion )
+      }
+      else   // angular (xPredIntraAng)
+      {
+        const bool isVer = t.isModeVer != 0;
+        const int angle = t.intraPredAngle, absInvAngle = t.absInvAngle;
+        // the arrays are zero on entry (cleared after use, like the CPU's persistent buffers); every entry below is
+        // computed directly from the reference lines (the CPU's copies, padding, end replication and negative-angle
+        // extension), so one barrier suffices
+        const int topRefLength = topLen, leftRefLength = leftLen;
+        const int mrl2 = mrl + 1, predStride2 = predStride + 1;   // the fusion line (multiRefIdx2nd)
+        const int sizeSide = isVer ? H : W;
+        const int refLength = isVer ? topRefLength : leftRefLength;
+        const int log2Ratio = findMSB( W ) - findMSB( H );
+        const int sh = max( 0, isVer ? log2Ratio : -log2Ratio );
+        int mainBase, sideBase, mainBase2, sideBase2;
+        if( angle < 0 )
         {
-          for( int i = lid; i < topRefLength + PAD + mrl2; i += NT ) s_angA[1][H + PAD + 1 + i] = s_ref[1][i];
-          for( int i = lid; i < leftRefLength + PAD + mrl2; i += NT ) s_angL[1][W + PAD + 1 + i] = s_ref[1][predStride2 + i];
-          const int sideOff2 = isVer ? predStride2 : 0;
-          const int sizeSideRange = ( isVer ? leftRefLength : topRefLength ) + mrl2;
-          for( int k = -( sizeSide + 1 + PAD ) + lid; k <= -1; k += NT )
+          mainBase = ( isVer ? H : W ) + PAD;
+          sideBase = ( isVer ? W : H ) + PAD;
+          for( int i = lid; i < W + PAD + 2 + mrl; i += NT ) s_angA[0][H + PAD + i] = s_ref[0][i];
+          for( int i = lid; i < H + PAD + 2 + mrl; i += NT ) s_angL[0][W + PAD + i] = s_ref[0][predStride + i];
+          // side entry j (copied above) = the reference line itself
+          const int sideOff = isVer ? predStride : 0;
+          const int sideRange = sizeSide + 2 + mrl;
+          for( int k = -( sizeSide + PAD ) + lid; k <= -1; k += NT )
           {
             int frac32precision = ( -k * absInvAngle + 8 ) >> 4;
             int intpel = frac32precision >> 5, fracpel = frac32precision & 31;
-            int left  = int( s_ref[1][sideOff2 + clip3i( 0, sizeSideRange, intpel ) ] );
-            int right = int( s_ref[1][sideOff2 + clip3i( 0, sizeSideRange, intpel + 1 ) ] );
+            int left  = int( s_ref[0][sideOff + clip3i( 0, sideRange, intpel ) ] );
+            int right = int( s_ref[0][sideOff + clip3i( 0, sideRange, intpel + 1 ) ] );
             int v;
             if( t.disableRefFilter != 0 )
             {
@@ -1170,146 +1239,248 @@ void main()
             }
             else
             {
-              int lm1 = int( s_ref[1][sideOff2 + clip3i( 0, sizeSideRange, intpel - 1 ) ] );
-              int rp1 = int( s_ref[1][sideOff2 + clip3i( 0, sizeSideRange, intpel + 2 ) ] );
+              int lm1 = int( s_ref[0][sideOff + clip3i( 0, sideRange, intpel - 1 ) ] );
+              int rp1 = int( s_ref[0][sideOff + clip3i( 0, sideRange, intpel + 2 ) ] );
               v = clip3i( 0, maxPel, ( weak4( fracpel, 0 ) * lm1 + weak4( fracpel, 1 ) * left + weak4( fracpel, 2 ) * right + weak4( fracpel, 3 ) * rp1 + 32 ) >> 6 );
             }
-            mainW( isVer, 1, mainBase2 + k, v );
+            mainW( isVer, 0, mainBase + k, v );
           }
-        }
-      }
-      else
-      {
-        mainBase = PAD;
-        sideBase = PAD;
-        // above: PAD copies of entry 0, then the top row (read on past the row, as the CPU's memcpy does); left alike;
-        // the main array's end (entry refLength + multiRefIdx) is replicated over maxIndex + PAD entries
-        const int maxIndex = ( mrl << sh ) + 6;
-        const int end0 = PAD + refLength + mrl;
-        const int val  = int( s_ref[0][( isVer ? 0 : predStride ) + refLength + mrl] );
-        const int lenA = isVer ? end0 + maxIndex + PAD + 1 : PAD + topRefLength + mrl + PAD;
-        const int lenL = isVer ? PAD + leftRefLength + mrl + PAD : end0 + maxIndex + PAD + 1;
-        for( int j = lid; j < lenA; j += NT )
-        {
-          const int v = isVer && j > end0 ? val : j < PAD ? int( s_ref[0][0] ) : int( s_ref[0][j - PAD] );
-          s_angA[0][j] = int16_t( v );
-        }
-        for( int j = lid; j < lenL; j += NT )
-        {
-          const int v = !isVer && j > end0 ? val : j < PAD ? int( s_ref[0][predStride] ) : int( s_ref[0][predStride + j - PAD] );
-          s_angL[0][j] = int16_t( v );
-        }
-        if( fusion )
-        {
-          const int maxIndex2 = ( mrl2 << sh ) + 6 + 4;
-          const int end1 = PAD + refLength + mrl2;
-          const int val2 = int( s_ref[1][( isVer ? 0 : predStride2 ) + refLength + mrl2] );
-          const int lenA2 = isVer ? end1 + maxIndex2 + PAD + 1 : PAD + topRefLength + mrl2 + PAD;
-          const int lenL2 = isVer ? PAD + leftRefLength + mrl2 + PAD : end1 + maxIndex2 + PAD + 1;
-          for( int j = lid; j < lenA2; j += NT )
+          mainBase2 = mainBase + 1;
+          sideBase2 = sideBase + 1;
+          if( fusion )
           {
-            const int v = isVer && j > end1 ? val2 : j < PAD ? int( s_ref[1][0] ) : int( s_ref[1][j - PAD] );
-            s_angA[1][j] = int16_t( v );
-          }
-          for( int j = lid; j < lenL2; j += NT )
-          {
-            const int v = !isVer && j > end1 ? val2 : j < PAD ? int( s_ref[1][predStride2] ) : int( s_ref[1][predStride2 + j - PAD] );
-            s_angL[1][j] = int16_t( v );
-          }
-        }
-        mainBase2 = PAD;
-        sideBase2 = PAD;
-      }
-      // the prediction reads the arrays from the reference line's own corner on (refMain += multiRefIdx, refMain2nd +=
-      // multiRefIdx2nd)
-      mainBase += mrl;
-      sideBase += mrl;
-      mainBase2 += mrl2;
-      sideBase2 += mrl2;
-      // cleared after the block (IntraPrediction's angRefClearEnd)
-      angClear = min( ANG, 2 * ( W + H ) + max( topRefLength, leftRefLength ) + 2 * PAD + 2 * mrl2 + ( mrl2 << abs( log2Ratio ) ) + 16 );
-      angClear2 = fusion;
-      SYNC();
-      // rows along the main direction (width/height swapped for horizontal modes)
-      const int w = isVer ? W : H, h = isVer ? H : W;
-      const bool isLuma = t.comp == 0;
-      int taps = 0;
-      if( isLuma )
-      {
-        taps = t.useCubic != 0 ? 16 : 6;
-        if( w < 8 && taps > 10 ) taps = 10;
-      }
-      const int numExtra = taps / 2 - 2;
-      const bool intSlope = ( abs( angle ) & 31 ) == 0;
-      const bool big = W >= 32 && H >= 32;
-      const int pdpcLimit = t.applyPDPC != 0 ? min( 3 << ( angle == 0 ? ( ( findMSB( w ) + findMSB( h ) - 2 ) >> 2 ) : t.angularScale ), w ) : 0;
-      for( int i = lid; i < N; i += NT )
-      {
-        int x = i % w, y = i / w;   // position in the (possibly transposed) block
-        int v;
-        if( angle == 0 )
-        {
-          v = mainR( isVer, 0, mainBase + 1 + x );
-          if( x < pdpcLimit )
-          {
-            const int scale = ( findMSB( w ) + findMSB( h ) - 2 ) >> 2;
-            const int topLeft = mainR( isVer, 0, mainBase ), left = sideR( isVer, 0, sideBase + 1 + y );
-            const int wL = 32 >> ( 2 * x >> scale );
-            v = clip3i( 0, maxPel, v + ( ( wL * ( left - topLeft ) + 32 ) >> 6 ) );
+            for( int i = lid; i < topRefLength + PAD + mrl2; i += NT ) s_angA[1][H + PAD + 1 + i] = s_ref[1][i];
+            for( int i = lid; i < leftRefLength + PAD + mrl2; i += NT ) s_angL[1][W + PAD + 1 + i] = s_ref[1][predStride2 + i];
+            const int sideOff2 = isVer ? predStride2 : 0;
+            const int sizeSideRange = ( isVer ? leftRefLength : topRefLength ) + mrl2;
+            for( int k = -( sizeSide + 1 + PAD ) + lid; k <= -1; k += NT )
+            {
+              int frac32precision = ( -k * absInvAngle + 8 ) >> 4;
+              int intpel = frac32precision >> 5, fracpel = frac32precision & 31;
+              int left  = int( s_ref[1][sideOff2 + clip3i( 0, sizeSideRange, intpel ) ] );
+              int right = int( s_ref[1][sideOff2 + clip3i( 0, sizeSideRange, intpel + 1 ) ] );
+              int v;
+              if( t.disableRefFilter != 0 )
+              {
+                v = fracpel > 15 ? right : left;
+              }
+              else
+              {
+                int lm1 = int( s_ref[1][sideOff2 + clip3i( 0, sizeSideRange, intpel - 1 ) ] );
+                int rp1 = int( s_ref[1][sideOff2 + clip3i( 0, sizeSideRange, intpel + 2 ) ] );
+                v = clip3i( 0, maxPel, ( weak4( fracpel, 0 ) * lm1 + weak4( fracpel, 1 ) * left + weak4( fracpel, 2 ) * right + weak4( fracpel, 3 ) * rp1 + 32 ) >> 6 );
+              }
+              mainW( isVer, 1, mainBase2 + k, v );
+            }
           }
         }
         else
         {
-          const int deltaPos = angle * ( y + 1 + mrl );
-          const int deltaInt = deltaPos >> 5, deltaFract = deltaPos & 31;
-          if( intSlope )
+          mainBase = PAD;
+          sideBase = PAD;
+          // above: PAD copies of entry 0, then the top row (read on past the row, as the CPU's memcpy does); left alike;
+          // the main array's end (entry refLength + multiRefIdx) is replicated over maxIndex + PAD entries
+          const int maxIndex = ( mrl << sh ) + 6;
+          const int end0 = PAD + refLength + mrl;
+          const int val  = int( s_ref[0][( isVer ? 0 : predStride ) + refLength + mrl] );
+          const int lenA = isVer ? end0 + maxIndex + PAD + 1 : PAD + topRefLength + mrl + PAD;
+          const int lenL = isVer ? PAD + leftRefLength + mrl + PAD : end0 + maxIndex + PAD + 1;
+          for( int j = lid; j < lenA; j += NT )
           {
-            v = mainR( isVer, 0, mainBase + deltaInt + 1 + x );
+            const int v = isVer && j > end0 ? val : j < PAD ? int( s_ref[0][0] ) : int( s_ref[0][j - PAD] );
+            s_angA[0][j] = int16_t( v );
           }
-          else if( isLuma )
+          for( int j = lid; j < lenL; j += NT )
           {
-            const bool cubic = t.useCubic != 0;
-            const int c0 = lumaConv( isVer, 0, mainBase + deltaInt + x - numExtra, taps, cubic, big, deltaFract );
-            int val32;
-            if( fusion )
+            const int v = !isVer && j > end0 ? val : j < PAD ? int( s_ref[0][predStride] ) : int( s_ref[0][predStride + j - PAD] );
+            s_angL[0][j] = int16_t( v );
+          }
+          if( fusion )
+          {
+            const int maxIndex2 = ( mrl2 << sh ) + 6 + 4;
+            const int end1 = PAD + refLength + mrl2;
+            const int val2 = int( s_ref[1][( isVer ? 0 : predStride2 ) + refLength + mrl2] );
+            const int lenA2 = isVer ? end1 + maxIndex2 + PAD + 1 : PAD + topRefLength + mrl2 + PAD;
+            const int lenL2 = isVer ? PAD + leftRefLength + mrl2 + PAD : end1 + maxIndex2 + PAD + 1;
+            for( int j = lid; j < lenA2; j += NT )
             {
-              const int deltaInt2 = ( deltaPos + angle ) >> 5, deltaFract2 = ( deltaPos + angle ) & 31;
-              const int c1 = lumaConv( isVer, 1, mainBase2 + deltaInt2 + x - numExtra, taps, cubic, big, deltaFract2 );
-              val32 = ( 3 * c0 + 1 * c1 + 128 * 4 ) >> ( 8 + 2 );
+              const int v = isVer && j > end1 ? val2 : j < PAD ? int( s_ref[1][0] ) : int( s_ref[1][j - PAD] );
+              s_angA[1][j] = int16_t( v );
             }
-            else
+            for( int j = lid; j < lenL2; j += NT )
             {
-              val32 = ( c0 + 128 ) >> 8;
+              const int v = !isVer && j > end1 ? val2 : j < PAD ? int( s_ref[1][predStride2] ) : int( s_ref[1][predStride2 + j - PAD] );
+              s_angL[1][j] = int16_t( v );
             }
-            v = clip3i( 0, maxPel, clip3i( 0, maxPel, val32 ) );
+          }
+          mainBase2 = PAD;
+          sideBase2 = PAD;
+        }
+        // the prediction reads the arrays from the reference line's own corner on (refMain += multiRefIdx, refMain2nd +=
+        // multiRefIdx2nd)
+        mainBase += mrl;
+        sideBase += mrl;
+        mainBase2 += mrl2;
+        sideBase2 += mrl2;
+        // cleared after the block (IntraPrediction's angRefClearEnd)
+        angClear = min( ANG, 2 * ( W + H ) + max( topRefLength, leftRefLength ) + 2 * PAD + 2 * mrl2 + ( mrl2 << abs( log2Ratio ) ) + 16 );
+        angClear2 = fusion;
+        SYNC();
+        // rows along the main direction (width/height swapped for horizontal modes)
+        const int w = isVer ? W : H, h = isVer ? H : W;
+        const bool isLuma = t.comp == 0;
+        int taps = 0;
+        if( isLuma )
+        {
+          taps = t.useCubic != 0 ? 16 : 6;
+          if( WITH_DIMD && g_dimdSum && t.useCubic != 0 )   // JVET-AN0158: a DIMD blend's prediction by its weight
+          {
+            taps = g_dimdW >= 32 ? 8 : 16;
+          }
+          if( w < 8 && taps > 10 ) taps = 10;
+          if( WITH_DIMD && g_dimdSum && t.useCubic != 0 && taps == 8 )   // JVET-AK0087: 8 taps for slopes away from H / V in small blocks
+          {
+            const int log2Size = ( findMSB( w ) + findMSB( h ) ) >> 1;
+            const int diff     = min( abs( angle - HOR_IDX ), abs( angle - VER_IDX ) );   // of the angle, as the CPU has it
+            taps = diff > ( log2Size >> 1 ) && log2Size < 4 ? 8 : 6;
+          }
+        }
+        const int numExtra = taps / 2 - 2;
+        const bool intSlope = ( abs( angle ) & 31 ) == 0;
+        const bool big = W >= 32 && H >= 32;
+        const int pdpcLimit = t.applyPDPC != 0 ? min( 3 << ( angle == 0 ? ( ( findMSB( w ) + findMSB( h ) - 2 ) >> 2 ) : t.angularScale ), w ) : 0;
+        for( int i = lid; i < N; i += NT )
+        {
+          int x = i % w, y = i / w;   // position in the (possibly transposed) block
+          int v;
+          if( angle == 0 )
+          {
+            v = mainR( isVer, 0, mainBase + 1 + x );
+            if( x < pdpcLimit )
+            {
+              const int scale = ( findMSB( w ) + findMSB( h ) - 2 ) >> 2;
+              const int topLeft = mainR( isVer, 0, mainBase ), left = sideR( isVer, 0, sideBase + 1 + y );
+              const int wL = 32 >> ( 2 * x >> scale );
+              v = clip3i( 0, maxPel, v + ( ( wL * ( left - topLeft ) + 32 ) >> 6 ) );
+            }
           }
           else
           {
-            const int p0 = mainR( isVer, 0, mainBase + deltaInt + x + 1 ), p1 = mainR( isVer, 0, mainBase + deltaInt + x + 2 );
-            v = asPel( p0 + ( ( deltaFract * ( p1 - p0 ) + 16 ) >> 5 ) );
-          }
-          v = asPel( v );
-          if( x < pdpcLimit )
-          {
-            const int scale = t.angularScale;
-            const int wL = 32 >> ( 2 * x >> scale );
-            if( t.gradPDPC != 0 )
+            const int deltaPos = angle * ( y + 1 + mrl );
+            const int deltaInt = deltaPos >> 5, deltaFract = deltaPos & 31;
+            if( intSlope )
             {
-              const int left = sideR( isVer, 0, sideBase + 1 + y );
-              const int m0 = mainR( isVer, 0, mainBase + deltaInt ), m1 = mainR( isVer, 0, mainBase + deltaInt + 1 );
-              const int topLeft = asPel( m0 + ( ( deltaFract * ( m1 - m0 ) + 16 ) >> 5 ) );
-              v = clip3i( 0, maxPel, v + ( ( wL * ( left - topLeft ) + 32 ) >> 6 ) );
+              v = mainR( isVer, 0, mainBase + deltaInt + 1 + x );
+            }
+            else if( isLuma )
+            {
+              const bool cubic = t.useCubic != 0;
+              const int c0 = lumaConv( isVer, 0, mainBase + deltaInt + x - numExtra, taps, cubic, big, deltaFract );
+              int val32;
+              if( fusion )
+              {
+                const int deltaInt2 = ( deltaPos + angle ) >> 5, deltaFract2 = ( deltaPos + angle ) & 31;
+                const int c1 = lumaConv( isVer, 1, mainBase2 + deltaInt2 + x - numExtra, taps, cubic, big, deltaFract2 );
+                val32 = ( 3 * c0 + 1 * c1 + 128 * 4 ) >> ( 8 + 2 );
+              }
+              else
+              {
+                val32 = ( c0 + 128 ) >> 8;
+              }
+              v = clip3i( 0, maxPel, clip3i( 0, maxPel, val32 ) );
             }
             else
             {
-              const int invAngleSum = 256 + ( x + 1 ) * absInvAngle;
-              const int left = sideR( isVer, 0, sideBase + y + ( invAngleSum >> 9 ) + 1 );
-              v = asPel( v + ( ( wL * ( left - v ) + 32 ) >> 6 ) );
+              const int p0 = mainR( isVer, 0, mainBase + deltaInt + x + 1 ), p1 = mainR( isVer, 0, mainBase + deltaInt + x + 2 );
+              v = asPel( p0 + ( ( deltaFract * ( p1 - p0 ) + 16 ) >> 5 ) );
+            }
+            v = asPel( v );
+            if( x < pdpcLimit )
+            {
+              const int scale = t.angularScale;
+              const int wL = 32 >> ( 2 * x >> scale );
+              if( t.gradPDPC != 0 )
+              {
+                const int left = sideR( isVer, 0, sideBase + 1 + y );
+                const int m0 = mainR( isVer, 0, mainBase + deltaInt ), m1 = mainR( isVer, 0, mainBase + deltaInt + 1 );
+                const int topLeft = asPel( m0 + ( ( deltaFract * ( m1 - m0 ) + 16 ) >> 5 ) );
+                v = clip3i( 0, maxPel, v + ( ( wL * ( left - topLeft ) + 32 ) >> 6 ) );
+              }
+              else
+              {
+                const int invAngleSum = 256 + ( x + 1 ) * absInvAngle;
+                const int left = sideR( isVer, 0, sideBase + y + ( invAngleSum >> 9 ) + 1 );
+                v = asPel( v + ( ( wL * ( left - v ) + 32 ) >> 6 ) );
+              }
             }
           }
+          const int ox = isVer ? x : y, oy = isVer ? y : x;
+          emitPred( t, ox, oy, asPel( v ), bf );
         }
-        const int ox = isVer ? x : y, oy = isVer ? y : x;
-        emitPred( t, ox, oy, asPel( v ), bf );
+      }
+      if( dimdBlend )   // the next prediction: its own angular arrays (zero), the sums visible to all invocations
+      {
+        SYNC();
+        for( int i = lid; i < angClear; i += NT )
+        {
+          s_angA[0][i] = int16_t( 0 );
+          s_angL[0][i] = int16_t( 0 );
+        }
+        angClear = 0;
+        controlBarrier( gl_ScopeWorkgroup, gl_ScopeWorkgroup, gl_StorageSemanticsBuffer | gl_StorageSemanticsShared,
+                        gl_SemanticsAcquireRelease );
+      }
+    }
+    if( dimdBlend )
+    {
+      // each class's prediction (predIntraAng): its sum over the sum of its weights (truncated, as the division and the
+      // shift of timdBlending / dimdBlending give it); the classes' weights are weightNonLocDep (with planar's),
+      // weightVer and weightHor
+      g_dimdSum = false;
+      int wt[3] = int[3]( 0, 0, 0 );
+      for( int sub = 0; sub < DIMD_FUSION_NUM; sub++ )
+      {
+        int mode, w, cls;
+        dimdPrediction( sub, mode, w, cls );
+        wt[cls] += w;
+      }
+      // with location dependence, xLocationdepBlending (range 10, doubled across blocks above 64): the vertical
+      // class's weight falls down the rows, the horizontal one's along the columns (mode 0 both, clipped to their
+      // shares of the rest, mode 1 vertical, mode 2 horizontal), the rest is the first class's
+      const int  wNon = wt[0], wVer = wt[1], wHor = wt[2];
+      const bool locDep = wVer != 0 || wHor != 0;
+      const int  ldMode = wHor > 0 && wVer > 0 ? 0 : wVer > 0 ? 1 : 2;
+      const int  rangeVer = H > 64 ? 20 : 10, rangeHor = W > 64 ? 20 : 10;
+      int clipVer = 64, clipHor = 64;
+      if( locDep && ldMode == 0 )
+      {
+        clipVer = wVer + dimdScaledWeight( wVer, wVer + wHor, wNon );
+        clipHor = wHor + dimdScaledWeight( wHor, wVer + wHor, wNon );
+      }
+      const bool needClipVer = wVer + rangeVer > clipVer || wVer - rangeVer < 0;
+      const bool needClipHor = wHor + rangeHor > clipHor || wHor - rangeHor < 0;
+      CBufI32 acc = CBufI32( P.dimdAcc );
+      for( int i = lid; i < N; i += NT )
+      {
+        const int x = i % W, y = i / W, o = int( gl_WorkGroupID.x ) * DIMD_ACC + i;
+        int v[3];
+        for( int c = 0; c < 3; c++ )
+        {
+          v[c] = wt[c] != 0 ? asPel( divTrunc( acc.v[o + c * N], wt[c] ) ) : 0;
+        }
+        int pr = v[0];
+        if( locDep )
+        {
+          const bool rowsVary = ( ldMode == 0 || wNon != 0 ) && H > 1, colsVary = wNon != 0 && W > 1;
+          int wv = rowsVary ? divTrunc( ( wVer + rangeVer ) * ( H - 1 ) - ( ( rangeVer * y ) << 1 ), H - 1 ) : 64;
+          wv = rowsVary && needClipVer ? clip3i( 0, clipVer, wv ) : wv;
+          int wh = colsVary ? divTrunc( ( wHor + rangeHor ) * ( W - 1 ) - ( ( rangeHor * x ) << 1 ), W - 1 ) : ldMode == 0 ? 64 - wv : 64;
+          wh = colsVary && needClipHor ? clip3i( 0, clipHor, wh ) : wh;
+          pr = ldMode == 0 ? asPel( ( v[1] * wv + v[2] * wh + v[0] * ( 64 - wv - wh ) + 32 ) >> 6 )
+             : ldMode == 1 ? asPel( ( v[1] * wv + v[0] * ( 64 - wv ) + 32 ) >> 6 )
+                           : asPel( ( v[2] * wh + v[0] * ( 64 - wh ) + 32 ) >> 6 );
+        }
+        emitPred( t, x, y, pr, bf );
       }
     }
     SYNC();

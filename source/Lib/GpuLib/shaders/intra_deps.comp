@@ -175,9 +175,31 @@ void dependencies( int comp )
         }
       }
     }
-    else
+    else if( c.lumaCu >= 0 )
     {
       addDep( BufCu( P.cus ).v[c.lumaCu].node );
+    }
+    // DIMD: the samples its histograms' gradients read (GpuIntraRec.cpp's dimdCallArea: each histogram's region and
+    // one sample around it, in the plane of its component), from the blocks owning them
+    for( int n = 0; n < c.dimdNum; n++ )
+    {
+      const DimdCall k = BufDimdCall( P.dimdCalls ).v[c.dimd + n];
+      if( k.kind == 0 )
+      {
+        continue;
+      }
+      const int ch = k.comp == 0 ? 0 : 1;
+      const int x0 = k.x - 1, y0 = k.y - 1, x1 = k.x + k.width, y1 = k.y + k.height;
+      for( int uy = y0 >> P.unitLog2Y[ch]; uy <= y1 >> P.unitLog2Y[ch]; uy++ )
+      {
+        for( int ux = x0 >> P.unitLog2X[ch]; ux <= x1 >> P.unitLog2X[ch]; ux++ )
+        {
+          if( ux >= 0 && uy >= 0 && ux < P.ownerW[ch] && uy < P.ownerH[ch] )
+          {
+            addDep( BufI32( P.owner[k.comp] ).v[uy * P.ownerW[ch] + ux] );
+          }
+        }
+      }
     }
     return;
   }

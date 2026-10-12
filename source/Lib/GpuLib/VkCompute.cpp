@@ -657,7 +657,8 @@ bool Buffer::ensure( Context& ctx, VkDeviceSize bytes, Kind kind )
 // Kernel
 // ====================================================================================================================
 
-void Kernel::create( Context& ctx, const uint32_t* spirv, size_t bytes, uint32_t pushBytes, const char* name )
+void Kernel::create( Context& ctx, const uint32_t* spirv, size_t bytes, uint32_t pushBytes, const char* name,
+                     const std::vector<uint32_t>& specialization )
 {
   const VkFn& vk  = ctx.vk();
   VkDevice    dev = ctx.device();
@@ -684,12 +685,25 @@ void Kernel::create( Context& ctx, const uint32_t* spirv, size_t bytes, uint32_t
   VkResult res                      = vk.CreatePipelineLayout( dev, &layoutInfo, nullptr, &m_layout );
   if( res == VK_SUCCESS )
   {
+    std::vector<VkSpecializationMapEntry> entries( specialization.size() );
+    for( size_t i = 0; i < entries.size(); i++ )
+    {
+      entries[i].constantID = (uint32_t) i;
+      entries[i].offset     = (uint32_t) ( i * sizeof( uint32_t ) );
+      entries[i].size       = sizeof( uint32_t );
+    }
+    VkSpecializationInfo spec{};
+    spec.mapEntryCount = (uint32_t) entries.size();
+    spec.pMapEntries   = entries.data();
+    spec.dataSize      = specialization.size() * sizeof( uint32_t );
+    spec.pData         = specialization.data();
     VkComputePipelineCreateInfo pipelineInfo{};
     pipelineInfo.sType        = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
     pipelineInfo.stage.sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
     pipelineInfo.stage.stage  = VK_SHADER_STAGE_COMPUTE_BIT;
     pipelineInfo.stage.module = module;
     pipelineInfo.stage.pName  = "main";
+    pipelineInfo.stage.pSpecializationInfo = specialization.empty() ? nullptr : &spec;
     pipelineInfo.layout       = m_layout;
     res = vk.CreateComputePipelines( dev, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_pipeline );
   }

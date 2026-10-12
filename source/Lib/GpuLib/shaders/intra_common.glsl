@@ -77,6 +77,8 @@ const int DERIVE_NO_SMOOTHING = 16;   // the SPS disables intra smoothing (no re
 // the transforms depend on the mode (explicit MTS of MTSExt, LFNST / NSPT): intra_rec chooses their matrices and
 // computes the residual itself (intra_resi skips the block, with joint CbCr also the other block's)
 const int DERIVE_TRANSFORM = 64;
+// a block of a DIMD CU (CU_DIMD): where the CU's DIMD blends, the prediction blends its modes (the node's DimdOut)
+const int DERIVE_DIMD = 128;
 
 // Params::dbgParams per block: the derived dirMode, isModeVer, intraPredAngle, absInvAngle, useCubic, refFilter,
 // applyPDPC, gradPDPC, angularScale, fusion, bf, plIdx, then mtxV, mtxH, secMatrix, secTranspose, secLayout
@@ -86,7 +88,7 @@ const int DBG_PARAMS = 17;
 // the non-adjacent ones
 const int MPM_NEIGHBOURS = 23;
 
-// a coding unit of one channel type whose blocks were recorded (40 int32, layout shared with GpuIntraRec.cpp)
+// a coding unit of one channel type whose blocks were recorded (41 int32, layout shared with GpuIntraRec.cpp)
 struct Cu
 {
   int kind;              // CU_*: how its intra mode is found
@@ -101,7 +103,8 @@ struct Cu
   // the modes the parsed syntax leaves (intra_deps reads the union of their reference ranges): modes[0] -1 any mode,
   // else modes[0] and, unless -1, modes[1]
   int modes[2];
-  int pad;
+  int dimd;              // the first of the CU's DIMD histograms in Params::dimdCalls (-1: no DIMD)
+  int dimdNum;           // their number
 };
 layout( buffer_reference, std430, buffer_reference_align = 4 ) buffer BufCu { Cu v[]; };
 
@@ -110,6 +113,35 @@ const int CU_KNOWN       = 0;   // the host knows the mode (Params::cuMode holds
 const int CU_MPM         = 1;   // luma: from the MPM lists (PU::getIntraMPMs)
 const int CU_CHROMA_DM   = 2;   // chroma: the co-located luma mode (PU::getCoLocatedIntraLumaMode)
 const int CU_CHROMA_CAND = 3;   // chroma: candId of PU::getIntraChromaCandModes' first four
+const int CU_DIMD        = 4;   // luma: a DIMD CU, its mode DIMD's (cu.dimd; intra_dimd.glsl)
+const int CU_CHROMA_DIMD = 5;   // chroma: DIMD chroma (DIMD_CHROMA_IDX), compared with the co-located luma mode
+
+// one gradient histogram of a CU's DIMD (16 int32, layout shared with GpuIntraRec.cpp; IntraPrediction's
+// DimdHistogramCall, the arguments deriveDimdMode / deriveDimdModeAdaptive / deriveDimdChromaMode call buildHistogram
+// / buildHistogramAdaptive with)
+struct DimdCall
+{
+  int kind;            // 0: none, 1: buildHistogram, 2: buildHistogramAdaptive (luma)
+  int histogram;       // 0: left, 1: above, 2: above-left (location dependence compares the first two); chroma 0
+  int x, y;            // pReco in the plane of comp
+  int height, width, direction, filterSizeIdx;
+  int sizeExt[3];      // buildHistogramAdaptive: the length of each group of 4 template lines (uiSizeExt),
+  int extra[3];        // whether the corner beyond each is available (isExtraAvailable),
+  int maxAmp;          // the amplitude its sums stop at
+  int comp;            // the component whose reconstruction it reads
+};
+layout( buffer_reference, std430, buffer_reference_align = 4 ) buffer BufDimdCall { DimdCall v[]; };
+
+// a CU's DIMD as its node derives it (DIMD_OUT int32 per CU in Params::dimdOut): the CodingUnit fields deriveDimdMode
+// sets (dimdMode, dimdBlending, dimdBlendMode, dimdRelWeight, dimdLocDep); DIMD chroma's the final mode and the second
+// one (dimdChromaMode, dimdChromaModeSecond)
+const int DIMD_OUT            = 24;
+const int DIMD_OUT_MODE       = 0;
+const int DIMD_OUT_SECOND     = 1;
+const int DIMD_OUT_BLENDING   = 1;
+const int DIMD_OUT_BLEND_MODE = 2;    // 7 entries, -1 where not set
+const int DIMD_OUT_REL_WEIGHT = 9;    // 8 entries, -1 where not set
+const int DIMD_OUT_LOC_DEP    = 17;   // 7 entries
 
 // the directory of the transform tables (in matrices at Params::trTables, GpuIntraRec.cpp's createShared): the
 // offsets of the tables (in matrices), then values
@@ -280,6 +312,9 @@ struct Params
   uint64_t cuMode;      // int32 per CU: its mode (luma: PU::getIntraDirLuma, which the neighbours' MPM lists take; chroma:
                         // the final mode), the host's (CU_KNOWN) or written by the CU's node (-1 until then)
   uint64_t dbgParams;   // verification: per block the parameters intra_rec derived (DBG_PARAMS int32, DERIVE_MODE blocks)
+  uint64_t dimdCalls;   // the DIMD histograms of the CUs (Cu::dimdNum DimdCall at Cu::dimd)
+  uint64_t dimdOut;     // int32 per CU (DIMD_OUT): its DIMD, written by its node (for its blocks, and the comparison)
+  uint64_t dimdAcc;     // int32 per intra_rec workgroup: 3 x 128 x 128 sums of DIMD blending (DIMD_ACC)
   int      origin[3];
   int      stride[3];
   int      width[3];

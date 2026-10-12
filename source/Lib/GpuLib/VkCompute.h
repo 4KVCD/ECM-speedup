@@ -217,7 +217,10 @@ public:
   Kernel& operator=( const Kernel& ) = delete;
   ~Kernel();
 
-  void create( Context& ctx, const uint32_t* spirv, size_t bytes, uint32_t pushBytes, const char* name );
+  /// specialization: the values of the shader's constants constant_id 0, 1, ... (32 bits each), which the pipeline
+  /// is compiled with (code they disable costs nothing)
+  void create( Context& ctx, const uint32_t* spirv, size_t bytes, uint32_t pushBytes, const char* name,
+               const std::vector<uint32_t>& specialization = {} );
   bool valid() const { return m_pipeline != VK_NULL_HANDLE; }
 
   VkPipeline       pipeline() const { return m_pipeline; }

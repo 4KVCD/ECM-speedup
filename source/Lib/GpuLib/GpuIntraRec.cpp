@@ -119,6 +119,7 @@ constexpr int DERIVE_BF           = 4;    // the intra bilateral filter applies 
 constexpr int DERIVE_NO_PDPC      = 8;    // the SPS disables PDPC
 constexpr int DERIVE_NO_SMOOTHING = 16;   // the SPS disables intra smoothing
 constexpr int DERIVE_TRANSFORM    = 64;   // the transforms depend on the mode: intra_rec chooses them, computes the residual
+constexpr int DERIVE_DIMD         = 128;  // a block of a DIMD CU: intra_rec blends the CU's DIMD modes where it blends
 
 // the parameters intra_rec derives per DERIVE_MODE block, downloaded for the comparison (intra_common.glsl's
 // DBG_PARAMS): dirMode, isModeVer, intraPredAngle, absInvAngle, useCubic, refFilter, applyPDPC, gradPDPC, angularScale,
@@ -148,7 +149,7 @@ constexpr int NSPT_SHAPE_H[NSPT_SHAPES] = { 4, 8, 8, 4, 16, 4, 16, 8, 32, 4, 32,
 // getSpatialIpm's positions: left, above, above-left, above-right, below-left, then the non-adjacent ones
 constexpr int MPM_NEIGHBOURS = 23;
 
-// a coding unit of one channel type (intra_common.glsl's Cu): 40 int32
+// a coding unit of one channel type (intra_common.glsl's Cu): 41 int32
 struct Cu
 {
   int32_t kind;
@@ -161,15 +162,51 @@ struct Cu
   int32_t lumaCu;
   int32_t nbr[MPM_NEIGHBOURS];
   int32_t modes[2];
-  int32_t pad;
+  int32_t dimd;      // the first of the CU's DIMD histograms (-1: no DIMD)
+  int32_t dimdNum;   // their number
 };
-static_assert( sizeof( Cu ) == 40 * 4, "Cu layout" );
+static_assert( sizeof( Cu ) == 41 * 4, "Cu layout" );
 
 // Cu::kind
 constexpr int CU_KNOWN       = 0;   // the host knows the mode
 constexpr int CU_MPM         = 1;   // luma: from the MPM lists (intra_modes.glsl)
 constexpr int CU_CHROMA_DM   = 2;   // chroma: the co-located luma mode
 constexpr int CU_CHROMA_CAND = 3;   // chroma: one of the first four candidates
+constexpr int CU_DIMD        = 4;   // luma: a DIMD CU (intra_dimd.glsl)
+constexpr int CU_CHROMA_DIMD = 5;   // chroma: DIMD chroma
+
+// the DIMD the kernels have (IntraPrediction::dimdHistogramCalls, dimdChromaHistogramCalls)
+#if ENABLE_DIMD && JVET_AJ0267_ADAPTIVE_HOG && JVET_AJ0203_DIMD_2X2_EDGE_OP && JVET_AC0098_LOC_DEP_DIMD && JVET_Z0050_DIMD_CHROMA_FUSION \
+  && JVET_AC0094_REF_SAMPLES_OPT
+#define GPU_DIMD 1
+#else
+#define GPU_DIMD 0
+#endif
+
+// one histogram of a CU's DIMD (intra_common.glsl's DimdCall, from IntraPrediction::DimdHistogramCall, pReco in its
+// plane): 16 int32
+struct DimdCall
+{
+  int32_t kind, histogram, x, y, height, width, direction, filterSizeIdx;
+  int32_t sizeExt[3], extra[3];
+  int32_t maxAmp;
+  int32_t comp;
+};
+static_assert( sizeof( DimdCall ) == 16 * 4, "DimdCall layout" );
+constexpr int DIMD_OUT   = 24;               // int32 per CU: dimdMode, dimdBlending, dimdBlendMode[7], dimdRelWeight[8], dimdLocDep[7]
+constexpr int DIMD_ACC   = 3 * 128 * 128;    // int32 per intra_rec workgroup: the sums of DIMD blending
+
+// the samples of component k.comp the gradients of DIMD histogram k read (inclusive; false: none): the histogram's
+// region and one sample around it (intra_deps.comp has a copy; the gradients of its samples, also those one line
+// further out of buildHistogramAdaptive's first line, lie inside it)
+bool dimdCallArea( const DimdCall& k, int& x0, int& y0, int& x1, int& y1 )
+{
+  x0 = k.x - 1;
+  y0 = k.y - 1;
+  x1 = k.x + k.width;
+  y1 = k.y + k.height;
+  return k.kind != 0;
+}
 
 // intra_modes.glsl's applyModeParams (the kernels' copy): a block's prediction parameters for a mode as
 // initPredIntraParams sets them without TIMD / TMRL, with intra fusion, the directional planar index and the intra
@@ -557,6 +594,9 @@ struct Params
   uint64_t cus;
   uint64_t cuMode;
   uint64_t dbgParams;
+  uint64_t dimdCalls;
+  uint64_t dimdOut;
+  uint64_t dimdAcc;
   int32_t  origin[3];
   int32_t  stride[3];
   int32_t  width[3];
@@ -571,7 +611,7 @@ struct Params
   int32_t  qcsOffset;
   int32_t  trTables;
 };
-static_assert( offsetof( Params, origin ) == 208 && offsetof( Params, edgeCap ) == 288 && sizeof( Params ) == 312,
+static_assert( offsetof( Params, origin ) == 232 && offsetof( Params, edgeCap ) == 312 && sizeof( Params ) == 336,
                "Params layout" );
 
 struct Push
@@ -591,11 +631,24 @@ struct PushScan
 constexpr int FILTER_TAPS[5] = { 6, 8, 10, 12, 16 };
 constexpr int RESI_GROUPS    = 256;   // persistent workgroups of intra_resi
 
+// intra_rec's pipelines (its specialization constants WITH_DIMD, WITH_DERIVED_TRANSFORMS): code that never runs still
+// slows every block, so a picture runs the pipeline without the features it does not use. The one with DIMD has the
+// derived transforms too: the compiler made the one with DIMD alone slower in every case measured (16.8 instead of
+// 14.2 ms per picture without either feature, 46.3 instead of 42.4 with DIMD)
+enum IntraRecVariant
+{
+  VARIANT_PLAIN,                // neither DIMD (Cu::dimd, DERIVE_DIMD) nor blocks with DERIVE_TRANSFORM
+  VARIANT_DERIVED_TRANSFORMS,   // blocks with DERIVE_TRANSFORM, no DIMD
+  VARIANT_FULL,                 // DIMD
+  NUM_VARIANTS
+};
+
 // the kernels and the constant tables, created once and shared by every instance (the decoder contexts of the frame
 // threads); destroyed by GpuIntraRec::releaseShared, before the device
 struct Shared
 {
-  gpu::Kernel                      kernel, kernelResi, kernelDeps, kernelScan;
+  gpu::Kernel                      kernel[NUM_VARIANTS];   // intra_rec, per IntraRecVariant
+  gpu::Kernel                      kernelResi, kernelDeps, kernelScan;
   gpu::Buffer                      filters, matrices;
   gpu::Buffer                      secKernels;                    // int8: the CPU's LFNST and NSPT tables, one after the other
   int32_t                          trOffset[NUM_TRANS_TYPE][7];   // of the inverse transform matrices of sizes 2..128 in matrices (-1: none)
@@ -638,7 +691,10 @@ struct Shared
 Shared* createShared( gpu::Context& ctx )
 {
   Shared* sh = new Shared;
-  sh->kernel.create( ctx, spv_intra_rec, sizeof( spv_intra_rec ), sizeof( Push ), "intra_rec" );
+  sh->kernel[VARIANT_PLAIN].create( ctx, spv_intra_rec, sizeof( spv_intra_rec ), sizeof( Push ), "intra_rec", { 0, 0 } );
+  sh->kernel[VARIANT_DERIVED_TRANSFORMS].create( ctx, spv_intra_rec, sizeof( spv_intra_rec ), sizeof( Push ),
+                                                 "intra_rec (derived transforms)", { 0, 1 } );
+  sh->kernel[VARIANT_FULL].create( ctx, spv_intra_rec, sizeof( spv_intra_rec ), sizeof( Push ), "intra_rec (DIMD)", { 1, 1 } );
   sh->kernelResi.create( ctx, spv_intra_resi, sizeof( spv_intra_resi ), sizeof( Push ), "intra_resi" );
   sh->kernelDeps.create( ctx, spv_intra_deps, sizeof( spv_intra_deps ), sizeof( Push ), "intra_deps" );
   sh->kernelScan.create( ctx, spv_scan, sizeof( spv_scan ), sizeof( PushScan ), "scan" );
@@ -868,6 +924,7 @@ struct GpuIntraRec::Impl
   std::unique_ptr<gpu::Stream> stream;
   gpu::Buffer                 params, tus, coeffs, planes[3], owner[3], sched, dbgPred, dbgResi, lmcs, signPredBuf;
   gpu::Buffer                 cuBuf, dbgParams;   // the CU records and their modes; the derived parameters (verification)
+  gpu::Buffer                 dimdAcc;            // intra_rec's sums of DIMD blending
   Reshape*                    reshape = nullptr;   // the decoder's reshaper (LMCS state of the picture being decoded)
   TrQuant*                    trQuant = nullptr;   // the decoder's TrQuant (transform types of the blocks)
   int                         numGroups = 0;
@@ -882,9 +939,14 @@ struct GpuIntraRec::Impl
   bool                        lmcsUsed = false;   // a block of the picture reads the LMCS tables
   int                         lastIspLuma = -1;   // the record of the last ISP luma sub-partition (Tu::ispPrev)
   std::vector<int32_t>        signPred;           // the sign prediction data of the blocks (Tu::spOffset)
-  bool                        deriveModes = false;   // the GPU derives intra modes in the picture (gpuDerivesModes())
+  // the GPU derives intra modes in the picture: with DIMD the MPM lists depend on the reconstruction, else where
+  // gpuDerivesModes() tests it
+  bool                        deriveModes = false;
   std::vector<Cu>             cus;                // the CUs of the recorded blocks (Tu::cu), where it does
   std::vector<int32_t>        cuMode;             // per CU the host's mode (CU_KNOWN), else -1 (Params::cuMode)
+  std::vector<DimdCall>       dimdCalls;          // the CUs' DIMD histograms (Cu::dimd)
+  std::vector<int32_t>        cpuDimd;            // per CU the CPU's DIMD (DIMD_OUT), compared in verification
+  bool                        dimdBlocks = false; // a block of a DIMD CU was recorded (DERIVE_DIMD: the sums are needed)
   std::unordered_map<const CodingUnit*, int32_t> cuIndex[2];   // per channel type: the record of a CU
   // the sign prediction prepareSignPred took from a TU, for the record() of its coded component
   struct PendingSignPred
@@ -913,7 +975,7 @@ struct GpuIntraRec::Impl
       return;
     }
     for( gpu::Buffer* b: { &params, &tus, &coeffs, &planes[0], &planes[1], &planes[2], &owner[0], &owner[1], &owner[2],
-                           &sched, &dbgPred, &dbgResi, &lmcs, &signPredBuf, &cuBuf, &dbgParams, &upload, &download } )
+                           &sched, &dbgPred, &dbgResi, &lmcs, &signPredBuf, &cuBuf, &dbgParams, &dimdAcc, &upload, &download } )
     {
       b->destroy( *ctx );
     }
@@ -1014,7 +1076,8 @@ bool GpuIntraRec::supported( const Slice& slice, std::string& why )
   else if( sps.getUseTmrl() )                                                             why = "TMRL";
   else if( sps.getUseLMChroma() || sps.getUseCcpMerge() || sps.getUseDdCcpFusion() || sps.getUseBvgCccm() ) why = "cross-component prediction";
   else if( sps.getUseChromaReordering() || sps.getUseIntraDBV() )                         why = "chroma reordering / DBV";
-  else if( sps.getUseDimd() || sps.getUseBvgDimd() || sps.getUseTimd() || sps.getUseTimdMrg() ) why = "DIMD / TIMD";
+  else if( sps.getUseDimd() && !GPU_DIMD )                                                why = "DIMD of another configuration";
+  else if( sps.getUseBvgDimd() || sps.getUseTimd() || sps.getUseTimdMrg() )                why = "BVG-DIMD / TIMD";
   else if( sps.getUseMdip() || sps.getUseMpmSorting() )                                   why = "MDIP / MPM sorting";
   else if( sps.getUseIntraTMP() || sps.getIBCFlag() )                                     why = "IntraTMP / IBC";
   else if( sps.getUseEip() || sps.getUseSgpm() )                                          why = "EIP / SGPM";
@@ -1035,9 +1098,12 @@ void GpuIntraRec::beginPicture( const CodingStructure& cs )
   m.lastIspLuma = -1;
   m.signPred.clear();
   m.pendingSign.num = 0;
-  m.deriveModes = gpuDerivesModes();
+  m.deriveModes = gpuDerivesModes() || cs.sps->getUseDimd();
   m.cus.clear();
   m.cuMode.clear();
+  m.dimdCalls.clear();
+  m.cpuDimd.clear();
+  m.dimdBlocks = false;
   m.cuIndex[0].clear();
   m.cuIndex[1].clear();
   m.unsupportedWhy.clear();
@@ -1112,11 +1178,65 @@ void GpuIntraRec::prepareSignPred( TransformUnit& tu, const ComponentID compID )
   p.num = (int) predicted.size();
 }
 
+// JVET-AK0217's MTSS: the LFNST / NSPT set of the block's luma comes from a DIMD mode list of its own
+static bool usesMtss( const TransformUnit& tu )
+{
+#if JVET_AK0217_INTRA_MTSS
+  return tu.mdirIdx[COMPONENT_Y] != 0;
+#else
+  return false;
+#endif
+}
+
+// the histograms of a CU's DIMD, added to the picture's (Cu::dimd, dimdNum): of a luma CU (IntraPrediction::
+// dimdHistogramCalls) or of DIMD chroma (dimdChromaHistogramCalls), placed in their planes
+static void addDimdCalls( GpuIntraRec::Impl& m, const CodingUnit& cu, const ChannelType chType, Cu& c )
+{
+#if GPU_DIMD
+  IntraPrediction::DimdHistogramCall calls[8];
+  int                                num = 3;
+  if( isLuma( chType ) )
+  {
+    IntraPrediction::dimdHistogramCalls( cu, cu.Y(), calls );
+  }
+  else
+  {
+    num = IntraPrediction::dimdChromaHistogramCalls( cu, cu.blocks[COMPONENT_Cb], calls );
+  }
+  c.dimd    = (int32_t) m.dimdCalls.size();
+  c.dimdNum = num;
+  for( int n = 0; n < num; n++ )
+  {
+    const IntraPrediction::DimdHistogramCall& k = calls[n];
+    CHECK( k.maxAmp > INT32_MAX, "DIMD's amplitude limit beyond 32 bits" );
+    // the area of its component: the CU's, or for the luma of DIMD chroma the co-located luma area
+    const ComponentID comp = ComponentID( k.comp );
+    const Position    origin = isLuma( chType ) || comp != COMPONENT_Y ? cu.blocks[comp].pos() : cu.blocks[COMPONENT_Cb].lumaPos();
+    DimdCall d{};
+    d.kind          = k.kind;
+    d.histogram     = k.histogram;
+    d.x             = origin.x + k.x;
+    d.y             = origin.y + k.y;
+    d.height        = k.height;
+    d.width         = k.width;
+    d.direction     = k.direction;
+    d.filterSizeIdx = k.filterSizeIdx;
+    std::copy_n( k.sizeExt, 3, d.sizeExt );
+    std::copy_n( k.extra, 3, d.extra );
+    d.maxAmp = (int32_t) k.maxAmp;
+    d.comp   = k.comp;
+    m.dimdCalls.push_back( d );
+  }
+#endif
+}
+
 // the record of the CU of a block of the channel (made at the CU's first block): how its mode is found and the CUs that
-// reads. With gpuDerivesModes() the GPU derives the luma modes the MPM lists give (from the CUs at getSpatialIpm's
-// positions, getPURestricted's) and the chroma modes DM or the candidates' substitution give from those, in a node
-// recorded before the CU's first block (intra_rec); the host keeps the others, for luma the mode the neighbours' MPM
-// lists take (PU::getIntraDirLuma: planar for MIP). -1 with why set where a neighbour cannot be read.
+// reads. With gpuDerivesModes() or DIMD the GPU derives the luma modes the MPM lists give (from the CUs at
+// getSpatialIpm's positions, getPURestricted's, and with DIMD the CU's DIMD modes) and the chroma modes DM or the
+// candidates' substitution give from those, in a node recorded before the CU's first block (intra_rec), which also
+// derives a DIMD CU's mode; the host keeps the others, for luma the mode the neighbours' MPM lists take
+// (PU::getIntraDirLuma: planar for MIP). -1 with why set where a neighbour cannot be read or a DIMD CU is of a kind
+// the GPU lacks.
 static int32_t cuRecord( GpuIntraRec::Impl& m, const TransformUnit& tu, const ComponentID compID, const char*& why )
 {
   const CodingUnit&     cu     = *tu.cu;
@@ -1131,6 +1251,8 @@ static int32_t cuRecord( GpuIntraRec::Impl& m, const TransformUnit& tu, const Co
   c.kind    = CU_KNOWN;
   c.node    = -1;
   c.lumaCu  = -1;
+  c.dimd    = -1;
+  c.dimdNum = 0;
   std::fill_n( c.nbr, MPM_NEIGHBOURS, -1 );
   c.modes[0] = c.modes[1] = -1;
   const CompArea& a = cu.blocks[chType == CHANNEL_TYPE_LUMA ? COMPONENT_Y : COMPONENT_Cb];
@@ -1141,7 +1263,17 @@ static int32_t cuRecord( GpuIntraRec::Impl& m, const TransformUnit& tu, const Co
   int32_t mode = -1;
   if( isLuma( chType ) )
   {
-    if( gpuDerivesModes() && pu.parseLumaMode && !cu.mipFlag && !cu.bdpcmMode )
+    if( m.deriveModes && cu.dimd )   // DIMD (DecCu): the mode from the reconstruction around the CU
+    {
+      why = cu.obicFlag ? "OBIC" : cu.intraMergeMode ? "intra merge" : cu.bvgDimdFlag ? "BVG-DIMD" : cu.isBvDimd ? "DIMD with a block vector" : nullptr;
+      if( why )
+      {
+        return -1;
+      }
+      c.kind  = CU_DIMD;
+      c.plIdx = cu.plIdx;
+    }
+    else if( m.deriveModes && pu.parseLumaMode && !cu.mipFlag && !cu.bdpcmMode )
     {
       c.kind          = CU_MPM;
       c.mpmFlag       = pu.mpmFlag ? 1 : 0;
@@ -1200,13 +1332,30 @@ static int32_t cuRecord( GpuIntraRec::Impl& m, const TransformUnit& tu, const Co
     {
       mode = PU::getIntraDirLuma( pu );
     }
+    // DIMD's histograms (deriveDimdMode): a DIMD CU's mode, and the first entries of an MPM list unless the parsed
+    // syntax selects its first entry, planar
+    if( cu.cs->sps->getUseDimd() && ( c.kind == CU_DIMD || ( c.kind == CU_MPM && c.modes[0] != PLANAR_IDX ) ) )
+    {
+      addDimdCalls( m, cu, chType, c );
+    }
   }
   else
   {
     const auto luma = m.cuIndex[CHANNEL_TYPE_LUMA].find( PU::getCoLocatedLumaPU( pu ).cu );
     c.lumaCu = luma != m.cuIndex[CHANNEL_TYPE_LUMA].end() ? luma->second : -1;
     const bool lumaDerived = c.lumaCu >= 0 && m.cus[c.lumaCu].kind != CU_KNOWN && !cu.bdpcmModeChroma;
-    if( lumaDerived && pu.intraDir[CHANNEL_TYPE_CHROMA] == DM_CHROMA_IDX )
+    if( m.deriveModes && pu.intraDir[CHANNEL_TYPE_CHROMA] == DIMD_CHROMA_IDX && !cu.bdpcmModeChroma )
+    {
+      // DIMD chroma (DecCu at the Cb block): from the reconstruction around the CU, then the co-located luma mode
+      if( c.lumaCu < 0 )
+      {
+        why = "DIMD chroma without its luma CU";
+        return -1;
+      }
+      c.kind = CU_CHROMA_DIMD;
+      addDimdCalls( m, cu, chType, c );
+    }
+    else if( lumaDerived && pu.intraDir[CHANNEL_TYPE_CHROMA] == DM_CHROMA_IDX )
     {
       c.kind     = CU_CHROMA_DM;
       c.modes[0] = m.cus[c.lumaCu].modes[0];
@@ -1226,7 +1375,7 @@ static int32_t cuRecord( GpuIntraRec::Impl& m, const TransformUnit& tu, const Co
     }
   }
   const int32_t index = (int32_t) m.cus.size();
-  if( c.kind != CU_KNOWN )   // its node, which derives the mode before the CU's blocks (no samples)
+  if( c.kind != CU_KNOWN )   // its node, which derives the mode before the CU's blocks (it reconstructs no samples)
   {
     Tu node{};
     node.comp      = chType == CHANNEL_TYPE_LUMA ? COMPONENT_Y : COMPONENT_Cb;
@@ -1243,6 +1392,23 @@ static int32_t cuRecord( GpuIntraRec::Impl& m, const TransformUnit& tu, const Co
   m.cus.push_back( c );
   m.cuMode.push_back( mode );
   m.cuIndex[chType][&cu] = index;
+#if GPU_DIMD
+  // the CPU's DIMD of the CU, which it derived before the CU's blocks (verification compares the node's with it)
+  int32_t* d = &*m.cpuDimd.insert( m.cpuDimd.end(), DIMD_OUT, 0 );
+  if( c.kind == CU_CHROMA_DIMD )
+  {
+    d[0] = cu.dimdChromaMode;
+    d[1] = cu.dimdChromaModeSecond;
+  }
+  else
+  {
+    d[0] = cu.dimdMode;
+    d[1] = cu.dimdBlending ? 1 : 0;
+    std::copy_n( cu.dimdBlendMode, 7, d + 2 );
+    std::copy_n( cu.dimdRelWeight, 8, d + 9 );
+    std::copy_n( cu.dimdLocDep, 7, d + 17 );
+  }
+#endif
   return index;
 }
 
@@ -1277,7 +1443,11 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
   else if( ( tu.mtsIdx[compID] == MTS_SKIP || ( tu.jointCbCr && tu.mtsIdx[COMPONENT_Cr] == MTS_SKIP ) )
            && slice.getTSResidualCodingDisabledFlag() )             why = "transform skip with regular residual coding";
   else if( cu.tmpFlag )                                             why = "IntraTMP";
-  else if( cu.dimd )                                                why = "DIMD";
+  // a DIMD CU (CU_DIMD): its prediction blends per CU, its transforms are chosen by modes of its own (implicit MTS,
+  // which supported() rejects, LFNST / NSPT, MTSS)
+  else if( cu.dimd && isLuma( compID ) && area != cu.blocks[COMPONENT_Y] ) why = "DIMD CU with several transform blocks";
+  else if( cu.dimd && isLuma( compID ) && ( tu.mtsIdx[COMPONENT_Y] > MTS_SKIP || cu.lfnstIdx ) ) why = "the transforms of a DIMD CU";
+  else if( isLuma( compID ) && usesMtss( tu ) )                     why = "MTSS";
   else if( cu.timd )                                                why = "TIMD";
   else if( cu.sgpm )                                                why = "SGPM";
   else if( cu.tmrlFlag )                                            why = "TMRL";
@@ -1421,9 +1591,27 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
   t.derive = 0;
   if( derived )
   {
-    t.derive = DERIVE_MODE | ( ipa.fetchRef2nd ? DERIVE_FETCH2ND : 0 ) | ( bfBase ? DERIVE_BF : 0 )
+    // a DIMD CU's fetchRef2nd without its DIMD term (the CPU's depends on the blending the GPU derives): DIMD has no
+    // MRL, ISP, MIP or SGPM, so the size, the CTU's first row and the SPS's switch remain (intra_rec ends it with blending)
+    // (ISP sub-partitions never fuse; their snapshot's flag can be the previous block's)
+    const bool dimdCu   = m.cus[cuIdx].kind == CU_DIMD;
+    const bool fetch2nd = dimdCu ? area.area() >= SIZE_CONSTRAINT && cu.blocks[COMPONENT_Y].y % sps.getMaxCUWidth() != 0
+                                     && !cu.plIdx && !sps.getDisableIntraFusion()
+                                 : ipa.fetchRef2nd && !( cu.ispMode && isLuma( compID ) );
+    t.derive = DERIVE_MODE | ( fetch2nd ? DERIVE_FETCH2ND : 0 ) | ( bfBase ? DERIVE_BF : 0 )
                | ( sps.getDisablePdpc() ? DERIVE_NO_PDPC : 0 )
-               | ( sps.getSpsRangeExtension().getIntraSmoothingDisabledFlag() ? DERIVE_NO_SMOOTHING : 0 );
+               | ( sps.getSpsRangeExtension().getIntraSmoothingDisabledFlag() ? DERIVE_NO_SMOOTHING : 0 )
+               | ( dimdCu ? DERIVE_DIMD : 0 );
+    m.dimdBlocks = m.dimdBlocks || dimdCu;
+    if( dimdCu )
+    {
+      // the CPU's parameters of the main mode, for the comparison: its snapshot after the prediction holds the last
+      // blended mode's (predIntraAng's initPredIntraParams of each); its fusion is the main mode's without blending,
+      // else off (fetchRef2nd)
+      applyModeParams( t, dirMode, cu.plIdx );
+      t.fusion = ipa.applyFusion;
+      t.bf     = cu.dimdBlending && bfBase ? 1 : 0;
+    }
   }
   const PreCalcValues& pcv = *cs.pcv;
   const bool noShift = pcv.noChroma2x2 && area.width == 4;
@@ -1655,7 +1843,8 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
     }
     const bool bfLmcs = cs.picHeader->getLmcsEnabledFlag() && rInfo.getUseSliceReshaper()
                         && ( slice.getSliceType() == I_SLICE ? rInfo.getUseSliceReshaper() : rsp.getCTUFlag() );
-    if( t.bf && bfLmcs )
+    // with a derived mode wherever the filter may apply (intra_rec decides it; the flag is read only where it does)
+    if( ( t.bf || ( t.derive & DERIVE_BF ) ) && bfLmcs )
     {
       t.lmcs |= LMCS_BF_INVERSE;
     }
@@ -1906,9 +2095,29 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
             }
           }
         }
-        else
+        else if( c.lumaCu >= 0 )
         {
           addBlock( m.cus[c.lumaCu].node );
+        }
+        // DIMD: the samples its histograms read (dimdCallArea), from the blocks owning them
+        for( int k = 0; k < c.dimdNum; k++ )
+        {
+          const DimdCall& call = m.dimdCalls[c.dimd + k];
+          const int       ch   = call.comp == COMPONENT_Y ? 0 : 1;
+          int x0, y0, x1, y1;
+          if( dimdCallArea( call, x0, y0, x1, y1 ) )
+          {
+            for( int uy = y0 >> P.unitLog2Y[ch]; uy <= y1 >> P.unitLog2Y[ch]; uy++ )
+            {
+              for( int ux = x0 >> P.unitLog2X[ch]; ux <= x1 >> P.unitLog2X[ch]; ux++ )
+              {
+                if( ux >= 0 && uy >= 0 && ux < P.ownerW[ch] && uy < P.ownerH[ch] )
+                {
+                  addBlock( ownerMap[call.comp][size_t( uy ) * P.ownerW[ch] + ux] );
+                }
+              }
+            }
+          }
         }
         continue;
       }
@@ -2181,6 +2390,7 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
   const int32_t* gOffDl  = nullptr;
   const int32_t* gListDl = nullptr;
   const int32_t* gParamsDl = nullptr;
+  const int32_t* gDimdDl   = nullptr;
   // the scheduling buffer (intra_deps fills it): pending counts, the dependents of each block (CSR, edgeCap entries),
   // the queue, the counters, then intra_deps' own arrays
   const size_t n = size_t( numTus );
@@ -2204,21 +2414,42 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
   P.lumaClipMax = cs.slice->clpRng( COMPONENT_Y ).max;
   P.qcsOffset   = m.sh->qcsOffset;
   P.trTables    = m.sh->trTables;
-  // the CU records, then their modes (the derived ones -1 until the CU's node writes them); with verification
-  // the parameters intra_rec derives
-  const size_t cusBytes = m.cus.size() * sizeof( Cu ), cuBytes = cusBytes + m.cuMode.size() * 4;
+  // the CU records, then their modes (the derived ones -1 until the CU's node writes them) and their DIMD histograms
+  // (uploaded), then their DIMD (written by their nodes); with verification the parameters intra_rec derives
+  const size_t cusBytes  = m.cus.size() * sizeof( Cu ), modeBytes = m.cuMode.size() * 4;
+  const size_t callBytes = m.dimdCalls.size() * sizeof( DimdCall ), cuBytes = cusBytes + modeBytes + callBytes;
+  const size_t dimdOutBytes   = m.cus.size() * DIMD_OUT * 4;
   const size_t dbgParamsBytes = m.on ? 4 : n * DBG_PARAMS * 4;
-  m.cuBuf.ensure( ctx, std::max<size_t>( cuBytes, 4 ), gpu::Buffer::DEVICE );
+  m.cuBuf.ensure( ctx, std::max<size_t>( cuBytes + dimdOutBytes, 4 ), gpu::Buffer::DEVICE );
   m.dbgParams.ensure( ctx, dbgParamsBytes, gpu::Buffer::DEVICE );
   P.cus       = m.cuBuf.addr;
   P.cuMode    = m.cuBuf.addr + cusBytes;
+  P.dimdCalls = m.cuBuf.addr + cusBytes + modeBytes;
+  P.dimdOut   = m.cuBuf.addr + cuBytes;
   P.dbgParams = m.dbgParams.addr;
   std::vector<int32_t> cuData( cuBytes / 4 );
   if( cuBytes )
   {
     memcpy( cuData.data(), m.cus.data(), cusBytes );
-    memcpy( cuData.data() + cusBytes / 4, m.cuMode.data(), cuBytes - cusBytes );
+    memcpy( cuData.data() + cusBytes / 4, m.cuMode.data(), modeBytes );
+    memcpy( cuData.data() + ( cusBytes + modeBytes ) / 4, m.dimdCalls.data(), callBytes );
   }
+  // the intra_rec pipeline with the features the picture uses
+  bool dimd = false, derivedTransforms = false;
+  for( const Cu& c: m.cus )
+  {
+    dimd = dimd || c.dimd >= 0;
+  }
+  for( const Tu& t: m.rec )
+  {
+    dimd              = dimd || ( t.derive & DERIVE_DIMD );
+    derivedTransforms = derivedTransforms || ( t.derive & DERIVE_TRANSFORM );
+  }
+  const IntraRecVariant variant = dimd ? VARIANT_FULL : derivedTransforms ? VARIANT_DERIVED_TRANSFORMS : VARIANT_PLAIN;
+  // DIMD blending's sums: per intra_rec workgroup three classes of a block of up to 128 x 128
+  const size_t dimdAccBytes = m.dimdBlocks ? size_t( m.numGroups ) * DIMD_ACC * 4 : 4;
+  m.dimdAcc.ensure( ctx, dimdAccBytes, gpu::Buffer::DEVICE );
+  P.dimdAcc = m.dimdAcc.addr;
   // the picture's LMCS tables: the forward and inverse LUTs and the chroma scale of every average luma value
   // (Reshape::calculateChromaAdj itself)
   std::vector<int32_t> lmcsTable;
@@ -2238,6 +2469,22 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
     P.lmcsLutSize = lutSize;
   }
   const size_t lmcsBytes = lmcsTable.size() * 4;
+  // ECM_GPU_DUMP=<prefix>: the records each picture uploads, into <prefix>_<POC>_ver.bin / _on.bin. With the
+  // reconstruction on, the CPU derives modes from samples it has not reconstructed: a field the host takes from them
+  // for a mode the GPU derives is wrong there and right in verification, which therefore cannot see it;
+  // perf/gpu/dumpdiff.py compares the two runs' records without the fields intra_rec derives
+  if( getenv( "ECM_GPU_DUMP" ) )
+  {
+    const std::string name = std::string( getenv( "ECM_GPU_DUMP" ) ) + "_" + std::to_string( m.poc ) + ( m.on ? "_on" : "_ver" ) + ".bin";
+    FILE* f = fopen( name.c_str(), "wb" );
+    CHECK( !f, "ECM_GPU_DUMP: cannot write " << name );
+    auto put = [&]( const void* p, size_t bytes ) { const uint64_t b = bytes; fwrite( &b, 8, 1, f ); fwrite( p, 1, bytes, f ); };
+    put( m.rec.data(), tuBytes );
+    put( m.coef.data(), coefBytes );
+    put( m.signPred.data(), spBytes );
+    put( cuData.data(), cuBytes );
+    fclose( f );
+  }
 
   for( ;; )   // once, again with more room when the dependencies do not fit
   {
@@ -2271,10 +2518,10 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
     // scheduling data and the derived parameters, then the planes
     size_t downBytes = 8;
     const size_t dPred = downBytes, dResi = dPred + dbgBytes, dTus = dResi + dbgBytes, dOffset = dTus + tuBytes;
-    const size_t dList = dOffset + ( n + 1 ) * 4, dParams = dList + cap * 4;
+    const size_t dList = dOffset + ( n + 1 ) * 4, dParams = dList + cap * 4, dDimd = dParams + dbgParamsBytes;
     if( !m.on )
     {
-      downBytes = dParams + dbgParamsBytes;
+      downBytes = dDimd + dimdOutBytes;
     }
     size_t dPlane[3] = {};
     for( int c = 0; c < numComp; c++ )
@@ -2337,7 +2584,7 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
     pass.verify = 3;
     s.dispatch( m.sh->kernelDeps, &pass, depGroups );   // the dependents lists, the queue
     s.barrier();
-    s.dispatch( m.sh->kernel, &push, (uint32_t) std::min<size_t>( m.numGroups, n ) );
+    s.dispatch( m.sh->kernel[variant], &push, (uint32_t) std::min<size_t>( m.numGroups, n ) );
     const uint32_t t1 = s.timestamp();
     s.barrier();
     s.copy( m.sched, ( oStart + n ) * 4, m.download, 0, 4 );
@@ -2349,6 +2596,10 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
       s.copy( m.sched, oOffset * 4, m.download, dOffset, ( n + 1 ) * 4 );
       s.copy( m.sched, oList * 4, m.download, dList, cap * 4 );
       s.copy( m.dbgParams, 0, m.download, dParams, dbgParamsBytes );
+      if( dimdOutBytes )
+      {
+        s.copy( m.cuBuf, cuBytes, m.download, dDimd, dimdOutBytes );
+      }
     }
     for( int c = 0; c < numComp; c++ )
     {
@@ -2372,6 +2623,7 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
     gOffDl   = (const int32_t*) ( (const char*) m.download.mapped + dOffset );
     gListDl  = (const int32_t*) ( (const char*) m.download.mapped + dList );
     gParamsDl = (const int32_t*) ( (const char*) m.download.mapped + dParams );
+    gDimdDl   = (const int32_t*) ( (const char*) m.download.mapped + dDimd );
     break;
   }
   m.gpuMs += ms;
@@ -2412,6 +2664,35 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
           || memcmp( h.bfAvail, g.bfAvail, sizeof( h.bfAvail ) ) || h.ispSide != g.ispSide || gd != dependents[i] )
       {
         first = "scheduling data of block " + std::to_string( i ) + " differ (availability, read ranges or dependents)";
+      }
+    }
+  }
+  // the DIMD the nodes derived against the CPU's: modes, blending, weights and location dependence
+  for( size_t u = 0; u < m.cus.size() && first.empty() && GPU_DIMD; u++ )
+  {
+    const Cu& c = m.cus[u];
+    if( c.dimd < 0 )
+    {
+      continue;
+    }
+    const int32_t* g = gDimdDl + u * DIMD_OUT;
+    const int32_t* h = m.cpuDimd.data() + u * DIMD_OUT;
+    for( int k = 0; k < DIMD_OUT; k++ )
+    {
+      if( g[k] != h[k] )
+      {
+        const char* field = c.kind == CU_CHROMA_DIMD ? ( k == 0 ? "dimdChromaMode" : "dimdChromaModeSecond" )
+                            : k == 0 ? "dimdMode" : k == 1 ? "dimdBlending" : k < 9 ? "dimdBlendMode" : k < 17 ? "dimdRelWeight" : "dimdLocDep";
+        const int   entry = k < 2 ? 0 : k < 9 ? k - 2 : k < 17 ? k - 9 : k - 17;
+        char buf[200];
+        snprintf( buf, sizeof( buf ), "%s[%d] of CU %d (%s at %d,%d %dx%d): CPU %d GPU %d", field, entry, (int) u,
+                  c.kind == CU_DIMD ? "DIMD" : c.kind == CU_CHROMA_DIMD ? "DIMD chroma" : "MPM", c.x, c.y, c.w, c.h, h[k], g[k] );
+        first = buf;
+        break;
+      }
+      if( c.kind == CU_CHROMA_DIMD && k == 1 )   // dimdChromaMode and dimdChromaModeSecond
+      {
+        break;
       }
     }
   }
@@ -2561,7 +2842,7 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
       }
     }
   }
-  int numFilter = 0, numPdpc = 0, numGrad = 0, numFusion = 0, numBf = 0, numNodes = 0;
+  int numFilter = 0, numPdpc = 0, numGrad = 0, numFusion = 0, numBf = 0, numNodes = 0, numDimd = 0, numDimdCus = 0;
   for( const Tu& t: m.rec )
   {
     numFilter += t.refFilter;
@@ -2571,7 +2852,12 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
     numBf += t.bf != 0;
     numNodes += ( t.derive & DERIVE_NODE ) != 0;
   }
-  printf( "\n[gpu-intra] POC %d: %d blocks, chain %d (ref filter %d, PDPC %d, gradient PDPC %d, fusion %d, bilateral filter candidates %d, mode nodes %d), GPU %.2f ms: %s%s%s", m.poc,
-          (int) m.rec.size() - numNodes, maxDepth, numFilter, numPdpc, numGrad, numFusion, numBf, numNodes, ms, bad ? "MISMATCH, " : "identical",
+  for( const Cu& c: m.cus )
+  {
+    numDimd += c.dimd >= 0;
+    numDimdCus += c.kind == CU_DIMD || c.kind == CU_CHROMA_DIMD;
+  }
+  printf( "\n[gpu-intra] POC %d: %d blocks, chain %d (ref filter %d, PDPC %d, gradient PDPC %d, fusion %d, bilateral filter candidates %d, mode nodes %d, DIMD %d, DIMD CUs %d), GPU %.2f ms: %s%s%s", m.poc,
+          (int) m.rec.size() - numNodes, maxDepth, numFilter, numPdpc, numGrad, numFusion, numBf, numNodes, numDimd, numDimdCus, ms, bad ? "MISMATCH, " : "identical",
           bad ? first.c_str() : "", numBad ? ( ", " + std::to_string( numBad ) + " picture samples differ" ).c_str() : "" );
 }

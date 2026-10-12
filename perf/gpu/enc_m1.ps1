@@ -1,7 +1,7 @@
 # M1 test stream for the GPU reconstruction: intra only, ECM tools off (plain angular/planar/DC, DCT-II, scalar
 # quantization, no in-loop filters); usage: enc_m1.ps1 <name> <yuv> <w> <h> <frames> [extra encoder args...]
 param( [string]$Name, [string]$Yuv, [int]$W, [int]$H, [int]$Frames, [Parameter(ValueFromRemainingArguments=$true)][string[]]$Extra )
-$enc = 'C:\Code\ECM\bin\qaCpu\EncoderApp.exe'
+$enc = if( $env:ECM_ENC_EXE ) { $env:ECM_ENC_EXE } else { 'C:\Code\ECM\bin\qaCpu\EncoderApp.exe' }   # ECM_ENC_EXE: a test encoder
 $out = "C:\Code\ECM\streams_gpu"
 New-Item -ItemType Directory -Force $out | Out-Null
 $off = @(
