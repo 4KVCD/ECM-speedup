@@ -49,8 +49,9 @@ void main()
   {
     const Tu t = BufTu( P.tus ).v[ti];
     const int W = t.w, H = t.h, N = W * H;
-    // a CU's mode derivation (intra_rec), or the Cr block of a joint CbCr pair, whose residual the Cb block writes
-    if( ( t.derive & DERIVE_NODE ) != 0 || t.jccr == 4 )
+    // a CU's mode derivation and a block whose transforms depend on a derived mode (intra_rec), or the Cr block of a
+    // joint CbCr pair, whose residual the Cb block writes
+    if( ( t.derive & ( DERIVE_NODE | DERIVE_TRANSFORM ) ) != 0 || t.jccr == 4 )
     {
       continue;
     }

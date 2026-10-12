@@ -42,7 +42,7 @@
     transform skip and BDPCM; scalar and dependent quantization, QCS; joint CbCr; LMCS; sign prediction; the dual tree;
     4:2:0 or 4:0:0. A picture with anything else is skipped and counted. The GPU can derive the intra modes itself (the
     MPM lists, chroma DM and candidates, in a node per CU before its blocks; ECM_GPU_MODES=1 tests it on every stream),
-    the base for the mode derivations that read reconstructed samples.
+    and the transforms that depend on them; the base for the mode derivations that read reconstructed samples.
 */
 
 #ifndef __GPUINTRAREC__

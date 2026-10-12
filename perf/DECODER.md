@@ -341,7 +341,14 @@ the reconstruction buffer; works in every frame-thread context):
   reference ranges of the modes the syntax leaves (planar for mpm_idx 0; else all 67). The host still derives every
   mode itself; ECM_GPU_MODES=1 makes the GPU derive all those the MPM lists give, on every test stream, and the
   verification compares each derived parameter with the CPU's (GPU time of four 720p pictures sets with it 22.2
-  instead of 13.7 ms per picture: the union lengthens the dependency chains). GpuIntraRec::supported()
+  instead of 13.7 ms per picture: the union lengthens the dependency chains); M18 moves the transforms that depend on
+  a derived mode to the GPU (ECM's explicit MTS with MTSExt, LFNST, NSPT): intra_rec picks the kernel pair and the
+  LFNST / NSPT matrix and transposition as getTrTypes / getFinalIntraModeForTransform do, from tables the host builds
+  once with the CPU's own lookups, and computes such a block's residual itself before its prediction (in chunks of
+  rows whose first stage fits shared memory; ECM's TU_256 keeps every coefficient of a 128 x 128 MTS block, which
+  the first stage then dequantizes from the levels buffer), stored device-coherent where intra_resi stores the
+  others' and made visible by a workgroup barrier with buffer semantics; with sign prediction the base border and the
+  templates too. GpuIntraRec::supported()
   rejects every tool whose mode derivation or prediction reads reconstructed samples or that the kernels lack, before
   anything is skipped. All 19 regular streams now fall back to the CPU at TMRL, the next sequence-level check (before
   M14: sign prediction, before M6: QCS, before M5: LMCS, before M4: dual tree); many block-level tools follow. The

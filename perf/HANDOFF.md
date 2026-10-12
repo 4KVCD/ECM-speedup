@@ -13,7 +13,7 @@ wall-clock gains with threads are "the easy baseline". Decoder status: single-th
 (`--GpuLoopFilter=1`: ALF, SAO, BIF, CCSAO, LF-CCCM, offset refinement on Vulkan). The user then asked for **a full
 GPU decoder in Vulkan, optimized until nothing is left** ("The GPU decoder needs to fully decode the frame on the
 GPU"; "Your first Vulkan version is going to be slow. That's OK"). That work is branch `dec-gpurecon`: intra
-reconstruction on the GPU (`--GpuRecon`), tool levels M1-M17 done and verified bit-exact; it is **not yet faster than
+reconstruction on the GPU (`--GpuRecon`), tool levels M1-M18 done and verified bit-exact; it is **not yet faster than
 the CPU decoder** (see section 8) and supports only a restricted tool set (all real CTC streams fall back to the CPU,
 first reason: TMRL).
 
@@ -287,7 +287,19 @@ of the modes the syntax leaves (`Cu::modes`: planar for mpm_idx 0, a chroma cand
 still derives every mode itself (no supported tool needs the GPU's yet) and makes no CU records then (they cost 4 % of
 the wall time); `ECM_GPU_MODES=1` (`gpuDerivesModes`, `Impl::deriveModes`) makes the GPU derive all those the MPM
 lists give, on every stream, and verification compares each derived parameter with the CPU's.
-Transforms are still chosen by the host (next: the mode-dependent ones on the GPU, see section 9).
+M18: the transforms of a derived mode (`Tu::derive & DERIVE_TRANSFORM`: ECM's explicit MTS with MTSExt, LFNST, NSPT)
+on the GPU: intra_rec's `selectTransform` picks the kernel pair (getTrTypes' set of the size class and the clamped wide
+angle, IDTR near horizontal / vertical) and the LFNST / NSPT set, transposition and matrix
+(getFinalIntraModeForTransform's mode: the wide angle of the TU, of the CU with ISP, in NSPT's numbering) from tables
+the host builds once with the CPU's own lookups (the TR_TAB_* directory in matrices: matrix offsets per type and size,
+g_aucIpmToTrSet / g_aucTrSet / g_aucTrIdxToTr / g_aiIdLut, g_lfnstLut / g_nsptLut, the LFNST / NSPT matrices' offsets per
+size class, set, index and bucket from TrQuant::getNsptMatrix); the host gives what does not depend on the mode
+(Tu::mtsSet, secIdx, secBucket, the kind, sizes and scan). intra_resi skips such blocks: intra_rec's inChainResidual
+computes the residual before the prediction in chunks of rows whose first stage fits shared memory (without LFNST /
+NSPT it dequantizes from the levels buffer: with TU_256 a 128 x 128 MTS block keeps all its coefficients) and stores it
+device-coherent where intra_resi would, followed by a workgroup barrier with buffer semantics (with joint CbCr the Cr
+block reads its residual like resiFrom); signPrediction computes the base border and templates itself (signPredData)
+and always recomputes. Without ECM_GPU_MODES no block has DERIVE_TRANSFORM.
 
 ## 8. Numbers (i7-10700 8C/16T, Win11, GCC 16.2, RTX 3070 driver 616.92)
 
@@ -312,7 +324,8 @@ Profile of a GPU-on decode (non-LTO, m2_park16, share of all samples): parsing ~
 2. Done (2026-10-11): M4 dual tree, M5 LMCS, M6 dependent quantization and QCS, M7 joint CbCr, M8 explicit MTS,
    M9 transform skip and BDPCM, M10 MIP, M11 LFNST / NSPT (computed by the host until M15), M12 MRL, M13 ISP, M14 sign
    prediction, M15 LFNST / NSPT on the GPU (the VVC kernels, LFNSTExt=0, rejected), M16 sign prediction of LFNST /
-   NSPT blocks. 2026-10-12: M17 intra modes derived on the GPU (tested with `ECM_GPU_MODES=1`).
+   NSPT blocks. 2026-10-12: M17 intra modes derived on the GPU (tested with `ECM_GPU_MODES=1`), M18 the transforms of
+   derived modes on the GPU.
    All 19 regular streams now stop at "TMRL" (the next sequence-level check; the block-level tools of step 4 follow).
 3. Make the GPU path win on CPU time per picture: the derive-only pass (record during parsing or a leaner pass;
    speed up getSpatialIpm/getPURestricted, which also helps the CPU decoder), GPU behaviour with frame threads
@@ -320,17 +333,15 @@ Profile of a GPU-on decode (non-LTO, m2_park16, share of all samples): parsing ~
    more frame threads than cores to hide GPU waits, overlapping a picture's GPU work with the next picture's parse).
 4. More tool levels. CTC turns on DIMD, TIMD, TMRL, MPM sorting, MDIP, PDP and chroma reordering together, and every
    one of them makes the intra modes depend on reconstructed samples (DIMD's modes are in every MPM list), so with
-   CTC the GPU derives every mode (M17's nodes) and everything that depends on a mode moves to the GPU too: next the
-   mode-dependent transforms of derived modes (ECM's explicit MTS kernel sets, LFNST / NSPT sets, transposition and
-   NSPT buckets, getFinalIntraModeForTransform) with their residual and sign-prediction templates computed in
-   intra_rec after the node (intra_resi cannot know them); then DIMD (histogram of gradients over the template, the
-   blended prediction, its modes in the MPM lists, DIMD chroma, the transform rules of DIMD CUs and MTSS'
-   candModeListForTransform), MPM sorting / MDIP / PDP, TIMD, TMRL, CCLM/CCCM and the other cross-component tools,
-   chroma reordering / DBV, LFNST of MIP, IntraTMP / IBC, then inter pictures. Each level: new test set with exactly
-   that tool on, verify mode identical, canaries, commit. Speed of derived modes: with `ECM_GPU_MODES=1` the GPU time
-   of four 720p pictures sets is 22.2 instead of 13.7 ms per picture (the union of the read ranges lengthens the
-   dependency chains); exact ranges would need dependencies a node registers once it knows the mode (a dependents
-   list per block, closed when the block finishes).
+   CTC the GPU derives every mode (M17's nodes) and everything that depends on a mode moves to the GPU too (M18 did
+   the transforms). Next DIMD (histogram of gradients over the template, the blended prediction, its modes in the MPM
+   lists, DIMD chroma, the transform rules of DIMD CUs: getFinalIntraModeForTransform's DIMD branch, NSPT buckets,
+   MTSS' candModeListForTransform), then MPM sorting / MDIP / PDP, TIMD, TMRL, CCLM/CCCM and the other cross-component
+   tools, chroma reordering / DBV, LFNST of MIP, IntraTMP / IBC, then inter pictures. Each level: new test set with
+   exactly that tool on, verify mode identical, canaries, commit. Speed of derived modes: with `ECM_GPU_MODES=1` the
+   GPU time of four 720p pictures sets is 25.3 instead of 14.0 ms per picture (the union of the read ranges lengthens
+   the dependency chains, the residuals of derived transforms are computed in the chain); exact ranges would need
+   dependencies a node registers once it knows the mode (a dependents list per block, closed when the block finishes).
 5. In-loop filters in ON mode on the GPU without a CPU round trip (deblocking: see dec-gpu-dbf-wip; ALF/SAO/... are
    on the GPU already via --GpuLoopFilter, but on the CPU's picture).
 6. 1080p/4K verification and timing on long streams once sources are agreed with the user (three short 1080p
@@ -343,7 +354,13 @@ Profile of a GPU-on decode (non-LTO, m2_park16, share of all samples): parsing ~
   queue are deadlock-free dependency scheduling.
 - RTX 3070, also with the memory model: data passed between the invocations of one workgroup through a global buffer
   and a barrier was read stale by whole warps while another process loaded the GPU (intra_resi, fixed by shared
-  memory). Pass data inside a workgroup through shared memory, and stress-test with `gpuload.py` running.
+  memory). Pass data inside a workgroup through shared memory, and stress-test with `gpuload.py` running. Where it
+  cannot fit (M18's in-chain residuals of up to 128 x 128 samples), store and load through a `coherent` buffer
+  reference with `controlBarrier( gl_ScopeWorkgroup, gl_ScopeWorkgroup, gl_StorageSemanticsBuffer,
+  gl_SemanticsAcquireRelease )` between: without `coherent` the memory model's accesses are private and no barrier
+  makes them visible (likely intra_resi's old failure); 120 stress decodes of such blocks under load were identical.
+  Code a kernel never runs still costs: M18's in-chain paths made intra_rec ~4 % slower on pictures that never take
+  them (a per-sample test of a global flag in storeRecon cost as much again; folded into Tu::resiFrom).
 - `supported()` / `record()` must reject every tool the kernels lack, including tools that only change a CPU code
   path the GPU replaces (dequantization, transforms, clipping): dependent quantization was not rejected until M6,
   and the reconstruction on decoded such streams wrong. With a new level, look through the CPU path it replaces for

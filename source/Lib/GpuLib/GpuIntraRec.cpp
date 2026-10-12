@@ -66,7 +66,7 @@
 
 namespace
 {
-// layout shared with intra_rec.comp (struct Tu): 96 int32
+// layout shared with intra_rec.comp (struct Tu): 100 int32
 struct Tu
 {
   int32_t comp, x, y, w, h;
@@ -106,8 +106,10 @@ struct Tu
   int32_t resiFrom;
   int32_t cu;
   int32_t derive;
+  int32_t mtsSet, secIdx, secBucket;
+  int32_t pad;
 };
-static_assert( sizeof( Tu ) == 96 * 4, "Tu layout" );
+static_assert( sizeof( Tu ) == 100 * 4, "Tu layout" );
 
 // Tu::derive (intra_common.glsl's DERIVE_*)
 constexpr int DERIVE_NODE         = 32;   // not a block: the derivation of the mode of CU Tu::cu, before its blocks
@@ -116,11 +118,32 @@ constexpr int DERIVE_FETCH2ND     = 2;    // IntraPrediction's fetchRef2nd: intr
 constexpr int DERIVE_BF           = 4;    // the intra bilateral filter applies unless the mode excludes it
 constexpr int DERIVE_NO_PDPC      = 8;    // the SPS disables PDPC
 constexpr int DERIVE_NO_SMOOTHING = 16;   // the SPS disables intra smoothing
+constexpr int DERIVE_TRANSFORM    = 64;   // the transforms depend on the mode: intra_rec chooses them, computes the residual
 
 // the parameters intra_rec derives per DERIVE_MODE block, downloaded for the comparison (intra_common.glsl's
 // DBG_PARAMS): dirMode, isModeVer, intraPredAngle, absInvAngle, useCubic, refFilter, applyPDPC, gradPDPC, angularScale,
-// fusion, bf, plIdx
-constexpr int DBG_PARAMS = 12;
+// fusion, bf, plIdx, then the transforms: mtxV, mtxH, secMatrix, secTranspose, secLayout
+constexpr int DBG_PARAMS = 17;
+
+// the directory of the transform tables of derived modes (intra_common.glsl's TR_TAB_*, createShared)
+constexpr int TR_TAB_MATRIX       = 0;
+constexpr int TR_TAB_IPM_TO_SET   = 1;
+constexpr int TR_TAB_SET          = 2;
+constexpr int TR_TAB_IDX_TO_TR    = 3;
+constexpr int TR_TAB_ID_LUT       = 4;
+constexpr int TR_TAB_LFNST_LUT    = 5;
+constexpr int TR_TAB_NSPT_LUT     = 6;
+constexpr int TR_TAB_LFNST_MATRIX = 7;
+constexpr int TR_TAB_NSPT_MATRIX  = 8;
+constexpr int TR_TAB_LFNST_LAYOUT = 9;
+constexpr int TR_TAB_EXT_MODES    = 10;
+constexpr int TR_TAB_SET_ROW      = 11;
+constexpr int TR_TAB_IDTR         = 12;
+constexpr int TR_TAB_NUM          = 13;
+// the NSPT shapes of TR_TAB_NSPT_MATRIX (intra_common.glsl's nsptShape)
+constexpr int NSPT_SHAPES                 = 12;
+constexpr int NSPT_SHAPE_W[NSPT_SHAPES] = { 4, 8, 4, 8, 4, 16, 8, 16, 4, 32, 8, 32 };
+constexpr int NSPT_SHAPE_H[NSPT_SHAPES] = { 4, 8, 8, 4, 16, 4, 16, 8, 32, 4, 32, 8 };
 
 // getSpatialIpm's positions: left, above, above-left, above-right, below-left, then the non-adjacent ones
 constexpr int MPM_NEIGHBOURS = 23;
@@ -546,7 +569,7 @@ struct Params
   int32_t  lmcsLutSize;
   int32_t  lumaClipMin, lumaClipMax;
   int32_t  qcsOffset;
-  int32_t  pad;
+  int32_t  trTables;
 };
 static_assert( offsetof( Params, origin ) == 208 && offsetof( Params, edgeCap ) == 288 && sizeof( Params ) == 312,
                "Params layout" );
@@ -579,6 +602,7 @@ struct Shared
   int32_t                          qcsOffset = 0;                 // of the QCS weights in matrices
   int32_t                          mipOffset[3] = {};             // of the MIP matrices of each size class in matrices
   int32_t                          lfnstLayout[3][2] = {};        // of the LFNST output positions in matrices (sbSize 4, 8, 16; transposed)
+  int32_t                          trTables = 0;                  // of the transform tables' directory in matrices (TR_TAB_*)
   std::vector<std::pair<const int8_t*, size_t>>      secTables;   // each table's start and bytes, in secKernels' order
   std::vector<std::pair<const ScanElement*, int32_t>> secScans;  // the scans LFNST / NSPT read, their positions' offset in matrices
   std::unique_ptr<BilateralFilter> bif;   // the intra prediction bilateral filter's tables
@@ -733,6 +757,65 @@ Shared* createShared( gpu::Context& ctx )
   for( const auto& table: sh->secTables )
   {
     kernels.insert( kernels.end(), table.first, table.first + table.second );
+  }
+  // the transforms of a mode intra_rec derives (intra_modes.glsl's selectTransform, TR_TAB_*): a directory of the
+  // tables' offsets, then the inverse transform matrices' offsets per type and size, ECM's explicit MTS kernel sets
+  // (getTrTypes), the LFNST / NSPT sets of the modes and the offsets in secKernels of their matrices per size class,
+  // set, index (and NSPT bucket), found with the CPU's own lookups (TrQuant::getNsptMatrix), and the LFNST output
+  // arrangements
+  {
+    std::vector<int32_t> tab( TR_TAB_NUM, 0 );
+    auto add = [&]( const int which, const std::vector<int32_t>& values )
+    {
+      tab[which] = (int32_t) ( mat.size() + tab.size() );
+      tab.insert( tab.end(), values.begin(), values.end() );
+    };
+    std::vector<int32_t> v;
+    for( int type = 0; type < NUM_TRANS_TYPE; type++ ) for( int l = 0; l < 7; l++ ) v.push_back( sh->trOffset[type][l] );
+    add( TR_TAB_MATRIX, v );
+    add( TR_TAB_IPM_TO_SET, std::vector<int32_t>( &g_aucIpmToTrSet[0][0], &g_aucIpmToTrSet[0][0] + sizeof( g_aucIpmToTrSet ) ) );
+    add( TR_TAB_SET, std::vector<int32_t>( &g_aucTrSet[0][0], &g_aucTrSet[0][0] + sizeof( g_aucTrSet ) ) );
+    add( TR_TAB_IDX_TO_TR, std::vector<int32_t>( &g_aucTrIdxToTr[0][0], &g_aucTrIdxToTr[0][0] + sizeof( g_aucTrIdxToTr ) ) );
+    add( TR_TAB_ID_LUT, std::vector<int32_t>( &g_aiIdLut[0][0], &g_aiIdLut[0][0] + sizeof( g_aiIdLut ) ) );
+    add( TR_TAB_LFNST_LUT, std::vector<int32_t>( g_lfnstLut, g_lfnstLut + sizeof( g_lfnstLut ) ) );
+    add( TR_TAB_NSPT_LUT, std::vector<int32_t>( g_nsptLut, g_nsptLut + sizeof( g_nsptLut ) ) );
+    v.clear();
+    for( int s = 0; s < 3; s++ )   // sbSize 4, 8, 16
+    {
+      for( int set = 0; set < 35; set++ )
+      {
+        for( int idx = 0; idx < 3; idx++ )
+        {
+          const int8_t* m = s == 0 ? &g_lfnst4x4[set][idx][0][0] : s == 1 ? &g_lfnst8x8[set][idx][0][0] : &g_lfnst16x16[set][idx][0][0];
+          v.push_back( sh->kernelOffset( m ) );
+          CHECK( v.back() < 0, "an LFNST matrix outside the kernels" );
+        }
+      }
+    }
+    add( TR_TAB_LFNST_MATRIX, v );
+    v.clear();
+    for( int shape = 0; shape < NSPT_SHAPES; shape++ )
+    {
+      for( int set = 0; set < 35; set++ )
+      {
+        for( int idx = 0; idx < 3; idx++ )
+        {
+          for( int bucket = 0; bucket < 3; bucket++ )
+          {
+            v.push_back( sh->kernelOffset( TrQuant::getNsptMatrix( set, NSPT_SHAPE_W[shape], NSPT_SHAPE_H[shape], idx, bucket ) ) );
+            CHECK( v.back() < 0, "an NSPT matrix outside the kernels" );
+          }
+        }
+      }
+    }
+    add( TR_TAB_NSPT_MATRIX, v );
+    v.assign( &sh->lfnstLayout[0][0], &sh->lfnstLayout[0][0] + 6 );
+    add( TR_TAB_LFNST_LAYOUT, v );
+    tab[TR_TAB_EXT_MODES] = NUM_EXT_LUMA_MODE;
+    tab[TR_TAB_SET_ROW]   = (int32_t) ( sizeof( g_aucTrSet[0] ) );
+    tab[TR_TAB_IDTR]      = IDTR;
+    sh->trTables = (int32_t) mat.size();
+    mat.insert( mat.end(), tab.begin(), tab.end() );
   }
   sh->filters.create( ctx, filt.size() * 4, gpu::Buffer::DEVICE );
   sh->matrices.create( ctx, mat.size() * 4, gpu::Buffer::DEVICE );
@@ -1376,9 +1459,9 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
       return;
     }
     t.jccr = JCCR_DERIVED;
+    const int32_t cbIndex = (int32_t) m.rec.size() - 1;
     if( cb->spOffset >= 0 )   // sign prediction of the pair, decided by the coded component's block
     {
-      const int32_t cbIndex = (int32_t) m.rec.size() - 1;
       if( std::abs( cb->jccr ) == 3 )   // Cr coded: this block decides and writes the Cb block's residual
       {
         t.spCoded               = cbIndex;
@@ -1388,6 +1471,10 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
       {
         t.resiFrom = cbIndex;
       }
+    }
+    else if( cb->derive & DERIVE_TRANSFORM )   // the Cb block computes both residuals in intra_rec
+    {
+      t.resiFrom = cbIndex;
     }
   }
   // sign prediction (TrQuant::predCoeffSigns): prepareSignPred took the predicted levels of the coded component before
@@ -1477,6 +1564,18 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
         unsupported( "a transform type without a matrix of this size" );
         return;
       }
+    }
+    // a derived mode's transforms (intra_rec's selectTransform): the kernel pair of ECM's explicit MTS
+    // (TrQuant::getTrTypes with MTSExt) and the LFNST / NSPT matrix and transposition (getFinalIntraModeForTransform)
+    // depend on the mode; the host gives what does not, and intra_rec computes the residual after the mode's node
+    const bool mtsByMode = isLuma( resiComp ) && sps.getUseMTS() && sps.getUseIntraMTS() && sps.getUseMTSExt()
+                           && !cu.ispMode && tu.mtsIdx[resiComp] > MTS_SKIP;
+    if( derived && ( mtsByMode || sec.kind != SEC_NONE ) )
+    {
+      t.derive   |= DERIVE_TRANSFORM;
+      t.mtsSet    = mtsByMode ? tu.mtsIdx[resiComp] - MTS_DST7_DST7 + 1 : 0;
+      t.secIdx    = cu.lfnstIdx - 1;
+      t.secBucket = sec.kind == SEC_NSPT ? PU::getNSPTBucket( tu, false, resiComp ) : 0;
     }
   }
   if( signPred && ( !t.cbf || ts || area.width < 4 || area.height < 4 || area.width > 32 || area.height > 32 ) )
@@ -1634,6 +1733,13 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
         return;
       }
       t.nzRows = t.nzCols = t.secSize;
+    }
+    // intra_rec keeps the coefficients of a derived mode's LFNST / NSPT (at most 16 x 16) and of sign prediction's
+    // blocks (at most 32 x 32) in 32 x 32 entries
+    if( ( t.derive & DERIVE_TRANSFORM ) && ( t.secKind != SEC_NONE || signPred ) && t.nzRows * t.nzCols > 1024 )
+    {
+      unsupported( "a derived mode's transform with more than 32 x 32 coefficients" );
+      return;
     }
     for( int y = 0; y < t.nzRows; y++ )
     {
@@ -2097,6 +2203,7 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
   P.lumaClipMin = cs.slice->clpRng( COMPONENT_Y ).min;
   P.lumaClipMax = cs.slice->clpRng( COMPONENT_Y ).max;
   P.qcsOffset   = m.sh->qcsOffset;
+  P.trTables    = m.sh->trTables;
   // the CU records, then their modes (the derived ones -1 until the CU's node writes them); with verification
   // the parameters intra_rec derives
   const size_t cusBytes = m.cus.size() * sizeof( Cu ), cuBytes = cusBytes + m.cuMode.size() * 4;
@@ -2347,6 +2454,14 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
     check( "fusion", h.fusion, g[9] );
     check( "bf", h.bf, g[10] );
     check( "plIdx", h.plIdx, g[11] );
+    if( h.derive & DERIVE_TRANSFORM )   // the transforms intra_rec chose for the mode
+    {
+      check( "mtxV", h.mtxV, g[12] );
+      check( "mtxH", h.mtxH, g[13] );
+      check( "secMatrix", h.secMatrix, g[14] );
+      check( "secTranspose", h.secTranspose, g[15] );
+      check( "secLayout", h.secLayout, g[16] );
+    }
     if( field )
     {
       char buf[200];

@@ -2,7 +2,7 @@
 #ifndef INTRA_COMMON_GLSL
 #define INTRA_COMMON_GLSL
 
-// one transform block of one component (96 int32, layout shared with GpuIntraRec.cpp)
+// one transform block of one component (100 int32, layout shared with GpuIntraRec.cpp)
 struct Tu
 {
   int comp, x, y, w, h;
@@ -58,6 +58,12 @@ struct Tu
   // and sets the fields above that depend on it (the host's are then the CPU's, for the comparison only)
   int cu;
   int derive;
+  // DERIVE_TRANSFORM (intra_rec's selectTransform): what the transforms of the mode depend on besides it - explicit
+  // MTS's kernel pair index + 1 (0: none), LFNST's / NSPT's index (lfnstIdx - 1) and NSPT's bucket
+  int mtsSet;
+  int secIdx;
+  int secBucket;
+  int pad;
 };
 layout( buffer_reference, std430, buffer_reference_align = 4 ) buffer BufTu { Tu v[]; };
 
@@ -68,10 +74,13 @@ const int DERIVE_FETCH2ND = 2;   // IntraPrediction's fetchRef2nd: the second re
 const int DERIVE_BF       = 4;   // the intra bilateral filter applies unless the mode excludes it
 const int DERIVE_NO_PDPC  = 8;   // the SPS disables PDPC (DisablePdpc)
 const int DERIVE_NO_SMOOTHING = 16;   // the SPS disables intra smoothing (no reference filter, no Gaussian interpolation)
+// the transforms depend on the mode (explicit MTS of MTSExt, LFNST / NSPT): intra_rec chooses their matrices and
+// computes the residual itself (intra_resi skips the block, with joint CbCr also the other block's)
+const int DERIVE_TRANSFORM = 64;
 
 // Params::dbgParams per block: the derived dirMode, isModeVer, intraPredAngle, absInvAngle, useCubic, refFilter,
-// applyPDPC, gradPDPC, angularScale, fusion, bf, plIdx
-const int DBG_PARAMS = 12;
+// applyPDPC, gradPDPC, angularScale, fusion, bf, plIdx, then mtxV, mtxH, secMatrix, secTranspose, secLayout
+const int DBG_PARAMS = 17;
 
 // the positions of getSpatialIpm (the MPM list's neighbours): left, above, above-left, above-right, below-left, then
 // the non-adjacent ones
@@ -101,6 +110,31 @@ const int CU_KNOWN       = 0;   // the host knows the mode (Params::cuMode holds
 const int CU_MPM         = 1;   // luma: from the MPM lists (PU::getIntraMPMs)
 const int CU_CHROMA_DM   = 2;   // chroma: the co-located luma mode (PU::getCoLocatedIntraLumaMode)
 const int CU_CHROMA_CAND = 3;   // chroma: candId of PU::getIntraChromaCandModes' first four
+
+// the directory of the transform tables (in matrices at Params::trTables, GpuIntraRec.cpp's createShared): the
+// offsets of the tables (in matrices), then values
+const int TR_TAB_MATRIX       = 0;    // [type][log2 size - 1]: the inverse transform matrices' offsets (-1: none)
+const int TR_TAB_IPM_TO_SET   = 1;    // g_aucIpmToTrSet[16][36]: explicit MTS's kernel set of size class and mode
+const int TR_TAB_SET          = 2;    // g_aucTrSet[80][TR_TAB_SET_ROW]: the kernel pairs of a set
+const int TR_TAB_IDX_TO_TR    = 3;    // g_aucTrIdxToTr[25][2]: a pair's vertical and horizontal type
+const int TR_TAB_ID_LUT       = 4;    // g_aiIdLut[3][3]: the identity transform's mode distance per size
+const int TR_TAB_LFNST_LUT    = 5;    // g_lfnstLut: the LFNST set of a mode
+const int TR_TAB_NSPT_LUT     = 6;    // g_nsptLut: the NSPT set of a mode
+const int TR_TAB_LFNST_MATRIX = 7;    // [3 region sizes][35 sets][3 indices]: the matrices' offsets in secKernels
+const int TR_TAB_NSPT_MATRIX  = 8;    // [NSPT shape][35 sets][3 indices][3 buckets]: the matrices' offsets in secKernels
+const int TR_TAB_LFNST_LAYOUT = 9;    // [3 region sizes][2 transposed]: the offsets of the LFNST output arrangements
+const int TR_TAB_EXT_MODES    = 10;   // value: NUM_EXT_LUMA_MODE
+const int TR_TAB_SET_ROW      = 11;   // value: the length of g_aucTrSet's rows
+const int TR_TAB_IDTR         = 12;   // value: the identity transform's type (IDTR)
+const int TR_TAB_NUM          = 13;
+
+// the NSPT shapes (w x h) of TR_TAB_NSPT_MATRIX
+int nsptShape( int w, int h )
+{
+  return w == 4 && h == 4 ? 0 : w == 8 && h == 8 ? 1 : w == 4 && h == 8 ? 2 : w == 8 && h == 4 ? 3 : w == 4 && h == 16 ? 4
+       : w == 16 && h == 4 ? 5 : w == 8 && h == 16 ? 6 : w == 16 && h == 8 ? 7 : w == 4 && h == 32 ? 8 : w == 32 && h == 4 ? 9
+       : w == 8 && h == 32 ? 10 : 11;
+}
 
 // Tu::secKind
 const int SEC_NONE  = 0;
@@ -258,7 +292,7 @@ struct Params
   int      lmcsLutSize;              // entries of each LMCS table (1 << luma bit depth)
   int      lumaClipMin, lumaClipMax; // the slice's luma clipping range (the average luma of chroma residual scaling)
   int      qcsOffset;   // Quant's m_coeffShift64: the weight (of 1024) of the next larger index, per index magnitude < 64
-  int      pad;
+  int      trTables;    // in matrices: the directory of the tables a derived mode's transforms are chosen with (TR_TAB_*)
 };
 layout( buffer_reference, std430, buffer_reference_align = 8 ) buffer BufParams { Params p; };
 

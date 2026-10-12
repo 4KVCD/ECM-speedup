@@ -93,6 +93,95 @@ int modeRead( Cu c, int k )
   return n >= 0 ? cuModeOf( n ) : -1;
 }
 
+// an entry of the transform tables' directory (TR_TAB_*)
+int trTab( int which )
+{
+  return BufI32( P.matrices ).v[P.trTables + which];
+}
+
+// PU::getWideAngle: the wide-angle index of a mode for a block of w x h (below 0 or above 66 for wide angles)
+int puWideAngle( int w, int h, int mode )
+{
+  if( mode < 2 )
+  {
+    return mode;
+  }
+  const int deltaSize = abs( findMSB( w ) - findMSB( h ) );
+  const int modeShift = deltaSize == 0 ? 0 : deltaSize == 1 ? 6 : deltaSize == 2 ? 10 : deltaSize == 3 ? 12 : deltaSize == 4 ? 14 : 15;
+  if( w > h && mode < 2 + modeShift )
+  {
+    return mode + VDIA_IDX - 1;
+  }
+  if( h > w && mode > VDIA_IDX - modeShift )
+  {
+    return mode - ( VDIA_IDX + 1 );
+  }
+  return mode;
+}
+
+// the transforms of a derived mode (Tu::derive & DERIVE_TRANSFORM), as the host chooses them otherwise: the kernel
+// pair of ECM's explicit MTS (TrQuant::getTrTypes with MTSExt: the set of the size class and the mode's wide angle,
+// clamped to 2 .. 66, the identity transform near horizontal / vertical) and the LFNST / NSPT set, transposition and
+// matrix of getFinalIntraModeForTransform's mode (planar of a directional planar index as its direction, the wide
+// angle of the block, of the CU with ISP, in NSPT's numbering); plIdx: the CU's directional planar index
+void selectTransform( inout Tu t, int mode, int plIdx )
+{
+  BufI32     mt      = BufI32( P.matrices );
+  const bool luma    = t.comp == 0;
+  const int  W = t.w, H = t.h;
+  const int  extHalf = trTab( TR_TAB_EXT_MODES ) >> 1;
+  if( t.mtsSet != 0 )
+  {
+    const int trIdx = t.mtsSet - 1;
+    const int wide  = puWideAngle( W, H, mode );
+    int pm = wide < 0 ? 2 : wide >= NUM_LUMA_MODE ? VDIA_IDX : wide;
+    if( luma && pm == PLANAR_IDX )
+    {
+      pm = plIdx == 2 ? HOR_IDX : plIdx == 1 ? VER_IDX : pm;
+    }
+    const bool transposed = pm > DIA_IDX;
+    const int  mdIdx = transposed ? NUM_LUMA_MODE + 1 - pm : pm;
+    const int  szW = min( 3, findMSB( W ) - 2 ), szH = min( 3, findMSB( H ) - 2 );
+    const int  set  = mt.v[trTab( TR_TAB_IPM_TO_SET ) + ( transposed ? szH * 4 + szW : szW * 4 + szH ) * 36 + mdIdx];
+    const int  pair = mt.v[trTab( TR_TAB_SET ) + set * trTab( TR_TAB_SET_ROW ) + trIdx];
+    int ver = mt.v[trTab( TR_TAB_IDX_TO_TR ) + pair * 2 + ( transposed ? 1 : 0 )];
+    int hor = mt.v[trTab( TR_TAB_IDX_TO_TR ) + pair * 2 + ( transposed ? 0 : 1 )];
+    if( trIdx == 3 && W <= 16 && H <= 16 )   // the signalled mode decides
+    {
+      const int limit = mt.v[trTab( TR_TAB_ID_LUT ) + ( findMSB( W ) - 2 ) * 3 + findMSB( H ) - 2];
+      ver = abs( mode - HOR_IDX ) <= limit ? trTab( TR_TAB_IDTR ) : ver;
+      hor = abs( mode - VER_IDX ) <= limit ? trTab( TR_TAB_IDTR ) : hor;
+    }
+    t.mtxV = mt.v[trTab( TR_TAB_MATRIX ) + ver * 7 + findMSB( H ) - 1];
+    t.mtxH = mt.v[trTab( TR_TAB_MATRIX ) + hor * 7 + findMSB( W ) - 1];
+  }
+  if( t.secKind != SEC_NONE )
+  {
+    int m = mode;
+    if( luma && m == PLANAR_IDX )
+    {
+      m = plIdx == 2 ? HOR_IDX : plIdx == 1 ? VER_IDX : m;
+    }
+    const bool ispLuma = luma && t.isp != 0;
+    const int  wide    = puWideAngle( ispLuma ? t.cuW : W, ispLuma ? t.cuH : H, m );
+    const int  im      = wide < 0 ? wide + extHalf + NUM_LUMA_MODE : wide >= NUM_LUMA_MODE ? wide + extHalf : wide;   // getNSPTIntraMode
+    // PU::getTransposeFlag
+    t.secTranspose = ( im >= NUM_LUMA_MODE && im >= NUM_LUMA_MODE + extHalf ) || ( im < NUM_LUMA_MODE && im > DIA_IDX ) ? 1 : 0;
+    if( t.secKind == SEC_LFNST )
+    {
+      const int set = mt.v[trTab( TR_TAB_LFNST_LUT ) + im], size = findMSB( t.secSize ) - 2;
+      t.secMatrix = mt.v[trTab( TR_TAB_LFNST_MATRIX ) + ( size * 35 + set ) * 3 + t.secIdx];
+      t.secLayout = mt.v[trTab( TR_TAB_LFNST_LAYOUT ) + size * 2 + t.secTranspose];
+    }
+    else
+    {
+      const int set   = mt.v[trTab( TR_TAB_NSPT_LUT ) + im];
+      const int shape = t.secTranspose != 0 ? nsptShape( H, W ) : nsptShape( W, H );   // the kernel's block
+      t.secMatrix = mt.v[trTab( TR_TAB_NSPT_MATRIX ) + ( ( shape * 35 + set ) * 3 + t.secIdx ) * 3 + t.secBucket];
+    }
+  }
+}
+
 int filterTap( int taps, int frac, int i )
 {
   int t = taps == 6 ? 0 : taps == 8 ? 1 : taps == 10 ? 2 : taps == 12 ? 3 : 4;
@@ -174,9 +263,10 @@ void reconstruct( Tu t, int x, int y, int pr, int re )
   }
 }
 
-// predicted sample (x, y) of block t: reconstructed with the residual of intra_resi, or with joint CbCr and sign
-// prediction with the one the decision in the pair's other block wrote (read device-coherent); with sign prediction
-// kept until the signs are decided (signPrediction)
+// predicted sample (x, y) of block t: reconstructed with the residual intra_resi computed, or one written in intra_rec
+// (Tu::resiFrom, read device-coherent): with joint CbCr by the pair's other block (sign prediction's decision, or the
+// Cb block whose transforms depend on a derived mode), or by this block (inChainResidual, which sets its local copy's
+// resiFrom to itself); with sign prediction kept until the signs are decided (signPrediction)
 void storeRecon( Tu t, int x, int y, int pr )
 {
   if( t.spCoded >= 0 )
@@ -296,6 +386,264 @@ int lumaConv( bool isVer, int l, int base, int taps, bool cubic, bool big, int f
   return sum;
 }
 
+// the residual of block c in intra_rec (a derived mode's transforms, DERIVE_TRANSFORM, or sign prediction's
+// recomputation), as intra_resi computes it for the others: the dequantized coefficients, those at the positions in
+// negativeAt (x | y << 16, -1: none) negated (for NSPT only its inputs, in scan order, into s_secIn), with LFNST its
+// outputs over them (s_spCoef); all invocations, ending with a barrier. firstStageRows then gives the first stage of
+// some rows, secondStage the residual sample by sample from that
+void prepareCoefficients( Tu c, int negativeAt[8], int lid, int NT )
+{
+  BufI32    mt      = BufI32( P.matrices );
+  BufI8     kernels = BufI8( P.secKernels );
+  BufI32    cf      = BufI32( P.coeffs );
+  const int nzR = c.nzRows, nzC = c.nzCols, addDq = dequantAdd( c );
+  if( c.secKind == SEC_NSPT )
+  {
+    for( int i = lid; i < c.secNumIn; i += NT )
+    {
+      const int pos = mt.v[c.secScan + i], x = pos & 0xffff, y = pos >> 16;
+      int       q   = y < nzR && x < nzC ? cf.v[c.coeffOffset + y * nzC + x] : 0;
+      for( int k = 0; k < 8; k++ )
+      {
+        q = negativeAt[k] == pos ? -q : q;
+      }
+      s_secIn[i] = q != 0 ? dequant( c, q, addDq, mt, P.qcsOffset ) : 0;
+    }
+    SYNC();
+    return;
+  }
+  for( int i = lid; i < nzR * nzC; i += NT )
+  {
+    const int pos = ( i % nzC ) | ( ( i / nzC ) << 16 );
+    int       q   = cf.v[c.coeffOffset + i];
+    for( int k = 0; k < 8; k++ )
+    {
+      q = negativeAt[k] == pos ? -q : q;
+    }
+    s_spCoef[i] = int16_t( q != 0 ? dequant( c, q, addDq, mt, P.qcsOffset ) : 0 );
+  }
+  SYNC();
+  if( c.secKind == SEC_LFNST )
+  {
+    for( int i = lid; i < c.secNumIn; i += NT )
+    {
+      const int pos = mt.v[c.secScan + i];
+      s_secIn[i] = int( s_spCoef[( pos >> 16 ) * nzC + ( pos & 0xffff )] );
+    }
+    SYNC();
+    for( int j = lid; j < c.secRowLength; j += NT )
+    {
+      int sum = 0;
+      for( int k = 0; k < c.secNumIn; k++ ) sum += s_secIn[k] * int( kernels.v[c.secMatrix + k * c.secRowLength + j] );
+      s_lfnstOut[j] = clip3i( c.trMin, c.trMax, ( sum + 64 ) >> 7 );
+    }
+    SYNC();
+    for( int j = lid; j < c.secRowLength; j += NT )
+    {
+      const int pos = mt.v[c.secLayout + j];
+      s_spCoef[( pos >> 16 ) * nzC + ( pos & 0xffff )] = int16_t( s_lfnstOut[j] );
+    }
+    SYNC();
+  }
+}
+
+// the first stage of rows y0 .. y0 + rows - 1 of block c (not NSPT): s_spStage1[xf * rows + y - y0] for the
+// coefficient columns xf < nzCols (rows * nzCols <= 1024), from prepareCoefficients' coefficients (prepared), or
+// dequantizing the recorded levels as intra_resi does (without LFNST: ECM's transforms up to 128 x 128 keep all
+// coefficients, TU_256); all invocations, ending with a barrier
+void firstStageRows( Tu c, int y0, int rows, bool prepared, int lid, int NT )
+{
+  BufI32    mt    = BufI32( P.matrices );
+  BufI32    cf    = BufI32( P.coeffs );
+  const int nzR   = c.nzRows, nzC = c.nzCols, H = c.h, addDq = dequantAdd( c );
+  const int rnd1  = 1 << ( c.shift1 - 1 );
+  for( int i = lid; i < nzC * rows; i += NT )
+  {
+    const int xf = i / rows, y = y0 + i % rows;
+    int sum = 0;
+    for( int k = 0; k < nzR; k++ )
+    {
+      int v;
+      if( prepared )
+      {
+        v = int( s_spCoef[k * nzC + xf] );
+      }
+      else
+      {
+        const int q = cf.v[c.coeffOffset + k * nzC + xf];
+        v = q != 0 ? dequant( c, q, addDq, mt, P.qcsOffset ) : 0;
+      }
+      sum += mt.v[c.mtxV + k * H + y] * v;
+    }
+    s_spStage1[i] = int16_t( clip3i( c.trMin, c.trMax, ( sum + rnd1 ) >> c.shift1 ) );
+  }
+  SYNC();
+}
+
+// prepareCoefficients and the first stage of the whole block (sign prediction's blocks, at most 32 x 32)
+void firstStage( Tu c, int negativeAt[8], int lid, int NT )
+{
+  prepareCoefficients( c, negativeAt, lid, NT );
+  if( c.secKind != SEC_NSPT )
+  {
+    firstStageRows( c, 0, c.h, true, lid, NT );
+  }
+}
+
+// the residual sample (x, y) of block c: NSPT's matrix times its inputs, or the second stage of the first stage of
+// rows y0 .. y0 + rows - 1 (firstStageRows)
+int secondStage( Tu c, int x, int y, int y0, int rows )
+{
+  const int W = c.w, H = c.h;
+  if( c.secKind == SEC_NSPT )
+  {
+    BufI8     kernels = BufI8( P.secKernels );
+    const int shift   = c.shift1 + c.shift2 - 7;
+    const int jj      = c.secTranspose != 0 ? x * H + y : y * W + x;
+    int sum = 0;
+    for( int k = 0; k < c.secNumIn; k++ ) sum += s_secIn[k] * int( kernels.v[c.secMatrix + k * c.secRowLength + jj] );
+    return clip3i( c.trMin, c.trMax, ( sum + ( 1 << ( shift - 1 ) ) ) >> shift );
+  }
+  BufI32 mt = BufI32( P.matrices );
+  int sum = 0;
+  for( int k = 0; k < c.nzCols; k++ ) sum += mt.v[c.mtxH + k * W + x] * int( s_spStage1[k * rows + y - y0] );
+  return clip3i( c.trMin, c.trMax, ( sum + ( 1 << ( c.shift2 - 1 ) ) ) >> c.shift2 );
+}
+
+// the residual of a block whose transforms depend on a derived mode (DERIVE_TRANSFORM, without sign prediction),
+// computed before its prediction in chunks of rows whose first stage fits s_spStage1 and stored (device-coherent) where
+// intra_resi stores the others', with joint CbCr also the other block's (which waits for this one); a barrier with
+// buffer semantics makes it visible to the invocations that read it at the reconstruction (storeRecon)
+void inChainResidual( Tu t, int lid, int NT )
+{
+  const bool prepared = t.secKind != SEC_NONE;   // LFNST / NSPT: their inputs and outputs in shared memory
+  if( prepared )
+  {
+    const int none[8] = int[8]( -1, -1, -1, -1, -1, -1, -1, -1 );
+    prepareCoefficients( t, none, lid, NT );
+  }
+  const int  W = t.w, H = t.h;
+  const int  chunk   = t.secKind == SEC_NSPT ? H : min( H, 1024 / t.nzCols );
+  const bool crCoded = abs( t.jccr ) == 3;   // joint CbCr: the Cb block holds Cr's coefficients, gets the derived residual
+  for( int y0 = 0; y0 < H; y0 += chunk )
+  {
+    const int rows = min( chunk, H - y0 );
+    if( t.secKind != SEC_NSPT )
+    {
+      firstStageRows( t, y0, rows, prepared, lid, NT );
+    }
+    for( int i = lid; i < rows * W; i += NT )
+    {
+      const int x = i % W, y = y0 + i / W, o = y * W + x;
+      const int coded = secondStage( t, x, y, y0, rows );
+      if( t.jccr != 0 )
+      {
+        const int derived = jccrDerived( t.jccr, coded );
+        CBufI16( P.dbgResi ).v[t.dbgOffset + o]  = int16_t( crCoded ? derived : coded );
+        CBufI16( P.dbgResi ).v[t.jccrOffset + o] = int16_t( crCoded ? coded : derived );
+      }
+      else
+      {
+        CBufI16( P.dbgResi ).v[t.dbgOffset + o] = int16_t( coded );
+      }
+    }
+    SYNC();   // s_spStage1 is the next rows'
+  }
+  controlBarrier( gl_ScopeWorkgroup, gl_ScopeWorkgroup, gl_StorageSemanticsBuffer, gl_SemanticsAcquireRelease );
+}
+
+// sign prediction's data of block c (with a derived mode's transforms, which intra_resi skipped) as intra_resi
+// computes it for the others: the border of the residual with every predicted sign positive (s_spBase: the left
+// column bottom-up, then the top row) and per predicted coefficient its template (s_spTempl: the border of the
+// residual of the coefficient alone with the amplitude 1 << 8, times its dequantized magnitude, >> 8; DCT-II / MTS:
+// one product per stage, NSPT: the matrix entry, LFNST: through the LFNST into its region and both stages, one
+// coefficient after the other). All invocations, ending with a barrier; s_spCoef and s_spStage1 are free afterwards
+void signPredData( Tu c, int n, int lid, int NT )
+{
+  BufI32    sp      = BufI32( P.signPred );
+  BufI32    mt      = BufI32( P.matrices );
+  BufI8     kernels = BufI8( P.secKernels );
+  BufI32    cf      = BufI32( P.coeffs );
+  const int W = c.w, H = c.h, len = W + H, nzR = c.nzRows, nzC = c.nzCols, addDq = dequantAdd( c );
+  const int rnd1 = 1 << ( c.shift1 - 1 ), rnd2 = 1 << ( c.shift2 - 1 ), nsptShift = c.shift1 + c.shift2 - 7;
+  const int none[8] = int[8]( -1, -1, -1, -1, -1, -1, -1, -1 );
+  firstStage( c, none, lid, NT );
+  for( int j = lid; j < len; j += NT )
+  {
+    s_spBase[j] = int16_t( j < H ? secondStage( c, 0, H - 1 - j, 0, H ) : secondStage( c, j - H, 0, 0, H ) );
+  }
+  SYNC();
+  if( c.secKind != SEC_LFNST )
+  {
+    for( int i = lid; i < n * len; i += NT )
+    {
+      const int k = i / len, j = i % len;
+      const int pos = sp.v[c.spOffset + SP_POS + k], px = pos & 0xffff, py = pos >> 16;
+      const int r = j < H ? H - 1 - j : 0, col = j < H ? 0 : j - H;
+      int basis;
+      if( c.secKind == SEC_NSPT )
+      {
+        int scanIdx = 0;   // the coefficient's index in the scan (the predicted ones lie among the first 16)
+        while( scanIdx < c.secNumIn && mt.v[c.secScan + scanIdx] != pos )
+        {
+          scanIdx++;
+        }
+        const int jj = c.secTranspose != 0 ? col * H + r : r * W + col;
+        const int k8 = scanIdx < c.secNumIn ? int( kernels.v[c.secMatrix + scanIdx * c.secRowLength + jj] ) : 0;
+        basis = clip3i( c.trMin, c.trMax, ( 256 * k8 + ( 1 << ( nsptShift - 1 ) ) ) >> nsptShift );
+      }
+      else
+      {
+        const int stage1 = clip3i( c.trMin, c.trMax, ( mt.v[c.mtxV + py * H + r] * 256 + rnd1 ) >> c.shift1 );
+        basis = clip3i( c.trMin, c.trMax, ( mt.v[c.mtxH + px * W + col] * stage1 + rnd2 ) >> c.shift2 );
+      }
+      const int coeffVal = dequant( c, cf.v[c.coeffOffset + py * nzC + px], addDq, mt, P.qcsOffset );
+      s_spTempl[i] = int16_t( ( coeffVal * basis + 128 ) >> 8 );   // a Pel
+    }
+    SYNC();
+    return;
+  }
+  for( int k = 0; k < n; k++ )
+  {
+    const int pos = sp.v[c.spOffset + SP_POS + k];
+    int scanIdx = 0;
+    while( scanIdx < c.secNumIn && mt.v[c.secScan + scanIdx] != pos )
+    {
+      scanIdx++;
+    }
+    for( int i = lid; i < nzR * nzC; i += NT )
+    {
+      s_spCoef[i] = int16_t( 0 );
+    }
+    SYNC();
+    for( int j = lid; j < c.secRowLength && scanIdx < c.secNumIn; j += NT )
+    {
+      const int lp = mt.v[c.secLayout + j];
+      s_spCoef[( lp >> 16 ) * nzC + ( lp & 0xffff )] =
+        int16_t( clip3i( c.trMin, c.trMax, ( 256 * int( kernels.v[c.secMatrix + scanIdx * c.secRowLength + j] ) + 64 ) >> 7 ) );
+    }
+    SYNC();
+    for( int i = lid; i < nzC * H; i += NT )
+    {
+      const int xf = i / H, y = i % H;
+      int sum = 0;
+      for( int ky = 0; ky < nzR; ky++ ) sum += mt.v[c.mtxV + ky * H + y] * int( s_spCoef[ky * nzC + xf] );
+      s_spStage1[xf * H + y] = int16_t( clip3i( c.trMin, c.trMax, ( sum + rnd1 ) >> c.shift1 ) );
+    }
+    SYNC();
+    const int coeffVal = dequant( c, cf.v[c.coeffOffset + ( pos >> 16 ) * nzC + ( pos & 0xffff )], addDq, mt, P.qcsOffset );
+    for( int j = lid; j < len; j += NT )
+    {
+      const int r = j < H ? H - 1 - j : 0, col = j < H ? 0 : j - H;
+      int sum = 0;
+      for( int xf = 0; xf < nzC; xf++ ) sum += mt.v[c.mtxH + xf * W + col] * int( s_spStage1[xf * H + r] );
+      const int basis = clip3i( c.trMin, c.trMax, ( sum + rnd2 ) >> c.shift2 );
+      s_spTempl[k * len + j] = int16_t( ( coeffVal * basis + 128 ) >> 8 );   // a Pel
+    }
+    SYNC();
+  }
+}
+
 // sign prediction, decoder side (TrQuant::predCoeffSigns), once the block is predicted (into s_spPred), then its
 // reconstruction (all invocations). The border the neighbours predict (TU::predBorderResi: twice the reconstructed
 // sample next to the block minus the one beyond it, or the mid-level value at the picture's left / top edge, minus
@@ -308,16 +656,26 @@ int lumaConv( bool isVer, int l, int base, int taps, bool cubic, bool big, int f
 // hypothesis was right, and after a wrong one the best is searched again among the hypotheses that agree with the
 // signs decided. Where a decided sign is negative the residual is computed again (dequantization, LFNST or NSPT and
 // both transform stages as in intra_resi, with joint CbCr also the other component's, for the other block of the pair,
-// which waits for this one).
+// which waits for this one). A block whose transforms depend on a derived mode (DERIVE_TRANSFORM; its mode is s_mode)
+// gets its data here (signPredData) and its residual computed in any case.
 void signPrediction( Tu t, int lid, int NT )
 {
-  const Tu  c = t.spCoded == g_ti ? t : BufTu( P.tus ).v[t.spCoded];   // the block with the coefficients
+  Tu c = t.spCoded == g_ti ? t : BufTu( P.tus ).v[t.spCoded];   // the block with the coefficients
+  const bool inChain = ( c.derive & DERIVE_TRANSFORM ) != 0;
+  if( inChain && t.spCoded != g_ti )   // the other block of a joint CbCr pair, in the same CU
+  {
+    selectTransform( c, s_mode, BufCu( P.cus ).v[c.cu].plIdx );
+  }
   const int W = t.w, H = t.h, N = W * H, len = W + H;
   BufI32    sp   = BufI32( P.signPred );
   BufI16    resi = BufI16( P.dbgResi );
   const int n = sp.v[c.spOffset + SP_NUM], codedSigns = sp.v[c.spOffset + SP_SIGNS];
   const bool useLeft = t.x != 0 || t.y == 0, useTop = t.y != 0 || t.x == 0;
   const int  first = useLeft ? 0 : H, last = useTop ? len : H;
+  if( inChain )
+  {
+    signPredData( c, n, lid, NT );
+  }
   for( int j = lid; j < len; j += NT )
   {
     const bool left = j < H;
@@ -330,9 +688,12 @@ void signPrediction( Tu t, int lid, int NT )
       predicted = asPel( 2 * nextTo - beyond );
     }
     s_spBorder[j] = int16_t( predicted - int( s_spPred[y * W + x] ) );
-    s_spBase[j]   = resi.v[t.dbgOffset + y * W + x];
+    if( !inChain )
+    {
+      s_spBase[j] = resi.v[t.dbgOffset + y * W + x];
+    }
   }
-  for( int i = lid; i < n * len; i += NT )
+  for( int i = lid; i < n * len && !inChain; i += NT )
   {
     s_spTempl[i] = int16_t( sp.v[c.spOffset + SP_TEMPLATES + i] );
   }
@@ -398,103 +759,25 @@ void signPrediction( Tu t, int lid, int NT )
       base += signMask;
     }
   }
-  const bool recompute = negative != 0;
-  BufI32     mt        = BufI32( P.matrices );
-  BufI8      kernels   = BufI8( P.secKernels );
-  const int  nsptShift = c.shift1 + c.shift2 - 7;
-  if( recompute )
+  const bool recompute = negative != 0 || inChain;
+  if( recompute )   // with the decided signs (the positions of the negative ones, x | y << 16, else -1)
   {
-    // the coefficients with the decided signs, dequantized (for NSPT only its inputs, in scan order), with LFNST its
-    // outputs over them (as in intra_resi), then the first stage
-    BufI32    cf  = BufI32( P.coeffs );
-    const int nzR = c.nzRows, nzC = c.nzCols, addDq = dequantAdd( c );
-    int       negativeAt[8];   // the positions of the negative ones (x | y << 16), else -1
+    int negativeAt[8];
     for( int k = 0; k < 8; k++ )
     {
       negativeAt[k] = k < n && ( ( negative >> k ) & 1 ) != 0 ? sp.v[c.spOffset + SP_POS + k] : -1;
     }
-    if( c.secKind == SEC_NSPT )
-    {
-      for( int i = lid; i < c.secNumIn; i += NT )
-      {
-        const int pos = mt.v[c.secScan + i], x = pos & 0xffff, y = pos >> 16;
-        int       q   = y < nzR && x < nzC ? cf.v[c.coeffOffset + y * nzC + x] : 0;
-        for( int k = 0; k < 8; k++ )
-        {
-          q = negativeAt[k] == pos ? -q : q;
-        }
-        s_secIn[i] = q != 0 ? dequant( c, q, addDq, mt, P.qcsOffset ) : 0;
-      }
-      SYNC();
-    }
-    else
-    {
-      for( int i = lid; i < nzR * nzC; i += NT )
-      {
-        const int pos = ( i % nzC ) | ( ( i / nzC ) << 16 );
-        int       q   = cf.v[c.coeffOffset + i];
-        for( int k = 0; k < 8; k++ )
-        {
-          q = negativeAt[k] == pos ? -q : q;
-        }
-        s_spCoef[i] = int16_t( q != 0 ? dequant( c, q, addDq, mt, P.qcsOffset ) : 0 );
-      }
-      SYNC();
-      if( c.secKind == SEC_LFNST )
-      {
-        for( int i = lid; i < c.secNumIn; i += NT )
-        {
-          const int pos = mt.v[c.secScan + i];
-          s_secIn[i] = int( s_spCoef[( pos >> 16 ) * nzC + ( pos & 0xffff )] );
-        }
-        SYNC();
-        for( int j = lid; j < c.secRowLength; j += NT )
-        {
-          int sum = 0;
-          for( int k = 0; k < c.secNumIn; k++ ) sum += s_secIn[k] * int( kernels.v[c.secMatrix + k * c.secRowLength + j] );
-          s_lfnstOut[j] = clip3i( c.trMin, c.trMax, ( sum + 64 ) >> 7 );
-        }
-        SYNC();
-        for( int j = lid; j < c.secRowLength; j += NT )
-        {
-          const int pos = mt.v[c.secLayout + j];
-          s_spCoef[( pos >> 16 ) * nzC + ( pos & 0xffff )] = int16_t( s_lfnstOut[j] );
-        }
-        SYNC();
-      }
-      const int rnd1 = 1 << ( c.shift1 - 1 );
-      for( int i = lid; i < nzC * H; i += NT )
-      {
-        const int xf = i / H, y = i % H;
-        int sum = 0;
-        for( int k = 0; k < nzR; k++ ) sum += mt.v[c.mtxV + k * H + y] * int( s_spCoef[k * nzC + xf] );
-        s_spStage1[xf * H + y] = int16_t( clip3i( c.trMin, c.trMax, ( sum + rnd1 ) >> c.shift1 ) );
-      }
-      SYNC();
-    }
+    firstStage( c, negativeAt, lid, NT );
   }
   // the second stage, sample by sample, and the reconstruction; the coded residual is this block's
-  const int rnd2 = 1 << ( c.shift2 - 1 );
   const int derivedOffset = abs( c.jccr ) == 3 ? c.dbgOffset : c.jccrOffset;
   for( int i = lid; i < N; i += NT )
   {
     const int x = i % W, y = i / W;
     int re;
-    if( recompute && c.secKind == SEC_NSPT )   // NSPT's matrix gives the residual (intra_resi)
-    {
-      const int jj = c.secTranspose != 0 ? x * H + y : i;
-      int sum = 0;
-      for( int k = 0; k < c.secNumIn; k++ ) sum += s_secIn[k] * int( kernels.v[c.secMatrix + k * c.secRowLength + jj] );
-      re = clip3i( c.trMin, c.trMax, ( sum + ( 1 << ( nsptShift - 1 ) ) ) >> nsptShift );
-    }
-    else if( recompute )
-    {
-      int sum = 0;
-      for( int k = 0; k < c.nzCols; k++ ) sum += mt.v[c.mtxH + k * W + x] * int( s_spStage1[k * H + y] );
-      re = clip3i( c.trMin, c.trMax, ( sum + rnd2 ) >> c.shift2 );
-    }
     if( recompute )
     {
+      re = secondStage( c, x, y, 0, H );
       if( c.jccr != 0 )
       {
         CBufI16( P.dbgResi ).v[derivedOffset + i] = int16_t( jccrDerived( c.jccr, re ) );
@@ -641,6 +924,13 @@ void main()
       }
       SYNC();
       applyModeParams( t, s_mode, BufCu( P.cus ).v[t.cu].plIdx );
+      // its transforms, where they depend on the mode: the matrices of the mode, and (unless the residual comes from
+      // the other block of a joint CbCr pair) without sign prediction the residual's first stage now, its second
+      // stage sample by sample at the reconstruction (storeRecon); signPrediction computes all for its blocks
+      if( ( t.derive & DERIVE_TRANSFORM ) != 0 )
+      {
+        selectTransform( t, s_mode, BufCu( P.cus ).v[t.cu].plIdx );
+      }
       if( pc.verify != 0 && lid == 0 )
       {
         const int o = g_ti * DBG_PARAMS;
@@ -648,7 +938,14 @@ void main()
         dp.v[o + 0] = t.dirMode;   dp.v[o + 1] = t.isModeVer;  dp.v[o + 2] = t.intraPredAngle;  dp.v[o + 3] = t.absInvAngle;
         dp.v[o + 4] = t.useCubic;  dp.v[o + 5] = t.refFilter;  dp.v[o + 6] = t.applyPDPC;       dp.v[o + 7] = t.gradPDPC;
         dp.v[o + 8] = t.angularScale; dp.v[o + 9] = t.fusion;  dp.v[o + 10] = t.bf;             dp.v[o + 11] = t.plIdx;
+        dp.v[o + 12] = t.mtxV;     dp.v[o + 13] = t.mtxH;      dp.v[o + 14] = t.secMatrix;      dp.v[o + 15] = t.secTranspose;
+        dp.v[o + 16] = t.secLayout;
       }
+    }
+    if( ( t.derive & DERIVE_TRANSFORM ) != 0 && t.spCoded < 0 && t.resiFrom < 0 )
+    {
+      inChainResidual( t, lid, NT );
+      t.resiFrom = g_ti;   // storeRecon reads it device-coherent
     }
     int  angClear  = 0;
     bool angClear2 = false;
