@@ -635,9 +635,14 @@ public:
   {
     bool isModeVer, interpolationFlag, refFilterFlag, applyPDPC, useGradPDPC, applyFusion;
     int  multiRefIndex, intraPredAngle, absInvAngle, angularScale;
+    bool fetchRef2nd;   // intra fusion may read the second reference line (initIntraPatternChType, not the mode)
   };
   /// initIntraPatternChType() sets the parameters only (no reference samples; the decoder's GPU reconstruction)
   void setParamsOnly( bool b ) { m_paramsOnly = b; }
+  /// initPredIntraParams' wide angle and reference filter threshold (m_aucIntraFilter), for the GPU reconstruction's
+  /// copy of it
+  static int wideAngle( int width, int height, int predMode ) { return getModifiedWideAngle( width, height, predMode ); }
+  static int intraFilterThreshold( int log2Size ) { return m_aucIntraFilter[log2Size]; }
   IpaSnapshot ipaSnapshot() const
   {
     return { m_ipaParam.isModeVer,
@@ -657,7 +662,12 @@ public:
              m_ipaParam.multiRefIndex,
              m_ipaParam.intraPredAngle,
              m_ipaParam.absInvAngle,
-             m_ipaParam.angularScale };
+             m_ipaParam.angularScale,
+#if JVET_AB0157_INTRA_FUSION
+             m_ipaParam.fetchRef2nd };
+#else
+             false };
+#endif
   }
 private:
   bool m_paramsOnly = false;

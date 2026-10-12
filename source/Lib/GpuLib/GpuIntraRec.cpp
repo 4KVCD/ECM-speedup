@@ -40,6 +40,7 @@
 
 #include <algorithm>
 #include <mutex>
+#include <unordered_map>
 
 #include "CommonLib/CodingStructure.h"
 #include "CommonLib/BilateralFilter.h"
@@ -65,7 +66,7 @@
 
 namespace
 {
-// layout shared with intra_rec.comp (struct Tu): 94 int32
+// layout shared with intra_rec.comp (struct Tu): 96 int32
 struct Tu
 {
   int32_t comp, x, y, w, h;
@@ -103,8 +104,137 @@ struct Tu
   int32_t ispPrev;
   int32_t spCoded, spOffset;
   int32_t resiFrom;
+  int32_t cu;
+  int32_t derive;
 };
-static_assert( sizeof( Tu ) == 94 * 4, "Tu layout" );
+static_assert( sizeof( Tu ) == 96 * 4, "Tu layout" );
+
+// Tu::derive (intra_common.glsl's DERIVE_*)
+constexpr int DERIVE_NODE         = 32;   // not a block: the derivation of the mode of CU Tu::cu, before its blocks
+constexpr int DERIVE_MODE         = 1;    // intra_rec takes the mode from the CU's node and sets its parameters
+constexpr int DERIVE_FETCH2ND     = 2;    // IntraPrediction's fetchRef2nd: intra fusion may read the second line
+constexpr int DERIVE_BF           = 4;    // the intra bilateral filter applies unless the mode excludes it
+constexpr int DERIVE_NO_PDPC      = 8;    // the SPS disables PDPC
+constexpr int DERIVE_NO_SMOOTHING = 16;   // the SPS disables intra smoothing
+
+// the parameters intra_rec derives per DERIVE_MODE block, downloaded for the comparison (intra_common.glsl's
+// DBG_PARAMS): dirMode, isModeVer, intraPredAngle, absInvAngle, useCubic, refFilter, applyPDPC, gradPDPC, angularScale,
+// fusion, bf, plIdx
+constexpr int DBG_PARAMS = 12;
+
+// getSpatialIpm's positions: left, above, above-left, above-right, below-left, then the non-adjacent ones
+constexpr int MPM_NEIGHBOURS = 23;
+
+// a coding unit of one channel type (intra_common.glsl's Cu): 40 int32
+struct Cu
+{
+  int32_t kind;
+  int32_t node;
+  int32_t x, y, w, h;
+  int32_t mpmFlag, secondMpmFlag, ipredIdx;
+  int32_t nbFirst, nbLast;
+  int32_t plIdx;
+  int32_t candId;
+  int32_t lumaCu;
+  int32_t nbr[MPM_NEIGHBOURS];
+  int32_t modes[2];
+  int32_t pad;
+};
+static_assert( sizeof( Cu ) == 40 * 4, "Cu layout" );
+
+// Cu::kind
+constexpr int CU_KNOWN       = 0;   // the host knows the mode
+constexpr int CU_MPM         = 1;   // luma: from the MPM lists (intra_modes.glsl)
+constexpr int CU_CHROMA_DM   = 2;   // chroma: the co-located luma mode
+constexpr int CU_CHROMA_CAND = 3;   // chroma: one of the first four candidates
+
+// intra_modes.glsl's applyModeParams (the kernels' copy): a block's prediction parameters for a mode as
+// initPredIntraParams sets them without TIMD / TMRL, with intra fusion, the directional planar index and the intra
+// bilateral filter's mode conditions; here for the read ranges of a derived mode's possible values (endPicture)
+void applyModeParams( Tu& t, const int mode, const int plIdx )
+{
+  static const int angTable[32]    = { 0,  1,  2,  3,  4,  6,  8,  10,  12,  14,  16,  18,  20,  23,  26,  29,
+                                       32, 35, 39, 45, 51, 57, 64, 73, 86, 102, 128, 171, 256, 341, 512, 1024 };
+  static const int invAngTable[32] = { 0,   16384, 8192, 5461, 4096, 2731, 2048, 1638, 1365, 1170, 1024, 910, 819, 712, 630, 565,
+                                       512, 468,   420,  364,  321,  287,  256,  224,  191,  161,  128,  96,  64,  48,  32,  16 };
+  const bool luma = t.comp == COMPONENT_Y;
+  const bool isp  = t.isp && luma;
+  const int  puW = t.regW, puH = t.h;
+  const int  predMode = IntraPrediction::wideAngle( isp ? t.cuW : puW, isp ? t.cuH : puH, mode );
+  t.dirMode        = mode;
+  t.isModeVer      = predMode >= DIA_IDX ? 1 : 0;
+  t.intraPredAngle = 0;
+  t.absInvAngle    = 0;
+  t.angularScale   = 0;
+  t.gradPDPC       = 0;
+  bool pdpc = puW >= 4 && puH >= 4 && t.mrl == 0;
+  const int angMode = t.isModeVer ? predMode - VER_IDX : -( predMode - HOR_IDX );
+  int absAng = 0;
+  if( mode > DC_IDX && mode < NUM_LUMA_MODE )
+  {
+    absAng           = angTable[std::abs( angMode )];
+    t.absInvAngle    = invAngTable[std::abs( angMode )];
+    t.intraPredAngle = angMode < 0 ? -absAng : absAng;
+    if( angMode < 0 )
+    {
+      pdpc = false;
+    }
+    else if( angMode > 0 )
+    {
+      t.angularScale = std::min( 2, floorLog2( t.isModeVer ? puH : puW ) - ( floorLog2( 3 * t.absInvAngle - 2 ) - 8 ) );
+      if( t.angularScale < 0 && luma )
+      {
+        t.angularScale = ( floorLog2( puW ) + floorLog2( puH ) - 2 ) >> 2;
+        t.gradPDPC     = 1;
+      }
+      pdpc = pdpc && t.angularScale >= 0;
+    }
+  }
+  if( t.derive & DERIVE_NO_PDPC )
+  {
+    pdpc       = false;
+    t.gradPDPC = 0;
+  }
+  int refFilter = 0, interpolation = 0;
+  if( ( t.derive & DERIVE_NO_SMOOTHING ) || !luma || isp || t.mrl || mode == DC_IDX )
+  {
+  }
+  else if( mode == PLANAR_IDX )
+  {
+    refFilter = puW * puH > 32 ? 1 : 0;
+  }
+  else
+  {
+    const int diff     = std::min( std::abs( predMode - HOR_IDX ), std::abs( predMode - VER_IDX ) );
+    const int log2Size = ( floorLog2( puW ) + floorLog2( puH ) ) >> 1;
+    if( diff > IntraPrediction::intraFilterThreshold( log2Size ) && puW * puH > 32 )
+    {
+      const bool intSlope = ( absAng & 31 ) == 0;
+      refFilter     = intSlope ? 1 : 0;
+      interpolation = intSlope ? 0 : 1;
+    }
+  }
+  t.refFilter = t.disableRefFilter ? 0 : refFilter;
+  t.useCubic  = interpolation ? 0 : 1;
+  t.applyPDPC = pdpc ? 1 : 0;
+  t.fusion    = ( t.derive & DERIVE_FETCH2ND ) && mode > DC_IDX && ( absAng & 31 ) != 0 && !isp ? 1 : 0;
+  t.plIdx     = luma && mode == PLANAR_IDX ? plIdx : 0;
+  t.bf        = 0;
+  if( ( t.derive & DERIVE_BF ) && !( ( t.mrl || isp ) && mode > DC_IDX ) )
+  {
+    const bool excluded = mode > DC_IDX && ( ( mode >= 2 && mode <= 3 ) || ( mode >= 17 && mode <= 19 ) || ( mode >= 33 && mode <= 35 )
+                                             || ( mode >= 49 && mode <= 51 ) || ( mode >= 65 && mode <= 66 ) );
+    t.bf = excluded ? 0 : mode <= DC_IDX ? 1 : 2;
+  }
+}
+
+// ECM_GPU_MODES=1: the GPU derives the intra modes of the CUs whose modes the MPM lists give (and of the chroma CUs
+// with DM or a substituted candidate) also where the host knows them; tests the derivation on every stream
+bool gpuDerivesModes()
+{
+  static const bool on = getenv( "ECM_GPU_MODES" ) && atoi( getenv( "ECM_GPU_MODES" ) ) != 0;
+  return on;
+}
 
 // the signPred data of a block (intra_common.glsl's SP_*): the number of predicted signs, the coded signs, the
 // positions, then the templates intra_resi computes
@@ -401,6 +531,9 @@ struct Params
   uint64_t lmcs;
   uint64_t signPred;
   uint64_t secKernels;
+  uint64_t cus;
+  uint64_t cuMode;
+  uint64_t dbgParams;
   int32_t  origin[3];
   int32_t  stride[3];
   int32_t  width[3];
@@ -415,7 +548,7 @@ struct Params
   int32_t  qcsOffset;
   int32_t  pad;
 };
-static_assert( offsetof( Params, origin ) == 184 && offsetof( Params, edgeCap ) == 264 && sizeof( Params ) == 288,
+static_assert( offsetof( Params, origin ) == 208 && offsetof( Params, edgeCap ) == 288 && sizeof( Params ) == 312,
                "Params layout" );
 
 struct Push
@@ -651,6 +784,7 @@ struct GpuIntraRec::Impl
   const Shared*               sh  = nullptr;
   std::unique_ptr<gpu::Stream> stream;
   gpu::Buffer                 params, tus, coeffs, planes[3], owner[3], sched, dbgPred, dbgResi, lmcs, signPredBuf;
+  gpu::Buffer                 cuBuf, dbgParams;   // the CU records and their modes; the derived parameters (verification)
   Reshape*                    reshape = nullptr;   // the decoder's reshaper (LMCS state of the picture being decoded)
   TrQuant*                    trQuant = nullptr;   // the decoder's TrQuant (transform types of the blocks)
   int                         numGroups = 0;
@@ -665,6 +799,10 @@ struct GpuIntraRec::Impl
   bool                        lmcsUsed = false;   // a block of the picture reads the LMCS tables
   int                         lastIspLuma = -1;   // the record of the last ISP luma sub-partition (Tu::ispPrev)
   std::vector<int32_t>        signPred;           // the sign prediction data of the blocks (Tu::spOffset)
+  bool                        deriveModes = false;   // the GPU derives intra modes in the picture (gpuDerivesModes())
+  std::vector<Cu>             cus;                // the CUs of the recorded blocks (Tu::cu), where it does
+  std::vector<int32_t>        cuMode;             // per CU the host's mode (CU_KNOWN), else -1 (Params::cuMode)
+  std::unordered_map<const CodingUnit*, int32_t> cuIndex[2];   // per channel type: the record of a CU
   // the sign prediction prepareSignPred took from a TU, for the record() of its coded component
   struct PendingSignPred
   {
@@ -691,8 +829,8 @@ struct GpuIntraRec::Impl
     {
       return;
     }
-    for( gpu::Buffer* b: { &params, &tus, &coeffs, &planes[0], &planes[1], &planes[2],
-                           &owner[0], &owner[1], &owner[2], &sched, &dbgPred, &dbgResi, &lmcs, &signPredBuf, &upload, &download } )
+    for( gpu::Buffer* b: { &params, &tus, &coeffs, &planes[0], &planes[1], &planes[2], &owner[0], &owner[1], &owner[2],
+                           &sched, &dbgPred, &dbgResi, &lmcs, &signPredBuf, &cuBuf, &dbgParams, &upload, &download } )
     {
       b->destroy( *ctx );
     }
@@ -814,6 +952,11 @@ void GpuIntraRec::beginPicture( const CodingStructure& cs )
   m.lastIspLuma = -1;
   m.signPred.clear();
   m.pendingSign.num = 0;
+  m.deriveModes = gpuDerivesModes();
+  m.cus.clear();
+  m.cuMode.clear();
+  m.cuIndex[0].clear();
+  m.cuIndex[1].clear();
   m.unsupportedWhy.clear();
   m.poc = cs.slice->getPOC();
   std::string why;
@@ -886,6 +1029,140 @@ void GpuIntraRec::prepareSignPred( TransformUnit& tu, const ComponentID compID )
   p.num = (int) predicted.size();
 }
 
+// the record of the CU of a block of the channel (made at the CU's first block): how its mode is found and the CUs that
+// reads. With gpuDerivesModes() the GPU derives the luma modes the MPM lists give (from the CUs at getSpatialIpm's
+// positions, getPURestricted's) and the chroma modes DM or the candidates' substitution give from those, in a node
+// recorded before the CU's first block (intra_rec); the host keeps the others, for luma the mode the neighbours' MPM
+// lists take (PU::getIntraDirLuma: planar for MIP). -1 with why set where a neighbour cannot be read.
+static int32_t cuRecord( GpuIntraRec::Impl& m, const TransformUnit& tu, const ComponentID compID, const char*& why )
+{
+  const CodingUnit&     cu     = *tu.cu;
+  const PredictionUnit& pu     = *cu.firstPU;
+  const ChannelType     chType = toChannelType( compID );
+  const auto            known  = m.cuIndex[chType].find( &cu );
+  if( known != m.cuIndex[chType].end() )
+  {
+    return known->second;
+  }
+  Cu c{};
+  c.kind    = CU_KNOWN;
+  c.node    = -1;
+  c.lumaCu  = -1;
+  std::fill_n( c.nbr, MPM_NEIGHBOURS, -1 );
+  c.modes[0] = c.modes[1] = -1;
+  const CompArea& a = cu.blocks[chType == CHANNEL_TYPE_LUMA ? COMPONENT_Y : COMPONENT_Cb];
+  c.x = a.x;
+  c.y = a.y;
+  c.w = a.width;
+  c.h = a.height;
+  int32_t mode = -1;
+  if( isLuma( chType ) )
+  {
+    if( gpuDerivesModes() && pu.parseLumaMode && !cu.mipFlag && !cu.bdpcmMode )
+    {
+      c.kind          = CU_MPM;
+      c.mpmFlag       = pu.mpmFlag ? 1 : 0;
+      c.secondMpmFlag = pu.secondMpmFlag ? 1 : 0;
+      c.ipredIdx      = pu.ipredIdx;
+      c.plIdx         = cu.plIdx;
+      if( pu.mpmFlag && pu.ipredIdx == 0 )   // the MPM list starts with planar (without PDP and NN, which supported() rejects)
+      {
+        c.modes[0] = PLANAR_IDX;
+      }
+      int nbFirst = 0, nbLast = 0;
+      CU::getNbModesRemovedFirstLast( cu.areAboveRightUnavail, cu.areBelowLeftUnavail, a.height, a.width, nbFirst, nbLast );
+      c.nbFirst = nbFirst;
+      c.nbLast  = nbLast;
+      // getSpatialIpm's positions: the adjacent ones, then per distance d the non-adjacent ones (idxMap: 0 below-left, 1
+      // above-right, 2 above the middle, 3 left of the middle, 4 above-left)
+      const int w = a.width, h = a.height;
+      Position  pos[MPM_NEIGHBOURS];
+      int       n = 0;
+      pos[n++] = a.topLeft().offset( -1, h - 1 );
+      pos[n++] = a.topLeft().offset( w - 1, -1 );
+      pos[n++] = a.topLeft().offset( -1, -1 );
+      pos[n++] = a.topLeft().offset( w, -1 );
+      pos[n++] = a.topLeft().offset( -1, h );
+      const int numNA[4]     = { 3, 5, 5, 5 };
+      const int idxMap[4][5] = { { 0, 1, 4 }, { 0, 1, 2, 3, 4 }, { 0, 1, 2, 3, 4 }, { 0, 1, 2, 3, 4 } };
+      for( int d = 0; d < NADISTANCE_LEVEL; d++ )
+      {
+        const int dh = w * ( d + 1 ), dv = h * ( d + 1 );
+        for( int k = 0; k < numNA[d]; k++ )
+        {
+          const int i = idxMap[d][k];
+          const int ox = i == 0 || i == 3 || i == 4 ? -dh - 1 : i == 1 ? w + dh - 1 : w >> 1;
+          const int oy = i == 0 ? h + dv - 1 : i == 3 ? h >> 1 : -dv - 1;
+          pos[n++] = a.topLeft().offset( ox, oy );
+        }
+      }
+      CHECK( n != MPM_NEIGHBOURS, "getSpatialIpm's positions" );
+      for( int k = 0; k < MPM_NEIGHBOURS; k++ )
+      {
+        const PredictionUnit* nb = cu.cs->getPURestricted( pos[k], pu, CHANNEL_TYPE_LUMA );
+        if( !nb )
+        {
+          continue;
+        }
+        const auto rec = m.cuIndex[CHANNEL_TYPE_LUMA].find( nb->cu );
+        if( !CU::isIntra( *nb->cu ) || rec == m.cuIndex[CHANNEL_TYPE_LUMA].end() )
+        {
+          why = "an MPM neighbour that is not a recorded intra CU";
+          return -1;
+        }
+        c.nbr[k] = rec->second;
+      }
+    }
+    else
+    {
+      mode = PU::getIntraDirLuma( pu );
+    }
+  }
+  else
+  {
+    const auto luma = m.cuIndex[CHANNEL_TYPE_LUMA].find( PU::getCoLocatedLumaPU( pu ).cu );
+    c.lumaCu = luma != m.cuIndex[CHANNEL_TYPE_LUMA].end() ? luma->second : -1;
+    const bool lumaDerived = c.lumaCu >= 0 && m.cus[c.lumaCu].kind != CU_KNOWN && !cu.bdpcmModeChroma;
+    if( lumaDerived && pu.intraDir[CHANNEL_TYPE_CHROMA] == DM_CHROMA_IDX )
+    {
+      c.kind     = CU_CHROMA_DM;
+      c.modes[0] = m.cus[c.lumaCu].modes[0];
+      c.modes[1] = m.cus[c.lumaCu].modes[1];
+    }
+    else if( lumaDerived && pu.parseChromaMode && pu.candId < 4 )
+    {
+      static const int32_t cand[4] = { PLANAR_IDX, VER_IDX, HOR_IDX, DC_IDX };
+      c.kind     = CU_CHROMA_CAND;
+      c.candId   = pu.candId;
+      c.modes[0] = cand[pu.candId];
+      c.modes[1] = VDIA_IDX;   // replaces it where the luma mode is the same
+    }
+    else
+    {
+      mode = PU::getFinalIntraMode( pu, CHANNEL_TYPE_CHROMA );
+    }
+  }
+  const int32_t index = (int32_t) m.cus.size();
+  if( c.kind != CU_KNOWN )   // its node, which derives the mode before the CU's blocks (no samples)
+  {
+    Tu node{};
+    node.comp      = chType == CHANNEL_TYPE_LUMA ? COMPONENT_Y : COMPONENT_Cb;
+    node.x         = c.x;
+    node.y         = c.y;
+    node.dbgOffset = (int32_t) m.numSamples;
+    node.mipMatrix = -1;
+    node.ispPrev = node.spCoded = node.spOffset = node.resiFrom = -1;
+    node.cu        = index;
+    node.derive    = DERIVE_NODE;
+    c.node         = (int32_t) m.rec.size();
+    m.rec.push_back( node );
+  }
+  m.cus.push_back( c );
+  m.cuMode.push_back( mode );
+  m.cuIndex[chType][&cu] = index;
+  return index;
+}
+
 void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, const IntraPrediction::IpaSnapshot& ipa,
                           const QpParam& qp, const CPelBuf* pred, const CPelBuf* resi )
 {
@@ -935,6 +1212,19 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
     unsupported( why );
     return;
   }
+  // the block's CU, where the GPU derives modes (of a CU_MPM / CU_CHROMA_* one: the mode-dependent fields below are
+  // then the CPU's, for the comparison only)
+  int32_t cuIdx = -1;
+  if( m.deriveModes )
+  {
+    cuIdx = cuRecord( m, tu, compID, why );
+    if( cuIdx < 0 )
+    {
+      unsupported( why );
+      return;
+    }
+  }
+  const bool derived = cuIdx >= 0 && m.cus[cuIdx].kind != CU_KNOWN;
 
   Tu t{};
   t.comp           = compID;
@@ -985,30 +1275,32 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
     }
     m.lastIspLuma = (int) m.rec.size();
   }
-  t.bf = 0;
-  if( compID == COMPONENT_Y && sps.getUseIntraPredBf() && slice.isIntra() && !( ( t.mrl || t.isp ) && dirMode > DC_IDX ) )
+  // the intra bilateral filter: checkBfApplication on the predicted block (an ISP prediction region) gives the
+  // conditions of size and QP (bfBase); xPredIntraAng turns the filter off for angular modes with ISP or MRL, and
+  // checkBfApplication for the modes next to the diagonals, horizontal and vertical (intra_modes.glsl's
+  // applyModeParams has the same rule for a derived mode)
+  bool bfBase = false;
+  if( compID == COMPONENT_Y && sps.getUseIntraPredBf() && slice.isIntra() )
   {
-    // checkBfApplication on the predicted block (an ISP prediction region); xPredIntraAng turns the filter off for ISP
     const int W = t.regW, H = area.height, qpY = cu.qp;
-    bool apply = qpY > 17 && W <= 128 && H <= 128 && ( W & ( W - 1 ) ) == 0 && ( H & ( H - 1 ) ) == 0 && W >= 4 && H >= 4;
-    apply = apply && W * H > 16 && W * H < 1024 && std::abs( floorLog2( W ) - floorLog2( H ) ) <= 2;
-    if( dirMode > DC_IDX )
-    {
-      const int md = dirMode;
-      apply = apply && !( ( md >= 2 && md <= 3 ) || ( md >= 17 && md <= 19 ) || ( md >= 33 && md <= 35 ) || ( md >= 49 && md <= 51 ) || ( md >= 65 && md <= 66 ) );
-    }
-    apply = apply && m.sh->bif->m_tuSizeFactor[0][std::min( floorLog2( W ), 7 ) * 8 + std::min( floorLog2( H ), 7 )] != 0;
-    if( apply )
-    {
-      // bilateralFilterPredDiamond5x5Clip pads at the CU, which ISP sub-partitions reproduce (Tu::isp); other blocks
-      // smaller than their CU are not supported
-      if( !t.isp && ( area.pos() != cu.blocks[COMPONENT_Y].pos() || area.size() != cu.blocks[COMPONENT_Y].size() ) )
-      {
-        unsupported( "intra bilateral filter of a split CU" );
-        return;
-      }
-      t.bf = dirMode <= DC_IDX ? 1 : 2;
-    }
+    bfBase = qpY > 17 && W <= 128 && H <= 128 && ( W & ( W - 1 ) ) == 0 && ( H & ( H - 1 ) ) == 0 && W >= 4 && H >= 4;
+    bfBase = bfBase && W * H > 16 && W * H < 1024 && std::abs( floorLog2( W ) - floorLog2( H ) ) <= 2;
+    bfBase = bfBase && m.sh->bif->m_tuSizeFactor[0][std::min( floorLog2( W ), 7 ) * 8 + std::min( floorLog2( H ), 7 )] != 0;
+  }
+  {
+    const int  md      = dirMode;
+    const bool modeOff = ( ( t.mrl || t.isp ) && md > DC_IDX )
+                         || ( md > DC_IDX && ( ( md >= 2 && md <= 3 ) || ( md >= 17 && md <= 19 ) || ( md >= 33 && md <= 35 )
+                                               || ( md >= 49 && md <= 51 ) || ( md >= 65 && md <= 66 ) ) );
+    t.bf = bfBase && !modeOff ? ( md <= DC_IDX ? 1 : 2 ) : 0;
+  }
+  // bilateralFilterPredDiamond5x5Clip pads at the CU, which ISP sub-partitions reproduce (Tu::isp); other blocks smaller
+  // than their CU are not supported (with a derived mode: wherever the filter may apply)
+  if( ( t.bf || ( derived && bfBase ) ) && !t.isp
+      && ( area.pos() != cu.blocks[COMPONENT_Y].pos() || area.size() != cu.blocks[COMPONENT_Y].size() ) )
+  {
+    unsupported( "intra bilateral filter of a split CU" );
+    return;
   }
   // MIP (MatrixIntraPrediction::predBlock): the mode's matrix, transposition and size class; the prediction reads the
   // unfiltered references and uses none of the angular parameters
@@ -1039,6 +1331,16 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
       return;
     }
     t.refFilter = t.applyPDPC = t.gradPDPC = t.fusion = t.bf = 0;
+  }
+  // a derived mode: what its parameters depend on besides the mode (initIntraPatternChType's fetchRef2nd, the
+  // filter's conditions, the SPS's switches)
+  t.cu     = cuIdx;
+  t.derive = 0;
+  if( derived )
+  {
+    t.derive = DERIVE_MODE | ( ipa.fetchRef2nd ? DERIVE_FETCH2ND : 0 ) | ( bfBase ? DERIVE_BF : 0 )
+               | ( sps.getDisablePdpc() ? DERIVE_NO_PDPC : 0 )
+               | ( sps.getSpsRangeExtension().getIntraSmoothingDisabledFlag() ? DERIVE_NO_SMOOTHING : 0 );
   }
   const PreCalcValues& pcv = *cs.pcv;
   const bool noShift = pcv.noChroma2x2 && area.width == 4;
@@ -1444,6 +1746,10 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
   {
     const Tu& t  = m.rec[r];
     const int ch = t.comp == 0 ? 0 : 1;
+    if( t.derive & DERIVE_NODE )   // no samples
+    {
+      continue;
+    }
     for( int uy = t.y >> P.unitLog2Y[ch]; uy <= ( t.y + t.h - 1 ) >> P.unitLog2Y[ch]; uy++ )
     {
       for( int ux = t.x >> P.unitLog2X[ch]; ux <= ( t.x + t.w - 1 ) >> P.unitLog2X[ch]; ux++ )
@@ -1472,7 +1778,34 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
     std::vector<int> mark( numTus, -1 );
     for( int i = 0; i < numTus && hostDeps; i++ )
     {
-      Tu&       t  = m.rec[i];
+      Tu&  t = m.rec[i];
+      auto addBlock = [&]( int b )
+      {
+        if( b >= 0 && b < i && mark[b] != i )
+        {
+          mark[b] = i;
+          deps[i].push_back( b );
+        }
+      };
+      if( t.derive & DERIVE_NODE )   // a CU's mode: the derived modes it reads, from those CUs' nodes
+      {
+        const Cu& c = m.cus[t.cu];
+        if( c.kind == CU_MPM )
+        {
+          for( int k = 0; k < MPM_NEIGHBOURS; k++ )
+          {
+            if( c.nbr[k] >= 0 )
+            {
+              addBlock( m.cus[c.nbr[k]].node );
+            }
+          }
+        }
+        else
+        {
+          addBlock( m.cus[c.lumaCu].node );
+        }
+        continue;
+      }
       const int ch = t.comp == 0 ? 0 : 1;
       auto own = [&]( int c, int x, int y ) -> int
       {
@@ -1510,34 +1843,33 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
       {
         t.ispSide = ( t.isp == HOR_INTRA_SUBPARTITIONS ? avail( t.cuX - 1, t.y ) : avail( t.regX, t.cuY - 1 ) ) ? 1 : 0;
       }
-      for( int ln = 0; ln <= ( t.fusion ? 1 : 0 ); ln++ )
+      // the read range of line ln (0: multiRefIdx k, 1: intra fusion's k + 1, non-integer slopes) for the mode of tm
+      auto readRange = [&]( const Tu& tm, const int ln, int& topMax, int& leftMax )
       {
-        const int mrl = t.mrl + ln;   // the reference line (multiRefIdx; the fusion line is the next one)
-        // the read range: the main line (multiRefIdx k = t.mrl), or the fusion line (k + 1, non-integer slopes)
-        const int rf = t.refFilter ? 1 : 0;
-        int topMax, leftMax;
-        if( t.dirMode == PLANAR_IDX )   // never with MRL; xPredIntraPlanar reads entries 1 .. w + 1 anyway
+        const int mrl = tm.mrl + ln;
+        const int rf  = tm.refFilter ? 1 : 0;
+        if( tm.dirMode == PLANAR_IDX )   // never with MRL; xPredIntraPlanar reads entries 1 .. w + 1 anyway
         {
           topMax  = W + 1 + rf;
           leftMax = H + 1 + rf;
         }
-        else if( t.dirMode == DC_IDX )   // xPredIntraDc: from entry multiRefIdx + 1 on
+        else if( tm.dirMode == DC_IDX )   // xPredIntraDc: from entry multiRefIdx + 1 on
         {
           topMax  = W + 1 + mrl;
           leftMax = H + 1 + mrl;
         }
         else
         {
-          const bool ver = t.isModeVer != 0;
+          const bool ver = tm.isModeVer != 0;
           const int  w = ver ? W : H, h = ver ? H : W, refLength = ver ? topLen : leftLen, sideLength = ver ? leftLen : topLen;
-          const int  angle = t.intraPredAngle;
+          const int  angle = tm.intraPredAngle;
           int mainMax, sideMax;
           if( ln == 0 )   // xPredIntraAng reads refMain + multiRefIdx from deltaPos = angle * (1 + multiRefIdx) on
           {
             if( angle == 0 )
             {
               mainMax = w + 1 + mrl;
-              sideMax = t.applyPDPC ? h + 1 : 1 + mrl;   // PDPC only without MRL
+              sideMax = tm.applyPDPC ? h + 1 : 1 + mrl;   // PDPC only without MRL
             }
             else if( angle < 0 )
             {
@@ -1549,10 +1881,10 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
               // beyond refLength + mrl: its replicated value
               mainMax = std::min( refLength + mrl, ( ( angle * ( h + mrl ) ) >> 5 ) + w + 10 + mrl );
               sideMax = 1 + mrl;
-              if( t.applyPDPC )
+              if( tm.applyPDPC )
               {
-                const int limit = std::min( 3 << t.angularScale, w );
-                sideMax = t.gradPDPC ? h + 1 : std::min( sideLength, h + ( ( 256 + limit * t.absInvAngle ) >> 9 ) + 1 );
+                const int limit = std::min( 3 << tm.angularScale, w );
+                sideMax = tm.gradPDPC ? h + 1 : std::min( sideLength, h + ( ( 256 + limit * tm.absInvAngle ) >> 9 ) + 1 );
               }
             }
             mainMax += rf;
@@ -1563,7 +1895,7 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
             if( angle < 0 )
             {
               mainMax = w + PAD + 9 + mrl;
-              sideMax = std::min( sideLength + mrl, ( ( ( h + 1 + PAD ) * t.absInvAngle + 8 ) >> 4 >> 5 ) + 2 + mrl );
+              sideMax = std::min( sideLength + mrl, ( ( ( h + 1 + PAD ) * tm.absInvAngle + 8 ) >> 4 >> 5 ) + 2 + mrl );
             }
             else
             {
@@ -1574,10 +1906,43 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
           topMax  = ver ? mainMax : sideMax;
           leftMax = ver ? sideMax : mainMax;
         }
-        if( t.bf == 2 && ln == 0 )   // the filter's gate: the texture of the whole reference arrays (never with MRL / ISP)
+        if( tm.bf == 2 && ln == 0 )   // the filter's gate: the texture of the whole reference arrays (never with MRL / ISP)
         {
           topMax  = topLen;
           leftMax = leftLen;
+        }
+      };
+      // a mode intra_rec derives is not known here: the union of the read ranges of the modes the syntax leaves
+      // (Cu::modes, else all), the fusion line where one of them reads it, the bilateral filter's neighbours where it
+      // applies to one
+      const bool derived  = ( t.derive & DERIVE_MODE ) != 0;
+      const Cu*  cuRec    = derived ? &m.cus[t.cu] : nullptr;
+      const int  numModes = !derived ? 1 : cuRec->modes[0] < 0 ? NUM_LUMA_MODE : cuRec->modes[1] < 0 ? 1 : 2;
+      bool       bfNeeded = !derived && t.bf != 0;
+      for( int ln = 0; ln < 2; ln++ )
+      {
+        const int mrl = t.mrl + ln;   // the reference line (multiRefIdx; the fusion line is the next one)
+        int topMax = -1, leftMax = -1;   // -1: the line is not read
+        for( int k = 0; k < numModes; k++ )
+        {
+          Tu tm = t;
+          if( derived )
+          {
+            applyModeParams( tm, cuRec->modes[0] < 0 ? k : cuRec->modes[k], cuRec->plIdx );
+          }
+          if( ln == 1 && !tm.fusion )
+          {
+            continue;
+          }
+          int a, b;
+          readRange( tm, ln, a, b );
+          topMax   = std::max( topMax, a );
+          leftMax  = std::max( leftMax, b );
+          bfNeeded = bfNeeded || tm.bf != 0;
+        }
+        if( topMax < 0 )
+        {
+          break;
         }
         // never beyond the arms (the ISP prediction reads only within them; the copies beyond are never read)
         t.readMax[ln][0] = std::max( mrl, std::min( topMax, topLen + mrl ) );
@@ -1614,7 +1979,7 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
         for( k = 0; k < aM && avail( fx - aM * t.unitW + k * t.unitW, y0 ); k++ ) {}   // above MRL, rightwards
         av[6] = k;
 
-        if( t.bf && ln == 0 )   // the bilateral filter's neighbours (rows y-2, y-1; columns x-2, x-1)
+        if( bfNeeded && ln == 0 )   // the bilateral filter's neighbours (rows y-2, y-1; columns x-2, x-1)
         {
           // its padding (bilateralFilterPredDiamond5x5Clip): line 0's corner and above / left units of the CU (the
           // block, for ISP the CU, whose origin it pads at), also with MRL; a superset of the samples it copies
@@ -1656,6 +2021,10 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
       {
         mark[t.ispPrev] = i;
         deps[i].push_back( t.ispPrev );
+      }
+      if( derived )   // the mode, from the CU's node
+      {
+        addBlock( cuRec->node );
       }
       if( t.spCoded >= 0 )   // sign prediction's border (TU::predBorderResi): the two columns left of / rows above the block
       {
@@ -1705,6 +2074,7 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
   const Tu*      gTusDl  = nullptr;
   const int32_t* gOffDl  = nullptr;
   const int32_t* gListDl = nullptr;
+  const int32_t* gParamsDl = nullptr;
   // the scheduling buffer (intra_deps fills it): pending counts, the dependents of each block (CSR, edgeCap entries),
   // the queue, the counters, then intra_deps' own arrays
   const size_t n = size_t( numTus );
@@ -1727,6 +2097,21 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
   P.lumaClipMin = cs.slice->clpRng( COMPONENT_Y ).min;
   P.lumaClipMax = cs.slice->clpRng( COMPONENT_Y ).max;
   P.qcsOffset   = m.sh->qcsOffset;
+  // the CU records, then their modes (the derived ones -1 until the CU's node writes them); with verification
+  // the parameters intra_rec derives
+  const size_t cusBytes = m.cus.size() * sizeof( Cu ), cuBytes = cusBytes + m.cuMode.size() * 4;
+  const size_t dbgParamsBytes = m.on ? 4 : n * DBG_PARAMS * 4;
+  m.cuBuf.ensure( ctx, std::max<size_t>( cuBytes, 4 ), gpu::Buffer::DEVICE );
+  m.dbgParams.ensure( ctx, dbgParamsBytes, gpu::Buffer::DEVICE );
+  P.cus       = m.cuBuf.addr;
+  P.cuMode    = m.cuBuf.addr + cusBytes;
+  P.dbgParams = m.dbgParams.addr;
+  std::vector<int32_t> cuData( cuBytes / 4 );
+  if( cuBytes )
+  {
+    memcpy( cuData.data(), m.cus.data(), cusBytes );
+    memcpy( cuData.data() + cusBytes / 4, m.cuMode.data(), cuBytes - cusBytes );
+  }
   // the picture's LMCS tables: the forward and inverse LUTs and the chroma scale of every average luma value
   // (Reshape::calculateChromaAdj itself)
   std::vector<int32_t> lmcsTable;
@@ -1765,22 +2150,24 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
     P.numDep    = m.sched.addr + oNumDep * 4;
     P.edgeCap   = (int32_t) cap;
 
-    const size_t upBytes = sizeof( Params ) + tuBytes + coefBytes + lmcsBytes + spBytes;
+    const size_t upBytes = sizeof( Params ) + tuBytes + coefBytes + lmcsBytes + spBytes + cuBytes;
     const size_t upSign  = sizeof( Params ) + tuBytes + coefBytes + lmcsBytes;   // where the signPred data goes
+    const size_t upCu    = upSign + spBytes;                                      // the CU records and modes
     m.upload.ensure( ctx, upBytes, gpu::Buffer::UPLOAD );
     memcpy( m.upload.mapped, &P, sizeof( Params ) );
     memcpy( (char*) m.upload.mapped + sizeof( Params ), m.rec.data(), tuBytes );
     memcpy( (char*) m.upload.mapped + sizeof( Params ) + tuBytes, m.coef.data(), coefBytes );
     memcpy( (char*) m.upload.mapped + sizeof( Params ) + tuBytes + coefBytes, lmcsTable.data(), lmcsBytes );
     memcpy( (char*) m.upload.mapped + upSign, m.signPred.data(), spBytes );
-    // downloaded: the dependency count (overflow check), with verification the CPU comparison data and the GPU's
-    // scheduling data, then the planes
+    memcpy( (char*) m.upload.mapped + upCu, cuData.data(), cuBytes );
+    // downloaded: the dependency count (overflow check), with verification the CPU comparison data, the GPU's
+    // scheduling data and the derived parameters, then the planes
     size_t downBytes = 8;
     const size_t dPred = downBytes, dResi = dPred + dbgBytes, dTus = dResi + dbgBytes, dOffset = dTus + tuBytes;
-    const size_t dList = dOffset + ( n + 1 ) * 4;
+    const size_t dList = dOffset + ( n + 1 ) * 4, dParams = dList + cap * 4;
     if( !m.on )
     {
-      downBytes = dList + cap * 4;
+      downBytes = dParams + dbgParamsBytes;
     }
     size_t dPlane[3] = {};
     for( int c = 0; c < numComp; c++ )
@@ -1805,6 +2192,10 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
     if( spBytes )
     {
       s.copy( m.upload, upSign, m.signPredBuf, 0, spBytes );
+    }
+    if( cuBytes )
+    {
+      s.copy( m.upload, upCu, m.cuBuf, 0, cuBytes );
     }
     for( int c = 0; c < numComp; c++ )
     {
@@ -1850,6 +2241,7 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
       s.copy( m.tus, 0, m.download, dTus, tuBytes );
       s.copy( m.sched, oOffset * 4, m.download, dOffset, ( n + 1 ) * 4 );
       s.copy( m.sched, oList * 4, m.download, dList, cap * 4 );
+      s.copy( m.dbgParams, 0, m.download, dParams, dbgParamsBytes );
     }
     for( int c = 0; c < numComp; c++ )
     {
@@ -1872,6 +2264,7 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
     gTusDl   = (const Tu*) ( (const char*) m.download.mapped + dTus );
     gOffDl   = (const int32_t*) ( (const char*) m.download.mapped + dOffset );
     gListDl  = (const int32_t*) ( (const char*) m.download.mapped + dList );
+    gParamsDl = (const int32_t*) ( (const char*) m.download.mapped + dParams );
     break;
   }
   m.gpuMs += ms;
@@ -1913,6 +2306,53 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
       {
         first = "scheduling data of block " + std::to_string( i ) + " differ (availability, read ranges or dependents)";
       }
+    }
+  }
+  // the modes and parameters intra_rec derived against the CPU's: every field the kernels read for the mode (the
+  // angular ones of angular modes, PDPC's scale for positive angles)
+  for( int i = 0; i < numTus && first.empty(); i++ )
+  {
+    const Tu& h = m.rec[i];
+    if( !( h.derive & DERIVE_MODE ) )
+    {
+      continue;
+    }
+    const int32_t* g = gParamsDl + size_t( i ) * DBG_PARAMS;
+    const char*    field = nullptr;
+    int            cpu = 0, gpu = 0;
+    auto check = [&]( const char* name, int a, int b )
+    {
+      if( !field && a != b )
+      {
+        field = name;
+        cpu   = a;
+        gpu   = b;
+      }
+    };
+    check( "mode", h.dirMode, g[0] );
+    check( "isModeVer", h.isModeVer, g[1] );
+    if( h.dirMode > DC_IDX )
+    {
+      check( "intraPredAngle", h.intraPredAngle, g[2] );
+      check( "absInvAngle", h.absInvAngle, g[3] );
+      if( h.intraPredAngle > 0 )
+      {
+        check( "gradPDPC", h.gradPDPC, g[7] );
+        check( "angularScale", h.angularScale, g[8] );
+      }
+    }
+    check( "useCubic", h.useCubic, g[4] );
+    check( "refFilter", h.refFilter, g[5] );
+    check( "applyPDPC", h.applyPDPC, g[6] );
+    check( "fusion", h.fusion, g[9] );
+    check( "bf", h.bf, g[10] );
+    check( "plIdx", h.plIdx, g[11] );
+    if( field )
+    {
+      char buf[200];
+      snprintf( buf, sizeof( buf ), "derived %s of block %d (comp %d at %d,%d %dx%d): CPU %d GPU %d", field, i, h.comp, h.x,
+                h.y, h.w, h.h, cpu, gpu );
+      first = buf;
     }
   }
   for( size_t i = 0; i < m.rec.size() && first.empty(); i++ )
@@ -2006,7 +2446,7 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
       }
     }
   }
-  int numFilter = 0, numPdpc = 0, numGrad = 0, numFusion = 0, numBf = 0;
+  int numFilter = 0, numPdpc = 0, numGrad = 0, numFusion = 0, numBf = 0, numNodes = 0;
   for( const Tu& t: m.rec )
   {
     numFilter += t.refFilter;
@@ -2014,8 +2454,9 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
     numGrad += t.applyPDPC && t.gradPDPC;
     numFusion += t.fusion;
     numBf += t.bf != 0;
+    numNodes += ( t.derive & DERIVE_NODE ) != 0;
   }
-  printf( "\n[gpu-intra] POC %d: %d blocks, chain %d (ref filter %d, PDPC %d, gradient PDPC %d, fusion %d, bilateral filter candidates %d), GPU %.2f ms: %s%s%s", m.poc,
-          (int) m.rec.size(), maxDepth, numFilter, numPdpc, numGrad, numFusion, numBf, ms, bad ? "MISMATCH, " : "identical",
+  printf( "\n[gpu-intra] POC %d: %d blocks, chain %d (ref filter %d, PDPC %d, gradient PDPC %d, fusion %d, bilateral filter candidates %d, mode nodes %d), GPU %.2f ms: %s%s%s", m.poc,
+          (int) m.rec.size() - numNodes, maxDepth, numFilter, numPdpc, numGrad, numFusion, numBf, numNodes, ms, bad ? "MISMATCH, " : "identical",
           bad ? first.c_str() : "", numBad ? ( ", " + std::to_string( numBad ) + " picture samples differ" ).c_str() : "" );
 }

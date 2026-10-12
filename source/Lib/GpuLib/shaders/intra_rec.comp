@@ -69,10 +69,29 @@ shared int16_t s_spStage1[32 * 32];           // their first inverse transform s
 shared int     s_secIn[64];                   // the LFNST / NSPT inputs (dequantized, in scan order)
 shared int     s_lfnstOut[96];                // the LFNST outputs
 
+shared int     s_mode;                        // the mode of a block whose mode is derived (intra_modes.glsl)
+shared int     s_modesRead[MPM_NEIGHBOURS];   // the modes its derivation reads (modeRead)
+
 Params P;      // the parameter block (loaded once)
 int    g_ti;   // the block being reconstructed
 bool   g_crs;       // LMCS chroma residual scaling of the block
 int    g_crsScale;  // its scale (Reshape::calculateChromaAdj)
+
+#include "intra_modes.glsl"
+
+// the mode of CU n: the host's (CU_KNOWN), or published by the CU's node, on which the reading block or node depends
+int cuModeOf( int n )
+{
+  return CBufI32( P.cuMode ).v[n];
+}
+
+// the modes a CU's derivation reads (loaded by the invocations in parallel): luma the neighbours' at getSpatialIpm's
+// positions (-1: none), chroma the co-located luma CU's in entry 0
+int modeRead( Cu c, int k )
+{
+  const int n = c.kind == CU_MPM ? c.nbr[k] : k == 0 ? c.lumaCu : -1;
+  return n >= 0 ? cuModeOf( n ) : -1;
+}
 
 int filterTap( int taps, int frac, int i )
 {
@@ -493,6 +512,30 @@ void signPrediction( Tu t, int lid, int NT )
   }
 }
 
+// the end of a block or node: its results (device-coherent stores of all invocations: samples, a node's mode) happen
+// before its dependents (d0 .. d1 in depList, the first ones prefetched in s_deps) are released; the last dependency of
+// a block to finish takes it over (one per block, the workgroup continues with it) or queues it
+void releaseDependents( int d0, int d1, int lid, int NT )
+{
+  controlBarrier( gl_ScopeWorkgroup, gl_ScopeQueueFamily, gl_StorageSemanticsBuffer, gl_SemanticsAcquireRelease );
+  for( int k = lid; k < d1 - d0; k += NT )
+  {
+    const int d = k < 256 ? s_deps[k] : BufI32( P.depList ).v[d0 + k];
+    if( atomicAdd( CBufI32( P.depCount ).v[d], -1, gl_ScopeQueueFamily, gl_StorageSemanticsBuffer, gl_SemanticsAcquireRelease ) == 1 )
+    {
+      if( atomicCompSwap( s_next, -1, d ) != -1 )
+      {
+        const int pos = atomicAdd( CBufI32( P.counter ).v[1], 1 );
+        atomicStore( CBufI32( P.queue ).v[pos], d, gl_ScopeQueueFamily, gl_StorageSemanticsBuffer, gl_SemanticsRelease );
+      }
+    }
+  }
+  if( lid == 0 )
+  {
+    atomicAdd( CBufI32( P.counter ).v[2], 1 );   // finished blocks and nodes
+  }
+}
+
 void main()
 {
   const int lid = int( gl_LocalInvocationID.x );
@@ -565,6 +608,47 @@ void main()
     if( lid < d1 - d0 )
     {
       s_deps[lid] = BufI32( P.depList ).v[d0 + lid];
+    }
+    // ----- a CU's node (intra_modes.glsl): the mode from the parsed syntax and the modes it reads (the neighbours' or
+    // the co-located luma CU's, the host's or published by the nodes of those CUs, on which it depends), published for
+    // the CU's blocks and the CUs reading it
+    if( ( t.derive & DERIVE_NODE ) != 0 )
+    {
+      const Cu c = BufCu( P.cus ).v[t.cu];
+      if( lid < MPM_NEIGHBOURS )   // the modes read, loaded at once
+      {
+        s_modesRead[lid] = modeRead( c, lid );
+      }
+      SYNC();
+      if( lid == 0 )
+      {
+        int modes[MPM_NEIGHBOURS];
+        for( int k = 0; k < MPM_NEIGHBOURS; k++ )
+        {
+          modes[k] = s_modesRead[k];
+        }
+        CBufI32( P.cuMode ).v[t.cu] = deriveCuMode( c, modes );
+      }
+      releaseDependents( d0, d1, lid, NT );
+      continue;
+    }
+    // ----- a block of a CU whose mode its node derived: the parameters for the mode
+    if( ( t.derive & DERIVE_MODE ) != 0 )
+    {
+      if( lid == 0 )
+      {
+        s_mode = cuModeOf( t.cu );
+      }
+      SYNC();
+      applyModeParams( t, s_mode, BufCu( P.cus ).v[t.cu].plIdx );
+      if( pc.verify != 0 && lid == 0 )
+      {
+        const int o = g_ti * DBG_PARAMS;
+        BufI32 dp = BufI32( P.dbgParams );
+        dp.v[o + 0] = t.dirMode;   dp.v[o + 1] = t.isModeVer;  dp.v[o + 2] = t.intraPredAngle;  dp.v[o + 3] = t.absInvAngle;
+        dp.v[o + 4] = t.useCubic;  dp.v[o + 5] = t.refFilter;  dp.v[o + 6] = t.applyPDPC;       dp.v[o + 7] = t.gradPDPC;
+        dp.v[o + 8] = t.angularScale; dp.v[o + 9] = t.fusion;  dp.v[o + 10] = t.bf;             dp.v[o + 11] = t.plIdx;
+      }
     }
     int  angClear  = 0;
     bool angClear2 = false;
@@ -1061,26 +1145,7 @@ void main()
       signPrediction( t, lid, NT );
     }
 
-    // the block's samples (device-coherent stores of all invocations) happen before its dependents are released:
-    // the last dependency of a block to finish takes it over (one per block, the workgroup continues with it) or
-    // queues it
-    controlBarrier( gl_ScopeWorkgroup, gl_ScopeQueueFamily, gl_StorageSemanticsBuffer, gl_SemanticsAcquireRelease );
-    for( int k = lid; k < d1 - d0; k += NT )
-    {
-      const int d = k < 256 ? s_deps[k] : BufI32( P.depList ).v[d0 + k];
-      if( atomicAdd( CBufI32( P.depCount ).v[d], -1, gl_ScopeQueueFamily, gl_StorageSemanticsBuffer, gl_SemanticsAcquireRelease ) == 1 )
-      {
-        if( atomicCompSwap( s_next, -1, d ) != -1 )
-        {
-          const int pos = atomicAdd( CBufI32( P.counter ).v[1], 1 );
-          atomicStore( CBufI32( P.queue ).v[pos], d, gl_ScopeQueueFamily, gl_StorageSemanticsBuffer, gl_SemanticsRelease );
-        }
-      }
-    }
-    if( lid == 0 )
-    {
-      atomicAdd( CBufI32( P.counter ).v[2], 1 );   // reconstructed blocks
-    }
+    releaseDependents( d0, d1, lid, NT );
     for( int i = lid; i < angClear; i += NT )
     {
       s_angA[0][i] = int16_t( 0 );

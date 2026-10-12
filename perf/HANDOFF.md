@@ -13,7 +13,7 @@ wall-clock gains with threads are "the easy baseline". Decoder status: single-th
 (`--GpuLoopFilter=1`: ALF, SAO, BIF, CCSAO, LF-CCCM, offset refinement on Vulkan). The user then asked for **a full
 GPU decoder in Vulkan, optimized until nothing is left** ("The GPU decoder needs to fully decode the frame on the
 GPU"; "Your first Vulkan version is going to be slow. That's OK"). That work is branch `dec-gpurecon`: intra
-reconstruction on the GPU (`--GpuRecon`), tool levels M1-M16 done and verified bit-exact; it is **not yet faster than
+reconstruction on the GPU (`--GpuRecon`), tool levels M1-M17 done and verified bit-exact; it is **not yet faster than
 the CPU decoder** (see section 8) and supports only a restricted tool set (all real CTC streams fall back to the CPU,
 first reason: TMRL).
 
@@ -275,6 +275,19 @@ waits for it). M15: LFNST and NSPT on the GPU (GpuIntraRec's invSecondary gives 
 transposition with the CPU's choices; the CPU's int8 kernel tables, the scans' positions and the LFNST output
 arrangement are uploaded once (Shared::secKernels, matrices); intra_resi runs them; Tu::secKind etc.). M16: sign
 prediction of LFNST / NSPT blocks (intra_resi's templates through NSPT / LFNST, intra_rec's recomputed residual too).
+M17: intra modes derived on the GPU, the base for DIMD / TIMD / MPM sorting, whose modes depend on reconstructed
+samples. Per CU and channel type a record (`Cu`: the parsed MPM syntax, the CUs at getSpatialIpm's 23 positions as
+getPURestricted finds them, a chroma CU's co-located luma CU, the modes the syntax leaves) and, for a mode the GPU
+derives, a node record before the CU's first block (`Tu::derive & DERIVE_NODE`, no samples): intra_rec runs the MPM
+lists there (`intra_modes.glsl`: PU::getIntraMPMs without MPM sorting, DIMD, MDIP, PDP, NN) or chroma DM / the
+candidates' substitution and publishes the mode (`Params::cuMode`); the CU's blocks depend on the node and set their
+parameters from the mode (`applyModeParams`: initPredIntraParams, fusion, directional planar, the bilateral filter's
+mode rule; GpuIntraRec.cpp has a copy for the host's read ranges); intra_deps reads the union of the reference ranges
+of the modes the syntax leaves (`Cu::modes`: planar for mpm_idx 0, a chroma candidate or VDIA, else all 67). The host
+still derives every mode itself (no supported tool needs the GPU's yet) and makes no CU records then (they cost 4 % of
+the wall time); `ECM_GPU_MODES=1` (`gpuDerivesModes`, `Impl::deriveModes`) makes the GPU derive all those the MPM
+lists give, on every stream, and verification compares each derived parameter with the CPU's.
+Transforms are still chosen by the host (next: the mode-dependent ones on the GPU, see section 9).
 
 ## 8. Numbers (i7-10700 8C/16T, Win11, GCC 16.2, RTX 3070 driver 616.92)
 
@@ -299,17 +312,25 @@ Profile of a GPU-on decode (non-LTO, m2_park16, share of all samples): parsing ~
 2. Done (2026-10-11): M4 dual tree, M5 LMCS, M6 dependent quantization and QCS, M7 joint CbCr, M8 explicit MTS,
    M9 transform skip and BDPCM, M10 MIP, M11 LFNST / NSPT (computed by the host until M15), M12 MRL, M13 ISP, M14 sign
    prediction, M15 LFNST / NSPT on the GPU (the VVC kernels, LFNSTExt=0, rejected), M16 sign prediction of LFNST /
-   NSPT blocks.
+   NSPT blocks. 2026-10-12: M17 intra modes derived on the GPU (tested with `ECM_GPU_MODES=1`).
    All 19 regular streams now stop at "TMRL" (the next sequence-level check; the block-level tools of step 4 follow).
 3. Make the GPU path win on CPU time per picture: the derive-only pass (record during parsing or a leaner pass;
    speed up getSpatialIpm/getPURestricted, which also helps the CPU decoder), GPU behaviour with frame threads
    (8 contexts x 32 persistent workgroups oversubscribe the GPU; spinning workgroups; try fewer groups per context,
    more frame threads than cores to hide GPU waits, overlapping a picture's GPU work with the next picture's parse).
-4. More tool levels, roughly in the order CTC AI needs them: LFNST of MIP (with the MIP prediction's DIMD mode), implicit MTS (with
-   DIMD), TMRL (template-selected lines: GPU), CCLM/CCCM and the other
-   cross-component tools (GPU), DIMD/TIMD/MPM sorting/chroma reordering/DBV (mode derivations that read the
-   reconstruction: these have to move to the GPU too), IntraTMP/IBC, then inter pictures. Each level: new test set
-   with exactly that tool on, verify mode identical, canaries, commit.
+4. More tool levels. CTC turns on DIMD, TIMD, TMRL, MPM sorting, MDIP, PDP and chroma reordering together, and every
+   one of them makes the intra modes depend on reconstructed samples (DIMD's modes are in every MPM list), so with
+   CTC the GPU derives every mode (M17's nodes) and everything that depends on a mode moves to the GPU too: next the
+   mode-dependent transforms of derived modes (ECM's explicit MTS kernel sets, LFNST / NSPT sets, transposition and
+   NSPT buckets, getFinalIntraModeForTransform) with their residual and sign-prediction templates computed in
+   intra_rec after the node (intra_resi cannot know them); then DIMD (histogram of gradients over the template, the
+   blended prediction, its modes in the MPM lists, DIMD chroma, the transform rules of DIMD CUs and MTSS'
+   candModeListForTransform), MPM sorting / MDIP / PDP, TIMD, TMRL, CCLM/CCCM and the other cross-component tools,
+   chroma reordering / DBV, LFNST of MIP, IntraTMP / IBC, then inter pictures. Each level: new test set with exactly
+   that tool on, verify mode identical, canaries, commit. Speed of derived modes: with `ECM_GPU_MODES=1` the GPU time
+   of four 720p pictures sets is 22.2 instead of 13.7 ms per picture (the union of the read ranges lengthens the
+   dependency chains); exact ranges would need dependencies a node registers once it knows the mode (a dependents
+   list per block, closed when the block finishes).
 5. In-loop filters in ON mode on the GPU without a CPU round trip (deblocking: see dec-gpu-dbf-wip; ALF/SAO/... are
    on the GPU already via --GpuLoopFilter, but on the CPU's picture).
 6. 1080p/4K verification and timing on long streams once sources are agreed with the user (three short 1080p
@@ -348,6 +369,9 @@ Profile of a GPU-on decode (non-LTO, m2_park16, share of all samples): parsing ~
   transforms read coefficients; the loop filters read none).
 - The scheduling allows a dependency on a later block: with joint CbCr whose Cr is coded, the Cr block decides the
   signs and writes the Cb block's residual (Tu::resiFrom). Statistics over the graph must not assume earlier blocks.
+  Any new edge between the blocks of one CU can close a cycle with it: a first M17 version let a CU's later blocks wait
+  for its first one (which derived the mode), and the Cb block (waiting for its Cr block) and the Cr block (waiting
+  for the Cb block) hung the GPU (VK_ERROR_DEVICE_LOST). Edges to the earlier nodes only are cycle-free.
 - `gpucheck.py --GpuRecon=2` compares the output, which in verification is the CPU's: it also requires the summary's
   "0 with differences" since 2026-10-12 (before, only the ON modes caught a wrong GPU reconstruction).
 - The owner maps have 4x4 luma units; ISP sub-partitions 1 or 2 wide or high share them. The last block owning a

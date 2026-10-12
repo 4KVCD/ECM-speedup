@@ -2,7 +2,7 @@
 #ifndef INTRA_COMMON_GLSL
 #define INTRA_COMMON_GLSL
 
-// one transform block of one component (94 int32, layout shared with GpuIntraRec.cpp)
+// one transform block of one component (96 int32, layout shared with GpuIntraRec.cpp)
 struct Tu
 {
   int comp, x, y, w, h;
@@ -54,8 +54,53 @@ struct Tu
   int spCoded;
   int spOffset;
   int resiFrom;
+  // the block's CU record (Cu, -1: none) and DERIVE_*: with DERIVE_MODE intra_rec takes the mode its CU's node derived
+  // and sets the fields above that depend on it (the host's are then the CPU's, for the comparison only)
+  int cu;
+  int derive;
 };
 layout( buffer_reference, std430, buffer_reference_align = 4 ) buffer BufTu { Tu v[]; };
+
+// Tu::derive
+const int DERIVE_NODE     = 32;  // not a block: the derivation of the mode of CU Tu::cu, before the CU's blocks
+const int DERIVE_MODE     = 1;   // the mode and its parameters come from the CU's mode (intra_modes.glsl)
+const int DERIVE_FETCH2ND = 2;   // IntraPrediction's fetchRef2nd: the second reference line of intra fusion may be read
+const int DERIVE_BF       = 4;   // the intra bilateral filter applies unless the mode excludes it
+const int DERIVE_NO_PDPC  = 8;   // the SPS disables PDPC (DisablePdpc)
+const int DERIVE_NO_SMOOTHING = 16;   // the SPS disables intra smoothing (no reference filter, no Gaussian interpolation)
+
+// Params::dbgParams per block: the derived dirMode, isModeVer, intraPredAngle, absInvAngle, useCubic, refFilter,
+// applyPDPC, gradPDPC, angularScale, fusion, bf, plIdx
+const int DBG_PARAMS = 12;
+
+// the positions of getSpatialIpm (the MPM list's neighbours): left, above, above-left, above-right, below-left, then
+// the non-adjacent ones
+const int MPM_NEIGHBOURS = 23;
+
+// a coding unit of one channel type whose blocks were recorded (40 int32, layout shared with GpuIntraRec.cpp)
+struct Cu
+{
+  int kind;              // CU_*: how its intra mode is found
+  int node;              // the record (DERIVE_NODE) that derives the mode and publishes it (Params::cuMode); -1 CU_KNOWN
+  int x, y, w, h;        // the CU (luma samples for luma)
+  int mpmFlag, secondMpmFlag, ipredIdx;   // luma: the parsed intra mode syntax
+  int nbFirst, nbLast;   // luma: the modes CU::isIdxModeValid removes at the start / the end of the angular range
+  int plIdx;             // luma: the CU's directional planar index (Tu::plIdx of planar blocks)
+  int candId;            // chroma: the parsed candidate index (CU_CHROMA_CAND)
+  int lumaCu;            // chroma: the co-located luma CU (DM, and the candidates' substitution)
+  int nbr[MPM_NEIGHBOURS];   // luma: the CU at each position of getSpatialIpm (-1: none, getPURestricted)
+  // the modes the parsed syntax leaves (intra_deps reads the union of their reference ranges): modes[0] -1 any mode,
+  // else modes[0] and, unless -1, modes[1]
+  int modes[2];
+  int pad;
+};
+layout( buffer_reference, std430, buffer_reference_align = 4 ) buffer BufCu { Cu v[]; };
+
+// Cu::kind
+const int CU_KNOWN       = 0;   // the host knows the mode (Params::cuMode holds it)
+const int CU_MPM         = 1;   // luma: from the MPM lists (PU::getIntraMPMs)
+const int CU_CHROMA_DM   = 2;   // chroma: the co-located luma mode (PU::getCoLocatedIntraLumaMode)
+const int CU_CHROMA_CAND = 3;   // chroma: candId of PU::getIntraChromaCandModes' first four
 
 // Tu::secKind
 const int SEC_NONE  = 0;
@@ -197,6 +242,10 @@ struct Params
   uint64_t lmcs;        // int32, lmcsLutSize entries each: the forward LUT, the inverse LUT, the chroma scale of each average luma
   uint64_t signPred;    // int32: the sign prediction data of the blocks with predicted signs (at Tu::spOffset, SP_*)
   uint64_t secKernels;  // int8: the LFNST and NSPT matrices (at Tu::secMatrix)
+  uint64_t cus;         // the CU records (Tu::cu)
+  uint64_t cuMode;      // int32 per CU: its mode (luma: PU::getIntraDirLuma, which the neighbours' MPM lists take; chroma:
+                        // the final mode), the host's (CU_KNOWN) or written by the CU's node (-1 until then)
+  uint64_t dbgParams;   // verification: per block the parameters intra_rec derived (DBG_PARAMS int32, DERIVE_MODE blocks)
   int      origin[3];
   int      stride[3];
   int      width[3];

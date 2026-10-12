@@ -15,6 +15,7 @@
 #extension GL_GOOGLE_include_directive : require
 #include "common.glsl"
 #include "intra_common.glsl"
+#include "intra_modes.glsl"
 
 layout( local_size_x = 64 ) in;
 
@@ -84,11 +85,102 @@ void addDep( int o )
   }
 }
 
+// the highest entries of the top and the left arm of line ln (0: multiRefIdx, 1: intra fusion's next one) the
+// prediction of block t reads (a superset; topLen / leftLen: the arms' lengths, m_topRefLength / m_leftRefLength);
+// the intra bilateral filter's gate of angular modes reads the whole arms
+void readRange( Tu t, int ln, int topLen, int leftLen, out int topMax, out int leftMax )
+{
+  const int W = t.regW, H = t.h;
+  const int mrl = t.mrl + ln;
+  const int rf  = t.refFilter != 0 ? 1 : 0;
+  if( t.dirMode == 0 )   // never with MRL
+  {
+    topMax  = W + 1 + rf;
+    leftMax = H + 1 + rf;
+  }
+  else if( t.dirMode == 1 )   // from entry multiRefIdx + 1 on
+  {
+    topMax  = W + 1 + mrl;
+    leftMax = H + 1 + mrl;
+  }
+  else
+  {
+    const bool ver = t.isModeVer != 0;
+    const int  w = ver ? W : H, h = ver ? H : W, refLength = ver ? topLen : leftLen, sideLength = ver ? leftLen : topLen;
+    const int  angle = t.intraPredAngle;
+    int mainMax, sideMax;
+    if( ln == 0 )
+    {
+      if( angle == 0 )
+      {
+        mainMax = w + 1 + mrl;
+        sideMax = t.applyPDPC != 0 ? h + 1 : 1 + mrl;
+      }
+      else if( angle < 0 )
+      {
+        mainMax = w + PAD + 2 + mrl;
+        sideMax = h + PAD + 2 + mrl;
+      }
+      else
+      {
+        mainMax = min( refLength + mrl, ( ( angle * ( h + mrl ) ) >> 5 ) + w + 10 + mrl );
+        sideMax = 1 + mrl;
+        if( t.applyPDPC != 0 )
+        {
+          const int limit = min( 3 << t.angularScale, w );
+          sideMax = t.gradPDPC != 0 ? h + 1 : min( sideLength, h + ( ( 256 + limit * t.absInvAngle ) >> 9 ) + 1 );
+        }
+      }
+      mainMax += rf;
+      sideMax += rf;
+    }
+    else
+    {
+      if( angle < 0 )
+      {
+        mainMax = w + PAD + 9 + mrl;
+        sideMax = min( sideLength + mrl, ( ( ( h + 1 + PAD ) * t.absInvAngle + 8 ) >> 4 >> 5 ) + 2 + mrl );
+      }
+      else
+      {
+        mainMax = min( refLength + mrl, ( ( angle * ( h + mrl ) ) >> 5 ) + w + 11 + mrl );
+        sideMax = mrl;
+      }
+    }
+    topMax  = ver ? mainMax : sideMax;
+    leftMax = ver ? sideMax : mainMax;
+  }
+  if( t.bf == 2 && ln == 0 )
+  {
+    topMax  = topLen;
+    leftMax = leftLen;
+  }
+}
+
 // GpuIntraRec::endPicture's dependency loop for block g_i (passes 1 and 2); pass 1 writes the availability, read
 // ranges and ISP side flag into the block record, which refSource reads (from the local copy) and pass 2 reloads
 void dependencies( int comp )
 {
   Tu t = BufTu( P.tus ).v[g_i];
+  if( ( t.derive & DERIVE_NODE ) != 0 )   // a CU's mode: the derived modes it reads, from those CUs' nodes
+  {
+    const Cu c = BufCu( P.cus ).v[t.cu];
+    if( c.kind == CU_MPM )
+    {
+      for( int k = 0; k < MPM_NEIGHBOURS; k++ )
+      {
+        if( c.nbr[k] >= 0 )
+        {
+          addDep( BufCu( P.cus ).v[c.nbr[k]].node );
+        }
+      }
+    }
+    else
+    {
+      addDep( BufCu( P.cus ).v[c.lumaCu].node );
+    }
+    return;
+  }
   const int availComp = t.comp == 0 ? 0 : 1;
   for( int ln = 0; ln < 2; ln++ )
   {
@@ -111,73 +203,41 @@ void dependencies( int comp )
   {
     t.ispSide = ( t.isp == 1 ? availAt( availComp, t.cuX - 1, t.y ) : availAt( availComp, t.regX, t.cuY - 1 ) ) ? 1 : 0;
   }
-  for( int ln = 0; ln <= ( t.fusion != 0 ? 1 : 0 ); ln++ )
+  // a mode intra_rec derives is not known here: the union of the read ranges of the modes the syntax leaves (Cu::modes,
+  // else all), the fusion line where one of them reads it, the bilateral filter's neighbours where it applies to one
+  const bool derived = ( t.derive & DERIVE_MODE ) != 0;
+  Cu         c;
+  int        numModes = 1;
+  if( derived )
+  {
+    c        = BufCu( P.cus ).v[t.cu];
+    numModes = c.modes[0] < 0 ? NUM_LUMA_MODE : c.modes[1] < 0 ? 1 : 2;
+  }
+  bool bfNeeded = !derived && t.bf != 0;
+  for( int ln = 0; ln < 2; ln++ )
   {
     const int mrl = t.mrl + ln;   // the reference line (multiRefIdx; the fusion line is the next one)
-    // the read range: the main line (multiRefIdx k = t.mrl), or the fusion line (k + 1, non-integer slopes)
-    const int rf = t.refFilter != 0 ? 1 : 0;
-    int topMax, leftMax;
-    if( t.dirMode == 0 )   // never with MRL
+    int topMax = -1, leftMax = -1;   // -1: the line is not read
+    for( int k = 0; k < numModes; k++ )
     {
-      topMax  = W + 1 + rf;
-      leftMax = H + 1 + rf;
-    }
-    else if( t.dirMode == 1 )   // from entry multiRefIdx + 1 on
-    {
-      topMax  = W + 1 + mrl;
-      leftMax = H + 1 + mrl;
-    }
-    else
-    {
-      const bool ver = t.isModeVer != 0;
-      const int  w = ver ? W : H, h = ver ? H : W, refLength = ver ? topLen : leftLen, sideLength = ver ? leftLen : topLen;
-      const int  angle = t.intraPredAngle;
-      int mainMax, sideMax;
-      if( ln == 0 )
+      Tu tm = t;
+      if( derived )
       {
-        if( angle == 0 )
-        {
-          mainMax = w + 1 + mrl;
-          sideMax = t.applyPDPC != 0 ? h + 1 : 1 + mrl;
-        }
-        else if( angle < 0 )
-        {
-          mainMax = w + PAD + 2 + mrl;
-          sideMax = h + PAD + 2 + mrl;
-        }
-        else
-        {
-          mainMax = min( refLength + mrl, ( ( angle * ( h + mrl ) ) >> 5 ) + w + 10 + mrl );
-          sideMax = 1 + mrl;
-          if( t.applyPDPC != 0 )
-          {
-            const int limit = min( 3 << t.angularScale, w );
-            sideMax = t.gradPDPC != 0 ? h + 1 : min( sideLength, h + ( ( 256 + limit * t.absInvAngle ) >> 9 ) + 1 );
-          }
-        }
-        mainMax += rf;
-        sideMax += rf;
+        applyModeParams( tm, c.modes[0] < 0 ? k : c.modes[k], c.plIdx );
       }
-      else
+      if( ln == 1 && tm.fusion == 0 )
       {
-        if( angle < 0 )
-        {
-          mainMax = w + PAD + 9 + mrl;
-          sideMax = min( sideLength + mrl, ( ( ( h + 1 + PAD ) * t.absInvAngle + 8 ) >> 4 >> 5 ) + 2 + mrl );
-        }
-        else
-        {
-          mainMax = min( refLength + mrl, ( ( angle * ( h + mrl ) ) >> 5 ) + w + 11 + mrl );
-          sideMax = mrl;
-        }
+        continue;
       }
-      topMax  = ver ? mainMax : sideMax;
-      leftMax = ver ? sideMax : mainMax;
+      int a, b;
+      readRange( tm, ln, topLen, leftLen, a, b );
+      topMax  = max( topMax, a );
+      leftMax = max( leftMax, b );
+      bfNeeded = bfNeeded || tm.bf != 0;
     }
-    if( t.bf == 2 && ln == 0 )
+    if( topMax < 0 )
     {
-      topMax  = topLen;
-      leftMax = leftLen;
+      break;
     }
     t.readMax[ln][0] = max( mrl, min( topMax, topLen + mrl ) );
     t.readMax[ln][1] = max( mrl, min( leftMax, leftLen + mrl ) );
@@ -206,7 +266,7 @@ void dependencies( int comp )
     for( k = 0; k < aM && availAt( availComp, fx - aM * t.unitW + k * t.unitW, y0 ); k++ ) {}   // above MRL, rightwards
     t.avail[ln][6] = k;
 
-    if( t.bf != 0 && ln == 0 )   // the bilateral filter's neighbours (rows y-2, y-1; columns x-2, x-1)
+    if( bfNeeded && ln == 0 )   // the bilateral filter's neighbours (rows y-2, y-1; columns x-2, x-1)
     {
       // its padding: line 0's corner and above / left units of the CU (the block, for ISP the CU, whose origin it
       // pads at), also with MRL; a superset of the samples it copies
@@ -256,6 +316,10 @@ void dependencies( int comp )
   if( t.ispPrev >= 0 )   // the chain of an ISP CU's sub-partitions
   {
     addDep( t.ispPrev );
+  }
+  if( derived )   // the mode, from the CU's node
+  {
+    addDep( c.node );
   }
   if( t.spCoded >= 0 )   // sign prediction's border (TU::predBorderResi): the two columns left of / rows above the block
   {
@@ -308,6 +372,10 @@ void main()
   if( g_pass == 0 )
   {
     const Tu t = BufTu( P.tus ).v[g_i];
+    if( ( t.derive & DERIVE_NODE ) != 0 )   // no samples
+    {
+      return;
+    }
     for( int uy = t.y >> P.unitLog2Y[g_ch]; uy <= ( t.y + t.h - 1 ) >> P.unitLog2Y[g_ch]; uy++ )
     {
       for( int ux = t.x >> P.unitLog2X[g_ch]; ux <= ( t.x + t.w - 1 ) >> P.unitLog2X[g_ch]; ux++ )

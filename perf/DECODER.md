@@ -329,7 +329,19 @@ the reconstruction buffer; works in every frame-thread context):
   into the region, then through both stages to the border, one predicted coefficient after the other, after the
   block's own residual (sharing its shared memory) - and intra_rec's recomputed residual goes through NSPT, or through
   LFNST before the stages (its coefficient buffer is int16 now, as the values are clipped to the 16-bit transform
-  range, which made room in shared memory). GpuIntraRec::supported()
+  range, which made room in shared memory); M17 lets the GPU derive intra modes, which DIMD, TIMD and MPM sorting will
+  need (their modes depend on reconstructed samples, and with DIMD on every MPM list holds DIMD's modes): per CU a
+  record with the parsed MPM syntax, the CUs at getSpatialIpm's 23 positions (getPURestricted on the host) and a
+  chroma CU's co-located luma CU; a CU whose mode the GPU derives gets a node record before its first block, which
+  intra_rec runs like a block without samples: PU::getIntraMPMs' lists (intra_modes.glsl; the neighbours' modes
+  loaded at once, the list built by one invocation) or chroma DM / the candidates' substitution, the mode published
+  for the CU's blocks and for the CUs reading it; the blocks depend on their node and set the parameters of the mode
+  as initPredIntraParams does (wide angle, PDPC, the reference filter or Gaussian interpolation, fusion, directional
+  planar, the bilateral filter's mode rule); intra_deps (and the host, for the comparison) reads the union of the
+  reference ranges of the modes the syntax leaves (planar for mpm_idx 0; else all 67). The host still derives every
+  mode itself; ECM_GPU_MODES=1 makes the GPU derive all those the MPM lists give, on every test stream, and the
+  verification compares each derived parameter with the CPU's (GPU time of four 720p pictures sets with it 22.2
+  instead of 13.7 ms per picture: the union lengthens the dependency chains). GpuIntraRec::supported()
   rejects every tool whose mode derivation or prediction reads reconstructed samples or that the kernels lack, before
   anything is skipped. All 19 regular streams now fall back to the CPU at TMRL, the next sequence-level check (before
   M14: sign prediction, before M6: QCS, before M5: LMCS, before M4: dual tree); many block-level tools follow. The
