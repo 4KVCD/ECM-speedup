@@ -117,7 +117,7 @@ void EncLib::create( const int layerId )
     m_searchStacks.emplace_back( new EncSearchStack );
   }
   // frame threads: the setups run on a stack of their own, so a picture takes a search stack when its search starts
-  m_setupStack.reset( getFrameThreads() > 1 ? new EncSearchStack : nullptr );
+  m_setupStack.reset( getFrameThreads() > 1 ? new EncSetupStack : nullptr );
   // CuThreads: a helper per thread (the picture's own thread uses the first one); the check codes with one helper
   m_rdHelperStacks.clear();
   const int numRdHelpers = getCuThreads() > 1 ? getCuThreads() : ( getCuThreadsCheck() ? 1 : 0 );
@@ -818,20 +818,13 @@ void EncLib::init( bool isFieldCoding, AUWriterIf* auWriterIf )
   }
   if( m_setupStack )
   {
-    // the objects a setup uses (EncLib.h)
-    m_setupStack->sliceEncoder.init( this, *m_setupStack, sps0 );
+    m_setupStack->sliceEncoder.initSetup( this, m_setupStack->cabacEncoder, m_setupStack->trQuant, m_setupStack->rdCost,
+                                          m_setupStack->reshaper, sps0, m_iSearchRange );
     m_setupStack->trQuant.init( getTrQuant()->getQuant(), 1 << m_log2MaxTbSize, m_useRDOQ, m_useRDOQTS,
 #if T0196_SELECTIVE_RDOQ
                                 m_useSelectiveRDOQ,
 #endif
                                 true );
-    for( int dir = 0; dir < MAX_NUM_REF_LIST_ADAPT_SR; dir++ )
-    {
-      for( int refIdx = 0; refIdx < MAX_IDX_ADAPT_SR; refIdx++ )
-      {
-        m_setupStack->interSearch.setAdaptiveSearchRange( dir, refIdx, m_iSearchRange );   // as InterSearch::init
-      }
-    }
   }
   for( int i = 0; i < getNumSearchStacks(); i++ )
   {

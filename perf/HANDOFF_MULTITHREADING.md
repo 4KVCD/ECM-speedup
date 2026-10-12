@@ -134,8 +134,11 @@ Commits on `enc-mt`, all bit-exact with stock ECM-20.0 (bitstream md5 of the sui
   writer counts into it; only the search start resets it), the separate-tree partitioner of the CABAC encoder.
   - Results: RA 129 frames 4.10x with 8 threads (B-2 2.48-2.64x), RA 65 2.74x with 4 (1.70x) and 2.79x with 8.
   - A full `EncSearchStack` object is 343 MB even when nothing in it is initialised (InterSearch 279 MB, of which
-    `m_gpmacsSplitModeTmSel` is 250 MB; EncCu 51 MB). The finish stacks are therefore small structs; the setup stack
-    (B-1) is still a full EncSearchStack and costs 343 MB.
+    `m_gpmacsSplitModeTmSel` is 250 MB; EncCu 51 MB). The finish stacks are therefore small structs.
+- P5 stage B-4: the setup stack is a small struct too (`EncSetupStack`: slice encoder, CABAC encoder, TrQuant, RdCost,
+  reshaper). Its slice encoder (`EncSlice::initSetup`) keeps the adaptive search ranges itself and leaves the IBC hash
+  map to the search stack, which resets it when it takes the picture (`loadSetup`). Peak commit 0.33 GB lower with
+  frame threads (RA 129 frames with 8 threads 11.1 -> 10.8 GB).
 - Found by the matrix of stage A: `--FrameThreads` >= 3 stopped with "PDP predictor unavailable" on ra_cif (bug of
   cfe3c39a, fixed in its own commit): a search stack's first picture used IntraPrediction's PDP buffer pointers before
   any CU of that stack had set them.
@@ -347,7 +350,7 @@ which is what the shadow check is for.
 - **Merge and GPM full-RD candidates** (`EncCu.cpp` 9995-11525, 15397-15944): ~22 % of RA, 24 % of LD.
 - **Intra MTS/LFNST passes.** In the MTS pass, `m_globalBestCostStore` truncates candidate k's transform loop by the
   minimum over earlier candidates (`IntraSearch.cpp` ~17841; agent).
-- **Inter residual options**: DCT2 鈫?SBT 鈫?MTS 鈫?LFNST passes in `xEncodeInterResidual`.
+- **Inter residual options**: DCT2 → SBT → MTS → LFNST passes in `xEncodeInterResidual`.
 
 They couple through `bestCS->cost` thresholds, `bestIsSkip` (FDM), `m_sbtCostSave`/`m_mtsCostSave`/`m_LNCostSave`
 and the SBT save-load cache. Run candidates speculatively from a frozen state and record each threshold comparison
@@ -371,7 +374,7 @@ segment-parallel already covers long RA encodes.
 
 ### Order
 
-P0 鈫?P1 鈫?P2 (intra first-pass RD and rough decision first, then merge, GPM, ME) 鈫?P3 鈫?P4 鈫?P5.
+P0 → P1 → P2 (intra first-pass RD and rough decision first, then merge, GPM, ME) → P3 → P4 → P5.
 
 P1 comes before P2 because it is the bigger certain gain for RA and builds the stacks and globals P2 needs. If the
 user cares most about LD, P2 should come first. Expected combined result on 8 cores (estimate): RA ~3x, LD and
@@ -390,7 +393,7 @@ AI-latency ~2-2.5x.
    - More P2 for LD, the only configuration nothing else speeds up: merge SATD pass, ME per reference, the GPM stages,
      intra RMD in chunks, then P3 speculation for the merge/GPM full RD and the intra MTS pass. Expected 1.1-1.2x on
      LD in all, each loop a step like the first (state sync, record and compare, shadow check).
-2. P0, P1, the first P2 step and P5 (stages A, B-1, B-2, B-3) are done (see Progress). Open in P5: the setup stack
-   as a small struct (-343 MB); `m_gpmacsSplitModeTmSel` (250 MB per stack) sparse or allocated on use; more periods
-   by default for long RA (memory). Next by the user's order: more P2 for LD.
+2. P0, P1, the first P2 step and P5 (stages A to B-4) are done (see Progress). Open in P5:
+   `m_gpmacsSplitModeTmSel` (250 MB per stack) sparse or allocated on use; more periods by default for long RA
+   (memory). Next by the user's order: more P2 for LD.
 3. Report each step as step % and cumulative % with before/after numbers and commit hashes, one commit per step.

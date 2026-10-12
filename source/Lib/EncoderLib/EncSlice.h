@@ -122,6 +122,7 @@ private:
   std::vector<BinStoreVector> m_binVectors;
 #endif
   bool                    m_ibcHashInit = false;   ///< initEncSlice reset the IBC hash map (EncSliceSetup)
+  int                     m_setupAdaptSR[MAX_NUM_REF_LIST_ADAPT_SR][MAX_IDX_ADAPT_SR] = {};   ///< without InterSearch
 
 public:
   double  initializeLambda(const Slice* slice, const int GOPid, const int refQP, const double dQP); // called by calculateLambda() and updateLambda()
@@ -147,6 +148,10 @@ public:
   /// frame threads: a finish stack's slice encoder, which only writes slices
   void    initFinish          ( EncLib* pcEncLib, CABACEncoder& cabacEncoder, RdCost& rdCost, EncReshape& reshaper,
                                 const SPS& sps );
+  /// frame threads: the setup stack's slice encoder, which only sets up pictures: it keeps the adaptive search ranges
+  /// itself and leaves the IBC hash map to the search stack (EncSliceSetup)
+  void    initSetup           ( EncLib* pcEncLib, CABACEncoder& cabacEncoder, TrQuant& trQuant, RdCost& rdCost,
+                                EncReshape& reshaper, const SPS& sps, int searchRange );
   /// frame threads: the state the picture's setup left in this slice encoder and its stack (the setup stack)
   void    saveSetup           ( EncSliceSetup& setup ) const;
   /// frame threads: takes over the state of a setup, for the picture's search on this slice encoder's stack

@@ -74,6 +74,17 @@
 #endif
 class EncLibCommon;
 
+/// Frame threads: what a picture's setup uses (EncSlice::initSetup); the search stack the picture takes over its state
+/// (EncSlice::saveSetup, loadSetup).
+struct EncSetupStack
+{
+  EncSlice     sliceEncoder;
+  CABACEncoder cabacEncoder;
+  TrQuant      trQuant;
+  RdCost       rdCost;
+  EncReshape   reshaper;
+};
+
 /// Frame threads: what a finish uses besides the filter encoders: the slice writing and the CABAC estimators, the intra
 /// prediction ALF-CCCM computes in, and the picture's RdCost and reshaper (copied from its search stack). A finish
 /// without frame threads uses the search stack's.
@@ -170,9 +181,8 @@ private:
   std::vector<std::unique_ptr<EncFinishObjects>> m_finishObjects;
   // frame threads: the finish stacks of the contexts
   std::vector<std::unique_ptr<EncFinishStack>>   m_finishStacks;
-  // frame threads: the stack of the picture setups, of which only the objects a setup uses are initialised (the slice
-  // encoder, the rate and quantizer lambdas, the adaptive search ranges, the IBC hash map, the reshaper)
-  std::unique_ptr<EncSearchStack> m_setupStack;
+  // frame threads: the stack of the picture setups
+  std::unique_ptr<EncSetupStack> m_setupStack;
   // coding tool
   LoopFilter                m_cLoopFilter;                        ///< deblocking filter class
   EncSampleAdaptiveOffset   m_cEncSAO;                            ///< sample adaptive offset class
@@ -275,7 +285,7 @@ public:
   /// The stacks for the mode search of pictures; the getters below return the objects of the first one.
   int                     getNumSearchStacks    () const        { return  int( m_searchStacks.size() ); }
   EncSearchStack&         getSearchStack        ( int i = 0 )   { return  *m_searchStacks[i];      }
-  EncSearchStack*         getSetupStack         ()              { return  m_setupStack.get();      }
+  EncSetupStack*          getSetupStack         ()              { return  m_setupStack.get();      }
   int                     getNumFinishContexts  () const        { return  int( m_finishContexts.size() ); }
   const EncFinishContext& getFinishContext      ( int i ) const { return  m_finishContexts[i];     }
   int                     getNumRdHelpers       () const        { return  m_searchStacks.empty() ? 0 : int( m_rdHelperStacks.size() / m_searchStacks.size() ); }

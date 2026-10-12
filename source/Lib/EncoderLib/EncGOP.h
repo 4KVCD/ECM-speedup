@@ -222,6 +222,9 @@ private:
   static thread_local EncSlice*       m_pcSliceEncoder;   ///< the slice encoder of the picture's search stack
   static thread_local EncSearchStack* m_pcSearchStack;    ///< search stack of the picture being encoded
   static thread_local EncPicOrder*    m_pcPicOrder;       ///< order record of the picture being encoded
+  // the objects of the picture's setup that are not the slice encoder's: its search stack's, or the setup stack's
+  static thread_local RdCost*          m_pcSetupRdCost;
+  static thread_local EncReshape*      m_pcSetupReshaper;
   // the objects of the picture's finish: its search stack's, or with frame threads the finish stack of its context
   static thread_local CABACEncoder*    m_pcFinishCabac;
   static thread_local CtxCache*        m_pcFinishCtxCache;

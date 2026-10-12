@@ -102,6 +102,19 @@ void EncSlice::initFinish( EncLib* pcEncLib, CABACEncoder& cabacEncoder, RdCost&
   xInit( pcEncLib, nullptr, nullptr, cabacEncoder, nullptr, &rdCost, &reshaper, sps );
 }
 
+void EncSlice::initSetup( EncLib* pcEncLib, CABACEncoder& cabacEncoder, TrQuant& trQuant, RdCost& rdCost,
+                          EncReshape& reshaper, const SPS& sps, int searchRange )
+{
+  xInit( pcEncLib, nullptr, nullptr, cabacEncoder, &trQuant, &rdCost, &reshaper, sps );
+  for( int dir = 0; dir < MAX_NUM_REF_LIST_ADAPT_SR; dir++ )
+  {
+    for( int refIdx = 0; refIdx < MAX_IDX_ADAPT_SR; refIdx++ )
+    {
+      m_setupAdaptSR[dir][refIdx] = searchRange;   // as InterSearch::init
+    }
+  }
+}
+
 void EncSlice::xInit( EncLib* pcEncLib, EncCu* cuEncoder, InterSearch* interSearch, CABACEncoder& cabacEncoder,
                       TrQuant* trQuant, RdCost* rdCost, EncReshape* reshaper, const SPS& sps )
 {
@@ -151,7 +164,8 @@ void EncSlice::saveSetup( EncSliceSetup& setup ) const
   {
     for( int refIdx = 0; refIdx < MAX_IDX_ADAPT_SR; refIdx++ )
     {
-      setup.adaptSR[dir][refIdx] = m_pcInterSearch->getAdaptiveSearchRange( dir, refIdx );
+      setup.adaptSR[dir][refIdx] = m_pcInterSearch ? m_pcInterSearch->getAdaptiveSearchRange( dir, refIdx )
+                                                   : m_setupAdaptSR[dir][refIdx];
     }
   }
   setup.reshaper        = *m_pcReshaper;
@@ -930,7 +944,7 @@ void EncSlice::initEncSlice(Picture* pcPic, const int pocLast, const int pocCurr
   rpcSlice->setDisableSATDForRD(false);
 
   m_ibcHashInit = eSliceType == I_SLICE || ( m_pcCfg->getIBCHashSearch() && m_pcCfg->getIBCMode() ) || ( eSliceType != I_SLICE && m_pcCfg->getAllowDisFracMMVD() );
-  if( m_ibcHashInit )
+  if( m_ibcHashInit && m_pcCuEncoder )   // the setup stack has none: the search stack's resets (loadSetup)
   {
     m_pcCuEncoder->getIbcHashMap().destroy();
     m_pcCuEncoder->getIbcHashMap().init( pcPic->cs->pps->getPicWidthInLumaSamples(), pcPic->cs->pps->getPicHeightInLumaSamples() );
@@ -1517,7 +1531,15 @@ void EncSlice::setSearchRange( Slice* pcSlice )
     {
       iRefPOC = pcSlice->getRefPic(e, iRefIdx)->getPOC();
       int newSearchRange = Clip3(m_pcCfg->getMinSearchWindow(), iMaxSR, (iMaxSR*ADAPT_SR_SCALE*abs(iCurrPOC - iRefPOC)+iOffset)/iGOPSize);
-      m_pcInterSearch->setAdaptiveSearchRange(iDir, iRefIdx, newSearchRange);
+      if( m_pcInterSearch )
+      {
+        m_pcInterSearch->setAdaptiveSearchRange(iDir, iRefIdx, newSearchRange);
+      }
+      else
+      {
+        CHECK( iDir >= MAX_NUM_REF_LIST_ADAPT_SR || iRefIdx >= int( MAX_IDX_ADAPT_SR ), "Invalid index" );
+        m_setupAdaptSR[iDir][iRefIdx] = newSearchRange;   // the setup stack (initSetup)
+      }
     }
   }
 }

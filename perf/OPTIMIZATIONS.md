@@ -111,17 +111,18 @@ lower all-core turbo, one duplicated intra frame per chunk, unequal chunk comple
   10 periods at 4.4x with M = 4 and 5.9x with M = 8, at a cost in memory). LD gains nothing. `--ParallelSegments`
   combines with it.
 - Memory: a search stack commits about 1.1 GB whatever the resolution (a quarter of it is one GPM cache of 250 MB in
-  InterSearch). Each period beyond the first adds about 33 MB at 128x128 and 75 MB at CIF (about 1 GB at 1080p by the
-  same rate, mostly picture-size ALF and SAO buffers), and up to max(N, GOPSize) x M pictures are in flight.
+  InterSearch); the setup stack and the finish stacks are small. Each period beyond the first adds about 33 MB at
+  128x128 and 75 MB at CIF (about 1 GB at 1080p by the same rate, mostly picture-size ALF and SAO buffers), and up to
+  max(N, GOPSize) x M pictures are in flight.
 - Core Ultra 7 265K, one run at a time on the 8 P-cores, foreman 128x128 QP 32 (ai_long's and ra_long's
   configurations), the previous commit's single-thread time as base, automatic M:
 
 | FrameThreads | AI, 33 pictures (TemporalSubsampleRatio 8) | RA, 65 frames (3 intra periods) | RA, 129 frames (5) | peak commit (AI / RA 65 / RA 129) |
 |---|---|---|---|---|
 | 1 | 215.7 s | 556.2 s | 1064.5 s | |
-| 2 | 104.0 s, 2.07x | | | 3.1 GB |
-| 4 | 56.0 s, 3.85x | 203.2 s, 2.74x | | 5.7 / 6.0 GB |
-| 8 | 30.9 s, 6.98x | 199.1 s, 2.79x | 259.8 s, 4.10x | 10.6 / 10.5 / 11.1 GB |
+| 2 | 104.0 s, 2.07x | | | 2.8 GB |
+| 4 | 56.0 s, 3.85x | 203.2 s, 2.74x | | 5.4 / 5.7 GB |
+| 8 | 30.9 s, 6.98x | 199.1 s, 2.79x | 259.8 s, 4.10x | 10.2 / 10.2 / 10.8 GB |
 
   Earlier steps, same tests: finishes in coding order and stacks held to the end of the finish (P5 stage A, B-1): RA
   65 387.6 s with 4 threads and 383.9 s with 8 (1.44x, 1.45x); finishes of several periods at the same time (B-2):

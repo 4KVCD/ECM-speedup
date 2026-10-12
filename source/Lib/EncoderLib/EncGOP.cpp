@@ -94,6 +94,8 @@ thread_local EncSlice*       EncGOP::m_pcSliceEncoder = nullptr;
 thread_local EncSearchStack* EncGOP::m_pcSearchStack  = nullptr;
 thread_local EncPicOrder*    EncGOP::m_pcPicOrder     = nullptr;
 thread_local int64_t         EncGOP::m_ftTurn         = 0;
+thread_local RdCost*          EncGOP::m_pcSetupRdCost     = nullptr;
+thread_local EncReshape*      EncGOP::m_pcSetupReshaper   = nullptr;
 thread_local CABACEncoder*    EncGOP::m_pcFinishCabac     = nullptr;
 thread_local CtxCache*        EncGOP::m_pcFinishCtxCache  = nullptr;
 thread_local IntraPrediction* EncGOP::m_pcFinishIntraPred = nullptr;
@@ -2464,7 +2466,7 @@ void EncGOP::xPicInitLMCS(Picture *pic, PicHeader *picHeader, Slice *slice)
     }
 
     // the picture's search uses the weights as they are after its LMCS setup
-    m_pcSearchStack->rdCost.copyReshapeLumaLevelWeights( m_lmcsWeights );
+    m_pcSetupRdCost->copyReshapeLumaLevelWeights( m_lmcsWeights );
 
     //set all necessary information in LMCS APS and picture header
     picHeader->setLmcsEnabledFlag(m_pcReshaper->getSliceReshaperInfo().getUseSliceReshaper());
@@ -2651,15 +2653,21 @@ void EncGOP::compressGOP(int iPOCLast, int iNumPicRcvd, PicList &rcListPic, std:
     m_pcPicOrder       = picOrder.get();
     if( m_ftActive )
     {
-      m_pcSearchStack = m_pcEncLib->getSetupStack();
+      EncSetupStack& setup = *m_pcEncLib->getSetupStack();
+      m_pcSearchStack   = nullptr;
+      m_pcSliceEncoder  = &setup.sliceEncoder;
+      m_pcSetupRdCost   = &setup.rdCost;
+      m_pcSetupReshaper = &setup.reshaper;
     }
     else
     {
       picOrder->stackIdx = int( m_numPicsStarted++ % m_pcEncLib->getNumSearchStacks() );
       m_pcSearchStack    = &m_pcEncLib->getSearchStack( picOrder->stackIdx );
+      m_pcSliceEncoder   = &m_pcSearchStack->sliceEncoder;
+      m_pcSetupRdCost    = &m_pcSearchStack->rdCost;
+      m_pcSetupReshaper  = &m_pcSearchStack->reshaper;
       xUseFinishContext( m_pcEncLib->getFinishContext( 0 ) );
     }
-    m_pcSliceEncoder = &m_pcSearchStack->sliceEncoder;
 
     // start a new access unit: create an entry in the list of output access units
     AccessUnit accessUnit;
@@ -7522,7 +7530,7 @@ void EncGOP::xUpdateRasInit(Slice* slice)
 void EncGOP::xSetupPicOrder( Slice* slice, const std::shared_ptr<EncPicOrder>& order )
 {
   // the search and the finish use the picture's copy of the reshaper as the setup leaves it
-  m_pcSearchStack->reshaper = *m_pcReshaper;
+  *m_pcSetupReshaper = *m_pcReshaper;
 
   if( m_ftActive )
   {
