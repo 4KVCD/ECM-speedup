@@ -382,6 +382,16 @@ late end is waited for, a missing one makes a repeatable stream (GpuIntraRec's: 
 fill what they read) run the commands again after draining its queue, else wait() throws; the decoder prints the
 count of such submissions at the end when there were any.
 
+Sign prediction's decision in intra_rec (M14) is part of the chain. Over the 16 pictures of seven m14 streams
+(fore32/22/37, park720, four720, m14a_fore22, m14s_park720; GPU time, best of 3, builds alternated, every picture
+identical) M14 took 178.1 ms, 111 ms with the decision step left out (a timing experiment). Each hypothesis' border
+is now the sum of two halves computed once per border entry (the changes of its low and of its high four bits;
+16-bit sums suffice, the CPU's are Pel) instead of up to 8 template additions per entry: ~150 ms; every subgroup
+making the decision itself (no barrier, no shared copy) and the negative positions in registers: 149.0 ms (1.20x in
+all). The decision's phases at 150 ms, by stopping after each: border, templates and halves ~8 ms, costs ~8 ms,
+decision ~7 ms, residual recomputed ~12 ms. Computing the halves in intra_resi instead (no work in the chain) was no
+faster (148.6 ms) and moves more memory; not kept.
+
 ## Fixes found on the way
 
 - Decoding that starts at a CRA in the middle of an RA stream (`-s`, random access) crashed the stock decoder:

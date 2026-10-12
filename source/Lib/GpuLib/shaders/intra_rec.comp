@@ -57,8 +57,12 @@ shared int16_t s_spPred[32 * 32];             // the block's prediction, reconst
 shared int16_t s_spBorder[64];                // TU::predBorderResi: the residual the neighbours predict along the border
 shared int16_t s_spBase[64];                  // the border of the residual with every predicted sign positive
 shared int16_t s_spTempl[8 * 64];             // the templates of the predicted coefficients
+// per border entry j, a sign hypothesis' border residual in two halves (16-bit sums, which suffice: the CPU's are
+// Pel): at j * 16 + h the base minus twice the templates the low four hypothesis bits h select, and minus twice those
+// the high four bits h select
+shared int16_t s_spLow[64 * 16];
+shared int16_t s_spHigh[64 * 16];
 shared uint    s_spCost[256];                 // per sign hypothesis: its cost << 8 | the hypothesis
-shared int     s_spNegative;                  // the decision: bit k set, predicted coefficient k is negative
 shared int     s_spCoef[32 * 32];             // the dequantized coefficients with the decided signs (nonzero region)
 shared int16_t s_spStage1[32 * 32];           // their first inverse transform stage
 
@@ -275,13 +279,14 @@ int lumaConv( bool isVer, int l, int base, int taps, bool cubic, bool big, int f
 // sample next to the block minus the one beyond it, or the mid-level value at the picture's left / top edge, minus
 // the prediction; the left column bottom-up, then the top row; only the left column at the top edge and the top row
 // at the left edge count) is compared with the border of the residual of each sign hypothesis: that of intra_resi
-// with every predicted sign positive, minus twice the template of each negative one, in 16 bits like the CPU's Pel
-// (with LMCS chroma scaling, reshapeChroma, scaled). The sums of absolute differences, shifted left by 8 with the
-// hypothesis in the low bits (bit b: predicted coefficient n - 1 - b negative), rank the hypotheses; the signs are
-// then decided in order: the coded sign says whether the prediction from the best hypothesis was right, and after a
-// wrong one the best is searched again among the hypotheses that agree with the signs decided. Where a decided sign
-// is negative the residual is computed again (dequantization and both transform stages as in intra_resi, with joint
-// CbCr also the other component's, for the other block of the pair, which waits for this one).
+// with every predicted sign positive, minus twice the template of each negative one (as two halves), in 16 bits
+// like the CPU's Pel (with LMCS chroma scaling, reshapeChroma, scaled). The sums of absolute differences,
+// shifted left by 8 with the hypothesis in the low bits (bit b: predicted coefficient n - 1 - b negative), rank the
+// hypotheses; the signs are then decided in order: the coded sign says whether the prediction from the best
+// hypothesis was right, and after a wrong one the best is searched again among the hypotheses that agree with the
+// signs decided. Where a decided sign is negative the residual is computed again (dequantization and both transform
+// stages as in intra_resi, with joint CbCr also the other component's, for the other block of the pair, which waits
+// for this one).
 void signPrediction( Tu t, int lid, int NT )
 {
   const Tu  c = t.spCoded == g_ti ? t : BufTu( P.tus ).v[t.spCoded];   // the block with the coefficients
@@ -310,21 +315,34 @@ void signPrediction( Tu t, int lid, int NT )
     s_spTempl[i] = int16_t( sp.v[c.spOffset + SP_TEMPLATES + i] );
   }
   SYNC();
+  for( int i = lid; i < 16 * len; i += NT )   // the halves (hypothesis bit b selects coefficient n - 1 - b)
+  {
+    const int j = i >> 4, h = i & 15;
+    int low = int( s_spBase[j] ), high = 0;
+    for( int b = 0; b < 4; b++ )
+    {
+      if( ( ( h >> b ) & 1 ) != 0 && b < n )
+      {
+        low -= 2 * int( s_spTempl[( n - 1 - b ) * len + j] );
+      }
+      if( ( ( h >> b ) & 1 ) != 0 && b + 4 < n )
+      {
+        high -= 2 * int( s_spTempl[( n - 5 - b ) * len + j] );
+      }
+    }
+    s_spLow[i]  = int16_t( low );
+    s_spHigh[i] = int16_t( high );
+  }
+  SYNC();
+  // the cost of each hypothesis s: its border residual is the sum of the halves its low and high four bits select
   const int maxPel = ( 1 << t.bitDepth ) - 1;
   for( int s = lid; s < ( 1 << n ); s += NT )
   {
+    const int low = s & 15, high = s >> 4;
     uint cost = 0;
     for( int j = first; j < last; j++ )
     {
-      int v = int( s_spBase[j] );
-      for( int b = 0; b < n; b++ )
-      {
-        if( ( ( s >> b ) & 1 ) != 0 )
-        {
-          v -= 2 * int( s_spTempl[( n - 1 - b ) * len + j] );
-        }
-      }
-      v = asPel( v );
+      int v = asPel( int( s_spLow[j * 16 + low] ) + int( s_spHigh[j * 16 + high] ) );
       if( g_crs )
       {
         v = scalePel( v, g_crsScale, maxPel );
@@ -334,55 +352,49 @@ void signPrediction( Tu t, int lid, int NT )
     s_spCost[s] = ( cost << 8 ) | uint( s );
   }
   SYNC();
-  if( gl_SubgroupID == 0 )   // the decision, in the first subgroup
+  // the decision, made alike by every subgroup (no barrier, no shared copy)
+  uint minIdx = 0, base = 0, signMask = 1u << n;
+  bool wrong    = true;   // the previous prediction was wrong (or none yet): search the best hypothesis again
+  int  negative = 0;      // bit k: predicted coefficient k is negative
+  for( int k = 0; k < n; k++ )
   {
-    uint minIdx = 0, base = 0, signMask = 1u << n;
-    bool wrong    = true;   // the previous prediction was wrong (or none yet): search the best hypothesis again
-    int  negative = 0;
-    for( int k = 0; k < n; k++ )
+    if( wrong )
     {
-      if( wrong )
+      uint m = 0xffffffffu;
+      for( uint idx = base + gl_SubgroupInvocationID; idx < base + signMask; idx += gl_SubgroupSize )
       {
-        uint m = 0xffffffffu;
-        for( uint idx = base + gl_SubgroupInvocationID; idx < base + signMask; idx += gl_SubgroupSize )
-        {
-          m = min( m, s_spCost[idx] );
-        }
-        minIdx = subgroupMin( m ) & 0xffu;
+        m = min( m, s_spCost[idx] );
       }
-      signMask >>= 1;
-      const bool predSign = ( minIdx & signMask ) != 0;
-      wrong = ( ( codedSigns >> k ) & 1 ) != 0;   // the coded sign: whether the predicted one was wrong
-      if( predSign != wrong )
-      {
-        negative |= 1 << k;
-        base += signMask;
-      }
+      minIdx = subgroupMin( m ) & 0xffu;
     }
-    if( subgroupElect() )
+    signMask >>= 1;
+    const bool predSign = ( minIdx & signMask ) != 0;
+    wrong = ( ( codedSigns >> k ) & 1 ) != 0;   // the coded sign: whether the predicted one was wrong
+    if( predSign != wrong )
     {
-      s_spNegative = negative;
+      negative |= 1 << k;
+      base += signMask;
     }
   }
-  SYNC();
-  const int  negative  = s_spNegative;
   const bool recompute = negative != 0;
   BufI32     mt        = BufI32( P.matrices );
   if( recompute )
   {
     // the coefficients with the decided signs, dequantized, then the first stage
-    BufI32    cf    = BufI32( P.coeffs );
+    BufI32    cf  = BufI32( P.coeffs );
     const int nzR = c.nzRows, nzC = c.nzCols, addDq = dequantAdd( c );
+    int       negativeAt[8];   // the positions of the negative ones (x | y << 16), else -1
+    for( int k = 0; k < 8; k++ )
+    {
+      negativeAt[k] = k < n && ( ( negative >> k ) & 1 ) != 0 ? sp.v[c.spOffset + SP_POS + k] : -1;
+    }
     for( int i = lid; i < nzR * nzC; i += NT )
     {
       const int pos = ( i % nzC ) | ( ( i / nzC ) << 16 );
       int       q   = cf.v[c.coeffOffset + i];
-      for( int k = 0; k < n; k++ )
+      for( int k = 0; k < 8; k++ )
       {
-        if( ( ( negative >> k ) & 1 ) != 0 && sp.v[c.spOffset + SP_POS + k] == pos )
-        {
-          q = -q;
-        }
+        q = negativeAt[k] == pos ? -q : q;
       }
       s_spCoef[i] = q != 0 ? dequant( c, q, addDq, mt, P.qcsOffset ) : 0;
     }
