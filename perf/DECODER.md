@@ -300,11 +300,26 @@ the reconstruction buffer; works in every frame-thread context):
   its block's row of iWidthExtSIMD samples into the next rows when the sub-partition is narrower than the CU; the
   sub-partitions of a CU are chained in the scheduling, as the 4x4 owner units cannot tell sub-partitions 1 or 2
   wide or high apart (which also made intra_deps' parallel owner writes race: the last block now wins with
-  atomicMax, as on the host). GpuIntraRec::supported()
+  atomicMax, as on the host); M14 adds sign prediction (TrQuant::predCoeffSigns, decoder side): the host takes each
+  block's predicted coefficients and their coded signs with the CPU's own DepQuant::getPredictedSigns (which also
+  hands the other levels of the sign area their signs in the decoder's order; the TU gets its levels back, as the CPU
+  calls it again when it reconstructs the picture after all) and uploads the levels with the predicted ones positive;
+  intra_resi computes that residual and per predicted coefficient its template (the left column and top row of the
+  residual of the coefficient alone with amplitude 256 - xIT of one coefficient is one product per stage - times its
+  dequantized magnitude, >> 8); intra_rec keeps the block's prediction in shared memory, compares the border the
+  neighbours predict (TU::predBorderResi: twice the sample next to the block minus the one beyond it, minus the
+  prediction) with the border of every sign hypothesis (up to 256, one invocation each, in 16-bit sums like the CPU's
+  Pel; scaled with LMCS chroma scaling), decides the signs in the CPU's order (a subgroup's minimum per search) and,
+  where a decided sign is negative, dequantizes and transforms the block again before it reconstructs it. With joint
+  CbCr the coded component's block decides (the Cr block when Cr is coded) and writes the other block's residual,
+  which waits for it (a scheduling edge that can point forward); the deciding block also waits for the owners of the
+  two columns / rows the border reads. Sign prediction of LFNST / NSPT blocks stays on the CPU (the host's LFNST /
+  NSPT results depend on the signs). GpuIntraRec::supported()
   rejects every tool whose mode derivation or prediction reads reconstructed samples or that the kernels lack, before
-  anything is skipped. All 19 regular streams now fall back to the CPU at sign prediction, the next sequence-level
-  check (before M6: QCS, before M5: LMCS, before M4: dual tree); many block-level tools follow. The kernels' reference
-  availability is "decoded earlier", while the CPU's (CodingStructure::getCURestricted) also excludes other tiles,
+  anything is skipped. All 19 regular streams now fall back to the CPU at TMRL, the next sequence-level check (before
+  M14: sign prediction, before M6: QCS, before M5: LMCS, before M4: dual tree); many block-level tools follow. The
+  kernels' reference availability is "decoded earlier", while the CPU's (CodingStructure::getCURestricted) also
+  excludes other tiles,
   with wavefronts the CTUs right of the current one in the row above, and with GDR the dirty area: until that fix
   pictures with tiles or wavefronts were not rejected and decoded wrong with the reconstruction on (their verification
   showed prediction differences at the tile and CTU boundaries); now tiles, wavefronts and GDR fall back to the CPU.

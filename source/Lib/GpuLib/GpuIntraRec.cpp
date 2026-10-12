@@ -43,6 +43,7 @@
 
 #include "CommonLib/CodingStructure.h"
 #include "CommonLib/BilateralFilter.h"
+#include "CommonLib/DepQuant.h"
 #include "CommonLib/InterpolationFilter.h"
 #include "CommonLib/MipData.h"
 #include "CommonLib/Picture.h"
@@ -64,7 +65,7 @@
 
 namespace
 {
-// layout shared with intra_rec.comp (struct Tu): 84 int32
+// layout shared with intra_rec.comp (struct Tu): 87 int32
 struct Tu
 {
   int32_t comp, x, y, w, h;
@@ -100,8 +101,15 @@ struct Tu
   int32_t regX, regW;
   int32_t ispSide;
   int32_t ispPrev;
+  int32_t spCoded, spOffset;
+  int32_t resiFrom;
 };
-static_assert( sizeof( Tu ) == 84 * 4, "Tu layout" );
+static_assert( sizeof( Tu ) == 87 * 4, "Tu layout" );
+
+// the signPred data of a block (intra_common.glsl's SP_*): the number of predicted signs, the coded signs, the
+// positions, then the templates intra_resi computes
+constexpr int SP_TEMPLATES = 10;
+static_assert( SP_TEMPLATES == 2 + SIGN_PRED_MAX_NUM, "signPred layout" );
 
 // Tu::lmcs
 constexpr int LMCS_BF_INVERSE  = 1;   // the intra bilateral filter works on inverse-mapped samples
@@ -249,6 +257,7 @@ struct Params
   uint64_t depTmp;
   uint64_t numDep;
   uint64_t lmcs;
+  uint64_t signPred;
   int32_t  origin[3];
   int32_t  stride[3];
   int32_t  width[3];
@@ -263,7 +272,7 @@ struct Params
   int32_t  qcsOffset;
   int32_t  pad;
 };
-static_assert( offsetof( Params, origin ) == 168 && offsetof( Params, edgeCap ) == 248 && sizeof( Params ) == 272,
+static_assert( offsetof( Params, origin ) == 176 && offsetof( Params, edgeCap ) == 256 && sizeof( Params ) == 280,
                "Params layout" );
 
 struct Push
@@ -408,7 +417,7 @@ struct GpuIntraRec::Impl
   gpu::Context*               ctx = nullptr;
   const Shared*               sh  = nullptr;
   std::unique_ptr<gpu::Stream> stream;
-  gpu::Buffer                 params, tus, coeffs, planes[3], owner[3], sched, dbgPred, dbgResi, lmcs;
+  gpu::Buffer                 params, tus, coeffs, planes[3], owner[3], sched, dbgPred, dbgResi, lmcs, signPredBuf;
   Reshape*                    reshape = nullptr;   // the decoder's reshaper (LMCS state of the picture being decoded)
   TrQuant*                    trQuant = nullptr;   // the decoder's TrQuant (transform types of the blocks)
   int                         numGroups = 0;
@@ -422,6 +431,17 @@ struct GpuIntraRec::Impl
   size_t                      numSamples = 0;     // samples of the recorded blocks
   bool                        lmcsUsed = false;   // a block of the picture reads the LMCS tables
   int                         lastIspLuma = -1;   // the record of the last ISP luma sub-partition (Tu::ispPrev)
+  std::vector<int32_t>        signPred;           // the sign prediction data of the blocks (Tu::spOffset)
+  // the sign prediction prepareSignPred took from a TU, for the record() of its coded component
+  struct PendingSignPred
+  {
+    int                 num = 0;   // predicted signs (0: none pending)
+    ComponentID         comp = COMPONENT_Y;
+    Position            pos;       // of the block
+    int32_t             codedSigns = 0;
+    int32_t             xy[SIGN_PRED_MAX_NUM] = {};
+    std::vector<TCoeff> coef;      // the levels with the decoder's signs, the predicted ones positive
+  }                           pendingSign;
   std::string                 unsupportedWhy;
   int                         poc = 0;
   bool                        on = false;
@@ -439,7 +459,7 @@ struct GpuIntraRec::Impl
       return;
     }
     for( gpu::Buffer* b: { &params, &tus, &coeffs, &planes[0], &planes[1], &planes[2],
-                           &owner[0], &owner[1], &owner[2], &sched, &dbgPred, &dbgResi, &lmcs, &upload, &download } )
+                           &owner[0], &owner[1], &owner[2], &sched, &dbgPred, &dbgResi, &lmcs, &signPredBuf, &upload, &download } )
     {
       b->destroy( *ctx );
     }
@@ -534,7 +554,9 @@ bool GpuIntraRec::supported( const Slice& slice, std::string& why )
   else if( sps.getScalingListFlag() )                                                     why = "scaling lists";
   else if( sps.getSpsRangeExtension().getExtendedPrecisionProcessingFlag() )               why = "extended precision";
   else if( sps.getUseColorTrans() )                                                       why = "ACT";
-  else if( sps.getNumPredSigns() > 0 )                                                    why = "sign prediction";
+  // TrQuant::predCoeffSigns keeps the templates of each block size and transform type of the first block that needs
+  // them, whatever its component; intra_resi computes them per block, with the block's bit depth
+  else if( sps.getNumPredSigns() > 0 && sps.getBitDepth( CHANNEL_TYPE_LUMA ) != sps.getBitDepth( CHANNEL_TYPE_CHROMA ) ) why = "sign prediction with unequal luma and chroma bit depths";
   else if( sps.getUseTmrl() )                                                             why = "TMRL";
   else if( sps.getUseLMChroma() || sps.getUseCcpMerge() || sps.getUseDdCcpFusion() || sps.getUseBvgCccm() ) why = "cross-component prediction";
   else if( sps.getUseChromaReordering() || sps.getUseIntraDBV() )                         why = "chroma reordering / DBV";
@@ -557,6 +579,8 @@ void GpuIntraRec::beginPicture( const CodingStructure& cs )
   m.numSamples = 0;
   m.lmcsUsed   = false;
   m.lastIspLuma = -1;
+  m.signPred.clear();
+  m.pendingSign.num = 0;
   m.unsupportedWhy.clear();
   m.poc = cs.slice->getPOC();
   std::string why;
@@ -572,6 +596,61 @@ void GpuIntraRec::unsupported( const char* why )
   {
     m_impl->unsupportedWhy = why;
   }
+}
+
+void GpuIntraRec::prepareSignPred( TransformUnit& tu, const ComponentID compID )
+{
+  Impl& m = *m_impl;
+  m.pendingSign.num = 0;
+  if( !m.unsupportedWhy.empty() )
+  {
+    return;
+  }
+  // TrQuant::predCoeffSigns' blocks: with joint CbCr at the Cb block, for the coded component
+  const bool jccr = tu.jointCbCr && isChroma( compID );
+  if( jccr && compID == COMPONENT_Cr )
+  {
+    return;
+  }
+  const ComponentID resiComp = jccr && !( tu.jointCbCr >> 1 ) ? COMPONENT_Cr : compID;
+  if( !TU::getUseSignPred( tu, resiComp ) || !( TU::getCbf( tu, compID ) || jccr ) )
+  {
+    return;
+  }
+  // DepQuant::getPredictedSigns gives the coded signs to the levels in the decoder's order (in place) and lists the
+  // predicted ones; the TU gets its levels back, as the CPU calls it again where it reconstructs the block
+  CoeffBuf            levels = tu.getCoeffs( resiComp );
+  const CompArea&     area   = tu.blocks[resiComp];
+  std::vector<TCoeff> saved( area.area() );
+  for( int y = 0; y < (int) area.height; y++ )
+  {
+    std::copy_n( levels.bufAt( 0, y ), area.width, saved.data() + y * area.width );
+  }
+  static_vector<Position, SIGN_PRED_MAX_NUM> predicted;
+  uint8_t                                    signBuf[SIGN_PRED_FREQ_RANGE * SIGN_PRED_FREQ_RANGE];
+  DepQuant::getPredictedSigns( tu, resiComp, predicted, signBuf, true );
+  Impl::PendingSignPred& p = m.pendingSign;
+  p.coef.resize( area.area() );
+  for( int y = 0; y < (int) area.height; y++ )
+  {
+    std::copy_n( levels.bufAt( 0, y ), area.width, p.coef.data() + y * area.width );
+    std::copy_n( saved.data() + y * area.width, area.width, levels.bufAt( 0, y ) );
+  }
+  // the coded signs of the predicted levels (whether each prediction is wrong), which become positive
+  p.comp       = resiComp;
+  p.pos        = area.pos();
+  p.codedSigns = 0;
+  for( int k = 0; k < (int) predicted.size(); k++ )
+  {
+    TCoeff& level = p.coef[predicted[k].y * area.width + predicted[k].x];
+    if( level < 0 )
+    {
+      p.codedSigns |= 1 << k;
+      level = -level;
+    }
+    p.xy[k] = predicted[k].x | ( predicted[k].y << 16 );
+  }
+  p.num = (int) predicted.size();
 }
 
 void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, const IntraPrediction::IpaSnapshot& ipa,
@@ -615,7 +694,6 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
   else if( sps.getUseLmcs() && !m.reshape )                         why = "LMCS without the decoder's reshaper";
   else if( sps.getScalingListFlag() )                               why = "scaling lists";
   else if( sps.getSpsRangeExtension().getExtendedPrecisionProcessingFlag() ) why = "extended precision";
-  else if( sps.getNumPredSigns() > 0 )                              why = "sign prediction";
   // ISP splits luma into sub-partitions down to 1 x 4 / 4 x 1
   else if( ( ( area.width < 2 || area.height < 2 ) && !( cu.ispMode && isLuma( compID ) ) ) || area.width > 128 || area.height > 128 ) why = "block size";
   else if( ( area.width & ( area.width - 1 ) ) || ( area.height & ( area.height - 1 ) ) ) why = "block size not a power of 2";
@@ -746,6 +824,7 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
   ComponentID resiComp = compID;
   t.jccr       = 0;
   t.jccrOffset = 0;
+  t.spCoded = t.spOffset = t.resiFrom = -1;
   if( tu.jointCbCr && compID == COMPONENT_Cb )
   {
     t.jccr   = TU::getICTMode( tu );
@@ -762,6 +841,28 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
       return;
     }
     t.jccr = JCCR_DERIVED;
+    if( cb->spOffset >= 0 )   // sign prediction of the pair, decided by the coded component's block
+    {
+      const int32_t cbIndex = (int32_t) m.rec.size() - 1;
+      if( std::abs( cb->jccr ) == 3 )   // Cr coded: this block decides and writes the Cb block's residual
+      {
+        t.spCoded               = cbIndex;
+        m.rec[cbIndex].resiFrom = cbIndex + 1;
+      }
+      else
+      {
+        t.resiFrom = cbIndex;
+      }
+    }
+  }
+  // sign prediction (TrQuant::predCoeffSigns): prepareSignPred took the predicted levels of the coded component before
+  // the CPU decided their signs
+  Impl::PendingSignPred& sign     = m.pendingSign;
+  const bool             signPred = sign.num > 0 && t.jccr != JCCR_DERIVED;
+  if( signPred && ( sign.comp != resiComp || sign.pos != tu.blocks[resiComp].pos() ) )
+  {
+    unsupported( "sign prediction taken from another block" );
+    return;
   }
   const QpParam resiQp = resiComp == compID ? qp : QpParam( tu, resiComp );
   t.cbf = t.jccr != JCCR_DERIVED && TU::getCbf( tu, resiComp ) ? 1 : 0;
@@ -815,6 +916,18 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
       }
       t.precomputed = cu.lfnstIdx ? PRECOMPUTED_COEFFS : 0;
     }
+  }
+  // the decision recomputes the residual with intra_resi's dequantization and primary transform; the host's
+  // LFNST / NSPT results depend on the signs
+  if( signPred && t.precomputed )
+  {
+    unsupported( "sign prediction of LFNST / NSPT blocks" );
+    return;
+  }
+  if( signPred && ( !t.cbf || ts || area.width < 4 || area.height < 4 || area.width > 32 || area.height > 32 ) )
+  {
+    unsupported( "sign prediction of a block outside TU::getUseSignPred's conditions" );
+    return;
   }
 
   // dequantization without scaling lists or extended precision: DepQuant::dequant (dequantBlock) with dependent
@@ -930,7 +1043,7 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
     // BDPCM (Quant::dequant, with transform skip): the levels accumulated along the rows or columns
     const bool          bdpcm = isLuma( resiComp ) ? cu.bdpcmMode != 0 : cu.bdpcmModeChroma != 0;
     std::vector<TCoeff> accumulated;
-    CCoeffBuf           c = tu.getCoeffs( resiComp );
+    CCoeffBuf           c = signPred ? CCoeffBuf( sign.coef.data(), area.width, area.height ) : tu.getCoeffs( resiComp );
     if( bdpcm )
     {
       accumulated.resize( area.area() );
@@ -1005,6 +1118,16 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
         state = int( ( stateTransTab >> ( ( state << 3 ) + ( ( level & 1 ) << 2 ) ) ) & 15 );
       }
     }
+  }
+  if( signPred )   // the signPred data; the block decides itself unless its pair's Cr is coded
+  {
+    t.spOffset = (int32_t) m.signPred.size();
+    t.spCoded  = std::abs( t.jccr ) == 3 ? -1 : (int32_t) m.rec.size();
+    m.signPred.push_back( sign.num );
+    m.signPred.push_back( sign.codedSigns );
+    m.signPred.insert( m.signPred.end(), sign.xy, sign.xy + SIGN_PRED_MAX_NUM );
+    m.signPred.resize( m.signPred.size() + size_t( sign.num ) * ( area.width + area.height ), 0 );
+    sign.num = 0;
   }
   if( pred && resi )   // the CPU's prediction and residual, for the comparison
   {
@@ -1095,7 +1218,8 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
   // line: the availability the CPU sees (corner flag, available prefix of each unit group), the highest top / left
   // index the prediction can read (a superset), then for each sample in that range its owner, or for an unavailable
   // sample the owner of its padding source (refSource, the kernel's fill rule); an ISP sub-partition also depends on
-  // the previous one
+  // the previous one, a block with sign prediction on the owners of its border, and with joint CbCr a block whose
+  // residual the decision in the other block writes on that block
   const int numTus = (int) m.rec.size();
   std::vector<std::vector<int>> deps( numTus );
   {
@@ -1288,6 +1412,26 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
         mark[t.ispPrev] = i;
         deps[i].push_back( t.ispPrev );
       }
+      if( t.spCoded >= 0 )   // sign prediction's border (TU::predBorderResi): the two columns left of / rows above the block
+      {
+        for( int k = 0; k < t.h && t.x > 0; k++ )
+        {
+          addOwner( t.x - 1, t.y + k );
+          addOwner( t.x - 2, t.y + k );
+        }
+        for( int k = 0; k < t.w && t.y > 0; k++ )
+        {
+          addOwner( t.x + k, t.y - 1 );
+          addOwner( t.x + k, t.y - 2 );
+        }
+      }
+      // joint CbCr with sign prediction: the residual comes from the decision in the other block of the pair, before
+      // or after this one
+      if( t.resiFrom >= 0 && mark[t.resiFrom] != i )
+      {
+        mark[t.resiFrom] = i;
+        deps[i].push_back( t.resiFrom );
+      }
       if( t.lmcs & LMCS_CHROMA_SCALE )   // the luma column left of and the row above the CU, clipped to the picture
       {
         auto addLuma = [&]( int sx, int sy )
@@ -1321,12 +1465,15 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
   const size_t n = size_t( numTus );
   m.edgeCap      = std::max( m.edgeCap, n * 8 );
   const size_t tuBytes = m.rec.size() * sizeof( Tu ), coefBytes = m.coef.size() * 4, dbgBytes = m.numSamples * 2;
+  const size_t spBytes = m.signPred.size() * 4;
   m.tus.ensure( ctx, tuBytes, gpu::Buffer::DEVICE );
   m.coeffs.ensure( ctx, std::max<size_t>( coefBytes, 4 ), gpu::Buffer::DEVICE );
+  m.signPredBuf.ensure( ctx, std::max<size_t>( spBytes, 4 ), gpu::Buffer::DEVICE );
   m.dbgPred.ensure( ctx, dbgBytes, gpu::Buffer::DEVICE );
   m.dbgResi.ensure( ctx, dbgBytes, gpu::Buffer::DEVICE );
   P.tus      = m.tus.addr;
   P.coeffs   = m.coeffs.addr;
+  P.signPred = m.signPredBuf.addr;
   P.filters  = m.sh->filters.addr;
   P.matrices = m.sh->matrices.addr;
   P.dbgPred  = m.dbgPred.addr;
@@ -1372,12 +1519,14 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
     P.numDep    = m.sched.addr + oNumDep * 4;
     P.edgeCap   = (int32_t) cap;
 
-    const size_t upBytes = sizeof( Params ) + tuBytes + coefBytes + lmcsBytes;
+    const size_t upBytes = sizeof( Params ) + tuBytes + coefBytes + lmcsBytes + spBytes;
+    const size_t upSign  = sizeof( Params ) + tuBytes + coefBytes + lmcsBytes;   // where the signPred data goes
     m.upload.ensure( ctx, upBytes, gpu::Buffer::UPLOAD );
     memcpy( m.upload.mapped, &P, sizeof( Params ) );
     memcpy( (char*) m.upload.mapped + sizeof( Params ), m.rec.data(), tuBytes );
     memcpy( (char*) m.upload.mapped + sizeof( Params ) + tuBytes, m.coef.data(), coefBytes );
     memcpy( (char*) m.upload.mapped + sizeof( Params ) + tuBytes + coefBytes, lmcsTable.data(), lmcsBytes );
+    memcpy( (char*) m.upload.mapped + upSign, m.signPred.data(), spBytes );
     // downloaded: the dependency count (overflow check), with verification the CPU comparison data and the GPU's
     // scheduling data, then the planes
     size_t downBytes = 8;
@@ -1406,6 +1555,10 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
     if( lmcsBytes )
     {
       s.copy( m.upload, sizeof( Params ) + tuBytes + coefBytes, m.lmcs, 0, lmcsBytes );
+    }
+    if( spBytes )
+    {
+      s.copy( m.upload, upSign, m.signPredBuf, 0, spBytes );
     }
     for( int c = 0; c < numComp; c++ )
     {
@@ -1498,9 +1651,9 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
   std::string first;
   int numBad = 0;
   // the GPU's scheduling data against the host's: availability, read ranges, the dependency graph
+  std::vector<std::vector<int>> dependents( numTus );
+  for( int i = 0; i < numTus; i++ ) for( int d: deps[i] ) dependents[d].push_back( i );
   {
-    std::vector<std::vector<int>> dependents( numTus );
-    for( int i = 0; i < numTus; i++ ) for( int d: deps[i] ) dependents[d].push_back( i );
     for( int i = 0; i < numTus && first.empty(); i++ )
     {
       const Tu& h = m.rec[i];
@@ -1581,13 +1734,31 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
   m.numVerified++;
   const bool bad = numBad > 0 || !first.empty();
   m.numMismatch += bad ? 1 : 0;
-  // the longest chain of blocks that read each other's samples
-  std::vector<int> depth( numTus, 1 );
-  int maxDepth = 0;
+  // the longest chain of blocks that wait for each other, in a topological order (a residual dependency of joint CbCr
+  // with sign prediction can point forward)
+  std::vector<int> depth( numTus, 1 ), waiting( numTus ), ready;
   for( int i = 0; i < numTus; i++ )
   {
-    for( int d: deps[i] ) depth[i] = std::max( depth[i], depth[d] + 1 );
-    maxDepth = std::max( maxDepth, depth[i] );
+    waiting[i] = (int) deps[i].size();
+    if( waiting[i] == 0 )
+    {
+      ready.push_back( i );
+    }
+  }
+  int maxDepth = 0;
+  while( !ready.empty() )
+  {
+    const int b = ready.back();
+    ready.pop_back();
+    maxDepth = std::max( maxDepth, depth[b] );
+    for( int d: dependents[b] )
+    {
+      depth[d] = std::max( depth[d], depth[b] + 1 );
+      if( --waiting[d] == 0 )
+      {
+        ready.push_back( d );
+      }
+    }
   }
   int numFilter = 0, numPdpc = 0, numGrad = 0, numFusion = 0, numBf = 0;
   for( const Tu& t: m.rec )

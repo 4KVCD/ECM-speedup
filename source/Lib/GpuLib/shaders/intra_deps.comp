@@ -48,9 +48,10 @@ bool availAt( int c, int x, int y )
   return a >= 0 && a < g_i;
 }
 
-void addDep( int o )
+// block g_i waits for block o
+void addEdge( int o )
 {
-  if( o < 0 || o >= g_i )
+  if( o < 0 || o == g_i )
   {
     return;
   }
@@ -71,6 +72,16 @@ void addDep( int o )
     atomicAdd( BufI32( P.numDep ).v[o], 1 );
   }
   g_count++;
+}
+
+// block g_i reads samples of block o, the owner of a unit: only an owner decoded before it (a later one has not
+// written the unit yet when the CPU reads it)
+void addDep( int o )
+{
+  if( o < g_i )
+  {
+    addEdge( o );
+  }
 }
 
 // GpuIntraRec::endPicture's dependency loop for block g_i (passes 1 and 2); pass 1 writes the availability, read
@@ -246,6 +257,22 @@ void dependencies( int comp )
   {
     addDep( t.ispPrev );
   }
+  if( t.spCoded >= 0 )   // sign prediction's border (TU::predBorderResi): the two columns left of / rows above the block
+  {
+    for( int k = 0; k < t.h && t.x > 0; k++ )
+    {
+      addDep( ownerAt( comp, t.x - 1, t.y + k ) );
+      addDep( ownerAt( comp, t.x - 2, t.y + k ) );
+    }
+    for( int k = 0; k < t.w && t.y > 0; k++ )
+    {
+      addDep( ownerAt( comp, t.x + k, t.y - 1 ) );
+      addDep( ownerAt( comp, t.x + k, t.y - 2 ) );
+    }
+  }
+  // joint CbCr with sign prediction: the residual comes from the decision in the other block of the pair, before or
+  // after this one
+  addEdge( t.resiFrom );
   if( g_pass == 1 )
   {
     BufTu( P.tus ).v[g_i].avail   = t.avail;

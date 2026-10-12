@@ -1379,6 +1379,7 @@ void DecCu::xIntraRecBlk( TransformUnit& tu, const ComponentID compID )
 #if ECM_VULKAN
   if( m_gpuDeriveOnly )   // the GPU reconstructs the picture: the block's parameters only
   {
+    m_gpuIntraRec->prepareSignPred( tu, compID );   // the GPU decides the predicted signs
     m_gpuIntraRec->record( tu, compID, m_pcIntraPred->ipaSnapshot(), QpParam( tu, compID ), nullptr, nullptr );
     // as below: an ISP CU's luma is marked decoded as a whole at its first sub-partition
     if( !tu.cu->ispMode || !isLuma( compID ) )
@@ -2213,6 +2214,12 @@ void DecCu::xIntraRecBlk( TransformUnit& tu, const ComponentID compID )
   bool bIsJccr     = tu.jointCbCr && isChroma(compID);
   ComponentID signPredCompID = bIsJccr ? (bJccrWithCr ? COMPONENT_Cr : COMPONENT_Cb): compID;
   bool reshapeChroma = flag && (TU::getCbf(tu, signPredCompID) || tu.jointCbCr) && isChroma(signPredCompID) && slice.getPicHeader()->getLmcsChromaResidualScaleFlag();
+#if ECM_VULKAN
+  if( m_gpuIntraRec )   // the GPU's record of the block takes the predicted signs before they are decided here
+  {
+    m_gpuIntraRec->prepareSignPred( tu, compID );
+  }
+#endif
   m_pcTrQuant->predCoeffSigns(tu, compID, reshapeChroma);
 #endif
   if( tu.jointCbCr && isChroma(compID) )

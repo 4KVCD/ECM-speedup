@@ -8,8 +8,9 @@
 // along the split, and the previous sub-partition's samples) and their [1 2 1] filtering, prediction (planar,
 // directional planar, DC, angular with PDPC and intra fusion, MIP, the intra bilateral filter) and reconstruction with
 // the residual intra_resi computed beforehand for all blocks at once (with LMCS: scaled for chroma by the neighbouring
-// luma, the bilateral filter on inverse-mapped samples). Every step follows the C++ of IntraPrediction /
-// MatrixIntraPrediction / DecCu.
+// luma, the bilateral filter on inverse-mapped samples); with sign prediction the signs are decided first from the
+// prediction and the neighbours, and the residual computed again where a sign is negative. Every step follows the C++
+// of IntraPrediction / MatrixIntraPrediction / TrQuant / DecCu.
 // Not yet: decoder-side intra modes.
 #extension GL_GOOGLE_include_directive : require
 #extension GL_KHR_shader_subgroup_basic : require
@@ -51,6 +52,15 @@ shared int     s_red[6];                      // workgroup sums
 shared int16_t s_bfLut[48];                   // the bilateral filter's LUT row of the block's QP
 shared int     s_mipBdry[8];                  // MIP: the reduced boundary (top, then left)
 shared int     s_mipRed[64];                  // MIP: the reduced prediction (4 x 4 or 8 x 8)
+// sign prediction (signPrediction; blocks of 4 x 4 to 32 x 32, at most 8 predicted signs)
+shared int16_t s_spPred[32 * 32];             // the block's prediction, reconstructed once the signs are decided
+shared int16_t s_spBorder[64];                // TU::predBorderResi: the residual the neighbours predict along the border
+shared int16_t s_spBase[64];                  // the border of the residual with every predicted sign positive
+shared int16_t s_spTempl[8 * 64];             // the templates of the predicted coefficients
+shared uint    s_spCost[256];                 // per sign hypothesis: its cost << 8 | the hypothesis
+shared int     s_spNegative;                  // the decision: bit k set, predicted coefficient k is negative
+shared int     s_spCoef[32 * 32];             // the dequantized coefficients with the decided signs (nonzero region)
+shared int16_t s_spStage1[32 * 32];           // their first inverse transform stage
 
 Params P;      // the parameter block (loaded once)
 int    g_ti;   // the block being reconstructed
@@ -118,12 +128,11 @@ void fillReferencePar( Tu t, int line, int predStride, int lid, int NT )
   }
 }
 
-// reconstruction of sample (x, y) of block t from its prediction and the residual of intra_resi (debug copy of the
-// prediction for the verification)
-void storeRecon( Tu t, int x, int y, int pr )
+// reconstruction of sample (x, y) of block t from its prediction and residual (debug copy of the prediction for the
+// verification)
+void reconstruct( Tu t, int x, int y, int pr, int re )
 {
-  const int i  = y * t.w + x;
-  int       re = int( BufI16( P.dbgResi ).v[t.dbgOffset + i] );
+  const int i = y * t.w + x;
   if( g_crs )   // the residual the CPU reconstructs with (and records, for the comparison)
   {
     re = scalePel( re, g_crsScale, ( 1 << t.bitDepth ) - 1 );
@@ -137,6 +146,21 @@ void storeRecon( Tu t, int x, int y, int pr )
   {
     BufI16( P.dbgPred ).v[t.dbgOffset + i] = int16_t( pr );
   }
+}
+
+// predicted sample (x, y) of block t: reconstructed with the residual of intra_resi, or with joint CbCr and sign
+// prediction with the one the decision in the pair's other block wrote (read device-coherent); with sign prediction
+// kept until the signs are decided (signPrediction)
+void storeRecon( Tu t, int x, int y, int pr )
+{
+  if( t.spCoded >= 0 )
+  {
+    s_spPred[y * t.w + x] = int16_t( pr );
+    return;
+  }
+  const int o  = t.dbgOffset + y * t.w + x;
+  const int re = t.resiFrom >= 0 ? int( CBufI16( P.dbgResi ).v[o] ) : int( BufI16( P.dbgResi ).v[o] );
+  reconstruct( t, x, y, pr, re );
 }
 
 // sample (x, y) of the predicted region: reconstructed if it lies in the block (the region of an ISP sub-partition 1
@@ -244,6 +268,162 @@ int lumaConv( bool isVer, int l, int base, int taps, bool cubic, bool big, int f
     for( int k = 0; k < 6; k++ ) sum += mainR( isVer, l, base + k ) * int( int16_t( f[k] ) );
   }
   return sum;
+}
+
+// sign prediction, decoder side (TrQuant::predCoeffSigns), once the block is predicted (into s_spPred), then its
+// reconstruction (all invocations). The border the neighbours predict (TU::predBorderResi: twice the reconstructed
+// sample next to the block minus the one beyond it, or the mid-level value at the picture's left / top edge, minus
+// the prediction; the left column bottom-up, then the top row; only the left column at the top edge and the top row
+// at the left edge count) is compared with the border of the residual of each sign hypothesis: that of intra_resi
+// with every predicted sign positive, minus twice the template of each negative one, in 16 bits like the CPU's Pel
+// (with LMCS chroma scaling, reshapeChroma, scaled). The sums of absolute differences, shifted left by 8 with the
+// hypothesis in the low bits (bit b: predicted coefficient n - 1 - b negative), rank the hypotheses; the signs are
+// then decided in order: the coded sign says whether the prediction from the best hypothesis was right, and after a
+// wrong one the best is searched again among the hypotheses that agree with the signs decided. Where a decided sign
+// is negative the residual is computed again (dequantization and both transform stages as in intra_resi, with joint
+// CbCr also the other component's, for the other block of the pair, which waits for this one).
+void signPrediction( Tu t, int lid, int NT )
+{
+  const Tu  c = t.spCoded == g_ti ? t : BufTu( P.tus ).v[t.spCoded];   // the block with the coefficients
+  const int W = t.w, H = t.h, N = W * H, len = W + H;
+  BufI32    sp   = BufI32( P.signPred );
+  BufI16    resi = BufI16( P.dbgResi );
+  const int n = sp.v[c.spOffset + SP_NUM], codedSigns = sp.v[c.spOffset + SP_SIGNS];
+  const bool useLeft = t.x != 0 || t.y == 0, useTop = t.y != 0 || t.x == 0;
+  const int  first = useLeft ? 0 : H, last = useTop ? len : H;
+  for( int j = lid; j < len; j += NT )
+  {
+    const bool left = j < H;
+    const int  x = left ? 0 : j - H, y = left ? H - 1 - j : 0;   // the block's sample at border entry j
+    int predicted = 1 << ( t.bitDepth - 1 );
+    if( left ? t.x != 0 : t.y != 0 )
+    {
+      const int nextTo = left ? recoAt( t.comp, t.x - 1, t.y + y ) : recoAt( t.comp, t.x + x, t.y - 1 );
+      const int beyond = left ? recoAt( t.comp, t.x - 2, t.y + y ) : recoAt( t.comp, t.x + x, t.y - 2 );
+      predicted = asPel( 2 * nextTo - beyond );
+    }
+    s_spBorder[j] = int16_t( predicted - int( s_spPred[y * W + x] ) );
+    s_spBase[j]   = resi.v[t.dbgOffset + y * W + x];
+  }
+  for( int i = lid; i < n * len; i += NT )
+  {
+    s_spTempl[i] = int16_t( sp.v[c.spOffset + SP_TEMPLATES + i] );
+  }
+  SYNC();
+  const int maxPel = ( 1 << t.bitDepth ) - 1;
+  for( int s = lid; s < ( 1 << n ); s += NT )
+  {
+    uint cost = 0;
+    for( int j = first; j < last; j++ )
+    {
+      int v = int( s_spBase[j] );
+      for( int b = 0; b < n; b++ )
+      {
+        if( ( ( s >> b ) & 1 ) != 0 )
+        {
+          v -= 2 * int( s_spTempl[( n - 1 - b ) * len + j] );
+        }
+      }
+      v = asPel( v );
+      if( g_crs )
+      {
+        v = scalePel( v, g_crsScale, maxPel );
+      }
+      cost += uint( abs( int( s_spBorder[j] ) - v ) );
+    }
+    s_spCost[s] = ( cost << 8 ) | uint( s );
+  }
+  SYNC();
+  if( gl_SubgroupID == 0 )   // the decision, in the first subgroup
+  {
+    uint minIdx = 0, base = 0, signMask = 1u << n;
+    bool wrong    = true;   // the previous prediction was wrong (or none yet): search the best hypothesis again
+    int  negative = 0;
+    for( int k = 0; k < n; k++ )
+    {
+      if( wrong )
+      {
+        uint m = 0xffffffffu;
+        for( uint idx = base + gl_SubgroupInvocationID; idx < base + signMask; idx += gl_SubgroupSize )
+        {
+          m = min( m, s_spCost[idx] );
+        }
+        minIdx = subgroupMin( m ) & 0xffu;
+      }
+      signMask >>= 1;
+      const bool predSign = ( minIdx & signMask ) != 0;
+      wrong = ( ( codedSigns >> k ) & 1 ) != 0;   // the coded sign: whether the predicted one was wrong
+      if( predSign != wrong )
+      {
+        negative |= 1 << k;
+        base += signMask;
+      }
+    }
+    if( subgroupElect() )
+    {
+      s_spNegative = negative;
+    }
+  }
+  SYNC();
+  const int  negative  = s_spNegative;
+  const bool recompute = negative != 0;
+  BufI32     mt        = BufI32( P.matrices );
+  if( recompute )
+  {
+    // the coefficients with the decided signs, dequantized, then the first stage
+    BufI32    cf    = BufI32( P.coeffs );
+    const int nzR = c.nzRows, nzC = c.nzCols, addDq = dequantAdd( c );
+    for( int i = lid; i < nzR * nzC; i += NT )
+    {
+      const int pos = ( i % nzC ) | ( ( i / nzC ) << 16 );
+      int       q   = cf.v[c.coeffOffset + i];
+      for( int k = 0; k < n; k++ )
+      {
+        if( ( ( negative >> k ) & 1 ) != 0 && sp.v[c.spOffset + SP_POS + k] == pos )
+        {
+          q = -q;
+        }
+      }
+      s_spCoef[i] = q != 0 ? dequant( c, q, addDq, mt, P.qcsOffset ) : 0;
+    }
+    SYNC();
+    const int rnd1 = 1 << ( c.shift1 - 1 );
+    for( int i = lid; i < nzC * H; i += NT )
+    {
+      const int xf = i / H, y = i % H;
+      int sum = 0;
+      for( int k = 0; k < nzR; k++ ) sum += mt.v[c.mtxV + k * H + y] * s_spCoef[k * nzC + xf];
+      s_spStage1[xf * H + y] = int16_t( clip3i( c.trMin, c.trMax, ( sum + rnd1 ) >> c.shift1 ) );
+    }
+    SYNC();
+  }
+  // the second stage, sample by sample, and the reconstruction; the coded residual is this block's
+  const int rnd2 = 1 << ( c.shift2 - 1 );
+  const int derivedOffset = abs( c.jccr ) == 3 ? c.dbgOffset : c.jccrOffset;
+  for( int i = lid; i < N; i += NT )
+  {
+    const int x = i % W, y = i / W;
+    int re;
+    if( recompute )
+    {
+      int sum = 0;
+      for( int k = 0; k < c.nzCols; k++ ) sum += mt.v[c.mtxH + k * W + x] * int( s_spStage1[k * H + y] );
+      re = clip3i( c.trMin, c.trMax, ( sum + rnd2 ) >> c.shift2 );
+      if( c.jccr != 0 )
+      {
+        CBufI16( P.dbgResi ).v[derivedOffset + i] = int16_t( jccrDerived( c.jccr, re ) );
+      }
+      if( pc.verify != 0 )
+      {
+        resi.v[t.dbgOffset + i] = int16_t( re );
+      }
+    }
+    else
+    {
+      re = int( resi.v[t.dbgOffset + i] );
+    }
+    reconstruct( t, x, y, int( s_spPred[i] ), re );
+  }
 }
 
 void main()
@@ -807,6 +987,11 @@ void main()
           storeRegion( t, i % W, i / W, lmcsBf ? fwdLut( pr ) : pr );
         }
       }
+    }
+    if( t.spCoded >= 0 )   // the prediction is complete: decide the signs, reconstruct
+    {
+      SYNC();
+      signPrediction( t, lid, NT );
     }
 
     // the block's samples (device-coherent stores of all invocations) happen before its dependents are released:

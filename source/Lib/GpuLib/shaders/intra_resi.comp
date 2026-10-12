@@ -9,7 +9,9 @@
 // themselves (BDPCM: the host accumulates the levels first). With LFNST the host gives the dequantized, inverse-LFNST'ed
 // coefficients, with NSPT the residual itself (Tu::precomputed). The result
 // goes to the residual buffer intra_rec adds to its prediction, with joint CbCr together with the other chroma
-// component's residual derived from it. Persistent workgroups take blocks by index.
+// component's residual derived from it. With sign prediction the predicted signs are positive here, and the templates
+// of the predicted coefficients go to the signPred buffer: intra_rec decides the signs and, where one is negative,
+// computes the residual again. Persistent workgroups take blocks by index.
 // Don't keep the first stage's output in a global scratch buffer: while other processes shared the GPU (RTX 3070),
 // whole warps of the second stage read it before the other warps' writes had reached it, although the barrier between
 // the stages had workgroup and even device scope.
@@ -26,59 +28,6 @@ shared int16_t s_stage1[128 * 128];
 int clip3i( int lo, int hi, int v )
 {
   return min( max( v, lo ), hi );
-}
-
-// Quant::dequant of a clipped nonzero level, in 32-bit arithmetic like the CPU's Intermediate_Int
-int dequantScalar( Tu t, int qc, int add )
-{
-  return t.dqRightShift > 0 ? ( qc * t.dqScale + add ) >> t.dqRightShift : ( qc * t.dqScale ) << ( -t.dqRightShift );
-}
-
-// the dequantized coefficient of a nonzero level (Tu::quant bit 0: a quantization index of dependent quantization),
-// clipped to the transform range; QCS (bit 1) weighs in the dequantization of the next larger index magnitude with
-// the weight table at qcsOffset in the matrices buffer
-int dequant( Tu t, int q, int add, BufI32 mt, int qcsOffset )
-{
-  const bool qcs = ( t.quant & 2 ) != 0;
-  if( ( t.quant & 1 ) != 0 )   // DepQuant's dequantBlock, in 64-bit arithmetic; the indices are not clipped
-  {
-    int64_t c = ( int64_t( q ) * t.dqScale + add ) >> t.dqRightShift;
-    if( qcs )
-    {
-      const int64_t c2 = ( int64_t( q + ( q > 0 ? 1 : -1 ) ) * t.dqScale + add ) >> t.dqRightShift;
-      const int     w  = abs( q ) < 64 ? mt.v[qcsOffset + abs( q )] : 0;
-      c = ( int64_t( 1024 - w ) * c + int64_t( w ) * c2 ) >> 10;
-    }
-    return int( min( max( c, int64_t( t.trMin ) ), int64_t( t.trMax ) ) );
-  }
-  const int qc = clip3i( t.dqInMin, t.dqInMax, q );
-  int       c  = dequantScalar( t, qc, add );
-  if( qcs )
-  {
-    const int c2 = dequantScalar( t, qc + ( qc > 0 ? 1 : -1 ), add );
-    const int w  = abs( qc ) < 64 ? mt.v[qcsOffset + abs( qc )] : 0;
-    c = ( ( 1024 - w ) * c + w * c2 ) >> 10;
-  }
-  return clip3i( t.trMin, t.trMax, c );
-}
-
-// TrQuant's invTransformCbCr: the residual of the other component of a joint CbCr pair from the coded one (ICT mode
-// +-1, +-2: Cr from Cb, +-3: Cb from Cr)
-int jccrDerived( int mode, int r )
-{
-  if( mode == 1 || mode == 3 )
-  {
-    return r >> 1;
-  }
-  if( mode == -1 || mode == -3 )
-  {
-    return ( -r ) >> 1;
-  }
-  if( mode == 2 )
-  {
-    return r;
-  }
-  return r == -32768 ? 32767 : -r;   // -2, with the CPU's clipping of -(-32768) to 16 bits
 }
 
 void main()
@@ -109,7 +58,7 @@ void main()
     }
     const int offH = t.mtxV, offW = t.mtxH;
     const int rnd1 = 1 << ( t.shift1 - 1 ), rnd2 = 1 << ( t.shift2 - 1 );
-    const int addDq = t.dqRightShift > 0 ? 1 << ( t.dqRightShift - 1 ) : 0;
+    const int addDq = dequantAdd( t );
     // the levels lie in rows < nzRows, columns < nzCols: the skipped terms are zero, and so is the first stage of an
     // all-zero column ((0 + rnd1) >> shift1), which the second stage then needs not read
     const int nzR = t.nzRows, nzC = t.nzCols;
@@ -148,6 +97,25 @@ void main()
         resi.v[codedOffset + i] = int16_t( clip3i( t.trMin, t.trMax, ( sum + ( 1 << ( shift - 1 ) ) ) >> shift ) );
       }
       continue;
+    }
+    // sign prediction (TrQuant::predCoeffSigns' templates, createTemplate): per predicted coefficient the left column
+    // (bottom-up) and the top row of the residual of that coefficient alone with the amplitude 1 << 8 (xIT of one
+    // coefficient: one product per stage), times its dequantized magnitude, >> 8. The host gave the predicted
+    // coefficients positive: the residual below is the one the decision in intra_rec starts from
+    if( t.spOffset >= 0 )
+    {
+      BufI32 sp = BufI32( P.signPred );
+      const int len = W + H, num = sp.v[t.spOffset + SP_NUM];
+      for( int i = lid; i < num * len; i += NT )
+      {
+        const int k = i / len, j = i % len;
+        const int pos = sp.v[t.spOffset + SP_POS + k], px = pos & 0xffff, py = pos >> 16;
+        const int r = j < H ? H - 1 - j : 0, c = j < H ? 0 : j - H;
+        const int stage1   = clip3i( t.trMin, t.trMax, ( mt.v[offH + py * H + r] * 256 + rnd1 ) >> t.shift1 );
+        const int basis    = clip3i( t.trMin, t.trMax, ( mt.v[offW + px * W + c] * stage1 + rnd2 ) >> t.shift2 );
+        const int coeffVal = dequant( t, cf.v[t.coeffOffset + py * nzC + px], addDq, mt, P.qcsOffset );
+        sp.v[t.spOffset + SP_TEMPLATES + i] = int( int16_t( ( coeffVal * basis + 128 ) >> 8 ) );   // a Pel
+      }
     }
     // first stage (vertical): s_stage1[xf * H + y] from the dequantized coefficient column xf
     for( int i = lid; i < nzC * H; i += NT )

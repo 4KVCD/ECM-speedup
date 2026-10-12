@@ -2,7 +2,7 @@
 #ifndef INTRA_COMMON_GLSL
 #define INTRA_COMMON_GLSL
 
-// one transform block of one component (84 int32, layout shared with GpuIntraRec.cpp)
+// one transform block of one component (87 int32, layout shared with GpuIntraRec.cpp)
 struct Tu
 {
   int comp, x, y, w, h;
@@ -42,8 +42,24 @@ struct Tu
   int regX, regW;       // the predicted region: the block, or the 4-wide region of ISP sub-partitions 1 or 2 wide
   int ispSide;          // ISP: the side along the split is available (the CU's arm is shifted, not replaced)
   int ispPrev;          // ISP: the previous sub-partition of the CU (-1: none)
+  // sign prediction (TrQuant::predCoeffSigns): the block whose prediction and neighbours decide the signs holds the
+  // block with the coefficients (itself, or with joint CbCr whose Cr is coded the Cb block before it; -1: no sign
+  // prediction); that block holds its data in the signPred buffer (spOffset, -1: none); with joint CbCr the other block
+  // of the pair waits for the decision, which writes its residual (resiFrom, -1: intra_resi does)
+  int spCoded;
+  int spOffset;
+  int resiFrom;
 };
 layout( buffer_reference, std430, buffer_reference_align = 4 ) buffer BufTu { Tu v[]; };
+
+// the signPred data of a block (at Tu::spOffset): the number of predicted signs (1..8), the coded residual signs (bit
+// i: predicted coefficient i is negative), the predicted coefficients in decision order (x | y << 16), then from
+// SP_TEMPLATES on, per predicted coefficient, its template (intra_resi): its residual's left column bottom-up, then
+// its top row (w + h samples)
+const int SP_NUM       = 0;
+const int SP_SIGNS     = 1;
+const int SP_POS       = 2;
+const int SP_TEMPLATES = 10;
 
 // xFillReferenceSamples' rule (GpuIntraRec.cpp's fillSource): the reconstructed sample (sx, sy) whose value entry idx
 // of the top or left arm of a reference line takes, for the area (fx, fy, fw, fh) filled with arms of predSize /
@@ -169,6 +185,7 @@ struct Params
   uint64_t depTmp;      // int32: the dependencies of each block (intra_deps)
   uint64_t numDep;      // int32 per block: its number of dependents, then the entries written (intra_deps)
   uint64_t lmcs;        // int32, lmcsLutSize entries each: the forward LUT, the inverse LUT, the chroma scale of each average luma
+  uint64_t signPred;    // int32: the sign prediction data of the blocks with predicted signs (at Tu::spOffset, SP_*)
   int      origin[3];
   int      stride[3];
   int      width[3];
@@ -184,6 +201,65 @@ struct Params
   int      pad;
 };
 layout( buffer_reference, std430, buffer_reference_align = 8 ) buffer BufParams { Params p; };
+
+// Quant::dequant of a clipped nonzero level, in 32-bit arithmetic like the CPU's Intermediate_Int
+int dequantScalar( Tu t, int qc, int add )
+{
+  return t.dqRightShift > 0 ? ( qc * t.dqScale + add ) >> t.dqRightShift : ( qc * t.dqScale ) << ( -t.dqRightShift );
+}
+
+// the dequantized coefficient of a nonzero level (Tu::quant bit 0: a quantization index of dependent quantization),
+// clipped to the transform range; QCS (bit 1) weighs in the dequantization of the next larger index magnitude with
+// the weight table at qcsOffset in the matrices buffer
+int dequant( Tu t, int q, int add, BufI32 mt, int qcsOffset )
+{
+  const bool qcs = ( t.quant & 2 ) != 0;
+  if( ( t.quant & 1 ) != 0 )   // DepQuant's dequantBlock, in 64-bit arithmetic; the indices are not clipped
+  {
+    int64_t c = ( int64_t( q ) * t.dqScale + add ) >> t.dqRightShift;
+    if( qcs )
+    {
+      const int64_t c2 = ( int64_t( q + ( q > 0 ? 1 : -1 ) ) * t.dqScale + add ) >> t.dqRightShift;
+      const int     w  = abs( q ) < 64 ? mt.v[qcsOffset + abs( q )] : 0;
+      c = ( int64_t( 1024 - w ) * c + int64_t( w ) * c2 ) >> 10;
+    }
+    return int( min( max( c, int64_t( t.trMin ) ), int64_t( t.trMax ) ) );
+  }
+  const int qc = clip3( t.dqInMin, t.dqInMax, q );
+  int       c  = dequantScalar( t, qc, add );
+  if( qcs )
+  {
+    const int c2 = dequantScalar( t, qc + ( qc > 0 ? 1 : -1 ), add );
+    const int w  = abs( qc ) < 64 ? mt.v[qcsOffset + abs( qc )] : 0;
+    c = ( ( 1024 - w ) * c + w * c2 ) >> 10;
+  }
+  return clip3( t.trMin, t.trMax, c );
+}
+
+// the rounding offset of dequantScalar / dequant
+int dequantAdd( Tu t )
+{
+  return t.dqRightShift > 0 ? 1 << ( t.dqRightShift - 1 ) : 0;
+}
+
+// TrQuant's invTransformCbCr: the residual of the other component of a joint CbCr pair from the coded one (ICT mode
+// +-1, +-2: Cr from Cb, +-3: Cb from Cr)
+int jccrDerived( int mode, int r )
+{
+  if( mode == 1 || mode == 3 )
+  {
+    return r >> 1;
+  }
+  if( mode == -1 || mode == -3 )
+  {
+    return ( -r ) >> 1;
+  }
+  if( mode == 2 )
+  {
+    return r;
+  }
+  return r == -32768 ? 32767 : -r;   // -2, with the CPU's clipping of -(-32768) to 16 bits
+}
 
 layout( push_constant ) uniform Push
 {

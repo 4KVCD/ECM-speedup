@@ -32,14 +32,15 @@
  */
 
 /** \file     GpuIntraRec.h
-    \brief    intra reconstruction of a picture on the GPU (first stage of the GPU reconstruction: verification only)
+    \brief    intra reconstruction of a picture on the GPU
 
-    The decoder records every intra transform block while it reconstructs a picture on the CPU (the CPU's prediction
-    and residual too); at the end of the picture the GPU reconstructs the picture from the records alone (reference
-    samples, prediction, dequantization, inverse transform, reconstruction) and the results are compared block by
-    block. Supported so far (M1): planar / DC / angular intra prediction without reference filtering, PDPC, intra
-    fusion, the intra bilateral filter, MRL, ISP, MIP and the decoder-side mode derivations; DCT-II without LFNST, MTS
-    or transform skip; scalar dequantization; 4:2:0 or 4:0:0. A picture with anything else is skipped and counted.
+    The decoder records every intra transform block of a picture; at the end of the picture the GPU reconstructs the
+    picture from the records alone (reference samples, prediction, dequantization, inverse transform, reconstruction).
+    With the reconstruction on, the CPU only derives the records; when verifying, it reconstructs the picture too
+    (its prediction and residual are recorded) and the results are compared block by block. Supported so far: planar / DC / angular intra prediction with reference filtering, PDPC, intra fusion, the
+    intra bilateral filter, MRL, ISP and MIP; DCT-II and explicit MTS, LFNST / NSPT (computed by the host), transform
+    skip and BDPCM; scalar and dependent quantization, QCS; joint CbCr; LMCS; sign prediction (not of LFNST / NSPT
+    blocks); the dual tree; 4:2:0 or 4:0:0. A picture with anything else is skipped and counted.
 */
 
 #ifndef __GPUINTRAREC__
@@ -80,6 +81,10 @@ public:
   static bool supported( const Slice& slice, std::string& why );
 
   void beginPicture( const CodingStructure& cs );
+  /// sign prediction (TrQuant::predCoeffSigns): takes the block's predicted levels and their coded signs for the next
+  /// record() of it, before the CPU decides the signs (the TU stays as it is); call right before record() or, when
+  /// the CPU reconstructs too, right before predCoeffSigns
+  void prepareSignPred( TransformUnit& tu, const ComponentID compID );
   /// one transform block of one component (with the CPU's prediction and residual when verifying, else nullptr)
   void record( const TransformUnit& tu, const ComponentID compID, const IntraPrediction::IpaSnapshot& ipa,
                const QpParam& qp, const CPelBuf* pred, const CPelBuf* resi );
