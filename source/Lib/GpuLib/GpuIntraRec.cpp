@@ -64,7 +64,7 @@
 
 namespace
 {
-// layout shared with intra_rec.comp (struct Tu): 75 int32
+// layout shared with intra_rec.comp (struct Tu): 84 int32
 struct Tu
 {
   int32_t comp, x, y, w, h;
@@ -95,8 +95,13 @@ struct Tu
   int32_t precomputed;
   int32_t mrl;
   int32_t bfAvail[3];
+  int32_t isp;
+  int32_t cuX, cuY, cuW, cuH;
+  int32_t regX, regW;
+  int32_t ispSide;
+  int32_t ispPrev;
 };
-static_assert( sizeof( Tu ) == 75 * 4, "Tu layout" );
+static_assert( sizeof( Tu ) == 84 * 4, "Tu layout" );
 
 // Tu::lmcs
 constexpr int LMCS_BF_INVERSE  = 1;   // the intra bilateral filter works on inverse-mapped samples
@@ -113,6 +118,116 @@ constexpr int JCCR_DERIVED = 4;
 // Tu::precomputed: the host ran a step of the CPU's inverse transform on the coefficients
 constexpr int PRECOMPUTED_COEFFS   = 1;   // dequantized and inverse-LFNST'ed: the input of the primary transform
 constexpr int PRECOMPUTED_RESIDUAL = 2;   // the residual itself (NSPT, which replaces the primary transform)
+
+// xFillReferenceSamples' rule (the kernels' copy is intra_common.glsl's fillSource): the reconstructed sample (sx, sy)
+// whose value entry idx of the top or left arm of a reference line takes, for the area (fx, fy, fw, fh) filled with
+// arms of predSize / predHSize samples from line mrl (multiRefIdx), given the availability av: the corner flag and the
+// available prefix of the above, above-right, left, below-left, left MRL and above MRL units. False where no unit is
+// available (the mid-level value). The units in the CPU's order: below-left and left (bottom-up), left MRL, the
+// corner C, above MRL, above, above-right; a line beyond the first unit has lM MRL units left of and aM above the
+// corner unit, which keeps entries 0 .. cLen of both arms (JVET-Y0116). An unavailable unit takes the last sample of
+// the unit before it in that order, units before the first available one take its first sample.
+bool fillSource( int fx, int fy, int fw, int fh, int predSize, int predHSize, int mrl, int uW, int uH, const int32_t av[7],
+                 bool top, int idx, int& sx, int& sy )
+{
+  const int tAU = predSize / uW, tLU = predHSize / uH;
+  const int lM = mrl / uH, aM = mrl / uW, cLen = mrl - lM * uH, C = tLU + lM;
+  const int totalUnits = tAU + tLU + 1 + lM + aM;
+  const int numAbove = std::max( fw / uW, 1 ), numLeft = std::max( fh / uH, 1 );
+  const int x0 = fx - 1 - mrl, y0 = fy - 1 - mrl;
+  const int corner = av[0], pA = av[1], pAR = av[2], pL = av[3], pBL = av[4], pLM = av[5], pAM = av[6];
+  // the available intervals [start, end] in unit order (empty when the prefix is 0); the MRL groups are scanned from
+  // the corner on
+  const int blS = tLU - numLeft - pBL, blE = tLU - 1 - numLeft, lS = tLU - pL, lE = tLU - 1;
+  const int lmS = C - pLM, lmE = C - 1, amS = C + 1, amE = C + pAM;
+  const int aS = C + 1 + aM, aE = C + aM + pA, arS = C + 1 + aM + numAbove, arE = C + aM + numAbove + pAR;
+  int firstAvail = totalUnits;
+  if( pAR > 0 ) firstAvail = arS;
+  if( pA > 0 ) firstAvail = aS;
+  if( pAM > 0 ) firstAvail = amS;
+  if( corner ) firstAvail = C;
+  if( pLM > 0 ) firstAvail = lmS;
+  if( pL > 0 ) firstAvail = lS;
+  if( pBL > 0 ) firstAvail = blS;
+  if( firstAvail >= totalUnits )
+  {
+    return false;
+  }
+  const int u = idx <= cLen ? C : top ? C + 1 + ( idx - 1 - cLen ) / uW : C - 1 - ( idx - 1 - cLen ) / uH;
+  int pm = -1;   // the nearest available unit at or before u
+  if( pBL > 0 && blS <= u ) pm = std::max( pm, std::min( u, blE ) );
+  if( pL > 0 && lS <= u ) pm = std::max( pm, std::min( u, lE ) );
+  if( pLM > 0 && lmS <= u ) pm = std::max( pm, std::min( u, lmE ) );
+  if( corner && C <= u ) pm = std::max( pm, C );
+  if( pAM > 0 && amS <= u ) pm = std::max( pm, std::min( u, amE ) );
+  if( pA > 0 && aS <= u ) pm = std::max( pm, std::min( u, aE ) );
+  if( pAR > 0 && arS <= u ) pm = std::max( pm, std::min( u, arE ) );
+  if( pm == u )   // available: its own sample
+  {
+    sx = top ? x0 + idx : x0;
+    sy = top ? y0 : y0 + idx;
+    return true;
+  }
+  // the last sample of the unit before (in unit order), or the first sample of the first available unit
+  const bool before = pm >= 0;
+  const int  s      = before ? pm : firstAvail;
+  if( s == C )
+  {
+    sx = before ? x0 + cLen : x0;
+    sy = before ? y0 : y0 + cLen;
+  }
+  else if( s > C )
+  {
+    sx = x0 + ( before ? ( s - C ) * uW + cLen : ( s - C - 1 ) * uW + 1 + cLen );
+    sy = y0;
+  }
+  else
+  {
+    sx = x0;
+    sy = y0 + ( before ? ( C - s - 1 ) * uH + 1 + cLen : ( C - s ) * uH + cLen );
+  }
+  return true;
+}
+
+// the sample entry idx of the top or left arm of reference line ln of block t takes (false: the mid-level value; the
+// kernels' copy is intra_common.glsl's refSource): xFillReferenceSamples at the block with arms of 8x its size, or for
+// an ISP sub-partition initIntraPatternChTypeISP: the first one fills the CU's references with arms of twice the CU's
+// size; a later one takes the CU's arm along the split shifted by its offset in the CU (the CPU shifts its buffer by
+// each sub-partition) where that side of it is available (Tu::ispSide; uniform along the CU, whose left column / above
+// row is decoded before it), else the first sample of the row / column it borders, and the other arm from the row above
+// / column left of it (the previous sub-partition), its last sample repeated; the corner is the shifted arm's entry 0
+bool refSource( const Tu& t, int ln, bool top, int idx, int& sx, int& sy )
+{
+  if( !t.isp )
+  {
+    return fillSource( t.x, t.y, t.w, t.h, t.w << 3, t.h << 3, t.mrl + ln, t.unitW, t.unitH, t.avail[ln], top, idx, sx, sy );
+  }
+  const bool hor = t.isp == HOR_INTRA_SUBPARTITIONS;
+  const int  off = hor ? t.y - t.cuY : t.regX - t.cuX;
+  auto cuFill = [&]( bool cuTop, int cuIdx )
+  {
+    return fillSource( t.cuX, t.cuY, t.cuW, t.cuH, 2 * t.cuW, 2 * t.cuH, 0, t.unitW, t.unitH, t.avail[0], cuTop, cuIdx, sx, sy );
+  };
+  if( off == 0 )
+  {
+    return cuFill( top, idx );
+  }
+  const bool shiftedArm = hor ? !top : top;
+  if( shiftedArm || idx == 0 )
+  {
+    if( t.ispSide )
+    {
+      return cuFill( !hor, ( shiftedArm ? idx : 0 ) + off );
+    }
+    sx = hor ? t.regX : t.regX - 1;
+    sy = hor ? t.y - 1 : t.y;
+    return true;
+  }
+  const int j = std::min( idx, hor ? t.regW : t.h ) - 1;
+  sx = hor ? t.regX + j : t.regX - 1;
+  sy = hor ? t.y - 1 : t.y + j;
+  return true;
+}
 
 // layout shared with intra_rec.comp (struct Params, std430)
 struct Params
@@ -292,6 +407,7 @@ struct GpuIntraRec::Impl
   std::vector<int16_t>        cpuPred, cpuResi;   // verification only
   size_t                      numSamples = 0;     // samples of the recorded blocks
   bool                        lmcsUsed = false;   // a block of the picture reads the LMCS tables
+  int                         lastIspLuma = -1;   // the record of the last ISP luma sub-partition (Tu::ispPrev)
   std::string                 unsupportedWhy;
   int                         poc = 0;
   bool                        on = false;
@@ -402,7 +518,6 @@ bool GpuIntraRec::supported( const Slice& slice, std::string& why )
   else if( sps.getSpsRangeExtension().getExtendedPrecisionProcessingFlag() )               why = "extended precision";
   else if( sps.getUseColorTrans() )                                                       why = "ACT";
   else if( sps.getNumPredSigns() > 0 )                                                    why = "sign prediction";
-  else if( sps.getUseISP() )                                                              why = "ISP";
   else if( sps.getUseTmrl() )                                                             why = "TMRL";
   else if( sps.getUseLMChroma() || sps.getUseCcpMerge() || sps.getUseDdCcpFusion() || sps.getUseBvgCccm() ) why = "cross-component prediction";
   else if( sps.getUseChromaReordering() || sps.getUseIntraDBV() )                         why = "chroma reordering / DBV";
@@ -424,6 +539,7 @@ void GpuIntraRec::beginPicture( const CodingStructure& cs )
   m.cpuResi.clear();
   m.numSamples = 0;
   m.lmcsUsed   = false;
+  m.lastIspLuma = -1;
   m.unsupportedWhy.clear();
   m.poc = cs.slice->getPOC();
   std::string why;
@@ -465,7 +581,7 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
   const char* why = nullptr;
   if( !CU::isIntra( cu ) )                                          why = "not intra";
   else if( !isLuma( compID ) && PU::isMIP( pu, chType ) )           why = "chroma MIP (4:4:4)";
-  else if( cu.ispMode )                                             why = "ISP";
+  else if( cu.ispMode && ipa.multiRefIndex )                        why = "ISP with MRL";
   // LFNST / NSPT of MIP blocks select their kernel by a DIMD mode the CPU derives from the MIP prediction
   else if( cu.mipFlag && cu.lfnstIdx )                              why = "LFNST of MIP";
   // transform skip with the regular residual coding is dequantized like a transform block (DepQuant::dequant)
@@ -483,7 +599,8 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
   else if( sps.getScalingListFlag() )                               why = "scaling lists";
   else if( sps.getSpsRangeExtension().getExtendedPrecisionProcessingFlag() ) why = "extended precision";
   else if( sps.getNumPredSigns() > 0 )                              why = "sign prediction";
-  else if( area.width < 2 || area.height < 2 || area.width > 128 || area.height > 128 ) why = "block size";
+  // ISP splits luma into sub-partitions down to 1 x 4 / 4 x 1
+  else if( ( ( area.width < 2 || area.height < 2 ) && !( cu.ispMode && isLuma( compID ) ) ) || area.width > 128 || area.height > 128 ) why = "block size";
   else if( ( area.width & ( area.width - 1 ) ) || ( area.height & ( area.height - 1 ) ) ) why = "block size not a power of 2";
   if( why )
   {
@@ -513,10 +630,38 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
   // MRL (luma): the reference line, the fusion line is the next one; xPredIntraAng turns the bilateral filter off
   // for it, the DC prediction (MRL excludes planar) keeps it
   t.mrl = ipa.multiRefIndex;
-  t.bf = 0;
-  if( compID == COMPONENT_Y && sps.getUseIntraPredBf() && slice.isIntra() && !( t.mrl && dirMode > DC_IDX ) )
+  // ISP (luma; DecCu::xIntraRecBlk, IntraPrediction::initIntraPatternChTypeISP): the CU, whose references the first
+  // sub-partition fills and the later ones shift; the prediction region, which for vertical sub-partitions 1 or 2 wide
+  // is 4 wide and shared (CU::isPredRegDiffFromTB, adjustPredArea); and the previous sub-partition, which the
+  // scheduling chains to, as the 4x4 owner units cannot tell sub-partitions 1 or 2 wide or high apart
+  t.isp     = 0;
+  t.regX    = area.x;
+  t.regW    = area.width;
+  t.ispPrev = -1;
+  if( cu.ispMode && isLuma( compID ) )
   {
-    const int W = area.width, H = area.height, qpY = cu.qp;
+    const CompArea& cuArea = cu.blocks[COMPONENT_Y];
+    t.isp = cu.ispMode;   // HOR_INTRA_SUBPARTITIONS 1, VER_INTRA_SUBPARTITIONS 2
+    t.cuX = cuArea.x;
+    t.cuY = cuArea.y;
+    t.cuW = cuArea.width;
+    t.cuH = cuArea.height;
+    if( CU::isPredRegDiffFromTB( cu, compID ) )
+    {
+      t.regX = cuArea.x + ( area.x - cuArea.x ) / PRED_REG_MIN_WIDTH * PRED_REG_MIN_WIDTH;
+      t.regW = std::max<int>( PRED_REG_MIN_WIDTH, area.width );
+    }
+    if( !CU::isISPFirst( cu, area, compID ) )
+    {
+      t.ispPrev = m.lastIspLuma;
+    }
+    m.lastIspLuma = (int) m.rec.size();
+  }
+  t.bf = 0;
+  if( compID == COMPONENT_Y && sps.getUseIntraPredBf() && slice.isIntra() && !( ( t.mrl || t.isp ) && dirMode > DC_IDX ) )
+  {
+    // checkBfApplication on the predicted block (an ISP prediction region); xPredIntraAng turns the filter off for ISP
+    const int W = t.regW, H = area.height, qpY = cu.qp;
     bool apply = qpY > 17 && W <= 128 && H <= 128 && ( W & ( W - 1 ) ) == 0 && ( H & ( H - 1 ) ) == 0 && W >= 4 && H >= 4;
     apply = apply && W * H > 16 && W * H < 1024 && std::abs( floorLog2( W ) - floorLog2( H ) ) <= 2;
     if( dirMode > DC_IDX )
@@ -527,7 +672,9 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
     apply = apply && m.sh->bif->m_tuSizeFactor[0][std::min( floorLog2( W ), 7 ) * 8 + std::min( floorLog2( H ), 7 )] != 0;
     if( apply )
     {
-      if( area.pos() != cu.blocks[COMPONENT_Y].pos() || area.size() != cu.blocks[COMPONENT_Y].size() )
+      // bilateralFilterPredDiamond5x5Clip pads at the CU, which ISP sub-partitions reproduce (Tu::isp); other blocks
+      // smaller than their CU are not supported
+      if( !t.isp && ( area.pos() != cu.blocks[COMPONENT_Y].pos() || area.size() != cu.blocks[COMPONENT_Y].size() ) )
       {
         unsupported( "intra bilateral filter of a split CU" );
         return;
@@ -620,12 +767,25 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
     int trTypeHor, trTypeVer;
     if( !m.trQuant->getInvTransformTypes( tu, resiComp, trTypeHor, trTypeVer ) )
     {
-      if( !cu.lfnstIdx )
+      if( area.width == 1 || area.height == 1 )   // xIT's 1-D transform (ISP sub-partitions): one stage along the block
       {
-        unsupported( "a 1-D transform" );
+        t.mtxV = area.width == 1 ? m.sh->trOffset[trTypeVer][floorLog2( area.height ) - 1] : 0;
+        t.mtxH = area.height == 1 ? m.sh->trOffset[trTypeHor][floorLog2( area.width ) - 1] : 0;
+        if( t.mtxV < 0 || t.mtxH < 0 )
+        {
+          unsupported( "a transform type without a matrix of this size" );
+          return;
+        }
+      }
+      else if( !cu.lfnstIdx )
+      {
+        unsupported( "a transform the GPU lacks" );
         return;
       }
-      t.precomputed = PRECOMPUTED_RESIDUAL;
+      else
+      {
+        t.precomputed = PRECOMPUTED_RESIDUAL;
+      }
     }
     else
     {
@@ -917,7 +1077,8 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
   // dependencies: the blocks owning a sample a block reads - geometry, decoding order and syntax only. Per reference
   // line: the availability the CPU sees (corner flag, available prefix of each unit group), the highest top / left
   // index the prediction can read (a superset), then for each sample in that range its owner, or for an unavailable
-  // sample the owner of its padding source (the same rule as the kernel's fill)
+  // sample the owner of its padding source (refSource, the kernel's fill rule); an ISP sub-partition also depends on
+  // the previous one
   const int numTus = (int) m.rec.size();
   std::vector<std::vector<int>> deps( numTus );
   {
@@ -937,16 +1098,37 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
       };
       const int availComp = t.comp == 0 ? 0 : 1;
       auto avail = [&]( int x, int y ) { const int a = own( availComp, x, y ); return a >= 0 && a < i; };
-      const int numAbove = std::max( t.w / t.unitW, 1 ), numLeft = std::max( t.h / t.unitH, 1 );
-      const int tAU = ( t.w << 3 ) / t.unitW, tLU = ( t.h << 3 ) / t.unitH;
+      auto addOwner = [&]( int sx, int sy )
+      {
+        const int o = own( t.comp, sx, sy );
+        if( o >= 0 && o < i && mark[o] != i )
+        {
+          mark[o] = i;
+          deps[i].push_back( o );
+        }
+      };
       memset( t.avail, 0, sizeof( t.avail ) );
       memset( t.readMax, 0, sizeof( t.readMax ) );
       memset( t.bfAvail, 0, sizeof( t.bfAvail ) );
+      t.ispSide = 0;
+      // the area the references are filled for: the block with arms of 8x its size, for ISP the CU with arms of twice
+      // its size; the prediction's arm lengths (m_topRefLength / m_leftRefLength): 8x the block, for ISP the CU's
+      // size plus the prediction region's
+      const bool isp = t.isp != 0;
+      const int  fx = isp ? t.cuX : t.x, fy = isp ? t.cuY : t.y, fw = isp ? t.cuW : t.w, fh = isp ? t.cuH : t.h;
+      const int  predSize = isp ? 2 * t.cuW : t.w << 3, predHSize = isp ? 2 * t.cuH : t.h << 3;
+      const int  numAbove = std::max( fw / t.unitW, 1 ), numLeft = std::max( fh / t.unitH, 1 );
+      const int  tAU = predSize / t.unitW, tLU = predHSize / t.unitH;
+      const int  W = t.regW, H = t.h, topLen = isp ? t.cuW + W : W << 3, leftLen = isp ? t.cuH + H : H << 3;
+      if( isp )   // the side of the sub-partition along the split (initIntraPatternChTypeISP's isLeftAvail / isAboveAvail)
+      {
+        t.ispSide = ( t.isp == HOR_INTRA_SUBPARTITIONS ? avail( t.cuX - 1, t.y ) : avail( t.regX, t.cuY - 1 ) ) ? 1 : 0;
+      }
       for( int ln = 0; ln <= ( t.fusion ? 1 : 0 ); ln++ )
       {
         const int mrl = t.mrl + ln;   // the reference line (multiRefIdx; the fusion line is the next one)
         // the read range: the main line (multiRefIdx k = t.mrl), or the fusion line (k + 1, non-integer slopes)
-        const int W = t.w, H = t.h, rf = t.refFilter ? 1 : 0;
+        const int rf = t.refFilter ? 1 : 0;
         int topMax, leftMax;
         if( t.dirMode == PLANAR_IDX )   // never with MRL; xPredIntraPlanar reads entries 1 .. w + 1 anyway
         {
@@ -961,7 +1143,7 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
         else
         {
           const bool ver = t.isModeVer != 0;
-          const int  w = ver ? W : H, h = ver ? H : W, refLength = 8 * w, sideLength = 8 * h;
+          const int  w = ver ? W : H, h = ver ? H : W, refLength = ver ? topLen : leftLen, sideLength = ver ? leftLen : topLen;
           const int  angle = t.intraPredAngle;
           int mainMax, sideMax;
           if( ln == 0 )   // xPredIntraAng reads refMain + multiRefIdx from deltaPos = angle * (1 + multiRefIdx) on
@@ -1006,161 +1188,88 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
           topMax  = ver ? mainMax : sideMax;
           leftMax = ver ? sideMax : mainMax;
         }
-        if( t.bf == 2 && ln == 0 )   // the filter's gate: the texture of the whole reference arrays (never with MRL)
+        if( t.bf == 2 && ln == 0 )   // the filter's gate: the texture of the whole reference arrays (never with MRL / ISP)
         {
-          topMax  = 8 * W;
-          leftMax = 8 * H;
+          topMax  = topLen;
+          leftMax = leftLen;
         }
-        t.readMax[ln][0] = std::max( mrl, std::min( topMax, 8 * W + mrl ) );
-        t.readMax[ln][1] = std::max( mrl, std::min( leftMax, 8 * H + mrl ) );
+        // never beyond the arms (the ISP prediction reads only within them; the copies beyond are never read)
+        t.readMax[ln][0] = std::max( mrl, std::min( topMax, topLen + mrl ) );
+        t.readMax[ln][1] = std::max( mrl, std::min( leftMax, leftLen + mrl ) );
 
-        const int x0 = t.x - 1 - mrl, y0 = t.y - 1 - mrl;
-        // MRL units (xFillReferenceSamples with JVET_Y0116): a line beyond the first unit gets lM units on the left
-        // and aM above between the corner and the left / above units; the corner unit keeps the samples up to entry
-        // cLen of both arms. Unit order: below-left and left (bottom-up), left MRL, the corner C, above MRL, above,
-        // above-right.
-        const int lM = mrl / t.unitH, aM = mrl / t.unitW, cLen = mrl - lM * t.unitH, C = tLU + lM;
-        const int totalUnits = tAU + tLU + 1 + lM + aM;
-        int* av = t.avail[ln];
         // availability: the corner flag and the available prefix of each unit group (in the CPU's scan direction:
-        // the MRL groups from the corner on), scanned only over the units the read range overlaps (at least one: a
-        // group's first unit decides whether any of it is available). Units beyond the range change neither a sample
-        // in range nor its padding source: those come from the nearest available unit before it in the CPU's unit
-        // order (an interval end, or a group's fixed start) or from the first available unit, whose position only
-        // depends on whether its group's prefix is 0.
-        const int topMaxL = t.readMax[ln][0], leftMaxL = t.readMax[ln][1];
-        const int unitsTop  = topMaxL >= 1 + mrl ? ( topMaxL - 1 - mrl ) / t.unitW + 1 : 0;
-        const int unitsLeft = leftMaxL >= 1 + mrl ? ( leftMaxL - 1 - mrl ) / t.unitH + 1 : 0;
+        // the MRL groups from the corner on). Without ISP the groups are scanned only over the units the read range
+        // overlaps (at least one: a group's first unit decides whether any of it is available): units beyond the
+        // range change neither a sample in range nor its padding source, which comes from the nearest available unit
+        // before it in the CPU's unit order (an interval end, or a group's fixed start) or from the first available
+        // unit, whose position only depends on whether its group's prefix is 0. ISP sub-partitions read the CU's
+        // arms at their offset: those groups are scanned whole.
+        const int x0 = fx - 1 - mrl, y0 = fy - 1 - mrl;
+        const int lM = mrl / t.unitH, aM = mrl / t.unitW;
+        int*      av = t.avail[ln];
+        const int unitsTop  = isp ? tAU : t.readMax[ln][0] >= 1 + mrl ? ( t.readMax[ln][0] - 1 - mrl ) / t.unitW + 1 : 0;
+        const int unitsLeft = isp ? tLU : t.readMax[ln][1] >= 1 + mrl ? ( t.readMax[ln][1] - 1 - mrl ) / t.unitH + 1 : 0;
         const int limA  = std::max( 1, std::min( numAbove, unitsTop ) );
         const int limAR = std::max( 1, std::min( tAU - numAbove, unitsTop - numAbove ) );
         const int limL  = std::max( 1, std::min( numLeft, unitsLeft ) );
         const int limBL = std::max( 1, std::min( tLU - numLeft, unitsLeft - numLeft ) );
         av[0] = avail( x0, y0 ) ? 1 : 0;
         int k;
-        for( k = 0; k < limA && avail( t.x + k * t.unitW, y0 ); k++ ) {}
+        for( k = 0; k < limA && avail( fx + k * t.unitW, y0 ); k++ ) {}
         av[1] = k;
-        for( k = 0; k < limAR && avail( t.x + t.w - 1 + t.unitW + k * t.unitW, y0 ); k++ ) {}
+        for( k = 0; k < limAR && avail( fx + fw - 1 + t.unitW + k * t.unitW, y0 ); k++ ) {}
         av[2] = k;
-        for( k = 0; k < limL && avail( x0, t.y + k * t.unitH ); k++ ) {}
+        for( k = 0; k < limL && avail( x0, fy + k * t.unitH ); k++ ) {}
         av[3] = k;
-        for( k = 0; k < limBL && avail( x0, t.y + t.h - 1 + t.unitH + k * t.unitH ); k++ ) {}
+        for( k = 0; k < limBL && avail( x0, fy + fh - 1 + t.unitH + k * t.unitH ); k++ ) {}
         av[4] = k;
-        for( k = 0; k < lM && avail( x0, t.y - lM * t.unitH + k * t.unitH ); k++ ) {}   // left MRL, downwards
+        for( k = 0; k < lM && avail( x0, fy - lM * t.unitH + k * t.unitH ); k++ ) {}   // left MRL, downwards
         av[5] = k;
-        for( k = 0; k < aM && avail( t.x - aM * t.unitW + k * t.unitW, y0 ); k++ ) {}   // above MRL, rightwards
+        for( k = 0; k < aM && avail( fx - aM * t.unitW + k * t.unitW, y0 ); k++ ) {}   // above MRL, rightwards
         av[6] = k;
 
         if( t.bf && ln == 0 )   // the bilateral filter's neighbours (rows y-2, y-1; columns x-2, x-1)
         {
-          auto addOwner = [&]( int sx, int sy )
-          {
-            const int o = own( t.comp, sx, sy );
-            if( o >= 0 && o < i && mark[o] != i )
-            {
-              mark[o] = i;
-              deps[i].push_back( o );
-            }
-          };
-          // its padding: line 0's corner and above / left units (bilateralFilterPredDiamond5x5Clip), also with MRL
+          // its padding (bilateralFilterPredDiamond5x5Clip): line 0's corner and above / left units of the CU (the
+          // block, for ISP the CU, whose origin it pads at), also with MRL; a superset of the samples it copies
           int bfA, bfL;
-          for( bfA = 0; bfA < numAbove && avail( t.x + bfA * t.unitW, t.y - 1 ); bfA++ ) {}
-          for( bfL = 0; bfL < numLeft && avail( t.x - 1, t.y + bfL * t.unitH ); bfL++ ) {}
-          t.bfAvail[0] = avail( t.x - 1, t.y - 1 ) ? 1 : 0;
+          for( bfA = 0; bfA < numAbove && avail( fx + bfA * t.unitW, fy - 1 ); bfA++ ) {}
+          for( bfL = 0; bfL < numLeft && avail( fx - 1, fy + bfL * t.unitH ); bfL++ ) {}
+          t.bfAvail[0] = avail( fx - 1, fy - 1 ) ? 1 : 0;
           t.bfAvail[1] = bfA;
           t.bfAvail[2] = bfL;
           if( t.bfAvail[0] )
           {
-            addOwner( t.x - 2, t.y - 2 ); addOwner( t.x - 1, t.y - 2 ); addOwner( t.x - 2, t.y - 1 ); addOwner( t.x - 1, t.y - 1 );
+            addOwner( fx - 2, fy - 2 ); addOwner( fx - 1, fy - 2 ); addOwner( fx - 2, fy - 1 ); addOwner( fx - 1, fy - 1 );
           }
-          for( int x = 0; x < bfA * t.unitW && x < t.w; x++ )
+          for( int x = 0; x < bfA * t.unitW; x++ )
           {
-            addOwner( t.x + x, t.y - 2 );
-            addOwner( t.x + x, t.y - 1 );
+            addOwner( fx + x, fy - 2 );
+            addOwner( fx + x, fy - 1 );
           }
-          for( int y = 0; y < bfL * t.unitH && y < t.h; y++ )
+          for( int y = 0; y < bfL * t.unitH; y++ )
           {
-            addOwner( t.x - 2, t.y + y );
-            addOwner( t.x - 1, t.y + y );
+            addOwner( fx - 2, fy + y );
+            addOwner( fx - 1, fy + y );
           }
         }
-        // the owners of the samples in range (the kernel's fill rule): the available unit intervals in unit order
-        const int corner = av[0], pA = av[1], pAR = av[2], pL = av[3], pBL = av[4], pLM = av[5], pAM = av[6];
-        const int blS = tLU - numLeft - pBL, blE = tLU - 1 - numLeft, lS = tLU - pL, lE = tLU - 1;
-        const int lmS = C - pLM, lmE = C - 1, amS = C + 1, amE = C + pAM;
-        const int aS = C + 1 + aM, aE = C + aM + pA, arS = C + 1 + aM + numAbove, arE = C + aM + numAbove + pAR;
-        int firstAvail = totalUnits;
-        if( pAR > 0 ) firstAvail = arS;
-        if( pA > 0 ) firstAvail = aS;
-        if( pAM > 0 ) firstAvail = amS;
-        if( corner ) firstAvail = C;
-        if( pLM > 0 ) firstAvail = lmS;
-        if( pL > 0 ) firstAvail = lS;
-        if( pBL > 0 ) firstAvail = blS;
-        if( firstAvail >= totalUnits )
-        {
-          continue;   // no neighbour: the DC value
-        }
+        // the owners of the samples in range (the kernel's fill rule)
         for( int side = 0; side < 2; side++ )
         {
-          const bool top = side == 0;
-          int lastKey = -1;   // the owner unit (available sample) or the availability unit (padding) just added
           for( int idx = 0; idx <= t.readMax[ln][side]; idx++ )
           {
-            const int u = idx <= cLen ? C : top ? C + 1 + ( idx - 1 - cLen ) / t.unitW : C - 1 - ( idx - 1 - cLen ) / t.unitH;
-            int pm = -1;
-            if( pBL > 0 && blS <= u ) pm = std::max( pm, std::min( u, blE ) );
-            if( pL > 0 && lS <= u ) pm = std::max( pm, std::min( u, lE ) );
-            if( pLM > 0 && lmS <= u ) pm = std::max( pm, std::min( u, lmE ) );
-            if( corner && C <= u ) pm = std::max( pm, C );
-            if( pAM > 0 && amS <= u ) pm = std::max( pm, std::min( u, amE ) );
-            if( pA > 0 && aS <= u ) pm = std::max( pm, std::min( u, aE ) );
-            if( pAR > 0 && arS <= u ) pm = std::max( pm, std::min( u, arE ) );
             int sx, sy;
-            if( pm == u )
+            if( refSource( t, ln, side == 0, idx, sx, sy ) )
             {
-              sx = top ? x0 + idx : x0;
-              sy = top ? y0 : y0 + idx;
-              const int key = ( ( sy >> P.unitLog2Y[ch] ) * P.ownerW[ch] + ( sx >> P.unitLog2X[ch] ) ) * 2;
-              if( sx >= 0 && sy >= 0 && key == lastKey )
-              {
-                continue;
-              }
-              lastKey = sx >= 0 && sy >= 0 ? key : -1;
-            }
-            else
-            {
-              if( lastKey == u * 2 + 1 )   // the same padding source as the sample before
-              {
-                continue;
-              }
-              lastKey = u * 2 + 1;
-              // the last sample of the unit before (in unit order), or the first sample of the first available unit
-              const bool before = pm >= 0;
-              const int  s = before ? pm : firstAvail;
-              if( s == C )
-              {
-                sx = before ? x0 + cLen : x0;
-                sy = before ? y0 : y0 + cLen;
-              }
-              else if( s > C )
-              {
-                sx = x0 + ( before ? ( s - C ) * t.unitW + cLen : ( s - C - 1 ) * t.unitW + 1 + cLen );
-                sy = y0;
-              }
-              else
-              {
-                sx = x0;
-                sy = y0 + ( before ? ( C - s - 1 ) * t.unitH + 1 + cLen : ( C - s ) * t.unitH + cLen );
-              }
-            }
-            const int o = own( t.comp, sx, sy );
-            if( o >= 0 && o < i && mark[o] != i )
-            {
-              mark[o] = i;
-              deps[i].push_back( o );
+              addOwner( sx, sy );
             }
           }
         }
+      }
+      if( t.ispPrev >= 0 && mark[t.ispPrev] != i )   // the chain of an ISP CU's sub-partitions
+      {
+        mark[t.ispPrev] = i;
+        deps[i].push_back( t.ispPrev );
       }
       if( t.lmcs & LMCS_CHROMA_SCALE )   // the luma column left of and the row above the CU, clipped to the picture
       {
@@ -1384,7 +1493,7 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
       gd.erase( std::unique( gd.begin(), gd.end() ), gd.end() );
       std::sort( dependents[i].begin(), dependents[i].end() );
       if( memcmp( h.avail, g.avail, sizeof( h.avail ) ) || memcmp( h.readMax, g.readMax, sizeof( h.readMax ) )
-          || memcmp( h.bfAvail, g.bfAvail, sizeof( h.bfAvail ) ) || gd != dependents[i] )
+          || memcmp( h.bfAvail, g.bfAvail, sizeof( h.bfAvail ) ) || h.ispSide != g.ispSide || gd != dependents[i] )
       {
         first = "scheduling data of block " + std::to_string( i ) + " differ (availability, read ranges or dependents)";
       }

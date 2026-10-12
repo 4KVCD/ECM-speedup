@@ -1380,7 +1380,15 @@ void DecCu::xIntraRecBlk( TransformUnit& tu, const ComponentID compID )
   if( m_gpuDeriveOnly )   // the GPU reconstructs the picture: the block's parameters only
   {
     m_gpuIntraRec->record( tu, compID, m_pcIntraPred->ipaSnapshot(), QpParam( tu, compID ), nullptr, nullptr );
-    cs.setDecomp( area );
+    // as below: an ISP CU's luma is marked decoded as a whole at its first sub-partition
+    if( !tu.cu->ispMode || !isLuma( compID ) )
+    {
+      cs.setDecomp( area );
+    }
+    else if( CU::isISPFirst( *tu.cu, tu.blocks[compID], compID ) )
+    {
+      cs.setDecomp( tu.cu->blocks[compID] );
+    }
     return;
   }
 #endif

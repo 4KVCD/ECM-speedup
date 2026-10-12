@@ -4,7 +4,8 @@
 // (Quant::dequant, or DepQuant's dequantBlock with dependent quantization, either with QCS; without scaling lists)
 // folded into the first inverse transform stage, then the second stage (TrQuant::xIT: two clipped matrix stages with
 // the matrices the host reads back from xIT's transform functions, DCT-II or the MTS types, whose integer sums and
-// single rounding equal those of the functions, butterflies included), or with transform skip the dequantized levels
+// single rounding equal those of the functions, butterflies included; one stage for the 1-D transforms of ISP
+// sub-partitions 1 wide or high), or with transform skip the dequantized levels
 // themselves (BDPCM: the host accumulates the levels first). With LFNST the host gives the dequantized, inverse-LFNST'ed
 // coefficients, with NSPT the residual itself (Tu::precomputed). The result
 // goes to the residual buffer intra_rec adds to its prediction, with joint CbCr together with the other chroma
@@ -125,6 +126,26 @@ void main()
         {
           resi.v[derivedOffset + i] = int16_t( jccrDerived( t.jccr, r ) );
         }
+      }
+      continue;
+    }
+    // TrQuant::xIT's 1-D transform (ISP sub-partitions 1 wide or high): one stage along the block, shift_2nd + 1,
+    // over the coefficients k < nzRows (a column) or k < nzCols (a row), stored at k either way
+    if( W == 1 || H == 1 )
+    {
+      const int off = W == 1 ? t.mtxV : t.mtxH, nz = W == 1 ? nzR : nzC, shift = t.shift2 + 1;
+      for( int i = lid; i < N; i += NT )
+      {
+        int sum = 0;
+        for( int k = 0; k < nz; k++ )
+        {
+          const int q = cf.v[t.coeffOffset + k];
+          if( q != 0 )
+          {
+            sum += mt.v[off + k * N + i] * ( t.precomputed != 0 ? q : dequant( t, q, addDq, mt, P.qcsOffset ) );
+          }
+        }
+        resi.v[codedOffset + i] = int16_t( clip3i( t.trMin, t.trMax, ( sum + ( 1 << ( shift - 1 ) ) ) >> shift ) );
       }
       continue;
     }

@@ -2,7 +2,7 @@
 #ifndef INTRA_COMMON_GLSL
 #define INTRA_COMMON_GLSL
 
-// one transform block of one component (75 int32, layout shared with GpuIntraRec.cpp)
+// one transform block of one component (84 int32, layout shared with GpuIntraRec.cpp)
 struct Tu
 {
   int comp, x, y, w, h;
@@ -37,8 +37,118 @@ struct Tu
   int precomputed;      // the host's coefficients are 1: dequantized and inverse-LFNST'ed, 2: the residual (NSPT)
   int mrl;              // multiRefIdx: the reference line (0, 1, 3, 5, 7, 12; luma)
   int bfAvail[3];       // the bilateral filter's padding: the corner flag, the available above / left units (line 0)
+  int isp;              // ISP sub-partition (luma): 1 horizontal split, 2 vertical split (0: none)
+  int cuX, cuY, cuW, cuH;   // ISP: the CU (its references, the bilateral filter's padding origin)
+  int regX, regW;       // the predicted region: the block, or the 4-wide region of ISP sub-partitions 1 or 2 wide
+  int ispSide;          // ISP: the side along the split is available (the CU's arm is shifted, not replaced)
+  int ispPrev;          // ISP: the previous sub-partition of the CU (-1: none)
 };
 layout( buffer_reference, std430, buffer_reference_align = 4 ) buffer BufTu { Tu v[]; };
+
+// xFillReferenceSamples' rule (GpuIntraRec.cpp's fillSource): the reconstructed sample (sx, sy) whose value entry idx
+// of the top or left arm of a reference line takes, for the area (fx, fy, fw, fh) filled with arms of predSize /
+// predHSize samples from line mrl (multiRefIdx), given the availability av: the corner flag and the available prefix
+// of the above, above-right, left, below-left, left MRL and above MRL units. False where no unit is available (the
+// mid-level value). The units in the CPU's order: below-left and left (bottom-up), left MRL, the corner C, above MRL,
+// above, above-right; a line beyond the first unit has lM MRL units left of and aM above the corner unit, which keeps
+// entries 0 .. cLen of both arms (JVET-Y0116). An unavailable unit takes the last sample of the unit before it in that
+// order, units before the first available one take its first sample.
+bool fillSource( int fx, int fy, int fw, int fh, int predSize, int predHSize, int mrl, int uW, int uH, int av[7],
+                 bool top, int idx, out int sx, out int sy )
+{
+  const int tAU = predSize / uW, tLU = predHSize / uH;
+  const int lM = mrl / uH, aM = mrl / uW, cLen = mrl - lM * uH, C = tLU + lM;
+  const int totalUnits = tAU + tLU + 1 + lM + aM;
+  const int numAbove = max( fw / uW, 1 ), numLeft = max( fh / uH, 1 );
+  const int x0 = fx - 1 - mrl, y0 = fy - 1 - mrl;
+  const int corner = av[0], pA = av[1], pAR = av[2], pL = av[3], pBL = av[4], pLM = av[5], pAM = av[6];
+  // the available intervals [start, end] in unit order (empty when the prefix is 0); the MRL groups are scanned from
+  // the corner on
+  const int blS = tLU - numLeft - pBL, blE = tLU - 1 - numLeft, lS = tLU - pL, lE = tLU - 1;
+  const int lmS = C - pLM, lmE = C - 1, amS = C + 1, amE = C + pAM;
+  const int aS = C + 1 + aM, aE = C + aM + pA, arS = C + 1 + aM + numAbove, arE = C + aM + numAbove + pAR;
+  int firstAvail = totalUnits;
+  if( pAR > 0 ) firstAvail = arS;
+  if( pA > 0 ) firstAvail = aS;
+  if( pAM > 0 ) firstAvail = amS;
+  if( corner != 0 ) firstAvail = C;
+  if( pLM > 0 ) firstAvail = lmS;
+  if( pL > 0 ) firstAvail = lS;
+  if( pBL > 0 ) firstAvail = blS;
+  sx = 0;
+  sy = 0;
+  if( firstAvail >= totalUnits )
+  {
+    return false;
+  }
+  const int u = idx <= cLen ? C : top ? C + 1 + ( idx - 1 - cLen ) / uW : C - 1 - ( idx - 1 - cLen ) / uH;
+  int pm = -1;   // the nearest available unit at or before u
+  if( pBL > 0 && blS <= u ) pm = max( pm, min( u, blE ) );
+  if( pL > 0 && lS <= u ) pm = max( pm, min( u, lE ) );
+  if( pLM > 0 && lmS <= u ) pm = max( pm, min( u, lmE ) );
+  if( corner != 0 && C <= u ) pm = max( pm, C );
+  if( pAM > 0 && amS <= u ) pm = max( pm, min( u, amE ) );
+  if( pA > 0 && aS <= u ) pm = max( pm, min( u, aE ) );
+  if( pAR > 0 && arS <= u ) pm = max( pm, min( u, arE ) );
+  if( pm == u )   // available: its own sample
+  {
+    sx = top ? x0 + idx : x0;
+    sy = top ? y0 : y0 + idx;
+    return true;
+  }
+  // the last sample of the unit before (in unit order), or the first sample of the first available unit
+  const bool before = pm >= 0;
+  const int  s      = before ? pm : firstAvail;
+  if( s == C )
+  {
+    sx = before ? x0 + cLen : x0;
+    sy = before ? y0 : y0 + cLen;
+  }
+  else if( s > C )
+  {
+    sx = x0 + ( before ? ( s - C ) * uW + cLen : ( s - C - 1 ) * uW + 1 + cLen );
+    sy = y0;
+  }
+  else
+  {
+    sx = x0;
+    sy = y0 + ( before ? ( C - s - 1 ) * uH + 1 + cLen : ( C - s ) * uH + cLen );
+  }
+  return true;
+}
+
+// the sample entry idx of the top or left arm of reference line ln of block t takes (false: the mid-level value;
+// GpuIntraRec.cpp's refSource): xFillReferenceSamples at the block with arms of 8x its size, or for an ISP
+// sub-partition initIntraPatternChTypeISP: the first one fills the CU's references with arms of twice the CU's size;
+// a later one takes the CU's arm along the split shifted by its offset in the CU where that side of it is available
+// (Tu::ispSide), else the first sample of the row / column it borders, and the other arm from the row above / column
+// left of it (the previous sub-partition), its last sample repeated; the corner is the shifted arm's entry 0
+bool refSource( Tu t, int ln, bool top, int idx, out int sx, out int sy )
+{
+  if( t.isp == 0 )
+  {
+    return fillSource( t.x, t.y, t.w, t.h, t.w << 3, t.h << 3, t.mrl + ln, t.unitW, t.unitH, t.avail[ln], top, idx, sx, sy );
+  }
+  const bool hor = t.isp == 1;
+  const int  off = hor ? t.y - t.cuY : t.regX - t.cuX;
+  const bool shiftedArm = hor ? !top : top;
+  if( off == 0 || ( ( shiftedArm || idx == 0 ) && t.ispSide != 0 ) )   // from the CU's references
+  {
+    const bool cuTop = off == 0 ? top : !hor;
+    const int  cuIdx = off == 0 ? idx : ( shiftedArm ? idx : 0 ) + off;
+    return fillSource( t.cuX, t.cuY, t.cuW, t.cuH, 2 * t.cuW, 2 * t.cuH, 0, t.unitW, t.unitH, t.avail[0], cuTop, cuIdx, sx, sy );
+  }
+  if( shiftedArm || idx == 0 )
+  {
+    sx = hor ? t.regX : t.regX - 1;
+    sy = hor ? t.y - 1 : t.y;
+    return true;
+  }
+  const int j = min( idx, hor ? t.regW : t.h ) - 1;
+  sx = hor ? t.regX + j : t.regX - 1;
+  sy = hor ? t.y - 1 : t.y + j;
+  return true;
+}
 
 struct Params
 {

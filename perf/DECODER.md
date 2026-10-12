@@ -289,7 +289,18 @@ the reconstruction buffer; works in every frame-thread context):
   (refMain + multiRefIdx) with deltaPos starting at angle * (1 + multiRefIdx) and the main array's end replicated over
   (multiRefIdx << s) + 6 entries, and the bilateral filter, which xPredIntraAng turns off for MRL but the DC
   prediction keeps, pads from line 0's availability (Tu::bfAvail). MRL with non-square availability units (the CPU
-  counts the corner samples of both arms by the unit height) and TMRL stay on the CPU. GpuIntraRec::supported()
+  counts the corner samples of both arms by the unit height) and TMRL stay on the CPU; M13 adds ISP (intra
+  sub-partitions): each sub-partition is a block of its own whose references follow initIntraPatternChTypeISP - the
+  first fills the CU's references with arms of twice the CU's size, a later one shifts the CU's arm along the split by
+  its offset (where that side is available) and takes the other arm from the previous sub-partition's last row /
+  column with its last sample repeated - and whose angular arrays use the CPU's arm lengths (the CU's size plus the
+  sub-partition's); vertical sub-partitions 1 or 2 wide share the prediction of a 4-wide region, of which each keeps
+  its columns; their 1-D transforms are one stage with shift_2nd + 1 in intra_resi; the bilateral filter of planar /
+  DC sub-partitions pads at the CU's origin with the CU's units, as the CPU does, including its writes that run past
+  its block's row of iWidthExtSIMD samples into the next rows when the sub-partition is narrower than the CU; the
+  sub-partitions of a CU are chained in the scheduling, as the 4x4 owner units cannot tell sub-partitions 1 or 2
+  wide or high apart (which also made intra_deps' parallel owner writes race: the last block now wins with
+  atomicMax, as on the host). GpuIntraRec::supported()
   rejects every tool whose mode derivation or prediction reads reconstructed samples or that the kernels lack, before
   anything is skipped. All 19 regular streams now fall back to the CPU at sign prediction, the next sequence-level
   check (before M6: QCS, before M5: LMCS, before M4: dual tree); many block-level tools follow. The kernels' reference

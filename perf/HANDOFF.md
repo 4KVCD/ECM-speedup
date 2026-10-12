@@ -13,7 +13,7 @@ wall-clock gains with threads are "the easy baseline". Decoder status: single-th
 (`--GpuLoopFilter=1`: ALF, SAO, BIF, CCSAO, LF-CCCM, offset refinement on Vulkan). The user then asked for **a full
 GPU decoder in Vulkan, optimized until nothing is left** ("The GPU decoder needs to fully decode the frame on the
 GPU"; "Your first Vulkan version is going to be slow. That's OK"). That work is branch `dec-gpurecon`: intra
-reconstruction on the GPU (`--GpuRecon`), tool levels M1-M12 done and verified bit-exact; it is **not yet faster than
+reconstruction on the GPU (`--GpuRecon`), tool levels M1-M13 done and verified bit-exact; it is **not yet faster than
 the CPU decoder** (see section 8) and supports only a restricted tool set (all real CTC streams fall back to the CPU,
 first reason: sign prediction).
 
@@ -159,6 +159,11 @@ commands that combine `Remove-Item` with `//` text. `perf\gpu\crlf.ps1 <worktree
     bilateral filter), all angle signs, and MRL unit groups unavailable at the picture's edges. `enc_m12_edges.ps1`:
     `m12e_*` (64x64 / 128x64 crops via `crop.py`: many blocks at the edges) and `m12s_*` (synthetic content via
     `gen_mrl_edge.py` on which the encoder picks lines 5-12 near the top).
+  - M13 (m12's arguments plus `--ISP=1`): `m13`; its foreman streams have 1312 ISP sub-partitions (both splits,
+    1x16 to 32x4, 114 in shared 4-wide regions, 93 with a coded 1-D transform, 39 with the side along the split
+    unavailable, planar / DC / all angle classes, PDPC). `m13c_0..47` (`enc_crops.py m13c 48 13 <m13 args>`, 64x64
+    crops): 122 bilateral filters of ISP sub-partitions with partial padding, 32 of them with the CPU's writes past the
+    row (counted with a temporary print).
   - `fx_wpp_park720`, `fx_tiles_park720` (m11's arguments plus `--WaveFrontSynchro=1`, resp. `--EnablePicPartitioning=1
     --TileColumnWidthArray=3 --TileRowHeightArray=2 --RasterScanSlices=1 --RasterSliceSizes=100`: one slice of 4x3
     tiles): must fall back to the CPU ("wavefronts", "tiles").
@@ -185,6 +190,7 @@ commands that combine `Remove-Item` with `//` text. `perf\gpu\crlf.ps1 <worktree
 | `enc_m1.ps1`, `enc_set.ps1`, `enc_long.ps1` | test stream encoding (section 5) |
 | `gen_screen.py <out.yuv> [w h frames]` | synthetic screen-like 4:2:0 content (transform skip / BDPCM test streams) |
 | `crop.py`, `gen_mrl_edge.py`, `enc_m12_edges.ps1` | small crops of the test sequences and synthetic MRL content; the M12 edge-case streams |
+| `enc_crops.py <prefix> <count> <seed> [args]` | test streams of random 64x64 crops (many blocks at the picture's edges), e.g. the M13 crops |
 | `qa.ps1` | the full QA before a push of `dec` (3 builds, 12 decoder modes on the 19 streams, encoder suite); paths point at wt-dec |
 | `buildgpu.ps1`, `cleanlibs.ps1`, `cleanlibs_gr.ps1`, `crlf.ps1` | build helpers (paths: wt-dec / wt-gr) |
 
@@ -216,7 +222,7 @@ everything that depends on samples runs on the GPU, implemented line by line aft
 TrQuant.cpp, BilateralFilter.cpp). `supported()` must reject every tool whose mode derivation or prediction reads
 reconstructed samples or that the kernels lack.
 
-Files: `source/Lib/GpuLib/GpuIntraRec.{h,cpp}`, `shaders/intra_common.glsl` (Tu = 75 ints and Params layouts,
+Files: `source/Lib/GpuLib/GpuIntraRec.{h,cpp}`, `shaders/intra_common.glsl` (Tu = 84 ints and Params layouts,
 static_asserts on the host), `intra_resi.comp`, `intra_rec.comp`, `intra_deps.comp`, `scan.comp`, `VkCompute.*`
 (device with vulkanMemoryModel + optional shader clock; up to 8 queues round-robin); `DecoderLib/DecCu.cpp`
 (record calls), `DecSlice.cpp` (parse-first, derive pass, CPU fallback), `DecLib.cpp` (setGpuRecon,
@@ -238,7 +244,9 @@ the host; BDPCM blocks predict as mode 18 / 50 with the filters off). M10: MIP (
 DC mode for the read range and the bilateral filter). M11: LFNST / NSPT on the host side (Tu::precomputed: 1 the
 host's dequantized, inverse-LFNST'ed coefficients, 2 the host's residual for NSPT). M12: MRL (Tu::mrl; the MRL unit
 groups left of and above the corner in avail[line][5..6]; Tu::bfAvail, line 0's availability for the bilateral
-filter of MRL DC blocks).
+filter of MRL DC blocks). M13: ISP (Tu::isp, cuX..cuH, regX / regW the prediction region, ispSide, ispPrev the
+scheduling chain; refSource in GpuIntraRec.cpp and intra_common.glsl gives every reference entry's source sample for
+the fill and the dependencies; 1-D transforms in intra_resi).
 
 ## 8. Numbers (i7-10700 8C/16T, Win11, GCC 16.2, RTX 3070 driver 616.92)
 
@@ -261,16 +269,15 @@ Profile of a GPU-on decode (non-LTO, m2_park16, share of all samples): parsing ~
 
 1. Time 180ccabc (paired grL builds, `walls.py` with `--GpuRecon=3`, CPU vs GPU, FT8; use m3_park60).
 2. Done (2026-10-11): M4 dual tree, M5 LMCS, M6 dependent quantization and QCS, M7 joint CbCr, M8 explicit MTS,
-   M9 transform skip and BDPCM, M10 MIP, M11 LFNST / NSPT (computed by the host: move to the GPU for speed), M12 MRL.
+   M9 transform skip and BDPCM, M10 MIP, M11 LFNST / NSPT (computed by the host: move to the GPU for speed), M12 MRL,
+   M13 ISP.
    All 19 regular streams now stop at "sign prediction" (the next sequence-level check; the block-level tools of
    step 4 follow).
 3. Make the GPU path win on CPU time per picture: the derive-only pass (record during parsing or a leaner pass;
    speed up getSpatialIpm/getPURestricted, which also helps the CPU decoder), GPU behaviour with frame threads
    (8 contexts x 32 persistent workgroups oversubscribe the GPU; spinning workgroups; try fewer groups per context,
    more frame threads than cores to hide GPU waits, overlapping a picture's GPU work with the next picture's parse).
-4. More tool levels, roughly in the order CTC AI needs them: ISP (references shifted from the CU's, the
-   bilateral filter padded at the CU's origin, 4-wide prediction regions over 1- and 2-wide blocks, 1-D transforms),
-   LFNST of MIP (with the MIP prediction's DIMD mode), implicit MTS (with
+4. More tool levels, roughly in the order CTC AI needs them: LFNST of MIP (with the MIP prediction's DIMD mode), implicit MTS (with
    DIMD), TMRL (template-selected lines: GPU), sign prediction (reads reconstruction: GPU), CCLM/CCCM and the other
    cross-component tools (GPU), DIMD/TIMD/MPM sorting/chroma reordering/DBV (mode derivations that read the
    reconstruction: these have to move to the GPU too), IntraTMP/IBC, then inter pictures. Each level: new test set
@@ -297,6 +304,10 @@ Profile of a GPU-on decode (non-LTO, m2_park16, share of all samples): parsing ~
   row above, and with GDR the dirty area. Tiles, wavefronts and GDR were not rejected until 2026-10-11: a stream with
   tiles or WPP decoded wrong with the reconstruction on (test streams `fx_tiles_park720`, `fx_wpp_park720`, now
   skipped). Any new availability rule of the CPU must be mirrored or rejected.
+- The owner maps have 4x4 luma units; ISP sub-partitions 1 or 2 wide or high share them. The last block owning a
+  unit must win everywhere (intra_deps pass 0 writes with atomicMax: plain parallel writes raced), and a block
+  reading a shared unit only waits for that last owner, so the sub-partitions of a CU are chained (Tu::ispPrev;
+  without the chain every m13 picture differed).
 - Class layouts must not depend on `ECM_VULKAN`: the define reaches only the targets that link DecoderLib or GpuLib,
   not EncoderLib, and EncCu derives from DecCu. GPU members under `#if ECM_VULKAN` in DecCu made the encoder of every
   Vulkan build of dec-gpurecon crash at start-up (fixed 2026-10-11). Run the encoder suite on a Vulkan build too.
