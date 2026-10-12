@@ -310,6 +310,7 @@ constexpr int TIMD_OUT = 12;
 constexpr int MERGE_NBR_MERGE = 1;   // an intra merge CU: always, its merge parameters (its DimdOut slot)
 constexpr int MERGE_NBR_OBIC  = 2;   // an OBIC CU: always, its OBIC converted
 constexpr int MERGE_NBR_DIMD  = 3;   // a DIMD CU or an MPM CU: where its DIMD blends, its DIMD
+constexpr int MERGE_NBR_TIMD  = 4;   // a TIMD CU: where its modes blend or its mode is angular, its TIMD converted (or its DIMD)
 constexpr int MERGE_COST      = NUM_LUMA_MODE;   // uint64 per intra merge CU: the template cost of each mode
 
 // the luma samples the template predictions of CU c read (inclusive; intra_deps.comp has a copy): the reference row
@@ -1532,11 +1533,6 @@ static bool addObicNeighbours( GpuIntraRec::Impl& m, const CodingUnit& cu, Cu& c
     {
       continue;
     }
-    if( nbrs[n]->timd )   // deriveObicMode counts its TIMD modes, which the GPU's OBIC does not read
-    {
-      why = "a TIMD neighbour of OBIC";
-      return false;
-    }
     const auto rec = m.cuIndex[CHANNEL_TYPE_LUMA].find( nbrs[n] );
     if( rec == m.cuIndex[CHANNEL_TYPE_LUMA].end() )
     {
@@ -1585,9 +1581,9 @@ static TemplateUnits templateUnits( const CodingUnit& cu, const int tw, const in
 
 // an intra merge CU's record (Cu::merge, MergeHead): deriveIntraMergeCand's neighbours in its order with how each may
 // be a candidate (CU::isAValidNeighborForIntraMerge: an intra merge or an OBIC CU always, a DIMD CU or an MPM CU where
-// its DIMD blends, which the GPU derives; the others never, left out), the DIMD of MPM CUs that have it aside put to
-// use; reorderIntraMergeCand's template and the availability of its reference units; the CPU's template costs. False
-// with why set where one cannot be read
+// its DIMD blends, a TIMD CU where its modes blend or its mode is angular, which the GPU derives; the others never, left
+// out), the DIMD of MPM CUs that have it aside put to use; reorderIntraMergeCand's template and the availability of its
+// reference units; the CPU's template costs. False with why set where one cannot be read
 static bool addMergeRecord( GpuIntraRec::Impl& m, const CodingUnit& cu, Cu& c, const char*& why )
 {
 #if GPU_DIMD && JVET_AJ0146_TIMDSAD && JVET_AG0146_DIMD_ITMP_IBC && JVET_AM0074_INTRA_MERGE   // IntraPrediction's helpers
@@ -1609,14 +1605,15 @@ static bool addMergeRecord( GpuIntraRec::Impl& m, const CodingUnit& cu, Cu& c, c
   std::vector<int32_t> pairs;
   for( const CodingUnit* n: nbrs )
   {
-    if( n->timd || n->bvgDimdFlag )
+    if( n->bvgDimdFlag )
     {
-      why = "a TIMD / BVG-DIMD neighbour of intra merge";
+      why = "a BVG-DIMD neighbour of intra merge";
       return false;
     }
     // CU::isAValidNeighborForIntraMerge's "MPM" CU
-    const bool mpm = !n->bdpcmMode && !n->tmpFlag && !n->mipFlag && !n->eipFlag && !n->mdip && !n->plIdx && n->firstPU->intraDir[0] != PNN_IDX;
-    const int  cls = CU::isIBC( *n ) ? 0 : n->intraMergeMode ? MERGE_NBR_MERGE : n->obicFlag ? MERGE_NBR_OBIC : n->dimd || mpm ? MERGE_NBR_DIMD : 0;
+    const bool mpm = !n->timd && !n->bdpcmMode && !n->tmpFlag && !n->mipFlag && !n->eipFlag && !n->mdip && !n->plIdx && n->firstPU->intraDir[0] != PNN_IDX;
+    const int  cls = CU::isIBC( *n ) ? 0 : n->intraMergeMode ? MERGE_NBR_MERGE : n->obicFlag ? MERGE_NBR_OBIC
+                     : n->timd ? MERGE_NBR_TIMD : n->dimd || mpm ? MERGE_NBR_DIMD : 0;
     if( !cls )
     {
       continue;
@@ -1628,8 +1625,9 @@ static bool addMergeRecord( GpuIntraRec::Impl& m, const CodingUnit& cu, Cu& c, c
       return false;
     }
     Cu& nc = m.cus[rec->second];
-    const int kind = cls == MERGE_NBR_MERGE ? CU_MERGE : cls == MERGE_NBR_OBIC ? CU_OBIC : n->dimd ? CU_DIMD : CU_MPM;
-    if( nc.kind != kind )
+    const int kind = cls == MERGE_NBR_MERGE ? CU_MERGE : cls == MERGE_NBR_OBIC ? CU_OBIC : cls == MERGE_NBR_TIMD ? CU_TIMD
+                     : n->dimd ? CU_DIMD : CU_MPM;
+    if( nc.kind != kind || ( kind == CU_TIMD && nc.dimd < 0 ) )   // (a TIMD CU's DIMD: where its TIMD does not convert)
     {
       why = "an intra merge neighbour of a kind the GPU lacks";
       return false;

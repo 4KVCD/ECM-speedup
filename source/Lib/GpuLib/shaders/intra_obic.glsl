@@ -23,9 +23,9 @@ void obicCount( int mode, int cls, int amount )
 
 // deriveObicMode's step 4 over the neighbours of OBIC CU c, one invocation each, all invocations (ends with a barrier).
 // A DIMD CU counts its main mode, planar and its blend modes, those but the main one by their weights relative to the
-// main one's; an OBIC CU its modes, each with all the samples; an intra merge CU its modes, each with all the samples,
-// without a class (s_obicPlain); another intra CU its mode (MIP CUs, which count nothing in intra slices, are not in
-// the list)
+// main one's; a TIMD CU alike its modes; an OBIC CU its modes, each with all the samples; an intra merge CU its modes,
+// each with all the samples, without a class (s_obicPlain); another intra CU its mode (MIP CUs, which count nothing in
+// intra slices, are not in the list)
 void obicHistogram( Cu c, int lid, int NT )
 {
   for( int i = lid; i < 3 * NUM_LUMA_MODE; i += NT )
@@ -82,6 +82,24 @@ void obicHistogram( Cu c, int lid, int NT )
         if( m >= 0 && m < NUM_LUMA_MODE && d.v[o + DIMD_OUT_REL_WEIGHT + k + 2] > 0 )
         {
           atomicAdd( s_obicPlain[m], ns );
+        }
+      }
+    }
+    else if( WITH_TIMD && kind == CU_TIMD )   // its node's TimdOut (MAP131TO67 of its modes)
+    {
+      CBufI32   o    = CBufI32( P.timdOut );
+      const int base = timdOutBase( nb.cu );
+      const int mode = o.v[base + TIMD_OUT_MODE], sec = o.v[base + TIMD_OUT_SECONDARY];
+      obicCount( timdMode67( mode ), o.v[base + TIMD_OUT_LOC_DEP], ns );
+      // where it blends, its secondary mode (not the mode again) and with it its non-angular one, by their weights
+      // relative to the mode's
+      const int w0 = o.v[base + TIMD_OUT_WEIGHT], w1 = o.v[base + TIMD_OUT_WEIGHT + 1], w2 = o.v[base + TIMD_OUT_WEIGHT + 2];
+      if( o.v[base + TIMD_OUT_BLENDED] != 0 && w1 > 0 && mode != sec )
+      {
+        obicCount( timdMode67( sec ), o.v[base + TIMD_OUT_LOC_DEP + 1], ns * w1 / w0 );
+        if( w2 > 0 )
+        {
+          obicCount( timdMode67( o.v[base + TIMD_OUT_NON_ANG] ), o.v[base + TIMD_OUT_LOC_DEP + 2], ns * w2 / w0 );
         }
       }
     }

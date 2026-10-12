@@ -23,17 +23,6 @@ const int EXT_DIA_IDX  = 66;
 const int EXT_VER_IDX  = 98;
 const int EXT_VDIA_IDX = 130;
 
-// MAP67TO131, MAP131TO67
-int timdMode131( int mode )
-{
-  return mode < 2 ? mode : ( mode << 1 ) - 2;
-}
-
-int timdMode67( int mode )
-{
-  return mode < 2 ? mode : ( mode >> 1 ) + 1;
-}
-
 // ----- the reference line
 
 // the availability bits of the reference's units (timdFillReference copies them from the CU's record): at most 2 x

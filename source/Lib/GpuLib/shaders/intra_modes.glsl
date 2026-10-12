@@ -34,6 +34,17 @@ const int INV_ANG_TABLE[32] = int[32]( 0, 16384, 8192, 5461, 4096, 2731, 2048, 1
                                        565, 512, 468, 420, 364, 321, 287, 256, 224, 191, 161, 128, 96, 64, 48, 32, 16 );
 const int INTRA_FILTER[8]   = int[8]( 24, 24, 24, 14, 2, 0, 0, 0 );
 
+// MAP67TO131, MAP131TO67: the modes of TIMD's 131-mode set (intra_timd.glsl)
+int timdMode131( int mode )
+{
+  return mode < 2 ? mode : ( mode << 1 ) - 2;
+}
+
+int timdMode67( int mode )
+{
+  return mode < 2 ? mode : ( mode >> 1 ) + 1;
+}
+
 // a set of the 67 luma modes (includedMode)
 bool modeIn( uint s[3], int mode )
 {

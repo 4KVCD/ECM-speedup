@@ -258,6 +258,7 @@ const int TIMD_OUT_SEC_CHECK_WA    = 11;   // timdModeSecondaryCheckWA
 const int MERGE_NBR_MERGE = 1;   // an intra merge CU: always a candidate, its merge parameters (its DimdOut slot)
 const int MERGE_NBR_OBIC  = 2;   // an OBIC CU: always, its OBIC converted
 const int MERGE_NBR_DIMD  = 3;   // a DIMD CU or an MPM CU: where its DIMD blends, its DIMD
+const int MERGE_NBR_TIMD  = 4;   // a TIMD CU: where its modes blend or its mode is angular, its TIMD converted (or its DIMD)
 layout( buffer_reference, std430, buffer_reference_align = 8 ) buffer BufU64 { uint64_t v[]; };
 
 // the directory of the transform tables (in matrices at Params::trTables, GpuIntraRec.cpp's createShared): the

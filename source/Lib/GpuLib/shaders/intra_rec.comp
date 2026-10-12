@@ -153,6 +153,12 @@ int cuModeOf( int n )
   return CBufI32( P.cuMode ).v[n];
 }
 
+// the start of TIMD CU n's TimdOut (written by its node)
+int timdOutBase( int n )
+{
+  return BufI32( P.timdData ).v[BufCu( P.cus ).v[n].timd] * TIMD_OUT;   // TimdHead::index
+}
+
 // the modes a CU's derivation reads (loaded by the invocations in parallel): luma the neighbours' at getSpatialIpm's
 // positions (-1: none), chroma the co-located luma CU's in entry 0
 int modeRead( Cu c, int k )
@@ -604,12 +610,6 @@ ivec2 wgSum2( int a, int b, int slot )
 #include "intra_merge.glsl"
 
 // ----- a TIMD block's prediction parameters (TIMD's luma path of initPredIntraParams, bExtIntraDir)
-
-// the start of CU cu's TimdOut
-int timdOutBase( int cu )
-{
-  return BufI32( P.timdData ).v[BufCu( P.cus ).v[cu].timd] * TIMD_OUT;   // TimdHead::index
-}
 
 // the parameters of a mode of the 131-mode set: its wide angle getWideAngleExt's (checkWA) or getTimdWideAngleExt's,
 // angles in 1/64 samples, PDPC as for the regular modes, planar's reference filter, none for angular modes (JVET-AM0104)
