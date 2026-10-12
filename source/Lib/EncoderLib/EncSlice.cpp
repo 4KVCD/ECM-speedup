@@ -69,12 +69,12 @@ EncSlice::~EncSlice()
 void EncSlice::create( int iWidth, int iHeight, ChromaFormat chromaFormat, uint32_t iMaxCUWidth, uint32_t iMaxCUHeight, uint8_t uhTotalDepth )
 {
 #if JVET_AG0117_CABAC_SPATIAL_TUNING
-  int numBinBuffers = iWidth / iMaxCUWidth + 1;
-  
-  for ( int i = 0; i < numBinBuffers; i++ )
+  // a bin buffer per CTU column; EncGOP calls this per picture, the buffers of the earlier ones stay
+  const int numBinBuffers = iWidth / iMaxCUWidth + 1;
+  while( int( m_binVectors.size() ) < numBinBuffers )
   {
     m_binVectors.push_back( BinStoreVector() );
-    m_binVectors[i].reserve( CABAC_SPATIAL_MAX_BINS );
+    m_binVectors.back().reserve( CABAC_SPATIAL_MAX_BINS );
   }
 #endif
 }
@@ -113,6 +113,75 @@ void EncSlice::init( EncLib* pcEncLib, EncSearchStack& stack, const SPS& sps )
   m_vdRdPicQp.resize(    m_pcCfg->getDeltaQpRD() * 2 + 1 );
   m_viRdPicQp.resize(    m_pcCfg->getDeltaQpRD() * 2 + 1 );
   m_pcRateCtrl        = pcEncLib->getRateCtrl();
+}
+
+void EncSlice::saveSetup( EncSliceSetup& setup ) const
+{
+  setup.rdPicLambda     = m_vdRdPicLambda;
+  setup.rdPicQp         = m_vdRdPicQp;
+  setup.rdPicQpInt      = m_viRdPicQp;
+  setup.sliceSegmentIdx = m_uiSliceSegmentIdx;
+#if SHARP_LUMA_DELTA_QP || ENABLE_QPA_SUB_CTU
+  setup.gopId           = m_gopID;
+#endif
+#if ENABLE_QPA
+  setup.adaptedLumaQP   = m_adaptedLumaQP;
+#endif
+  setup.ibcHashInit     = m_ibcHashInit;
+  setup.rdCost          = *m_pcRdCost;
+#if RDOQ_CHROMA_LAMBDA
+  m_pcTrQuant->getLambdas( setup.trLambdas );
+#else
+  setup.trLambda        = m_pcTrQuant->getLambda();
+#endif
+  for( int dir = 0; dir < MAX_NUM_REF_LIST_ADAPT_SR; dir++ )
+  {
+    for( int refIdx = 0; refIdx < MAX_IDX_ADAPT_SR; refIdx++ )
+    {
+      setup.adaptSR[dir][refIdx] = m_pcInterSearch->getAdaptiveSearchRange( dir, refIdx );
+    }
+  }
+  setup.reshaper        = *m_pcReshaper;
+}
+
+void EncSlice::loadSetup( const EncSliceSetup& setup, const Picture& pic )
+{
+  const SPS& sps = *pic.cs->sps;
+  const PPS& pps = *pic.cs->pps;
+  create( pps.getPicWidthInLumaSamples(), pps.getPicHeightInLumaSamples(), sps.getChromaFormatIdc(), sps.getMaxCUWidth(),
+          sps.getMaxCUHeight(), floorLog2( sps.getMaxCUWidth() ) - sps.getLog2MinCodingBlockSize() );
+  m_vdRdPicLambda     = setup.rdPicLambda;
+  m_vdRdPicQp         = setup.rdPicQp;
+  m_viRdPicQp         = setup.rdPicQpInt;
+  m_uiSliceSegmentIdx = setup.sliceSegmentIdx;
+#if SHARP_LUMA_DELTA_QP || ENABLE_QPA_SUB_CTU
+  m_gopID             = setup.gopId;
+#endif
+#if ENABLE_QPA
+  m_adaptedLumaQP     = setup.adaptedLumaQP;
+#endif
+  m_ibcHashInit       = setup.ibcHashInit;
+  *m_pcRdCost         = setup.rdCost;
+  // as setUpLambda
+  m_pcTrQuant->resetStore();
+#if RDOQ_CHROMA_LAMBDA
+  m_pcTrQuant->setLambdas( setup.trLambdas );
+#else
+  m_pcTrQuant->setLambda( setup.trLambda );
+#endif
+  for( int dir = 0; dir < MAX_NUM_REF_LIST_ADAPT_SR; dir++ )
+  {
+    for( int refIdx = 0; refIdx < MAX_IDX_ADAPT_SR; refIdx++ )
+    {
+      m_pcInterSearch->setAdaptiveSearchRange( dir, refIdx, setup.adaptSR[dir][refIdx] );
+    }
+  }
+  if( setup.ibcHashInit )
+  {
+    m_pcCuEncoder->getIbcHashMap().destroy();
+    m_pcCuEncoder->getIbcHashMap().init( pps.getPicWidthInLumaSamples(), pps.getPicHeightInLumaSamples() );
+  }
+  *m_pcReshaper       = setup.reshaper;
 }
 
 void
@@ -847,7 +916,8 @@ void EncSlice::initEncSlice(Picture* pcPic, const int pocLast, const int pocCurr
 
   rpcSlice->setDisableSATDForRD(false);
 
-  if( eSliceType == I_SLICE || ( m_pcCfg->getIBCHashSearch() && m_pcCfg->getIBCMode() ) || ( eSliceType != I_SLICE && m_pcCfg->getAllowDisFracMMVD() ) )
+  m_ibcHashInit = eSliceType == I_SLICE || ( m_pcCfg->getIBCHashSearch() && m_pcCfg->getIBCMode() ) || ( eSliceType != I_SLICE && m_pcCfg->getAllowDisFracMMVD() );
+  if( m_ibcHashInit )
   {
     m_pcCuEncoder->getIbcHashMap().destroy();
     m_pcCuEncoder->getIbcHashMap().init( pcPic->cs->pps->getPicWidthInLumaSamples(), pcPic->cs->pps->getPicHeightInLumaSamples() );
@@ -855,9 +925,9 @@ void EncSlice::initEncSlice(Picture* pcPic, const int pocLast, const int pocCurr
 #if JVET_Z0118_GDR
   if (m_pcCfg->getGdrEnabled())
   {
-    int gdrPocStart = m_pcCuEncoder->getEncCfg()->getGdrPocStart();
-    int gdrPeriod = m_pcCuEncoder->getEncCfg()->getGdrPeriod();
-    int gdrInterval = m_pcCuEncoder->getEncCfg()->getGdrInterval();
+    int gdrPocStart = m_pcCfg->getGdrPocStart();
+    int gdrPeriod = m_pcCfg->getGdrPeriod();
+    int gdrInterval = m_pcCfg->getGdrInterval();
 
     int picWidth = rpcSlice->getPPS()->getPicWidthInLumaSamples();
 

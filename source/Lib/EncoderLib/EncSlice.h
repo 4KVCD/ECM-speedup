@@ -40,6 +40,7 @@
 
 // Include files
 #include "EncCu.h"
+#include "EncReshape.h"
 #include "WeightPredAnalysis.h"
 #include "RateCtrl.h"
 
@@ -52,6 +53,25 @@
 class EncLib;
 struct EncSearchStack;
 class EncGOP;
+
+/// Frame threads: what a picture's setup (initEncSlice, setUpLambda, setSearchRange, the LMCS setup) leaves in the slice
+/// encoder of the setup stack and in the objects of that stack, for the search stack the picture's search takes
+/// (EncSlice::saveSetup, loadSetup)
+struct EncSliceSetup
+{
+  std::vector<double> rdPicLambda;
+  std::vector<double> rdPicQp;
+  std::vector<int>    rdPicQpInt;
+  uint32_t            sliceSegmentIdx = 0;
+  int                 gopId           = 0;
+  int                 adaptedLumaQP   = -1;
+  bool                ibcHashInit     = false;     ///< initEncSlice reset the IBC hash map
+  RdCost              rdCost;
+  double              trLambdas[MAX_NUM_COMPONENT] = {};
+  double              trLambda        = 0;
+  int                 adaptSR[MAX_NUM_REF_LIST_ADAPT_SR][MAX_IDX_ADAPT_SR] = {};
+  EncReshape          reshaper;
+};
 
 // ====================================================================================================================
 // Class definition
@@ -101,6 +121,7 @@ private:
 #if JVET_AG0117_CABAC_SPATIAL_TUNING
   std::vector<BinStoreVector> m_binVectors;
 #endif
+  bool                    m_ibcHashInit = false;   ///< initEncSlice reset the IBC hash map (EncSliceSetup)
 
 public:
   double  initializeLambda(const Slice* slice, const int GOPid, const int refQP, const double dQP); // called by calculateLambda() and updateLambda()
@@ -123,6 +144,10 @@ public:
   void    create              ( int iWidth, int iHeight, ChromaFormat chromaFormat, uint32_t iMaxCUWidth, uint32_t iMaxCUHeight, uint8_t uhTotalDepth );
   void    destroy             ();
   void    init                ( EncLib* pcEncLib, EncSearchStack& stack, const SPS& sps );
+  /// frame threads: the state the picture's setup left in this slice encoder and its stack (the setup stack)
+  void    saveSetup           ( EncSliceSetup& setup ) const;
+  /// frame threads: takes over the state of a setup, for the picture's search on this slice encoder's stack
+  void    loadSetup           ( const EncSliceSetup& setup, const Picture& pic );
 
   /// preparation of slice encoding (reference marking, QP and lambda)
   void    initEncSlice        ( Picture*  pcPic, const int pocLast, const int pocCurr,

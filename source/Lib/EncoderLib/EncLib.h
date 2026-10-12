@@ -101,6 +101,9 @@ private:
   std::vector<std::unique_ptr<EncSearchStack>> m_searchStacks;
   // CuThreads: the helpers of each search stack (stack i has the helpers i * CuThreads ... i * CuThreads + CuThreads - 1)
   std::vector<std::unique_ptr<EncRdHelperStack>> m_rdHelperStacks;
+  // frame threads: the stack of the picture setups, of which only the objects a setup uses are initialised (the slice
+  // encoder, the rate and quantizer lambdas, the adaptive search ranges, the IBC hash map, the reshaper)
+  std::unique_ptr<EncSearchStack> m_setupStack;
   // coding tool
   LoopFilter                m_cLoopFilter;                        ///< deblocking filter class
   EncSampleAdaptiveOffset   m_cEncSAO;                            ///< sample adaptive offset class
@@ -202,6 +205,7 @@ public:
   /// The stacks for the mode search of pictures; the getters below return the objects of the first one.
   int                     getNumSearchStacks    () const        { return  int( m_searchStacks.size() ); }
   EncSearchStack&         getSearchStack        ( int i = 0 )   { return  *m_searchStacks[i];      }
+  EncSearchStack*         getSetupStack         ()              { return  m_setupStack.get();      }
   int                     getNumRdHelpers       () const        { return  m_searchStacks.empty() ? 0 : int( m_rdHelperStacks.size() / m_searchStacks.size() ); }
   EncRdHelperStack&       getRdHelperStack      ( int i, int h ) { return *m_rdHelperStacks[i * getNumRdHelpers() + h]; }
   InterSearch*            getInterSearch        ()              { return  &m_searchStacks[0]->interSearch; }

@@ -1287,6 +1287,7 @@ public:
 
   /// set ME search range
   void setAdaptiveSearchRange       ( int iDir, int iRefIdx, int iSearchRange) { CHECK(iDir >= MAX_NUM_REF_LIST_ADAPT_SR || iRefIdx>=int(MAX_IDX_ADAPT_SR), "Invalid index"); m_aaiAdaptSR[iDir][iRefIdx] = iSearchRange; }
+  int  getAdaptiveSearchRange       ( int iDir, int iRefIdx ) const { return m_aaiAdaptSR[iDir][iRefIdx]; }
 #if JVET_AD0208_IBC_ADAPT_FOR_CAM_CAPTURED_CONTENTS
   bool  predIBCSearch               ( CodingUnit& cu, Partitioner& partitioner, const int localSearchRangeX, const int localSearchRangeY, IbcHashMap& ibcHashMap
 #if JVET_AC0112_IBC_LIC || JVET_AC0112_IBC_CIIP

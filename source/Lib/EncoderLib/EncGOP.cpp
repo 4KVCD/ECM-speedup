@@ -171,6 +171,8 @@ void EncGOP::compressGOPFrameThreads( int numPics, int iPOCLast, int iNumPicRcvd
     m_ftError      = false;
     m_ftFirstError = nullptr;
     m_ftStackBusy.assign( m_pcEncLib->getNumSearchStacks(), false );
+    m_ftStackWaiters.clear();
+    m_ftStackHolders.clear();
     m_ftPicsInFlight.clear();
     m_ftPicsDone.clear();
   }
@@ -229,10 +231,10 @@ void EncGOP::finishFrameThreads()
   }
   waitFrameThreads( 0 );
   m_ftActive = false;
-  if( m_lastPicOrder )
+  if( m_lastPicOrder && m_lastPicOrder->picHeader )
   {
     // the shared picture header continues from the last picture (xUsePicHeaderCopy)
-    *m_lastPicOrder->sharedPicHeader = m_pcEncLib->getSearchStack( m_lastPicOrder->stackIdx ).picHeader;
+    *m_lastPicOrder->sharedPicHeader = *m_lastPicOrder->picHeader;
   }
 }
 
@@ -263,10 +265,27 @@ void EncGOP::xFtSkip( int64_t turn )
 
 void EncGOP::xFtAcquireStack( EncPicOrder& order )
 {
-  // only the picture holding the setup turn takes a stack, so the stack stays free until it does
-  xFtWait( [&]() { return !m_ftStackBusy[order.stackIdx]; } );
+  // A picture whose search inputs are done takes the first free stack, the earliest waiting picture first. The
+  // earliest picture not done, whose finish waits for no other picture, has a stack or one stays free for it: so the
+  // pictures holding the stacks cannot all wait for a picture without one. Only the earliest waiter takes a stack, so
+  // the condition still holds when it does.
+  {
+    std::lock_guard<std::mutex> lock( m_ftMutex );
+    m_ftStackWaiters.insert( order.turn );
+  }
+  xFtWait( [&]()
+  {
+    const int64_t earliest = m_ftFinishTurn;   // the finishes run in coding order
+    const int     numFree  = int( std::count( m_ftStackBusy.begin(), m_ftStackBusy.end(), false ) );
+    return *m_ftStackWaiters.begin() == order.turn && numFree > 0
+           && ( order.turn == earliest || m_ftStackHolders.count( earliest ) || numFree > 1 );
+  } );
   std::lock_guard<std::mutex> lock( m_ftMutex );
+  m_ftStackWaiters.erase( order.turn );
+  order.stackIdx = int( std::find( m_ftStackBusy.begin(), m_ftStackBusy.end(), false ) - m_ftStackBusy.begin() );
   m_ftStackBusy[order.stackIdx] = true;
+  m_ftStackHolders.insert( order.turn );
+  m_ftCv.notify_all();   // the next waiter may take one too
 }
 
 void EncGOP::xFtEndSetup( EncPicOrder& order )
@@ -324,8 +343,13 @@ PicHeader* EncGOP::xUsePicHeaderCopy( Picture* pic, EncPicOrder& order )
 {
   // The pictures share one picture header (EncLib's), which every setup changes. The search and the finish use a copy
   // as the setup leaves it, so the next picture's setup can run at the same time. The copy goes back to the shared
-  // header when the picture is done (xEndPicture), with frame threads when the GOP is done (compressGOPFrameThreads).
-  PicHeader& copy         = m_pcSearchStack->picHeader;
+  // header when the picture is done (xEndPicture), with frame threads after the last picture (finishFrameThreads).
+  // With frame threads, the copy is the picture's own: the setup stack's would change with the next setup.
+  if( m_ftActive )
+  {
+    order.picHeader.reset( new PicHeader );
+  }
+  PicHeader& copy         = m_ftActive ? *order.picHeader : m_pcSearchStack->picHeader;
   order.sharedPicHeader   = pic->cs->picHeader;
   order.referencedAtSetup = pic->referenced;
   copy                    = *order.sharedPicHeader;
@@ -378,6 +402,7 @@ void EncGOP::xEndPicture( EncPicOrder& order )
   m_ftPicsInFlight.erase( order.pic );
   m_ftPicsDone.insert( order.pic );
   m_ftStackBusy[order.stackIdx] = false;
+  m_ftStackHolders.erase( order.turn );
   m_ftFinishTurn = order.turn + 1;
   m_ftCv.notify_all();
 }
@@ -558,6 +583,10 @@ void EncGOP::init ( EncLib* pcEncLib )
   for( int i = 0; i < pcEncLib->getNumSearchStacks(); i++ )
   {
     lumaWeightOwners.push_back( &pcEncLib->getSearchStack( i ).rdCost );
+  }
+  if( pcEncLib->getSetupStack() )
+  {
+    lumaWeightOwners.push_back( &pcEncLib->getSetupStack()->rdCost );
   }
   for( RdCost* rdCost: lumaWeightOwners )
   {
@@ -2468,18 +2497,22 @@ void EncGOP::compressGOP(int iPOCLast, int iNumPicRcvd, PicList &rcListPic, std:
       m_iLastIDR = pocCurr;
     }
 
-    // the pictures use the search stacks in turn
+    // the pictures use the search stacks in turn; with frame threads, the setup runs on the setup stack and the search
+    // takes a search stack when it can start (xStartPicSearch)
     const std::shared_ptr<EncPicOrder> picOrder = std::make_shared<EncPicOrder>();
     picOrder->turn     = m_ftActive ? m_ftTurn : picIdInGOP;
-    picOrder->stackIdx = int( m_numPicsStarted++ % m_pcEncLib->getNumSearchStacks() );
     picOrder->previous = m_lastPicOrder;
     m_lastPicOrder     = picOrder;
     m_pcPicOrder       = picOrder.get();
     if( m_ftActive )
     {
-      xFtAcquireStack( *picOrder );   // waits until the stack's previous picture is done
+      m_pcSearchStack = m_pcEncLib->getSetupStack();
     }
-    m_pcSearchStack  = &m_pcEncLib->getSearchStack( picOrder->stackIdx );
+    else
+    {
+      picOrder->stackIdx = int( m_numPicsStarted++ % m_pcEncLib->getNumSearchStacks() );
+      m_pcSearchStack    = &m_pcEncLib->getSearchStack( picOrder->stackIdx );
+    }
     m_pcSliceEncoder = &m_pcSearchStack->sliceEncoder;
 
     // start a new access unit: create an entry in the list of output access units
@@ -3977,11 +4010,13 @@ void EncGOP::compressGOP(int iPOCLast, int iNumPicRcvd, PicList &rcListPic, std:
     xSetupPicOrder( pcSlice, picOrder );
     if( m_ftActive )
     {
+      picOrder->setup.reset( new EncSliceSetup );
+      m_pcSliceEncoder->saveSetup( *picOrder->setup );
       picListLock.unlock();
       xFtEndSetup( *picOrder );   // from here on, the next picture's setup runs at the same time
     }
-    EncReshape* const picReshaper = &m_pcSearchStack->reshaper;
     xStartPicSearch( pcPic, picHeader, pcSlice, *picOrder, decPic );
+    EncReshape* const picReshaper = &m_pcSearchStack->reshaper;
     std::unique_lock<std::mutex> apsMapLock( m_ftApsMapMutex, std::defer_lock );   // the finish's (frame threads)
 
     if( encPic )
@@ -7348,6 +7383,12 @@ void EncGOP::xStartPicSearch( Picture* pic, PicHeader* picHeader, Slice* slice, 
   if( m_ftActive )
   {
     xFtWaitSearchInputs( slice, order );
+    // the search stack takes over what the setup left in the setup stack
+    xFtAcquireStack( order );
+    m_pcSearchStack  = &m_pcEncLib->getSearchStack( order.stackIdx );
+    m_pcSliceEncoder = &m_pcSearchStack->sliceEncoder;
+    m_pcSliceEncoder->loadSetup( *order.setup, *pic );
+    order.setup.reset();
   }
 #if JVET_AI0183_MVP_EXTENSION
   slice->generateIntersectingMv();   // reads the motion of the reference pictures

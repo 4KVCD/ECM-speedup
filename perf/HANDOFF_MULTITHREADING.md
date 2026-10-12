@@ -102,6 +102,12 @@ Commits on `enc-mt`, all bit-exact with stock ECM-20.0 (bitstream md5 of the sui
     copies of the finish state (ALF/SAO/CCSAO encoders, APS map, the HLS writer), the sequential finish state decided
     in the setup (`m_bSeqFirst`, AUD) or moved to an output step in coding order (AU output, PSNR sums, log line), and
     stacks taken by pictures that are ready.
+- P5 stage B-1: setups run on a setup stack of their own (only what a setup uses is initialised: slice encoder,
+  lambdas, adaptive search ranges, IBC hash map, reshaper); `EncSlice::saveSetup`/`loadSetup` move the result to the
+  search stack the picture takes when its search inputs are done. Stacks go to ready pictures, earliest first, while
+  the earliest picture not finished has one or one stays free for it (deadlock-free with any finish order where that
+  picture waits for nothing). Taking stacks strictly in coding order once ready blocks RA behind pictures waiting for
+  their references (modelled 1.11x instead of 1.45x with 8 threads; measured ra20 1.04x at 4 threads).
 - Found by the matrix of stage A: `--FrameThreads` >= 3 stopped with "PDP predictor unavailable" on ra_cif (bug of
   cfe3c39a, fixed in its own commit): a search stack's first picture used IntraPrediction's PDP buffer pointers before
   any CU of that stack had set them.

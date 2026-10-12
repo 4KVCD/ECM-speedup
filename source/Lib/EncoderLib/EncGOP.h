@@ -103,7 +103,8 @@ struct EncPicOrder
   int64_t                       turn   = 0;                     ///< setup and finish turn: the picture's index in coding order
                                                                 ///< over all GOPs (frame threads), else its index in the GOP
   const Picture*                pic    = nullptr;
-  int                           stackIdx = 0;                   ///< the picture's search stack
+  int                           stackIdx = 0;                   ///< the picture's search stack (frame threads: from the
+                                                                ///< start of the search, xFtAcquireStack)
   bool                          finished = false;               ///< the picture is done, including the padding as a reference
   std::shared_ptr<EncPicOrder>  previous;                       ///< previous picture in coding order (until the finish)
   bool                          cabacTableIdxDeferred = false;  ///< the CABAC init table comes from the previous picture
@@ -122,6 +123,9 @@ struct EncPicOrder
   uint32_t                      amaxbtBlkSize = 0;              ///< this picture's AMaxBT block statistics (after its finish)
   uint32_t                      amaxbtNumBlk  = 0;
   PicHeader*                    sharedPicHeader = nullptr;      ///< the picture header the pictures share (EncLib's)
+  std::unique_ptr<PicHeader>    picHeader;                      ///< frame threads: the picture's copy of the header
+  std::unique_ptr<EncSliceSetup> setup;                         ///< frame threads: what the setup left in the setup
+                                                                ///< stack, until the search stack takes it over
   bool                          referencedAtSetup = false;      ///< Picture::referenced at the end of the setup (for the log)
 };
 
@@ -458,6 +462,8 @@ protected:
   std::exception_ptr       m_ftFirstError;
   std::set<const Picture*> m_ftPicsDone;               ///< done and not yet forgotten (forgetPicDone)
   std::vector<bool>        m_ftStackBusy;
+  std::set<int64_t>        m_ftStackWaiters;           ///< turns whose search waits for a stack (xFtAcquireStack)
+  std::set<int64_t>        m_ftStackHolders;           ///< turns holding a stack
   std::set<const Picture*> m_ftPicsInFlight;           ///< set up and not done (not usable as a reference yet)
   std::mutex               m_ftApsMapMutex;            ///< EncLib's APS map: held by the finish, taken by a setup to use it
   template<class Pred> void xFtWait( Pred pred );      ///< waits until pred() holds (pred runs with m_ftMutex locked)
