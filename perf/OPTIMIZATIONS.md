@@ -100,32 +100,38 @@ lower all-core turbo, one duplicated intra frame per chunk, unequal chunk comple
   log lines, access units and PSNR sums still go out in coding order. A period starts at a RAS-init intra picture
   (the CRA of each intra period in RA, every picture in AI), whose finish resets what the filter encoders carry.
 - Output identical at every N and M: bitstream, reconstruction and log (except the [ET] times).
-- M = 0 (default) uses min(N, 4) periods, and 1 for one long period (IntraPeriod -1, LD) and for the options whose
-  finishes share state between periods (buffering period, picture timing, decoding unit, frame-field, frame packing,
-  scalable nesting and DRAP SEIs, DeblockingFilterMetric, a scaling-list file, HDR metrics), which M > 1 rejects.
+- M = 0 (default) uses a period per frame thread, as far as the sequence has periods and 70 % of the physical memory
+  holds them by the figures below (with 8 threads: up to 720p 8 periods on a 32 GB machine, 1080p 8 on 64 GB and 3 on
+  32 GB, 2160p 1), and min(N, 4) for all intra. It uses 1 for one long period (IntraPeriod -1, LD) and for the
+  options whose finishes share state between periods (buffering period, picture timing, decoding unit, frame-field,
+  frame packing, scalable nesting and DRAP SEIs, DeblockingFilterMetric, a scaling-list file, HDR metrics), which
+  M > 1 rejects.
 - AI pictures are independent, so AI scales with N, also onto the efficiency cores: 33 pictures unpinned on all 20
   cores of the 265K took 27.1 s with N = 12, 25.8 s with 16 and 23.7 s with 20 (7.96x, 8.37x, 9.12x; 24.7 GB at 20).
   In RA the temporal CABAC context store chains each picture to the previous one of its temporal layer, so a single
-  intra period gains about 1.4x; the periods then overlap. The dependency chains inside the periods bound RA at about
-  4.4x for 129 frames (5 periods) whatever N; longer RA sequences gain from more periods (`perf/mt/p5_sim.py` models
-  10 periods at 4.4x with M = 4 and 5.9x with M = 8, at a cost in memory). LD gains nothing. `--ParallelSegments`
-  combines with it.
+  intra period gains about 1.4x; the periods then overlap, so RA gains with the number of periods in flight: RA 129
+  frames (5 periods) about 4.2x with 8 threads, RA 257 frames (9 periods) 4.16x with M = 4 and 6.49x with M = 8
+  (`perf/mt/p5_sim.py` models 4.75x and 7.00x; the window has to hold the periods' pictures). LD gains nothing.
+  `--ParallelSegments` combines with it.
 - Memory: a search stack commits about 0.85 GB whatever the resolution; the setup stack and the finish stacks are
   small. Each period beyond the first adds a finish context (about 0.13 GB at 1080p while idle; a running finish
   creates the SAO statistics, 0.6 GB at 1080p, and frees them after its SAO), and up to max(N, GOPSize) x M pictures
-  are in flight. A picture that waits for its
-  search holds its buffers, coding structure and temporary buffers (about 68 MB at 1080p); its search data (about
-  80 MB more) is created when its search starts. RA 1080p with N = 8 and M = 4 committed about 27 GB in its first
-  5 minutes.
+  are in flight. A picture that waits for its search holds its buffers, coding structure and temporary buffers (about
+  68 MB at 1080p); its search data (about 80 MB more) is created when its search starts. RA 1080p with N = 8 (a
+  synthetic sequence, first 5 minutes): about 23 GB on average with M = 4 and 34 GB with M = 8 (peaks 26 and 39 GB).
 - Core Ultra 7 265K, one run at a time on the 8 P-cores, foreman 128x128 QP 32 (ai_long's and ra_long's
   configurations), the previous commit's single-thread time as base, automatic M:
 
-| FrameThreads | AI, 33 pictures (TemporalSubsampleRatio 8) | RA, 65 frames (3 intra periods) | RA, 129 frames (5) | peak commit (AI / RA 65 / RA 129) |
-|---|---|---|---|---|
-| 1 | 215.7 s | 556.2 s | 1064.5 s | |
-| 2 | 104.0 s, 2.07x | | | 2.8 GB |
-| 4 | 56.0 s, 3.85x | 203.2 s, 2.74x | | 5.4 / 5.7 GB |
-| 8 | 30.9 s, 6.98x | 199.1 s, 2.79x | 259.8 s, 4.10x | 10.2 / 10.2 / 10.8 GB |
+| FrameThreads | AI, 33 pictures (TemporalSubsampleRatio 8) | RA, 65 frames (3 intra periods) | RA, 129 frames (5) | RA, 257 frames (9) | peak commit (AI / RA 65 / RA 129) |
+|---|---|---|---|---|---|
+| 1 | 215.7 s | 556.2 s | 1064.5 s | 1810.2 s | |
+| 2 | 104.0 s, 2.07x | | | | 2.8 GB |
+| 4 | 56.0 s, 3.85x | 203.2 s, 2.74x | | | 5.4 / 5.7 GB |
+| 8 | 30.9 s, 6.98x | 199.1 s, 2.79x | 259.8 s, 4.10x | 278.8 s, 6.49x | 10.2 / 10.2 / 10.8 GB |
+
+  RA 257 frames with the automatic M (8 periods); with M = 4 it took 435.6 s (4.16x). The peak commits are those of
+  the setup-stack commit; the later memory commits lowered them (8 threads: AI 8.3, RA 65 8.3, RA 129 9.0, RA 257
+  9.9 GB).
 
   Earlier steps, same tests: finishes in coding order and stacks held to the end of the finish (P5 stage A, B-1): RA
   65 387.6 s with 4 threads and 383.9 s with 8 (1.44x, 1.45x); finishes of several periods at the same time (B-2):

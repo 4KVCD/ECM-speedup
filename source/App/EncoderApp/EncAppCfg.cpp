@@ -36,6 +36,9 @@
 */
 
 #include "EncAppCfg.h"
+#include "SystemMemory.h"
+
+#include <algorithm>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -3978,8 +3981,32 @@ bool EncAppCfg::xCheckParameter()
     ;
   if( m_framePeriods == 0 )
   {
-    // automatic: a period per frame thread, up to 4; one long period (IntraPeriod -1) gains nothing
-    m_framePeriods = periodsSupported && m_iIntraPeriod > 0 ? std::min( m_frameThreads, 4 ) : 1;
+    // automatic: a period per frame thread, as far as the sequence has periods and the memory holds their pictures;
+    // one long period (IntraPeriod -1) gains nothing
+    m_framePeriods = 1;
+    if( periodsSupported && m_iIntraPeriod > 0 )
+    {
+      const int numPeriods = ( m_framesToBeEncoded + m_iIntraPeriod - 1 ) / m_iIntraPeriod;   // coded frames
+      // Measured at 1080p (perf/OPTIMIZATIONS.md): a search stack commits about 0.85 GB, a picture that waits for its
+      // search about 33 bytes per luma sample, an idle finish context about 63; up to max(N, GOPSize) pictures per
+      // period are in flight, and about GOPSize + 2N more (references, pictures being searched) about 70 bytes per
+      // sample. The encoder takes at most 70 % of the physical memory, with some margin on each figure; if the memory
+      // is unknown, at most 4 periods.
+#if JVET_AA0146_WRAP_AROUND_FIX
+      const double   samples   = double( m_sourceWidth ) * double( m_sourceHeight );
+#else
+      const double   samples   = double( m_iSourceWidth ) * double( m_iSourceHeight );
+#endif
+      const double   perPeriod = std::max( m_frameThreads, m_iGOPSize ) * 40.0 * samples + 80.0 * samples;
+      const double   base      = m_frameThreads * 1.0e9 + ( m_iGOPSize + 2 * m_frameThreads ) * 70.0 * samples;
+      const uint64_t memory    = getPhysicalMemoryBytes();
+      const double   budget    = 0.7 * double( memory ) - base;
+      const int      memPeriods = memory == 0 ? 4 : budget > perPeriod ? int( std::min( budget / perPeriod, 64.0 ) ) : 1;
+      // all intra: pictures are independent, and 4 contexts keep 8 threads busy (AI 33 pictures with 8 threads:
+      // 32.0 s with 4 periods, 32.3 s with 8)
+      const int maxPeriods = m_iIntraPeriod == 1 ? std::min( m_frameThreads, 4 ) : m_frameThreads;
+      m_framePeriods = std::max( 1, std::min( { maxPeriods, numPeriods, memPeriods } ) );
+    }
   }
   xConfirmPara( m_framePeriods > 1 && !periodsSupported, "FramePeriods > 1 needs FrameThreads > 1 and supports no buffering period, picture timing, decoding unit, frame-field, frame packing, scalable nesting or DRAP SEI, no DeblockingFilterMetric, no scaling list file and no HDR metrics" );
   xConfirmPara( m_ensureWppBitEqual, "ENABLE_WPP_PARALLELISM is disabled, cannot ensure being WPP bit-equal" );

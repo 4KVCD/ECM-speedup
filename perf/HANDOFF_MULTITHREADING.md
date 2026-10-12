@@ -154,6 +154,20 @@ Commits on `enc-mt`, all bit-exact with stock ECM-20.0 (bitstream md5 of the sui
     1080p, measured with the same probe: SAO statistics (`createEncData`) 625 MB, ALF 97 MB, loop filter 7 MB, the
     rest 28 MB. A finish frees and creates the SAO statistics around its SAO (as stock), so contexts beyond the first no
     longer create them at startup: an idle context is about 0.13 GB.
+- Automatic FramePeriods (M = 0): a period per frame thread, capped by the periods of the sequence and by 70 % of the
+  physical memory (`SystemMemory.cpp`; figures in `EncAppCfg::xCheckParameter`), all intra min(N, 4). RA 257 frames
+  with 8 threads: 4.16x with M = 4, 6.49x with M = 8 (automatic); AI 33 pictures with 8 threads 32.0 s with M = 4,
+  32.3 s with 8. RA 1080p with 8 threads on this 64 GB machine takes 8 periods (34 GB on average in the first
+  5 minutes).
+- P2 for LD, motion search per reference picture (not committed; `C:\Code\work\mt\me_patch.py`, `me_job.cpp`):
+  the AMVP and search of each reference picture of predInterSearch's uni-prediction loop on the CuThreads helpers
+  (an InterSearch per helper stack), the loop replaying the results with the PU fields, RdCost predictor and cost
+  scale, TM-AMVP buffer entry and the CU's fill-once caches they leave; a check mode compares with the serial search.
+  Bit-exact on LD foreman, but the loop is only 6.5 % of LD 128x128 (7.3 of 113 s, 57 % of its calls LIC CUs that the
+  helpers did not take): the jobs saved about 1.4 s, and workers spinning on 3 more P-cores cost the main thread as
+  much (LD 13 frames 113.7 s with one thread, 114.3 s with 4, 112.9 s with 2; with the 2 ms spin of EncCuWorkers,
+  sleeping workers made it slower: 115.4 s with 4, 125.8 s with 8). UMWAIT instead of spinning and helpers on the
+  efficiency cores did not help either.
 - Found by the matrix of stage A: `--FrameThreads` >= 3 stopped with "PDP predictor unavailable" on ra_cif (bug of
   cfe3c39a, fixed in its own commit): a search stack's first picture used IntraPrediction's PDP buffer pointers before
   any CU of that stack had set them.
@@ -408,6 +422,9 @@ AI-latency ~2-2.5x.
    - More P2 for LD, the only configuration nothing else speeds up: merge SATD pass, ME per reference, the GPM stages,
      intra RMD in chunks, then P3 speculation for the merge/GPM full RD and the intra MTS pass. Expected 1.1-1.2x on
      LD in all, each loop a step like the first (state sync, record and compare, shadow check).
-2. P0, P1, the first P2 step and P5 (stages A to B-4) are done (see Progress). Open in P5: more periods by default
-   for long RA (memory). Next by the user's order: more P2 for LD.
+2. P0, P1, the first P2 step and P5 (stages A to C and the automatic periods) are done (see Progress). LD: the
+   motion search per reference picture gained nothing on this CPU (see Progress); further P2 loops for LD are smaller
+   still, so LD stays at the single-thread speed unless spinning workers get cheaper. Open: a waiting picture's
+   reconstruction and coding-structure arrays (about 40 MB at 1080p) could be created at its search start too, which
+   would let 32-48 GB machines take more periods at 1080p.
 3. Report each step as step % and cumulative % with before/after numbers and commit hashes, one commit per step.
