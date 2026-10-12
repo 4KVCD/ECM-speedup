@@ -101,7 +101,7 @@ lower all-core turbo, one duplicated intra frame per chunk, unequal chunk comple
   (the CRA of each intra period in RA, every picture in AI), whose finish resets what the filter encoders carry.
 - Output identical at every N and M: bitstream, reconstruction and log (except the [ET] times).
 - M = 0 (default) uses a period per frame thread, as far as the sequence has periods and 70 % of the physical memory
-  holds them by the figures below (with 8 threads: up to 720p 8 periods on a 32 GB machine, 1080p 8 on 64 GB and 3 on
+  holds them by the figures below (with 8 threads: up to 720p 8 periods on a 32 GB machine, 1080p 8 on 64 GB and 5 on
   32 GB, 2160p 1), and min(N, 4) for all intra. It uses 1 for one long period (IntraPeriod -1, LD) and for the
   options whose finishes share state between periods (buffering period, picture timing, decoding unit, frame-field,
   frame packing, scalable nesting and DRAP SEIs, DeblockingFilterMetric, a scaling-list file, HDR metrics), which
@@ -116,9 +116,10 @@ lower all-core turbo, one duplicated intra frame per chunk, unequal chunk comple
 - Memory: a search stack commits about 0.85 GB whatever the resolution; the setup stack and the finish stacks are
   small. Each period beyond the first adds a finish context (about 0.13 GB at 1080p while idle; a running finish
   creates the SAO statistics, 0.6 GB at 1080p, and frees them after its SAO), and up to max(N, GOPSize) x M pictures
-  are in flight. A picture that waits for its search holds its buffers, coding structure and temporary buffers (about
-  68 MB at 1080p); its search data (about 80 MB more) is created when its search starts. RA 1080p with N = 8 (a
-  synthetic sequence, first 5 minutes): about 23 GB on average with M = 4 and 34 GB with M = 8 (peaks 26 and 39 GB).
+  are in flight. A picture that waits for its search holds its original and temporary buffers (about 27 MB at 1080p);
+  its reconstruction, coding-structure arrays and search data (about 120 MB at 1080p) are created when its search
+  starts. RA 1080p with N = 8 and the automatic M = 8 (a synthetic sequence, first 5 minutes): about 24 GB on average,
+  peak 28 GB.
 - Core Ultra 7 265K, one run at a time on the 8 P-cores, foreman 128x128 QP 32 (ai_long's and ra_long's
   configurations), the previous commit's single-thread time as base, automatic M:
 

@@ -159,6 +159,12 @@ Commits on `enc-mt`, all bit-exact with stock ECM-20.0 (bitstream md5 of the sui
   with 8 threads: 4.16x with M = 4, 6.49x with M = 8 (automatic); AI 33 pictures with 8 threads 32.0 s with M = 4,
   32.3 s with 8. RA 1080p with 8 threads on this 64 GB machine takes 8 periods (34 GB on average in the first
   5 minutes).
+- P5 stage C3: a waiting picture holds neither its reconstruction nor its coding structure's per-4x4 arrays (motion,
+  intra modes, CCP and EIP indices, QT depth): EncLib releases them after reading the picture
+  (`Picture::releaseSearchBuffers`), `xStartPicSearch` creates them (`createSearchBuffers`); `getPicWidthInLumaSamples`
+  reads the picture's area instead of the reconstruction. RA 1080p with 8 threads and 8 periods, minutes 2.5-5:
+  34.0 -> 23.6 GB on average (peaks 38.7 -> 27.7 GB). The automatic FramePeriods counts a waiting picture at 17 bytes
+  per luma sample (measured about 13).
 - P2 for LD, motion search per reference picture (not committed; `C:\Code\work\mt\me_patch.py`, `me_job.cpp`):
   the AMVP and search of each reference picture of predInterSearch's uni-prediction loop on the CuThreads helpers
   (an InterSearch per helper stack), the loop replaying the results with the PU fields, RdCost predictor and cost
@@ -424,7 +430,7 @@ AI-latency ~2-2.5x.
      LD in all, each loop a step like the first (state sync, record and compare, shadow check).
 2. P0, P1, the first P2 step and P5 (stages A to C and the automatic periods) are done (see Progress). LD: the
    motion search per reference picture gained nothing on this CPU (see Progress); further P2 loops for LD are smaller
-   still, so LD stays at the single-thread speed unless spinning workers get cheaper. Open: a waiting picture's
-   reconstruction and coding-structure arrays (about 40 MB at 1080p) could be created at its search start too, which
-   would let 32-48 GB machines take more periods at 1080p.
+   still, so LD stays at the single-thread speed unless spinning workers get cheaper. RA with more threads than
+   cores of one kind: RA 257 frames unpinned on all 20 cores took 283.5 s with 8 threads, 271.2 s with 12 and 272.7 s
+   with 16 (6.39x, 6.68x, 6.64x; 9.9, 13.9 and 17.8 GB): the periods' chains bound it.
 3. Report each step as step % and cumulative % with before/after numbers and commit hashes, one commit per step.

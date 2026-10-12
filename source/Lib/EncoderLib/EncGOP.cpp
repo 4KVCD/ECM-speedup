@@ -7626,8 +7626,10 @@ void EncGOP::xStartPicSearch( Picture* pic, PicHeader* picHeader, Slice* slice, 
     m_pcSliceEncoder = &m_pcSearchStack->sliceEncoder;
     m_pcSliceEncoder->loadSetup( *order.setup, *pic );
     order.setup.reset();
-    // the picture's search data (CU, PU and TU maps, coefficients, refined TMVP motion), which the setup does not
-    // create with frame threads: a picture holds it only from here, not while it waits for its inputs and a stack
+    // the picture's search data (reconstruction, per-4x4 arrays, CU, PU and TU maps, coefficients, refined TMVP
+    // motion), which the setup does not create with frame threads: a picture holds it only from here, not while it
+    // waits for its inputs and a stack
+    pic->createSearchBuffers();
     pic->cs->createTemporaryCsData( (bool) pic->cs->sps->getPLTMode() );
 #if JVET_AL0214_MV_REFINEMENT_FOR_TMVP
     int refineTmvpNumRefIdx[2] = { slice->getNumRefIdx( REF_PIC_LIST_0 ), slice->getNumRefIdx( REF_PIC_LIST_1 ) };

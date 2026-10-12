@@ -1351,6 +1351,10 @@ bool EncLib::encodePrep(bool flush, PelStorage* pcPicYuvOrg, const InputColourSp
 #endif
 
     pcPicCurr->poc = m_iPOCLast;
+    if( getFrameThreads() > 1 )
+    {
+      pcPicCurr->releaseSearchBuffers();   // until its search starts (EncGOP::xStartPicSearch)
+    }
 
     // compute image characteristics
     if( getUseAdaptiveQP() )

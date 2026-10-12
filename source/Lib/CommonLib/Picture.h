@@ -120,6 +120,10 @@ void create(
 
   void createTempBuffers( const unsigned _maxCUSize, bool useFilterFrame, bool resChange, bool decoder );
   void destroyTempBuffers();
+  /// frame threads: a picture that waits for its search holds neither its reconstruction nor its coding structure's
+  /// per-4x4 arrays (EncLib::encodePrep releases them, EncGOP::xStartPicSearch creates them)
+  void releaseSearchBuffers();
+  void createSearchBuffers();
 
          PelBuf     getOrigBuf(const CompArea &blk);
   const CPelBuf     getOrigBuf(const CompArea &blk) const;
@@ -381,8 +385,9 @@ public:
   XUCache*           unitCache = nullptr;   ///< CU / PU / TU cache of cs, owned (null: g_globalUnitCache); the decoder gives each
                                             ///< picture its own, pictures being decoded in parallel threads
 
-  uint32_t           getPicWidthInLumaSamples() const                                { return  getRecoBuf( COMPONENT_Y ).width; }
-  uint32_t           getPicHeightInLumaSamples() const                               { return  getRecoBuf( COMPONENT_Y ).height; }
+  // the picture's area, the reconstruction's size (which a picture that waits for its search may not have yet)
+  uint32_t           getPicWidthInLumaSamples() const                                { return  lumaSize().width; }
+  uint32_t           getPicHeightInLumaSamples() const                               { return  lumaSize().height; }
   Window&            getConformanceWindow()                                          { return  m_conformanceWindow; }
   const Window&      getConformanceWindow() const                                    { return  m_conformanceWindow; }
   Window&            getScalingWindow()                                              { return  m_scalingWindow; }
@@ -415,6 +420,10 @@ public:
 #if !KEEP_PRED_AND_RESI_SIGNALS
 private:
   UnitArea m_ctuArea;
+  // how create() made the reconstruction, for createSearchBuffers
+  unsigned m_maxCUSizeReco    = 0;
+  int      m_numRecoBufs      = 1;
+  bool     m_useWrapAroundBuf = false;
 #endif
 #if JVET_AK0085_TM_BOUNDARY_PADDING
   bool m_useTMBP;

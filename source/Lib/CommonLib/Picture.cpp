@@ -239,12 +239,15 @@ void Picture::create(
   margin            =  rprEnabled?(MAX_SCALING_RATIO*_margin):_margin;
   const Area a      = Area( Position(), size );
 
+  m_maxCUSizeReco    = _maxCUSize;
+  m_useWrapAroundBuf = useWrapAround;
 #if JVET_Z0118_GDR
   int numPt = (gdrEnabled) ? 2 : 1;
+  m_numRecoBufs = numPt;
   for (int i = 0; i < numPt; i++)
   {
     M_BUFS(0, PIC_RECONSTRUCTION_0 + i).create(_chromaFormat, a, _maxCUSize, margin, MEMORY_ALIGN_DEF_SIZE);
-  }  
+  }
 #else
   M_BUFS( 0, PIC_RECONSTRUCTION ).create( _chromaFormat, a, _maxCUSize, margin, MEMORY_ALIGN_DEF_SIZE );
 #endif
@@ -321,6 +324,40 @@ void Picture::destroy()
       m_spliceIdx = NULL;
     }
   }
+}
+
+void Picture::releaseSearchBuffers()
+{
+#if JVET_Z0118_GDR
+  for( int i = 0; i < m_numRecoBufs; i++ )
+  {
+    M_BUFS( 0, PIC_RECONSTRUCTION_0 + i ).destroy();
+  }
+#else
+  M_BUFS( 0, PIC_RECONSTRUCTION ).destroy();
+#endif
+  M_BUFS( 0, PIC_RECON_WRAP ).destroy();
+  cs->releasePicData();
+  cs->rebindPicBufs();   // drops the coding structure's view of the reconstruction
+}
+
+void Picture::createSearchBuffers()
+{
+  const Area a( Position(), lumaSize() );
+#if JVET_Z0118_GDR
+  for( int i = 0; i < m_numRecoBufs; i++ )
+  {
+    M_BUFS( 0, PIC_RECONSTRUCTION_0 + i ).create( chromaFormat, a, m_maxCUSizeReco, margin, MEMORY_ALIGN_DEF_SIZE );
+  }
+#else
+  M_BUFS( 0, PIC_RECONSTRUCTION ).create( chromaFormat, a, m_maxCUSizeReco, margin, MEMORY_ALIGN_DEF_SIZE );
+#endif
+  if( m_useWrapAroundBuf )
+  {
+    M_BUFS( 0, PIC_RECON_WRAP ).create( chromaFormat, a, m_maxCUSizeReco, margin, MEMORY_ALIGN_DEF_SIZE );
+  }
+  cs->createPicData();
+  cs->rebindPicBufs();
 }
 
 void Picture::createTempBuffers( const unsigned _maxCUSize, bool useFilterFrame, bool resChange, bool decoder)

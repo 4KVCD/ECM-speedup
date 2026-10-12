@@ -221,7 +221,19 @@ void CodingStructure::destroy()
 
   destroyTemporaryCsData();
 
+#if JVET_Z0118_GDR
+  if (picHeader && m_gdrEnabled)
+  {
+    delete picHeader;
+  }
 
+  picHeader = nullptr;
+#endif
+  releasePicData();
+}
+
+void CodingStructure::releasePicData()
+{
 #if JVET_Z0118_GDR
   delete[] m_motionBuf0;
   if (m_gdrEnabled)
@@ -230,13 +242,6 @@ void CodingStructure::destroy()
   }
   m_motionBuf0 = nullptr;
   m_motionBuf1 = nullptr;
-
-  if (picHeader && m_gdrEnabled)
-  {
-    delete picHeader;
-  }
-
-  picHeader = nullptr;  
 #else
   delete[] m_motionBuf;
   m_motionBuf = nullptr;
@@ -2088,6 +2093,12 @@ void CodingStructure::createInternals(const UnitArea& _unit, const bool isTopLay
   m_isTopLayer = isTopLayer;
   if( !isTopLayer ) createTemporaryCsData(isPLTused);
 
+  createPicData();
+  if (!isTopLayer) initStructData();
+}
+
+void CodingStructure::createPicData()
+{
   unsigned _lumaAreaScaled = g_miScaling.scale( area.lumaSize() ).area();
 #if JVET_Z0118_GDR
   m_motionBuf0 = new MotionInfo[_lumaAreaScaled];
@@ -2121,7 +2132,6 @@ void CodingStructure::createInternals(const UnitArea& _unit, const bool isTopLay
   m_ipmBuf          = new uint8_t[_lumaAreaScaled];
 #endif
 #endif // JVET_W0123_TIMD_FUSION
-  if (!isTopLayer) initStructData();
 }
 
 void CodingStructure::addMiToLut(static_vector<MotionInfo, MAX_NUM_HMVP_CANDS> &lut, const MotionInfo &mi)

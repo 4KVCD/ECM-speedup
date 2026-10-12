@@ -180,6 +180,10 @@ public:
 #endif
 
   void rebindPicBufs();
+  /// the per-4x4 arrays (motion, intra modes, CCP and EIP indices, QT depth), which a picture that waits for its search
+  /// does not hold with frame threads (Picture::releaseSearchBuffers)
+  void createPicData();
+  void releasePicData();
 #if JVET_AC0060_IBC_BVP_CLUSTER_RRIBC_BVD_SIGN_DERIV && !JVET_AD0208_IBC_ADAPT_FOR_CAM_CAPTURED_CONTENTS
   void createTMBuf(const int cbWidth, const int cbHeight);
   void destroyTMBuf();
