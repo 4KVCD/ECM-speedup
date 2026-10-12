@@ -260,7 +260,8 @@ protected:
   void  xInitAPS          (APS &aps);                 ///< initialize APS from encoder options
   void  xInitScalingLists ( SPS &sps, APS &aps );     ///< initialize scaling lists
   std::vector<TrQuant*> xAllTrQuants();               ///< the quantizers of the search stacks and their helpers
-  void xCreateFinishObjects( LoopFilter& loopFilter, EncAdaptiveLoopFilter& alf, EncSampleAdaptiveOffset& sao );
+  void xCreateFinishObjects( LoopFilter& loopFilter, EncAdaptiveLoopFilter& alf, EncSampleAdaptiveOffset& sao,
+                             bool saoEncData );
   void  xInitPPSforLT(PPS& pps);
   void  xInitHrdParameters(SPS &sps);                 ///< initialize HRDParameters parameters
 

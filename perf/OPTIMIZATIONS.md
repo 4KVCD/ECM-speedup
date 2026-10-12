@@ -111,8 +111,9 @@ lower all-core turbo, one duplicated intra frame per chunk, unequal chunk comple
   10 periods at 4.4x with M = 4 and 5.9x with M = 8, at a cost in memory). LD gains nothing. `--ParallelSegments`
   combines with it.
 - Memory: a search stack commits about 0.85 GB whatever the resolution; the setup stack and the finish stacks are
-  small. Each period beyond the first adds a finish context (about 33 MB at 128x128, 75 MB at CIF and 0.8 GB at 1080p,
-  mostly ALF and SAO statistics), and up to max(N, GOPSize) x M pictures are in flight. A picture that waits for its
+  small. Each period beyond the first adds a finish context (about 0.13 GB at 1080p while idle; a running finish
+  creates the SAO statistics, 0.6 GB at 1080p, and frees them after its SAO), and up to max(N, GOPSize) x M pictures
+  are in flight. A picture that waits for its
   search holds its buffers, coding structure and temporary buffers (about 68 MB at 1080p); its search data (about
   80 MB more) is created when its search starts. RA 1080p with N = 8 and M = 4 committed about 27 GB in its first
   5 minutes.

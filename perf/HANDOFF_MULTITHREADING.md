@@ -151,9 +151,9 @@ Commits on `enc-mt`, all bit-exact with stock ECM-20.0 (bitstream md5 of the sui
   - Still held by a waiting picture: its reconstruction and coding structure (motion fields and per-4x4 maps, about
     40 MB at 1080p; EncGOP's setup code touches neither directly) and the temporary buffers (true and filtered
     original, which the temporal filter writes in the setup, and the residual). A finish context is about 0.8 GB at
-    1080p; the ALF encoder's per-CTU statistics (`EncAdaptiveLoopFilter::m_alfCovariance`: per CTU, fixed-filter set,
-    classifier and class) are likely most of it (not measured). If a finish only uses the statistics of its own
-    picture (not checked yet), the contexts could share them through a pool.
+    1080p, measured with the same probe: SAO statistics (`createEncData`) 625 MB, ALF 97 MB, loop filter 7 MB, the
+    rest 28 MB. A finish frees and creates the SAO statistics around its SAO (as stock), so contexts beyond the first no
+    longer create them at startup: an idle context is about 0.13 GB.
 - Found by the matrix of stage A: `--FrameThreads` >= 3 stopped with "PDP predictor unavailable" on ra_cif (bug of
   cfe3c39a, fixed in its own commit): a search stack's first picture used IntraPrediction's PDP buffer pointers before
   any CU of that stack had set them.

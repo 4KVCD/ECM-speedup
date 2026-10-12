@@ -191,7 +191,7 @@ void EncLib::create( const int layerId )
 #endif
   }
 
-  xCreateFinishObjects( m_cLoopFilter, m_cEncALF, m_cEncSAO );
+  xCreateFinishObjects( m_cLoopFilter, m_cEncALF, m_cEncSAO, true );
   // frame threads: a finish context per intra period whose finishes run at the same time
   EncFinishContext own;
   own.alf            = &m_cEncALF;
@@ -211,7 +211,9 @@ void EncLib::create( const int layerId )
   {
     m_finishObjects.emplace_back( new EncFinishObjects );
     EncFinishObjects& objects = *m_finishObjects.back();
-    xCreateFinishObjects( objects.loopFilter, objects.alf, objects.sao );
+    // the SAO statistics of a picture's finish are created before its SAO and freed after it (EncGOP): an idle context
+    // holds none (625 MB at 1080p)
+    xCreateFinishObjects( objects.loopFilter, objects.alf, objects.sao, false );
 #if JVET_AM0209_CHROMA_ALF_CCALF_REUSE_CTU
     objects.alf.m_pictureControlInfo = objects.pictureControlInfo;
 #endif
@@ -243,7 +245,8 @@ void EncLib::create( const int layerId )
   }
 }
 
-void EncLib::xCreateFinishObjects( LoopFilter& loopFilter, EncAdaptiveLoopFilter& alf, EncSampleAdaptiveOffset& sao )
+void EncLib::xCreateFinishObjects( LoopFilter& loopFilter, EncAdaptiveLoopFilter& alf, EncSampleAdaptiveOffset& sao,
+                                   bool saoEncData )
 {
   loopFilter.create( floorLog2( m_maxCUWidth ) - MIN_CU_LOG2 );
   if( !m_bLoopFilterDisable && m_encDbOpt )
@@ -300,7 +303,10 @@ void EncLib::xCreateFinishObjects( LoopFilter& loopFilter, EncAdaptiveLoopFilter
     const uint32_t numCtuInFrame = widthInCtus * heightInCtus;
     sao.create(m_iSourceWidth, m_iSourceHeight, m_chromaFormatIDC, m_maxCUWidth, m_maxCUHeight, floorLog2(m_maxCUWidth) - m_log2MinCUSize, (uint32_t)std::max(0, m_bitDepth[CHANNEL_TYPE_LUMA] - MAX_SAO_TRUNCATED_BITDEPTH), (uint32_t)std::max(0, m_bitDepth[CHANNEL_TYPE_CHROMA] - MAX_SAO_TRUNCATED_BITDEPTH));
 #endif
-    sao.createEncData(m_saoCtuBoundary, numCtuInFrame);
+    if( saoEncData )
+    {
+      sao.createEncData(m_saoCtuBoundary, numCtuInFrame);
+    }
 #if JVET_AJ0237_INTERNAL_12BIT
     sao.m_bilateralFilter.setInternalBitDepth(m_bitDepth[COMPONENT_Y]);
 #endif
