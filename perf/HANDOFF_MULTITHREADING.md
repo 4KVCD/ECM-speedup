@@ -143,6 +143,17 @@ Commits on `enc-mt`, all bit-exact with stock ECM-20.0 (bitstream md5 of the sui
   (250 MB per search stack), is a cache of one CU: a CU's GPM test starts with all rows unavailable, and no row of an
   earlier CU is read (probe: 84 million reads). A CU now takes a 43 kB block per index pair it uses from a pool
   (at most 525 pairs, 22 MB, in the probe), which the next CU reuses.
+- P5 stage C: with frame threads, a picture's temporary coding-structure data and refined TMVP data are created when
+  its search starts (`xStartPicSearch`), not in the setup. A commit probe at 1080p (temporary counters around each
+  allocation) put a picture at about 150 MB: buffers 16 MB and coding structure 30-33 MB when read, temporary buffers
+  19.5 MB, temporary coding-structure data 35 MB and refined TMVP data 35-51 MB in the setup. RA 1080p with 8 threads
+  and 4 periods, first 5 minutes: 37.4 -> 26.7 GB (M = 8 before: 58.8 GB).
+  - Still held by a waiting picture: its reconstruction and coding structure (motion fields and per-4x4 maps, about
+    40 MB at 1080p; EncGOP's setup code touches neither directly) and the temporary buffers (true and filtered
+    original, which the temporal filter writes in the setup, and the residual). A finish context is about 0.8 GB at
+    1080p; the ALF encoder's per-CTU statistics (`EncAdaptiveLoopFilter::m_alfCovariance`: per CTU, fixed-filter set,
+    classifier and class) are likely most of it (not measured). If a finish only uses the statistics of its own
+    picture (not checked yet), the contexts could share them through a pool.
 - Found by the matrix of stage A: `--FrameThreads` >= 3 stopped with "PDP predictor unavailable" on ra_cif (bug of
   cfe3c39a, fixed in its own commit): a search stack's first picture used IntraPrediction's PDP buffer pointers before
   any CU of that stack had set them.

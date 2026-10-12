@@ -2753,7 +2753,10 @@ void EncGOP::compressGOP(int iPOCLast, int iNumPicRcvd, PicList &rcListPic, std:
       }
       pcPic->getFilteredOrigBuf().copyFrom(pcPic->getOrigBuf());
     }
-    pcPic->cs->createTemporaryCsData((bool)pcPic->cs->sps->getPLTMode());
+    if( !m_ftActive )   // with frame threads, the search start creates the search data (xStartPicSearch)
+    {
+      pcPic->cs->createTemporaryCsData((bool)pcPic->cs->sps->getPLTMode());
+    }
 
     //  Slice data initialization
     pcPic->clearSliceBuffer();
@@ -3975,8 +3978,11 @@ void EncGOP::compressGOP(int iPOCLast, int iNumPicRcvd, PicList &rcListPic, std:
     pcSlice->generateEqualPocDist();
 #endif
 #if JVET_AL0214_MV_REFINEMENT_FOR_TMVP
-    int refineTmvpNumRefIdx[2] = { pcSlice->getNumRefIdx(REF_PIC_LIST_0), pcSlice->getNumRefIdx(REF_PIC_LIST_1) };
-    pcSlice->getPic()->cs->createTemporaryRefineTmvpCsData(pcSlice->isIntra(), refineTmvpNumRefIdx, false);
+    if( !m_ftActive )
+    {
+      int refineTmvpNumRefIdx[2] = { pcSlice->getNumRefIdx(REF_PIC_LIST_0), pcSlice->getNumRefIdx(REF_PIC_LIST_1) };
+      pcSlice->getPic()->cs->createTemporaryRefineTmvpCsData(pcSlice->isIntra(), refineTmvpNumRefIdx, false);
+    }
 #endif
 
     double lambda            = 0.0;
@@ -7620,6 +7626,13 @@ void EncGOP::xStartPicSearch( Picture* pic, PicHeader* picHeader, Slice* slice, 
     m_pcSliceEncoder = &m_pcSearchStack->sliceEncoder;
     m_pcSliceEncoder->loadSetup( *order.setup, *pic );
     order.setup.reset();
+    // the picture's search data (CU, PU and TU maps, coefficients, refined TMVP motion), which the setup does not
+    // create with frame threads: a picture holds it only from here, not while it waits for its inputs and a stack
+    pic->cs->createTemporaryCsData( (bool) pic->cs->sps->getPLTMode() );
+#if JVET_AL0214_MV_REFINEMENT_FOR_TMVP
+    int refineTmvpNumRefIdx[2] = { slice->getNumRefIdx( REF_PIC_LIST_0 ), slice->getNumRefIdx( REF_PIC_LIST_1 ) };
+    pic->cs->createTemporaryRefineTmvpCsData( slice->isIntra(), refineTmvpNumRefIdx, false );
+#endif
 #if JVET_AI0136_ADAPTIVE_DUAL_TREE
     std::lock_guard<std::mutex> lock( m_ftMutex );
     if( m_ftWriterPartitionerSST )
