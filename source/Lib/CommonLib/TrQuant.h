@@ -86,9 +86,6 @@ public:
   /// the matrix of xIT's inverse transform of type trType and size 2^log2Size, read back from its transform function:
   /// m[k * size + i] is the contribution of coefficient k to sample i; false where there is no such function
   bool getInvTransformMatrix( const int trType, const int log2Size, std::vector<TCoeff> &m ) const;
-  /// the input of xIT for the block: its dequantized coefficients after the inverse LFNST (invTransformNxN's first
-  /// steps; valid until the next transform). Read by the decoder's GPU reconstruction.
-  CCoeffBuf getInvLfnstOutput( const TransformUnit &tu, const ComponentID compID, const QpParam &cQP );
 
 #if AHG7_LN_TOOLOFF_CFG
 #if JVET_R0351_HIGH_BIT_DEPTH_SUPPORT
@@ -293,7 +290,6 @@ private:
 
   // inverse transform
   void xGetInvTrParams( const TransformUnit &tu, const ComponentID &compID, const int width, const int height, int &trTypeHor, int &trTypeVer, int &skipWidth, int &skipHeight, bool &allowNSPT );
-  void xDeQuantLfnst( const TransformUnit &tu, const ComponentID &compID, const QpParam &cQP, CoeffBuf &tempCoeff );
   void xIT     ( const TransformUnit &tu, const ComponentID &compID, const CCoeffBuf &pCoeff, PelBuf &pResidual );
 #if SIGN_PREDICTION && JVET_Y0141_SIGN_PRED_IMPROVE
 #if JVET_AJ0237_INTERNAL_12BIT

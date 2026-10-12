@@ -2,7 +2,7 @@
 #ifndef INTRA_COMMON_GLSL
 #define INTRA_COMMON_GLSL
 
-// one transform block of one component (87 int32, layout shared with GpuIntraRec.cpp)
+// one transform block of one component (94 int32, layout shared with GpuIntraRec.cpp)
 struct Tu
 {
   int comp, x, y, w, h;
@@ -34,8 +34,13 @@ struct Tu
   int transformSkip;    // the dequantized levels are the residual (with BDPCM the host accumulated the levels)
   int mipMatrix;        // MIP: the mode's matrix in the matrices buffer (-1: no MIP; dirMode is then DC)
   int mipTransposed, mipSizeId;
-  int precomputed;      // the host's coefficients are 1: dequantized and inverse-LFNST'ed, 2: the residual (NSPT)
-  int mrl;              // multiRefIdx: the reference line (0, 1, 3, 5, 7, 12; luma)
+  // the inverse LFNST or NSPT (TrQuant::xInvLfnst, xInvNspt; SEC_*): its matrix (int8, at secMatrix in the kernels
+  // buffer) takes secNumIn dequantized coefficients in the scan at secScan (in the matrices buffer, x | y << 16) and
+  // gives secRowLength outputs per input; LFNST's go to the positions at secLayout in the top-left secSize x secSize
+  // (the coefficients' region), whose dequantized coefficients the others keep, before the primary transform; NSPT's
+  // are the residual, row after row (secTranspose: column after column)
+  int secKind, secMatrix, secRowLength, secNumIn, secScan, secLayout, secSize, secTranspose;
+  int mrl;             // multiRefIdx: the reference line (0, 1, 3, 5, 7, 12; luma)
   int bfAvail[3];       // the bilateral filter's padding: the corner flag, the available above / left units (line 0)
   int isp;              // ISP sub-partition (luma): 1 horizontal split, 2 vertical split (0: none)
   int cuX, cuY, cuW, cuH;   // ISP: the CU (its references, the bilateral filter's padding origin)
@@ -51,6 +56,11 @@ struct Tu
   int resiFrom;
 };
 layout( buffer_reference, std430, buffer_reference_align = 4 ) buffer BufTu { Tu v[]; };
+
+// Tu::secKind
+const int SEC_NONE  = 0;
+const int SEC_LFNST = 1;
+const int SEC_NSPT  = 2;
 
 // the signPred data of a block (at Tu::spOffset): the number of predicted signs (1..8), the coded residual signs (bit
 // i: predicted coefficient i is negative), the predicted coefficients in decision order (x | y << 16), then from
@@ -186,6 +196,7 @@ struct Params
   uint64_t numDep;      // int32 per block: its number of dependents, then the entries written (intra_deps)
   uint64_t lmcs;        // int32, lmcsLutSize entries each: the forward LUT, the inverse LUT, the chroma scale of each average luma
   uint64_t signPred;    // int32: the sign prediction data of the blocks with predicted signs (at Tu::spOffset, SP_*)
+  uint64_t secKernels;  // int8: the LFNST and NSPT matrices (at Tu::secMatrix)
   int      origin[3];
   int      stride[3];
   int      width[3];

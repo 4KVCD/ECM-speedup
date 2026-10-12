@@ -6,8 +6,9 @@
 // the matrices the host reads back from xIT's transform functions, DCT-II or the MTS types, whose integer sums and
 // single rounding equal those of the functions, butterflies included; one stage for the 1-D transforms of ISP
 // sub-partitions 1 wide or high), or with transform skip the dequantized levels
-// themselves (BDPCM: the host accumulates the levels first). With LFNST the host gives the dequantized, inverse-LFNST'ed
-// coefficients, with NSPT the residual itself (Tu::precomputed). The result
+// themselves (BDPCM: the host accumulates the levels first). With LFNST (TrQuant::xInvLfnst) the coefficients of the
+// top-left region go through its matrix before the primary transform; NSPT's matrix (xInvNspt) replaces the primary
+// transform (both matrices are the CPU's int8 tables, chosen by the host). The result
 // goes to the residual buffer intra_rec adds to its prediction, with joint CbCr together with the other chroma
 // component's residual derived from it. With sign prediction the predicted signs are positive here, and the templates
 // of the predicted coefficients go to the signPred buffer: intra_rec decides the signs and, where one is negative,
@@ -24,6 +25,11 @@ layout( local_size_x = 256 ) in;
 // the first stage's output, clipped to the transform range (16 bits without extended precision, which the host
 // rejects): column xf of the levels at xf * H + y
 shared int16_t s_stage1[128 * 128];
+// LFNST / NSPT: their inputs (dequantized, in scan order); LFNST: the dequantized coefficients of the top-left region
+// (16 x 16 at most) with its outputs written over them, and its outputs before that
+shared int     s_secIn[64];
+shared int     s_lfnst[16 * 16];
+shared int     s_lfnstOut[96];
 
 int clip3i( int lo, int hi, int v )
 {
@@ -62,14 +68,14 @@ void main()
     // the levels lie in rows < nzRows, columns < nzCols: the skipped terms are zero, and so is the first stage of an
     // all-zero column ((0 + rnd1) >> shift1), which the second stage then needs not read
     const int nzR = t.nzRows, nzC = t.nzCols;
-    // TrQuant::xITransformSkip: the residual is the dequantized level (clipped to 16 bits); or the host's residual
-    if( t.transformSkip != 0 || t.precomputed == 2 )
+    // TrQuant::xITransformSkip: the residual is the dequantized level (clipped to 16 bits)
+    if( t.transformSkip != 0 )
     {
       for( int i = lid; i < N; i += NT )
       {
         const int y = i / W, x = i % W;
         const int q = y < nzR && x < nzC ? cf.v[t.coeffOffset + y * nzC + x] : 0;
-        const int r = t.precomputed == 2 || q == 0 ? q : dequant( t, q, addDq, mt, P.qcsOffset );
+        const int r = q == 0 ? 0 : dequant( t, q, addDq, mt, P.qcsOffset );
         resi.v[codedOffset + i] = int16_t( r );
         if( t.jccr != 0 )
         {
@@ -91,12 +97,71 @@ void main()
           const int q = cf.v[t.coeffOffset + k];
           if( q != 0 )
           {
-            sum += mt.v[off + k * N + i] * ( t.precomputed != 0 ? q : dequant( t, q, addDq, mt, P.qcsOffset ) );
+            sum += mt.v[off + k * N + i] * dequant( t, q, addDq, mt, P.qcsOffset );
           }
         }
         resi.v[codedOffset + i] = int16_t( clip3i( t.trMin, t.trMax, ( sum + ( 1 << ( shift - 1 ) ) ) >> shift ) );
       }
       continue;
+    }
+    BufI8 kernels = BufI8( P.secKernels );
+    // NSPT (TrQuant::xInvNspt, computeInvNspt): the first secNumIn dequantized coefficients in scan order times its
+    // matrix are the residual, each rounded and shifted by shift_1st + shift_2nd - 7 and clipped
+    if( t.secKind == SEC_NSPT )
+    {
+      for( int i = lid; i < t.secNumIn; i += NT )
+      {
+        const int pos = mt.v[t.secScan + i], x = pos & 0xffff, y = pos >> 16;
+        const int q   = y < nzR && x < nzC ? cf.v[t.coeffOffset + y * nzC + x] : 0;
+        s_secIn[i] = q != 0 ? dequant( t, q, addDq, mt, P.qcsOffset ) : 0;
+      }
+      barrier();
+      const int shift = t.shift1 + t.shift2 - 7;
+      for( int i = lid; i < N; i += NT )
+      {
+        const int y = i / W, x = i % W, j = t.secTranspose != 0 ? x * H + y : i;
+        int sum = 0;
+        for( int k = 0; k < t.secNumIn; k++ ) sum += s_secIn[k] * int( kernels.v[t.secMatrix + k * t.secRowLength + j] );
+        const int r = clip3i( t.trMin, t.trMax, ( sum + ( 1 << ( shift - 1 ) ) ) >> shift );
+        resi.v[codedOffset + i] = int16_t( r );
+        if( t.jccr != 0 )
+        {
+          resi.v[derivedOffset + i] = int16_t( jccrDerived( t.jccr, r ) );
+        }
+      }
+      barrier();
+      continue;
+    }
+    // LFNST (TrQuant::xInvLfnst, invLfnstNxN): the coefficients' region is its top-left square (nzRows = nzCols =
+    // secSize); its first secNumIn dequantized coefficients in scan order times its matrix, rounded by 7 bits and
+    // clipped, overwrite the coefficients at its output positions
+    if( t.secKind == SEC_LFNST )
+    {
+      for( int i = lid; i < nzR * nzC; i += NT )
+      {
+        const int q = cf.v[t.coeffOffset + i];
+        s_lfnst[i] = q != 0 ? dequant( t, q, addDq, mt, P.qcsOffset ) : 0;
+      }
+      barrier();
+      for( int i = lid; i < t.secNumIn; i += NT )
+      {
+        const int pos = mt.v[t.secScan + i];
+        s_secIn[i] = s_lfnst[( pos >> 16 ) * nzC + ( pos & 0xffff )];
+      }
+      barrier();
+      for( int j = lid; j < t.secRowLength; j += NT )
+      {
+        int sum = 0;
+        for( int k = 0; k < t.secNumIn; k++ ) sum += s_secIn[k] * int( kernels.v[t.secMatrix + k * t.secRowLength + j] );
+        s_lfnstOut[j] = clip3i( t.trMin, t.trMax, ( sum + 64 ) >> 7 );
+      }
+      barrier();
+      for( int j = lid; j < t.secRowLength; j += NT )
+      {
+        const int pos = mt.v[t.secLayout + j];
+        s_lfnst[( pos >> 16 ) * nzC + ( pos & 0xffff )] = s_lfnstOut[j];
+      }
+      barrier();
     }
     // sign prediction (TrQuant::predCoeffSigns' templates, createTemplate): per predicted coefficient the left column
     // (bottom-up) and the top row of the residual of that coefficient alone with the amplitude 1 << 8 (xIT of one
@@ -117,17 +182,22 @@ void main()
         sp.v[t.spOffset + SP_TEMPLATES + i] = int( int16_t( ( coeffVal * basis + 128 ) >> 8 ) );   // a Pel
       }
     }
-    // first stage (vertical): s_stage1[xf * H + y] from the dequantized coefficient column xf
+    // first stage (vertical): s_stage1[xf * H + y] from the dequantized coefficient column xf (with LFNST its output)
     for( int i = lid; i < nzC * H; i += NT )
     {
       const int xf = i / H, y = i % H;
       int sum = 0;
       for( int k = 0; k < nzR; k++ )
       {
+        if( t.secKind == SEC_LFNST )
+        {
+          sum += mt.v[offH + k * H + y] * s_lfnst[k * nzC + xf];
+          continue;
+        }
         const int q = cf.v[t.coeffOffset + k * nzC + xf];
         if( q != 0 )
         {
-          sum += mt.v[offH + k * H + y] * ( t.precomputed != 0 ? q : dequant( t, q, addDq, mt, P.qcsOffset ) );
+          sum += mt.v[offH + k * H + y] * dequant( t, q, addDq, mt, P.qcsOffset );
         }
       }
       s_stage1[xf * H + y] = int16_t( clip3i( t.trMin, t.trMax, ( sum + rnd1 ) >> t.shift1 ) );

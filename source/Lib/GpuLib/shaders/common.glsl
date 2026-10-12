@@ -12,6 +12,7 @@
 layout( buffer_reference, std430, buffer_reference_align = 2 ) buffer BufI16 { int16_t v[]; };
 layout( buffer_reference, std430, buffer_reference_align = 2 ) buffer BufU16 { uint16_t v[]; };
 layout( buffer_reference, std430, buffer_reference_align = 1 ) buffer BufU8 { uint8_t v[]; };
+layout( buffer_reference, std430, buffer_reference_align = 1 ) buffer BufI8 { int8_t v[]; };
 layout( buffer_reference, std430, buffer_reference_align = 4 ) buffer BufI32 { int v[]; };
 
 struct Plane

@@ -13,7 +13,7 @@ wall-clock gains with threads are "the easy baseline". Decoder status: single-th
 (`--GpuLoopFilter=1`: ALF, SAO, BIF, CCSAO, LF-CCCM, offset refinement on Vulkan). The user then asked for **a full
 GPU decoder in Vulkan, optimized until nothing is left** ("The GPU decoder needs to fully decode the frame on the
 GPU"; "Your first Vulkan version is going to be slow. That's OK"). That work is branch `dec-gpurecon`: intra
-reconstruction on the GPU (`--GpuRecon`), tool levels M1-M14 done and verified bit-exact; it is **not yet faster than
+reconstruction on the GPU (`--GpuRecon`), tool levels M1-M15 done and verified bit-exact; it is **not yet faster than
 the CPU decoder** (see section 8) and supports only a restricted tool set (all real CTC streams fall back to the CPU,
 first reason: TMRL).
 
@@ -174,6 +174,12 @@ commands that combine `Remove-Item` with `//` text. `perf\gpu\crlf.ps1 <worktree
     CbCr with Cb and with Cr coded, ISP, MIP, MRL, the bilateral filter, at the picture's edges, 1 to 8 signs), 1822
     with a negative decided sign (the residual computed again), 1324 with a wrong prediction; m14a_fore22 predicts
     coefficients up to (19, 19); m14_park720 / m14s_park720 have 613 / 1215 chroma blocks with LMCS chroma scaling.
+    1080p: `h14_crowd`, `h14_park` (`enc_m1.ps1`, 2 pictures, QP 32, m14's arguments).
+  - M15 (LFNST and NSPT on the GPU; the m11-m13 sets have both): `m15n` (m13's arguments with `--NSPT=0`: LFNST also
+    on the small blocks NSPT otherwise takes, i.e. its 4x4 and 8x8 regions; m15n_fore32 has 362 / 125 LFNST blocks
+    with a 4x4 region (plain / transposed), 485 / 157 with 8x8, 162 / 55 with 16x16), `m15s` (m13's arguments with
+    `--DualITree=0`: in a single tree only luma takes LFNST / NSPT). NSPT in m11_fore32: all 12 block shapes, 870
+    plain / 352 transposed; chroma and joint CbCr blocks with LFNST / NSPT in the dual-tree sets.
   - `fx_wpp_park720`, `fx_tiles_park720` (m11's arguments plus `--WaveFrontSynchro=1`, resp. `--EnablePicPartitioning=1
     --TileColumnWidthArray=3 --TileRowHeightArray=2 --RasterScanSlices=1 --RasterSliceSizes=100`: one slice of 4x3
     tiles): must fall back to the CPU ("wavefronts", "tiles").
@@ -251,17 +257,18 @@ M7: joint CbCr (the Cb block computes both residuals in intra_resi; Tu::jccr, jc
 M8: explicit intra MTS (TrQuant::getInvTransformTypes per block; every transform matrix read back by impulses with
 TrQuant::getInvTransformMatrix; Tu::mtxV, mtxH). M9: transform skip and BDPCM (Tu::transformSkip; invResDPCM on
 the host; BDPCM blocks predict as mode 18 / 50 with the filters off). M10: MIP (Tu::mipMatrix etc.; recorded with the
-DC mode for the read range and the bilateral filter). M11: LFNST / NSPT on the host side (Tu::precomputed: 1 the
-host's dequantized, inverse-LFNST'ed coefficients, 2 the host's residual for NSPT). M12: MRL (Tu::mrl; the MRL unit
-groups left of and above the corner in avail[line][5..6]; Tu::bfAvail, line 0's availability for the bilateral
-filter of MRL DC blocks). M13: ISP (Tu::isp, cuX..cuH, regX / regW the prediction region, ispSide, ispPrev the
+DC mode for the read range and the bilateral filter). M11: LFNST / NSPT on the host side (replaced by M15). M12: MRL
+(Tu::mrl; the MRL unit groups left of and above the corner in avail[line][5..6]; Tu::bfAvail, line 0's availability
+for the bilateral filter of MRL DC blocks). M13: ISP (Tu::isp, cuX..cuH, regX / regW the prediction region, ispSide, ispPrev the
 scheduling chain; refSource in GpuIntraRec.cpp and intra_common.glsl gives every reference entry's source sample for
 the fill and the dependencies; 1-D transforms in intra_resi). M14: sign prediction (GpuIntraRec::prepareSignPred takes
 a block's predicted levels and coded signs with DepQuant::getPredictedSigns and gives the TU its levels back;
 intra_resi computes the templates into the signPred buffer and the residual with the predicted signs positive;
 intra_rec's signPrediction decides the signs after the prediction and computes the residual again where one is
 negative; Tu::spCoded, spOffset, resiFrom: with joint CbCr the coded component's block decides and the other block
-waits for it).
+waits for it). M15: LFNST and NSPT on the GPU (GpuIntraRec's invSecondary gives a block's matrix, scan, sizes and
+transposition with the CPU's choices; the CPU's int8 kernel tables, the scans' positions and the LFNST output
+arrangement are uploaded once (Shared::secKernels, matrices); intra_resi runs them; Tu::secKind etc.).
 
 ## 8. Numbers (i7-10700 8C/16T, Win11, GCC 16.2, RTX 3070 driver 616.92)
 
@@ -284,16 +291,16 @@ Profile of a GPU-on decode (non-LTO, m2_park16, share of all samples): parsing ~
 
 1. Time 180ccabc (paired grL builds, `walls.py` with `--GpuRecon=3`, CPU vs GPU, FT8; use m3_park60).
 2. Done (2026-10-11): M4 dual tree, M5 LMCS, M6 dependent quantization and QCS, M7 joint CbCr, M8 explicit MTS,
-   M9 transform skip and BDPCM, M10 MIP, M11 LFNST / NSPT (computed by the host: move to the GPU for speed), M12 MRL,
-   M13 ISP, M14 sign prediction (not of LFNST / NSPT blocks).
+   M9 transform skip and BDPCM, M10 MIP, M11 LFNST / NSPT (computed by the host until M15), M12 MRL, M13 ISP, M14 sign
+   prediction (not of LFNST / NSPT blocks), M15 LFNST / NSPT on the GPU (the VVC kernels, LFNSTExt=0, rejected).
    All 19 regular streams now stop at "TMRL" (the next sequence-level check; the block-level tools of step 4 follow).
 3. Make the GPU path win on CPU time per picture: the derive-only pass (record during parsing or a leaner pass;
    speed up getSpatialIpm/getPURestricted, which also helps the CPU decoder), GPU behaviour with frame threads
    (8 contexts x 32 persistent workgroups oversubscribe the GPU; spinning workgroups; try fewer groups per context,
    more frame threads than cores to hide GPU waits, overlapping a picture's GPU work with the next picture's parse).
 4. More tool levels, roughly in the order CTC AI needs them: LFNST of MIP (with the MIP prediction's DIMD mode), implicit MTS (with
-   DIMD), TMRL (template-selected lines: GPU), sign prediction of LFNST / NSPT blocks (needs LFNST / NSPT on the GPU:
-   their results depend on the decided signs), CCLM/CCCM and the other
+   DIMD), TMRL (template-selected lines: GPU), sign prediction of LFNST / NSPT blocks (intra_rec's recomputed residual
+   and intra_resi's templates through LFNST / NSPT, whose GPU code is in intra_resi since M15), CCLM/CCCM and the other
    cross-component tools (GPU), DIMD/TIMD/MPM sorting/chroma reordering/DBV (mode derivations that read the
    reconstruction: these have to move to the GPU too), IntraTMP/IBC, then inter pictures. Each level: new test set
    with exactly that tool on, verify mode identical, canaries, commit.

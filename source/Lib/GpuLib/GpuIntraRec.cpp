@@ -65,7 +65,7 @@
 
 namespace
 {
-// layout shared with intra_rec.comp (struct Tu): 87 int32
+// layout shared with intra_rec.comp (struct Tu): 94 int32
 struct Tu
 {
   int32_t comp, x, y, w, h;
@@ -93,7 +93,7 @@ struct Tu
   int32_t mtxV, mtxH;
   int32_t transformSkip;
   int32_t mipMatrix, mipTransposed, mipSizeId;
-  int32_t precomputed;
+  int32_t secKind, secMatrix, secRowLength, secNumIn, secScan, secLayout, secSize, secTranspose;
   int32_t mrl;
   int32_t bfAvail[3];
   int32_t isp;
@@ -104,7 +104,7 @@ struct Tu
   int32_t spCoded, spOffset;
   int32_t resiFrom;
 };
-static_assert( sizeof( Tu ) == 87 * 4, "Tu layout" );
+static_assert( sizeof( Tu ) == 94 * 4, "Tu layout" );
 
 // the signPred data of a block (intra_common.glsl's SP_*): the number of predicted signs, the coded signs, the
 // positions, then the templates intra_resi computes
@@ -123,9 +123,151 @@ constexpr int QUANT_QCS = 2;   // quantization center shift (JVET-AN0095 / JVET-
 // and computes both residuals; its Cr block, recorded right after it, is marked JCCR_DERIVED
 constexpr int JCCR_DERIVED = 4;
 
-// Tu::precomputed: the host ran a step of the CPU's inverse transform on the coefficients
-constexpr int PRECOMPUTED_COEFFS   = 1;   // dequantized and inverse-LFNST'ed: the input of the primary transform
-constexpr int PRECOMPUTED_RESIDUAL = 2;   // the residual itself (NSPT, which replaces the primary transform)
+// Tu::secKind (intra_common.glsl's SEC_*): the inverse LFNST before the primary transform, or NSPT instead of it
+constexpr int SEC_NONE  = 0;
+constexpr int SEC_LFNST = 1;
+constexpr int SEC_NSPT  = 2;
+
+// the inverse LFNST or NSPT the CPU applies to a block, with its choices (TrQuant::xIT's xGetInvTrParams and
+// CU::nsptApplyCond, xDeQuantLfnst / xInvLfnst / invLfnstNxN with the extended kernels, xInvNspt / getNsptMatrix): the
+// matrix takes numIn coefficients in the order of scan and gives rowLength outputs per input (output j of input i at
+// matrix[i * rowLength + j])
+struct Secondary
+{
+  int                kind      = SEC_NONE;
+  const int8_t*      matrix    = nullptr;
+  int                rowLength = 0;
+  int                numIn     = 0;
+  const ScanElement* scan      = nullptr;
+  int                sbSize    = 0;       // LFNST: its outputs lie in the top-left sbSize x sbSize
+  bool               transpose = false;
+};
+
+// false where the block's LFNST is one the GPU path does not have (the VVC kernels without the extension)
+bool invSecondary( const TransformUnit& tu, const ComponentID compID, Secondary& s )
+{
+  s = Secondary();
+  const CodingUnit& cu   = *tu.cu;
+  const SPS&        sps  = *tu.cs->sps;
+  const CompArea&   area = tu.blocksResidual[compID];
+  const int         W = area.width, H = area.height;
+  if( !cu.lfnstIdx || W < 2 || H < 2 )   // NSPT is in xIT's 2-D path only; LFNST is not signalled there
+  {
+    return true;
+  }
+  const bool spsIntraLfnstEnabled = ( cu.slice->getSliceType() == I_SLICE && sps.getUseIntraLFNSTISlice() )
+                                    || ( cu.slice->getSliceType() != I_SLICE && sps.getUseIntraLFNSTPBSlice() );
+  const bool allowNSPT = CU::isNSPTAllowed( tu, compID, W, H, spsIntraLfnstEnabled && CU::isIntra( cu ) );
+  bool       secondBucket = false;
+  if( CU::nsptApplyCond( tu, compID, allowNSPT ) )
+  {
+    const uint32_t intraMode = PU::getFinalIntraModeForTransform( secondBucket, tu, compID ).first;
+    s.transpose  = PU::getTransposeFlag( intraMode );
+    const int tw = s.transpose ? H : W, th = s.transpose ? W : H;   // the kernel's block
+    s.kind       = SEC_NSPT;
+    s.numIn      = PU::getNSPTMatrixDim( tw, th );
+    s.matrix     = TrQuant::getNsptMatrix( g_nsptLut[intraMode], tw, th, cu.lfnstIdx - 1, PU::getNSPTBucket( tu, secondBucket, compID ) );
+    s.rowLength  = tw * th;
+    s.scan       = g_scanOrder[SCAN_GROUPED_4x4][SCAN_DIAG][gp_sizeIdxInfo->idxFrom( W )][gp_sizeIdxInfo->idxFrom( H )];
+    return true;
+  }
+  const bool lfnstOn = ( spsIntraLfnstEnabled && CU::isIntra( cu ) ) || ( sps.getUseInterLFNST() && CU::isInter( cu ) );
+  if( !lfnstOn || tu.mtsIdx[compID] == MTS_SKIP || !( cu.separateTree || isLuma( compID ) ) || allowNSPT )
+  {
+    return true;
+  }
+  const bool ext = sps.getUseLFNSTExt();
+  if( cu.lfnstIdx >= ( ext ? 4 : 3 ) )
+  {
+    return true;
+  }
+  if( !ext )
+  {
+    return false;
+  }
+  const uint32_t intraMode = PU::getFinalIntraModeForTransform( secondBucket, tu, compID ).first;
+  const bool     whge4 = PU::getUseLFNST16( W, H ), whge3 = PU::getUseLFNST8( W, H );
+  const int      widthIdx = gp_sizeIdxInfo->idxFrom( W ), heightIdx = gp_sizeIdxInfo->idxFrom( H );
+  const int      mode = g_lfnstLut[intraMode], index = cu.lfnstIdx - 1;
+  s.kind      = SEC_LFNST;
+  s.transpose = PU::getTransposeFlag( intraMode );
+  s.sbSize    = whge4 ? 16 : whge3 ? 8 : 4;
+  s.scan      = whge4 ? g_coefTopLeftDiagScan16x16[widthIdx]
+                      : whge3 ? g_coefTopLeftDiagScan8x8[widthIdx] : g_scanOrder[SCAN_GROUPED_4x4][SCAN_DIAG][widthIdx][heightIdx];
+  s.numIn     = PU::getLFNSTMatrixDim( W, H, ext );   // zeroOutSize: the inputs invLfnstNxN uses
+  s.matrix    = s.sbSize > 8 ? &g_lfnst16x16[mode][index][0][0] : s.sbSize > 4 ? &g_lfnst8x8[mode][index][0][0] : &g_lfnst4x4[mode][index][0][0];
+  s.rowLength = s.sbSize > 8 ? L16W_ZO : s.sbSize > 4 ? L8W_ZO : 16;
+  return true;
+}
+
+// xInvLfnst's arrangement of the extended LFNST's outputs in the top-left sbSize x sbSize of the coefficients: the
+// position x | y << 16 of each output, found by replaying its copies (with the CPU's row stride sbSize) on the outputs'
+// numbers
+std::vector<int32_t> lfnstOutputLayout( const int sbSize, const bool transpose )
+{
+  const int            numOut = sbSize > 8 ? L16W_ZO : sbSize > 4 ? L8W_ZO : 16, width = sbSize;
+  std::vector<int32_t> out( numOut ), region( sbSize * sbSize, -1 );
+  for( int j = 0; j < numOut; j++ )
+  {
+    out[j] = j;
+  }
+  const int32_t* lfnstTemp = out.data();
+  int32_t*       coeffTemp = region.data();
+  if( transpose )
+  {
+    if( sbSize == 4 )
+    {
+      for( int y = 0; y < 4; y++, lfnstTemp++, coeffTemp += width )
+      {
+        coeffTemp[0] = lfnstTemp[0]; coeffTemp[1] = lfnstTemp[4]; coeffTemp[2] = lfnstTemp[8]; coeffTemp[3] = lfnstTemp[12];
+      }
+    }
+    else if( sbSize == 8 )
+    {
+      for( int y = 0; y < 8; y++, lfnstTemp++, coeffTemp += width )
+      {
+        for( int x = 0; x < 8; x++ ) coeffTemp[x] = lfnstTemp[8 * x];
+      }
+    }
+    else
+    {
+      for( int y = 0; y < 12; y++, lfnstTemp++, coeffTemp += width )
+      {
+        coeffTemp[0] = lfnstTemp[0]; coeffTemp[1] = lfnstTemp[12]; coeffTemp[2] = lfnstTemp[24]; coeffTemp[3] = lfnstTemp[36];
+        if( y < 8 )
+        {
+          coeffTemp[4] = lfnstTemp[48]; coeffTemp[5] = lfnstTemp[56]; coeffTemp[6] = lfnstTemp[64]; coeffTemp[7] = lfnstTemp[72];
+        }
+        if( y < 4 )
+        {
+          coeffTemp[8] = lfnstTemp[80]; coeffTemp[9] = lfnstTemp[84]; coeffTemp[10] = lfnstTemp[88]; coeffTemp[11] = lfnstTemp[92];
+        }
+      }
+    }
+  }
+  else
+  {
+    for( int y = 0; y < ( sbSize == 16 ? 12 : sbSize ); y++, coeffTemp += width )
+    {
+      const int stride = sbSize == 16 ? ( y < 4 ? 12 : y < 8 ? 8 : 4 ) : sbSize;
+      std::copy_n( lfnstTemp, stride, coeffTemp );
+      lfnstTemp += stride;
+    }
+  }
+  std::vector<int32_t> pos( numOut, -1 );
+  for( int y = 0; y < sbSize; y++ )
+  {
+    for( int x = 0; x < sbSize; x++ )
+    {
+      if( region[y * sbSize + x] >= 0 )
+      {
+        pos[region[y * sbSize + x]] = x | ( y << 16 );
+      }
+    }
+  }
+  CHECK( std::find( pos.begin(), pos.end(), -1 ) != pos.end(), "an LFNST output without a position" );
+  return pos;
+}
 
 // xFillReferenceSamples' rule (the kernels' copy is intra_common.glsl's fillSource): the reconstructed sample (sx, sy)
 // whose value entry idx of the top or left arm of a reference line takes, for the area (fx, fy, fw, fh) filled with
@@ -258,6 +400,7 @@ struct Params
   uint64_t numDep;
   uint64_t lmcs;
   uint64_t signPred;
+  uint64_t secKernels;
   int32_t  origin[3];
   int32_t  stride[3];
   int32_t  width[3];
@@ -272,7 +415,7 @@ struct Params
   int32_t  qcsOffset;
   int32_t  pad;
 };
-static_assert( offsetof( Params, origin ) == 176 && offsetof( Params, edgeCap ) == 256 && sizeof( Params ) == 280,
+static_assert( offsetof( Params, origin ) == 184 && offsetof( Params, edgeCap ) == 264 && sizeof( Params ) == 288,
                "Params layout" );
 
 struct Push
@@ -298,10 +441,41 @@ struct Shared
 {
   gpu::Kernel                      kernel, kernelResi, kernelDeps, kernelScan;
   gpu::Buffer                      filters, matrices;
+  gpu::Buffer                      secKernels;                    // int8: the CPU's LFNST and NSPT tables, one after the other
   int32_t                          trOffset[NUM_TRANS_TYPE][7];   // of the inverse transform matrices of sizes 2..128 in matrices (-1: none)
   int32_t                          qcsOffset = 0;                 // of the QCS weights in matrices
   int32_t                          mipOffset[3] = {};             // of the MIP matrices of each size class in matrices
+  int32_t                          lfnstLayout[3][2] = {};        // of the LFNST output positions in matrices (sbSize 4, 8, 16; transposed)
+  std::vector<std::pair<const int8_t*, size_t>>      secTables;   // each table's start and bytes, in secKernels' order
+  std::vector<std::pair<const ScanElement*, int32_t>> secScans;  // the scans LFNST / NSPT read, their positions' offset in matrices
   std::unique_ptr<BilateralFilter> bif;   // the intra prediction bilateral filter's tables
+
+  // the offset in secKernels of a matrix of the CPU's LFNST / NSPT tables (-1: not in them)
+  int32_t kernelOffset( const int8_t* matrix ) const
+  {
+    size_t offset = 0;
+    for( const auto& table: secTables )
+    {
+      if( matrix >= table.first && matrix < table.first + table.second )
+      {
+        return int32_t( offset + ( matrix - table.first ) );
+      }
+      offset += table.second;
+    }
+    return -1;
+  }
+  // the offset in matrices of the positions (x | y << 16) of a scan LFNST / NSPT read (-1: not one of them)
+  int32_t scanOffset( const ScanElement* scan ) const
+  {
+    for( const auto& s: secScans )
+    {
+      if( s.first == scan )
+      {
+        return s.second;
+      }
+    }
+    return -1;
+  }
 };
 
 Shared* createShared( gpu::Context& ctx )
@@ -372,17 +546,75 @@ Shared* createShared( gpu::Context& ctx )
   mat.insert( mat.end(), &mipMatrix8x8[0][0][0], &mipMatrix8x8[0][0][0] + sizeof( mipMatrix8x8 ) );
   sh->mipOffset[2] = (int32_t) mat.size();
   mat.insert( mat.end(), &mipMatrix16x16[0][0][0], &mipMatrix16x16[0][0][0] + sizeof( mipMatrix16x16 ) );
+  // LFNST / NSPT (invSecondary): the positions x | y << 16 of the first 64 entries of each scan they read (the grouped
+  // 4x4 diagonal scans, the top-left 8x8 / 16x16 ones of LFNST; from each entry's raster index, as the 16x16 scan's x
+  // and y lie within its 8x8 quarters), and the extended LFNST's output positions
+  auto addScan = [&]( const ScanElement* scan, const int width, const int count )
+  {
+    sh->secScans.emplace_back( scan, (int32_t) mat.size() );
+    for( int i = 0; i < count; i++ )
+    {
+      mat.push_back( int32_t( scan[i].idx % width ) | int32_t( scan[i].idx / width ) << 16 );
+    }
+  };
+  for( int wIdx = 0; wIdx < (int) gp_sizeIdxInfo->numWidths() && wIdx <= MAX_CU_DEPTH; wIdx++ )
+  {
+    const int w = gp_sizeIdxInfo->sizeFrom( wIdx );
+    if( w >= 8 && w <= MAX_CU_SIZE )
+    {
+      addScan( g_coefTopLeftDiagScan8x8[wIdx], w, 64 );
+    }
+    if( w >= 16 && w <= MAX_CU_SIZE )
+    {
+      addScan( g_coefTopLeftDiagScan16x16[wIdx], w, 64 );
+    }
+    for( int hIdx = 0; hIdx < (int) gp_sizeIdxInfo->numHeights(); hIdx++ )
+    {
+      const int          h    = gp_sizeIdxInfo->sizeFrom( hIdx );
+      const ScanElement* scan = w >= 4 && h >= 4 && w <= MAX_CU_SIZE && h <= MAX_CU_SIZE ? g_scanOrder[SCAN_GROUPED_4x4][SCAN_DIAG][wIdx][hIdx] : nullptr;
+      if( scan )
+      {
+        addScan( scan, w, std::min( 64, w * h ) );
+      }
+    }
+  }
+  for( int s = 0; s < 3; s++ )
+  {
+    for( int transpose = 0; transpose < 2; transpose++ )
+    {
+      const std::vector<int32_t> layout = lfnstOutputLayout( 4 << s, transpose != 0 );
+      sh->lfnstLayout[s][transpose] = (int32_t) mat.size();
+      mat.insert( mat.end(), layout.begin(), layout.end() );
+    }
+  }
+  // the CPU's LFNST (extended) and NSPT matrices as they are (int8)
+  sh->secTables = { { &g_lfnst4x4[0][0][0][0], sizeof( g_lfnst4x4 ) },   { &g_lfnst8x8[0][0][0][0], sizeof( g_lfnst8x8 ) },
+                    { &g_lfnst16x16[0][0][0][0], sizeof( g_lfnst16x16 ) }, { &g_nspt4x4[0][0][0], sizeof( g_nspt4x4 ) },
+                    { &g_nspt4x8[0][0][0], sizeof( g_nspt4x8 ) },          { &g_nspt8x4[0][0][0], sizeof( g_nspt8x4 ) },
+                    { &g_nspt8x8[0][0][0], sizeof( g_nspt8x8 ) },          { &g_nspt4x16[0][0][0], sizeof( g_nspt4x16 ) },
+                    { &g_nspt16x4[0][0][0], sizeof( g_nspt16x4 ) },        { &g_nspt8x16[0][0][0], sizeof( g_nspt8x16 ) },
+                    { &g_nspt16x8[0][0][0], sizeof( g_nspt16x8 ) },        { &g_nspt4x32[0][0][0], sizeof( g_nspt4x32 ) },
+                    { &g_nspt32x4[0][0][0], sizeof( g_nspt32x4 ) },        { &g_nspt8x32[0][0][0], sizeof( g_nspt8x32 ) },
+                    { &g_nspt32x8[0][0][0], sizeof( g_nspt32x8 ) } };
+  std::vector<int8_t> kernels;
+  for( const auto& table: sh->secTables )
+  {
+    kernels.insert( kernels.end(), table.first, table.first + table.second );
+  }
   sh->filters.create( ctx, filt.size() * 4, gpu::Buffer::DEVICE );
   sh->matrices.create( ctx, mat.size() * 4, gpu::Buffer::DEVICE );
+  sh->secKernels.create( ctx, kernels.size(), gpu::Buffer::DEVICE );
   gpu::Buffer upload;
-  upload.create( ctx, ( filt.size() + mat.size() ) * 4, gpu::Buffer::UPLOAD );
+  upload.create( ctx, ( filt.size() + mat.size() ) * 4 + kernels.size(), gpu::Buffer::UPLOAD );
   memcpy( upload.mapped, filt.data(), filt.size() * 4 );
   memcpy( (char*) upload.mapped + filt.size() * 4, mat.data(), mat.size() * 4 );
+  memcpy( (char*) upload.mapped + ( filt.size() + mat.size() ) * 4, kernels.data(), kernels.size() );
   {
     gpu::Stream stream( ctx );
     stream.begin();
     stream.copy( upload, 0, sh->filters, 0, filt.size() * 4 );
     stream.copy( upload, filt.size() * 4, sh->matrices, 0, mat.size() * 4 );
+    stream.copy( upload, ( filt.size() + mat.size() ) * 4, sh->secKernels, 0, kernels.size() );
     stream.submitAndWait();
   }
   upload.destroy( ctx );
@@ -408,6 +640,7 @@ void GpuIntraRec::releaseShared()
   gpu::Context* ctx = gpu::Context::get();
   s_shared->filters.destroy( *ctx );
   s_shared->matrices.destroy( *ctx );
+  s_shared->secKernels.destroy( *ctx );
   delete s_shared;   // the kernels
   s_shared = nullptr;
 }
@@ -870,11 +1103,11 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
   const bool ts   = tu.mtsIdx[resiComp] == MTS_SKIP;
   t.transformSkip = ts ? 1 : 0;
 
-  // TrQuant::xIT's transform types (DCT-II, or those of explicit MTS) and their matrices. With LFNST / NSPT (lfnstIdx)
-  // the host runs the CPU's own dequantization and inverse LFNST and the GPU the primary transform; where NSPT replaces
-  // the primary transform, the host computes the residual itself (both syntax only)
+  // TrQuant::xIT's transform types (DCT-II, or those of explicit MTS) and their matrices; with lfnstIdx the inverse
+  // LFNST before them or NSPT instead of them (invSecondary: the CPU's own choices of matrix, scan and sizes)
   t.mtxV = t.mtxH = 0;
-  t.precomputed   = 0;
+  t.secKind = SEC_NONE;
+  t.secMatrix = t.secRowLength = t.secNumIn = t.secScan = t.secLayout = t.secSize = t.secTranspose = 0;
   if( t.cbf && !ts )
   {
     if( !m.trQuant )
@@ -882,8 +1115,40 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
       unsupported( "transform types without the decoder's TrQuant" );
       return;
     }
-    int trTypeHor, trTypeVer;
-    if( !m.trQuant->getInvTransformTypes( tu, resiComp, trTypeHor, trTypeVer ) )
+    Secondary sec;
+    if( !invSecondary( tu, resiComp, sec ) )
+    {
+      unsupported( "LFNST without its extension (the VVC kernels)" );
+      return;
+    }
+    int        trTypeHor, trTypeVer;
+    const bool separable = m.trQuant->getInvTransformTypes( tu, resiComp, trTypeHor, trTypeVer );
+    if( area.width > 1 && area.height > 1 && separable == ( sec.kind == SEC_NSPT ) )   // xIT: NSPT or the separable one
+    {
+      unsupported( "NSPT where xIT does not apply it" );
+      return;
+    }
+    if( sec.kind != SEC_NONE )
+    {
+      t.secKind      = sec.kind;
+      t.secMatrix    = m.sh->kernelOffset( sec.matrix );
+      t.secRowLength = sec.rowLength;
+      t.secNumIn     = sec.numIn;
+      t.secScan      = m.sh->scanOffset( sec.scan );
+      t.secSize      = sec.sbSize;
+      t.secTranspose = sec.transpose ? 1 : 0;
+      t.secLayout    = sec.kind == SEC_LFNST ? m.sh->lfnstLayout[floorLog2( sec.sbSize ) - 2][t.secTranspose] : 0;
+      if( t.secMatrix < 0 || t.secScan < 0 || sec.numIn > 64 || ( sec.kind == SEC_LFNST && sec.rowLength > 96 ) )
+      {
+        unsupported( "an LFNST / NSPT matrix or scan the GPU lacks" );
+        return;
+      }
+    }
+    if( sec.kind == SEC_NSPT )
+    {
+      // its matrix gives the residual
+    }
+    else if( !separable )
     {
       if( area.width == 1 || area.height == 1 )   // xIT's 1-D transform (ISP sub-partitions): one stage along the block
       {
@@ -895,14 +1160,10 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
           return;
         }
       }
-      else if( !cu.lfnstIdx )
+      else
       {
         unsupported( "a transform the GPU lacks" );
         return;
-      }
-      else
-      {
-        t.precomputed = PRECOMPUTED_RESIDUAL;
       }
     }
     else
@@ -914,12 +1175,11 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
         unsupported( "a transform type without a matrix of this size" );
         return;
       }
-      t.precomputed = cu.lfnstIdx ? PRECOMPUTED_COEFFS : 0;
     }
   }
-  // the decision recomputes the residual with intra_resi's dequantization and primary transform; the host's
-  // LFNST / NSPT results depend on the signs
-  if( signPred && t.precomputed )
+  // the decision recomputes the residual with the dequantization and primary transform of intra_resi, but not yet with
+  // LFNST / NSPT
+  if( signPred && t.secKind != SEC_NONE )
   {
     unsupported( "sign prediction of LFNST / NSPT blocks" );
     return;
@@ -935,10 +1195,6 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
   // with the dequantization of the next larger index
   const int maxLog2TrDynamicRange = sps.getMaxLog2TrDynamicRange( chType );
   t.quant = ( slice.getDepQuantEnabledIdc() && !ts ? QUANT_DEP : 0 ) | ( sps.getUseQcs() ? QUANT_QCS : 0 );
-  if( t.precomputed )   // the host dequantized
-  {
-    t.quant = 0;
-  }
   if( t.quant & QUANT_DEP )
   {
     // the index of a level depends on the quantizer state (the indices are derived with the levels below); QP + 1,
@@ -1051,19 +1307,6 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
       invResDPCM( tu, resiComp, acc );
       c = CCoeffBuf( accumulated.data(), area.width, area.height );
     }
-    else if( t.precomputed == PRECOMPUTED_COEFFS )
-    {
-      c = m.trQuant->getInvLfnstOutput( tu, resiComp, resiQp );
-    }
-    else if( t.precomputed == PRECOMPUTED_RESIDUAL )
-    {
-      // invTransformNxN takes the TU non-const but only reads it
-      std::vector<Pel> resiPel( area.area() );
-      PelBuf           resiBuf( resiPel.data(), area.width, area.height );
-      m.trQuant->invTransformNxN( const_cast<TransformUnit&>( tu ), resiComp, resiBuf, resiQp );
-      accumulated.assign( resiPel.begin(), resiPel.end() );
-      c = CCoeffBuf( accumulated.data(), area.width, area.height );
-    }
     for( int y = 0; y < (int) area.height; y++ )
     {
       const TCoeff* row = c.bufAt( 0, y );
@@ -1087,6 +1330,15 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
           }
         }
       }
+    }
+    if( t.secKind == SEC_LFNST )   // intra_resi takes the whole region of its outputs, which holds every level
+    {
+      if( t.nzRows > t.secSize || t.nzCols > t.secSize )
+      {
+        unsupported( "LFNST with levels outside its region" );
+        return;
+      }
+      t.nzRows = t.nzCols = t.secSize;
     }
     for( int y = 0; y < t.nzRows; y++ )
     {
@@ -1473,7 +1725,8 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
   m.dbgResi.ensure( ctx, dbgBytes, gpu::Buffer::DEVICE );
   P.tus      = m.tus.addr;
   P.coeffs   = m.coeffs.addr;
-  P.signPred = m.signPredBuf.addr;
+  P.signPred   = m.signPredBuf.addr;
+  P.secKernels = m.sh->secKernels.addr;
   P.filters  = m.sh->filters.addr;
   P.matrices = m.sh->matrices.addr;
   P.dbgPred  = m.dbgPred.addr;

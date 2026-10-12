@@ -280,8 +280,8 @@ the reconstruction buffer; works in every frame-thread context):
   only: for blocks with lfnstIdx the host runs the CPU's own dequantization and inverse LFNST
   (TrQuant::getInvLfnstOutput) and the GPU the primary transform, and where NSPT replaces the primary transform the
   host computes the residual with TrQuant::invTransformNxN. That keeps them exact by construction, but NSPT blocks are
-  many (in m11 ~40 % of the coded blocks), so the host does much of the transform work there: NSPT (and LFNST) on the
-  GPU is a speed-up still to do. LFNST of MIP blocks stays on the CPU (its kernel follows a DIMD mode derived from the
+  many (in m11 ~40 % of the coded blocks), so the host did much of the transform work there (M15 moves both to the
+  GPU). LFNST of MIP blocks stays on the CPU (its kernel follows a DIMD mode derived from the
   MIP prediction); M12 adds MRL (multiple reference lines 1, 3, 5, 7 and 12 with JVET-Y0116's extended list; the
   fusion line is the next one, up to 13): the reference fill follows xFillReferenceSamples' unit model, where a line
   beyond the first unit has extra units left of and above the corner (7 availability groups per line instead of 5),
@@ -314,7 +314,16 @@ the reconstruction buffer; works in every frame-thread context):
   CbCr the coded component's block decides (the Cr block when Cr is coded) and writes the other block's residual,
   which waits for it (a scheduling edge that can point forward); the deciding block also waits for the owners of the
   two columns / rows the border reads. Sign prediction of LFNST / NSPT blocks stays on the CPU (the host's LFNST /
-  NSPT results depend on the signs). GpuIntraRec::supported()
+  NSPT results depend on the signs); M15 moves LFNST and NSPT to the GPU: the host records each block's matrix, scan,
+  sizes and transposition with the CPU's own choices (GpuIntraRec's invSecondary follows xGetInvTrParams /
+  nsptApplyCond, xInvLfnst and xInvNspt) and uploads once the CPU's int8 kernel tables (6.7 MB), the positions of the
+  scans they read (from each entry's raster index: the 16x16 LFNST scan's x / y lie within its 8x8 quarters) and the
+  extended LFNST's output arrangement (xInvLfnst's copies replayed on the outputs' numbers); intra_resi runs the
+  inverse LFNST in shared memory on the top-left region (16 x 16 at most) before the primary transform, and NSPT's
+  matrix gives the residual (rounded by shift_1st + shift_2nd - 7). LFNST without the extension (the VVC kernels) is
+  rejected: with a transposed 8x8 region ECM's arrangement reads 64 outputs of the VVC kernel, which writes 48, so the
+  other 16 are whatever an earlier block left in TrQuant's m_tempOutMatrix. TrQuant::getInvLfnstOutput and M11's
+  refactoring of invTransformNxN are gone. GpuIntraRec::supported()
   rejects every tool whose mode derivation or prediction reads reconstructed samples or that the kernels lack, before
   anything is skipped. All 19 regular streams now fall back to the CPU at TMRL, the next sequence-level check (before
   M14: sign prediction, before M6: QCS, before M5: LMCS, before M4: dual tree); many block-level tools follow. The
