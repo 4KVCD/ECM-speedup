@@ -133,12 +133,16 @@ Commits on `enc-mt`, all bit-exact with stock ECM-20.0 (bitstream md5 of the sui
   of the search stack moves with the picture: RdCost, reshaper, the slice encoder's AMVP-SbTMVP area count (the
   writer counts into it; only the search start resets it), the separate-tree partitioner of the CABAC encoder.
   - Results: RA 129 frames 4.10x with 8 threads (B-2 2.48-2.64x), RA 65 2.74x with 4 (1.70x) and 2.79x with 8.
-  - A full `EncSearchStack` object is 343 MB even when nothing in it is initialised (InterSearch 279 MB, of which
-    `m_gpmacsSplitModeTmSel` is 250 MB; EncCu 51 MB). The finish stacks are therefore small structs.
+  - A full `EncSearchStack` object was 343 MB even when nothing in it is initialised (InterSearch 279 MB, of which
+    `m_gpmacsSplitModeTmSel` was 250 MB; EncCu 51 MB). The finish stacks are therefore small structs.
 - P5 stage B-4: the setup stack is a small struct too (`EncSetupStack`: slice encoder, CABAC encoder, TrQuant, RdCost,
   reshaper). Its slice encoder (`EncSlice::initSetup`) keeps the adaptive search ranges itself and leaves the IBC hash
   map to the search stack, which resets it when it takes the picture (`loadSetup`). Peak commit 0.33 GB lower with
   frame threads (RA 129 frames with 8 threads 11.1 -> 10.8 GB).
+- `InterSearch::m_gpmacsSplitModeTmSel`, the GPM split modes of every pair of MMVD indices and merge candidates
+  (250 MB per search stack), is a cache of one CU: a CU's GPM test starts with all rows unavailable, and no row of an
+  earlier CU is read (probe: 84 million reads). A CU now takes a 43 kB block per index pair it uses from a pool
+  (at most 525 pairs, 22 MB, in the probe), which the next CU reuses.
 - Found by the matrix of stage A: `--FrameThreads` >= 3 stopped with "PDP predictor unavailable" on ra_cif (bug of
   cfe3c39a, fixed in its own commit): a search stack's first picture used IntraPrediction's PDP buffer pointers before
   any CU of that stack had set them.
@@ -393,7 +397,6 @@ AI-latency ~2-2.5x.
    - More P2 for LD, the only configuration nothing else speeds up: merge SATD pass, ME per reference, the GPM stages,
      intra RMD in chunks, then P3 speculation for the merge/GPM full RD and the intra MTS pass. Expected 1.1-1.2x on
      LD in all, each loop a step like the first (state sync, record and compare, shadow check).
-2. P0, P1, the first P2 step and P5 (stages A to B-4) are done (see Progress). Open in P5:
-   `m_gpmacsSplitModeTmSel` (250 MB per stack) sparse or allocated on use; more periods by default for long RA
-   (memory). Next by the user's order: more P2 for LD.
+2. P0, P1, the first P2 step and P5 (stages A to B-4) are done (see Progress). Open in P5: more periods by default
+   for long RA (memory). Next by the user's order: more P2 for LD.
 3. Report each step as step % and cumulative % with before/after numbers and commit hashes, one commit per step.

@@ -8336,7 +8336,9 @@ void InterSearch::initGeoAngleSelection(PredictionUnit& pu
 )
 {
   xAMLGetCurBlkTemplate(pu, pu.lwidth(), pu.lheight());
-  // the rows of m_gpmacsSplitModeTmSelAvail (0) and m_gpmPartTplCost (-1) are cleared when first used
+  // the rows of m_gpmacsSplitModeTmSelAvail (0) and m_gpmPartTplCost (-1) are cleared when first used, and the split
+  // mode tables of the MMVD index pairs come from the pool again
+  m_gpmSplitModeTmSelPoolUsed = 0;
   if( ++m_gpmRowGen == 0 )
   {
     memset( m_gpmPartTplCostGen, 0, sizeof( m_gpmPartTplCostGen ) );
@@ -8428,7 +8430,7 @@ void InterSearch::setGeoSplitModeToSyntaxTable(PredictionUnit& pu, MergeCtx& mer
 #endif
     );
 
-    xSetGpmModeToSyntaxModeTable(numValidInList, modeList, m_gpmacsSplitModeTmSel[idx0][idx1][mergeCand0][mergeCand1]);
+    xSetGpmModeToSyntaxModeTable(numValidInList, modeList, gpmSplitModeTmSel(idx0, idx1)[mergeCand0][mergeCand1]);
     gpmSelAvailRow(idx0, idx1)[mergeCand0] |= ((uint16_t)1 << mergeCand1);
   }
 }
@@ -8460,7 +8462,7 @@ void InterSearch::setGeoTMSplitModeToSyntaxTable(PredictionUnit& pu, MergeCtx(&m
                         , modeList
     );
 
-    xSetGpmModeToSyntaxModeTable(numValidInList, modeList, m_gpmacsSplitModeTmSel[idx0][idx1][mergeCand0][mergeCand1]);
+    xSetGpmModeToSyntaxModeTable(numValidInList, modeList, gpmSplitModeTmSel(idx0, idx1)[mergeCand0][mergeCand1]);
     gpmSelAvailRow(idx0, idx1)[mergeCand0] |= ((uint16_t)1 << mergeCand1);
   }
 }
@@ -8477,7 +8479,7 @@ int InterSearch::convertGeoSplitModeToSyntax(int splitDir, int mergeCand0, int m
   xRemapMrgIndexAndMmvdIdx(mergeCand0, mergeCand1, mmvdCand0, mmvdCand1, isIntra[0], isIntra[1]);
 #endif
 #endif
-  return m_gpmacsSplitModeTmSel[mmvdCand0 + 1][mmvdCand1 + 1][mergeCand0][mergeCand1][splitDir];
+  return gpmSplitModeTmSel(mmvdCand0 + 1, mmvdCand1 + 1)[mergeCand0][mergeCand1][splitDir];
 }
 
 bool InterSearch::selectGeoSplitModes(PredictionUnit &pu,

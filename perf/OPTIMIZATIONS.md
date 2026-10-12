@@ -110,8 +110,8 @@ lower all-core turbo, one duplicated intra frame per chunk, unequal chunk comple
   4.4x for 129 frames (5 periods) whatever N; longer RA sequences gain from more periods (`perf/mt/p5_sim.py` models
   10 periods at 4.4x with M = 4 and 5.9x with M = 8, at a cost in memory). LD gains nothing. `--ParallelSegments`
   combines with it.
-- Memory: a search stack commits about 1.1 GB whatever the resolution (a quarter of it is one GPM cache of 250 MB in
-  InterSearch); the setup stack and the finish stacks are small. Each period beyond the first adds about 33 MB at
+- Memory: a search stack commits about 0.85 GB whatever the resolution; the setup stack and the finish stacks are
+  small. Each period beyond the first adds about 33 MB at
   128x128 and 75 MB at CIF (about 1 GB at 1080p by the same rate, mostly picture-size ALF and SAO buffers), and up to
   max(N, GOPSize) x M pictures are in flight.
 - Core Ultra 7 265K, one run at a time on the 8 P-cores, foreman 128x128 QP 32 (ai_long's and ra_long's

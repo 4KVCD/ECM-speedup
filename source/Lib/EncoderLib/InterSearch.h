@@ -1409,16 +1409,23 @@ public:
 protected:
 #if JVET_AG0164_AFFINE_GPM
   uint32_t m_gpmacsSplitModeTmSelAvail [GEO_ENC_MMVD_MAX_REFINE_NUM_ADJ][GEO_ENC_MMVD_MAX_REFINE_NUM_ADJ][GEO_MAX_ALL_INTER_UNI_CANDS]; // Note: sizeof(uint16_t) should not be less than GEO_MAX_NUM_UNI_CANDS
-  uint8_t  m_gpmacsSplitModeTmSel      [GEO_ENC_MMVD_MAX_REFINE_NUM_ADJ][GEO_ENC_MMVD_MAX_REFINE_NUM_ADJ][GEO_MAX_ALL_INTER_UNI_CANDS][GEO_MAX_ALL_INTER_UNI_CANDS][GEO_NUM_PARTITION_MODE];
+  using GpmSplitModeTmSelBlock = uint8_t[GEO_MAX_ALL_INTER_UNI_CANDS][GEO_MAX_ALL_INTER_UNI_CANDS][GEO_NUM_PARTITION_MODE];
 #if JVET_AN0093_JRGPM_WITH_AFFINE_AND_INTRA
 public:
 #endif
   uint32_t m_gpmPartTplCost            [GEO_ENC_MMVD_MAX_REFINE_NUM_ADJ][GEO_MAX_ALL_INTER_UNI_CANDS][2][GEO_NUM_PARTITION_MODE]; // [][][0][]: partition 0, [][][1][]: partition 1
 #else
   uint16_t m_gpmacsSplitModeTmSelAvail [GEO_ENC_MMVD_MAX_REFINE_NUM_ADJ][GEO_ENC_MMVD_MAX_REFINE_NUM_ADJ][GEO_MAX_NUM_UNI_CANDS]; // Note: sizeof(uint16_t) should not be less than GEO_MAX_NUM_UNI_CANDS
-  uint8_t  m_gpmacsSplitModeTmSel      [GEO_ENC_MMVD_MAX_REFINE_NUM_ADJ][GEO_ENC_MMVD_MAX_REFINE_NUM_ADJ][GEO_MAX_NUM_UNI_CANDS][GEO_MAX_NUM_UNI_CANDS][GEO_NUM_PARTITION_MODE];
+  using GpmSplitModeTmSelBlock = uint8_t[GEO_MAX_NUM_UNI_CANDS][GEO_MAX_NUM_UNI_CANDS][GEO_NUM_PARTITION_MODE];
   uint32_t m_gpmPartTplCost            [GEO_ENC_MMVD_MAX_REFINE_NUM_ADJ][GEO_MAX_NUM_UNI_CANDS][2][GEO_NUM_PARTITION_MODE]; // [][][0][]: partition 0, [][][1][]: partition 1
 #endif
+  // memory: the split mode table of an MMVD index pair is read only in the CU that wrote it (initGeoAngleSelection), so
+  // a pair takes a block from a pool, reused from CU to CU, when the CU first uses it (gpmSelAvailRow). A CU used at
+  // most ~500 pairs in the tests; the table of all pairs was 250 MB.
+  GpmSplitModeTmSelBlock* m_gpmacsSplitModeTmSel[GEO_ENC_MMVD_MAX_REFINE_NUM_ADJ][GEO_ENC_MMVD_MAX_REFINE_NUM_ADJ] = {};
+  std::vector<std::unique_ptr<GpmSplitModeTmSelBlock[]>> m_gpmSplitModeTmSelPool;
+  size_t   m_gpmSplitModeTmSelPoolUsed = 0;
+  GpmSplitModeTmSelBlock& gpmSplitModeTmSel( int idx0, int idx1 ) { return *m_gpmacsSplitModeTmSel[idx0][idx1]; }
   // perf: initGeoAngleSelection used to clear both tables (1.6 MB) for every CU; now a row is cleared when it is first
   // used after initGeoAngleSelection (generation stamp per row), which gives the same values for every row read
   uint32_t m_gpmRowGen = 0;
@@ -1432,6 +1439,11 @@ public:
     {
       m_gpmSelAvailGen[idx0][idx1] = m_gpmRowGen;
       memset( m_gpmacsSplitModeTmSelAvail[idx0][idx1], 0, sizeof( m_gpmacsSplitModeTmSelAvail[idx0][idx1] ) );
+      if( m_gpmSplitModeTmSelPoolUsed == m_gpmSplitModeTmSelPool.size() )
+      {
+        m_gpmSplitModeTmSelPool.emplace_back( new GpmSplitModeTmSelBlock[1] );
+      }
+      m_gpmacsSplitModeTmSel[idx0][idx1] = &m_gpmSplitModeTmSelPool[m_gpmSplitModeTmSelPoolUsed++][0];
     }
     return m_gpmacsSplitModeTmSelAvail[idx0][idx1];
   }
