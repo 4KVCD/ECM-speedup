@@ -79,6 +79,8 @@ const int DERIVE_NO_SMOOTHING = 16;   // the SPS disables intra smoothing (no re
 const int DERIVE_TRANSFORM = 64;
 // a block of a DIMD CU (CU_DIMD): where the CU's DIMD blends, the prediction blends its modes (the node's DimdOut)
 const int DERIVE_DIMD = 128;
+// a block of an OBIC CU (CU_OBIC): the prediction blends the CU's OBIC modes (the node's OBIC_OUT)
+const int DERIVE_OBIC = 256;
 
 // Params::dbgParams per block: the derived dirMode, isModeVer, intraPredAngle, absInvAngle, useCubic, refFilter,
 // applyPDPC, gradPDPC, angularScale, fusion, bf, plIdx, then mtxV, mtxH, secMatrix, secTranspose, secLayout
@@ -88,7 +90,7 @@ const int DBG_PARAMS = 17;
 // the non-adjacent ones
 const int MPM_NEIGHBOURS = 23;
 
-// a coding unit of one channel type whose blocks were recorded (41 int32, layout shared with GpuIntraRec.cpp)
+// a coding unit of one channel type whose blocks were recorded (42 int32, layout shared with GpuIntraRec.cpp)
 struct Cu
 {
   int kind;              // CU_*: how its intra mode is found
@@ -105,6 +107,7 @@ struct Cu
   int modes[2];
   int dimd;              // the first of the CU's DIMD histograms in Params::dimdCalls (-1: no DIMD)
   int dimdNum;           // their number
+  int obic;              // an OBIC CU's index among the OBIC CUs (Params::obicNbrs, obicOut; -1: not OBIC)
 };
 layout( buffer_reference, std430, buffer_reference_align = 4 ) buffer BufCu { Cu v[]; };
 
@@ -115,6 +118,7 @@ const int CU_CHROMA_DM   = 2;   // chroma: the co-located luma mode (PU::getCoLo
 const int CU_CHROMA_CAND = 3;   // chroma: candId of PU::getIntraChromaCandModes' first four
 const int CU_DIMD        = 4;   // luma: a DIMD CU, its mode DIMD's (cu.dimd; intra_dimd.glsl)
 const int CU_CHROMA_DIMD = 5;   // chroma: DIMD chroma (DIMD_CHROMA_IDX), compared with the co-located luma mode
+const int CU_OBIC        = 6;   // luma: an OBIC CU, its mode OBIC's first (from its neighbours' modes; intra_obic.glsl)
 
 // one gradient histogram of a CU's DIMD (16 int32, layout shared with GpuIntraRec.cpp; IntraPrediction's
 // DimdHistogramCall, the arguments deriveDimdMode / deriveDimdModeAdaptive / deriveDimdChromaMode call buildHistogram
@@ -142,6 +146,24 @@ const int DIMD_OUT_BLENDING   = 1;
 const int DIMD_OUT_BLEND_MODE = 2;    // 7 entries, -1 where not set
 const int DIMD_OUT_REL_WEIGHT = 9;    // 8 entries, -1 where not set
 const int DIMD_OUT_LOC_DEP    = 17;   // 7 entries
+
+// a neighbour of an OBIC CU whose mode its histogram counts (layout shared with GpuIntraRec.cpp, OBIC_NBRS per OBIC CU
+// in Params::obicNbrs; IntraPrediction::obicNeighbours): its record (-1: none) and the samples it counts
+struct ObicNbr
+{
+  int cu;
+  int numSamples;
+};
+layout( buffer_reference, std430, buffer_reference_align = 4 ) buffer BufObicNbr { ObicNbr v[]; };
+const int OBIC_NBRS  = 20;
+
+// an OBIC CU's OBIC as its node derives it (OBIC_OUT int32 per OBIC CU in Params::obicOut): the CodingUnit fields
+// deriveObicMode sets, obicMode (-1 where not set), obicFusionWeight and obicLocDep
+const int OBIC_MODES          = 6;
+const int OBIC_OUT            = 3 * OBIC_MODES;
+const int OBIC_OUT_MODE       = 0;
+const int OBIC_OUT_WEIGHT     = OBIC_MODES;
+const int OBIC_OUT_LOC_DEP    = 2 * OBIC_MODES;
 
 // the directory of the transform tables (in matrices at Params::trTables, GpuIntraRec.cpp's createShared): the
 // offsets of the tables (in matrices), then values
@@ -314,7 +336,9 @@ struct Params
   uint64_t dbgParams;   // verification: per block the parameters intra_rec derived (DBG_PARAMS int32, DERIVE_MODE blocks)
   uint64_t dimdCalls;   // the DIMD histograms of the CUs (Cu::dimdNum DimdCall at Cu::dimd)
   uint64_t dimdOut;     // int32 per CU (DIMD_OUT): its DIMD, written by its node (for its blocks, and the comparison)
-  uint64_t dimdAcc;     // int32 per intra_rec workgroup: 3 x 128 x 128 sums of DIMD blending (DIMD_ACC)
+  uint64_t obicNbrs;    // per OBIC CU (Cu::obic) its neighbours (OBIC_NBRS ObicNbr)
+  uint64_t obicOut;     // int32 per OBIC CU (OBIC_OUT): its OBIC, written by its node (for its blocks, the comparison)
+  uint64_t blendAcc;    // int32 per intra_rec workgroup: 3 x 128 x 128 sums of DIMD / OBIC blending (BLEND_ACC)
   int      origin[3];
   int      stride[3];
   int      width[3];

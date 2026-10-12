@@ -11,7 +11,9 @@
 // luma, the bilateral filter on inverse-mapped samples); with sign prediction the signs are decided first from the
 // prediction and the neighbours, and the residual computed again where a sign is negative. Every step follows the C++
 // of IntraPrediction / MatrixIntraPrediction / TrQuant / DecCu.
-// Not yet: decoder-side intra modes.
+// Modes the CPU cannot know without the reconstruction are derived in a node per CU before its blocks: the MPM lists
+// (intra_modes.glsl), DIMD (intra_dimd.glsl) and OBIC (intra_obic.glsl); the blocks of DIMD and OBIC CUs blend the
+// predictions of several modes.
 #extension GL_GOOGLE_include_directive : require
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
@@ -30,7 +32,7 @@ layout( buffer_reference, std430, buffer_reference_align = 4 ) coherent buffer C
 
 // the features of a picture the pipeline is built for (specialization constants; GpuIntraRec.cpp's IntraRecVariant):
 // a picture without them runs a pipeline without their code, whose mere presence slows every block (~15 % for DIMD)
-layout( constant_id = 0 ) const bool WITH_DIMD = true;                 // DIMD in nodes, the blending of DIMD CUs
+layout( constant_id = 0 ) const bool WITH_DIMD = true;                 // DIMD and OBIC in nodes, their blending
 layout( constant_id = 1 ) const bool WITH_DERIVED_TRANSFORMS = true;   // blocks with DERIVE_TRANSFORM
 
 const int PAD     = 6;                        // interpFilterNumPadded (16 taps / 2 - 2)
@@ -81,13 +83,20 @@ Params P;      // the parameter block (loaded once)
 int    g_ti;   // the block being reconstructed
 bool   g_crs;       // LMCS chroma residual scaling of the block
 int    g_crsScale;  // its scale (Reshape::calculateChromaAdj)
-// DIMD blending (a DERIVE_DIMD block whose CU blends): the predictions of its modes are summed per location dependence
-// class (emitPred), weighted by their dimdRelWeight, in the workgroup's DIMD_ACC sums (each class's N samples)
-const int DIMD_ACC = 3 * 128 * 128;
-bool   g_dimdSum;     // emitPred adds to the sums
-bool   g_dimdFirst;   // the first prediction (the main mode) sets them, the other classes' to 0
-int    g_dimdW;       // the prediction's weight
-int    g_dimdClass;   // its class (dimdLocDep: 0 none, 1 vertical, 2 horizontal)
+// blending (a DERIVE_DIMD block whose CU's DIMD blends, a DERIVE_OBIC block): the predictions of the CU's modes
+// (s_blendMode: DIMD's main mode, planar and blend modes, OBIC's modes) are summed per location dependence class
+// (emitPred), weighted, in the workgroup's BLEND_ACC sums (each class's N samples)
+const int BLEND_ACC = 3 * 128 * 128;
+const int BLEND_MAX = 8;
+shared int s_blendNum;                 // the block's predictions (0: no blending)
+shared int s_blendMode[BLEND_MAX];     // their modes,
+shared int s_blendW[BLEND_MAX];        // weights (0: not predicted; dimdRelWeight, obicFusionWeight)
+shared int s_blendClass[BLEND_MAX];    // and classes (dimdLocDep, obicLocDep: 0 none, 1 vertical, 2 horizontal)
+bool   g_blendSum;     // emitPred adds to the sums
+bool   g_blendFirst;   // the first prediction (the main mode) sets them, the other classes' to 0
+int    g_blendW;       // the prediction's weight
+int    g_blendClass;   // its class
+bool   g_blendTaps;    // DIMD: the prediction's filter length by its weight (JVET-AN0158)
 
 #include "intra_modes.glsl"
 
@@ -212,6 +221,7 @@ int recoAt( int comp, int x, int y )
 }
 
 #include "intra_dimd.glsl"
+#include "intra_obic.glsl"
 
 int clip3i( int lo, int hi, int v )
 {
@@ -304,19 +314,19 @@ void storeRegion( Tu t, int x, int y, int pr )
   }
 }
 
-// a predicted sample of the region: reconstructed now, kept for the bilateral filter, or added to DIMD's sums (stored
-// and loaded device-coherent: another invocation may handle the sample in the next prediction)
+// a predicted sample of the region: reconstructed now, kept for the bilateral filter, or added to the blending's sums
+// (stored and loaded device-coherent: another invocation may handle the sample in the next prediction)
 void emitPred( Tu t, int x, int y, int pr, bool bf )
 {
-  if( WITH_DIMD && g_dimdSum )
+  if( WITH_DIMD && g_blendSum )
   {
-    CBufI32   acc = CBufI32( P.dimdAcc );
-    const int o   = int( gl_WorkGroupID.x ) * DIMD_ACC + y * t.regW + x;
+    CBufI32   acc = CBufI32( P.blendAcc );
+    const int o   = int( gl_WorkGroupID.x ) * BLEND_ACC + y * t.regW + x;
     const int N   = t.regW * t.h;
     for( int c = 0; c < 3; c++ )
     {
-      const int add = c == g_dimdClass ? pr * g_dimdW : 0;
-      if( g_dimdFirst )
+      const int add = c == g_blendClass ? pr * g_blendW : 0;
+      if( g_blendFirst )
       {
         acc.v[o + c * N] = add;
       }
@@ -929,7 +939,8 @@ void main()
     // ----- a CU's node (intra_modes.glsl): the mode from the parsed syntax and the modes it reads (the neighbours' or
     // the co-located luma CU's, the host's or published by the nodes of those CUs, on which it depends), published for
     // the CU's blocks and the CUs reading it; first the CU's DIMD (intra_dimd.glsl: from the reconstruction around the
-    // CU, on whose blocks it depends), the mode of a DIMD CU and the first entries of an MPM list
+    // CU, on whose blocks it depends), the mode of a DIMD CU and the first entries of an MPM list; an OBIC CU's modes
+    // then from its neighbours' (intra_obic.glsl: published by the nodes of those CUs, on which it depends)
     if( ( t.derive & DERIVE_NODE ) != 0 )
     {
       const Cu c = BufCu( P.cus ).v[t.cu];
@@ -943,9 +954,10 @@ void main()
         dimdHistograms( c, lid, NT );
       }
       SYNC();
+      DimdOut d;   // invocation 0's
+      int dimdModes[3] = int[3]( -1, -1, -1 );
       if( lid == 0 )
       {
-        int dimdModes[3] = int[3]( -1, -1, -1 );
         if( dimd && c.kind == CU_CHROMA_DIMD )   // its mode, after the co-located luma mode's (s_modesRead[0])
         {
           int second;
@@ -955,10 +967,22 @@ void main()
         }
         else if( dimd )
         {
-          const DimdOut d = dimdSelect( c.w, c.h );
+          d = dimdSelect( c.w, c.h );
           dimdStore( t.cu, d );
           dimdModes = int[3]( d.mode, d.blendMode[0], d.blendMode[1] );
         }
+      }
+      if( WITH_DIMD && c.kind == CU_OBIC )
+      {
+        SYNC();   // dimdSelect has read the histograms whose memory OBIC's takes
+        obicHistogram( c, lid, NT );
+        if( lid == 0 )
+        {
+          CBufI32( P.cuMode ).v[t.cu] = obicSelect( c, d );
+        }
+      }
+      else if( lid == 0 )
+      {
         int modes[MPM_NEIGHBOURS];
         for( int k = 0; k < MPM_NEIGHBOURS; k++ )
         {
@@ -976,18 +1000,39 @@ void main()
       {
         s_mode = cuModeOf( t.cu );
       }
-      const bool dimdCu = WITH_DIMD && ( t.derive & DERIVE_DIMD ) != 0;
-      if( dimdCu && lid < DIMD_OUT )   // a DIMD CU's: its DIMD
+      // a DIMD CU's predictions where its DIMD blends (dimdPrediction), an OBIC CU's: its modes but those not set
+      const bool dimdCu = WITH_DIMD && ( t.derive & DERIVE_DIMD ) != 0, obicCu = WITH_DIMD && ( t.derive & DERIVE_OBIC ) != 0;
+      if( ( dimdCu || obicCu ) && lid < BLEND_MAX )
       {
-        s_dimdOut[lid] = CBufI32( P.dimdOut ).v[t.cu * DIMD_OUT + lid];
+        int mode = -1, w = 0, cls = 0;
+        if( dimdCu )
+        {
+          dimdPrediction( t.cu, lid, mode, w, cls );
+        }
+        else if( lid < OBIC_MODES )
+        {
+          CBufI32   b = CBufI32( P.obicOut );
+          const int o = BufCu( P.cus ).v[t.cu].obic * OBIC_OUT;
+          mode = b.v[o + OBIC_OUT_MODE + lid];
+          w    = mode >= 0 ? b.v[o + OBIC_OUT_WEIGHT + lid] : 0;
+          cls  = b.v[o + OBIC_OUT_LOC_DEP + lid];
+        }
+        s_blendMode[lid]  = mode;
+        s_blendW[lid]     = w;
+        s_blendClass[lid] = cls;
+        if( lid == 0 )
+        {
+          s_blendNum = obicCu ? OBIC_MODES : CBufI32( P.dimdOut ).v[t.cu * DIMD_OUT + DIMD_OUT_BLENDING] != 0 ? DIMD_FUSION_NUM : 0;
+        }
       }
       SYNC();
       applyModeParams( t, s_mode, BufCu( P.cus ).v[t.cu].plIdx );
-      if( dimdCu )
+      if( dimdCu || obicCu )
       {
-        // DIMD's main mode has no bilateral filter; blending has no intra fusion (initIntraPatternChType's fetchRef2nd)
-        // and filters the blended prediction (predIntraAng; the host checked the size and QP)
-        const bool blending = s_dimdOut[DIMD_OUT_BLENDING] != 0;
+        // the main mode of DIMD and OBIC has no bilateral filter; blending (always with OBIC: planar is added) has no
+        // intra fusion (initIntraPatternChType's fetchRef2nd) and filters the blended prediction (predIntraAng; the host
+        // checked the size and QP)
+        const bool blending = s_blendNum != 0;
         t.fusion = blending ? 0 : t.fusion;
         t.bf     = blending && ( t.derive & DERIVE_BF ) != 0 ? 1 : 0;
       }
@@ -1051,10 +1096,10 @@ void main()
       fillReferencePar( t, 1, predStride + 1, lid, NT );
     }
     SYNC();
-    // DIMD blending (predIntraAng): each mode predicts from the filtered or the unfiltered references as its own
+    // DIMD / OBIC blending (predIntraAng): each mode predicts from the filtered or the unfiltered references as its own
     // parameters say, so both are kept: the unfiltered in s_ref[1] (blending has no fusion line), the filtered in s_tmp
-    const bool dimdBlend = WITH_DIMD && ( t.derive & DERIVE_DIMD ) != 0 && s_dimdOut[DIMD_OUT_BLENDING] != 0;
-    if( t.refFilter != 0 || dimdBlend )   // xFilterReferenceSamples (multiRefIdx 0): in place, or for DIMD beside them
+    const bool blend = WITH_DIMD && ( t.derive & ( DERIVE_DIMD | DERIVE_OBIC ) ) != 0 && s_blendNum != 0;
+    if( t.refFilter != 0 || blend )   // xFilterReferenceSamples (multiRefIdx 0): in place, or for blending beside them
     {
       for( int i = lid; i <= predStride + predHSize; i += NT )
       {
@@ -1074,8 +1119,8 @@ void main()
         s_tmp[i] = int16_t( v );
       }
       SYNC();
-      for( int i = lid; i <= predStride + predHSize && !dimdBlend; i += NT ) s_ref[0][i] = s_tmp[i];
-      for( int i = lid; i <= predStride + predHSize && dimdBlend; i += NT ) s_ref[1][i] = s_ref[0][i];
+      for( int i = lid; i <= predStride + predHSize && !blend; i += NT ) s_ref[0][i] = s_tmp[i];
+      for( int i = lid; i <= predStride + predHSize && blend; i += NT ) s_ref[1][i] = s_ref[0][i];
       SYNC();
     }
 
@@ -1095,29 +1140,31 @@ void main()
       bf = min( ( ( madT + madL + 1 ) >> 1 ) >> 4, 15 ) <= 10;
     }
 
-    // ----- prediction and reconstruction; with DIMD blending (predIntraAng) the predictions of the main mode, planar and
-    // the blend modes in turn, each with the parameters of its mode (initPredIntraParams for the CU, no fusion, no
-    // bilateral filter), its references and its filter length, summed (emitPred), then blended
-    g_dimdSum = false;
-    bool dimdFirst = true;
-    for( int sub = 0; sub < ( dimdBlend ? DIMD_FUSION_NUM : 1 ); sub++ )
+    // ----- prediction and reconstruction; with blending (predIntraAng) the predictions of the CU's modes in turn (DIMD's
+    // main mode, planar and blend modes; OBIC's modes), each with the parameters of its mode (initPredIntraParams for
+    // the CU, no fusion, no bilateral filter), its references and its filter length (DIMD's by its weight), summed
+    // (emitPred), then blended
+    g_blendSum  = false;
+    g_blendTaps = ( t.derive & DERIVE_DIMD ) != 0;
+    bool blendFirst = true;
+    for( int sub = 0; sub < ( blend ? s_blendNum : 1 ); sub++ )
     {
-      if( dimdBlend )
+      if( blend )
       {
-        int mode;
-        dimdPrediction( sub, mode, g_dimdW, g_dimdClass );
-        if( g_dimdW == 0 )
+        g_blendW     = s_blendW[sub];
+        g_blendClass = s_blendClass[sub];
+        if( g_blendW == 0 )
         {
           continue;
         }
         if( sub > 0 )
         {
-          applyModeParams( t, mode, 0 );
+          applyModeParams( t, s_blendMode[sub], 0 );
           t.fusion = 0;
         }
-        g_dimdSum   = true;
-        g_dimdFirst = dimdFirst;
-        dimdFirst   = false;
+        g_blendSum   = true;
+        g_blendFirst = blendFirst;
+        blendFirst   = false;
         for( int i = lid; i <= predStride + predHSize; i += NT ) s_ref[0][i] = t.refFilter != 0 ? s_tmp[i] : s_ref[1][i];
         SYNC();
       }
@@ -1333,12 +1380,13 @@ void main()
         if( isLuma )
         {
           taps = t.useCubic != 0 ? 16 : 6;
-          if( WITH_DIMD && g_dimdSum && t.useCubic != 0 )   // JVET-AN0158: a DIMD blend's prediction by its weight
+          const bool byWeight = WITH_DIMD && g_blendSum && g_blendTaps && t.useCubic != 0;
+          if( byWeight )   // JVET-AN0158: a DIMD blend's prediction by its weight
           {
-            taps = g_dimdW >= 32 ? 8 : 16;
+            taps = g_blendW >= 32 ? 8 : 16;
           }
           if( w < 8 && taps > 10 ) taps = 10;
-          if( WITH_DIMD && g_dimdSum && t.useCubic != 0 && taps == 8 )   // JVET-AK0087: 8 taps for slopes away from H / V in small blocks
+          if( byWeight && taps == 8 )   // JVET-AK0087: 8 taps for slopes away from H / V in small blocks
           {
             const int log2Size = ( findMSB( w ) + findMSB( h ) ) >> 1;
             const int diff     = min( abs( angle - HOR_IDX ), abs( angle - VER_IDX ) );   // of the angle, as the CPU has it
@@ -1418,7 +1466,7 @@ void main()
           emitPred( t, ox, oy, asPel( v ), bf );
         }
       }
-      if( dimdBlend )   // the next prediction: its own angular arrays (zero), the sums visible to all invocations
+      if( blend )   // the next prediction: its own angular arrays (zero), the sums visible to all invocations
       {
         SYNC();
         for( int i = lid; i < angClear; i += NT )
@@ -1431,18 +1479,16 @@ void main()
                         gl_SemanticsAcquireRelease );
       }
     }
-    if( dimdBlend )
+    if( blend )
     {
       // each class's prediction (predIntraAng): its sum over the sum of its weights (truncated, as the division and the
-      // shift of timdBlending / dimdBlending give it); the classes' weights are weightNonLocDep (with planar's),
+      // shift of timdBlending / dimdBlending give it); the classes' weights are weightNonLocDep (with DIMD's planar),
       // weightVer and weightHor
-      g_dimdSum = false;
+      g_blendSum = false;
       int wt[3] = int[3]( 0, 0, 0 );
-      for( int sub = 0; sub < DIMD_FUSION_NUM; sub++ )
+      for( int sub = 0; sub < s_blendNum; sub++ )
       {
-        int mode, w, cls;
-        dimdPrediction( sub, mode, w, cls );
-        wt[cls] += w;
+        wt[s_blendClass[sub]] += s_blendW[sub];
       }
       // with location dependence, xLocationdepBlending (range 10, doubled across blocks above 64): the vertical
       // class's weight falls down the rows, the horizontal one's along the columns (mode 0 both, clipped to their
@@ -1459,10 +1505,10 @@ void main()
       }
       const bool needClipVer = wVer + rangeVer > clipVer || wVer - rangeVer < 0;
       const bool needClipHor = wHor + rangeHor > clipHor || wHor - rangeHor < 0;
-      CBufI32 acc = CBufI32( P.dimdAcc );
+      CBufI32 acc = CBufI32( P.blendAcc );
       for( int i = lid; i < N; i += NT )
       {
-        const int x = i % W, y = i / W, o = int( gl_WorkGroupID.x ) * DIMD_ACC + i;
+        const int x = i % W, y = i / W, o = int( gl_WorkGroupID.x ) * BLEND_ACC + i;
         int v[3];
         for( int c = 0; c < 3; c++ )
         {

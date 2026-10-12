@@ -363,8 +363,12 @@ the reconstruction buffer; works in every frame-thread context):
   ECM_GPU_DUMP with perf/gpu/dumpdiff.py compares the records of both runs. The blending code slowed every block of
   intra_rec by ~15 % even where nothing blends, so intra_rec is now built as three pipelines (specialization
   constants): a picture without DIMD runs one without its code, and without M18's derived transforms where it has
-  none. OBIC and intra merge, which ECM's encoder uses whenever DIMD is on, are not done yet (M19's test streams come
-  from an encoder that skips them).
+  none. M20 is OBIC: an OBIC CU's node counts the modes of up to 20 neighbouring CUs (the host picks them with
+  deriveObicMode's own rules, IntraPrediction::obicNeighbours), weighted by their size and, for a blending DIMD
+  neighbour, by each mode's weight, read from those CUs' nodes; then the six strongest modes, their weights and
+  location dependence, planar added; its blocks blend those predictions through the same path as DIMD's. Intra
+  merge, which ECM's encoder uses wherever it is allowed, is not done yet (the test streams of M19 and M20 come from
+  an encoder that skips it).
   GpuIntraRec::supported()
   rejects every tool whose mode derivation or prediction reads reconstructed samples or that the kernels lack, before
   anything is skipped. All 19 regular streams now fall back to the CPU at TMRL, the next sequence-level check (before

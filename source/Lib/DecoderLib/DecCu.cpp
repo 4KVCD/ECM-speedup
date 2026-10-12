@@ -638,6 +638,15 @@ void DecCu::decompressCtu( CodingStructure& cs, const UnitArea& ctuArea )
 #endif
           {
             m_pcIntraPred->deriveObicMode(currCU.cs->picture->getRecoBuf(area), area, currCU);
+#if ECM_VULKAN
+            // the GPU reconstructs the picture: the CPU's DIMD modes of the neighbours come from samples it has not
+            // reconstructed and may leave OBIC without a mode, with which the CPU's later MPM lists and OBIC
+            // histograms would index; a placeholder keeps it in range (the GPU derives the CU's modes)
+            if( m_gpuDeriveOnly && currCU.obicMode[0] < 0 )
+            {
+              currCU.obicMode[0] = PLANAR_IDX;
+            }
+#endif
             pu->intraDir[0] = currCU.obicMode[0];
           }
 #endif

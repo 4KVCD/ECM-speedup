@@ -23,7 +23,6 @@ shared int s_dimdLo[DIMD_MAX_OUTER];        // buildHistogramAdaptive's sample o
 shared int s_dimdHi[DIMD_MAX_OUTER];
 shared int s_dimdStart[DIMD_MAX_OUTER + 1];
 shared int s_dimdSg[33];                    // per subgroup (at least 8 invocations each): a batch's prefix sums
-shared int s_dimdOut[DIMD_OUT];             // a DIMD block's: its CU's DIMD (DIMD_OUT_*)
 
 // the gradient (iDx, iDy) of component comp's reconstruction at (x, y): DIMD's 3x3 Sobel operator, or its 2x2 one
 // (filterSizeIdx 1, JVET-AJ0203)
@@ -527,28 +526,30 @@ void dimdStore( int cu, DimdOut d )
   }
 }
 
-// prediction sub of a DIMD block's blending (predIntraAng; its CU's DIMD in s_dimdOut): 0 the main mode, 1 planar,
-// 2 .. 7 the blend modes (those that are not planar); its mode, weight (dimdRelWeight, 0: not predicted) and location
+// prediction sub of the blending of DIMD CU cu (predIntraAng; its node's DimdOut): 0 the main mode, 1 planar, 2 .. 7
+// the blend modes (those that are not planar); its mode, weight (dimdRelWeight, 0: not predicted) and location
 // dependence class (dimdLocDep; planar's 0)
-void dimdPrediction( int sub, out int mode, out int w, out int cls )
+void dimdPrediction( int cu, int sub, out int mode, out int w, out int cls )
 {
+  CBufI32   d = CBufI32( P.dimdOut );
+  const int o = cu * DIMD_OUT;
   if( sub == 0 )
   {
-    mode = s_dimdOut[DIMD_OUT_MODE];
-    w    = s_dimdOut[DIMD_OUT_REL_WEIGHT];
-    cls  = s_dimdOut[DIMD_OUT_LOC_DEP];
+    mode = d.v[o + DIMD_OUT_MODE];
+    w    = d.v[o + DIMD_OUT_REL_WEIGHT];
+    cls  = d.v[o + DIMD_OUT_LOC_DEP];
   }
   else if( sub == 1 )
   {
     mode = PLANAR_IDX;
-    w    = s_dimdOut[DIMD_OUT_REL_WEIGHT + 1];
+    w    = d.v[o + DIMD_OUT_REL_WEIGHT + 1];
     cls  = 0;
   }
   else
   {
-    mode = s_dimdOut[DIMD_OUT_BLEND_MODE + sub - 2];
-    w    = mode != PLANAR_IDX ? s_dimdOut[DIMD_OUT_REL_WEIGHT + sub] : 0;
-    cls  = s_dimdOut[DIMD_OUT_LOC_DEP + sub - 1];
+    mode = d.v[o + DIMD_OUT_BLEND_MODE + sub - 2];
+    w    = mode != PLANAR_IDX ? d.v[o + DIMD_OUT_REL_WEIGHT + sub] : 0;
+    cls  = d.v[o + DIMD_OUT_LOC_DEP + sub - 1];
   }
 }
 

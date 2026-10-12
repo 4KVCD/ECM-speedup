@@ -34,7 +34,7 @@ def load(path):
         n = struct.unpack_from("<Q", data, o)[0]
         parts.append(data[o + 8:o + 8 + n])
         o += 8 + n
-    return parts   # Tu records, levels, sign prediction data, CU records with their modes and DIMD histograms
+    return parts   # Tu records, levels, sign prediction data, CU records with their modes, DIMD histograms and OBIC neighbours
 
 def main():
     prefix, pocs = sys.argv[1], sys.argv[2:]

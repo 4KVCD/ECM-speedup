@@ -19843,6 +19843,168 @@ int IntraPrediction::dimdChromaHistogramCalls( const CodingUnit& cu, const CompA
 #endif
 #endif
 
+#if JVET_AH0076_OBIC && JVET_AK0056_WEIGHTED_OBIC
+// the neighbours deriveObicMode builds its histogram of occurrence from, its steps 1 to 3 (keep in step with them): the
+// adjacent and non-adjacent luma CUs at its positions, those that are intra and at a position not taken yet, the
+// nearest 20 of them; with the samples each counts (its area, weighted by its place in the candidate list). Inter
+// neighbours count by the intra modes of their motion, which the GPU does not have: -1 where one would be used
+int IntraPrediction::obicNeighbours( const CodingUnit& cu, const CodingUnit* nbrs[NUM_OBIC_CUS], int numSamples[NUM_OBIC_CUS] )
+{
+  const CodingStructure& cs   = *cu.cs;
+  const int              step = 4;
+  const CodingUnit*      cuNeighbours[NUM_OBIC_CUS];
+
+  // step 1: the adjacent neighbours (the first intra CU along the left column and the above row, then the chains
+  // around the left and the above CU)
+  cuNeighbours[0] = cs.getCURestricted( cu.lumaPos().offset( -1, 0 ), cu, CH_L );
+  cuNeighbours[1] = cs.getCURestricted( cu.lumaPos().offset( 0, -1 ), cu, CH_L );
+  cuNeighbours[2] = cs.getCURestricted( cu.lumaPos().offset( -1, -1 ), cu, CH_L );
+  for( int i = 0; i <= (int) cu.lheight(); i += step )
+  {
+    const CodingUnit* cuTemp = cs.getCURestricted( cu.lumaPos().offset( -1, i ), cu, CH_L );
+    if( cuTemp && CU::isIntra( *cuTemp ) )
+    {
+      cuNeighbours[0] = cuTemp;
+      break;
+    }
+  }
+  for( int i = 0; i <= (int) cu.lwidth(); i += step )
+  {
+    const CodingUnit* cuTemp = cs.getCURestricted( cu.lumaPos().offset( i, -1 ), cu, CH_L );
+    if( cuTemp && CU::isIntra( *cuTemp ) )
+    {
+      cuNeighbours[1] = cuTemp;
+      break;
+    }
+  }
+  const CodingUnit* cuLeft = cs.getCURestricted( cu.lumaPos().offset( -1, 0 ), cu, CH_L );
+  const CodingUnit* cuTop  = cs.getCURestricted( cu.lumaPos().offset( 0, -1 ), cu, CH_L );
+  auto below = [&]( const CodingUnit* c ) { return c ? cs.getCURestricted( c->lumaPos().offset( c->lwidth() - 1, c->lheight() ), cu, CH_L ) : nullptr; };
+  auto right = [&]( const CodingUnit* c ) { return c ? cs.getCURestricted( c->lumaPos().offset( c->lwidth(), c->lheight() - 1 ), cu, CH_L ) : nullptr; };
+  auto left  = [&]( const CodingUnit* c ) { return c ? cs.getCURestricted( c->lumaPos().offset( -1, 0 ), cu, CH_L ) : nullptr; };
+  auto above = [&]( const CodingUnit* c ) { return c ? cs.getCURestricted( c->lumaPos().offset( 0, -1 ), cu, CH_L ) : nullptr; };
+  cuNeighbours[3]  = below( cuLeft );
+  cuNeighbours[4]  = right( cuTop );
+  cuNeighbours[5]  = below( cuNeighbours[3] );
+  cuNeighbours[6]  = right( cuNeighbours[4] );
+  cuNeighbours[7]  = left( cuLeft );
+  cuNeighbours[8]  = above( cuTop );
+  cuNeighbours[9]  = left( cuNeighbours[3] );
+  cuNeighbours[10] = above( cuNeighbours[4] );
+  cuNeighbours[11] = left( cuNeighbours[5] );
+  cuNeighbours[12] = above( cuNeighbours[6] );
+  if( !cuNeighbours[9] && cuNeighbours[2] )
+  {
+    cuNeighbours[9] = cs.getCURestricted( cuNeighbours[2]->lumaPos().offset( -1, cuNeighbours[2]->lheight() - 1 ), cu, CH_L );
+  }
+  if( !cuNeighbours[10] && cuNeighbours[2] )
+  {
+    cuNeighbours[10] = cs.getCURestricted( cuNeighbours[2]->lumaPos().offset( cuNeighbours[2]->lwidth() - 1, -1 ), cu, CH_L );
+  }
+  if( !cuNeighbours[11] && cuLeft && cuNeighbours[7] )
+  {
+    cuNeighbours[11] = left( cuNeighbours[7] );
+  }
+  if( !cuNeighbours[12] && cuTop && cuNeighbours[8] )
+  {
+    cuNeighbours[12] = above( cuNeighbours[8] );
+  }
+
+  // step 2: the non-adjacent neighbours, at multiples of the CU's size
+  const Position topLeft          = cu.Y().topLeft();
+  int            next             = 13;
+  const int      numNACandidate[4] = { 3, 5, 5, 5 };
+  const int      idxMap[4][5]      = { { 0, 1, 4 }, { 0, 1, 2, 3, 4 }, { 0, 1, 2, 3, 4 }, { 0, 1, 2, 3, 4 } };
+  for( int distanceIdx = 0; distanceIdx < NADISTANCE_LEVEL; distanceIdx++ )
+  {
+    const int distanceHor = cu.Y().width * ( distanceIdx + 1 );
+    const int distanceVer = cu.Y().height * ( distanceIdx + 1 );
+    for( int k = 0; k < numNACandidate[distanceIdx]; k++ )
+    {
+      int offsetX = 0, offsetY = 0;
+      switch( idxMap[distanceIdx][k] )
+      {
+      case 0: offsetX = -distanceHor - 1; offsetY = cu.Y().height + distanceVer - 1; break;
+      case 1: offsetX = cu.Y().width + distanceHor - 1; offsetY = -distanceVer - 1; break;
+      case 2: offsetX = cu.Y().width >> 1; offsetY = -distanceVer - 1; break;
+      case 3: offsetX = -distanceHor - 1; offsetY = cu.Y().height >> 1; break;
+      default: offsetX = -distanceHor - 1; offsetY = -distanceVer - 1; break;
+      }
+      cuNeighbours[next++] = cs.getCURestricted( topLeft.offset( offsetX, offsetY ), cu, CH_L );
+    }
+  }
+
+  // step 3: the intra CUs at a position not taken yet, sorted by their distance (the earlier first on ties; those not
+  // used count 0 and come first), the nearest 20
+  bool useNeighbour[NUM_OBIC_CUS];
+  int  inDistOrder[NUM_OBIC_CUS];
+  int  dists[NUM_OBIC_CUS];
+  for( int i = 0; i < NUM_OBIC_CUS; i++ )
+  {
+    inDistOrder[i] = 0;
+    dists[i]       = MAX_INT;
+  }
+  for( int i = 0; i < NUM_OBIC_CUS; i++ )
+  {
+    if( cuNeighbours[i] && CU::isInter( *cuNeighbours[i] ) )
+    {
+      return -1;
+    }
+    useNeighbour[i] = cuNeighbours[i] && CU::isIntra( *cuNeighbours[i] );
+    for( int j = i - 1; j >= 0 && useNeighbour[i]; j-- )
+    {
+      if( useNeighbour[j] && cuNeighbours[i]->lx() == cuNeighbours[j]->lx() && cuNeighbours[i]->ly() == cuNeighbours[j]->ly() )
+      {
+        useNeighbour[i] = false;
+      }
+    }
+    const int dist = useNeighbour[i] ? std::abs( (int) cu.lx() - (int) cuNeighbours[i]->lx() ) + std::abs( (int) cu.ly() - (int) cuNeighbours[i]->ly() ) : 0;
+    for( int j = 0; j < NUM_OBIC_CUS; j++ )
+    {
+      if( dist < dists[j] )
+      {
+        for( int k = NUM_OBIC_CUS - 1; k > j; k-- )
+        {
+          dists[k]       = dists[k - 1];
+          inDistOrder[k] = inDistOrder[k - 1];
+        }
+        dists[j]       = dist;
+        inDistOrder[j] = i;
+        break;
+      }
+    }
+  }
+  const int limitMaxNeigh = 20;
+  int       numToMix      = 0;
+  for( int i = 0; i < NUM_OBIC_CUS; i++ )
+  {
+    const int j = inDistOrder[i];
+    if( numToMix >= limitMaxNeigh )
+    {
+      useNeighbour[j] = false;
+    }
+    else if( useNeighbour[j] )
+    {
+      numToMix++;
+    }
+  }
+
+  // the weights of step 4: 4 for the adjacent neighbours, 2 and 1 for the non-adjacent ones further out
+  const int weight[NUM_OBIC_CUS] = { 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1 };
+  int num = 0;
+  for( int i = 0; i < NUM_OBIC_CUS; i++ )
+  {
+    if( useNeighbour[i] )
+    {
+      nbrs[num]       = cuNeighbours[i];
+      numSamples[num] = ( weight[i] * ( cuNeighbours[i]->lumaSize().width * cuNeighbours[i]->lumaSize().height ) + 2 ) / 4;
+      num++;
+    }
+  }
+  return num;
+}
+#endif
+
 void IntraPrediction::deriveDimdMode(const CPelBuf &recoBuf, const CompArea &area, CodingUnit &cu
 #if JVET_AK0059_MDIP
   , bool useExcludingMode

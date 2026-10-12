@@ -668,6 +668,11 @@ public:
   static int dimdChromaHistogramCalls( const CodingUnit& cu, const CompArea& areaCb, DimdHistogramCall calls[8] );
 #endif
 #endif
+#if JVET_AH0076_OBIC && JVET_AK0056_WEIGHTED_OBIC
+  /// the neighbours deriveObicMode counts the modes of, with the samples each counts; returns their number (-1: an
+  /// inter neighbour), for the GPU reconstruction
+  static int obicNeighbours( const CodingUnit& cu, const CodingUnit* nbrs[NUM_OBIC_CUS], int numSamples[NUM_OBIC_CUS] );
+#endif
   IpaSnapshot ipaSnapshot() const
   {
     return { m_ipaParam.isModeVer,

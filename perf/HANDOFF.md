@@ -13,7 +13,7 @@ wall-clock gains with threads are "the easy baseline". Decoder status: single-th
 (`--GpuLoopFilter=1`: ALF, SAO, BIF, CCSAO, LF-CCCM, offset refinement on Vulkan). The user then asked for **a full
 GPU decoder in Vulkan, optimized until nothing is left** ("The GPU decoder needs to fully decode the frame on the
 GPU"; "Your first Vulkan version is going to be slow. That's OK"). That work is branch `dec-gpurecon`: intra
-reconstruction on the GPU (`--GpuRecon`), tool levels M1-M19 done and verified bit-exact (M19: DIMD); it is **not yet
+reconstruction on the GPU (`--GpuRecon`), tool levels M1-M20 done and verified bit-exact (M19: DIMD, M20: OBIC); it is **not yet
 faster than the CPU decoder** (see section 8) and supports only a restricted tool set (all real CTC streams fall back
 to the CPU, first reason: TMRL).
 
@@ -310,15 +310,29 @@ gradients computed in parallel - then the modes, blending, weights and location 
 `Params::dimdOut`), which the MPM list (JVET-AL0125: DIMD's modes after planar) or a DIMD CU (`CU_DIMD`) takes. A DIMD
 CU's block (`DERIVE_DIMD`) with blending predicts the main mode, planar and the blend modes one after the other, each
 with its own parameters, filtered or unfiltered references (both kept) and JVET-AN0158 filter length, sums them per
-location-dependence class into a global per-workgroup buffer (`DIMD_ACC`; another invocation may handle a sample in
+location-dependence class into a global per-workgroup buffer (`BLEND_ACC`; another invocation may handle a sample in
 the next prediction: coherent, with buffer barriers), then divides and blends location-dependently
 (xLocationdepBlending; its double-precision clip ranges are reproduced exactly in integers, `dimdScaledWeight`) and
 applies the bilateral filter to the blend. DIMD chroma (`CU_CHROMA_DIMD`) is a node too: one histogram of the luma
 inside the co-located area and the Cb / Cr neighbours (`dimdChromaHistogramCalls`), then the co-located luma mode's
 substitution. Nodes depend on the owners of their histograms' samples. Verification compares every node's DIMD with
 the CPU's. A picture with DIMD runs the full intra_rec pipeline, one without DIMD a pipeline without its code (and
-without M18's derived transforms where it has none; `IntraRecVariant`, section 10). Not yet: OBIC and intra merge (ECM's encoder uses them whenever DIMD is on; record() rejects their CUs),
-DIMD CUs with LFNST / MTS / several transform blocks, MTSS, implicit MTS.
+without M18's derived transforms where it has none; `IntraRecVariant`, section 10).
+M20: OBIC (JVET-AH0076 with JVET-AK0056's weights). An OBIC CU (`CU_OBIC`, a DIMD CU with obicFlag) is a node that
+first computes its own DIMD (whose main mode and first blend mode OBIC counts half), then the histogram of occurrence
+of its neighbours' modes (`intra_obic.glsl`): the host picks the neighbours with deriveObicMode's steps 1-3
+(`IntraPrediction::obicNeighbours`: adjacent and non-adjacent positions, intra, distinct, the nearest 20) and records
+each one's CU and sample count (`ObicNbr`, `Cu::obic`; MIP CUs count nothing in intra slices and are left out); the
+node reads a DIMD neighbour's DimdOut (planar and blend modes by their weights relative to the main mode's), an OBIC
+neighbour's ObicOut, any other CU's mode, from those CUs' nodes (dependencies), then picks the six strongest modes
+but planar with their dominant class, weights them (DIMD's division by table, 64-bit products, the excess / shortfall
+loops) and adds planar (`Params::obicOut`). Its histogram reuses `s_dimdHist` (shared memory is full). The blocks
+(`DERIVE_OBIC`) blend through DIMD's path, generalised to a list of (mode, weight, class) per block (`s_blendMode`,
+`s_blendW`, `s_blendClass`; DIMD's filter length by weight only for DIMD); an OBIC CU always blends (no fusion, the
+bilateral filter on the blend). With the reconstruction on, the CPU's OBIC can lack a mode (its neighbours' DIMD
+comes from samples it has not reconstructed) and its later MPM lists would index with -1: DecCu then keeps a
+placeholder (ECM_VULKAN, ON mode only). Not yet: intra merge (record() rejects its CUs), DIMD CUs with LFNST / MTS /
+several transform blocks, MTSS, implicit MTS.
 
 ## 8. Numbers (i7-10700 8C/16T, Win11, GCC 16.2, RTX 3070 driver 616.92)
 
@@ -345,7 +359,7 @@ Profile of a GPU-on decode (non-LTO, m2_park16, share of all samples): parsing ~
    prediction, M15 LFNST / NSPT on the GPU (the VVC kernels, LFNSTExt=0, rejected), M16 sign prediction of LFNST /
    NSPT blocks. 2026-10-12: M17 intra modes derived on the GPU (tested with `ECM_GPU_MODES=1`), M18 the transforms of
    derived modes on the GPU, M19 DIMD (the m19d test set; the m19 set, encoded by the stock encoder, falls back at
-   "intra merge").
+   "intra merge"), M20 OBIC (the m20 and m20o test sets).
    All 19 regular streams now stop at "TMRL" (the next sequence-level check; the block-level tools of step 4 follow).
 3. Make the GPU path win on CPU time per picture: the derive-only pass (record during parsing or a leaner pass;
    speed up getSpatialIpm/getPURestricted, which also helps the CPU decoder), GPU behaviour with frame threads
@@ -354,10 +368,14 @@ Profile of a GPU-on decode (non-LTO, m2_park16, share of all samples): parsing ~
 4. More tool levels. CTC turns on DIMD, TIMD, TMRL, MPM sorting, MDIP, PDP and chroma reordering together, and every
    one of them makes the intra modes depend on reconstructed samples (DIMD's modes are in every MPM list), so with
    CTC the GPU derives every mode (M17's nodes) and everything that depends on a mode moves to the GPU too (M18 did
-   the transforms, M19 DIMD). Next OBIC and intra merge (JVET-AH0076, JVET-AM0074: ECM's encoder uses both whenever
-   DIMD is on and has no switch for them; the m19d streams come from a test encoder, `bin\encNoOM`, built with a local
-   patch that skips them in IntraSearch when ECM_TEST_NO_OBIC_MERGE is set - its two `testObic` / `testIntraMerge`
-   conditions - and `perf/gpu/enc_m1.ps1` with ECM_ENC_EXE), then the transform rules of DIMD CUs
+   the transforms, M19 DIMD, M20 OBIC). Next intra merge (JVET-AM0074: ECM's encoder uses it wherever it is allowed
+   and has no switch for it; OBIC is available only where intra merge is not). The test streams come from test
+   encoders built with a local patch to IntraSearch.cpp that is not committed (`perf/gpu/enc_m1.ps1` with ECM_ENC_EXE):
+   `bin\encNoOM` (m19d: ECM_TEST_NO_OBIC_MERGE skips both), `bin\encTest` (m20: ECM_TEST_NO_INTRA_MERGE;
+   ECM_TEST_NO_OBIC skips OBIC), `bin\encTest2` (the same, and for m20o ECM_TEST_PREFER_OBIC, which skips plain DIMD
+   where OBIC is available, for many more OBIC CUs) - the patch adds `&& !getenv(...)` to `testObic` /
+   `testIntraMerge` and sets `m_skipDimdMode` / `m_skipDimdLfnstMtsPass` where OBIC is tested. Then the transform
+   rules of DIMD CUs
    (getFinalIntraModeForTransform's DIMD branch, NSPT buckets, MTSS' candModeListForTransform, implicit MTS), then MPM
    sorting / MDIP / PDP, TIMD, TMRL, CCLM/CCCM and the other cross-component tools, chroma reordering / DBV, LFNST of
    MIP, IntraTMP / IBC, then inter pictures. Each level: new test set with exactly that tool on, verify mode
@@ -440,6 +458,10 @@ Profile of a GPU-on decode (non-LTO, m2_park16, share of all samples): parsing ~
   verification cannot see: M19's first ON run differed almost everywhere because the bilateral filter's LMCS flag came
   from the CPU's mode. Check every new level with `ECM_GPU_DUMP=<prefix>` on a verification and an ON decode and
   `perf/gpu/dumpdiff.py <prefix> <POCs>` (the records agree apart from the fields intra_rec derives). The CPU's
-  parameter snapshot after DIMD blending is the last blended mode's, not the main mode's (record() restates them).
+  parameter snapshot after DIMD / OBIC blending is the last blended mode's, not the main mode's (record() restates
+  them). Garbage modes can also be out of range for the CPU's own later code: OBIC without a mode left -1, which
+  getSpatialIpm writes an array with (DecCu keeps a placeholder in ON mode).
+- Shared memory of intra_rec is nearly full (by the declarations, about 48 200 of the 49 152 bytes Vulkan gives a
+  workgroup on the RTX 3070): OBIC's histogram reuses DIMD's.
 - A double-precision expression of the CPU (xLocationdepBlending's clip ranges) can be reproduced exactly in integers
   when its inputs are small: `dimdScaledWeight` (checked exhaustively against IEEE doubles for inputs below 200).

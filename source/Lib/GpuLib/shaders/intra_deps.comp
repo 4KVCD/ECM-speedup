@@ -179,6 +179,14 @@ void dependencies( int comp )
     {
       addDep( BufCu( P.cus ).v[c.lumaCu].node );
     }
+    for( int k = 0; c.obic >= 0 && k < OBIC_NBRS; k++ )   // OBIC: the modes of its neighbours
+    {
+      const int n = BufObicNbr( P.obicNbrs ).v[c.obic * OBIC_NBRS + k].cu;
+      if( n >= 0 )
+      {
+        addDep( BufCu( P.cus ).v[n].node );
+      }
+    }
     // DIMD: the samples its histograms' gradients read (GpuIntraRec.cpp's dimdCallArea: each histogram's region and
     // one sample around it, in the plane of its component), from the blocks owning them
     for( int n = 0; n < c.dimdNum; n++ )

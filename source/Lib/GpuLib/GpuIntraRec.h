@@ -42,8 +42,9 @@
     transform skip and BDPCM; scalar and dependent quantization, QCS; joint CbCr; LMCS; sign prediction; the dual tree;
     4:2:0 or 4:0:0. A picture with anything else is skipped and counted. The GPU derives the intra modes itself (the
     MPM lists, chroma DM and candidates, in a node per CU before its blocks) where they depend on reconstructed
-    samples, i.e. with DIMD: DIMD CUs (their blended prediction), DIMD's modes in every MPM list, DIMD chroma; and the
-    transforms that depend on a derived mode. ECM_GPU_MODES=1 makes it derive every MPM mode on any stream.
+    samples, i.e. with DIMD: DIMD CUs (their blended prediction), DIMD's modes in every MPM list, DIMD chroma, OBIC CUs
+    (the modes of their neighbours, blended); and the transforms that depend on a derived mode. ECM_GPU_MODES=1 makes
+    it derive every MPM mode on any stream.
 */
 
 #ifndef __GPUINTRAREC__
