@@ -88,28 +88,39 @@ RA parallel efficiency is ~60 % (1.15x single-thread x 8 workers would be 9.2x):
 lower all-core turbo, one duplicated intra frame per chunk, unequal chunk complexity. With intra period 32 a
 257-frame sequence has only 8 chunks, so hyperthreads cannot be used.
 
-## Frame threads (`--FrameThreads=N`)
+## Frame threads (`--FrameThreads=N`, `--FramePeriods=M`)
 
-- The pictures run in threads of their own, at most N with a search stack at a time; setups and finishes (loop
-  filters, slice writing) take turns in coding order, and a search starts when its references and the pictures it
-  takes coding-order state from are done (`perf/HANDOFF_MULTITHREADING.md`, P1). The GOPs overlap (P5 stage A): the
-  next GOPs are read and started while a GOP's pictures are in flight, and the reconstructions are written in output
-  order as they are done. Output identical at every N (bitstream and reconstruction).
-- All-intra pictures are independent, so AI scales with N. The temporal CABAC context store chains each RA picture
-  to the previous picture of its temporal layer and QP, and the finishes run in coding order, so RA gains 1.3-1.5x
-  (`perf/mt/ft_sim.py` and `p5_sim.py` model it). LD gains nothing. `--ParallelSegments` combines with it.
+- The pictures run in threads of their own, at most N with a search stack at a time. The setups take turns in coding
+  order on a setup stack of their own; a picture takes a search stack once the pictures it reads are done, the
+  earliest such picture first (`perf/HANDOFF_MULTITHREADING.md`, P1 and P5). The GOPs overlap: the next GOPs are read
+  and started while a GOP's pictures are in flight, and the reconstructions are written in output order as they are
+  done.
+- The finishes (loop filters, APSs, slice writing) of an intra period run in coding order. With M > 1 the finishes of
+  up to M intra periods run at the same time, each period with its own copy of the filter encoders and APSs, while the
+  log lines, access units and PSNR sums still go out in coding order. A period starts at a RAS-init intra picture
+  (the CRA of each intra period in RA, every picture in AI), whose finish resets what the filter encoders carry.
+- Output identical at every N and M: bitstream, reconstruction and log (except the [ET] times).
+- M = 0 (default) uses min(N, 4) periods, and 1 for one long period (IntraPeriod -1, LD) and for the options whose
+  finishes share state between periods (buffering period, picture timing, decoding unit, frame-field, frame packing,
+  scalable nesting and DRAP SEIs, DeblockingFilterMetric, a scaling-list file, HDR metrics), which M > 1 rejects.
+- AI pictures are independent, so AI scales with N. In RA the temporal CABAC context store chains each picture to the
+  previous one of its temporal layer, so a single intra period gains about 1.4x; the periods then overlap. LD gains
+  nothing. `perf/mt/p5_sim.py` models the schedule. `--ParallelSegments` combines with it.
+- Memory: a search stack commits about 1.1 GB whatever the resolution. Each period beyond the first adds about 33 MB
+  at 128x128 and 75 MB at CIF (about 1 GB at 1080p by the same rate, mostly picture-size ALF and SAO buffers), and up
+  to max(N, GOPSize) x M pictures are in flight.
 - Core Ultra 7 265K, one run at a time on the 8 P-cores, foreman 128x128 QP 32 (ai_long's and ra_long's
-  configurations); the previous commit's single-thread time as base:
+  configurations), the previous commit's single-thread time as base, automatic M:
 
-| FrameThreads | AI, 33 pictures (TemporalSubsampleRatio 8) | RA, 65 frames (3 intra periods) | bit-exact |
-|---|---|---|---|
-| 1 | 207.8 s | 568.0 s | yes |
-| 2 | 110.0 s, 1.89x | | yes |
-| 4 | 59.9 s, 3.47x | 431.9 s, 1.32x | yes |
-| 8 | 33.7 s, 6.17x | 378.9 s, 1.50x | yes |
+| FrameThreads | AI, 33 pictures (TemporalSubsampleRatio 8) | RA, 65 frames (3 intra periods) | RA, 129 frames (5) | peak commit (AI / RA 65) |
+|---|---|---|---|---|
+| 1 | 215.7 s | 556.2 s | 1064.5 s | |
+| 2 | 102.6 s, 2.10x | | | 3.0 GB / |
+| 4 | 55.9 s, 3.86x | 327.1 s, 1.70x | | 5.5 / 5.8 GB |
+| 8 | 31.6 s, 6.83x | 199.0 s, 2.79x | 403.4-429.2 s, 2.48-2.64x | 10.4 / 10.3 GB |
 
-  Before the GOPs overlapped (P1 alone), the RA case took 449.4 s with 4 threads and 414.8 s with 8, and AI did not
-  gain. LD (17 frames) takes 174.2 s with one thread and 170.5 s with 4.
+  With the finishes in coding order (M = 1, P5 stage A and B-1) RA 65 took 387.6 s with 4 threads (1.44x) and 383.9 s
+  with 8 (1.45x), AI 33.8 s with 8 (6.39x). LD 13 frames: 118.5 s with one thread, 116.8 s with 8.
 
 ## CU threads (`--CuThreads=N`)
 

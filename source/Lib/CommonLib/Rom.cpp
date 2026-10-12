@@ -728,6 +728,7 @@ bool g_mctsDecCheckEnabled = false;
 //! \{
 
 MsgLevel g_verbosity = VERBOSE;
+thread_local std::string* g_msgCapture = nullptr;
 #if SIGN_PREDICTION
 #if JVET_Y0141_SIGN_PRED_IMPROVE
 #if JVET_W0119_LFNST_EXTENSION || EXTENDED_LFNST

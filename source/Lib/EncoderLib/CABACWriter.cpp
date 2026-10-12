@@ -308,7 +308,7 @@ void CABACWriter::coding_tree_unit( CodingStructure& cs, const UnitArea& area, i
                             ctuRsAddr, cs.slice->m_ccSaoControl[compIdx], lumaPos, setNum);
 #if JVET_AL0142_CCSAO_REUSE_CTU
         // Allocated ccSaoControl in setupCcSaoPrv, assigned here
-        g_ccSaoPrvParam[compIdx][0].ccSaoControl[ctuRsAddr] = cs.slice->m_ccSaoControl[compIdx][ctuRsAddr];
+        ( m_ccSaoPrvParam ? m_ccSaoPrvParam : g_ccSaoPrvParam )[compIdx][0].ccSaoControl[ctuRsAddr] = cs.slice->m_ccSaoControl[compIdx][ctuRsAddr];
 #endif
       }
     }

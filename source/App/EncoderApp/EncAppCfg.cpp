@@ -1990,6 +1990,7 @@ bool EncAppCfg::parseCfg( int argc, char* argv[] )
   ("NumWppThreads",                                   m_numWppThreads,                              1, "Number of threads used to run WPP-style parallelization")
   ("SearchStacks",                                    m_searchStackCount,                           1, "Check of the multithreading infrastructure: number of mode-search stacks, which the pictures use in turn (one thread; the output does not change)")
   ("FrameThreads",                                    m_frameThreads,                               1, "Number of pictures of a GOP encoded at the same time (threads); the output does not change")
+  ("FramePeriods",                                    m_framePeriods,                               0, "FrameThreads: number of intra periods whose loop filters and slice writing run at the same time, each with its own filter encoders; 0: automatic; the output does not change")
   ("CuThreads",                                       m_cuThreads,                                  1, "Number of threads that search the candidates of a picture's CUs; the output does not change")
   ("CuThreadsCheck",                                  m_cuThreadsCheck,                         false, "Check of CuThreads: also evaluates the helpers' candidates serially and stops at the first difference")
   ("NumWppExtraLines",                                m_numWppExtraLines,                           0, "Number of additional wpp lines to switch when threads are blocked")
@@ -3964,6 +3965,23 @@ bool EncAppCfg::xCheckParameter()
     xConfirmPara( m_nnlfUnified, "FrameThreads does not support the NN loop filter" );
 #endif
   }
+  // several intra periods at a time: the finishes of a period share state only with the earlier pictures of the period,
+  // except through these
+  xConfirmPara( m_framePeriods < 0 || m_framePeriods > 64, "FramePeriods must be in the range 0..64" );
+  const bool periodsSupported = m_frameThreads > 1 && !m_bufferingPeriodSEIEnabled && !m_pictureTimingSEIEnabled
+                                && !m_decodingUnitInfoSEIEnabled && !m_frameFieldInfoSEIEnabled && !m_framePackingSEIEnabled
+                                && !m_scalableNestingSEIEnabled && m_drapPeriod == 0 && m_deblockingFilterMetric == 0
+                                && m_useScalingListId != SCALING_LIST_FILE_READ
+#if JVET_O0756_CALCULATE_HDRMETRICS
+                                && !m_calculateHdrMetrics
+#endif
+    ;
+  if( m_framePeriods == 0 )
+  {
+    // automatic: a period per frame thread, up to 4; one long period (IntraPeriod -1) gains nothing
+    m_framePeriods = periodsSupported && m_iIntraPeriod > 0 ? std::min( m_frameThreads, 4 ) : 1;
+  }
+  xConfirmPara( m_framePeriods > 1 && !periodsSupported, "FramePeriods > 1 needs FrameThreads > 1 and supports no buffering period, picture timing, decoding unit, frame-field, frame packing, scalable nesting or DRAP SEI, no DeblockingFilterMetric, no scaling list file and no HDR metrics" );
   xConfirmPara( m_ensureWppBitEqual, "ENABLE_WPP_PARALLELISM is disabled, cannot ensure being WPP bit-equal" );
 
 

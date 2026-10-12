@@ -94,6 +94,22 @@ thread_local EncSlice*       EncGOP::m_pcSliceEncoder = nullptr;
 thread_local EncSearchStack* EncGOP::m_pcSearchStack  = nullptr;
 thread_local EncPicOrder*    EncGOP::m_pcPicOrder     = nullptr;
 thread_local int64_t         EncGOP::m_ftTurn         = 0;
+thread_local HLSWriter*               EncGOP::m_HLSWriter        = nullptr;
+thread_local LoopFilter*              EncGOP::m_pcLoopFilter     = nullptr;
+#if JVET_AA0096_MC_BOUNDARY_PADDING
+thread_local InterPrediction*         EncGOP::m_pcFrameMcPadPrediction = nullptr;
+#endif
+thread_local EncSampleAdaptiveOffset* EncGOP::m_pcSAO            = nullptr;
+thread_local EncAdaptiveLoopFilter*   EncGOP::m_pcALF            = nullptr;
+thread_local ParameterSetMap<APS>*    EncGOP::m_pcApsMap         = nullptr;
+#if JVET_AL0153_ALF_CCCM
+thread_local EncLoopFilterCccm*       EncGOP::m_pcLoopFilterCccm = nullptr;
+#endif
+thread_local bool                     EncGOP::m_audIrapOrGdrAuFlag            = false;
+thread_local bool                     EncGOP::m_bufferingPeriodSEIPresentInAU = false;
+#if EMBEDDED_APS
+thread_local std::vector<APS>         EncGOP::m_aps;
+#endif
 
 // Worker threads for the frame threads. They are started when first needed and never end (the process ends them): a
 // thread that exits runs the destructors of its thread_local objects, which crashes with MinGW's emulated TLS.
@@ -165,7 +181,12 @@ void EncGOP::compressGOPFrameThreads( int numPics, int iPOCLast, int iNumPicRcvd
   {
     m_ftActive     = true;
     m_ftSetupTurn  = 0;
-    m_ftFinishTurn = 0;
+    m_ftPeriods    = m_pcEncLib->getNumFinishContexts();
+    m_ftPeriod     = -1;
+    m_ftCtxLast.assign( m_ftPeriods, nullptr );
+    m_ftFirstNotFinished = 0;
+    m_ftFinishedAhead.clear();
+    m_ftOutputTurn = 0;
     m_ftNumTurns   = 0;
     m_ftNumDone    = 0;
     m_ftError      = false;
@@ -173,6 +194,7 @@ void EncGOP::compressGOPFrameThreads( int numPics, int iPOCLast, int iNumPicRcvd
     m_ftStackBusy.assign( m_pcEncLib->getNumSearchStacks(), false );
     m_ftStackWaiters.clear();
     m_ftStackHolders.clear();
+    m_ftRefsInFlight.clear();
     m_ftPicsInFlight.clear();
     m_ftPicsDone.clear();
   }
@@ -184,6 +206,7 @@ void EncGOP::compressGOPFrameThreads( int numPics, int iPOCLast, int iNumPicRcvd
     xFtRunInPool( [=, &rcListPic, &rcListPicYuvRecOut]()
     {
       m_ftTurn = firstTurn + i;
+      xUseFinishContext( EncFinishContext() );   // the finish sets its period's (xStartPicFinish)
       try
       {
         compressGOP( iPOCLast, iNumPicRcvd, rcListPic, rcListPicYuvRecOut, isField, isTff, snr_conversion, printFrameMSE,
@@ -204,6 +227,7 @@ void EncGOP::compressGOPFrameThreads( int numPics, int iPOCLast, int iNumPicRcvd
           m_ftError      = true;
         }
       }
+      g_msgCapture = nullptr;
       std::lock_guard<std::mutex> lock( m_ftMutex );
       m_ftNumDone++;
       m_ftCv.notify_all();
@@ -244,6 +268,12 @@ bool EncGOP::isPicDone( const Picture* pic )
   return m_ftPicsDone.count( pic ) > 0;
 }
 
+bool EncGOP::isPicReferencedInFlight( const Picture* pic )
+{
+  std::lock_guard<std::mutex> lock( m_ftMutex );
+  return m_ftRefsInFlight.count( pic ) > 0;
+}
+
 void EncGOP::forgetPicDone( const Picture* pic )
 {
   std::lock_guard<std::mutex> lock( m_ftMutex );
@@ -255,12 +285,70 @@ void EncGOP::xFtSkip( int64_t turn )
   {
     std::lock_guard<std::mutex> lock( m_ftMutex );
     m_ftSetupTurn = turn + 1;
+    xFtMarkFinished( turn );
     m_ftCv.notify_all();
   }
-  xFtWait( [&]() { return m_ftFinishTurn == turn; } );
+  if( m_ftPeriods > 1 )
+  {
+    xFtWait( [&]() { return m_ftOutputTurn == turn; } );
+    std::lock_guard<std::mutex> lock( m_ftMutex );
+    m_ftOutputTurn = turn + 1;
+    m_ftCv.notify_all();
+  }
+}
+
+void EncGOP::xFtMarkFinished( int64_t turn )
+{
+  m_ftFinishedAhead.insert( turn );
+  while( m_ftFinishedAhead.count( m_ftFirstNotFinished ) )
+  {
+    m_ftFinishedAhead.erase( m_ftFirstNotFinished++ );
+  }
+}
+
+void EncGOP::xFtOutput( EncPicOrder& order )
+{
+  // several periods at a time: the finishes' logs, access units and PSNR sums go out in coding order
+  xFtWait( [&]() { return m_ftOutputTurn == order.turn; } );
+  if( order.analyze )
+  {
+    m_gcAnalyzeAll.add( order.analyze->all );
+    m_gcAnalyzeI.add( order.analyze->i );
+    m_gcAnalyzeP.add( order.analyze->p );
+    m_gcAnalyzeB.add( order.analyze->b );
+#if WCG_WPSNR
+    m_gcAnalyzeWPSNR.add( order.analyze->wpsnr );
+#endif
+    m_vRVM_RP.insert( m_vRVM_RP.end(), order.analyze->rvmBits.begin(), order.analyze->rvmBits.end() );
+  }
+  fputs( order.log.c_str(), stdout );
+  fflush( stdout );
+  if( order.au )
+  {
+    m_AUWriterIf->outputAU( *order.au );
+  }
+  order.log = std::string();
+  order.au.reset();
+  order.analyze.reset();
   std::lock_guard<std::mutex> lock( m_ftMutex );
-  m_ftFinishTurn = turn + 1;
+  m_ftPicsDone.insert( order.pic );
+  m_ftOutputTurn = order.turn + 1;
   m_ftCv.notify_all();
+}
+
+void EncGOP::xUseFinishContext( const EncFinishContext& ctx )
+{
+  m_pcALF            = ctx.alf;
+  m_pcSAO            = ctx.sao;
+  m_pcLoopFilter     = ctx.loopFilter;
+#if JVET_AL0153_ALF_CCCM
+  m_pcLoopFilterCccm = ctx.loopFilterCccm;
+#endif
+#if JVET_AA0096_MC_BOUNDARY_PADDING
+  m_pcFrameMcPadPrediction = ctx.mcPad;
+#endif
+  m_HLSWriter        = ctx.hlsWriter;
+  m_pcApsMap         = ctx.apsMap;
 }
 
 void EncGOP::xFtAcquireStack( EncPicOrder& order )
@@ -275,7 +363,7 @@ void EncGOP::xFtAcquireStack( EncPicOrder& order )
   }
   xFtWait( [&]()
   {
-    const int64_t earliest = m_ftFinishTurn;   // the finishes run in coding order
+    const int64_t earliest = m_ftFirstNotFinished;
     const int     numFree  = int( std::count( m_ftStackBusy.begin(), m_ftStackBusy.end(), false ) );
     return *m_ftStackWaiters.begin() == order.turn && numFree > 0
            && ( order.turn == earliest || m_ftStackHolders.count( earliest ) || numFree > 1 );
@@ -290,7 +378,22 @@ void EncGOP::xFtAcquireStack( EncPicOrder& order )
 
 void EncGOP::xFtEndSetup( EncPicOrder& order )
 {
+  // The references stay in use until the picture is done. Later setups may already have marked them unused for
+  // reference (the next intra period's CRA marks the previous one's pictures), and EncLib may read new pictures into
+  // buffers that are not referenced (isPicReferencedInFlight).
+  const Slice& slice = *order.pic->slices[0];
+  for( int list = 0; list < NUM_REF_PIC_LIST_01; list++ )
+  {
+    for( int refIdx = 0; refIdx < slice.getNumRefIdx( RefPicList( list ) ); refIdx++ )
+    {
+      order.refs.push_back( slice.getRefPic( RefPicList( list ), refIdx ) );
+    }
+  }
   std::lock_guard<std::mutex> lock( m_ftMutex );
+  for( const Picture* ref: order.refs )
+  {
+    m_ftRefsInFlight[ref]++;
+  }
   m_ftPicsInFlight.insert( order.pic );
   m_ftSetupTurn = order.turn + 1;
   m_ftCv.notify_all();
@@ -400,10 +503,21 @@ void EncGOP::xEndPicture( EncPicOrder& order )
   std::lock_guard<std::mutex> lock( m_ftMutex );
   order.finished = true;
   m_ftPicsInFlight.erase( order.pic );
-  m_ftPicsDone.insert( order.pic );
+  for( const Picture* ref: order.refs )
+  {
+    if( --m_ftRefsInFlight[ref] == 0 )
+    {
+      m_ftRefsInFlight.erase( ref );
+    }
+  }
+  order.refs.clear();
+  if( m_ftPeriods == 1 )
+  {
+    m_ftPicsDone.insert( order.pic );   // else after its output (xFtOutput)
+  }
   m_ftStackBusy[order.stackIdx] = false;
   m_ftStackHolders.erase( order.turn );
-  m_ftFinishTurn = order.turn + 1;
+  xFtMarkFinished( order.turn );
   m_ftCv.notify_all();
 }
 
@@ -551,6 +665,7 @@ void EncGOP::init ( EncLib* pcEncLib )
   m_pcLoopFilter         = pcEncLib->getLoopFilter();
   m_pcSAO                = pcEncLib->getSAO();
   m_pcALF                = pcEncLib->getALF();
+  m_pcApsMap             = pcEncLib->getApsMap();
   m_pcRateCtrl           = pcEncLib->getRateCtrl();
 #if JVET_AL0153_ALF_CCCM
   m_pcLoopFilterCccm     = pcEncLib->getLoopFilterCccmEncoder();
@@ -607,7 +722,10 @@ void EncGOP::init ( EncLib* pcEncLib )
   {
     alfWSSD = 1;
   }
-  pcEncLib->getALF()->setAlfWSSD(alfWSSD);
+  for( int i = 0; i < pcEncLib->getNumFinishContexts(); i++ )
+  {
+    pcEncLib->getFinishContext( i ).alf->setAlfWSSD( alfWSSD );
+  }
 #endif
   m_pcReshaper = pcEncLib->getReshaper();
 
@@ -865,6 +983,7 @@ void EncGOP::xWriteSEI (NalUnitType naluType, SEIMessages& seiMessages, AccessUn
   {
     return;
   }
+  std::lock_guard<std::mutex> seiLock( m_ftSeiMutex );   // finishes of several periods
   OutputNALUnit nalu( naluType, m_pcEncLib->getLayerId(), temporalId );
   m_seiWriter.writeSEImessages(nalu.m_Bitstream, seiMessages, *m_HRD, false, temporalId);
   auPos = accessUnit.insert(auPos, new NALUnitEBSP(nalu));
@@ -873,6 +992,7 @@ void EncGOP::xWriteSEI (NalUnitType naluType, SEIMessages& seiMessages, AccessUn
 
 void EncGOP::xWriteSEISeparately (NalUnitType naluType, SEIMessages& seiMessages, AccessUnit &accessUnit, AccessUnit::iterator &auPos, int temporalId)
 {
+  std::lock_guard<std::mutex> seiLock( m_ftSeiMutex );   // finishes of several periods
   // don't do anything, if we get an empty list
   if (seiMessages.empty())
   {
@@ -2512,6 +2632,7 @@ void EncGOP::compressGOP(int iPOCLast, int iNumPicRcvd, PicList &rcListPic, std:
     {
       picOrder->stackIdx = int( m_numPicsStarted++ % m_pcEncLib->getNumSearchStacks() );
       m_pcSearchStack    = &m_pcEncLib->getSearchStack( picOrder->stackIdx );
+      xUseFinishContext( m_pcEncLib->getFinishContext( 0 ) );
     }
     m_pcSliceEncoder = &m_pcSearchStack->sliceEncoder;
 
@@ -4664,7 +4785,7 @@ void EncGOP::compressGOP(int iPOCLast, int iNumPicRcvd, PicList &rcListPic, std:
           pcPic->slices[s]->setTileGroupAlfEnabledFlag(COMPONENT_Y, false);
         }
 
-        m_pcALF->initCABACEstimator(&m_pcSearchStack->cabacEncoder, &m_pcSearchStack->ctxCache, pcSlice, m_pcEncLib->getApsMap());
+        m_pcALF->initCABACEstimator(&m_pcSearchStack->cabacEncoder, &m_pcSearchStack->ctxCache, pcSlice, m_pcApsMap);
 
 #if JVET_AL0153_ALF_CCCM
         if(pcSlice->getLfCccmEnabledFlag())
@@ -4904,7 +5025,7 @@ void EncGOP::compressGOP(int iPOCLast, int iNumPicRcvd, PicList &rcListPic, std:
 
             m_pcALF->setApsIdStart( ALF_CTB_MAX_NUM_APS );
 
-            ParameterSetMap<APS>* apsMap = m_pcEncLib->getApsMap();
+            ParameterSetMap<APS>* apsMap = m_pcApsMap;
             apsMap->clear();
 
             for( int apsId = 0; apsId < ALF_CTB_MAX_NUM_APS; apsId++ )
@@ -4977,7 +5098,7 @@ void EncGOP::compressGOP(int iPOCLast, int iNumPicRcvd, PicList &rcListPic, std:
         int changedApsId = -1;
         for( int apsId = ALF_CTB_MAX_NUM_APS - 1; apsId >= 0; apsId-- )
         {
-          ParameterSetMap<APS>* apsMap = m_pcEncLib->getApsMap();
+          ParameterSetMap<APS>* apsMap = m_pcApsMap;
           int psId = ( apsId << NUM_APS_TYPE_LEN ) + ALF_APS;
           APS* aps = apsMap->getPS( psId );
           if( aps )
@@ -4998,7 +5119,7 @@ void EncGOP::compressGOP(int iPOCLast, int iNumPicRcvd, PicList &rcListPic, std:
         int changedApsId2 = -1;
         for( int apsId = ALF_CTB_MAX_NUM_APS - 1; apsId >= 0; apsId-- )
         {
-          ParameterSetMap<APS>* apsMap = m_pcEncLib->getApsMap();
+          ParameterSetMap<APS>* apsMap = m_pcApsMap;
           int psId = ( apsId << NUM_APS_TYPE_LEN ) + TALF_APS;
           APS* aps = apsMap->getPS( psId );
           if( aps )
@@ -5047,10 +5168,18 @@ void EncGOP::compressGOP(int iPOCLast, int iNumPicRcvd, PicList &rcListPic, std:
 #endif
 
       // write various parameter sets
+      // frame threads: the first picture is decided in the setup, and the finishes share the parameter sets' changed
+      // flags, so their setting and the writing go together
+      const bool seqFirst = m_ftActive ? picOrder->seqFirst : m_bSeqFirst;
+      std::unique_lock<std::mutex> paramSetLock( m_ftParamSetMutex, std::defer_lock );
+      if( m_ftActive )
+      {
+        paramSetLock.lock();
+      }
 #if JVET_Z0118_GDR // note : insert SPS/PPS at every GDR picture
-      bool writePS = m_bSeqFirst || (m_pcCfg->getReWriteParamSets() && (pcSlice->isIRAP())) || pcSlice->isInterGDR();
+      bool writePS = seqFirst || (m_pcCfg->getReWriteParamSets() && (pcSlice->isIRAP())) || pcSlice->isInterGDR();
 #else
-      bool writePS = m_bSeqFirst || (m_pcCfg->getReWriteParamSets() && (pcSlice->isIRAP()));
+      bool writePS = seqFirst || (m_pcCfg->getReWriteParamSets() && (pcSlice->isIRAP()));
 #endif
       if (writePS)
       {
@@ -5068,13 +5197,20 @@ void EncGOP::compressGOP(int iPOCLast, int iNumPicRcvd, PicList &rcListPic, std:
 
       // it is assumed that layerIdx equal to 0 is always present
       actualTotalBits += xWriteParameterSets(accessUnit, pcSlice, writePS, layerIdx);
+      if( paramSetLock.owns_lock() )
+      {
+        paramSetLock.unlock();
+      }
       if (writePS)
       {
         // create prefix SEI messages at the beginning of the sequence
         CHECK(!(leadingSeiMessages.empty()), "Unspecified error");
         xCreateIRAPLeadingSEIMessages(leadingSeiMessages, pcSlice->getSPS(), pcSlice->getPPS());
 
-        m_bSeqFirst = false;
+        if( !m_ftActive )
+        {
+          m_bSeqFirst = false;
+        }
       }
 
 
@@ -5084,7 +5220,7 @@ void EncGOP::compressGOP(int iPOCLast, int iNumPicRcvd, PicList &rcListPic, std:
       {
         //only 1 LMCS data for 1 picture
         int apsId = picHeader->getLmcsAPSId();
-        ParameterSetMap<APS> *apsMap = m_pcEncLib->getApsMap();
+        ParameterSetMap<APS> *apsMap = m_pcApsMap;
         APS* aps = apsMap->getPS((apsId << NUM_APS_TYPE_LEN) + LMCS_APS);
         bool writeAPS = aps && apsMap->getChangedFlag((apsId << NUM_APS_TYPE_LEN) + LMCS_APS);
 #if JVET_Z0118_GDR // note : insert APS at every GDR picture
@@ -5115,7 +5251,7 @@ void EncGOP::compressGOP(int iPOCLast, int iNumPicRcvd, PicList &rcListPic, std:
       if( pcSlice->getSPS()->getScalingListFlag() && ( m_pcCfg->getUseScalingListId() == SCALING_LIST_FILE_READ ) )
       {
         int apsId = picHeader->getScalingListAPSId();
-        ParameterSetMap<APS> *apsMap = m_pcEncLib->getApsMap();
+        ParameterSetMap<APS> *apsMap = m_pcApsMap;
         APS* aps = apsMap->getPS( ( apsId << NUM_APS_TYPE_LEN ) + SCALING_LIST_APS );
         bool writeAPS = aps && apsMap->getChangedFlag( ( apsId << NUM_APS_TYPE_LEN ) + SCALING_LIST_APS );
 #if JVET_Z0118_GDR // note : insert APS at every GDR picture
@@ -5146,7 +5282,7 @@ void EncGOP::compressGOP(int iPOCLast, int iNumPicRcvd, PicList &rcListPic, std:
       {
         for (int apsId = 0; apsId < ALF_CTB_MAX_NUM_APS; apsId++)
         {
-          ParameterSetMap<APS> *apsMap = m_pcEncLib->getApsMap();
+          ParameterSetMap<APS> *apsMap = m_pcApsMap;
 
           APS* aps = apsMap->getPS((apsId << NUM_APS_TYPE_LEN) + ALF_APS);
           bool writeAPS = aps && apsMap->getChangedFlag((apsId << NUM_APS_TYPE_LEN) + ALF_APS);
@@ -5198,7 +5334,7 @@ void EncGOP::compressGOP(int iPOCLast, int iNumPicRcvd, PicList &rcListPic, std:
       {
         for (int apsId = 0; apsId < ALF_CTB_MAX_NUM_APS; apsId++)
         {
-          ParameterSetMap<APS> *apsMap = m_pcEncLib->getApsMap();
+          ParameterSetMap<APS> *apsMap = m_pcApsMap;
           APS *aps      = apsMap->getPS((apsId << NUM_APS_TYPE_LEN) + TALF_APS);
           bool writeAPS = aps && apsMap->getChangedFlag((apsId << NUM_APS_TYPE_LEN) + TALF_APS);
           if (!aps && pcSlice->getTAlfAPSs() && pcSlice->getTAlfAPSs()[apsId])
@@ -5261,7 +5397,7 @@ void EncGOP::compressGOP(int iPOCLast, int iNumPicRcvd, PicList &rcListPic, std:
           }
           //the inference for NoOutputPriorPicsFlag
           // KJS: This cannot happen at the encoder
-          if( !m_bFirst && ( pcSlice->isIRAP() || pcSlice->getNalUnitType() >= NAL_UNIT_CODED_SLICE_GDR ) && picHeader->getNoOutputBeforeRecoveryFlag() )
+          if( !( m_ftActive ? picOrder->first : m_bFirst ) && ( pcSlice->isIRAP() || pcSlice->getNalUnitType() >= NAL_UNIT_CODED_SLICE_GDR ) && picHeader->getNoOutputBeforeRecoveryFlag() )
           {
             if (pcSlice->getNalUnitType() == NAL_UNIT_CODED_SLICE_CRA || pcSlice->getNalUnitType() >= NAL_UNIT_CODED_SLICE_GDR)
             {
@@ -5629,7 +5765,17 @@ void EncGOP::compressGOP(int iPOCLast, int iNumPicRcvd, PicList &rcListPic, std:
       xWriteLeadingSEIMessages( leadingSeiMessages, duInfoSeiMessages, accessUnit, pcSlice->getTLayer(), pcSlice->getSPS(), duData );
       xWriteDuSEIMessages( duInfoSeiMessages, accessUnit, pcSlice->getTLayer(), duData );
 
-      m_AUWriterIf->outputAU( accessUnit );
+      if( m_ftActive && m_ftPeriods > 1 )
+      {
+        // written in coding order (xFtOutput)
+        picOrder->au.reset( new AccessUnit );
+        picOrder->au->temporalId = accessUnit.temporalId;
+        picOrder->au->swap( accessUnit );
+      }
+      else
+      {
+        m_AUWriterIf->outputAU( accessUnit );
+      }
 
       msg( NOTICE, "\n" );
       fflush( stdout );
@@ -5640,10 +5786,18 @@ void EncGOP::compressGOP(int iPOCLast, int iNumPicRcvd, PicList &rcListPic, std:
     xEndPicFinish( pcSlice, *picOrder, apsMapLock );
 
     pcPic->reconstructed = true;
-    m_bFirst = false;
+    if( !m_ftActive )
+    {
+      m_bFirst = false;
+    }
     m_iNumPicCoded++;
     if (!(m_pcCfg->getUseCompositeRef() && isEncodeLtRef))
     {
+      std::unique_lock<std::mutex> totalLock( m_ftMutex, std::defer_lock );   // finishes of several periods
+      if( m_ftActive )
+      {
+        totalLock.lock();
+      }
       for( int i = pcSlice->getTLayer() ; i < pcSlice->getSPS()->getMaxTLayers() ; i ++ )
       {
         m_totalCoded[i]++;
@@ -5690,7 +5844,15 @@ void EncGOP::compressGOP(int iPOCLast, int iNumPicRcvd, PicList &rcListPic, std:
     }
 #endif
 #endif
+    if( m_ftActive )
+    {
+      g_msgCapture = nullptr;
+    }
     xEndPicture( *picOrder );
+    if( m_ftActive && m_ftPeriods > 1 )
+    {
+      xFtOutput( *picOrder );
+    }
   } // iGOPid-loop
 
   delete pcBitstreamRedirect;
@@ -6371,6 +6533,15 @@ void EncGOP::xCalculateAddPSNR(Picture *pcPic, PelUnitBuf cPicD, const AccessUni
                                double *PSNR_Y,
                                bool isEncodeLtRef)
 {
+  // frame threads with several periods: the picture's own sums, added to these in coding order (xFtOutput)
+  EncPicAnalyze* const own = m_pcPicOrder ? m_pcPicOrder->analyze.get() : nullptr;
+  Analyze& analyzeAll = own ? own->all : m_gcAnalyzeAll;
+  Analyze& analyzeI   = own ? own->i   : m_gcAnalyzeI;
+  Analyze& analyzeP   = own ? own->p   : m_gcAnalyzeP;
+  Analyze& analyzeB   = own ? own->b   : m_gcAnalyzeB;
+#if WCG_WPSNR
+  Analyze& analyzeWPSNR = own ? own->wpsnr : m_gcAnalyzeWPSNR;
+#endif
   const SPS&         sps = *pcPic->cs->sps;
   const CPelUnitBuf& pic = cPicD;
   CHECK(!(conversion == IPCOLOURSPACE_UNCHANGED), "Unspecified error");
@@ -6575,10 +6746,10 @@ void EncGOP::xCalculateAddPSNR(Picture *pcPic, PelUnitBuf cPicD, const AccessUni
   }
 
   uint32_t uibits = numRBSPBytes * 8;
-  m_vRVM_RP.push_back( uibits );
+  ( own ? own->rvmBits : m_vRVM_RP ).push_back( uibits );
 
   //===== add PSNR =====
-  m_gcAnalyzeAll.addResult(dPSNR, (double) uibits, MSEyuvframe, upscaledPSNR,
+  analyzeAll.addResult(dPSNR, (double) uibits, MSEyuvframe, upscaledPSNR,
 #if MSSIM_UNIFORM_METRICS_LOG
                            msssim,
                            upscaledMsssim, 
@@ -6590,12 +6761,12 @@ void EncGOP::xCalculateAddPSNR(Picture *pcPic, PelUnitBuf cPicD, const AccessUni
 #if JVET_O0756_CALCULATE_HDRMETRICS
   if (calculateHdrMetrics)
   {
-    m_gcAnalyzeAll.addHDRMetricsResult(deltaE, psnrL);
+    analyzeAll.addHDRMetricsResult(deltaE, psnrL);
   }
 #endif
   if (pcSlice->isIntra())
   {
-    m_gcAnalyzeI.addResult(dPSNR, (double) uibits, MSEyuvframe, upscaledPSNR,
+    analyzeI.addResult(dPSNR, (double) uibits, MSEyuvframe, upscaledPSNR,
 #if MSSIM_UNIFORM_METRICS_LOG
                            msssim,
                            upscaledMsssim, 
@@ -6608,13 +6779,13 @@ void EncGOP::xCalculateAddPSNR(Picture *pcPic, PelUnitBuf cPicD, const AccessUni
 #if JVET_O0756_CALCULATE_HDRMETRICS
     if (calculateHdrMetrics)
     {
-      m_gcAnalyzeI.addHDRMetricsResult(deltaE, psnrL);
+      analyzeI.addHDRMetricsResult(deltaE, psnrL);
     }
 #endif
   }
   if (pcSlice->isInterP())
   {
-    m_gcAnalyzeP.addResult(dPSNR, (double) uibits, MSEyuvframe, upscaledPSNR,
+    analyzeP.addResult(dPSNR, (double) uibits, MSEyuvframe, upscaledPSNR,
 #if MSSIM_UNIFORM_METRICS_LOG
                            msssim,
                            upscaledMsssim, 
@@ -6627,13 +6798,13 @@ void EncGOP::xCalculateAddPSNR(Picture *pcPic, PelUnitBuf cPicD, const AccessUni
 #if JVET_O0756_CALCULATE_HDRMETRICS
     if (calculateHdrMetrics)
     {
-      m_gcAnalyzeP.addHDRMetricsResult(deltaE, psnrL);
+      analyzeP.addHDRMetricsResult(deltaE, psnrL);
     }
 #endif
   }
   if (pcSlice->isInterB())
   {
-    m_gcAnalyzeB.addResult(dPSNR, (double) uibits, MSEyuvframe, upscaledPSNR,
+    analyzeB.addResult(dPSNR, (double) uibits, MSEyuvframe, upscaledPSNR,
 #if MSSIM_UNIFORM_METRICS_LOG
                            msssim,
                            upscaledMsssim, 
@@ -6646,14 +6817,14 @@ void EncGOP::xCalculateAddPSNR(Picture *pcPic, PelUnitBuf cPicD, const AccessUni
 #if JVET_O0756_CALCULATE_HDRMETRICS
     if (calculateHdrMetrics)
     {
-      m_gcAnalyzeB.addHDRMetricsResult(deltaE, psnrL);
+      analyzeB.addHDRMetricsResult(deltaE, psnrL);
     }
 #endif
   }
 #if WCG_WPSNR
   if (useLumaWPSNR)
   {
-    m_gcAnalyzeWPSNR.addResult(dPSNRWeighted, (double) uibits, MSEyuvframeWeighted, upscaledPSNR,
+    analyzeWPSNR.addResult(dPSNRWeighted, (double) uibits, MSEyuvframeWeighted, upscaledPSNR,
 #if MSSIM_UNIFORM_METRICS_LOG
                                msssim,
                                upscaledMsssim, 
@@ -7323,6 +7494,28 @@ void EncGOP::xSetupPicOrder( Slice* slice, const std::shared_ptr<EncPicOrder>& o
   // the search and the finish use the picture's copy of the reshaper as the setup leaves it
   m_pcSearchStack->reshaper = *m_pcReshaper;
 
+  if( m_ftActive )
+  {
+    // An intra period starts at a RAS-init IRAP. Its finish resets the state the filter encoders and the APSs carry
+    // (ALF APSs and controls, CCSAO history, ALF scales, the SAO disabled rates of the upper layers), and as an intra
+    // picture of the lowest layer it reads none of what the reset keeps (the SAO disabled rate of layer 0, which it
+    // sets). So the periods' finishes may run at the same time with a finish context each (m_ftPeriods); a context's
+    // next period finishes after its previous one. A RAS-init picture that is not an IRAP (the first one after POC 0
+    // without a CRA, LD) reads layer 0's rate and starts no period.
+    if( m_ftPeriod < 0 || ( slice->getPendingRasInit() && slice->isIRAP() ) )
+    {
+      m_ftPeriod++;
+    }
+    order->finishCtx  = int( m_ftPeriod % m_ftPeriods );
+    order->finishPrev = m_ftCtxLast[order->finishCtx];
+    m_ftCtxLast[order->finishCtx] = order;
+    // decided in coding order here, as the finishes of several periods may not run in coding order
+    order->first    = m_bFirst;
+    order->seqFirst = m_bSeqFirst;
+    m_bFirst        = false;
+    m_bSeqFirst     = false;
+  }
+
   if( m_pcEncLib->getNumSearchStacks() == 1 )
   {
     return;   // one search stack keeps the live temporal context store and AMVP-SbTMVP areas
@@ -7433,21 +7626,49 @@ void EncGOP::xStartPicFinish( Slice* slice, EncPicOrder& order, std::unique_lock
 {
   if( m_ftActive )
   {
-    xFtWait( [&]() { return m_ftFinishTurn == order.turn; } );   // the finishes run in coding order
-    apsMapLock.lock();   // the finish adds and changes APSs; the next pictures' setups may look them up
+    // the finishes of a period run in coding order, its first after the last of the period that had the context before
+    xFtWait( [&]() { return !order.finishPrev || order.finishPrev->finished; } );
+    order.finishPrev.reset();
+    xUseFinishContext( m_pcEncLib->getFinishContext( order.finishCtx ) );
+    if( order.finishCtx == 0 )
+    {
+      apsMapLock.lock();   // the finish adds and changes EncLib's APSs; the next pictures' setups may look them up
+    }
+#if JVET_AL0142_CCSAO_REUSE_CTU && JVET_AE0151_CCSAO_HISTORY_OFFSETS_AND_EXT_EO
+    m_pcSearchStack->cabacEncoder.getCABACWriter( slice->getSPS() )->m_ccSaoPrvParam    = m_pcSAO->m_ccSaoPrvParam;
+    m_pcSearchStack->cabacEncoder.getCABACEstimator( slice->getSPS() )->m_ccSaoPrvParam = m_pcSAO->m_ccSaoPrvParam;
+#endif
+    if( m_ftPeriods > 1 )
+    {
+      order.analyze.reset( new EncPicAnalyze );
+      g_msgCapture = &order.log;   // printed in coding order (xFtOutput)
+    }
   }
   // the LMCS APS of a picture with a new reshaper model (set up in xPicInitLMCS)
   const SliceReshapeInfo& sInfo = m_pcSearchStack->reshaper.getSliceReshaperInfo();
   if( slice->getSPS()->getUseLmcs() && sInfo.getSliceReshapeModelPresentFlag() )
   {
     APS* lmcsAPS = slice->getPicHeader()->getLmcsAPS();
+    if( m_pcApsMap != m_pcEncLib->getApsMap() )
+    {
+      // a finish context of its own: the period's LMCS APS (the setups put EncLib's into the picture header)
+      const int lmcsApsId = slice->getPicHeader()->getLmcsAPSId();
+      lmcsAPS             = m_pcApsMap->getPS( ( lmcsApsId << NUM_APS_TYPE_LEN ) + LMCS_APS );
+      if( lmcsAPS == nullptr )
+      {
+        lmcsAPS = m_pcApsMap->allocatePS( ( lmcsApsId << NUM_APS_TYPE_LEN ) + LMCS_APS );
+        lmcsAPS->setAPSId( lmcsApsId );
+        lmcsAPS->setAPSType( LMCS_APS );
+      }
+      order.picHeader->setLmcsAPS( lmcsAPS );   // the picture's copy (xUsePicHeaderCopy)
+    }
     SliceReshapeInfo& tInfo = lmcsAPS->getReshaperAPSInfo();
     tInfo.reshaperModelMaxBinIdx = sInfo.reshaperModelMaxBinIdx;
     tInfo.reshaperModelMinBinIdx = sInfo.reshaperModelMinBinIdx;
     memcpy(tInfo.reshaperModelBinCWDelta, sInfo.reshaperModelBinCWDelta, sizeof(int)*(PIC_CODE_CW_BINS));
     tInfo.maxNbitsNeededDeltaCW = sInfo.maxNbitsNeededDeltaCW;
     tInfo.chrResScalingOffset = sInfo.chrResScalingOffset;
-    m_pcEncLib->getApsMap()->setChangedFlag((lmcsAPS->getAPSId() << NUM_APS_TYPE_LEN) + LMCS_APS);
+    m_pcApsMap->setChangedFlag((lmcsAPS->getAPSId() << NUM_APS_TYPE_LEN) + LMCS_APS);
   }
 
   if( order.cabacTableIdxDeferred )

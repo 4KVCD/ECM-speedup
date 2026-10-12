@@ -120,6 +120,30 @@ public:
 #endif
 #endif
   double  getPsnr(ComponentID compID) const { return  m_dPSNRSum[compID];  }
+  /// Adds the sums of another analyzer (frame threads: a picture's own, in coding order). For one picture's sums this
+  /// gives the same values as its addResult calls: the sums start at zero and only add.
+  void add( const Analyze& o )
+  {
+    m_dAddBits += o.m_dAddBits;
+    for( uint32_t i = 0; i < MAX_NUM_COMPONENT; i++ )
+    {
+      m_dPSNRSum[i]     += o.m_dPSNRSum[i];
+      m_MSEyuvframe[i]  += o.m_MSEyuvframe[i];
+      m_upscaledPSNR[i] += o.m_upscaledPSNR[i];
+#if MSSIM_UNIFORM_METRICS_LOG
+      m_msssim[i]         += o.m_msssim[i];
+      m_upscaledMsssim[i] += o.m_upscaledMsssim[i];
+#endif
+    }
+#if JVET_O0756_CALCULATE_HDRMETRICS
+    for( int i = 0; i < hdrtoolslib::NB_REF_WHITE; i++ )
+    {
+      m_logDeltaESum[i] += o.m_logDeltaESum[i];
+      m_psnrLSum[i]     += o.m_psnrLSum[i];
+    }
+#endif
+    m_uiNumPic += o.m_uiNumPic;
+  }
 #if JVET_O0756_CALCULATE_HDRMETRICS
   double getDeltaE()                  const { return m_logDeltaESum[0];  }
   double getPsnrL()                   const { return m_psnrLSum[0];  }

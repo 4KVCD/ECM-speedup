@@ -800,6 +800,7 @@ protected:
   bool      m_forceSplitSequential;
   int       m_searchStackCount;
   int       m_frameThreads;
+  int       m_framePeriods;
   int       m_cuThreads;
   bool      m_cuThreadsCheck;
   int       m_numWppThreads;

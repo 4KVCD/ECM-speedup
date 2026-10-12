@@ -145,7 +145,6 @@ void EncLib::create( const int layerId )
 #endif
   }
 
-  m_cLoopFilter.create(floorLog2(m_maxCUWidth) - MIN_CU_LOG2);
   for( auto& stack: m_searchStacks )
   {
     stack->loopFilter.create( floorLog2( m_maxCUWidth ) - MIN_CU_LOG2 );
@@ -153,7 +152,6 @@ void EncLib::create( const int layerId )
 
   if (!m_bLoopFilterDisable && m_encDbOpt)
   {
-    m_cLoopFilter.initEncPicYuvBuffer(m_chromaFormatIDC, Size(getSourceWidth(), getSourceHeight()), getMaxCUWidth());
     for( auto& stack: m_searchStacks )
     {
       stack->loopFilter.initEncPicYuvBuffer( m_chromaFormatIDC, Size( getSourceWidth(), getSourceHeight() ), getMaxCUWidth() );
@@ -193,12 +191,63 @@ void EncLib::create( const int layerId )
 #endif
   }
 
+  xCreateFinishObjects( m_cLoopFilter, m_cEncALF, m_cEncSAO );
+  // frame threads: a finish context per intra period whose finishes run at the same time
+  EncFinishContext own;
+  own.alf            = &m_cEncALF;
+  own.sao            = &m_cEncSAO;
+  own.loopFilter     = &m_cLoopFilter;
+#if JVET_AL0153_ALF_CCCM
+  own.loopFilterCccm = &m_cEncLoopFilterCccm;
+#endif
+#if JVET_AA0096_MC_BOUNDARY_PADDING
+  own.mcPad          = &m_cFrameMcPadPredSearch;
+#endif
+  own.hlsWriter      = &m_HLSWriter;
+  own.apsMap         = &m_apsMap;
+  m_finishContexts.assign( 1, own );
+  m_finishObjects.clear();
+  for( int i = 1; i < ( getFrameThreads() > 1 ? getFramePeriods() : 1 ); i++ )
+  {
+    m_finishObjects.emplace_back( new EncFinishObjects );
+    EncFinishObjects& objects = *m_finishObjects.back();
+    xCreateFinishObjects( objects.loopFilter, objects.alf, objects.sao );
+#if JVET_AM0209_CHROMA_ALF_CCALF_REUSE_CTU
+    objects.alf.m_pictureControlInfo = objects.pictureControlInfo;
+#endif
+#if JVET_AE0151_CCSAO_HISTORY_OFFSETS_AND_EXT_EO
+    objects.sao.m_ccSaoPrvParam = objects.ccSaoPrvParam;
+#endif
+    EncFinishContext context;
+    context.alf            = &objects.alf;
+    context.sao            = &objects.sao;
+    context.loopFilter     = &objects.loopFilter;
+#if JVET_AL0153_ALF_CCCM
+    context.loopFilterCccm = &objects.loopFilterCccm;
+#endif
+#if JVET_AA0096_MC_BOUNDARY_PADDING
+    context.mcPad          = &objects.mcPad;
+#endif
+    context.hlsWriter      = &objects.hlsWriter;
+    context.apsMap         = &objects.apsMap;
+    m_finishContexts.push_back( context );
+  }
+}
+
+void EncLib::xCreateFinishObjects( LoopFilter& loopFilter, EncAdaptiveLoopFilter& alf, EncSampleAdaptiveOffset& sao )
+{
+  loopFilter.create( floorLog2( m_maxCUWidth ) - MIN_CU_LOG2 );
+  if( !m_bLoopFilterDisable && m_encDbOpt )
+  {
+    loopFilter.initEncPicYuvBuffer( m_chromaFormatIDC, Size( getSourceWidth(), getSourceHeight() ), getMaxCUWidth() );
+  }
+
   if (m_alf)
   {
 #if JVET_AA0146_WRAP_AROUND_FIX
-    m_cEncALF.create(this, m_sourceWidth, m_sourceHeight, m_chromaFormatIDC, m_maxCUWidth, m_maxCUHeight, floorLog2(m_maxCUWidth) - m_log2MinCUSize, m_bitDepth, m_inputBitDepth);
+    alf.create(this, m_sourceWidth, m_sourceHeight, m_chromaFormatIDC, m_maxCUWidth, m_maxCUHeight, floorLog2(m_maxCUWidth) - m_log2MinCUSize, m_bitDepth, m_inputBitDepth);
 #else
-    m_cEncALF.create(this, m_iSourceWidth, m_iSourceHeight, m_chromaFormatIDC, m_maxCUWidth, m_maxCUHeight, floorLog2(m_maxCUWidth) - m_log2MinCUSize, m_bitDepth, m_inputBitDepth);
+    alf.create(this, m_iSourceWidth, m_iSourceHeight, m_chromaFormatIDC, m_maxCUWidth, m_maxCUHeight, floorLog2(m_maxCUWidth) - m_log2MinCUSize, m_bitDepth, m_inputBitDepth);
 #endif
   }
 #if JVET_V0094_BILATERAL_FILTER
@@ -235,16 +284,16 @@ void EncLib::create( const int layerId )
     const uint32_t widthInCtus = (m_sourceWidth + m_maxCUWidth - 1) / m_maxCUWidth;
     const uint32_t heightInCtus = (m_sourceHeight + m_maxCUHeight - 1) / m_maxCUHeight;
     const uint32_t numCtuInFrame = widthInCtus * heightInCtus;
-    m_cEncSAO.create(m_sourceWidth, m_sourceHeight, m_chromaFormatIDC, m_maxCUWidth, m_maxCUHeight, floorLog2(m_maxCUWidth) - m_log2MinCUSize, (uint32_t)std::max(0, m_bitDepth[CHANNEL_TYPE_LUMA] - MAX_SAO_TRUNCATED_BITDEPTH), (uint32_t)std::max(0, m_bitDepth[CHANNEL_TYPE_CHROMA] - MAX_SAO_TRUNCATED_BITDEPTH));
+    sao.create(m_sourceWidth, m_sourceHeight, m_chromaFormatIDC, m_maxCUWidth, m_maxCUHeight, floorLog2(m_maxCUWidth) - m_log2MinCUSize, (uint32_t)std::max(0, m_bitDepth[CHANNEL_TYPE_LUMA] - MAX_SAO_TRUNCATED_BITDEPTH), (uint32_t)std::max(0, m_bitDepth[CHANNEL_TYPE_CHROMA] - MAX_SAO_TRUNCATED_BITDEPTH));
 #else
     const uint32_t widthInCtus = (m_iSourceWidth + m_maxCUWidth - 1) / m_maxCUWidth;
     const uint32_t heightInCtus = (m_iSourceHeight + m_maxCUHeight - 1) / m_maxCUHeight;
     const uint32_t numCtuInFrame = widthInCtus * heightInCtus;
-    m_cEncSAO.create(m_iSourceWidth, m_iSourceHeight, m_chromaFormatIDC, m_maxCUWidth, m_maxCUHeight, floorLog2(m_maxCUWidth) - m_log2MinCUSize, (uint32_t)std::max(0, m_bitDepth[CHANNEL_TYPE_LUMA] - MAX_SAO_TRUNCATED_BITDEPTH), (uint32_t)std::max(0, m_bitDepth[CHANNEL_TYPE_CHROMA] - MAX_SAO_TRUNCATED_BITDEPTH));
+    sao.create(m_iSourceWidth, m_iSourceHeight, m_chromaFormatIDC, m_maxCUWidth, m_maxCUHeight, floorLog2(m_maxCUWidth) - m_log2MinCUSize, (uint32_t)std::max(0, m_bitDepth[CHANNEL_TYPE_LUMA] - MAX_SAO_TRUNCATED_BITDEPTH), (uint32_t)std::max(0, m_bitDepth[CHANNEL_TYPE_CHROMA] - MAX_SAO_TRUNCATED_BITDEPTH));
 #endif
-    m_cEncSAO.createEncData(m_saoCtuBoundary, numCtuInFrame);
+    sao.createEncData(m_saoCtuBoundary, numCtuInFrame);
 #if JVET_AJ0237_INTERNAL_12BIT
-    m_cEncSAO.m_bilateralFilter.setInternalBitDepth(m_bitDepth[COMPONENT_Y]);
+    sao.m_bilateralFilter.setInternalBitDepth(m_bitDepth[COMPONENT_Y]);
 #endif
   }
 }
@@ -264,6 +313,17 @@ void EncLib::destroy ()
   }
   m_cEncSAO.            destroy();
   m_cLoopFilter.        destroy();
+  for( auto& objects: m_finishObjects )
+  {
+    if( m_alf )
+    {
+      objects->alf.destroy();
+    }
+    objects->sao.destroy();
+    objects->loopFilter.destroy();
+  }
+  m_finishObjects.clear();
+  m_finishContexts.clear();
   for( auto& stack: m_searchStacks )
   {
     stack->loopFilter.destroy();
@@ -883,6 +943,10 @@ void EncLib::init( bool isFieldCoding, AUWriterIf* auWriterIf )
     for (int aps = 0; aps < ALF_CTB_MAX_NUM_APS; aps++)
     {
       g_pictureControlInfo[aps].resize(numCTUsInPic);
+      for( auto& objects: m_finishObjects )
+      {
+        objects->pictureControlInfo[aps].resize( numCTUsInPic );
+      }
     }
   }
 #endif
@@ -1316,7 +1380,7 @@ bool EncLib::encode( const InputColourSpaceConversion snrCSC, std::list<PelUnitB
     // search stack, ahead of the pictures in flight.
     if( m_picIdInGOP == 0 )
     {
-      m_cGOPEncoder.waitFrameThreads( std::max( getNumSearchStacks(), m_iGOPSize ) );
+      m_cGOPEncoder.waitFrameThreads( std::max( getNumSearchStacks(), m_iGOPSize ) * getNumFinishContexts() );
       m_cGOPEncoder.compressGOPFrameThreads( m_iPOCLast ? m_iGOPSize : 1, m_iPOCLast, m_iNumPicRcvd, m_cListPic,
                                              rcListPicYuvRecOut, false, false, snrCSC, m_printFrameMSE,
 #if MSSIM_UNIFORM_METRICS_LOG
@@ -1545,8 +1609,9 @@ void EncLib::xGetNewPicBuffer ( std::list<PelUnitBuf*>& rcListPicYuvRecOut, Pict
     {
       rpcPic = *iterPic;
       // with frame threads, pictures read ahead may already be marked unused for reference, and a picture's buffer
-      // stays until it is output (m_ftBusyPics)
-      if( !rpcPic->referenced && rpcPic->layerId == m_layerId && !m_ftBusyPics.count( rpcPic ) )
+      // stays until it is output (m_ftBusyPics) and no picture in flight references it
+      if( !rpcPic->referenced && rpcPic->layerId == m_layerId && !m_ftBusyPics.count( rpcPic )
+          && !( getFrameThreads() > 1 && m_cGOPEncoder.isPicReferencedInFlight( rpcPic ) ) )
       {
         break;
       }

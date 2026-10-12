@@ -3023,9 +3023,9 @@ void EncSampleAdaptiveOffset::CCSAOProcess(CodingStructure& cs, const double* la
   if( cs.slice->isIDRorBLA() || cs.slice->getPendingRasInit() )
 #endif
   {
-    g_ccSaoPrvParam[COMPONENT_Y ].clear();
-    g_ccSaoPrvParam[COMPONENT_Cb].clear();
-    g_ccSaoPrvParam[COMPONENT_Cr].clear();
+    m_ccSaoPrvParam[COMPONENT_Y ].clear();
+    m_ccSaoPrvParam[COMPONENT_Cb].clear();
+    m_ccSaoPrvParam[COMPONENT_Cr].clear();
   }
 #endif
 
@@ -3323,9 +3323,9 @@ void EncSampleAdaptiveOffset::deriveCcSao( CodingStructure& cs, const ComponentI
 #if JVET_AE0151_CCSAO_HISTORY_OFFSETS_AND_EXT_EO
   if (!cs.slice->isIntra())
   {
-    for (int prvId = 0; prvId < g_ccSaoPrvParam[compID].size(); prvId++)
+    for (int prvId = 0; prvId < m_ccSaoPrvParam[compID].size(); prvId++)
     {
-      if (g_ccSaoPrvParam[compID][prvId].temporalId > cs.slice->getTLayer())
+      if (m_ccSaoPrvParam[compID][prvId].temporalId > cs.slice->getTLayer())
       {
         continue;
       }
@@ -3333,9 +3333,9 @@ void EncSampleAdaptiveOffset::deriveCcSao( CodingStructure& cs, const ComponentI
 #if JVET_AL0142_CCSAO_REUSE_CTU
       for (int reuseMode = CCSAO_REUSE_PARAM; reuseMode < NUM_CCSAO_REUSE_MODES; reuseMode++)
       {
-        setupTempCcSaoParamFromPrv(cs, compID, prvId, reuseMode, m_tempCcSaoParam, g_ccSaoPrvParam[compID][prvId], m_tempCcSaoControl);
+        setupTempCcSaoParamFromPrv(cs, compID, prvId, reuseMode, m_tempCcSaoParam, m_ccSaoPrvParam[compID][prvId], m_tempCcSaoControl);
 #else
-        setupTempCcSaoParamFromPrv(cs, compID, prvId,            m_tempCcSaoParam, g_ccSaoPrvParam[compID][prvId], m_tempCcSaoControl);
+        setupTempCcSaoParamFromPrv(cs, compID, prvId,            m_tempCcSaoParam, m_ccSaoPrvParam[compID][prvId], m_tempCcSaoControl);
 #endif
 
         getCcSaoStatistics    (cs, compID, orgYuv, srcYuv, dstYuv, m_ccSaoStatData,                             m_tempCcSaoParam);
@@ -7152,9 +7152,9 @@ void EncSampleAdaptiveOffset::setupCcSaoPrv(CodingStructure &cs)
     if (m_ccSaoComParam.enabled[compIdx] && !m_ccSaoComParam.reusePrv[compIdx])
 #endif
     {
-      if (g_ccSaoPrvParam[compIdx].size() == MAX_CCSAO_PRV_NUM)
+      if (m_ccSaoPrvParam[compIdx].size() == MAX_CCSAO_PRV_NUM)
       {
-        g_ccSaoPrvParam[compIdx].pop_back();
+        m_ccSaoPrvParam[compIdx].pop_back();
       }
 
       CcSaoPrvParam prvParam;
@@ -7166,7 +7166,7 @@ void EncSampleAdaptiveOffset::setupCcSaoPrv(CodingStructure &cs)
       std::memcpy( prvParam.bandNum,    m_ccSaoComParam.bandNum   [compIdx], sizeof( prvParam.bandNum    ) );
       std::memcpy( prvParam.offset,     m_ccSaoComParam.offset    [compIdx], sizeof( prvParam.offset     ) );
 
-      g_ccSaoPrvParam[compIdx].insert(g_ccSaoPrvParam[compIdx].begin(), prvParam);
+      m_ccSaoPrvParam[compIdx].insert(m_ccSaoPrvParam[compIdx].begin(), prvParam);
     }
   }
 }

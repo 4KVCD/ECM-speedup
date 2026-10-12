@@ -2657,7 +2657,7 @@ void EncSlice::encodeSlice   ( Picture* pcPic, OutputBitstream* pcSubstreams, ui
   uint32_t uiSubStrm = 0;
 
 #if JVET_Z0135_TEMP_CABAC_WIN_WEIGHT
-  static Ctx storedCtx;
+  static thread_local Ctx storedCtx;   // set and used within the call (slice writings may run at the same time)
 #endif
   // for every CTU in the slice...
   for( uint32_t ctuIdx = 0; ctuIdx < pcSlice->getNumCtuInSlice(); ctuIdx++ )

@@ -195,6 +195,9 @@ public:
 #endif
   void disabledRate( CodingStructure& cs, SAOBlkParam* reconParams, const double saoEncodingRate, const double saoEncodingRateChroma );
   void getPreDBFStatistics(CodingStructure& cs);
+#if JVET_AE0151_CCSAO_HISTORY_OFFSETS_AND_EXT_EO
+  std::vector<CcSaoPrvParam>* m_ccSaoPrvParam = g_ccSaoPrvParam;   ///< CCSAO history (frame threads: one per finish context)
+#endif
 private: //methods
 
   void deriveLoopFilterBoundaryAvailibility(CodingStructure& cs, const Position &pos, bool& isLeftAvail, bool& isAboveAvail, bool& isAboveLeftAvail) const;

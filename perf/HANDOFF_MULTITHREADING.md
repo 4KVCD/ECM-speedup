@@ -108,6 +108,23 @@ Commits on `enc-mt`, all bit-exact with stock ECM-20.0 (bitstream md5 of the sui
   the earliest picture not finished has one or one stays free for it (deadlock-free with any finish order where that
   picture waits for nothing). Taking stacks strictly in coding order once ready blocks RA behind pictures waiting for
   their references (modelled 1.11x instead of 1.45x with 8 threads; measured ra20 1.04x at 4 threads).
+- P5 stage B-2 (`--FramePeriods`): the finishes of up to M intra periods run at the same time. EncLib holds a finish
+  context per period in flight (`EncFinishContext`: ALF and SAO encoders, loop filter, ALF-CCCM, MC padding, HLS
+  writer, APS map, with the ALF CTU control and CCSAO history that were globals); EncGOP's filter pointers are
+  thread-local and point to the picture's context during its finish. A period's finishes run in coding order through
+  `EncPicOrder::finishPrev` (the last picture that used the context). An output step in coding order prints each
+  finish's captured log (`g_msgCapture`), writes its access unit and adds its PSNR sums and RVM bits. The first picture
+  (`m_bFirst`, `m_bSeqFirst`) is decided in the setup; parameter-set and SEI writing take locks; the embedded-APS list,
+  AUD and BP flags are per thread; the ALF scale statics became members, the ALF coefficient caches fill under a lock,
+  the slice writer's stored contexts are per thread. EncLib reuses a picture buffer only when no picture in flight
+  references it (the next period's CRA marks the previous period's pictures unused while they are still read).
+  - A period starts only at a RAS-init IRAP: the RAS-init reset keeps the SAO disabled rate of layer 0, which a
+    non-intra RAS-init picture reads (ra20's POC 16: SAO slice flags differed, reconstruction identical).
+  - Results (8 P-cores, previous commit's single thread as base): AI 33 pictures 6.83x with 8 threads, RA 65 frames
+    1.70x with 4 and 2.79x with 8 (stage A: 1.32x / 1.50x), as `p5_sim.py` predicts (1.65x / 2.79x); RA 129
+    frames 2.48-2.64x with 8 (two runs).
+  - Not covered by the tests: ALF APSs (ECM embeds APSs in the picture header, and no test sequence signalled an ALF
+    APS; LMCS APSs appear at every intra picture and are covered).
 - Found by the matrix of stage A: `--FrameThreads` >= 3 stopped with "PDP predictor unavailable" on ra_cif (bug of
   cfe3c39a, fixed in its own commit): a search stack's first picture used IntraPrediction's PDP buffer pointers before
   any CU of that stack had set them.
@@ -128,8 +145,9 @@ Commits on `enc-mt`, all bit-exact with stock ECM-20.0 (bitstream md5 of the sui
 - `grain_probe/insert_grain_probes.py <tree>`: adds timers to every candidate loop in a throwaway checkout of 2912a239
   and prints, at exit, the speed-up a 2/4/8/16-worker pool would reach with 2 us overhead per task (results in
   Progress). Its task times include each candidate's setup.
-- `p5_sim.py <serial log> [finish fraction]`: event-driven schedule of overlapping GOPs with K threads and S stacks,
-  finishes in coding order globally or per intra period.
+- `p5_sim.py <serial log> [finish fraction] [periods]`: event-driven schedule with K threads, S stacks, C finish
+  contexts and W pictures in flight, stacks in coding order (stage A) or to ready pictures (stage B); can extend the
+  log's last intra period to model longer sequences.
 - `cu_matrix.py EXE TAG REFEXE`: the bit-exactness matrix of the thread options (default, CuThreads 2/4/8, the
   check, FrameThreads 2/4/8 and combinations), jobs on their own P-cores; `cu_scale.py EXE tests counts`: CuThreads timings, one run at
   a time on P-cores, with each run's peak commit.
@@ -361,5 +379,8 @@ AI-latency ~2-2.5x.
    - More P2 for LD, the only configuration nothing else speeds up: merge SATD pass, ME per reference, the GPM stages,
      intra RMD in chunks, then P3 speculation for the merge/GPM full RD and the intra MTS pass. Expected 1.1-1.2x on
      LD in all, each loop a step like the first (state sync, record and compare, shadow check).
-2. P0, P1, the first P2 step and P5 stage A are done (see Progress). Next: P5 stage B (Progress has the plan).
+2. P0, P1, the first P2 step and P5 (stages A, B-1, B-2) are done (see Progress). Open in P5: the model loses with
+   a larger in-flight window at 4 threads (later periods' pictures take the stacks and hold them while their finishes
+   wait); a stack could be released at the end of the search if the finish used its context's objects only. Next by
+   the user's order: more P2 for LD.
 3. Report each step as step % and cumulative % with before/after numbers and commit hashes, one commit per step.

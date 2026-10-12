@@ -2256,7 +2256,10 @@ template <typename T> inline void Check3( T minVal, T maxVal, T a)
   CHECK( ( a > maxVal ) || ( a < minVal ), "ERROR: Range check " << minVal << " >= " << a << " <= " << maxVal << " failed" );
 }  ///< general min/max clip
 
+#include <string>
+
 extern MsgLevel g_verbosity;
+extern thread_local std::string* g_msgCapture;   ///< when set, msg() below ERROR appends here instead of printing
 
 #include <stdarg.h>
 inline void msg( MsgLevel level, const char* fmt, ... )
@@ -2265,7 +2268,24 @@ inline void msg( MsgLevel level, const char* fmt, ... )
   {
     va_list args;
     va_start( args, fmt );
-    vfprintf( level == ERROR ? stderr : stdout, fmt, args );
+    if( g_msgCapture && level != ERROR )
+    {
+      va_list size;
+      va_copy( size, args );
+      const int len = vsnprintf( nullptr, 0, fmt, size );
+      va_end( size );
+      if( len > 0 )
+      {
+        const size_t start = g_msgCapture->size();
+        g_msgCapture->resize( start + len + 1 );
+        vsnprintf( &( *g_msgCapture )[start], len + 1, fmt, args );
+        g_msgCapture->resize( start + len );
+      }
+    }
+    else
+    {
+      vfprintf( level == ERROR ? stderr : stdout, fmt, args );
+    }
     va_end( args );
   }
 }

@@ -588,6 +588,9 @@ public:
 #if JVET_AG0098_AMVP_WITH_SBTMVP
   uint32_t*               m_amvpSbTmvpEnabledArea = nullptr;   ///< where encoding adds the area of AMVP-SbTMVP blocks
 #endif
+#if JVET_AL0142_CCSAO_REUSE_CTU
+  std::vector<CcSaoPrvParam>* m_ccSaoPrvParam = nullptr;   ///< the CCSAO history the slice writing completes (null: g_ccSaoPrvParam)
+#endif
 
 
 private:

@@ -74,6 +74,52 @@
 #endif
 class EncLibCommon;
 
+/// Frame threads: the objects whose state the finishes (loop filters, APSs, slice writing) of an intra period carry from
+/// picture to picture. A period starts at a RAS-init picture, whose finish resets that state, so periods in flight each
+/// take a context (EncGOP, FramePeriods); context 0 is EncLib's own objects.
+struct EncFinishContext
+{
+  EncAdaptiveLoopFilter*   alf        = nullptr;
+  EncSampleAdaptiveOffset* sao        = nullptr;
+  LoopFilter*              loopFilter = nullptr;
+#if JVET_AL0153_ALF_CCCM
+  EncLoopFilterCccm*       loopFilterCccm = nullptr;
+#endif
+#if JVET_AA0096_MC_BOUNDARY_PADDING
+  InterPrediction*         mcPad      = nullptr;
+#endif
+  HLSWriter*               hlsWriter  = nullptr;
+  ParameterSetMap<APS>*    apsMap     = nullptr;
+};
+
+/// The objects of a finish context other than the first
+struct EncFinishObjects
+{
+  int                      apsIdStart  = ALF_CTB_MAX_NUM_APS;
+  int                      apsIdStart2 = ALF_CTB_MAX_NUM_APS;
+#if JVET_AK0065_TALF
+  EncAdaptiveLoopFilter    alf { apsIdStart, apsIdStart2 };
+#else
+  EncAdaptiveLoopFilter    alf { apsIdStart };
+#endif
+  EncSampleAdaptiveOffset  sao;
+  LoopFilter               loopFilter;
+#if JVET_AL0153_ALF_CCCM
+  EncLoopFilterCccm        loopFilterCccm;
+#endif
+#if JVET_AA0096_MC_BOUNDARY_PADDING
+  InterPrediction          mcPad;
+#endif
+  HLSWriter                hlsWriter;
+  ParameterSetMap<APS>     apsMap { MAX_NUM_APS * MAX_NUM_APS_TYPE };
+#if JVET_AM0209_CHROMA_ALF_CCALF_REUSE_CTU
+  FrameCtrlInfo            pictureControlInfo[ALF_CTB_MAX_NUM_APS];   ///< as g_pictureControlInfo
+#endif
+#if JVET_AE0151_CCSAO_HISTORY_OFFSETS_AND_EXT_EO
+  std::vector<CcSaoPrvParam> ccSaoPrvParam[MAX_NUM_COMPONENT];        ///< as g_ccSaoPrvParam
+#endif
+};
+
 //! \ingroup EncoderLib
 //! \{
 
@@ -101,6 +147,9 @@ private:
   std::vector<std::unique_ptr<EncSearchStack>> m_searchStacks;
   // CuThreads: the helpers of each search stack (stack i has the helpers i * CuThreads ... i * CuThreads + CuThreads - 1)
   std::vector<std::unique_ptr<EncRdHelperStack>> m_rdHelperStacks;
+  // frame threads: the finish contexts of the intra periods in flight (FramePeriods); the first is EncLib's own objects
+  std::vector<EncFinishContext>                  m_finishContexts;
+  std::vector<std::unique_ptr<EncFinishObjects>> m_finishObjects;
   // frame threads: the stack of the picture setups, of which only the objects a setup uses are initialised (the slice
   // encoder, the rate and quantizer lambdas, the adaptive search ranges, the IBC hash map, the reshaper)
   std::unique_ptr<EncSearchStack> m_setupStack;
@@ -181,6 +230,7 @@ protected:
   void  xInitAPS          (APS &aps);                 ///< initialize APS from encoder options
   void  xInitScalingLists ( SPS &sps, APS &aps );     ///< initialize scaling lists
   std::vector<TrQuant*> xAllTrQuants();               ///< the quantizers of the search stacks and their helpers
+  void xCreateFinishObjects( LoopFilter& loopFilter, EncAdaptiveLoopFilter& alf, EncSampleAdaptiveOffset& sao );
   void  xInitPPSforLT(PPS& pps);
   void  xInitHrdParameters(SPS &sps);                 ///< initialize HRDParameters parameters
 
@@ -206,6 +256,8 @@ public:
   int                     getNumSearchStacks    () const        { return  int( m_searchStacks.size() ); }
   EncSearchStack&         getSearchStack        ( int i = 0 )   { return  *m_searchStacks[i];      }
   EncSearchStack*         getSetupStack         ()              { return  m_setupStack.get();      }
+  int                     getNumFinishContexts  () const        { return  int( m_finishContexts.size() ); }
+  const EncFinishContext& getFinishContext      ( int i ) const { return  m_finishContexts[i];     }
   int                     getNumRdHelpers       () const        { return  m_searchStacks.empty() ? 0 : int( m_rdHelperStacks.size() / m_searchStacks.size() ); }
   EncRdHelperStack&       getRdHelperStack      ( int i, int h ) { return *m_rdHelperStacks[i * getNumRdHelpers() + h]; }
   InterSearch*            getInterSearch        ()              { return  &m_searchStacks[0]->interSearch; }
