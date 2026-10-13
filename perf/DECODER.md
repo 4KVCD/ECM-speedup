@@ -413,7 +413,8 @@ the reconstruction buffer; works in every frame-thread context):
   9 taps) instead of the downsampled luma. M34 is CCCM: a chroma block fits each chroma component a 7-tap
   convolutional model (the downsampled luma sample, its four neighbours, a nonlinear term, a bias) to a template of up
   to 6 lines around it by least squares - one model or two, and with LBCCP a second set competing by the template's
-  SATD - and applies it.
+  SATD - and applies it. M35 is GL-CCCM: the model takes luma gradients and the sample's position instead of its
+  neighbours (with 64-bit sums).
   GpuIntraRec::supported()
   rejects every tool whose mode derivation or prediction reads reconstructed samples or that the kernels lack, before
   anything is skipped. All 19 regular streams now fall back to the CPU at cross-component prediction (CCP merge,
