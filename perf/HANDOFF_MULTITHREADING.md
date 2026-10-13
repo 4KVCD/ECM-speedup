@@ -196,6 +196,9 @@ Commits on `enc-mt`, all bit-exact with stock ECM-20.0 (bitstream md5 of the sui
 - RAM step R5: `BestEncInfoCache` also makes a slot itself (CU, PU, TUs) at its first store (`xCreateSlot`), not
   every slot at create (about 85 MB per stack, all touched). Peak commit RA 65 frames with 8 threads 5.14 -> 4.37 GB;
   2.1 % faster on the suite.
+- RAM step R6: the CCSAO edge statistics per CTU (`CcSaoCtuStatData`) sum in 32 bits: a running finish's SAO
+  statistics 0.64 -> 0.43 GB at 1080p; 1.3 % faster on the suite. RA 1080p with 8 threads and 8 periods, 75-150 s,
+  after R1-R6: about 8.9 GB on average (working set 6.0 GB), peak 9.6 GB (working set 6.9 GB).
 - Tried and dropped (RAM): freeing the original and the per-4x4 arrays of a finished picture that waits only for its
   output and is no reference (`C:\Code\work\mt\ram\w_dropped.diff`). In the first minutes at 1080p with 8 threads
   and 8 periods the list holds about 280 waiting pictures, 9 being searched and at most 13 finished ones, all still
