@@ -13,18 +13,29 @@ file( GLOB INC_FILES "*.h" )
 file( GLOB SHADER_FILES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/shaders/*.comp" )
 file( GLOB SHADER_INCLUDES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/shaders/*.glsl" )
 
-# every compute shader becomes a header with its SPIR-V words (const uint32_t spv_<name>[])
+# every compute shader becomes a header with its SPIR-V words (const uint32_t spv_<name>[]); glslang's depfile names
+# the includes each one reads, so a change to one include recompiles only the shaders that read it (CMake 3.21 has
+# DEPFILE for every generator; before, each shader depends on all includes)
 set( SPV_DIR "${CMAKE_CURRENT_BINARY_DIR}/spv" )
 file( MAKE_DIRECTORY "${SPV_DIR}" )
 set( SPV_HEADERS )
 foreach( SHADER ${SHADER_FILES} )
   get_filename_component( NAME ${SHADER} NAME_WE )
   set( OUT "${SPV_DIR}/${NAME}.spv.h" )
-  add_custom_command( OUTPUT "${OUT}"
-                      COMMAND "${ECM_GLSLANG}" -V --target-env vulkan1.3 -Os -I${CMAKE_CURRENT_SOURCE_DIR}/shaders
-                              --vn spv_${NAME} -o "${OUT}" "${SHADER}"
-                      DEPENDS "${SHADER}" ${SHADER_INCLUDES}
-                      COMMENT "glslang ${NAME}.comp" VERBATIM )
+  if( CMAKE_VERSION VERSION_GREATER_EQUAL 3.21 )
+    add_custom_command( OUTPUT "${OUT}"
+                        COMMAND "${ECM_GLSLANG}" -V --target-env vulkan1.3 -Os -I${CMAKE_CURRENT_SOURCE_DIR}/shaders
+                                --vn spv_${NAME} --depfile "${OUT}.d" -o "${OUT}" "${SHADER}"
+                        DEPENDS "${SHADER}"
+                        DEPFILE "${OUT}.d"
+                        COMMENT "glslang ${NAME}.comp" VERBATIM )
+  else()
+    add_custom_command( OUTPUT "${OUT}"
+                        COMMAND "${ECM_GLSLANG}" -V --target-env vulkan1.3 -Os -I${CMAKE_CURRENT_SOURCE_DIR}/shaders
+                                --vn spv_${NAME} -o "${OUT}" "${SHADER}"
+                        DEPENDS "${SHADER}" ${SHADER_INCLUDES}
+                        COMMENT "glslang ${NAME}.comp" VERBATIM )
+  endif()
   list( APPEND SPV_HEADERS "${OUT}" )
 endforeach()
 

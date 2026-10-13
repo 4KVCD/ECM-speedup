@@ -705,6 +705,10 @@ Profile of a GPU-on decode (non-LTO, m2_park16, share of all samples): parsing ~
   each). Since then intra_rec's variants are compiled on first use (`intraRecKernel`: ~19 s for a cold start that
   needs one), and the test scripts give the driver a cache of their own (`__GL_SHADER_DISK_CACHE_PATH`,
   `__GL_SHADER_DISK_CACHE_SIZE`, `__GL_SHADER_DISK_CACHE_SKIP_CLEANUP`, which the Windows driver honors).
+- Build time of a shader change (2026-10-13): ~15 s, of which glslang `-Os` on intra_rec.comp takes 14.1 s (0.3 s
+  without the optimizer, `-O` 12.2 s); without `-Os` the driver's cold compile of a pipeline takes 30.7 instead of
+  ~19 s, so `-Os` stays. Each shader depends on the includes glslang's depfile names (CMake 3.21+), not on all of them;
+  moving the SPIR-V arrays out of GpuIntraRec.cpp gained nothing (its compile runs beside glslang's).
 - Buffer references (device addresses) have no robustness: a read past a plane's end loses the device
   (VK_ERROR_DEVICE_LOST, nvlddmkm event 153; all three decodes running at the time failed), and one past a row's end reads
   the next row unnoticed. To find such a read without more device losses (M31's first version: luma TIMD / TMRL blocks
