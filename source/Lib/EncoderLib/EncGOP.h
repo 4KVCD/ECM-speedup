@@ -502,6 +502,7 @@ protected:
   std::mutex               m_ftMutex;
   std::condition_variable  m_ftCv;
   int64_t                  m_ftSetupTurn  = 0;         ///< turn (EncPicOrder::turn) whose setup may run
+  bool                     m_ftInputWaits = false;     ///< the input side waits for pictures to be done (waitFrameThreads)
   int                      m_ftPeriods    = 1;         ///< finish contexts (FramePeriods)
   int64_t                  m_ftPeriod     = -1;        ///< the intra period of the last setup
   std::vector<std::shared_ptr<EncPicOrder>> m_ftCtxLast;   ///< per finish context: the last picture set up to use it

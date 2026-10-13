@@ -188,6 +188,7 @@ void EncGOP::compressGOPFrameThreads( int numPics, int iPOCLast, int iNumPicRcvd
   {
     m_ftActive     = true;
     m_ftSetupTurn  = 0;
+    m_ftInputWaits = false;
     m_ftPeriods    = m_pcEncLib->getNumFinishContexts();
     m_ftPeriod     = -1;
     m_ftCtxLast.assign( m_ftPeriods, nullptr );
@@ -208,8 +209,12 @@ void EncGOP::compressGOPFrameThreads( int numPics, int iPOCLast, int iNumPicRcvd
     m_ftPicsInFlight.clear();
     m_ftPicsDone.clear();
   }
-  const int64_t firstTurn = m_ftNumTurns;
-  m_ftNumTurns += numPics;
+  int64_t firstTurn;
+  {
+    std::lock_guard<std::mutex> lock( m_ftMutex );   // the searches read it (xFtAcquireStack)
+    firstTurn = m_ftNumTurns;
+    m_ftNumTurns += numPics;
+  }
   // the GOP's arguments by value: the call returns before the pictures are done
   for( int i = 0; i < numPics; i++ )
   {
@@ -248,7 +253,15 @@ void EncGOP::compressGOPFrameThreads( int numPics, int iPOCLast, int iNumPicRcvd
 void EncGOP::waitFrameThreads( int64_t maxPending )
 {
   std::unique_lock<std::mutex> lock( m_ftMutex );
-  m_ftCv.wait( lock, [&]() { return m_ftError || m_ftNumTurns - m_ftNumDone <= maxPending; } );
+  const auto ready = [&]() { return m_ftError || m_ftNumTurns - m_ftNumDone <= maxPending; };
+  if( !ready() )
+  {
+    // no picture is passed in until it returns: all-intra searches may take stacks (xFtAcquireStack)
+    m_ftInputWaits = true;
+    m_ftCv.notify_all();
+    m_ftCv.wait( lock, ready );
+    m_ftInputWaits = false;
+  }
   if( m_ftError )
   {
     // the other pictures stop at their next wait (FtAbort)
@@ -366,18 +379,28 @@ void EncGOP::xFtAcquireStack( EncPicOrder& order )
   // A picture whose search inputs are done takes the first free stack, the waiting picture of the highest search
   // priority first (xFtSearchPriority: the earliest, or for all-intra coding the most expensive). The
   // earliest picture not done, whose finish waits for no other picture, has a stack or one stays free for it: so the
-  // pictures holding the stacks cannot all wait for a picture without one. Only the first waiter takes a stack, so
-  // the condition still holds when it does.
+  // pictures holding the stacks cannot all wait for a picture without one. Only the first waiter takes a stack, or
+  // the earliest picture the one kept for it (it need not be the first in priority order), so the condition still
+  // holds when one does. In all intra, the setups take microseconds, so each picture would take a
+  // free stack as soon as its setup ends and the first N would start in coding order: the waiters take stacks only
+  // while the input side waits (waitFrameThreads: at the in-flight limit or at the end) and every picture passed is
+  // set up, so that the priority order covers them all.
   {
     std::lock_guard<std::mutex> lock( m_ftMutex );
     m_ftStackWaiters.insert( { -order.searchPriority, order.turn } );
   }
+  const bool allIntra = m_pcCfg->getIntraPeriod() == 1;
   xFtWait( [&]()
   {
+    if( allIntra && !( m_ftInputWaits && m_ftSetupTurn == m_ftNumTurns ) )
+    {
+      return false;
+    }
     const int64_t earliest = m_ftFirstNotFinished;
     const int     numFree  = int( std::count( m_ftStackBusy.begin(), m_ftStackBusy.end(), false ) );
-    return m_ftStackWaiters.begin()->second == order.turn && numFree > 0
-           && ( order.turn == earliest || m_ftStackHolders.count( earliest ) || numFree > 1 );
+    const bool    first    = m_ftStackWaiters.begin()->second == order.turn;
+    return numFree > 0
+           && ( order.turn == earliest || ( first && ( m_ftStackHolders.count( earliest ) || numFree > 1 ) ) );
   } );
   std::lock_guard<std::mutex> lock( m_ftMutex );
   m_ftStackWaiters.erase( { -order.searchPriority, order.turn } );

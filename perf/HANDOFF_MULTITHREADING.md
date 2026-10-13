@@ -216,6 +216,15 @@ Commits on `enc-mt`, all bit-exact with stock ECM-20.0 (bitstream md5 of the sui
   the 265K (20 threads chosen): AI 33 pictures 201.2 -> 23.1 s (8.7x), RA 65 frames 540.0 -> 202.7 s (2.66x; two
   periods, chain-bound: 2.8 busy cores), RA 513 frames 327.8 s (8 threads on the 8 P-cores took 612.3 s). `bench.py`
   pins before the encoder starts, so a pinned run picks one thread.
+- Speed step S4: in all intra, while pictures are still being passed in, a picture takes a search stack only when the
+  input side waits in `waitFrameThreads` (at the in-flight limit or at the end) and every picture passed is set up
+  (`m_ftInputWaits`), so S1's order covers the first wave too (the setups take microseconds, so before, the first N
+  pictures took the stacks in coding order). Fix of S1 (42c9fbd3) in the same step: the earliest picture not
+  finished may take the stack kept for it even when it is not first in priority order; before, that stack stayed
+  idle while a cheap early picture waited behind expensive ones (8 threads: 29.1 -> 32.4 s with the first-wave change
+  alone). AI 33 pictures, 2 runs each alternating with the previous commit: 20 threads unpinned 21.85 -> 19.0 s,
+  8 threads on the P-cores 29.1 -> 29.2 s (coding order was already balanced there: about 7 s of CPU a picture on 8
+  cores). `--ParallelSegments=20` takes 16.8 s. RA and LD: unchanged (coding order; the earliest is always first).
 - RA 513 frames with 20 threads, timeline (`ECM_FT_TRACE` probe, `C:\Code\work\mt\trace_patch2.py`): all 16
   periods start at once and all 20 stacks search from about 60 to 160 s; the second half is a tail (16 down to 1
   searching) of the heaviest periods' chains (period cost varies 6x on this sequence). The schedule simulation

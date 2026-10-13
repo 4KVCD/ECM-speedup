@@ -101,9 +101,12 @@ lower all-core turbo, one duplicated intra frame per chunk, unequal chunk comple
 - The pictures run in threads of their own, at most N searching at a time. The setups take turns in coding order on
   a setup stack of their own; a picture takes a search stack once the pictures it reads are done, the earliest such
   picture first (in all intra, which reads no other picture, the one of the highest luma activity, as the chunks of
-  `--ParallelSegments`: AI 33 pictures 4.5-4.9 % faster), and gives it back when its search ends: its finish uses its intra period's finish stack
-  (`perf/HANDOFF_MULTITHREADING.md`, P1 and P5). The GOPs overlap: the next GOPs are read and started while a GOP's
-  pictures are in flight, and the reconstructions are written in output order as they are done.
+  `--ParallelSegments`; while pictures are still being passed in, all-intra pictures take stacks only when the input
+  waits and every picture passed is set up, so the first ones start in that order too: AI 33 pictures with 20
+  threads 4.9 % and then 13 % faster (21.9 -> 19.0 s), with 8 threads 4.5 % and then as before), and gives it back
+  when its search ends: its finish uses its intra period's finish stack (`perf/HANDOFF_MULTITHREADING.md`, P1 and
+  P5). The GOPs overlap: the next GOPs are read and started while a GOP's pictures are in flight, and the
+  reconstructions are written in output order as they are done.
 - The finishes (loop filters, APSs, slice writing) of an intra period run in coding order. With M > 1 the finishes of
   up to M intra periods run at the same time, each period with its own copy of the filter encoders and APSs, while the
   log lines, access units and PSNR sums still go out in coding order. A period starts at a RAS-init intra picture
