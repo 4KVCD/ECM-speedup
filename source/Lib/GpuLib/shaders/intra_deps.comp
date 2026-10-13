@@ -108,6 +108,11 @@ void readRange( Tu t, int ln, int topLen, int leftLen, out int topMax, out int l
     topMax  = W + 1 + mrl;
     leftMax = H + 1 + mrl;
   }
+  else if( ( t.lm & LM_ACTIVE ) != 0 )   // CCLM's template: entries 1 .. 2W / 2H (MDLM's longest)
+  {
+    topMax  = 2 * W;
+    leftMax = 2 * H;
+  }
   else
   {
     const bool ver = t.isModeVer != 0;
@@ -210,6 +215,16 @@ void lineDeps( int comp, int fx, int fy, int predSize, int predHSize, int mrl )
   const int x0 = fx - 1 - mrl, y0 = fy - 1 - mrl;
   addAreaDeps( comp, x0, y0, fx - 1 + predSize, y0 );
   addAreaDeps( comp, x0, y0, x0, fy - 1 + predHSize );
+}
+
+// a dependency of CCLM block t on the blocks owning the luma samples its downsampling reads (xGetLumaRecPixels, 4:2:0):
+// the co-located block, the rows above it (up to 3; MDLM's template 2W wide) and the columns left of it (3; 2H high)
+void cclmDeps( Tu t )
+{
+  const int lx = t.x << 1, ly = t.y << 1, lw = t.w << 1, lh = t.h << 1;
+  addAreaDeps( 0, lx, ly, lx + lw - 1, ly + lh - 1 );
+  addAreaDeps( 0, lx - 1, ly - 3, lx + 2 * lw, ly - 1 );
+  addAreaDeps( 0, lx - 3, ly - 1, lx - 1, ly + 2 * lh - 1 );
 }
 
 // a dependency of chroma TMRL CU c's node on the modes it reads - the luma CUs' at its five positions and the chroma
@@ -465,6 +480,10 @@ void dependencies( int comp )
   if( bfNeeded )
   {
     bilateralFilterDeps( t, comp, availComp, fx, fy, numAbove, numLeft );
+  }
+  if( ( t.lm & LM_ACTIVE ) != 0 )   // CCLM: the luma it downsamples
+  {
+    cclmDeps( t );
   }
   if( t.ispPrev >= 0 )   // the chain of an ISP CU's sub-partitions
   {

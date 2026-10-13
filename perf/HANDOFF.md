@@ -13,10 +13,10 @@ wall-clock gains with threads are "the easy baseline". Decoder status: single-th
 (`--GpuLoopFilter=1`: ALF, SAO, BIF, CCSAO, LF-CCCM, offset refinement on Vulkan). The user then asked for **a full
 GPU decoder in Vulkan, optimized until nothing is left** ("The GPU decoder needs to fully decode the frame on the
 GPU"; "Your first Vulkan version is going to be slow. That's OK"). That work is branch `dec-gpurecon`: intra
-reconstruction on the GPU (`--GpuRecon`), tool levels M1-M30 done and verified bit-exact (M19: DIMD, M20: OBIC, M21:
+reconstruction on the GPU (`--GpuRecon`), tool levels M1-M31 done and verified bit-exact (M19: DIMD, M20: OBIC, M21:
 intra merge, M22: the transforms of DIMD CUs, M23: LFNST of MIP, M24: TIMD, M25: OBIC and intra merge with TIMD
 neighbours, M26: TIMD-SAD, M27: OBIC and intra merge with TIMD-SAD neighbours, M28: TIMD merge, M29: TMRL of luma,
-M30: chroma TMRL); it is **not yet faster than the CPU decoder** (see section 8) and supports only a restricted tool
+M30: chroma TMRL, M31: CCLM); it is **not yet faster than the CPU decoder** (see section 8) and supports only a restricted tool
 set (all real CTC streams fall back to the CPU, first reason: cross-component prediction).
 
 ## 2. The user's rules (follow them exactly)
@@ -546,6 +546,33 @@ Test set: m30 (encTest9 without ECM_TEST_NO_CHROMA_TMRL, m29's arguments: up to 
 134 to 218 per 720p picture, among them 16x2 ones whose co-located luma block is 4 high). GPU time: m30 135 ms per
 picture; m29 131 -> 135 (the chroma node's code is in the TMRL pipeline also where no CU takes it: a pipeline of its own
 would win that back), the other sets unchanged within 0.5 %.
+M31: CCLM (LMChroma: LM_CHROMA, MDLM_L / MDLM_T and, with MMLM, their two-model variants; ECM's least-squares model,
+LMS_LINEAR_MODEL). A chroma block in an LM mode carries Tu::lm's LM_ACTIVE: its mode number does not tell, as a luma
+TIMD / TMRL block derives modes of the 131-mode set, whose values from 67 on are angular (a first version that took
+them for LM read luma at twice their position, past the end of the plane, and lost the device). Its model is fitted on
+one invocation (`cclmModel`, intra_cclm.glsl): xGetLMParametersLMS's template samples (availability in chroma units of
+2; MDLM's 2W / 2H arms where the above-right / below-left units are available) of the luma downsampled as
+xGetLumaRecPixels does (JVET-AN0090's filter by the SPS's collocated flags: the mean of 2 x 2, the 5-tap cross, or
+1 2 1 over two rows; in a CTU's first row from the one luma row above), in 64-bit sums (JVET-AJ0237), the division
+table m_auShiftLM computed in the shader; MDLM pads its template to a power of two, MMLM splits at the mean
+(divSigTable) and pads each group (xLMSampleClassifiedTraining), and each model's slope takes the CU's cclmOffsets
+(JVET-Z0050, xUpdateCclmModel around the middle luma of that model's samples). All invocations then apply it to the
+downsampled co-located block, with LBCCP's 3x3 filter (JVET-AD0120, ccInsideFilter: the reconstruction above / left
+where available, else the prediction's border) where the CU takes it. intra_deps gives an LM block the read range
+2W / 2H and the owners of the co-located luma block and of the 3 luma rows above it and 3 columns left of it, each
+twice the co-located block's side long (MDLM's template). The host gives LM blocks no angular, PDPC, reference filter or fusion parameters
+(initPredIntraParams leaves the angles as the previous block's; ECM_GPU_DUMP's records differed there, and dumpdiff.py
+now also leaves a TMRL block's line, which its node chooses, out). Rejected: GLM, CCCM, LM chroma fusion (JVET-AC0119),
+CCLM with LFNST / NSPT (its mode is a DIMD of the CU's Cb and Cr predictions: next), CCLM CUs of several blocks
+(DecCu predicts Cr over the CU's area with the Cb block, JVET-AK0064), above 10 bits or with unequal bit depths; CCP
+merge, decoder-derived CCP fusion and BVG-CCCM at sequence level, as CCCM. Test sets: m31n (encTest10, see section 9,
+with ECM_TEST_NO_GLM and ECM_TEST_NO_CHROMA_FUSION; m29's arguments with `--LMChroma=1 --IntraLFNSTISlice=0 --NSPT=0
+--LFNSTExt=0`: 170 and 184 CCLM blocks per fore22 picture, 1526 and 1680 per park720 picture, all variants: MMLM,
+MDLM, LBCCP; the 1 2 1 filter), m31a_fore32 / 22 (`--HorCollocatedChroma=0`: the 2 x 2 mean), m31c_fore32 / 22
+(`--VerCollocatedChroma=1`: the cross) and m31 (with LFNST: skipped until the next level). The CCLM code is in the
+pipelines with WITH_CCLM only (a specialization constant beside each IntraRecVariant; `intraRecKernel` builds the
+pair on first use): in all pipelines it slowed the plain set by 30 % and the TIMD ones by 5 %. GPU time: m31n 134.1,
+m31a / m31c 84.6 ms per picture; the other sets unchanged within 0.8 % (plain 12.28 -> 12.38).
 
 ## 8. Numbers (i7-10700 8C/16T, Win11, GCC 16.2, RTX 3070 driver 616.92)
 
@@ -577,7 +604,7 @@ Profile of a GPU-on decode (non-LTO, m2_park16, share of all samples): parsing ~
    M25 OBIC and intra merge with TIMD neighbours (the m25, m25o, m25s and m25os sets), M26 TIMD-SAD (the m26 and
    m26o sets), M27 OBIC and intra merge with TIMD-SAD neighbours (the m27 and m27o sets), M28 TIMD merge (the m28 and
    m28m sets). 2026-10-13: M29 TMRL of luma (the m29 set, m29n_fore32, m29s_screen32 / 22), M30 chroma TMRL (the m30
-   set).
+   set), M31 CCLM (the m31n set, m31a_fore32 / 22, m31c_fore32 / 22).
    All 19 regular streams now stop at "cross-component prediction" (the next sequence-level check; the block-level
    tools of step 4 follow).
 3. Make the GPU path win on CPU time per picture: the derive-only pass (record during parsing or a leaner pass;
@@ -601,7 +628,9 @@ Profile of a GPU-on decode (non-LTO, m2_park16, share of all samples): parsing ~
    by 4; xCheckRDCostIntra recomputes the CU's cost from its bits and distortion, so the partitioning sees the true
    cost); `bin\encTest8` (m26o) adds ECM_TEST_PREFER_TIMD_SAD (`testTimd` off where `testTimdSad`); `bin\encTest9`
    (m29) adds ECM_TEST_NO_CHROMA_TMRL (the `PU::hasChromaTmrl(pu) && ...getUseTmrl()` conditions of the chroma search
-   false). The user's order (2026-10-13): all intra first, then inter. Next CCLM/CCCM
+   false); `bin\encTest10` (m31) adds ECM_TEST_NO_GLM (the `PU::hasGlmFlag` conditions of the chroma search false) and
+   ECM_TEST_NO_CHROMA_FUSION (its `PU::hasChromaFusionFlag` conditions false). The user's order (2026-10-13): all intra
+   first, then inter. Next LFNST / NSPT of CCLM blocks (the m31 set), GLM, LM chroma fusion, CCCM
    and the other cross-component tools, chroma reordering / DBV, BVG-DIMD, MDIP / MPM sorting, IntraTMP / IBC, EIP /
    SGPM, PDP, NN intra, implicit MTS (not in CTC; its test set, the m24 arguments with `--MTS=0 --MTSImplicit=1`, is
    encoded: `streams_gpu\pending\imts_*`), deblocking on the GPU, then inter pictures.
@@ -634,9 +663,10 @@ Profile of a GPU-on decode (non-LTO, m2_park16, share of all samples): parsing ~
   them (a per-sample test of a global flag in storeRecon cost as much again; folded into Tu::resiFrom), M19's DIMD
   blending ~15 % (spread over the loop around the prediction and the code inside it; no single part), M21's intra
   merge ~11 % on pictures with DIMD, a second call site of selectTransform and inChainResidual ~7 % (M23: one call
-  site each instead). Since M19 intra_rec is built as several pipelines with specialization constants
-  (`WITH_DIMD`, `WITH_DERIVED_TRANSFORMS`, `WITH_MERGE`; `gpu::Kernel::create`'s specialization, GpuIntraRec.cpp's
-  `IntraRecVariant`) and a picture runs the one without the features it does not use. The compiler is not monotonic
+  site each instead), M31's CCLM 30 % on plain pictures. Since M19 intra_rec is built as several pipelines with
+  specialization constants (`WITH_DIMD`, `WITH_DERIVED_TRANSFORMS`, `WITH_MERGE`, ..., `WITH_CCLM`;
+  `gpu::Kernel::create`'s specialization, GpuIntraRec.cpp's `IntraRecVariant`) and a picture runs the one without the
+  features it does not use. The compiler is not monotonic
   here: the pipeline with DIMD alone was slower than the one with DIMD and the derived transforms in every case
   measured, so that one is not built. Measure each new variant.
 - `supported()` / `record()` must reject every tool the kernels lack, including tools that only change a CPU code
@@ -675,6 +705,13 @@ Profile of a GPU-on decode (non-LTO, m2_park16, share of all samples): parsing ~
   each). Since then intra_rec's variants are compiled on first use (`intraRecKernel`: ~19 s for a cold start that
   needs one), and the test scripts give the driver a cache of their own (`__GL_SHADER_DISK_CACHE_PATH`,
   `__GL_SHADER_DISK_CACHE_SIZE`, `__GL_SHADER_DISK_CACHE_SKIP_CLEANUP`, which the Windows driver honors).
+- Buffer references (device addresses) have no robustness: a read past a plane's end loses the device
+  (VK_ERROR_DEVICE_LOST, nvlddmkm event 153; all three decodes running at the time failed), and one past a row's end reads
+  the next row unnoticed. To find such a read without more device losses (M31's first version: luma TIMD / TMRL blocks
+  of 131-mode values from 67 on took the CCLM branch), a temporary check in `recoAt` that returns 0 out of the
+  picture and records the block (`atomicMax` into the unused `counter[3]`, downloaded with the dependency count;
+  `atomicCompSwap` of the coordinates into a Tu field that verification downloads) named the blocks and the positions
+  in one decode (stubbing parts of the new code out had only narrowed it to the prediction step).
 - The owner maps have 4x4 luma units; ISP sub-partitions 1 or 2 wide or high share them. The last block owning a
   unit must win everywhere (intra_deps pass 0 writes with atomicMax: plain parallel writes raced), and a block
   reading a shared unit only waits for that last owner, so the sub-partitions of a CU are chained (Tu::ispPrev;

@@ -40,6 +40,7 @@ layout( constant_id = 3 ) const bool WITH_TIMD = true;                 // TIMD C
 layout( constant_id = 4 ) const bool WITH_TIMD_SAD = false;            // TIMD-SAD CUs (with TIMD; a picture's own pipeline)
 layout( constant_id = 5 ) const bool WITH_TIMD_MERGE = false;          // TIMD merge CUs (with TIMD-SAD)
 layout( constant_id = 6 ) const bool WITH_TMRL = false;                // TMRL CUs (with TIMD merge)
+layout( constant_id = 7 ) const bool WITH_CCLM = false;                // CCLM blocks (with any of the above: ~30 % without DIMD)
 // the template costs of arms one sample thick (TIMD merge's and TMRL's templates: their SATD kernels)
 const bool WITH_THIN_TEMPLATES = WITH_TIMD_MERGE || WITH_TMRL;
 
@@ -877,6 +878,7 @@ ivec2 angularArrays( bool isVer, int W, int H, int angle, int absInvAngle, int t
 }
 
 #include "intra_tmrl.glsl"
+#include "intra_cclm.glsl"
 
 // the residual of block c in intra_rec (a derived mode's transforms, DERIVE_TRANSFORM, or sign prediction's
 // recomputation), as intra_resi computes it for the others: the dequantized coefficients, those at the positions in
@@ -1812,6 +1814,26 @@ void main()
       if( t.mipMatrix >= 0 )   // MIP: predictionUpsampling of the reduced prediction
       {
         for( int i = lid; i < N; i += NT ) emitPred( t, i % W, i / W, mipSample( i % W, i / W, mipPs, mipUpH, mipUpV, predStride ), bf );
+      }
+      else if( WITH_CCLM && ( t.lm & LM_ACTIVE ) != 0 )   // CCLM (intra_cclm.glsl): its model from its template, then applied
+      {
+        const int lx = t.x << 1, ly = t.y << 1;   // the co-located luma block (4:2:0)
+        if( lid == 0 )
+        {
+          cclmAvailability( t );
+        }
+        SYNC();
+        if( lid == 0 )
+        {
+          cclmModel( t, lx, ly, predStride );
+        }
+        SYNC();
+        const bool inside = ( t.lm & LM_INSIDE ) != 0;
+        for( int i = lid; i < N; i += NT )
+        {
+          const int x = i % W, y = i / W;
+          emitPred( t, x, y, inside ? cclmInsideFiltered( t, lx, ly, x, y, maxPel ) : cclmPredSample( t, lx, ly, x, y, maxPel ), false );
+        }
       }
       else if( t.dirMode == 0 || t.dirMode == 1 )   // planar / DC, then their PDPC
       {

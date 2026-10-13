@@ -15,12 +15,14 @@ FIELDS = ["comp", "x", "y", "w", "h", "dirMode", "isModeVer", "intraPredAngle", 
           "crsAvail", "quant", "jccr", "jccrOffset", "mtxV", "mtxH", "transformSkip", "mipMatrix", "mipTransposed",
           "mipSizeId", "secKind", "secMatrix", "secRowLength", "secNumIn", "secScan", "secLayout", "secSize",
           "secTranspose", "mrl", "bfAvail0", "bfAvail1", "bfAvail2", "isp", "cuX", "cuY", "cuW", "cuH", "regX", "regW",
-          "ispSide", "ispPrev", "spCoded", "spOffset", "resiFrom", "cu", "derive", "mtsSet", "secIdx", "secBucket", "pad"]
+          "ispSide", "ispPrev", "spCoded", "spOffset", "resiFrom", "cu", "derive", "mtsSet", "secIdx", "secBucket", "lm"]
 assert len(FIELDS) == TU
 # intra_rec derives these for DERIVE_MODE blocks (applyModeParams, DIMD), the transforms for DERIVE_TRANSFORM ones
 DERIVED   = {"dirMode", "isModeVer", "intraPredAngle", "absInvAngle", "useCubic", "refFilter", "applyPDPC", "gradPDPC",
              "angularScale", "fusion", "bf", "plIdx"}
 TRANSFORM = {"mtxV", "mtxH", "secMatrix", "secTranspose", "secLayout"}
+# a TMRL block's line comes from its node too (tmrlBlockParams; Tu::derive & DERIVE_TMRL)
+DERIVE_TMRL = 131072
 # computed by intra_deps on the GPU
 SCHEDULING = {f for f in FIELDS if f.startswith(("avail", "readMax", "bfAvail"))} | {"ispSide"}
 # the angular fields planar / DC / MIP blocks keep from the CPU's previous block (never read for them), and PDPC's
@@ -55,7 +57,8 @@ def main():
         for r in range(len(ta) // TU):
             ra, rb = ta[r * TU:(r + 1) * TU], tb[r * TU:(r + 1) * TU]
             derive = ra[FIELDS.index("derive")]
-            ignored = SCHEDULING | (DERIVED if derive & 1 else set()) | (TRANSFORM if derive & 64 else set())
+            ignored = SCHEDULING | (DERIVED if derive & 1 else set()) | (TRANSFORM if derive & 64 else set()) \
+                      | ({"mrl"} if derive & DERIVE_TMRL else set())
             if ra[FIELDS.index("dirMode")] <= 1 or ra[FIELDS.index("mipMatrix")] >= 0:
                 ignored |= ANGULAR
             elif ra[FIELDS.index("intraPredAngle")] <= 0:

@@ -404,7 +404,10 @@ the reconstruction buffer; works in every frame-thread context):
   finds the line's availability itself. M30 is chroma TMRL: the chroma CU's node ranks eight modes on up to three
   chroma lines by the SATD of the co-located luma block predicted from the luma line twice as far (with its own,
   position-based reference fill) and the SAD of the Cb and Cr templates, and the chroma blocks predict the chosen mode
-  from the chosen line.
+  from the chosen line. M31 is CCLM: a chroma block in an LM mode fits ECM's least-squares model (one or, with MMLM,
+  two; MDLM's longer one-sided templates) to its template's chroma samples and the downsampled luma beside the
+  co-located block, adjusts the slopes by the CU's offsets, and applies the model to the downsampled co-located luma,
+  smoothed by LBCCP's filter where the CU takes it.
   GpuIntraRec::supported()
   rejects every tool whose mode derivation or prediction reads reconstructed samples or that the kernels lack, before
   anything is skipped. All 19 regular streams now fall back to the CPU at cross-component prediction, the next

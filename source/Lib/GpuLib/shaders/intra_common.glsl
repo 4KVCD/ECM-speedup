@@ -63,9 +63,26 @@ struct Tu
   int mtsSet;
   int secIdx;
   int secBucket;
-  int pad;
+  // a CCLM block's mark (dirMode LM_CHROMA_IDX ..; intra_cclm.glsl), slope adjustments and LBCCP filter (LM_* fields)
+  int lm;
 };
 layout( buffer_reference, std430, buffer_reference_align = 4 ) buffer BufTu { Tu v[]; };
+
+// the chroma modes of the LM family (CommonDef.h with MMLM; a CCLM block's Tu::dirMode)
+const int LM_CHROMA_IDX   = 67;   // NUM_LUMA_MODE
+const int MMLM_CHROMA_IDX = LM_CHROMA_IDX + 1;
+const int MDLM_L_IDX      = LM_CHROMA_IDX + 2;
+const int MMLM_L_IDX      = LM_CHROMA_IDX + 3;
+const int MDLM_T_IDX      = LM_CHROMA_IDX + 4;
+const int MMLM_T_IDX      = LM_CHROMA_IDX + 5;
+
+// Tu::lm: whether the block is a CCLM block (its mode is not enough: a luma TIMD / TMRL block derives modes of the
+// 131-mode set, whose values from 67 on are angular), the slope adjustment (cclmOffsets, -4 .. 4) of its first and
+// second model, each + 8 in 4 bits, and whether the CU's prediction takes LBCCP's inside filter (ccInsideFilter)
+const int LM_DELTA0_SHIFT = 0;
+const int LM_DELTA1_SHIFT = 4;
+const int LM_INSIDE       = 256;
+const int LM_ACTIVE       = 512;
 
 // Tu::derive
 const int DERIVE_NODE     = 32;  // not a block: the derivation of the mode of CU Tu::cu, before the CU's blocks
@@ -591,6 +608,7 @@ struct Params
   int      trTables;    // in matrices: the directory of the tables a derived mode's transforms are chosen with (TR_TAB_*)
   int      ctuSize;     // the SPS's CTU size (luma samples)
   int      lumaUnitW, lumaUnitH;   // the luma availability units (PreCalcValues::minCUWidth / minCUHeight)
+  int      cclmFilter;  // CCLM's luma downsampling filter by the SPS's collocated chroma flags (CCLM_FILTER_*)
 };
 layout( buffer_reference, std430, buffer_reference_align = 8 ) buffer BufParams { Params p; };
 
