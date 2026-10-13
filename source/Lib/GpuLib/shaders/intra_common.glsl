@@ -152,6 +152,9 @@ const int CU_MERGE       = 7;   // luma: an intra merge CU, its mode its chosen 
 const int CU_TIMD        = 8;   // luma: a TIMD CU, its modes from template costs (intra_timd.glsl), with its DIMD
 const int CU_TMRL        = 9;   // luma: a TMRL CU, its mode and reference line from template costs (intra_tmrl.glsl), with
                                 // its DIMD
+const int CU_CHROMA_TMRL = 10;  // chroma: a chroma TMRL CU, its mode and reference line from costs of the co-located luma
+                                // block's prediction and of its template (intra_tmrl.glsl), with its DIMD chroma (its
+                                // Cu::nbr: CHROMA_TMRL_NBR_*)
 
 // a TMRL CU's choice as its node derives it (TMRL_OUT int32 per TMRL CU in Params::tmrlOut): the mode (131-mode set)
 // and the reference line (multiRefIdx) of m_tmrlList[tmrlListIdx], which its blocks predict with
@@ -167,6 +170,26 @@ int tmrlNumLines( int y )
 {
   int n = 0;
   while( n < 5 && TMRL_LINES[n] < y )
+  {
+    n++;
+  }
+  return n;
+}
+
+// chroma TMRL (JVET-AJ0081): the chroma reference lines it tries (CHROMA_MULTI_REF_LINE_IDX), of a CU at chroma row y
+// those inside the picture (getChromaTmrlSearchRange; PU::hasChromaTmrl allows it from row 4 on); the co-located luma
+// block's line is twice as far. Its CU's Cu::nbr: the luma CUs at the five positions of getChromaTmrlSearchRange
+// (CHROMA_TMRL_NBR_LUMA ..), then the chroma CUs at its five neighbour positions (CHROMA_TMRL_NBR_CHROMA ..; -1: none
+// or not one it reads)
+const int CHROMA_TMRL_LINES[3]   = int[3]( 1, 3, 5 );
+const int CHROMA_TMRL_MODES      = 8;   // CHROMA_TMRL_MPM_SIZE
+const int CHROMA_TMRL_NBR_LUMA   = 0;
+const int CHROMA_TMRL_NBR_CHROMA = 5;
+
+int chromaTmrlNumLines( int y )
+{
+  int n = 0;
+  while( n < 3 && CHROMA_TMRL_LINES[n] < y )
   {
     n++;
   }
@@ -366,12 +389,13 @@ const int SP_TEMPLATES = 10;
 // of the above, above-right, left, below-left, left MRL and above MRL units. False where no unit is available (the
 // mid-level value). The units in the CPU's order: below-left and left (bottom-up), left MRL, the corner C, above MRL,
 // above, above-right; a line beyond the first unit has lM MRL units left of and aM above the corner unit, which keeps
-// entries 0 .. cLen of both arms (JVET-Y0116). An unavailable unit takes the last sample of the unit before it in that
+// entries 0 .. cLen of both arms (JVET-Y0116); an arm whose length is no multiple of the unit ends in a partial unit
+// (chroma TMRL's arms of 2 x (the side + 1)). An unavailable unit takes the last sample of the unit before it in that
 // order, units before the first available one take its first sample.
 bool fillSource( int fx, int fy, int fw, int fh, int predSize, int predHSize, int mrl, int uW, int uH, int av[7],
                  bool top, int idx, out int sx, out int sy )
 {
-  const int tAU = predSize / uW, tLU = predHSize / uH;
+  const int tAU = ( predSize + uW - 1 ) / uW, tLU = ( predHSize + uH - 1 ) / uH;
   const int lM = mrl / uH, aM = mrl / uW, cLen = mrl - lM * uH, C = tLU + lM;
   const int totalUnits = tAU + tLU + 1 + lM + aM;
   const int numAbove = max( fw / uW, 1 ), numLeft = max( fh / uH, 1 );
@@ -565,6 +589,8 @@ struct Params
   int      lumaClipMin, lumaClipMax; // the slice's luma clipping range (the average luma of chroma residual scaling)
   int      qcsOffset;   // Quant's m_coeffShift64: the weight (of 1024) of the next larger index, per index magnitude < 64
   int      trTables;    // in matrices: the directory of the tables a derived mode's transforms are chosen with (TR_TAB_*)
+  int      ctuSize;     // the SPS's CTU size (luma samples)
+  int      lumaUnitW, lumaUnitH;   // the luma availability units (PreCalcValues::minCUWidth / minCUHeight)
 };
 layout( buffer_reference, std430, buffer_reference_align = 8 ) buffer BufParams { Params p; };
 

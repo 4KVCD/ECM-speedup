@@ -401,7 +401,10 @@ the reconstruction buffer; works in every frame-thread context):
   one-sample template from each of up to five reference lines with each of ten modes (its DIMD modes, its neighbours',
   the angles around them), ranks those up to fifty candidates by SATD and takes the entry the bitstream selects; its block predicts that
   mode from that line, and, since the line is known only on the GPU, depends on every line the node may choose and
-  finds the line's availability itself.
+  finds the line's availability itself. M30 is chroma TMRL: the chroma CU's node ranks eight modes on up to three
+  chroma lines by the SATD of the co-located luma block predicted from the luma line twice as far (with its own,
+  position-based reference fill) and the SAD of the Cb and Cr templates, and the chroma blocks predict the chosen mode
+  from the chosen line.
   GpuIntraRec::supported()
   rejects every tool whose mode derivation or prediction reads reconstructed samples or that the kernels lack, before
   anything is skipped. All 19 regular streams now fall back to the CPU at cross-component prediction, the next

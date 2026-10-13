@@ -114,9 +114,10 @@ int mpmSpatial( Cu c, int nbrMode[MPM_NEIGHBOURS], int dimdModes[3], bool forced
   return num;
 }
 
-// fillMPMList after mpmSpatial's num entries (offset NUM_LUMA_MODE - 6, modulo + 3: the angles next to each one,
-// wrapping around 2 .. 66), then the defaults, up to NUM_MPM
-void mpmFill( int num, inout int mpm[NUM_MPM], inout uint included[3] )
+// fillMPMList (67-mode set) after a list's num spatial entries, up to maxCands: the angles next to each angular one
+// (offset NUM_LUMA_MODE - 6, modulo + 3: wrapping around 2 .. 66), then the defaults. included: the list's modes (planar
+// also where not in the list: neither step can add it)
+void mpmFill( int num, int maxCands, inout int mpm[NUM_MPM], inout uint included[3] )
 {
   const int numSpatial = num;
   for( int i = 0; i < numSpatial; i++ )
@@ -128,19 +129,19 @@ void mpmFill( int num, inout int mpm[NUM_MPM], inout uint included[3] )
     for( int d = 0; d < 4; d++ )
     {
       const int below = ( ( mpm[i] + 61 - d ) % 64 ) + 2, above = ( ( mpm[i] - 1 + d ) % 64 ) + 2;
-      if( num < NUM_MPM && !modeIn( included, below ) )
+      if( num < maxCands && !modeIn( included, below ) )
       {
         mpm[num++] = below;
         modeAdd( included, below );
       }
-      if( num < NUM_MPM && !modeIn( included, above ) )
+      if( num < maxCands && !modeIn( included, above ) )
       {
         mpm[num++] = above;
         modeAdd( included, above );
       }
     }
   }
-  for( int i = 0; num < NUM_MPM; i++ )
+  for( int i = 0; num < maxCands; i++ )
   {
     if( !modeIn( included, MPM_DEFAULT[i] ) )
     {
@@ -161,7 +162,7 @@ int deriveLumaMode( Cu c, int nbrMode[MPM_NEIGHBOURS], int dimdModes[3] )
   {
     return mpm[c.ipredIdx];
   }
-  mpmFill( num, mpm, included );
+  mpmFill( num, NUM_MPM, mpm, included );
   if( c.mpmFlag != 0 || c.secondMpmFlag != 0 )
   {
     return mpm[c.ipredIdx];

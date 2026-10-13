@@ -212,6 +212,41 @@ void lineDeps( int comp, int fx, int fy, int predSize, int predHSize, int mrl )
   addAreaDeps( comp, x0, y0, x0, fy - 1 + predHSize );
 }
 
+// a dependency of chroma TMRL CU c's node on the modes it reads - the luma CUs' at its five positions and the chroma
+// neighbours' (Cu::nbr; the co-located luma CU's is the chroma nodes' own) - and on the blocks owning the samples it
+// reads: of Cb and Cr each line's whole arms (2 x (the side + 1)) and the template, of luma the co-located block and
+// its lines twice as far with arms of 2 x its sides, whose positional availability reads neither past the CTU's right
+// edge above nor past its bottom edge on the left
+void chromaTmrlDeps( Cu c )
+{
+  for( int k = CHROMA_TMRL_NBR_LUMA; k < CHROMA_TMRL_NBR_CHROMA + 5; k++ )
+  {
+    if( c.nbr[k] >= 0 )
+    {
+      addModeDep( c.nbr[k] );
+    }
+  }
+  const int lx = c.x << 1, ly = c.y << 1, lw = c.w << 1, lh = c.h << 1;
+  const int ctuRight = ( lx / P.ctuSize + 1 ) * P.ctuSize - 1, ctuBottom = ( ly / P.ctuSize + 1 ) * P.ctuSize - 1;
+  for( int k = 0; k < chromaTmrlNumLines( c.y ); k++ )
+  {
+    const int line = CHROMA_TMRL_LINES[k];
+    for( int comp = 1; comp <= 2; comp++ )
+    {
+      lineDeps( comp, c.x, c.y, ( c.w + 1 ) << 1, ( c.h + 1 ) << 1, line );
+    }
+    const int mrl = line << 1, x0 = lx - 1 - mrl, y0 = ly - 1 - mrl;
+    addAreaDeps( 0, x0, y0, min( lx - 1 + ( lw << 1 ), ctuRight ), y0 );
+    addAreaDeps( 0, x0, y0, x0, min( ly - 1 + ( lh << 1 ), ctuBottom ) );
+  }
+  for( int comp = 1; comp <= 2; comp++ )
+  {
+    addAreaDeps( comp, c.x, c.y - 1, c.x + c.w - 1, c.y - 1 );
+    addAreaDeps( comp, c.x - 1, c.y, c.x - 1, c.y + c.h - 1 );
+  }
+  addAreaDeps( 0, lx, ly, lx + lw - 1, ly + lh - 1 );
+}
+
 // the intra bilateral filter's neighbours of block t (rows y-2, y-1; columns x-2, x-1): its padding - line 0's corner and
 // above / left units of the area at (fx, fy) (the block, for ISP the CU, whose origin it pads at), also with MRL - into
 // t.bfAvail, and a dependency on the owners of a superset of the samples it copies
@@ -307,7 +342,7 @@ void dependencies( int comp )
         addModeDep( td.v[c.timd + TIMD_HEAD_MERGE + 1 + k] );
       }
     }
-    if( c.tmrl >= 0 )   // TMRL: the reference lines it tries (whole arms) and its template, one sample thick
+    if( c.tmrl >= 0 && c.kind == CU_TMRL )   // TMRL: the reference lines it tries (whole arms), its one-sample template
     {
       for( int k = 0; k < tmrlNumLines( c.y ); k++ )
       {
@@ -315,6 +350,10 @@ void dependencies( int comp )
       }
       addAreaDeps( 0, c.x, c.y - 1, c.x + c.w - 1, c.y - 1 );
       addAreaDeps( 0, c.x - 1, c.y, c.x - 1, c.y + c.h - 1 );
+    }
+    if( c.kind == CU_CHROMA_TMRL )   // chroma TMRL: chromaTmrlDeps
+    {
+      chromaTmrlDeps( c );
     }
     return;
   }
@@ -346,8 +385,8 @@ void dependencies( int comp )
   // next line also where the CU's fetchRef2nd is off: the whole arms of both lines, the filter's neighbours where it may
   // filter a blend
   // A TMRL block's line comes from its node, which intra_deps cannot know: the whole arms of every line the node may
-  // choose and of the next one (intra fusion's), the filter's neighbours where it may filter (DC); the block finds its
-  // line's availability itself (its avail and readMax stay 0)
+  // choose and, for luma, of the next one (intra fusion's), the filter's neighbours where it may filter (DC); the block
+  // finds its line's availability itself (its avail and readMax stay 0)
   const bool derived   = ( t.derive & DERIVE_MODE ) != 0;
   const bool timdBlock = ( t.derive & DERIVE_TIMD ) != 0;
   const bool tmrlBlock = ( t.derive & DERIVE_TMRL ) != 0;
@@ -359,10 +398,16 @@ void dependencies( int comp )
     numModes = timdBlock ? 0 : c.modes[0] < 0 ? NUM_LUMA_MODE : c.modes[1] < 0 ? 1 : 2;
   }
   bool bfNeeded = ( !derived && t.bf != 0 ) || ( ( timdBlock || tmrlBlock ) && ( t.derive & DERIVE_BF ) != 0 );
-  for( int k = 0; tmrlBlock && k < tmrlNumLines( t.y ); k++ )
+  const bool lumaTmrl     = t.comp == 0;
+  const int  numTmrlLines = !tmrlBlock ? 0 : lumaTmrl ? tmrlNumLines( t.y ) : chromaTmrlNumLines( t.y );
+  for( int k = 0; k < numTmrlLines; k++ )
   {
-    lineDeps( comp, fx, fy, predSize, predHSize, TMRL_LINES[k] );
-    lineDeps( comp, fx, fy, predSize, predHSize, TMRL_LINES[k] + 1 );
+    const int line = lumaTmrl ? TMRL_LINES[k] : CHROMA_TMRL_LINES[k];
+    lineDeps( comp, fx, fy, predSize, predHSize, line );
+    if( lumaTmrl )
+    {
+      lineDeps( comp, fx, fy, predSize, predHSize, line + 1 );
+    }
   }
   for( int ln = 0; ln < 2 && !tmrlBlock; ln++ )
   {

@@ -13,11 +13,11 @@ wall-clock gains with threads are "the easy baseline". Decoder status: single-th
 (`--GpuLoopFilter=1`: ALF, SAO, BIF, CCSAO, LF-CCCM, offset refinement on Vulkan). The user then asked for **a full
 GPU decoder in Vulkan, optimized until nothing is left** ("The GPU decoder needs to fully decode the frame on the
 GPU"; "Your first Vulkan version is going to be slow. That's OK"). That work is branch `dec-gpurecon`: intra
-reconstruction on the GPU (`--GpuRecon`), tool levels M1-M29 done and verified bit-exact (M19: DIMD, M20: OBIC, M21:
+reconstruction on the GPU (`--GpuRecon`), tool levels M1-M30 done and verified bit-exact (M19: DIMD, M20: OBIC, M21:
 intra merge, M22: the transforms of DIMD CUs, M23: LFNST of MIP, M24: TIMD, M25: OBIC and intra merge with TIMD
-neighbours, M26: TIMD-SAD, M27: OBIC and intra merge with TIMD-SAD neighbours, M28: TIMD merge, M29: TMRL of luma); it
-is **not yet faster than the CPU decoder** (see section 8) and supports only a restricted tool set (all real CTC
-streams fall back to the CPU, first reason: cross-component prediction).
+neighbours, M26: TIMD-SAD, M27: OBIC and intra merge with TIMD-SAD neighbours, M28: TIMD merge, M29: TMRL of luma,
+M30: chroma TMRL); it is **not yet faster than the CPU decoder** (see section 8) and supports only a restricted tool
+set (all real CTC streams fall back to the CPU, first reason: cross-component prediction).
 
 ## 2. The user's rules (follow them exactly)
 
@@ -519,6 +519,33 @@ picture) and m29n_fore32 (the same with `--DIMD=0 --TIMD=0 --TIMDMerge=0 --MIP=0
 without DIMD the GPU rejects LFNST of MIP) and m29s_screen32 / 22 (screen_352x288: 135 to 181 TMRL CUs per picture).
 GPU time: m29 130, m29n_fore32 34 ms per picture (the TMRL nodes' up to
 50 template predictions and their line fills are the next speed candidate); the other sets unchanged within 1 %.
+M30: chroma TMRL (JVET-AJ0081, dual tree; the only chroma MRL). A chroma TMRL CU (`CU_CHROMA_TMRL`; chromaTmrlIdx in
+Cu::ipredIdx, its TmrlOut shared with luma TMRL's) gets its DIMD chroma like a DIMD chroma CU (deriveDimdChromaMode and
+DecCu's exchange with the co-located luma mode) and a node (`chromaTmrlNode`) that does getChromaTmrlList: eight modes of
+the 67-mode set (`chromaTmrlModeList`: the co-located luma mode, the DIMD chroma modes, DC, the luma CUs' at the centre
+and corners of the co-located area, the final modes of the chroma neighbours at five positions where they are intra and
+neither LM nor DBV - the host records these ten CUs in Cu::nbr - then fillMPMList's, `mpmFill` with a list size), on
+each chroma line 1, 3, 5 inside the picture (PU::hasChromaTmrl allows it from chroma row 4 on), costed as 9 x the SATD
+of the co-located luma block predicted from the luma line twice as far plus the SAD of the Cb and Cr templates, one
+sample thick, the above arms weighed by 4 x the CU's height, the left ones (where x > 0) by 4 x its width, in 64 bits.
+The luma prediction is predCoLuma's: a plain luma PU (no PDPC, reference filter, fusion or bilateral filter; the cubic
+filter, 10 taps along rows shorter than 8) from xFillReferenceSamplesForCoLuma's line (`coLumaReference`, a literal port
+on one invocation: its availability is by position - inside the picture, above-right and below-left only up to the
+CTU's edges - with quirks in its unit flags, count and padding), the reference arrays of `angularArrays` (main()'s
+line-0 setup, factored out for it). Its SATD (`coLumaSatd`) takes xGetHADs_SIMD's AVX2 tiles (16x8, 8x16, 8x4, 4x8, 8x8
+- the 16x16 kernel sums four - and 4x4), band by band of 16 rows through s_tmp, the 16x8 / 8x16 scale floor(sad /
+sqrt(32)) exactly in integers (`hadScaleSqrt32`, checked for every sum below 2^25). The templates' chroma lines have
+arms of 2 x (the side + 1), whose last unit may be partial (fillSource rounds the unit counts up now, as the CPU), and
+xPredTmrlIntraAng steps through the regular 1/32-sample angles as 1/64 samples (`chromaTmrlParams`). The Cb and Cr
+blocks predict the chosen mode as regular chroma blocks with that line (DERIVE_TMRL with applyModeParams; no fusion),
+their availability found at run time as luma TMRL's; intra_deps gives them the whole arms of every candidate line, the
+node the co-located luma block, its lines up to the CTU's edges, the chroma lines, templates and the ten CUs' nodes.
+Rejected: chroma TMRL without DIMD in the SPS (no test stream), above 10 bits or with unequal luma and chroma bit
+depths, in a picture smaller than the SPS's (the positional availability takes the SPS's size), CUs of several blocks.
+Test set: m30 (encTest9 without ECM_TEST_NO_CHROMA_TMRL, m29's arguments: up to 84 chroma TMRL CUs per CIF picture,
+134 to 218 per 720p picture, among them 16x2 ones whose co-located luma block is 4 high). GPU time: m30 135 ms per
+picture; m29 131 -> 135 (the chroma node's code is in the TMRL pipeline also where no CU takes it: a pipeline of its own
+would win that back), the other sets unchanged within 0.5 %.
 
 ## 8. Numbers (i7-10700 8C/16T, Win11, GCC 16.2, RTX 3070 driver 616.92)
 
@@ -549,7 +576,8 @@ Profile of a GPU-on decode (non-LTO, m2_park16, share of all samples): parsing ~
    CUs and MTSS (the m22 and m22o sets), M23 LFNST / NSPT of MIP (the m23 set), M24 TIMD (the m24 and m24s sets),
    M25 OBIC and intra merge with TIMD neighbours (the m25, m25o, m25s and m25os sets), M26 TIMD-SAD (the m26 and
    m26o sets), M27 OBIC and intra merge with TIMD-SAD neighbours (the m27 and m27o sets), M28 TIMD merge (the m28 and
-   m28m sets). 2026-10-13: M29 TMRL of luma (the m29 set and m29n_fore32).
+   m28m sets). 2026-10-13: M29 TMRL of luma (the m29 set, m29n_fore32, m29s_screen32 / 22), M30 chroma TMRL (the m30
+   set).
    All 19 regular streams now stop at "cross-component prediction" (the next sequence-level check; the block-level
    tools of step 4 follow).
 3. Make the GPU path win on CPU time per picture: the derive-only pass (record during parsing or a leaner pass;
@@ -573,9 +601,7 @@ Profile of a GPU-on decode (non-LTO, m2_park16, share of all samples): parsing ~
    by 4; xCheckRDCostIntra recomputes the CU's cost from its bits and distortion, so the partitioning sees the true
    cost); `bin\encTest8` (m26o) adds ECM_TEST_PREFER_TIMD_SAD (`testTimd` off where `testTimdSad`); `bin\encTest9`
    (m29) adds ECM_TEST_NO_CHROMA_TMRL (the `PU::hasChromaTmrl(pu) && ...getUseTmrl()` conditions of the chroma search
-   false). The user's order (2026-10-13): all intra first, then inter. Next chroma TMRL (JVET-AJ0081; its test set m30,
-   encTest9 without ECM_TEST_NO_CHROMA_TMRL and m29's arguments, is encoded: 11 of its 12 pictures have chroma TMRL
-   CUs), then CCLM/CCCM
+   false). The user's order (2026-10-13): all intra first, then inter. Next CCLM/CCCM
    and the other cross-component tools, chroma reordering / DBV, BVG-DIMD, MDIP / MPM sorting, IntraTMP / IBC, EIP /
    SGPM, PDP, NN intra, implicit MTS (not in CTC; its test set, the m24 arguments with `--MTS=0 --MTSImplicit=1`, is
    encoded: `streams_gpu\pending\imts_*`), deblocking on the GPU, then inter pictures.

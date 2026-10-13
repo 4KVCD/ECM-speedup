@@ -753,8 +753,6 @@ bool timdBlendFusion( int outBase, int W, int H )
   return ( mode > DC_IDX && secondary > DC_IDX && close ) || ( mode == secondary && mode > DC_IDX );
 }
 
-#include "intra_tmrl.glsl"
-
 // bifApplyLut (the LUT row in s_bfLut, offset base: 0 distance 1, 16 diagonal, 32 distance 2)
 int bfLut( int diff, int base, int cutBits, int bdShift )
 {
@@ -815,6 +813,70 @@ int lumaConv( bool isVer, int l, int base, int taps, bool cubic, bool big, int f
   }
   return sum;
 }
+
+// xPredIntraAng's reference arrays refMain / refSide of a prediction of W x H at angle `angle` (absInvAngle) from
+// reference line mrl in s_ref[0] (stride predStride, arms topRefLength / leftRefLength long), into s_angA[0] / s_angL[0]
+// (above / left), all invocations; the caller synchronizes before reading them. The arrays are zero on entry (cleared
+// after use, like the CPU's persistent buffers); every entry is computed directly from the line (the CPU's copies,
+// padding, end replication and negative-angle extension). Returns the indices of the line's corner in the main and the
+// side array (refMain, refSide before their offset by multiRefIdx)
+ivec2 angularArrays( bool isVer, int W, int H, int angle, int absInvAngle, int topRefLength, int leftRefLength, int mrl,
+                     int predStride, bool disableRefFilter, int maxPel, int lid, int NT )
+{
+  const int sizeSide = isVer ? H : W;
+  if( angle < 0 )
+  {
+    // the corner and the arms, then the main arm extended below its start by the side arm projected onto it (the weak
+    // 4-tap filter, or where the SPS disables the reference filter the nearer sample)
+    for( int i = lid; i < W + PAD + 2 + mrl; i += NT ) s_angA[0][H + PAD + i] = s_ref[0][i];
+    for( int i = lid; i < H + PAD + 2 + mrl; i += NT ) s_angL[0][W + PAD + i] = s_ref[0][predStride + i];
+    const int mainBase  = sizeSide + PAD;
+    const int sideOff   = isVer ? predStride : 0;   // side entry j (copied above) = the reference line itself
+    const int sideRange = sizeSide + 2 + mrl;
+    for( int k = -( sizeSide + PAD ) + lid; k <= -1; k += NT )
+    {
+      const int frac32precision = ( -k * absInvAngle + 8 ) >> 4;
+      const int intpel = frac32precision >> 5, fracpel = frac32precision & 31;
+      const int left  = int( s_ref[0][sideOff + clip3i( 0, sideRange, intpel )] );
+      const int right = int( s_ref[0][sideOff + clip3i( 0, sideRange, intpel + 1 )] );
+      int v;
+      if( disableRefFilter )
+      {
+        v = fracpel > 15 ? right : left;
+      }
+      else
+      {
+        const int lm1 = int( s_ref[0][sideOff + clip3i( 0, sideRange, intpel - 1 )] );
+        const int rp1 = int( s_ref[0][sideOff + clip3i( 0, sideRange, intpel + 2 )] );
+        v = clip3i( 0, maxPel, ( weak4( fracpel, 0 ) * lm1 + weak4( fracpel, 1 ) * left + weak4( fracpel, 2 ) * right + weak4( fracpel, 3 ) * rp1 + 32 ) >> 6 );
+      }
+      mainW( isVer, 0, mainBase + k, v );
+    }
+    return ivec2( mainBase, ( isVer ? W : H ) + PAD );
+  }
+  // above: PAD copies of entry 0, then the top row (read on past the row, as the CPU's memcpy does); left alike; the
+  // main array's end (entry refLength + multiRefIdx) is replicated over maxIndex + PAD entries
+  const int refLength = isVer ? topRefLength : leftRefLength;
+  const int log2Ratio = findMSB( W ) - findMSB( H );
+  const int maxIndex  = ( mrl << max( 0, isVer ? log2Ratio : -log2Ratio ) ) + 6;
+  const int end0 = PAD + refLength + mrl;
+  const int val  = int( s_ref[0][( isVer ? 0 : predStride ) + refLength + mrl] );
+  const int lenA = isVer ? end0 + maxIndex + PAD + 1 : PAD + topRefLength + mrl + PAD;
+  const int lenL = isVer ? PAD + leftRefLength + mrl + PAD : end0 + maxIndex + PAD + 1;
+  for( int j = lid; j < lenA; j += NT )
+  {
+    const int v = isVer && j > end0 ? val : j < PAD ? int( s_ref[0][0] ) : int( s_ref[0][j - PAD] );
+    s_angA[0][j] = int16_t( v );
+  }
+  for( int j = lid; j < lenL; j += NT )
+  {
+    const int v = !isVer && j > end0 ? val : j < PAD ? int( s_ref[0][predStride] ) : int( s_ref[0][predStride + j - PAD] );
+    s_angL[0][j] = int16_t( v );
+  }
+  return ivec2( PAD, PAD );
+}
+
+#include "intra_tmrl.glsl"
 
 // the residual of block c in intra_rec (a derived mode's transforms, DERIVE_TRANSFORM, or sign prediction's
 // recomputation), as intra_resi computes it for the others: the dequantized coefficients, those at the positions in
@@ -1330,8 +1392,9 @@ void main()
     // then from its neighbours' (intra_obic.glsl: published by the nodes of those CUs, on which it depends); an intra
     // merge CU's parameters from its neighbours', ranked by template costs (intra_merge.glsl); a TIMD CU's modes from
     // template costs of its MPM list's modes and more, a TIMD merge CU's from its TIMD neighbours', ranked by template
-    // costs (intra_timd.glsl); a TMRL CU's mode and reference line by template costs of a list's modes on several lines
-    // (intra_tmrl.glsl); with MTSS the LFNST / NSPT mode of the CU's block (mtssList, mtssChoice)
+    // costs (intra_timd.glsl); a TMRL CU's mode and reference line by template costs of a list's modes on several lines,
+    // a chroma TMRL CU's also by the co-located luma block's prediction (intra_tmrl.glsl); with MTSS the LFNST / NSPT
+    // mode of the CU's block (mtssList, mtssChoice)
     if( ( t.derive & DERIVE_NODE ) != 0 )
     {
       const Cu c = BufCu( P.cus ).v[t.cu];
@@ -1349,12 +1412,11 @@ void main()
       int dimdModes[3] = int[3]( -1, -1, -1 );
       if( lid == 0 )
       {
-        if( dimd && c.kind == CU_CHROMA_DIMD )   // its mode, after the co-located luma mode's (s_modesRead[0])
-        {
-          int second;
-          dimdModes[0] = dimdChromaSelect( s_modesRead[0], second );
+        if( dimd && ( c.kind == CU_CHROMA_DIMD || c.kind == CU_CHROMA_TMRL ) )   // after the co-located luma mode's
+        {                                                                        // (s_modesRead[0])
+          dimdModes[0] = dimdChromaSelect( s_modesRead[0], dimdModes[1] );
           CBufI32( P.dimdOut ).v[t.cu * DIMD_OUT + DIMD_OUT_MODE]   = dimdModes[0];
-          CBufI32( P.dimdOut ).v[t.cu * DIMD_OUT + DIMD_OUT_SECOND] = second;
+          CBufI32( P.dimdOut ).v[t.cu * DIMD_OUT + DIMD_OUT_SECOND] = dimdModes[1];
         }
         else if( dimd )
         {
@@ -1385,6 +1447,10 @@ void main()
       else if( WITH_TMRL && c.kind == CU_TMRL )   // intra_tmrl.glsl, its mode list with its DIMD
       {
         cuMode = tmrlNode( t, c, dimdModes, t.bitDepth, lid, NT );
+      }
+      else if( WITH_TMRL && c.kind == CU_CHROMA_TMRL )   // intra_tmrl.glsl, its mode list with its DIMD chroma
+      {
+        cuMode = chromaTmrlNode( t, c, s_modesRead[0], dimdModes, lid, NT );
       }
       else if( WITH_TIMD && c.kind == CU_TIMD )   // intra_timd.glsl, its MPM list with its DIMD
       {
@@ -1793,44 +1859,19 @@ void main()
       {
         const bool isVer = t.isModeVer != 0;
         const int angle = t.intraPredAngle, absInvAngle = t.absInvAngle;
-        // the arrays are zero on entry (cleared after use, like the CPU's persistent buffers); every entry below is
-        // computed directly from the reference lines (the CPU's copies, padding, end replication and negative-angle
-        // extension), so one barrier suffices
+        // the reference arrays of the block's line (angularArrays), then of the fusion line (refMain2nd / refSide2nd:
+        // longer copies and ranges); every entry is computed directly from the lines, so one barrier after both suffices
         const int topRefLength = topLen, leftRefLength = leftLen;
         const int mrl2 = mrl + 1, predStride2 = predStride + 1;   // the fusion line (multiRefIdx2nd)
         const int sizeSide = isVer ? H : W;
         const int refLength = isVer ? topRefLength : leftRefLength;
         const int log2Ratio = findMSB( W ) - findMSB( H );
         const int sh = max( 0, isVer ? log2Ratio : -log2Ratio );
-        int mainBase, sideBase, mainBase2, sideBase2;
+        const ivec2 bases = angularArrays( isVer, W, H, angle, absInvAngle, topRefLength, leftRefLength, mrl, predStride,
+                                           t.disableRefFilter != 0, maxPel, lid, NT );
+        int mainBase = bases.x, sideBase = bases.y, mainBase2, sideBase2;
         if( angle < 0 )
         {
-          mainBase = ( isVer ? H : W ) + PAD;
-          sideBase = ( isVer ? W : H ) + PAD;
-          for( int i = lid; i < W + PAD + 2 + mrl; i += NT ) s_angA[0][H + PAD + i] = s_ref[0][i];
-          for( int i = lid; i < H + PAD + 2 + mrl; i += NT ) s_angL[0][W + PAD + i] = s_ref[0][predStride + i];
-          // side entry j (copied above) = the reference line itself
-          const int sideOff = isVer ? predStride : 0;
-          const int sideRange = sizeSide + 2 + mrl;
-          for( int k = -( sizeSide + PAD ) + lid; k <= -1; k += NT )
-          {
-            int frac32precision = ( -k * absInvAngle + 8 ) >> 4;
-            int intpel = frac32precision >> 5, fracpel = frac32precision & 31;
-            int left  = int( s_ref[0][sideOff + clip3i( 0, sideRange, intpel ) ] );
-            int right = int( s_ref[0][sideOff + clip3i( 0, sideRange, intpel + 1 ) ] );
-            int v;
-            if( t.disableRefFilter != 0 )
-            {
-              v = fracpel > 15 ? right : left;
-            }
-            else
-            {
-              int lm1 = int( s_ref[0][sideOff + clip3i( 0, sideRange, intpel - 1 ) ] );
-              int rp1 = int( s_ref[0][sideOff + clip3i( 0, sideRange, intpel + 2 ) ] );
-              v = clip3i( 0, maxPel, ( weak4( fracpel, 0 ) * lm1 + weak4( fracpel, 1 ) * left + weak4( fracpel, 2 ) * right + weak4( fracpel, 3 ) * rp1 + 32 ) >> 6 );
-            }
-            mainW( isVer, 0, mainBase + k, v );
-          }
           mainBase2 = mainBase + 1;
           sideBase2 = sideBase + 1;
           if( fusion )
@@ -1862,25 +1903,6 @@ void main()
         }
         else
         {
-          mainBase = PAD;
-          sideBase = PAD;
-          // above: PAD copies of entry 0, then the top row (read on past the row, as the CPU's memcpy does); left alike;
-          // the main array's end (entry refLength + multiRefIdx) is replicated over maxIndex + PAD entries
-          const int maxIndex = ( mrl << sh ) + 6;
-          const int end0 = PAD + refLength + mrl;
-          const int val  = int( s_ref[0][( isVer ? 0 : predStride ) + refLength + mrl] );
-          const int lenA = isVer ? end0 + maxIndex + PAD + 1 : PAD + topRefLength + mrl + PAD;
-          const int lenL = isVer ? PAD + leftRefLength + mrl + PAD : end0 + maxIndex + PAD + 1;
-          for( int j = lid; j < lenA; j += NT )
-          {
-            const int v = isVer && j > end0 ? val : j < PAD ? int( s_ref[0][0] ) : int( s_ref[0][j - PAD] );
-            s_angA[0][j] = int16_t( v );
-          }
-          for( int j = lid; j < lenL; j += NT )
-          {
-            const int v = !isVer && j > end0 ? val : j < PAD ? int( s_ref[0][predStride] ) : int( s_ref[0][predStride + j - PAD] );
-            s_angL[0][j] = int16_t( v );
-          }
           if( fusion )
           {
             const int maxIndex2 = ( mrl2 << sh ) + 6 + 4;
@@ -1916,7 +1938,7 @@ void main()
         // 1/64 samples (bExtIntraDir)
         const int w = isVer ? W : H, h = isVer ? H : W;
         const bool isLuma = t.comp == 0;
-        const bool ext = ( WITH_TIMD && ( t.derive & DERIVE_TIMD ) != 0 ) || ( WITH_TMRL && ( t.derive & DERIVE_TMRL ) != 0 );
+        const bool ext = ( WITH_TIMD && ( t.derive & DERIVE_TIMD ) != 0 ) || ( WITH_TMRL && ( t.derive & DERIVE_TMRL ) != 0 && isLuma );
         const int  fracBits = ext ? 6 : 5, fracMask = ( 1 << fracBits ) - 1;
         int taps = 0;
         if( isLuma )

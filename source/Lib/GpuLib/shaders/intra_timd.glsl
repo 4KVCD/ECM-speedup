@@ -806,7 +806,7 @@ void timdMpmCandidates( Cu c, int nbrMode[MPM_NEIGHBOURS], int dimdModes[3], Tim
   int  mpm[NUM_MPM];
   uint included[3] = uint[3]( 0u, 0u, 0u );
   const int numSpatial = mpmSpatial( c, nbrMode, dimdModes, true, mpm, included );
-  mpmFill( numSpatial, mpm, included );
+  mpmFill( numSpatial, NUM_MPM, mpm, included );
   for( int i = 0; i < NUM_MPM; i++ )
   {
     if( mpm[i] > DC_IDX )
