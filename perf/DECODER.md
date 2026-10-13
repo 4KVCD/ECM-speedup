@@ -410,12 +410,15 @@ the reconstruction buffer; works in every frame-thread context):
   smoothed by LBCCP's filter where the CU takes it. M32 is LFNST / NSPT of CCLM blocks: their mode is a DIMD of the
   CU's Cb and / or Cr predictions, so such a block also predicts the other chroma component before its transforms.
   M33 is GLM's gradient patterns: the model is fitted to and applied on a luma gradient (one of four patterns of 6 or
-  9 taps) instead of the downsampled luma.
+  9 taps) instead of the downsampled luma. M34 is CCCM: a chroma block fits each chroma component a 7-tap
+  convolutional model (the downsampled luma sample, its four neighbours, a nonlinear term, a bias) to a template of up
+  to 6 lines around it by least squares - one model or two, and with LBCCP a second set competing by the template's
+  SATD - and applies it.
   GpuIntraRec::supported()
   rejects every tool whose mode derivation or prediction reads reconstructed samples or that the kernels lack, before
-  anything is skipped. All 19 regular streams now fall back to the CPU at cross-component prediction, the next
-  sequence-level check (before M29: TMRL, before M14: sign prediction, before M6: QCS, before M5: LMCS, before M4:
-  dual tree); many block-level tools follow. The
+  anything is skipped. All 19 regular streams now fall back to the CPU at cross-component prediction (CCP merge,
+  decoder-derived CCP fusion, BVG-CCCM), the next sequence-level check (before M34: CCCM, before M29: TMRL, before M14:
+  sign prediction, before M6: QCS, before M5: LMCS, before M4: dual tree); many block-level tools follow. The
   kernels' reference availability is "decoded earlier", while the CPU's (CodingStructure::getCURestricted) also
   excludes other tiles,
   with wavefronts the CTUs right of the current one in the row above, and with GDR the dirty area: until that fix

@@ -13,11 +13,12 @@ wall-clock gains with threads are "the easy baseline". Decoder status: single-th
 (`--GpuLoopFilter=1`: ALF, SAO, BIF, CCSAO, LF-CCCM, offset refinement on Vulkan). The user then asked for **a full
 GPU decoder in Vulkan, optimized until nothing is left** ("The GPU decoder needs to fully decode the frame on the
 GPU"; "Your first Vulkan version is going to be slow. That's OK"). That work is branch `dec-gpurecon`: intra
-reconstruction on the GPU (`--GpuRecon`), tool levels M1-M33 done and verified bit-exact (M19: DIMD, M20: OBIC, M21:
+reconstruction on the GPU (`--GpuRecon`), tool levels M1-M34 done and verified bit-exact (M19: DIMD, M20: OBIC, M21:
 intra merge, M22: the transforms of DIMD CUs, M23: LFNST of MIP, M24: TIMD, M25: OBIC and intra merge with TIMD
 neighbours, M26: TIMD-SAD, M27: OBIC and intra merge with TIMD-SAD neighbours, M28: TIMD merge, M29: TMRL of luma,
-M30: chroma TMRL, M31: CCLM, M32: LFNST / NSPT of CCLM, M33: GLM's gradient patterns); it is **not yet faster than the CPU decoder** (see section 8) and supports only a restricted tool
-set (all real CTC streams fall back to the CPU, first reason: cross-component prediction).
+M30: chroma TMRL, M31: CCLM, M32: LFNST / NSPT of CCLM, M33: GLM's gradient patterns, M34: CCCM); it is **not yet
+faster than the CPU decoder** (see section 8) and supports only a restricted tool set (all real CTC streams fall back to
+the CPU, first reason: cross-component prediction - CCP merge, decoder-derived CCP fusion, BVG-CCCM).
 
 ## 2. The user's rules (follow them exactly)
 
@@ -599,6 +600,32 @@ ECM_TEST_GLM_GRADIENT_ONLY and ECM_TEST_NO_CHROMA_FUSION): m33 (M31n's arguments
 default off: 14 to 72 GLM blocks per CIF picture, 92 per four720 picture, none in park720), m33l_fore32 / 22 / 37
 (with LFNST and NSPT, as m31), m33a_fore22 / m33c_fore22 (the averaging and the cross location types, with LFNST).
 GPU time: m33 130.3 ms per picture; the other sets within 0.7 %.
+M34: CCCM (JVET-AA0057), the plain kind. A chroma block of a CCCM CU (an LM mode with cccmFlag) fits each chroma
+component a 7-tap model - the downsampled luma sample (minus a luma offset, JVET-AB0174), its four neighbours, a
+nonlinear term, a bias - to the template of its reference area (up to 6 lines above / left of the block with the
+above-right / below-left units available; the CU's template selection, JVET-AB0143: both sides, left, above) by
+CccmCovariance::solve2's division-free least squares (JVET-AC0053's Gaussian elimination): one model, or for the MMLM
+modes two split at the template's mean luma; the prediction is clipped to the template chroma's range (JVET-AP0168).
+In intra slices with the TM non-inter tools LBCCP lets a second set compete by the SATD of the template's chroma, Cb's
+and Cr's summed: a single model fitted to the template's two lines next to the block, or two models split at the
+block's mean luma (still fitted to the whole template: the first version fitted them to the two lines too); then
+LBCCP's inside filter (intra_cclm.glsl's, reading the CCCM prediction). intra_cccm.glsl builds the luma buffer in
+xCccmCreateLumaRef's order (the padding right of / below the area's parts, then in a dual tree the luma right of /
+below the block within its CTU over it) in the four angular arrays, or for areas above 7168 samples in the workgroup's
+scratch (blendAcc); per model 42 sums (ATA's upper triangle, ATCb, ATCr) of 6 invocations each, 32-bit (the host
+rejects W + H > 164: chroma blocks above 64 x 64 / 128 x 32, which need a CTU of 256); the 7 x 9 elimination one row
+per invocation; the models as 64-bit words in s_spCost; the costs with timdHadLine's one-sample-thick kernels. Each
+block (Cb, Cr) fits both components' models: the choice needs both costs. Host: Tu::lm's cccmFlag (LM_CCCM_SHIFT),
+Params::dualTree / cccmLbccp, the WITH_CCCM pipelines (LmLevel beside each IntraRecVariant), a CCCM block's parameter
+snapshot reset (DecCu calls no initIntraPatternChType for it, so it held the previous block's, a chroma TMRL CU's
+reference line too); intra_deps and the host add both components' templates and the luma area. Rejected: GL-CCCM,
+CCCM without subsampling, with several downsampling filters, BVG-CCCM, with LFNST / NSPT (block level; next), CCP
+merge and decoder-derived CCP fusion (sequence level). Test sets (encTest13, see section 9): m34 (m33's arguments with
+`--CCCM=1`: 22 to 244 CCCM blocks per CIF picture, 666 to 822 per 720p picture, all template selections, one and two
+models), m34a_fore22 / m34c_fore22 (the averaging and the cross location types). The scratch luma buffer and the
+prediction recomputed for blocks above 2048 samples were also verified with both thresholds lowered (896 / 64
+samples, so most blocks take them). GPU time: m34 136.3 ms per picture (m33, its arguments without CCCM, 130.6); the
+other sets within 0.3 % (the CCCM code is in the WITH_CCCM pipelines only).
 
 ## 8. Numbers (i7-10700 8C/16T, Win11, GCC 16.2, RTX 3070 driver 616.92)
 
@@ -631,9 +658,10 @@ Profile of a GPU-on decode (non-LTO, m2_park16, share of all samples): parsing ~
    m26o sets), M27 OBIC and intra merge with TIMD-SAD neighbours (the m27 and m27o sets), M28 TIMD merge (the m28 and
    m28m sets). 2026-10-13: M29 TMRL of luma (the m29 set, m29n_fore32, m29s_screen32 / 22), M30 chroma TMRL (the m30
    set), M31 CCLM (the m31n set, m31a_fore32 / 22, m31c_fore32 / 22), M32 LFNST / NSPT of CCLM (the m31 set), M33
-   GLM's gradient patterns (the m33 set, m33l_fore32 / 22 / 37, m33a_fore22, m33c_fore22).
-   All 19 regular streams now stop at "cross-component prediction" (the next sequence-level check; the block-level
-   tools of step 4 follow).
+   GLM's gradient patterns (the m33 set, m33l_fore32 / 22 / 37, m33a_fore22, m33c_fore22), M34 CCCM (the m34 set,
+   m34a_fore22, m34c_fore22).
+   All 19 regular streams now stop at "cross-component prediction" (the next sequence-level check: CCP merge,
+   decoder-derived CCP fusion, BVG-CCCM; the block-level tools of step 4 follow).
 3. Make the GPU path win on CPU time per picture: the derive-only pass (record during parsing or a leaner pass;
    speed up getSpatialIpm/getPURestricted, which also helps the CPU decoder), GPU behaviour with frame threads
    (8 contexts x 32 persistent workgroups oversubscribe the GPU; spinning workgroups; try fewer groups per context,
@@ -657,9 +685,12 @@ Profile of a GPU-on decode (non-LTO, m2_park16, share of all samples): parsing ~
    (m29) adds ECM_TEST_NO_CHROMA_TMRL (the `PU::hasChromaTmrl(pu) && ...getUseTmrl()` conditions of the chroma search
    false); `bin\encTest10` (m31) adds ECM_TEST_NO_GLM (the `PU::hasGlmFlag` conditions of the chroma search false) and
    ECM_TEST_NO_CHROMA_FUSION (its `PU::hasChromaFusionFlag` conditions false); `bin\encTest11` (m33) adds
-   ECM_TEST_GLM_GRADIENT_ONLY (xFindBestGlmIdcSATD searches the gradient patterns only, not GLM with luma). The user's
-   order (2026-10-13): all intra first, then inter. Next LM chroma fusion, CCCM (with GLM with luma, which takes its
-   model)
+   ECM_TEST_GLM_GRADIENT_ONLY (xFindBestGlmIdcSATD searches the gradient patterns only, not GLM with luma);
+   `bin\encTest12` adds ECM_TEST_CCCM_PLAIN (the chroma searches' CCCM candidates without GL-CCCM's, the first
+   downsampling filter only) and `bin\encTest13` (m34) extends it to LBCCP's search (its GL-CCCM candidate and its other
+   downsampling filters; encTest12's streams still had them). The user's order (2026-10-13): all intra first, then
+   inter. Next the other kinds of CCCM (GL-CCCM, whose gradients and positions need 64-bit sums, several downsampling
+   filters, CCCM without subsampling), CCCM with LFNST / NSPT, GLM with luma (a CCCM model), LM chroma fusion
    and the other cross-component tools, chroma reordering / DBV, BVG-DIMD, MDIP / MPM sorting, IntraTMP / IBC, EIP /
    SGPM, PDP, NN intra, implicit MTS (not in CTC; its test set, the m24 arguments with `--MTS=0 --MTSImplicit=1`, is
    encoded: `streams_gpu\pending\imts_*`), deblocking on the GPU, then inter pictures.
@@ -693,8 +724,8 @@ Profile of a GPU-on decode (non-LTO, m2_park16, share of all samples): parsing ~
   blending ~15 % (spread over the loop around the prediction and the code inside it; no single part), M21's intra
   merge ~11 % on pictures with DIMD, a second call site of selectTransform and inChainResidual ~7 % (M23: one call
   site each instead), M31's CCLM 30 % on plain pictures. Since M19 intra_rec is built as several pipelines with
-  specialization constants (`WITH_DIMD`, `WITH_DERIVED_TRANSFORMS`, `WITH_MERGE`, ..., `WITH_CCLM`;
-  `gpu::Kernel::create`'s specialization, GpuIntraRec.cpp's `IntraRecVariant`) and a picture runs the one without the
+  specialization constants (`WITH_DIMD`, `WITH_DERIVED_TRANSFORMS`, `WITH_MERGE`, ..., `WITH_CCLM`, `WITH_CCCM`;
+  `gpu::Kernel::create`'s specialization, GpuIntraRec.cpp's `IntraRecVariant` and `LmLevel`) and a picture runs the one without the
   features it does not use. The compiler is not monotonic
   here: the pipeline with DIMD alone was slower than the one with DIMD and the derived transforms in every case
   measured, so that one is not built. Measure each new variant.
@@ -728,6 +759,9 @@ Profile of a GPU-on decode (non-LTO, m2_park16, share of all samples): parsing ~
   for the Cb block) hung the GPU (VK_ERROR_DEVICE_LOST). Edges to the earlier nodes only are cycle-free.
 - `gpucheck.py --GpuRecon=2` compares the output, which in verification is the CPU's: it also requires the summary's
   "0 with differences" since 2026-10-12 (before, only the ON modes caught a wrong GPU reconstruction).
+- PowerShell 5.1 drops an empty-string argument to a native program: `DecoderApp -b x.bin -o '' --GpuRecon=2` ran as
+  `-o --GpuRecon=2`, a CPU decode into a file named `--GpuRecon=2` without a summary line. Decode through the Python
+  scripts (`verify_all.py`, `gpucheck.py`), which pass `-o ""` intact.
 - NVIDIA's shared shader cache (`%LOCALAPPDATA%\NVIDIA\GLCache`) holds 1 GB. At that limit (2026-10-13, after many
   canary builds) it stored no new pipelines for a while (later the driver pruned it to ~320 MB): every decode of a
   new build compiled all of intra_rec's pipelines, ~96 s per decoder start (six decodes of one canary build took ~90 s

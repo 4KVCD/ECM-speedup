@@ -81,7 +81,9 @@ const int MMLM_T_IDX      = LM_CHROMA_IDX + 5;
 // second model, each + 8 in 4 bits, and whether the CU's prediction takes LBCCP's inside filter (ccInsideFilter).
 // With LFNST / NSPT (DERIVE_CCLM_DIMD) also the predictions whose DIMD gives their mode (deriveChromaIpmForTransform
 // by the TU's joint CbCr mode: Cb's for 1, Cr's for 2, both for 0 and 3) and the other component's slope adjustments.
-// With GLM (JVET-AA0126) the gradient pattern of the block (glmIdc 1 .. NUM_GLM_PATTERN, 0: none) and the other's
+// With GLM (JVET-AA0126) the gradient pattern of the block (glmIdc 1 .. NUM_GLM_PATTERN, 0: none) and the other's.
+// A CCCM block (JVET-AA0057, intra_cccm.glsl; no slope adjustments, GLM, LFNST / NSPT) has its template selection
+// (cccmFlag: 1 above and left, 2 left, 3 above; 0: not CCCM)
 const int LM_DELTA0_SHIFT = 0;
 const int LM_DELTA1_SHIFT = 4;
 const int LM_INSIDE       = 256;
@@ -91,6 +93,7 @@ const int LM_HIST_CR      = 2048;
 const int LM_OTHER_SHIFT  = 12;   // the other component's two adjustments, in LM_DELTA0 / 1's layout
 const int LM_GLM_SHIFT    = 20;   // 4 bits
 const int LM_OTHER_GLM_SHIFT = 24;
+const int LM_CCCM_SHIFT   = 28;   // 2 bits
 
 // Tu::derive
 const int DERIVE_NODE     = 32;  // not a block: the derivation of the mode of CU Tu::cu, before the CU's blocks
@@ -620,6 +623,8 @@ struct Params
   int      ctuSize;     // the SPS's CTU size (luma samples)
   int      lumaUnitW, lumaUnitH;   // the luma availability units (PreCalcValues::minCUWidth / minCUHeight)
   int      cclmFilter;  // CCLM's luma downsampling filter by the SPS's collocated chroma flags (CCLM_FILTER_*)
+  int      dualTree;    // CS::isDualITree: luma and chroma are separate trees (CCCM reads luma right of / below a block)
+  int      cccmLbccp;   // CCCM's two sets of models (LBCCP, JVET-AD0120: an intra slice with the TM non-inter tools)
 };
 layout( buffer_reference, std430, buffer_reference_align = 8 ) buffer BufParams { Params p; };
 

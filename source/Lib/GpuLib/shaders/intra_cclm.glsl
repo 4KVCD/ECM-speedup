@@ -435,9 +435,16 @@ void cclmModel( Tu t, int lx, int ly, int predStride, int ref, int slot )
 
 // ----- the prediction (predIntraChromaLM, LBCCP's filterPredInside); `slot`: the model's in s_cclm
 
-// the model applied to the co-located block's downsampled sample (i, j) (two models: split at the threshold)
+int cccmBlockPrediction( Tu t, int x, int y );   // (intra_cccm.glsl)
+
+// the model applied to the co-located block's downsampled sample (i, j) (two models: split at the threshold); a CCCM
+// block's prediction
 int cclmPredSample( Tu t, int lx, int ly, int i, int j, int maxPel, int slot )
 {
+  if( WITH_CCCM && ( ( t.lm >> LM_CCCM_SHIFT ) & 3 ) != 0 )
+  {
+    return cccmBlockPrediction( t, i, j );
+  }
   const int  m      = CCLM_MODEL + slot * CCLM_SLOT;
   const int  luma   = cclmLumaInner( lx, ly, i, j, s_cclm[CCLM_LEFT] != 0, s_cclm[CCLM_ABOVE] != 0, ( t.lm >> LM_GLM_SHIFT ) & 15 );
   const bool second = cclmMultiModel( t.dirMode ) && luma > s_cclm[m + CCLM_THRES];

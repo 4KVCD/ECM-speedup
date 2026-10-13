@@ -227,6 +227,22 @@ void cclmDeps( Tu t )
   addAreaDeps( 0, lx - 3, ly - 1, lx - 1, ly + 2 * lh - 1 );
 }
 
+// a dependency of CCCM block t (intra_cccm.glsl) on the blocks owning the samples it reads, for the largest reference
+// area it may have (up to 6 lines above / left, arms of twice the block): of both chroma components the template
+// (which holds the offsets' samples, the costs' arms and the inside filter's neighbours), of luma the area's
+// downsampling with a sample of padding around (with the luma offset's sample; luma right of / below the block in a
+// dual tree is its CTU's, decoded before)
+void cccmDeps( Tu t )
+{
+  const int sx = min( t.x, 6 ), sy = min( t.y, 6 ), x1 = t.x + 2 * t.w - 1, y1 = t.y + 2 * t.h - 1;
+  for( int comp = 1; comp <= 2; comp++ )
+  {
+    addAreaDeps( comp, t.x - sx, t.y - sy, x1, t.y - 1 );
+    addAreaDeps( comp, t.x - sx, t.y, t.x - 1, y1 );
+  }
+  addAreaDeps( 0, 2 * ( t.x - sx - 1 ) - 1, 2 * ( t.y - sy - 1 ) - 1, 2 * ( x1 + 1 ) + 1, 2 * ( y1 + 1 ) + 1 );
+}
+
 // a dependency of chroma TMRL CU c's node on the modes it reads - the luma CUs' at its five positions and the chroma
 // neighbours' (Cu::nbr; the co-located luma CU's is the chroma nodes' own) - and on the blocks owning the samples it
 // reads: of Cb and Cr each line's whole arms (2 x (the side + 1)) and the template, of luma the co-located block and
@@ -495,6 +511,10 @@ void dependencies( int comp )
   if( ( t.lm & LM_ACTIVE ) != 0 )   // CCLM: the luma it downsamples
   {
     cclmDeps( t );
+  }
+  if( ( ( t.lm >> LM_CCCM_SHIFT ) & 3 ) != 0 )
+  {
+    cccmDeps( t );
   }
   if( t.ispPrev >= 0 )   // the chain of an ISP CU's sub-partitions
   {
