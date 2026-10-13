@@ -4180,6 +4180,7 @@ void EncGOP::compressGOP(int iPOCLast, int iNumPicRcvd, PicList &rcListPic, std:
     xSetupPicOrder( pcSlice, picOrder );
     if( m_ftActive )
     {
+      pcPic->packWaitingBufs( pcSlice->getSPS()->getBitDepths() );   // until its search starts
       picOrder->setup.reset( new EncSliceSetup );
       m_pcSliceEncoder->saveSetup( *picOrder->setup );
       picListLock.unlock();
@@ -7649,6 +7650,7 @@ void EncGOP::xStartPicSearch( Picture* pic, PicHeader* picHeader, Slice* slice, 
     m_pcSliceEncoder = &m_pcSearchStack->sliceEncoder;
     m_pcSliceEncoder->loadSetup( *order.setup, *pic );
     order.setup.reset();
+    pic->unpackWaitingBufs();
     // the temporary buffers the setup left out: the true original of a picture the temporal filter left as it was,
     // and the filtered original, are copies of the original, which nothing changes between the setup and here
     const bool trueOrigMade = !pic->getTrueOrigBuf().bufs.empty();

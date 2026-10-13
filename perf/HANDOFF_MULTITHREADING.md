@@ -184,6 +184,9 @@ Commits on `enc-mt`, all bit-exact with stock ECM-20.0 (bitstream md5 of the sui
   hardly touched). Peak commit with 8 threads: RA 65 frames 8.29 -> 6.14 GB, AI 33 pictures 8.31 -> 6.14 GB. An
   allocation probe (`C:\Code\work\mt\ram\allocprobe`: every live allocation with its call site and resident bytes,
   QueryWorkingSetEx) showed these tables as 2.7 GB of the 9.1 GB committed at 1080p before the first picture.
+- RAM step R2: a waiting picture keeps its original and true original in 8 bits per sample where that is lossless
+  (`Picture::packWaitingBufs` at the setup end, `unpackWaitingBufs` at the search start). RA 1080p with 8 threads and
+  8 periods, 75-150 s: 11.8 -> 10.9 GB on average (working set 8.1 -> 7.3 GB).
 - Tried and dropped (RAM): freeing the original and the per-4x4 arrays of a finished picture that waits only for its
   output and is no reference (`C:\Code\work\mt\ram\w_dropped.diff`). In the first minutes at 1080p with 8 threads
   and 8 periods the list holds about 280 waiting pictures, 9 being searched and at most 13 finished ones, all still

@@ -360,6 +360,91 @@ void Picture::createSearchBuffers()
   cs->rebindPicBufs();
 }
 
+void Picture::packWaitingBufs( const BitDepths& bitDepths )
+{
+  xPackBuf( PIC_ORIGINAL, bitDepths );
+  xPackBuf( PIC_TRUE_ORIGINAL, bitDepths );
+}
+
+bool Picture::xPackBuf( PictureType type, const BitDepths& bitDepths )
+{
+  PelStorage& buf = M_BUFS( 0, type );
+  if( buf.bufs.empty() )
+  {
+    return false;
+  }
+  PackedBuf packed{ type, {}, nullptr };
+  size_t    numSamples = 0;
+  for( uint32_t c = 0; c < buf.bufs.size(); c++ )
+  {
+    const ChannelType ch    = toChannelType( ComponentID( c ) );
+    const int         shift = std::max( 0, bitDepths.recon[ch] - 8 );
+    packed.shift[ch]        = shift;
+    const PelBuf& b         = buf.bufs[c];
+    for( int y = 0; y < (int) b.height; y++ )
+    {
+      const Pel* row = b.bufAt( 0, y );
+      for( int x = 0; x < (int) b.width; x++ )
+      {
+        if( row[x] < 0 || ( row[x] & ( ( 1 << shift ) - 1 ) ) || ( row[x] >> shift ) > 255 )
+        {
+          return false;   // not lossless in 8 bits
+        }
+      }
+    }
+    numSamples += size_t( b.width ) * b.height;
+  }
+  packed.samples.reset( new uint8_t[numSamples] );
+  uint8_t* dst = packed.samples.get();
+  for( uint32_t c = 0; c < buf.bufs.size(); c++ )
+  {
+    const int     shift = packed.shift[toChannelType( ComponentID( c ) )];
+    const PelBuf& b     = buf.bufs[c];
+    for( int y = 0; y < (int) b.height; y++ )
+    {
+      const Pel* row = b.bufAt( 0, y );
+      for( int x = 0; x < (int) b.width; x++ )
+      {
+        *dst++ = uint8_t( row[x] >> shift );
+      }
+    }
+  }
+  buf.destroy();
+  m_packedBufs.push_back( std::move( packed ) );
+  return true;
+}
+
+void Picture::unpackWaitingBufs()
+{
+  for( PackedBuf& packed: m_packedBufs )
+  {
+    if( packed.type == PIC_ORIGINAL )
+    {
+      M_BUFS( 0, PIC_ORIGINAL ).create( chromaFormat, Area( Position(), lumaSize() ) );   // as create() makes it
+    }
+    else
+    {
+      createTrueOrigBuf( m_maxCUSizeReco );
+    }
+    PelStorage&    buf = M_BUFS( 0, packed.type );
+    const uint8_t* src = packed.samples.get();
+    for( uint32_t c = 0; c < buf.bufs.size(); c++ )
+    {
+      const int shift = packed.shift[toChannelType( ComponentID( c ) )];
+      PelBuf&   b     = buf.bufs[c];
+      for( int y = 0; y < (int) b.height; y++ )
+      {
+        Pel* row = b.bufAt( 0, y );
+        for( int x = 0; x < (int) b.width; x++ )
+        {
+          row[x] = Pel( *src++ ) << shift;
+        }
+      }
+    }
+  }
+  m_packedBufs.clear();
+}
+
 void Picture::createTempBuffers( const unsigned _maxCUSize, bool useFilterFrame, bool resChange, bool decoder)
 {
 #if KEEP_PRED_AND_RESI_SIGNALS

@@ -117,12 +117,13 @@ lower all-core turbo, one duplicated intra frame per chunk, unequal chunk comple
   small. Each period beyond the first adds a finish context (about 0.13 GB at 1080p while idle; a running finish
   creates the SAO statistics, 0.64 GB at 1080p, and frees them after its SAO and CCSAO; one finish at a time holds
   them), and up to max(N, GOPSize) x M pictures
-  are in flight. A picture that waits for its search holds its original (6.2 MB at 1080p) and, if the temporal filter
-  changed it, its true original (6.5 MB); its reconstruction, coding-structure arrays, temporary buffers and search
+  are in flight. A picture that waits for its search holds its original (6.2 MB at 1080p; 3.1 MB in 8 bits per sample
+  where that is lossless, as for an 8-bit source the temporal filter left as it was) and, if the temporal filter
+  changed it, its true original (likewise); its reconstruction, coding-structure arrays, temporary buffers and search
   data (about 140 MB at 1080p) are created when its search starts, and its CUs, PUs and TUs are freed when its finish
   ends (each picture buffer has its own unit cache, so it would keep them). RA 1080p with N = 8 and the automatic
-  M = 8 (a synthetic sequence on the 8 P-cores, commit sampled every 2 s, from 75 to 150 s): about 14 GB on average
-  (working set 8 GB), peak 15 GB (working set 9 GB).
+  M = 8 (a synthetic sequence on the 8 P-cores, commit sampled every 2 s, from 75 to 150 s): about 11 GB on average
+  (working set 7.3 GB), peak 11.7 GB (working set 8.3 GB).
 - Core Ultra 7 265K, one run at a time on the 8 P-cores, foreman 128x128 QP 32 (ai_long's and ra_long's
   configurations), the previous commit's single-thread time as base, automatic M:
 

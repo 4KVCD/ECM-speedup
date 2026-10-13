@@ -49,6 +49,7 @@
 #include "Hash.h"
 #include "MCTS.h"
 #include <deque>
+#include <memory>
 
 #if NN_LF_UNIFIED
 #include "CommonLib/NNFilterUnified.h"
@@ -127,6 +128,11 @@ void create(
   /// per-4x4 arrays (EncLib::encodePrep releases them, EncGOP::xStartPicSearch creates them)
   void releaseSearchBuffers();
   void createSearchBuffers();
+  /// frame threads: while a picture waits for its search, its original and true original are kept in 8 bits per
+  /// sample where that is lossless (every sample a multiple of 1 << (bit depth - 8) and below 256 << it, as an 8-bit
+  /// source read into a higher internal bit depth gives); unpackWaitingBufs restores them
+  void packWaitingBufs( const BitDepths& bitDepths );
+  void unpackWaitingBufs();
 
          PelBuf     getOrigBuf(const CompArea &blk);
   const CPelBuf     getOrigBuf(const CompArea &blk) const;
@@ -419,6 +425,16 @@ public:
 
   MCTSInfo     mctsInfo;
   std::vector<AQpLayer*> aqlayer;
+
+private:
+  struct PackedBuf
+  {
+    PictureType                type;
+    int                        shift[MAX_NUM_CHANNEL_TYPE];   ///< sample = packed << shift
+    std::unique_ptr<uint8_t[]> samples;                       ///< the components one after the other, row by row
+  };
+  bool                   xPackBuf( PictureType type, const BitDepths& bitDepths );
+  std::vector<PackedBuf> m_packedBufs;   ///< packWaitingBufs
 
 #if !KEEP_PRED_AND_RESI_SIGNALS
 private:
