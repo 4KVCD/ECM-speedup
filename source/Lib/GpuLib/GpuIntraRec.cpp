@@ -907,7 +907,8 @@ enum IntraRecVariant
 // threads); destroyed by GpuIntraRec::releaseShared, before the device
 struct Shared
 {
-  gpu::Kernel                      kernel[NUM_VARIANTS];   // intra_rec, per IntraRecVariant
+  mutable gpu::Kernel              kernel[NUM_VARIANTS];   // intra_rec, per IntraRecVariant (intraRecKernel: on first use)
+  mutable std::once_flag           kernelOnce[NUM_VARIANTS];
   gpu::Kernel                      kernelResi, kernelDeps, kernelScan;
   gpu::Buffer                      filters, matrices;
   gpu::Buffer                      secKernels;                    // int8: the CPU's LFNST and NSPT tables, one after the other
@@ -948,22 +949,30 @@ struct Shared
   }
 };
 
+// intra_rec's pipeline of a variant, compiled the first time a picture needs it (by any thread: the decoder contexts
+// share it). Compiling all of them up front cost ~11 s each where the driver's shader cache misses (a new build), and a
+// stream rarely needs more than two. Not while the caller's stream is recording: creating a pipeline waits until no
+// submission is in flight (gpu::Context::inFlight), which includes the caller's own
+gpu::Kernel& intraRecKernel( const Shared& sh, gpu::Context& ctx, IntraRecVariant variant )
+{
+  // the names and the specialization constants (WITH_DIMD, WITH_DERIVED_TRANSFORMS, WITH_MERGE, WITH_TIMD,
+  // WITH_TIMD_SAD, WITH_TIMD_MERGE, WITH_TMRL) per IntraRecVariant
+  static const char* const NAMES[NUM_VARIANTS] = { "intra_rec", "intra_rec (derived transforms)", "intra_rec (DIMD)",
+                                                   "intra_rec (intra merge)", "intra_rec (TIMD)", "intra_rec (TIMD-SAD)",
+                                                   "intra_rec (TIMD merge)", "intra_rec (TMRL)" };
+  static const std::vector<uint32_t> SPECIALIZATION[NUM_VARIANTS] = {
+    { 0, 0, 0, 0 }, { 0, 1, 0, 0 }, { 1, 1, 0, 0 }, { 1, 1, 1, 0 }, { 1, 1, 1, 1, 0 }, { 1, 1, 1, 1, 1 },
+    { 1, 1, 1, 1, 1, 1 }, { 1, 1, 1, 1, 1, 1, 1 } };
+  std::call_once( sh.kernelOnce[variant], [&] {
+    sh.kernel[variant].create( ctx, spv_intra_rec, sizeof( spv_intra_rec ), sizeof( Push ), NAMES[variant],
+                               SPECIALIZATION[variant] );
+  } );
+  return sh.kernel[variant];
+}
+
 Shared* createShared( gpu::Context& ctx )
 {
   Shared* sh = new Shared;
-  sh->kernel[VARIANT_PLAIN].create( ctx, spv_intra_rec, sizeof( spv_intra_rec ), sizeof( Push ), "intra_rec", { 0, 0, 0, 0 } );
-  sh->kernel[VARIANT_DERIVED_TRANSFORMS].create( ctx, spv_intra_rec, sizeof( spv_intra_rec ), sizeof( Push ),
-                                                 "intra_rec (derived transforms)", { 0, 1, 0, 0 } );
-  sh->kernel[VARIANT_FULL].create( ctx, spv_intra_rec, sizeof( spv_intra_rec ), sizeof( Push ), "intra_rec (DIMD)", { 1, 1, 0, 0 } );
-  sh->kernel[VARIANT_MERGE].create( ctx, spv_intra_rec, sizeof( spv_intra_rec ), sizeof( Push ), "intra_rec (intra merge)",
-                                    { 1, 1, 1, 0 } );
-  sh->kernel[VARIANT_TIMD].create( ctx, spv_intra_rec, sizeof( spv_intra_rec ), sizeof( Push ), "intra_rec (TIMD)", { 1, 1, 1, 1, 0 } );
-  sh->kernel[VARIANT_TIMD_SAD].create( ctx, spv_intra_rec, sizeof( spv_intra_rec ), sizeof( Push ), "intra_rec (TIMD-SAD)",
-                                       { 1, 1, 1, 1, 1 } );
-  sh->kernel[VARIANT_TIMD_MERGE].create( ctx, spv_intra_rec, sizeof( spv_intra_rec ), sizeof( Push ), "intra_rec (TIMD merge)",
-                                         { 1, 1, 1, 1, 1, 1 } );
-  sh->kernel[VARIANT_TMRL].create( ctx, spv_intra_rec, sizeof( spv_intra_rec ), sizeof( Push ), "intra_rec (TMRL)",
-                                   { 1, 1, 1, 1, 1, 1, 1 } );
   sh->kernelResi.create( ctx, spv_intra_resi, sizeof( spv_intra_resi ), sizeof( Push ), "intra_resi" );
   sh->kernelDeps.create( ctx, spv_intra_deps, sizeof( spv_intra_deps ), sizeof( Push ), "intra_deps" );
   sh->kernelScan.create( ctx, spv_scan, sizeof( spv_scan ), sizeof( PushScan ), "scan" );
@@ -3449,6 +3458,7 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
                                   : m.numTimdSad > 0 ? VARIANT_TIMD_SAD : m.numTimd > 0 ? VARIANT_TIMD
                                   : m.numMerge > 0 ? VARIANT_MERGE : dimd ? VARIANT_FULL
                                   : derivedTransforms ? VARIANT_DERIVED_TRANSFORMS : VARIANT_PLAIN;
+  gpu::Kernel& recKernel = intraRecKernel( *m.sh, ctx, variant );   // (before the stream begins)
   // the sums of DIMD / OBIC blending: per intra_rec workgroup three classes of a block of up to 128 x 128
   const size_t blendAccBytes = m.blendBlocks ? size_t( m.numGroups ) * BLEND_ACC * 4 : 4;
   m.blendAcc.ensure( ctx, blendAccBytes, gpu::Buffer::DEVICE );
@@ -3588,7 +3598,7 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
     pass.verify = 3;
     s.dispatch( m.sh->kernelDeps, &pass, depGroups );   // the dependents lists, the queue
     s.barrier();
-    s.dispatch( m.sh->kernel[variant], &push, (uint32_t) std::min<size_t>( m.numGroups, n ) );
+    s.dispatch( recKernel, &push, (uint32_t) std::min<size_t>( m.numGroups, n ) );
     const uint32_t t1 = s.timestamp();
     s.barrier();
     s.copy( m.sched, ( oStart + n ) * 4, m.download, 0, 4 );

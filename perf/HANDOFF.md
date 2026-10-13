@@ -643,6 +643,12 @@ Profile of a GPU-on decode (non-LTO, m2_park16, share of all samples): parsing ~
   for the Cb block) hung the GPU (VK_ERROR_DEVICE_LOST). Edges to the earlier nodes only are cycle-free.
 - `gpucheck.py --GpuRecon=2` compares the output, which in verification is the CPU's: it also requires the summary's
   "0 with differences" since 2026-10-12 (before, only the ON modes caught a wrong GPU reconstruction).
+- NVIDIA's shared shader cache (`%LOCALAPPDATA%\NVIDIA\GLCache`) holds 1 GB. At that limit (2026-10-13, after many
+  canary builds) it stored no new pipelines for a while (later the driver pruned it to ~320 MB): every decode of a
+  new build compiled all of intra_rec's pipelines, ~96 s per decoder start (six decodes of one canary build took ~90 s
+  each). Since then intra_rec's variants are compiled on first use (`intraRecKernel`: ~19 s for a cold start that
+  needs one), and the test scripts give the driver a cache of their own (`__GL_SHADER_DISK_CACHE_PATH`,
+  `__GL_SHADER_DISK_CACHE_SIZE`, `__GL_SHADER_DISK_CACHE_SKIP_CLEANUP`, which the Windows driver honors).
 - The owner maps have 4x4 luma units; ISP sub-partitions 1 or 2 wide or high share them. The last block owning a
   unit must win everywhere (intra_deps pass 0 writes with atomicMax: plain parallel writes raced), and a block
   reading a shared unit only waits for that last owner, so the sub-partitions of a CU are chained (Tu::ispPrev;
