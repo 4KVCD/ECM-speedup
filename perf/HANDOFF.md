@@ -13,11 +13,11 @@ wall-clock gains with threads are "the easy baseline". Decoder status: single-th
 (`--GpuLoopFilter=1`: ALF, SAO, BIF, CCSAO, LF-CCCM, offset refinement on Vulkan). The user then asked for **a full
 GPU decoder in Vulkan, optimized until nothing is left** ("The GPU decoder needs to fully decode the frame on the
 GPU"; "Your first Vulkan version is going to be slow. That's OK"). That work is branch `dec-gpurecon`: intra
-reconstruction on the GPU (`--GpuRecon`), tool levels M1-M36 done and verified bit-exact (M19: DIMD, M20: OBIC, M21:
+reconstruction on the GPU (`--GpuRecon`), tool levels M1-M37 done and verified bit-exact (M19: DIMD, M20: OBIC, M21:
 intra merge, M22: the transforms of DIMD CUs, M23: LFNST of MIP, M24: TIMD, M25: OBIC and intra merge with TIMD
 neighbours, M26: TIMD-SAD, M27: OBIC and intra merge with TIMD-SAD neighbours, M28: TIMD merge, M29: TMRL of luma,
 M30: chroma TMRL, M31: CCLM, M32: LFNST / NSPT of CCLM, M33: GLM's gradient patterns, M34: CCCM, M35: GL-CCCM, M36:
-CCCM with several downsampling filters); it is **not yet faster than the CPU decoder** (see section 8) and supports
+CCCM with several downsampling filters, M37: CCCM without subsampling); it is **not yet faster than the CPU decoder** (see section 8) and supports
 only a restricted tool set (all real CTC streams fall back to the CPU, first reason: cross-component prediction - CCP
 merge, decoder-derived CCP fusion, BVG-CCCM).
 
@@ -657,6 +657,22 @@ LM_CCCM_MDF_SHIFT (bits 13, 14). Test set (encTest14 without its CCCM switches: 
 m36 (m35's arguments: 26 to 142 CCCM blocks of several filters per CIF picture, 250 to 320 per 720p picture, beside
 plain and GL-CCCM ones). Also verified with the shared capacities lowered (896 / 64 samples). GPU time: m36 143.4 ms
 per picture; m34 135.3 -> 136.2, m35 136.9 -> 137.9, the other sets within 0.6 %.
+M37: CCCM without subsampling (JVET-AC0147, cccmNoSubFlag; CTC's CCCM=2). Its luma buffer (xCccmCreateLumaNoSubRef)
+holds the luma itself, minus the luma offset, over the reference area at twice its size per direction, padded by two
+samples; the model's taps lie around the co-located luma sample (2x, 2y), by the chroma location type
+(xCccmCalcModels' chromaloctype): the averaging type's 2 x 2 samples and their nonlinear terms (9 parameters), the
+cross's sample and its four neighbours (11), the 6-tap filter's two rows of three and four nonlinear terms (11). The
+template and the prediction are at the chroma positions (every second luma sample), the two-model threshold is the
+mean of all the template's luma samples (four per chroma sample); no LBCCP second set; no minimum clipping span (above
+7 parameters). The taps reach at most (2x + 1, 2y + 1), never the buffer's right / bottom padding, which is built
+anyway as the CPU builds it. intra_cccm.glsl's luma buffers are now in the buffer's units (g_cccmShift: cccmBufferW,
+cccmLumaIndex, cccmColocated; cccmBuildLuma builds both kinds, the padding a chroma sample wide, in a dual tree the
+CTU checks of luma positions against the chroma CTU size as on the CPU); a buffer up to 7168 samples stays in shared
+memory. Tu::lm's LM_CCCM_NOSUB (bit 15). Test set (encTest14 without its CCCM switches, `--CCCM=2`): m37 (m36's
+arguments: 10 to 42 CCCM blocks without subsampling per CIF picture, 54 to 442 per 720p picture, beside the other
+kinds), m37a_fore22 / m37c_fore22 (the averaging and the cross location types). Also verified with the shared
+capacities lowered (896 / 64 samples). GPU time: m37 138.1 ms per picture; m34 135.9 -> 136.6, m35 137.6 -> 138.3,
+m36 142.8 -> 143.6, the other sets within 0.7 %.
 
 ## 8. Numbers (i7-10700 8C/16T, Win11, GCC 16.2, RTX 3070 driver 616.92)
 
@@ -690,7 +706,8 @@ Profile of a GPU-on decode (non-LTO, m2_park16, share of all samples): parsing ~
    m28m sets). 2026-10-13: M29 TMRL of luma (the m29 set, m29n_fore32, m29s_screen32 / 22), M30 chroma TMRL (the m30
    set), M31 CCLM (the m31n set, m31a_fore32 / 22, m31c_fore32 / 22), M32 LFNST / NSPT of CCLM (the m31 set), M33
    GLM's gradient patterns (the m33 set, m33l_fore32 / 22 / 37, m33a_fore22, m33c_fore22), M34 CCCM (the m34 set,
-   m34a_fore22, m34c_fore22), M35 GL-CCCM (the m35 set), M36 CCCM with several downsampling filters (the m36 set).
+   m34a_fore22, m34c_fore22), M35 GL-CCCM (the m35 set), M36 CCCM with several downsampling filters (the m36 set),
+   M37 CCCM without subsampling (the m37 set, m37a_fore22, m37c_fore22).
    All 19 regular streams now stop at "cross-component prediction" (the next sequence-level check: CCP merge,
    decoder-derived CCP fusion, BVG-CCCM; the block-level tools of step 4 follow).
 3. Make the GPU path win on CPU time per picture: the derive-only pass (record during parsing or a leaner pass;
@@ -720,10 +737,9 @@ Profile of a GPU-on decode (non-LTO, m2_park16, share of all samples): parsing ~
    `bin\encTest12` adds ECM_TEST_CCCM_PLAIN (the chroma searches' CCCM candidates without GL-CCCM's, the first
    downsampling filter only) and `bin\encTest13` (m34) extends it to LBCCP's search (its GL-CCCM candidate and its other
    downsampling filters; encTest12's streams still had them); `bin\encTest14` (m35) adds ECM_TEST_CCCM_NO_MDF (the
-   downsampling-filter switches of ECM_TEST_CCCM_PLAIN alone: GL-CCCM stays; m36: none of them). The user's order
-   (2026-10-13): all intra first, then inter. Next CCCM without subsampling (CTC's CCCM=2), CCCM with LFNST / NSPT,
-   GLM with luma (a CCCM model), LM chroma fusion
-   and the other cross-component tools, chroma reordering / DBV, BVG-DIMD, MDIP / MPM sorting, IntraTMP / IBC, EIP /
+   downsampling-filter switches of ECM_TEST_CCCM_PLAIN alone: GL-CCCM stays; m36: none of them; m37: none, with
+   `--CCCM=2`). The user's order (2026-10-13): all intra first, then inter. Next CCCM with LFNST / NSPT, GLM with luma
+   (a CCCM model), LM chroma fusion and the other cross-component tools, chroma reordering / DBV, BVG-DIMD, MDIP / MPM sorting, IntraTMP / IBC, EIP /
    SGPM, PDP, NN intra, implicit MTS (not in CTC; its test set, the m24 arguments with `--MTS=0 --MTSImplicit=1`, is
    encoded: `streams_gpu\pending\imts_*`), deblocking on the GPU, then inter pictures.
    Intra merge's GPU time (m19: park720 152, four720 183 ms per picture, from 347 / 392 at first) has room: the

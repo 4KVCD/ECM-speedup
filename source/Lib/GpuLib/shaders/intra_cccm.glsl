@@ -1,20 +1,21 @@
-// CCCM on the GPU (JVET-AA0057's convolutional cross-component models; the plain kind, GL-CCCM (JVET-AC0054) and
-// several downsampling filters (JVET-AD0202): not without subsampling nor BVG-CCCM): IntraPrediction::predIntraCCCM for
-// one chroma block of a CCCM CU. xCccmCreateLumaRef downsamples the luma (xCccmGetLumaVal, minus a luma offset:
+// CCCM on the GPU (JVET-AA0057's convolutional cross-component models; the plain kind, GL-CCCM (JVET-AC0054), several
+// downsampling filters (JVET-AD0202) and no subsampling (JVET-AC0147): not BVG-CCCM): IntraPrediction::predIntraCCCM
+// for one chroma block of a CCCM CU. xCccmCreateLumaRef downsamples the luma (xCccmGetLumaVal, minus a luma offset:
 // JVET-AB0174) of the reference area - the block, up to 6 rows above and columns left of it, and the units above-right
 // / below-left that are available - padded by a sample all around, into a buffer (with several filters a buffer per
-// filter); xCccmCalcModels fits each chroma component a model (cccmFeature: of 7 parameters, the luma sample, its four
+// filter; without subsampling xCccmCreateLumaNoSubRef's buffer holds the luma itself, padded by two samples);
+// xCccmCalcModels fits each chroma component a model (cccmFeature: of 7 parameters, the luma sample, its four
 // neighbours - with GL-CCCM a vertical and a horizontal gradient and the sample's position instead -, a nonlinear term,
-// a bias; of 10 or 11 with several filters) to the template - the area's samples outside the block, those of the CU's
-// template selection (JVET-AB0143) - by least squares (CccmCovariance::solve2 with JVET-AC0053's gaussElimination), one
-// model or, for the multi-model modes, two split at a luma threshold; the prediction is clipped to the range of the
-// template's chroma (JVET-AP0168). In intra slices with the TM non-inter tools (LBCCP, JVET-AD0120) a plain CCCM block
-// has a second set of models compete - a single model fitted to the template's two lines next to the block, two models
-// split at the block's mean luma instead - and the set with the lower SATD on the template's chroma
-// (xCalculateCCCMcost, Cb's and Cr's summed) predicts. LBCCP's inside filter may then smooth the prediction
-// (intra_cclm.glsl's cclmPrediction). The CPU predicts both components at the Cb block; here each block fits both
-// components' models (its choice needs both costs) and predicts its own. Included by intra_rec.comp after
-// intra_cclm.glsl.
+// a bias; of 10 or 11 with several filters, of 9 or 11 without subsampling) to the template - the area's samples
+// outside the block, those of the CU's template selection (JVET-AB0143) - by least squares (CccmCovariance::solve2 with
+// JVET-AC0053's gaussElimination), one model or, for the multi-model modes, two split at a luma threshold; the
+// prediction is clipped to the range of the template's chroma (JVET-AP0168). In intra slices with the TM non-inter
+// tools (LBCCP, JVET-AD0120) a plain CCCM block has a second set of models compete - a single model fitted to the
+// template's two lines next to the block, two models split at the block's mean luma instead - and the set with the
+// lower SATD on the template's chroma (xCalculateCCCMcost, Cb's and Cr's summed) predicts. LBCCP's inside filter may
+// then smooth the prediction (intra_cclm.glsl's cclmPrediction). The CPU predicts both components at the Cb block; here
+// each block fits both components' models (its choice needs both costs) and predicts its own. Included by
+// intra_rec.comp after intra_cclm.glsl.
 //
 // Shared memory, all free while an LM block predicts: one luma buffer in the four angular arrays (s_angA, s_angL; the
 // block clears them again), a larger one or several in the workgroup's CCCM scratch (Params::scratch's CCCM part), the
@@ -25,7 +26,7 @@
 #define INTRA_CCCM_GLSL
 
 const int CCCM_WINDOW   = 6;         // CCCM_WINDOW_SIZE: the template's rows above / columns left of the block
-const int CCCM_MAX_PARAMS = 11;      // a model's parameters: CCCM_NUM_PARAMS 7, with several filters 10 or 11
+const int CCCM_MAX_PARAMS = 11;      // a model's parameters: CCCM_NUM_PARAMS 7, else 9 to 11
 const int CCCM_DECIM    = 16;        // DECIM_BITS (bit depths up to 10)
 const int CCCM_MATRIX   = 22;        // CCCM_MATRIX_BITS
 const int CCCM_LUMA_MAX = 4 * ANG;   // the luma buffer's capacity in shared memory (GpuIntraRec.cpp's CCCM_LUMA_MAX)
@@ -92,10 +93,14 @@ int  g_cccmRefX, g_cccmRefY, g_cccmAreaW, g_cccmAreaH, g_cccmSizeX, g_cccmSizeY,
 bool g_cccmSharedLuma;   // the luma buffer is in shared memory (else in the workgroup's scratch)
 bool g_cccmGl;           // GL-CCCM: the model's features are gradients and positions
 int  g_cccmMdf;          // CCCM with several downsampling filters (cccmMultiFilterIdx 1 .. 3; 0: one filter)
+bool g_cccmNoSub;        // CCCM without subsampling (cccmNoSubFlag): the luma buffer holds the luma itself
+int  g_cccmShift;        // log2 of the luma buffer's samples per chroma sample and direction (1 without subsampling)
 int  g_cccmParams;       // the model's parameters
 int  g_cccmSet;          // the set of models that predicts (LBCCP's choice; 0 without it)
 
-int cccmBufferSize() { return ( g_cccmAreaW + 2 ) * ( g_cccmAreaH + 2 ); }   // a luma buffer's samples
+// a luma buffer's row and its samples: the area padded by a chroma sample all around, in the buffer's units
+int cccmBufferW() { return ( g_cccmAreaW + 2 ) << g_cccmShift; }
+int cccmBufferSize() { return cccmBufferW() * ( ( g_cccmAreaH + 2 ) << g_cccmShift ); }
 
 // the luma buffers of several downsampling filters (xGetLumaRecPixels' calls in DecCu): mode 1 filters 0 to 3, mode
 // 2 filters 0 and 1, mode 3 filters 0 and 3; buffer b holds filter cccmFilterOf( b )
@@ -154,13 +159,20 @@ void cccmLoadArea()
   g_cccmSharedLuma = g_cccmMdf == 0 && cccmBufferSize() <= CCCM_LUMA_MAX;
 }
 
-// sample (x, y) of luma buffer b, -1 <= x <= areaW and -1 <= y <= areaH of the reference area, at index
-// (y + 1) * (areaW + 2) + x + 1; one buffer in shared memory spread over the four angular arrays (index % 4 the array,
-// index / 4 the entry) so that the used part is a prefix of each (the block clears it again: intra_rec's angClear),
-// several or a larger one one after the other in the workgroup's scratch (the host allocates it for such blocks)
+// sample (x, y) of luma buffer b in the buffer's units, -pad <= x < areaW + pad and -pad <= y < areaH + pad of the
+// reference area in them (pad: a chroma sample, 1 << g_cccmShift), at index (y + pad) * cccmBufferW() + x + pad; one
+// buffer in shared memory spread over the four angular arrays (index % 4 the array, index / 4 the entry) so that the
+// used part is a prefix of each (the block clears it again: intra_rec's angClear), several or a larger one one after
+// the other in the workgroup's scratch (the host allocates it for such blocks)
+int cccmLumaIndex( int x, int y )
+{
+  const int pad = 1 << g_cccmShift;
+  return ( y + pad ) * cccmBufferW() + x + pad;
+}
+
 int cccmLumaOf( int b, int x, int y )
 {
-  const int i = ( y + 1 ) * ( g_cccmAreaW + 2 ) + x + 1, a = i & 3, j = i >> 2;
+  const int i = cccmLumaIndex( x, y ), a = i & 3, j = i >> 2;
   if( !g_cccmSharedLuma )
   {
     return CBufI32( P.scratch ).v[cccmScratchBase() + b * cccmBufferSize() + i];
@@ -170,9 +182,13 @@ int cccmLumaOf( int b, int x, int y )
 
 int cccmLuma( int x, int y ) { return cccmLumaOf( 0, x, y ); }
 
+// the luma of chroma position (x, y) of the reference area: its downsampled sample, without subsampling the luma
+// sample at (2x, 2y)
+int cccmColocated( int x, int y ) { return cccmLumaOf( 0, x << g_cccmShift, y << g_cccmShift ); }
+
 void cccmSetLuma( int b, int x, int y, int v )
 {
-  const int i = ( y + 1 ) * ( g_cccmAreaW + 2 ) + x + 1, a = i & 3, j = i >> 2;
+  const int i = cccmLumaIndex( x, y ), a = i & 3, j = i >> 2;
   if( !g_cccmSharedLuma )
   {
     CBufI32( P.scratch ).v[cccmScratchBase() + b * cccmBufferSize() + i] = v;
@@ -239,93 +255,115 @@ int cccmDownsample( int cx, int cy, int fi )
   return ( fi == 0 ? v : max( v, 0 ) ) - g_cccmLumaOffset;
 }
 
-// the downsampled luma of filter `fi` at position (x, y) of the reference area, its picture position clamped to the
-// picture
+// the luma buffer's sample of filter `fi` at picture position (px, py) in the buffer's units: the downsampled luma,
+// without subsampling the luma sample itself minus the luma offset (xCccmGetLumaVal's)
+int cccmLumaSample( int px, int py, int fi )
+{
+  return g_cccmNoSub ? recoAt( 0, px, py ) - g_cccmLumaOffset : cccmDownsample( px, py, fi );
+}
+
+// the picture's last column and row in the luma buffer's units
+ivec2 cccmPictureMax()
+{
+  const int comp = g_cccmNoSub ? 0 : 1;
+  return ivec2( P.width[comp] - 1, P.height[comp] - 1 );
+}
+
+// the luma buffer's sample of filter `fi` at position (x, y) of the reference area in the buffer's units, its picture
+// position clamped to the picture
 int cccmFetch( int x, int y, int fi )
 {
-  return cccmDownsample( clamp( g_cccmRefX + x, 0, P.width[1] - 1 ), clamp( g_cccmRefY + y, 0, P.height[1] - 1 ),
-                         fi );
+  const ivec2 maxPos = cccmPictureMax();
+  return cccmLumaSample( clamp( ( g_cccmRefX << g_cccmShift ) + x, 0, maxPos.x ),
+                         clamp( ( g_cccmRefY << g_cccmShift ) + y, 0, maxPos.y ), fi );
 }
 
 // xCccmCreateLumaRef into luma buffer b (all invocations, ending with a barrier), step by step in its order (a later
-// step overwrites an earlier one's samples): the area with a sample more above and left, but not right of or below
-// the block; the padding right of the area's three parts (the part above, the block, the part left) by their last
-// column, then below them (the part left, the block, the part right of the block) by their last row, which reads the
-// padding right of them; in a dual tree, where the luma right of / below a part lies in its CTU and the picture (the
-// sample column right of the part left and the row below the part right of the block need only the picture), the
-// downsampled luma there over the padding, right of the parts first
+// step overwrites an earlier one's samples), without subsampling xCccmCreateLumaNoSubRef's, the same in luma units
+// (each padding a chroma sample, two luma samples, wide): the area with the padding above and left, but not right of or
+// below the block; the padding right of the area's three parts (the part above, the block, the part left) by their
+// last column, then below them (the part left, the block, the part right of the block) by their last row, which reads
+// the padding right of them; in a dual tree, where the luma right of / below a part lies in its CTU and the picture
+// (the column right of the part left and the row below the part right of the block need only the picture), the luma
+// there over the padding (every padding column / row the one next to the part), right of the parts first. The CTU
+// checks take the chroma CTU size also for luma positions, as the CPU does
 void cccmBuildLuma( Tu t, int b, int lid, int NT )
 {
-  const int W = g_cccmAreaW, H = g_cccmAreaH, sx = g_cccmSizeX, sy = g_cccmSizeY, f = cccmFilterOf( b );
-  const int bx = sx + t.w, by = sy + t.h;   // puBorderX / puBorderY
-  for( int i = lid; i < ( W + 1 ) * ( H + 1 ); i += NT )
+  const int s = g_cccmShift, pad = 1 << s, f = cccmFilterOf( b );
+  const int W = g_cccmAreaW << s, H = g_cccmAreaH << s, sx = g_cccmSizeX << s, sy = g_cccmSizeY << s;
+  const int bx = sx + ( t.w << s ), by = sy + ( t.h << s );   // puBorderX / puBorderY
+  for( int i = lid; i < ( W + pad ) * ( H + pad ); i += NT )
   {
-    const int x = i % ( W + 1 ) - 1, y = i / ( W + 1 ) - 1;
+    const int x = i % ( W + pad ) - pad, y = i / ( W + pad ) - pad;
     if( !( ( x >= bx && y >= sy ) || ( y >= by && x >= sx ) ) )
     {
       cccmSetLuma( b, x, y, cccmFetch( x, y, f ) );
     }
   }
   cccmSync();
-  for( int y = lid - 1; y < H; y += NT )
+  for( int i = lid; i < pad * ( H + pad ); i += NT )   // (row y's padding column i % pad)
   {
-    const int x = y < sy ? W : y < by ? bx : sx;
-    cccmSetLuma( b, x, y, cccmLumaOf( b, x - 1, y ) );
+    const int y = ( i >> s ) - pad, x = y < sy ? W : y < by ? bx : sx;
+    cccmSetLuma( b, x + ( i & ( pad - 1 ) ), y, cccmLumaOf( b, x - 1, y ) );
   }
   cccmSync();
-  // (below the part left and below the block meet at column sx, the same sample where the area ends with the block)
-  for( int x = lid - 1; x <= W; x += NT )
+  // (column x's padding row i % pad; below the part left and below the block meet at the columns sx .. sx + pad - 1,
+  // the same samples where the area ends with the block)
+  for( int i = lid; i < pad * ( W + 2 * pad ); i += NT )
   {
-    if( x < sx || ( x == sx && H != by ) )
+    const int x = ( i >> s ) - pad, r = i & ( pad - 1 );
+    if( x < sx || ( x < sx + pad && H != by ) )
     {
-      cccmSetLuma( b, x, H, cccmLumaOf( b, x, H - 1 ) );
+      cccmSetLuma( b, x, H + r, cccmLumaOf( b, x, H - 1 ) );
     }
-    if( x >= sx && x <= bx )
+    if( x >= sx && x < bx + pad )
     {
-      cccmSetLuma( b, x, by, cccmLumaOf( b, x, by - 1 ) );
+      cccmSetLuma( b, x, by + r, cccmLumaOf( b, x, by - 1 ) );
     }
-    if( x > bx )
+    if( x >= bx + pad )
     {
-      cccmSetLuma( b, x, sy, cccmLumaOf( b, x, sy - 1 ) );
+      cccmSetLuma( b, x, sy + r, cccmLumaOf( b, x, sy - 1 ) );
     }
   }
   if( P.dualTree != 0 )
   {
     cccmSync();
-    const int ctu = P.ctuSize >> 1, maxX = P.width[1] - 1, maxY = P.height[1] - 1;
-    const int rightOfAbove = g_cccmRefX + W, rightOfBlock = g_cccmRefX + bx, rightOfLeft = g_cccmRefX + sx;
-    const bool fetchAbove = rightOfAbove <= maxX && rightOfAbove % ctu != 0;
-    const bool fetchBlock = rightOfBlock <= maxX && rightOfBlock % ctu != 0;
-    const bool fetchLeft  = rightOfLeft <= maxX;
-    for( int y = lid - 1; y < H; y += NT )
+    const ivec2 maxPos = cccmPictureMax();
+    const int   ctu = P.ctuSize >> 1, refX = g_cccmRefX << s, refY = g_cccmRefY << s;
+    const int   rightOfAbove = refX + W, rightOfBlock = refX + bx, rightOfLeft = refX + sx;
+    const bool  fetchAbove = rightOfAbove <= maxPos.x && rightOfAbove % ctu != 0;
+    const bool  fetchBlock = rightOfBlock <= maxPos.x && rightOfBlock % ctu != 0;
+    const bool  fetchLeft  = rightOfLeft <= maxPos.x;
+    for( int i = lid; i < pad * ( H + pad ); i += NT )
     {
+      const int  y     = ( i >> s ) - pad;
       const int  px    = y < sy ? rightOfAbove : y < by ? rightOfBlock : rightOfLeft;
       const bool fetch = y < sy ? fetchAbove : y < by ? fetchBlock : fetchLeft;
       if( fetch )
       {
-        cccmSetLuma( b, px - g_cccmRefX, y, cccmDownsample( px, clamp( g_cccmRefY + y, 0, maxY ), f ) );
+        cccmSetLuma( b, px - refX + ( i & ( pad - 1 ) ), y, cccmLumaSample( px, clamp( refY + y, 0, maxPos.y ), f ) );
       }
     }
     cccmSync();
-    const int belowLeft = g_cccmRefY + H, belowBlock = g_cccmRefY + by, belowRight = g_cccmRefY + sy;
-    const bool fetchBelowLeft  = belowLeft <= maxY && belowLeft % ctu != 0;
-    const bool fetchBelowBlock = belowBlock <= maxY && belowBlock % ctu != 0;
-    const bool fetchBelowRight = belowRight <= maxY;
+    const int  belowLeft = refY + H, belowBlock = refY + by, belowRight = refY + sy;
+    const bool fetchBelowLeft  = belowLeft <= maxPos.y && belowLeft % ctu != 0;
+    const bool fetchBelowBlock = belowBlock <= maxPos.y && belowBlock % ctu != 0;
+    const bool fetchBelowRight = belowRight <= maxPos.y;
     const int  lastX = min( ctu - t.x % ctu + sx, W );   // the part right of the block up to the CTU's right edge
-    for( int x = lid - 1; x <= W; x += NT )
+    for( int i = lid; i < pad * ( W + 2 * pad ); i += NT )
     {
-      const int px = clamp( g_cccmRefX + x, 0, maxX );
-      if( fetchBelowLeft && ( x < sx || ( x == sx && H != by ) ) )
+      const int x = ( i >> s ) - pad, r = i & ( pad - 1 ), px = clamp( refX + x, 0, maxPos.x );
+      if( fetchBelowLeft && ( x < sx || ( x < sx + pad && H != by ) ) )
       {
-        cccmSetLuma( b, x, H, cccmDownsample( px, belowLeft, f ) );
+        cccmSetLuma( b, x, H + r, cccmLumaSample( px, belowLeft, f ) );
       }
       if( fetchBelowBlock && x >= sx && x < bx )
       {
-        cccmSetLuma( b, x, by, cccmDownsample( px, belowBlock, f ) );
+        cccmSetLuma( b, x, by + r, cccmLumaSample( px, belowBlock, f ) );
       }
       if( fetchBelowRight && x > bx && x < lastX )
       {
-        cccmSetLuma( b, x, sy, cccmDownsample( px, belowRight, f ) );
+        cccmSetLuma( b, x, sy + r, cccmLumaSample( px, belowRight, f ) );
       }
     }
   }
@@ -401,6 +439,28 @@ int cccmEntryIndex( int i, int j, int M )
 
 int cccmNonlinear( int v, int bitDepth ) { return ( v * v + ( 1 << ( bitDepth - 1 ) ) ) >> bitDepth; }
 
+// CCCM without subsampling (xCccmCalcModels' / ApplyModel's vectors by chromaloctype): per chroma location type
+// (Params::cclmFilter) the luma taps around the co-located luma sample - the averaging type's 2 x 2 samples, the
+// cross's sample with its left, right, lower and upper neighbours, the 6-tap filter's two rows of three - whose samples
+// are the first features, the nonlinear terms of the same taps the next (the 6-tap filter's of four: the sample, the
+// one below, right, left); 9 parameters with the averaging type, else 11
+const int   CCCM_NOSUB_LINEAR[3] = int[3]( 4, 5, 6 );   // the taps whose samples are features, per CCLM_FILTER_*
+const ivec2 CCCM_NOSUB_TAPS[30]  = ivec2[30](
+  ivec2( 0, 0 ), ivec2( 1, 0 ), ivec2( 0, 1 ), ivec2( 1, 1 ), ivec2( 0, 0 ),          // CCLM_FILTER_AVERAGE
+  ivec2( 1, 0 ), ivec2( 0, 1 ), ivec2( 1, 1 ), ivec2( 0, 0 ), ivec2( 0, 0 ),
+  ivec2( 0, 0 ), ivec2( -1, 0 ), ivec2( 1, 0 ), ivec2( 0, 1 ), ivec2( 0, -1 ),        // CCLM_FILTER_CROSS
+  ivec2( 0, 0 ), ivec2( -1, 0 ), ivec2( 1, 0 ), ivec2( 0, 1 ), ivec2( 0, -1 ),
+  ivec2( 0, 0 ), ivec2( -1, 0 ), ivec2( 1, 0 ), ivec2( 0, 1 ), ivec2( -1, 1 ),        // CCLM_FILTER_6TAP
+  ivec2( 1, 1 ), ivec2( 0, 0 ), ivec2( 0, 1 ), ivec2( 1, 0 ), ivec2( -1, 0 ) );
+
+// feature f (f < the bias) of chroma position (x, y) of the reference area without subsampling
+int cccmNoSubFeature( int f, int x, int y, int bitDepth )
+{
+  const ivec2 d = CCCM_NOSUB_TAPS[P.cclmFilter * 10 + f];
+  const int   v = cccmLuma( ( x << 1 ) + d.x, ( y << 1 ) + d.y );
+  return f < CCCM_NOSUB_LINEAR[P.cclmFilter] ? v : cccmNonlinear( v, bitDepth );
+}
+
 // feature f of the sample at (x, y) of the reference area (c: its luma in buffer 0) - xCccmCalcModels' / ApplyModel's
 // vectors, the bias last, then the template's chroma (Cb, Cr):
 // - plain: the sample, the ones above, below, left and right of it, its nonlinear term (CccmModel::nonlinear), the bias
@@ -412,6 +472,8 @@ int cccmNonlinear( int v, int bitDepth ) { return ( v * v + ( 1 << ( bitDepth - 
 //   the column, the bias; mode 2: the sample, its left and right neighbours of filter 0 and of filter 1, the nonlinear
 //   terms of filter 0's three, the column, the bias; mode 3 as mode 2 with the neighbours above-right and below-left,
 //   filter 3, the row
+// - without subsampling: the luma taps around the co-located luma sample (cccmNoSubFeature), their nonlinear terms,
+//   the bias
 // Each below 2^15 in magnitude up to 10 bits (the nonlinear terms of the filters' gradients the largest): their
 // products fit 32 bits
 int cccmFeature( int f, int x, int y, int c, int bitDepth )
@@ -424,6 +486,10 @@ int cccmFeature( int f, int x, int y, int c, int bitDepth )
   if( f == M - 1 )
   {
     return 1 << ( bitDepth - 1 );
+  }
+  if( g_cccmNoSub )
+  {
+    return cccmNoSubFeature( f, x, y, bitDepth );
   }
   if( g_cccmMdf == 1 )
   {
@@ -494,7 +560,7 @@ void cccmAccumulate( Tu t, int k, bool twoModels, int lid, int NT )
     for( int s = lane; s < counts.x + counts.y; s += lanes )
     {
       const ivec2 p = cccmTemplateSample( r, counts, s );
-      const int   c = cccmLuma( p.x, p.y );
+      const int   c = cccmColocated( p.x, p.y );
       if( twoModels && ( cls == 0 ? c > thr : c <= thr ) )
       {
         continue;
@@ -682,7 +748,7 @@ void cccmSolve( Tu t, int k, int lid )
 // Pel (CccmModel::convolve), clipped to the model's range
 int cccmPredict( int set, int c, int x, int y, bool twoModels, int bitDepth )
 {
-  const int lc = cccmLuma( x, y );
+  const int lc = cccmColocated( x, y );
   const int k  = 2 * set + ( twoModels && lc > s_cclm[CCCM_THRESHOLD + set] ? 1 : 0 );
   int64_t sum = 0;
   for( int p = 0; p < g_cccmParams; p++ )   // (a run-time bound: the compiler keeps the loop, cccmFeature once)
@@ -752,9 +818,10 @@ void cccmCosts( Tu t, bool twoModels, int lid, int NT )
 
 // the prediction of CCCM block t into s_tmp, a larger block's into the scratch (rows of t.w; all invocations, ending
 // with a barrier; cccmBlockPrediction reads it): the reference area, the luma buffer(s), with two models the
-// thresholds (set 0: xCccmCalcRefAver's mean of the template's luma, the mid level without one; LBCCP's set 1: the
-// block's mean luma), the models, with LBCCP (plain CCCM only: not GL-CCCM nor several filters) the set of the lower
-// template cost (the second only when strictly lower)
+// thresholds (set 0: xCccmCalcRefAver's mean of the template's luma - without subsampling of all its luma samples,
+// four per chroma sample -, the mid level without one; LBCCP's set 1: the block's mean luma), the models, with LBCCP
+// (plain CCCM only: not GL-CCCM, several filters nor without subsampling) the set of the lower template cost (the
+// second only when strictly lower)
 void cccmPrediction( Tu t, int lid, int NT )
 {
   if( lid == 0 )
@@ -764,7 +831,10 @@ void cccmPrediction( Tu t, int lid, int NT )
   }
   g_cccmGl     = ( t.lm & LM_CCCM_GL ) != 0;
   g_cccmMdf    = ( t.lm >> LM_CCCM_MDF_SHIFT ) & 3;
-  g_cccmParams = g_cccmMdf == 0 ? 7 : g_cccmMdf == 1 ? 10 : 11;
+  g_cccmNoSub  = ( t.lm & LM_CCCM_NOSUB ) != 0;
+  g_cccmShift  = g_cccmNoSub ? 1 : 0;
+  g_cccmParams = g_cccmNoSub ? ( P.cclmFilter == CCLM_FILTER_AVERAGE ? 9 : 11 )
+               : g_cccmMdf == 0 ? 7 : g_cccmMdf == 1 ? 10 : 11;
   SYNC();
   cccmLoadArea();
   for( int b = 0; b < cccmNumBuffers(); b++ )
@@ -772,18 +842,21 @@ void cccmPrediction( Tu t, int lid, int NT )
     cccmBuildLuma( t, b, lid, NT );
   }
   const int  W = t.w, H = t.h, bitDepth = t.bitDepth;
-  const bool twoModels = cclmMultiModel( t.dirMode ), lbccp = P.cccmLbccp != 0 && !g_cccmGl && g_cccmMdf == 0;
+  const bool twoModels = cclmMultiModel( t.dirMode );
+  const bool lbccp     = P.cccmLbccp != 0 && !g_cccmGl && g_cccmMdf == 0 && !g_cccmNoSub;
   if( twoModels )
   {
     const ivec4 r = cccmTemplate( cccmTemplateFlag( t ), false );
     const ivec2 counts = cccmTemplateCounts( r );
+    const int   s = g_cccmShift, perSample = 1 << ( 2 * s );   // the luma samples of a chroma sample
     int sum = 0;
-    for( int s = lid; s < counts.x + counts.y; s += NT )
+    for( int i = lid; i < ( counts.x + counts.y ) * perSample; i += NT )
     {
-      const ivec2 p = cccmTemplateSample( r, counts, s );
-      sum += cccmLuma( p.x, p.y );
+      const ivec2 p = cccmTemplateSample( r, counts, i >> ( 2 * s ) );
+      const int   q = i & ( perSample - 1 );
+      sum += cccmLuma( ( p.x << s ) + ( q & 1 ), ( p.y << s ) + ( q >> 1 ) );
     }
-    const int num = counts.x + counts.y, total = wgSum2( sum, 0, 2 ).x;
+    const int num = ( counts.x + counts.y ) * perSample, total = wgSum2( sum, 0, 2 ).x;
     if( lid == 0 )
     {
       s_cclm[CCCM_THRESHOLD] = num == 0 ? 1 << ( bitDepth - 1 ) : cccmDivideLowPrec( total, num );

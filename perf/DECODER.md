@@ -415,7 +415,8 @@ the reconstruction buffer; works in every frame-thread context):
   to 6 lines around it by least squares - one model or two, and with LBCCP a second set competing by the template's
   SATD - and applies it. M35 is GL-CCCM: the model takes luma gradients and the sample's position instead of its
   neighbours (with 64-bit sums). M36 is CCCM with several downsampling filters: models of 10 or 11 parameters over
-  the luma of two or four filters.
+  the luma of two or four filters. M37 is CCCM without subsampling: models of 9 or 11 parameters over the luma
+  samples around the chroma sample's co-located one.
   GpuIntraRec::supported()
   rejects every tool whose mode derivation or prediction reads reconstructed samples or that the kernels lack, before
   anything is skipped. All 19 regular streams now fall back to the CPU at cross-component prediction (CCP merge,

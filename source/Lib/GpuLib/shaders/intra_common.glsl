@@ -84,7 +84,8 @@ const int MMLM_T_IDX      = LM_CHROMA_IDX + 5;
 // With GLM (JVET-AA0126) the gradient pattern of the block (glmIdc 1 .. NUM_GLM_PATTERN, 0: none) and the other's.
 // A CCCM block (JVET-AA0057, intra_cccm.glsl; no slope adjustments, GLM, LFNST / NSPT) has its template selection
 // (cccmFlag: 1 above and left, 2 left, 3 above; 0: not CCCM) and its kind in the other component's field: GL-CCCM's
-// gradients and locations (JVET-AC0054), several downsampling filters (JVET-AD0202's cccmMultiFilterIdx 1 .. 3)
+// gradients and locations (JVET-AC0054), several downsampling filters (JVET-AD0202's cccmMultiFilterIdx 1 .. 3), no
+// subsampling (JVET-AC0147's cccmNoSubFlag)
 const int LM_DELTA0_SHIFT = 0;
 const int LM_DELTA1_SHIFT = 4;
 const int LM_INSIDE       = 256;
@@ -97,6 +98,7 @@ const int LM_OTHER_GLM_SHIFT = 24;
 const int LM_CCCM_SHIFT   = 28;   // 2 bits
 const int LM_CCCM_GL      = 4096;
 const int LM_CCCM_MDF_SHIFT = 13;   // 2 bits
+const int LM_CCCM_NOSUB   = 32768;
 
 // Tu::derive
 const int DERIVE_NODE     = 32;  // not a block: the derivation of the mode of CU Tu::cu, before the CU's blocks
