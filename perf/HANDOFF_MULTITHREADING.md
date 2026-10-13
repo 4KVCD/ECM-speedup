@@ -207,6 +207,15 @@ Commits on `enc-mt`, all bit-exact with stock ECM-20.0 (bitstream md5 of the sui
   coding order; only the pictures that wait are reordered (more of them in a long sequence). 20 processes of
   `--ParallelSegments` take 16.8 s: they keep 17-19 cores busy to 80 % of the run, the frame threads 17-18 cores to
   50 % and fewer after (`C:\Code\work\mt\cpu_trace.py`). RA and LD keep coding order.
+- Speed step S2: `--FrameThreads=0`, now the default, picks the number of frame threads (`EncAppCfg::
+  xAutomaticFrameThreads`): the logical processors of the encoder's affinity (`ProcessorCount.cpp`), at most one per
+  coded picture, fewer if 70 % of the physical memory does not hold them with one period
+  (`xFrameThreadsMemoryBytes`, the figures of the automatic FramePeriods); 1 for low delay in one period and for the
+  coding tools frame threads do not support (`xFrameThreadsUnsupported`; FrameThreads > 1 is an error there as
+  before). `--ParallelSegments` workers get `--FrameThreads=1` unless FrameThreads is given. No options, unpinned on
+  the 265K (20 threads chosen): AI 33 pictures 201.2 -> 23.1 s (8.7x), RA 65 frames 540.0 -> 202.7 s (2.66x; two
+  periods, chain-bound: 2.8 busy cores), RA 513 frames 327.8 s (8 threads on the 8 P-cores took 612.3 s). `bench.py`
+  pins before the encoder starts, so a pinned run picks one thread.
 - Tried and dropped (RAM): freeing the original and the per-4x4 arrays of a finished picture that waits only for its
   output and is no reference (`C:\Code\work\mt\ram\w_dropped.diff`). In the first minutes at 1080p with 8 threads
   and 8 periods the list holds about 280 waiting pictures, 9 being searched and at most 13 finished ones, all still

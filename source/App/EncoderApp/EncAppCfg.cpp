@@ -36,6 +36,7 @@
 */
 
 #include "EncAppCfg.h"
+#include "ProcessorCount.h"
 #include "SystemMemory.h"
 
 #include <algorithm>
@@ -1992,7 +1993,7 @@ bool EncAppCfg::parseCfg( int argc, char* argv[] )
   ("ForceSingleSplitThread",                          m_forceSplitSequential,                   false, "Force single thread execution even if taking the parallelized path")
   ("NumWppThreads",                                   m_numWppThreads,                              1, "Number of threads used to run WPP-style parallelization")
   ("SearchStacks",                                    m_searchStackCount,                           1, "Check of the multithreading infrastructure: number of mode-search stacks, which the pictures use in turn (one thread; the output does not change)")
-  ("FrameThreads",                                    m_frameThreads,                               1, "Number of pictures of a GOP encoded at the same time (threads); the output does not change")
+  ("FrameThreads",                                    m_frameThreads,                               0, "Number of pictures encoded at the same time (threads); 0: automatic, the processors the encoder may run on as far as the coding structure gains from them, the memory holds them and the coding tools allow; the output does not change")
   ("FramePeriods",                                    m_framePeriods,                               0, "FrameThreads: number of intra periods whose loop filters and slice writing run at the same time, each with its own filter encoders; 0: automatic; the output does not change")
   ("CuThreads",                                       m_cuThreads,                                  1, "Number of threads that search the candidates of a picture's CUs; the output does not change")
   ("CuThreadsCheck",                                  m_cuThreadsCheck,                         false, "Check of CuThreads: also evaluates the helpers' candidates serially and stops at the first difference")
@@ -3874,6 +3875,75 @@ int EncAppCfg::xAutoDetermineProfile()
   return 0;
 }
 
+const char* EncAppCfg::xFrameThreadsUnsupported() const
+{
+  // frame threads keep every picture's state apart; these tools share state between pictures in other ways
+  if( m_RCEnableRateControl ) return "rate control";
+  if( m_isField ) return "field coding";
+  if( m_compositeRefEnabled ) return "the composite reference";
+  if( m_HashME ) return "hash motion estimation";
+  if( m_bUsePerceptQPA ) return "PerceptQPA";
+  if( m_uiDeltaQpRD > 0 ) return "DeltaQpRD";
+  if( m_subPicInfoPresentFlag ) return "subpictures";
+  if( m_resChangeInClvsEnabled || m_scalingRatioHor != 1.0 || m_scalingRatioVer != 1.0 ) return "reference picture resampling";
+  if( !m_decodeBitstreams[0].empty() || !m_decodeBitstreams[1].empty() ) return "DecodeBitstream";
+  if( m_maxLayers > 1 ) return "more than one layer";
+#if JVET_Z0118_GDR
+  if( m_gdrEnabled ) return "GDR";
+#endif
+#if JVET_Y0240_BIM
+  if( m_bimEnabled ) return "BIM";
+#endif
+#if NN_LF_UNIFIED
+  if( m_nnlfUnified ) return "the NN loop filter";
+#endif
+  return nullptr;
+}
+
+double EncAppCfg::xFrameThreadsMemoryBytes( int threads, int periods ) const
+{
+  // Measured at 1080p (perf/OPTIMIZATIONS.md), with some margin on each figure: a search stack commits about 0.6 GB, a
+  // picture that waits for its search about 4 bytes per luma sample, an idle finish context about 63; up to
+  // max(N, GOPSize) pictures per period are in flight, and about GOPSize + 2N more (references, pictures being
+  // searched) about 70 bytes per sample.
+#if JVET_AA0146_WRAP_AROUND_FIX
+  const double samples   = double( m_sourceWidth ) * double( m_sourceHeight );
+#else
+  const double samples   = double( m_iSourceWidth ) * double( m_iSourceHeight );
+#endif
+  const double perPeriod = std::max( threads, m_iGOPSize ) * 6.0 * samples + 80.0 * samples;
+  return threads * 0.7e9 + ( m_iGOPSize + 2 * threads ) * 70.0 * samples + periods * perPeriod;
+}
+
+int EncAppCfg::xAutomaticFrameThreads() const
+{
+  if( xFrameThreadsUnsupported() )
+  {
+    return 1;
+  }
+  // Low delay (coding order = output order) in one intra period: each picture reads the one before, so one picture
+  // searches at a time (LD 13 frames: 113.7 s with one thread, 114.3 s with 4); the other threads would only take
+  // memory.
+  bool reorders = false;
+  for( int i = 1; i < m_iGOPSize; i++ )
+  {
+    reorders |= m_GOPList[i].m_POC < m_GOPList[i - 1].m_POC;
+  }
+  const bool onePeriod = m_iIntraPeriod <= 0 || m_framesToBeEncoded <= m_iIntraPeriod;
+  if( m_iIntraPeriod != 1 && !reorders && onePeriod )
+  {
+    return 1;
+  }
+  // a thread per processor, at most one per picture, as far as 70 % of the physical memory holds them with one period
+  int threads = std::min( { getAvailableProcessorCount(), std::max( m_framesToBeEncoded, 1 ), 64 } );
+  const uint64_t memory = getPhysicalMemoryBytes();
+  while( memory > 0 && threads > 1 && xFrameThreadsMemoryBytes( threads, 1 ) > 0.7 * double( memory ) )
+  {
+    threads--;
+  }
+  return threads;
+}
+
 bool EncAppCfg::xCheckParameter()
 {
   msg( NOTICE, "\n" );
@@ -3943,30 +4013,16 @@ bool EncAppCfg::xCheckParameter()
 
   xConfirmPara( m_numWppThreads != 1, "ENABLE_WPP_PARALLELISM is disabled, numWppThreads has to be 1" );
   xConfirmPara( m_searchStackCount < 1 || m_searchStackCount > 64, "SearchStacks must be in the range 1..64" );
-  xConfirmPara( m_frameThreads < 1 || m_frameThreads > 64, "FrameThreads must be in the range 1..64" );
+  xConfirmPara( m_frameThreads < 0 || m_frameThreads > 64, "FrameThreads must be in the range 0..64" );
   xConfirmPara( m_cuThreads < 1 || m_cuThreads > 64, "CuThreads must be in the range 1..64" );
-  if( m_frameThreads > 1 )
+  if( m_frameThreads == 0 )
   {
-    // frame threads keep every picture's state apart; these tools share state between pictures in other ways
-    xConfirmPara( m_RCEnableRateControl, "FrameThreads does not support rate control" );
-    xConfirmPara( m_isField, "FrameThreads does not support field coding" );
-    xConfirmPara( m_compositeRefEnabled, "FrameThreads does not support the composite reference" );
-    xConfirmPara( m_HashME, "FrameThreads does not support hash motion estimation" );
-    xConfirmPara( m_bUsePerceptQPA, "FrameThreads does not support PerceptQPA" );
-    xConfirmPara( m_uiDeltaQpRD > 0, "FrameThreads does not support DeltaQpRD" );
-    xConfirmPara( m_subPicInfoPresentFlag, "FrameThreads does not support subpictures" );
-    xConfirmPara( m_resChangeInClvsEnabled || m_scalingRatioHor != 1.0 || m_scalingRatioVer != 1.0, "FrameThreads does not support reference picture resampling" );
-    xConfirmPara( !m_decodeBitstreams[0].empty() || !m_decodeBitstreams[1].empty(), "FrameThreads does not support DecodeBitstream" );
-    xConfirmPara( m_maxLayers > 1, "FrameThreads supports one layer" );
-#if JVET_Z0118_GDR
-    xConfirmPara( m_gdrEnabled, "FrameThreads does not support GDR" );
-#endif
-#if JVET_Y0240_BIM
-    xConfirmPara( m_bimEnabled, "FrameThreads does not support BIM" );
-#endif
-#if NN_LF_UNIFIED
-    xConfirmPara( m_nnlfUnified, "FrameThreads does not support the NN loop filter" );
-#endif
+    m_frameThreadsAutomatic = true;
+    m_frameThreads          = xAutomaticFrameThreads();
+  }
+  if( m_frameThreads > 1 && xFrameThreadsUnsupported() )
+  {
+    xConfirmPara( true, ( std::string( "FrameThreads does not support " ) + xFrameThreadsUnsupported() ).c_str() );
   }
   // several intra periods at a time: the finishes of a period share state only with the earlier pictures of the period,
   // except through these
@@ -3987,20 +4043,11 @@ bool EncAppCfg::xCheckParameter()
     if( periodsSupported && m_iIntraPeriod > 0 )
     {
       const int numPeriods = ( m_framesToBeEncoded + m_iIntraPeriod - 1 ) / m_iIntraPeriod;   // coded frames
-      // Measured at 1080p (perf/OPTIMIZATIONS.md): a search stack commits about 0.6 GB, a picture that waits for its
-      // search about 4 bytes per luma sample, an idle finish context about 63; up to max(N, GOPSize) pictures per
-      // period are in flight, and about GOPSize + 2N more (references, pictures being searched) about 70 bytes per
-      // sample. The encoder takes at most 70 % of the physical memory, with some margin on each figure; if the memory
-      // is unknown, at most 4 periods.
-#if JVET_AA0146_WRAP_AROUND_FIX
-      const double   samples   = double( m_sourceWidth ) * double( m_sourceHeight );
-#else
-      const double   samples   = double( m_iSourceWidth ) * double( m_iSourceHeight );
-#endif
-      const double   perPeriod = std::max( m_frameThreads, m_iGOPSize ) * 6.0 * samples + 80.0 * samples;
-      const double   base      = m_frameThreads * 0.7e9 + ( m_iGOPSize + 2 * m_frameThreads ) * 70.0 * samples;
-      const uint64_t memory    = getPhysicalMemoryBytes();
-      const double   budget    = 0.7 * double( memory ) - base;
+      // the encoder takes at most 70 % of the physical memory (xFrameThreadsMemoryBytes); if the memory is unknown,
+      // at most 4 periods
+      const double   perPeriod  = xFrameThreadsMemoryBytes( m_frameThreads, 1 ) - xFrameThreadsMemoryBytes( m_frameThreads, 0 );
+      const uint64_t memory     = getPhysicalMemoryBytes();
+      const double   budget     = 0.7 * double( memory ) - xFrameThreadsMemoryBytes( m_frameThreads, 0 );
       const int      memPeriods = memory == 0 ? 4 : budget > perPeriod ? int( std::min( budget / perPeriod, 64.0 ) ) : 1;
       // all intra: pictures are independent, and 4 contexts keep 8 threads busy (AI 33 pictures with 8 threads:
       // 32.0 s with 4 periods, 32.3 s with 8)
@@ -6201,6 +6248,8 @@ void EncAppCfg::xPrintParameter()
 #if !INTRA_RM_SMALL_BLOCK_SIZE_CONSTRAINTS
   msg( VERBOSE, "FastLocalDualTree:%d ", m_fastLocalDualTreeMode );
 #endif
+  msg( VERBOSE, "FrameThreads:%d%s FramePeriods:%d ", m_frameThreads, m_frameThreadsAutomatic ? " (automatic)" : "",
+       m_framePeriods );
   msg( VERBOSE, "NumSplitThreads:%d ", m_numSplitThreads );
   if( m_numSplitThreads > 1 )
   {

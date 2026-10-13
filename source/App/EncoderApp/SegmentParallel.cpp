@@ -700,6 +700,10 @@ int runSegmentParallel( int argc, char* argv[], const SegmentParallelCfg& cfg )
       // coded frame i is input frame FrameSkip + i * TemporalSubsampleRatio; FramesToBeEncoded counts input frames
       const int tsr = cfg.temporalSubsampleRatio;
       args.push_back( "--ParallelSegments=1" );
+      if( cfg.frameThreadsAutomatic )
+      {
+        args.push_back( "--FrameThreads=1" );   // the workers share the processors
+      }
       args.push_back( "--FrameSkip=" + std::to_string( cfg.frameSkip + seg.start * tsr ) );
       args.push_back( "--FramesToBeEncoded=" + std::to_string( seg.frames * tsr ) );
       args.push_back( "--BitstreamFile=" + seg.bitstream );

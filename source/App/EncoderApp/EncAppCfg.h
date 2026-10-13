@@ -799,7 +799,8 @@ protected:
   int       m_numSplitThreads;
   bool      m_forceSplitSequential;
   int       m_searchStackCount;
-  int       m_frameThreads;
+  int       m_frameThreads;                 ///< 0 (automatic) until xCheckParameter picks the number
+  bool      m_frameThreadsAutomatic = false;   ///< FrameThreads was 0
   int       m_framePeriods;
   int       m_cuThreads;
   bool      m_cuThreadsCheck;
@@ -1309,6 +1310,9 @@ protected:
 
   // internal member functions
   bool  xCheckParameter ();                                   ///< check validity of configuration values
+  const char* xFrameThreadsUnsupported() const;               ///< a coding tool frame threads do not support
+  double xFrameThreadsMemoryBytes( int threads, int periods ) const;   ///< estimated memory of frame threads
+  int   xAutomaticFrameThreads() const;                       ///< the number of frame threads FrameThreads=0 uses
   void  xPrintParameter ();                                   ///< print configuration values
   void  xPrintUsage     ();                                   ///< print usage
   bool  xHasNonZeroTemporalID();                             ///< check presence of constant temporal ID in GOP structure
@@ -1325,6 +1329,7 @@ public:
 
   // segment-parallel encoding (see SegmentParallel.h)
   int                getParallelSegments()      const { return m_parallelSegments; }
+  bool               getFrameThreadsAutomatic() const { return m_frameThreadsAutomatic; }
   bool               getPowerThrottling()       const { return m_powerThrottling; }
   int                getSegmentLength()         const { return m_segmentLength; }
   // all-intra chunks can start at their own POC (SegmentPOCOffset) and be joined by plain concatenation

@@ -90,6 +90,14 @@ lower all-core turbo, one duplicated intra frame per chunk, unequal chunk comple
 
 ## Frame threads (`--FrameThreads=N`, `--FramePeriods=M`)
 
+- N = 0 (the default) picks N: a thread per logical processor the encoder may run on (its CPU affinity), at most one
+  per coded picture, as far as 70 % of the physical memory holds them with one period (the figures below); 1 for low
+  delay in one intra period, which gains nothing, and when a coding tool does not support frame threads (rate
+  control, field coding, the composite reference, hash motion estimation, PerceptQPA, DeltaQpRD, subpictures,
+  reference picture resampling, DecodeBitstream, more than one layer, GDR, BIM, the NN loop filter), where N > 1 is
+  an error. The workers of `--ParallelSegments` get N = 1 unless FrameThreads is given. The parameter list shows the
+  choice, e.g. `FrameThreads:20 (automatic) FramePeriods:16`.
+
 - The pictures run in threads of their own, at most N searching at a time. The setups take turns in coding order on
   a setup stack of their own; a picture takes a search stack once the pictures it reads are done, the earliest such
   picture first (in all intra, which reads no other picture, the one of the highest luma activity, as the chunks of
@@ -100,7 +108,8 @@ lower all-core turbo, one duplicated intra frame per chunk, unequal chunk comple
   up to M intra periods run at the same time, each period with its own copy of the filter encoders and APSs, while the
   log lines, access units and PSNR sums still go out in coding order. A period starts at a RAS-init intra picture
   (the CRA of each intra period in RA, every picture in AI), whose finish resets what the filter encoders carry.
-- Output identical at every N and M: bitstream, reconstruction and log (except the [ET] times).
+- Output identical at every N and M: bitstream, reconstruction and log (except the [ET] times and the two counts in
+  the parameter list).
 - M = 0 (default) uses a period per frame thread, as far as the sequence has periods and 70 % of the physical memory
   holds them by the figures below (with 8 threads: up to 1080p 8 periods on a 32 GB machine, 2160p 3 on 64 GB and 1
   on 32 GB), and min(N, 4) for all intra. It uses 1 for one long period (IntraPeriod -1, LD) and for the
