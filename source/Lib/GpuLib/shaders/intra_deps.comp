@@ -458,8 +458,13 @@ void dependencies( int comp )
     int av[7];
     refLineAvailability( ownerMap( availComp ), g_i, fx, fy, fw, fh, tAU, tLU, mrl, t.unitW, t.unitH, unitsTop, unitsLeft, av );
     t.avail[ln] = av;
-    // the owners of the samples in range (intra_rec's fill rule); consecutive samples mostly share an owner
-    int lastOwner = -2;
+    // the owners of the samples in range (intra_rec's fill rule); consecutive samples mostly share an owner. A CCLM block
+    // with LFNST / NSPT that predicts the other chroma component too (cclmTransformMode) reads that component's line
+    // at the same positions
+    const int  otherComp = 3 - comp;
+    const bool other     = ln == 0 && ( t.derive & DERIVE_CCLM_DIMD ) != 0
+                           && ( t.lm & ( comp == 1 ? LM_HIST_CR : LM_HIST_CB ) ) != 0;
+    int lastOwner = -2, lastOther = -2;
     for( int side = 0; side < 2; side++ )
     {
       for( int idx = 0; idx <= t.readMax[ln][side]; idx++ )
@@ -472,6 +477,12 @@ void dependencies( int comp )
           {
             addDep( o );
             lastOwner = o;
+          }
+          const int p = other ? ownerAt( otherComp, sx, sy ) : -2;
+          if( p != lastOther )
+          {
+            addDep( p );
+            lastOther = p;
           }
         }
       }

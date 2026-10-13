@@ -290,7 +290,7 @@ int tmrlNode( Tu t, Cu c, int dimdModes[3], int bitDepth, int lid, int NT )
     const int mrl        = TMRL_LINES[li];
     const int predStride = ( c.w << 3 ) + 1 + mrl;
     const Tu  r          = tmrlLineRecord( t, c, mrl, lid );
-    fillReferencePar( r, 0, predStride, lid, NT );
+    fillReferencePar( r, 0, 0, predStride, lid, NT );
     SYNC();
     const int dc = tmrlDc( c.w, c.h, mrl, predStride, lid, NT );
     tmrlLineCosts( c, li, mrl, predStride, dc, ( 1 << bitDepth ) - 1, lid, NT );

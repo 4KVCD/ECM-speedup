@@ -407,7 +407,8 @@ the reconstruction buffer; works in every frame-thread context):
   from the chosen line. M31 is CCLM: a chroma block in an LM mode fits ECM's least-squares model (one or, with MMLM,
   two; MDLM's longer one-sided templates) to its template's chroma samples and the downsampled luma beside the
   co-located block, adjusts the slopes by the CU's offsets, and applies the model to the downsampled co-located luma,
-  smoothed by LBCCP's filter where the CU takes it.
+  smoothed by LBCCP's filter where the CU takes it. M32 is LFNST / NSPT of CCLM blocks: their mode is a DIMD of the
+  CU's Cb and / or Cr predictions, so such a block also predicts the other chroma component before its transforms.
   GpuIntraRec::supported()
   rejects every tool whose mode derivation or prediction reads reconstructed samples or that the kernels lack, before
   anything is skipped. All 19 regular streams now fall back to the CPU at cross-component prediction, the next

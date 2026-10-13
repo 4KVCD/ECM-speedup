@@ -70,7 +70,7 @@ shared int     s_red[6];                      // workgroup sums
 shared int16_t s_bfLut[48];                   // the bilateral filter's LUT row of the block's QP
 shared int     s_mipBdry[8];                  // MIP: the reduced boundary (top, then left)
 shared int     s_mipRed[64];                  // MIP: the reduced prediction (4 x 4 or 8 x 8)
-shared int     s_mipDimdMode;                 // MIP with LFNST / NSPT: the DIMD mode of its prediction (mipDimdMode)
+shared int     s_predDimdMode;                // MIP / CCLM with LFNST / NSPT: their mode, a DIMD of the prediction(s)
 // sign prediction (signPrediction; blocks of 4 x 4 to 32 x 32, at most 8 predicted signs)
 shared int16_t s_spPred[32 * 32];             // the block's prediction, reconstructed once the signs are decided
 shared int16_t s_spBorder[64];                // TU::predBorderResi: the residual the neighbours predict along the border
@@ -274,9 +274,10 @@ int trMatrix( int type, int size )
 // pair of ECM's explicit MTS (explicitMtsTypes) and the LFNST / NSPT set, transposition and matrix of
 // getFinalIntraModeForTransform's mode (planar of a directional planar index as its direction, the wide angle of the
 // block, of the CU with ISP, in NSPT's numbering); a TIMD merge CU's block the types its chosen candidate gave on the
-// sides that take them (DERIVE_INHERIT_*). mode: the CU's mode, which MTS takes, or a MIP block's mipDimdMode (MIP has no
-// MTS with LFNST); LFNST / NSPT take a DIMD or OBIC CU's DIMD main mode instead (getFinalIntraModeForTransform's DIMD
-// branch), with MTSS the mode and NSPT bucket chosen into the CU's DimdOut. plIdx: the CU's directional planar index
+// sides that take them (DERIVE_INHERIT_*). mode: the CU's mode, which MTS takes, or a MIP / CCLM block's DIMD of its
+// prediction(s) (MIP has no MTS with LFNST, chroma no MTS); LFNST / NSPT take a DIMD or OBIC CU's DIMD main mode
+// instead (getFinalIntraModeForTransform's DIMD branch), with MTSS the mode and NSPT bucket chosen into the CU's
+// DimdOut. plIdx: the CU's directional planar index
 void selectTransform( inout Tu t, int mode, int plIdx )
 {
   BufI32     mt      = BufI32( P.matrices );
@@ -458,10 +459,10 @@ int scalePel( int val, int scale, int maxVal )
 }
 
 // the reference samples of line `line` (refSource: xFillReferenceSamples' unit availability and padding, or for ISP
-// initIntraPatternChTypeISP), all invocations, no barrier, every sample fetched by its own invocation: the samples the
-// prediction can read (the host's or intra_deps' superset; entries beyond are never read), top entries 0 ..
-// readMax[line][0] at 0, left entries 0 .. readMax[line][1] at predStride
-void fillReferencePar( Tu t, int line, int predStride, int lid, int NT )
+// initIntraPatternChTypeISP) into s_ref[dst], all invocations, no barrier, every sample fetched by its own invocation:
+// the samples the prediction can read (the host's or intra_deps' superset; entries beyond are never read), top entries
+// 0 .. readMax[line][0] at 0, left entries 0 .. readMax[line][1] at predStride
+void fillReferencePar( Tu t, int line, int dst, int predStride, int lid, int NT )
 {
   const int valueDC = 1 << ( t.bitDepth - 1 );
   const int numTop  = t.readMax[line][0] + 1;
@@ -471,7 +472,7 @@ void fillReferencePar( Tu t, int line, int predStride, int lid, int NT )
     const int  idx = top ? e : e - numTop;
     int sx, sy;
     const int v = refSource( t, line, top, idx, sx, sy ) ? recoAt( t.comp, sx, sy ) : valueDC;
-    s_ref[line][top ? idx : idx + predStride] = int16_t( v );
+    s_ref[dst][top ? idx : idx + predStride] = int16_t( v );
   }
 }
 
@@ -589,7 +590,7 @@ const int MIN_MTSS_SIZE = 128;
 // the LFNST / NSPT mode of MIP block t of W x H (DERIVE_MIP_DIMD), all invocations, s_dimdHist's first histogram zeroed
 // before, ending with a barrier: deriveIpmForTransform over the prediction (buildHistogram's 3x3 gradients at the
 // samples inside the block, subsampled from MIN_MTSS_SIZE samples on; the strongest mode, mipDimdMode, and the second
-// strongest, dimdDerivedIntraDir2nd), into s_mipDimdMode and for the comparison the CU's DimdOut; with MTSS
+// strongest, dimdDerivedIntraDir2nd), into s_predDimdMode and for the comparison the CU's DimdOut; with MTSS
 // (DERIVE_MTSS) MTSS's choice among them and the mode list of the CU's node, into the DimdOut that selectTransform reads
 void mipTransformMode( Tu t, int W, int H, int ps, int upH, int upV, int predStride, int lid, int NT )
 {
@@ -628,7 +629,7 @@ void mipTransformMode( Tu t, int W, int H, int ps, int upH, int upV, int predStr
         second    = i;
       }
     }
-    s_mipDimdMode = first;
+    s_predDimdMode = first;
     CBufI32   o    = CBufI32( P.dimdOut );
     const int base = t.cu * DIMD_OUT;
     o.v[base + DIMD_OUT_MODE]      = first;
@@ -1157,9 +1158,10 @@ void signPrediction( Tu t, int lid, int NT )
 {
   Tu c = t.spCoded == g_ti ? t : BufTu( P.tus ).v[t.spCoded];   // the block with the coefficients
   const bool inChain = WITH_DERIVED_TRANSFORMS && ( c.derive & DERIVE_TRANSFORM ) != 0;
-  if( inChain && t.spCoded != g_ti )   // the other block of a joint CbCr pair, in the same CU
+  if( inChain && t.spCoded != g_ti )   // the other block of a joint CbCr pair, in the same CU (CCLM: its DIMD, found too)
   {
-    selectTransform( c, s_mode, BufCu( P.cus ).v[c.cu].plIdx );
+    const bool cclmDimd = WITH_CCLM && ( c.derive & DERIVE_CCLM_DIMD ) != 0;
+    selectTransform( c, cclmDimd ? s_predDimdMode : s_mode, cclmDimd ? 0 : BufCu( P.cus ).v[c.cu].plIdx );
   }
   const int W = t.w, H = t.h, N = W * H, len = W + H;
   BufI32    sp   = BufI32( P.signPred );
@@ -1645,10 +1647,10 @@ void main()
     }
 
     // ----- reference samples (and the second line of intra fusion)
-    fillReferencePar( t, 0, predStride, lid, NT );
+    fillReferencePar( t, 0, 0, predStride, lid, NT );
     if( fusion )
     {
-      fillReferencePar( t, 1, predStride + 1, lid, NT );
+      fillReferencePar( t, 1, 1, predStride + 1, lid, NT );
     }
     SYNC();
     // DIMD / OBIC / intra merge blending (predIntraAng): each mode predicts from the filtered or the unfiltered
@@ -1749,14 +1751,21 @@ void main()
       }
     }
 
-    // ----- the transforms, where they depend on a derived mode or a MIP block's prediction: the matrices of the mode,
-    // and (unless the residual comes from the other block of a joint CbCr pair) without sign prediction the residual, its
-    // first stage now, its second sample by sample at the reconstruction (storeRecon); signPrediction computes all for
-    // its blocks
+    // ----- a CCLM block with LFNST / NSPT: their mode from a DIMD of the CU's chroma predictions (intra_cclm.glsl)
+    const bool cclmDimd = WITH_CCLM && WITH_DIMD && WITH_DERIVED_TRANSFORMS && ( t.derive & DERIVE_CCLM_DIMD ) != 0;
+    if( cclmDimd )
+    {
+      cclmTransformMode( t, predStride, maxPel, lid, NT );
+    }
+
+    // ----- the transforms, where they depend on a derived mode or a MIP / CCLM block's prediction: the matrices of the
+    // mode, and (unless the residual comes from the other block of a joint CbCr pair) without sign prediction the
+    // residual, its first stage now, its second sample by sample at the reconstruction (storeRecon); signPrediction
+    // computes all for its blocks
     if( WITH_DERIVED_TRANSFORMS && ( t.derive & DERIVE_TRANSFORM ) != 0 )
     {
-      const bool mipDimd = WITH_DIMD && ( t.derive & DERIVE_MIP_DIMD ) != 0;
-      selectTransform( t, mipDimd ? s_mipDimdMode : s_mode, mipDimd ? 0 : BufCu( P.cus ).v[t.cu].plIdx );
+      const bool predDimd = cclmDimd || ( WITH_DIMD && ( t.derive & DERIVE_MIP_DIMD ) != 0 );
+      selectTransform( t, predDimd ? s_predDimdMode : s_mode, predDimd ? 0 : BufCu( P.cus ).v[t.cu].plIdx );
       if( pc.verify != 0 && lid == 0 )
       {
         storeDbgTransforms( t );
@@ -1825,14 +1834,12 @@ void main()
         SYNC();
         if( lid == 0 )
         {
-          cclmModel( t, lx, ly, predStride );
+          cclmModel( t, lx, ly, predStride, 0, 0 );
         }
         SYNC();
-        const bool inside = ( t.lm & LM_INSIDE ) != 0;
         for( int i = lid; i < N; i += NT )
         {
-          const int x = i % W, y = i / W;
-          emitPred( t, x, y, inside ? cclmInsideFiltered( t, lx, ly, x, y, maxPel ) : cclmPredSample( t, lx, ly, x, y, maxPel ), false );
+          emitPred( t, i % W, i / W, cclmPrediction( t, lx, ly, i % W, i / W, maxPel, 0 ), false );
         }
       }
       else if( t.dirMode == 0 || t.dirMode == 1 )   // planar / DC, then their PDPC

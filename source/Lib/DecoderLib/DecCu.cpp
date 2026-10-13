@@ -1388,6 +1388,14 @@ void DecCu::xIntraRecBlk( TransformUnit& tu, const ComponentID compID )
 #if ECM_VULKAN
   if( m_gpuDeriveOnly )   // the GPU reconstructs the picture: the block's parameters only
   {
+#if JVET_AK0064_CCP_LFNST_NSPT
+    // a CCLM CU with LFNST / NSPT: their mode is a DIMD of its predictions (deriveChromaIpmForTransform), which the GPU
+    // derives; the host's choice of the transforms reads a placeholder in range instead of the unset mode
+    if( compID == COMPONENT_Cb && PU::isLMCMode( uiChFinalMode ) && tu.cu->lfnstIdx )
+    {
+      std::fill( std::begin( tu.cu->ccpChromaDimdMode ), std::end( tu.cu->ccpChromaDimdMode ), int8_t( PLANAR_IDX ) );
+    }
+#endif
     m_gpuIntraRec->prepareSignPred( tu, compID );   // the GPU decides the predicted signs
     m_gpuIntraRec->record( tu, compID, m_pcIntraPred->ipaSnapshot(), QpParam( tu, compID ), nullptr, nullptr );
     // as below: an ISP CU's luma is marked decoded as a whole at its first sub-partition

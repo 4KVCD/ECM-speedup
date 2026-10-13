@@ -12,15 +12,17 @@ const int CCLM_FILTER_AVERAGE = 0;   // neither flag: the mean of 2 x 2 samples
 const int CCLM_FILTER_CROSS   = 1;   // both: the 5-tap cross
 const int CCLM_FILTER_6TAP    = 2;   // one of them: 1 2 1 over two rows
 
-// the model in shared memory (invocation 0 fits it, all apply it), in MIP's arrays, which an LM block does not use:
-// the first model's a, b, shift, the second's, and the luma threshold between them
-#define s_cclm s_mipBdry
-const int CCLM_A = 0, CCLM_B = 1, CCLM_SHIFT = 2, CCLM_A2 = 3, CCLM_B2 = 4, CCLM_SHIFT2 = 5, CCLM_THRES = 6;
-// (the template's: whether all units above / left are available, the available units above-right / below-left;
-// LBCCP's: whether the positions above, left, above-left, above-right and below-left of the block are)
-#define s_cclmAvail s_mipRed
+// the availability and the models in shared memory (invocation 0 finds them, all apply them), in MIP's reduced
+// prediction, which an LM block does not use. The availability: the template's (whether all units above / left are
+// available, the available units above-right / below-left), LBCCP's (whether the positions above, left, above-left,
+// above-right and below-left of the block are). The models: per slot (0: the block's, 1: with LFNST / NSPT the other
+// component's, cclmTransformMode) at CCLM_MODEL + slot * CCLM_SLOT the first model's a, b, shift, the second's, and the
+// luma threshold between them
+#define s_cclm s_mipRed
 const int CCLM_ABOVE = 0, CCLM_LEFT = 1, CCLM_AR_UNITS = 2, CCLM_BL_UNITS = 3;
 const int CCLM_POS_ABOVE = 4, CCLM_POS_LEFT = 5, CCLM_POS_LEFT_ABOVE = 6, CCLM_POS_ABOVE_RIGHT = 7, CCLM_POS_LEFT_BELOW = 8;
+const int CCLM_MODEL = 16, CCLM_SLOT = 8;
+const int CCLM_A = 0, CCLM_B = 1, CCLM_SHIFT = 2, CCLM_A2 = 3, CCLM_B2 = 4, CCLM_SHIFT2 = 5, CCLM_THRES = 6;
 
 // the availability of block t's template units (xGetLMParametersLMS: chroma units of 2) and of LBCCP's positions
 // (isPosAvailable) into s_cclmAvail (invocation 0)
@@ -32,15 +34,15 @@ void cclmAvailability( Tu t )
   int av[7];
   refLineAvailability( om, g_ti, t.x, t.y, t.w, t.h, tAU, tLU, 0, unit, unit, tAU, tLU, av );
   const bool above = av[1] == t.w / unit, left = av[3] == t.h / unit;
-  s_cclmAvail[CCLM_ABOVE]    = above ? 1 : 0;
-  s_cclmAvail[CCLM_LEFT]     = left ? 1 : 0;
-  s_cclmAvail[CCLM_AR_UNITS] = above ? av[2] : 0;   // (none where the units above are not all available)
-  s_cclmAvail[CCLM_BL_UNITS] = left ? av[4] : 0;
-  s_cclmAvail[CCLM_POS_ABOVE]       = decodedBefore( om, t.x, t.y - 1, g_ti ) ? 1 : 0;
-  s_cclmAvail[CCLM_POS_LEFT]        = decodedBefore( om, t.x - 1, t.y, g_ti ) ? 1 : 0;
-  s_cclmAvail[CCLM_POS_LEFT_ABOVE]  = decodedBefore( om, t.x - 1, t.y - 1, g_ti ) ? 1 : 0;
-  s_cclmAvail[CCLM_POS_ABOVE_RIGHT] = decodedBefore( om, t.x + t.w, t.y - 1, g_ti ) ? 1 : 0;
-  s_cclmAvail[CCLM_POS_LEFT_BELOW]  = decodedBefore( om, t.x - 1, t.y + t.h, g_ti ) ? 1 : 0;
+  s_cclm[CCLM_ABOVE]    = above ? 1 : 0;
+  s_cclm[CCLM_LEFT]     = left ? 1 : 0;
+  s_cclm[CCLM_AR_UNITS] = above ? av[2] : 0;   // (none where the units above are not all available)
+  s_cclm[CCLM_BL_UNITS] = left ? av[4] : 0;
+  s_cclm[CCLM_POS_ABOVE]       = decodedBefore( om, t.x, t.y - 1, g_ti ) ? 1 : 0;
+  s_cclm[CCLM_POS_LEFT]        = decodedBefore( om, t.x - 1, t.y, g_ti ) ? 1 : 0;
+  s_cclm[CCLM_POS_LEFT_ABOVE]  = decodedBefore( om, t.x - 1, t.y - 1, g_ti ) ? 1 : 0;
+  s_cclm[CCLM_POS_ABOVE_RIGHT] = decodedBefore( om, t.x + t.w, t.y - 1, g_ti ) ? 1 : 0;
+  s_cclm[CCLM_POS_LEFT_BELOW]  = decodedBefore( om, t.x - 1, t.y + t.h, g_ti ) ? 1 : 0;
 }
 
 bool cclmMultiModel( int mode ) { return mode == MMLM_CHROMA_IDX || mode == MMLM_L_IDX || mode == MMLM_T_IDX; }
@@ -204,28 +206,28 @@ void cclmAdjust( inout int a, inout int b, inout int shift, int midLuma, int del
   b -= ( delta * midLuma ) >> shift;
 }
 
-// the model of CCLM block t (invocation 0) into s_cclm: the template's luma (downsampled, into s_tmp from 0) and chroma
-// samples (from its references in s_ref[0], into s_tmp from 256) as xGetLMParametersLMS picks them, fitted as one model
-// (LM_CHROMA, MDLM: the MDLM template padded to a power of two) or as two split at the luma mean (MMLM:
-// xLMSampleClassifiedTraining, each group padded to a power of two), then the slope adjustments of Tu::lm
-void cclmModel( Tu t, int lx, int ly, int predStride )
+// the model of CCLM block t (invocation 0) into slot `slot` of s_cclm: the template's luma (downsampled, into s_tmp from
+// 0) and chroma samples (from its references in s_ref[ref], into s_tmp from 256) as xGetLMParametersLMS picks them,
+// fitted as one model (LM_CHROMA, MDLM: the MDLM template padded to a power of two) or as two split at the luma mean
+// (MMLM: xLMSampleClassifiedTraining, each group padded to a power of two), then the slope adjustments of Tu::lm
+void cclmModel( Tu t, int lx, int ly, int predStride, int ref, int slot )
 {
   const int  W = t.w, H = t.h, mode = t.dirMode, bitDepth = t.bitDepth;
   const bool leftOnly = cclmLeftOnly( mode ), topOnly = cclmTopOnly( mode );
-  bool aboveAvail = s_cclmAvail[CCLM_ABOVE] != 0, leftAvail = s_cclmAvail[CCLM_LEFT] != 0;
+  bool aboveAvail = s_cclm[CCLM_ABOVE] != 0, leftAvail = s_cclm[CCLM_LEFT] != 0;
   const bool aboveAvailFill = aboveAvail, leftAvailFill = leftAvail;   // (the downsampling's padding)
   const int  unit = 2;   // baseUnitSize >> 1: the chroma units of the template's availability
   int actualTop = 0, actualLeft = 0, minDim = 1;
   if( topOnly )
   {
     leftAvail = false;
-    actualTop = aboveAvail ? unit * ( W / unit + s_cclmAvail[CCLM_AR_UNITS] ) : 0;
+    actualTop = aboveAvail ? unit * ( W / unit + s_cclm[CCLM_AR_UNITS] ) : 0;
     minDim    = actualTop;
   }
   else if( leftOnly )
   {
     aboveAvail = false;
-    actualLeft = leftAvail ? unit * ( H / unit + s_cclmAvail[CCLM_BL_UNITS] ) : 0;
+    actualLeft = leftAvail ? unit * ( H / unit + s_cclm[CCLM_BL_UNITS] ) : 0;
     minDim     = actualLeft;
   }
   else
@@ -244,7 +246,7 @@ void cclmModel( Tu t, int lx, int ly, int predStride )
     {
       const int idx = ( j * actualTop ) / minDim;
       s_tmp[j]       = int16_t( cclmLumaAbove( lx, ly, idx, leftAvailFill ) );
-      s_tmp[256 + j] = s_ref[0][1 + idx];
+      s_tmp[256 + j] = s_ref[ref][1 + idx];
       sumLuma       += int( s_tmp[j] );
     }
   }
@@ -255,7 +257,7 @@ void cclmModel( Tu t, int lx, int ly, int predStride )
     {
       const int idx = ( i * actualLeft ) / minDim;
       s_tmp[cntT + i]       = int16_t( cclmLumaLeft( lx, ly, idx, aboveAvailFill ) );
-      s_tmp[256 + cntT + i] = s_ref[0][predStride + 1 + idx];
+      s_tmp[256 + cntT + i] = s_ref[ref][predStride + 1 + idx];
       sumLuma              += int( s_tmp[cntT + i] );
     }
   }
@@ -379,71 +381,186 @@ void cclmModel( Tu t, int lx, int ly, int predStride )
   // the slope adjustments (cclmOffsets of the component), then the model into shared memory
   cclmAdjust( m1.x, m1.y, m1.z, midLuma, ( ( t.lm >> LM_DELTA0_SHIFT ) & 15 ) - 8 );
   cclmAdjust( m2.x, m2.y, m2.z, midLuma2, ( ( t.lm >> LM_DELTA1_SHIFT ) & 15 ) - 8 );
-  s_cclm[CCLM_A]  = m1.x;  s_cclm[CCLM_B]  = m1.y;  s_cclm[CCLM_SHIFT]  = m1.z;
-  s_cclm[CCLM_A2] = m2.x;  s_cclm[CCLM_B2] = m2.y;  s_cclm[CCLM_SHIFT2] = m2.z;
-  s_cclm[CCLM_THRES] = thres;
+  const int m = CCLM_MODEL + slot * CCLM_SLOT;
+  s_cclm[m + CCLM_A]  = m1.x;  s_cclm[m + CCLM_B]  = m1.y;  s_cclm[m + CCLM_SHIFT]  = m1.z;
+  s_cclm[m + CCLM_A2] = m2.x;  s_cclm[m + CCLM_B2] = m2.y;  s_cclm[m + CCLM_SHIFT2] = m2.z;
+  s_cclm[m + CCLM_THRES] = thres;
 }
 
-// ----- the prediction (predIntraChromaLM, LBCCP's filterPredInside)
+// ----- the prediction (predIntraChromaLM, LBCCP's filterPredInside); `slot`: the model's in s_cclm
 
 // the model applied to the co-located block's downsampled sample (i, j) (two models: split at the threshold)
-int cclmPredSample( Tu t, int lx, int ly, int i, int j, int maxPel )
+int cclmPredSample( Tu t, int lx, int ly, int i, int j, int maxPel, int slot )
 {
-  const int luma = cclmLumaInner( lx, ly, i, j, s_cclmAvail[CCLM_LEFT] != 0, s_cclmAvail[CCLM_ABOVE] != 0 );
-  const bool second = cclmMultiModel( t.dirMode ) && luma > s_cclm[CCLM_THRES];
-  const int  v = second ? ( ( s_cclm[CCLM_A2] * luma ) >> s_cclm[CCLM_SHIFT2] ) + s_cclm[CCLM_B2]
-                        : ( ( s_cclm[CCLM_A] * luma ) >> s_cclm[CCLM_SHIFT] ) + s_cclm[CCLM_B];
+  const int  m      = CCLM_MODEL + slot * CCLM_SLOT;
+  const int  luma   = cclmLumaInner( lx, ly, i, j, s_cclm[CCLM_LEFT] != 0, s_cclm[CCLM_ABOVE] != 0 );
+  const bool second = cclmMultiModel( t.dirMode ) && luma > s_cclm[m + CCLM_THRES];
+  const int  v = second ? ( ( s_cclm[m + CCLM_A2] * luma ) >> s_cclm[m + CCLM_SHIFT2] ) + s_cclm[m + CCLM_B2]
+                        : ( ( s_cclm[m + CCLM_A] * luma ) >> s_cclm[m + CCLM_SHIFT] ) + s_cclm[m + CCLM_B];
   return clamp( v, 0, maxPel );
 }
 
 // filterPredInside's padding above (x = 0 .. W - 1) and left (y = 0 .. H - 1) of the prediction: the reconstruction
 // where that side is available, else the prediction's first row / column
-int cclmInsideAbove( Tu t, int lx, int ly, int x, int maxPel )
+int cclmInsideAbove( Tu t, int lx, int ly, int x, int maxPel, int slot )
 {
-  return s_cclmAvail[CCLM_POS_ABOVE] != 0 ? recoAt( t.comp, t.x + x, t.y - 1 ) : cclmPredSample( t, lx, ly, x, 0, maxPel );
+  return s_cclm[CCLM_POS_ABOVE] != 0 ? recoAt( t.comp, t.x + x, t.y - 1 ) : cclmPredSample( t, lx, ly, x, 0, maxPel, slot );
 }
 
-int cclmInsideLeft( Tu t, int lx, int ly, int y, int maxPel )
+int cclmInsideLeft( Tu t, int lx, int ly, int y, int maxPel, int slot )
 {
-  return s_cclmAvail[CCLM_POS_LEFT] != 0 ? recoAt( t.comp, t.x - 1, t.y + y ) : cclmPredSample( t, lx, ly, 0, y, maxPel );
+  return s_cclm[CCLM_POS_LEFT] != 0 ? recoAt( t.comp, t.x - 1, t.y + y ) : cclmPredSample( t, lx, ly, 0, y, maxPel, slot );
 }
 
 // filterPredInside's padded prediction at (x, y), -1 <= x <= W, -1 <= y <= H: the prediction inside and, right of and
 // below it, its last column / row; above and left cclmInsideAbove / Left; the three corners the reconstruction where
 // available, else the top-left one the mean of its two neighbours, the others the padding next to them
-int cclmInsideSample( Tu t, int lx, int ly, int x, int y, int maxPel )
+int cclmInsideSample( Tu t, int lx, int ly, int x, int y, int maxPel, int slot )
 {
   const int W = t.w, H = t.h;
   if( y < 0 && x < 0 )
   {
-    return s_cclmAvail[CCLM_POS_LEFT_ABOVE] != 0 ? recoAt( t.comp, t.x - 1, t.y - 1 )
-         : ( cclmInsideAbove( t, lx, ly, 0, maxPel ) + cclmInsideLeft( t, lx, ly, 0, maxPel ) + 1 ) >> 1;
+    return s_cclm[CCLM_POS_LEFT_ABOVE] != 0 ? recoAt( t.comp, t.x - 1, t.y - 1 )
+         : ( cclmInsideAbove( t, lx, ly, 0, maxPel, slot ) + cclmInsideLeft( t, lx, ly, 0, maxPel, slot ) + 1 ) >> 1;
   }
   if( y < 0 )
   {
-    return x < W ? cclmInsideAbove( t, lx, ly, x, maxPel )
-         : s_cclmAvail[CCLM_POS_ABOVE_RIGHT] != 0 ? recoAt( t.comp, t.x + W, t.y - 1 ) : cclmInsideAbove( t, lx, ly, W - 1, maxPel );
+    return x < W ? cclmInsideAbove( t, lx, ly, x, maxPel, slot )
+         : s_cclm[CCLM_POS_ABOVE_RIGHT] != 0 ? recoAt( t.comp, t.x + W, t.y - 1 ) : cclmInsideAbove( t, lx, ly, W - 1, maxPel, slot );
   }
   if( x < 0 )
   {
-    return y < H ? cclmInsideLeft( t, lx, ly, y, maxPel )
-         : s_cclmAvail[CCLM_POS_LEFT_BELOW] != 0 ? recoAt( t.comp, t.x - 1, t.y + H ) : cclmInsideLeft( t, lx, ly, H - 1, maxPel );
+    return y < H ? cclmInsideLeft( t, lx, ly, y, maxPel, slot )
+         : s_cclm[CCLM_POS_LEFT_BELOW] != 0 ? recoAt( t.comp, t.x - 1, t.y + H ) : cclmInsideLeft( t, lx, ly, H - 1, maxPel, slot );
   }
-  return cclmPredSample( t, lx, ly, min( x, W - 1 ), min( y, H - 1 ), maxPel );
+  return cclmPredSample( t, lx, ly, min( x, W - 1 ), min( y, H - 1 ), maxPel, slot );
 }
 
 // LBCCP's filtered sample (x, y): the padded prediction around it weighed 1, itself 8, the sum over 16
-int cclmInsideFiltered( Tu t, int lx, int ly, int x, int y, int maxPel )
+int cclmInsideFiltered( Tu t, int lx, int ly, int x, int y, int maxPel, int slot )
 {
   int sum = 0;
   for( int dy = -1; dy <= 1; dy++ )
   {
     for( int dx = -1; dx <= 1; dx++ )
     {
-      sum += ( dx == 0 && dy == 0 ? 8 : 1 ) * cclmInsideSample( t, lx, ly, x + dx, y + dy, maxPel );
+      sum += ( dx == 0 && dy == 0 ? 8 : 1 ) * cclmInsideSample( t, lx, ly, x + dx, y + dy, maxPel, slot );
     }
   }
   return ( sum + 8 ) >> 4;
+}
+
+// the predicted sample (x, y) of CCLM block t: with LBCCP's filter where the CU takes it (Tu::lm's LM_INSIDE)
+int cclmPrediction( Tu t, int lx, int ly, int x, int y, int maxPel, int slot )
+{
+  return ( t.lm & LM_INSIDE ) != 0 ? cclmInsideFiltered( t, lx, ly, x, y, maxPel, slot ) : cclmPredSample( t, lx, ly, x, y, maxPel, slot );
+}
+
+// ----- LFNST / NSPT of a CCLM block (JVET-AK0064)
+
+// the CU's prediction of chroma component comp (1: Cb, 2: Cr) at (x, y) for cclmTransformMode's histogram: from s_tmp
+// where it holds them (`stored`), else computed again (block t's own component from slot 0, o's from slot 1)
+int cclmHistSample( Tu t, Tu o, bool stored, int comp, int x, int y, int maxPel )
+{
+  if( stored )
+  {
+    return int( s_tmp[( comp == 1 ? 0 : 1024 ) + y * t.w + x] );
+  }
+  const int lx = t.x << 1, ly = t.y << 1;
+  return comp == t.comp ? cclmPrediction( t, lx, ly, x, y, maxPel, 0 ) : cclmPrediction( o, lx, ly, x, y, maxPel, 1 );
+}
+
+// the LFNST / NSPT mode of CCLM block t (DERIVE_CCLM_DIMD): deriveChromaIpmForTransform, which DecCu calls with the Cb
+// block - the strongest mode of buildHistogram's 3x3 gradients (no subsampling) at the samples inside the CU's Cb
+// prediction, its Cr prediction or both (Tu::lm's LM_HIST_*) - into s_predDimdMode. The block of the other component
+// has the same area, its template's and LBCCP's availability is the block's (decodedBefore on both components' owner
+// maps; neither reads the CU), its references go into s_ref[1], its model into slot 1 (its slope adjustments from
+// Tu::lm); the predictions into s_tmp, Cb's from 0, Cr's from 1024, where they fit (up to 32 x 32; larger blocks, rare,
+// compute each sample of the gradients again). All invocations, ending with a barrier; the prediction section predicts
+// the block again
+void cclmTransformMode( Tu t, int predStride, int maxPel, int lid, int NT )
+{
+  const int  lx = t.x << 1, ly = t.y << 1, W = t.w, H = t.h;
+  const bool histCb = ( t.lm & LM_HIST_CB ) != 0, histCr = ( t.lm & LM_HIST_CR ) != 0;
+  const bool own    = t.comp == 1 ? histCb : histCr;
+  const bool other  = t.comp == 1 ? histCr : histCb;
+  const bool stored = W * H <= 1024;
+  Tu o = t;
+  o.comp = 3 - t.comp;
+  o.lm   = ( t.lm & ~0xff ) | ( ( t.lm >> LM_OTHER_SHIFT ) & 0xff );
+  if( other )
+  {
+    fillReferencePar( o, 0, 1, predStride, lid, NT );
+  }
+  if( lid == 0 )
+  {
+    cclmAvailability( t );
+  }
+  SYNC();
+  if( lid == 0 )   // (cclmModel's samples share s_tmp: one after the other)
+  {
+    if( own )
+    {
+      cclmModel( t, lx, ly, predStride, 0, 0 );
+    }
+    if( other )
+    {
+      cclmModel( o, lx, ly, predStride, 1, 1 );
+    }
+  }
+  SYNC();
+  for( int i = lid; i < W * H && stored; i += NT )
+  {
+    const int x = i % W, y = i / W;
+    if( own )
+    {
+      s_tmp[( t.comp == 1 ? 0 : 1024 ) + i] = int16_t( cclmPrediction( t, lx, ly, x, y, maxPel, 0 ) );
+    }
+    if( other )
+    {
+      s_tmp[( o.comp == 1 ? 0 : 1024 ) + i] = int16_t( cclmPrediction( o, lx, ly, x, y, maxPel, 1 ) );
+    }
+  }
+  for( int i = lid; i < NUM_LUMA_MODE; i += NT )
+  {
+    s_dimdHist[i] = 0;
+  }
+  SYNC();
+  const int iw = W - 2, ih = H - 2, inner = iw * ih;
+  for( int k = lid; k < 2 * inner; k += NT )
+  {
+    const int comp = k < inner ? 1 : 2, i = k % inner, x = 1 + i % iw, y = 1 + i / iw;
+    if( comp == 1 ? histCb : histCr )
+    {
+      const ivec2 g = sobel3x3( cclmHistSample( t, o, stored, comp, x - 1, y - 1, maxPel ),
+                                cclmHistSample( t, o, stored, comp, x, y - 1, maxPel ),
+                                cclmHistSample( t, o, stored, comp, x + 1, y - 1, maxPel ),
+                                cclmHistSample( t, o, stored, comp, x - 1, y, maxPel ),
+                                cclmHistSample( t, o, stored, comp, x + 1, y, maxPel ),
+                                cclmHistSample( t, o, stored, comp, x - 1, y + 1, maxPel ),
+                                cclmHistSample( t, o, stored, comp, x, y + 1, maxPel ),
+                                cclmHistSample( t, o, stored, comp, x + 1, y + 1, maxPel ) );
+      if( g.x != 0 || g.y != 0 )
+      {
+        atomicAdd( s_dimdHist[dimdAngle( g )], abs( g.x ) + abs( g.y ) );
+      }
+    }
+  }
+  SYNC();
+  if( lid == 0 )   // the first of equal amplitudes
+  {
+    int firstAmp = 0, first = 0;
+    for( int i = 0; i < NUM_LUMA_MODE; i++ )
+    {
+      if( s_dimdHist[i] > firstAmp )
+      {
+        firstAmp = s_dimdHist[i];
+        first    = i;
+      }
+    }
+    s_predDimdMode = first;
+  }
+  SYNC();
 }
 
 #endif

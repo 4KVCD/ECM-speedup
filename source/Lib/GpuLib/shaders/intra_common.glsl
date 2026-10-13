@@ -78,11 +78,16 @@ const int MMLM_T_IDX      = LM_CHROMA_IDX + 5;
 
 // Tu::lm: whether the block is a CCLM block (its mode is not enough: a luma TIMD / TMRL block derives modes of the
 // 131-mode set, whose values from 67 on are angular), the slope adjustment (cclmOffsets, -4 .. 4) of its first and
-// second model, each + 8 in 4 bits, and whether the CU's prediction takes LBCCP's inside filter (ccInsideFilter)
+// second model, each + 8 in 4 bits, and whether the CU's prediction takes LBCCP's inside filter (ccInsideFilter).
+// With LFNST / NSPT (DERIVE_CCLM_DIMD) also the predictions whose DIMD gives their mode (deriveChromaIpmForTransform
+// by the TU's joint CbCr mode: Cb's for 1, Cr's for 2, both for 0 and 3) and the other component's slope adjustments
 const int LM_DELTA0_SHIFT = 0;
 const int LM_DELTA1_SHIFT = 4;
 const int LM_INSIDE       = 256;
 const int LM_ACTIVE       = 512;
+const int LM_HIST_CB      = 1024;
+const int LM_HIST_CR      = 2048;
+const int LM_OTHER_SHIFT  = 12;   // the other component's two adjustments, in LM_DELTA0 / 1's layout
 
 // Tu::derive
 const int DERIVE_NODE     = 32;  // not a block: the derivation of the mode of CU Tu::cu, before the CU's blocks
@@ -121,6 +126,9 @@ const int DERIVE_INHERIT_VER = 65536;
 // a block of a TMRL CU (CU_TMRL): its mode (131-mode set, 1/64-sample angles) and reference line come from the CU's node
 // (TmrlOut); the availability of that line, unknown to intra_deps, is found by the block itself (refLineAvailability)
 const int DERIVE_TMRL = 131072;
+// a CCLM block with LFNST / NSPT (JVET-AK0064): intra_rec derives their mode from a DIMD of the CU's chroma predictions
+// (Tu::lm's LM_HIST_*; cclmTransformMode), then its residual
+const int DERIVE_CCLM_DIMD = 262144;
 
 // Params::dbgParams per block: the derived dirMode, isModeVer, intraPredAngle, absInvAngle, useCubic, refFilter,
 // applyPDPC, gradPDPC, angularScale, fusion, bf, plIdx, then mtxV, mtxH, secMatrix, secTranspose, secLayout
