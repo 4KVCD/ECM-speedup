@@ -250,13 +250,17 @@ void dependencies( int comp )
       }
       addTemplateDeps( c, md.v[c.merge + MERGE_HEAD_T], md.v[c.merge + MERGE_HEAD_T + 1] );
     }
-    if( c.timd >= 0 )   // TIMD: its template (TIMD-SAD: also deriveTimdModeSad's)
+    if( c.timd >= 0 )   // TIMD: its template (TIMD-SAD: also deriveTimdModeSad's; TIMD merge: its candidates' TIMD)
     {
       BufI32 td = BufI32( P.timdData );
       addTemplateDeps( c, td.v[c.timd + TIMD_HEAD_T], td.v[c.timd + TIMD_HEAD_T + 1] );
       if( td.v[c.timd + TIMD_HEAD_SAD] != 0 )
       {
         addTemplateDeps( c, td.v[c.timd + TIMD_HEAD_TS], td.v[c.timd + TIMD_HEAD_TS + 1] );
+      }
+      for( int k = 0; k < td.v[c.timd + TIMD_HEAD_MERGE]; k++ )
+      {
+        addModeDep( td.v[c.timd + TIMD_HEAD_MERGE + 1 + k] );
       }
     }
     return;

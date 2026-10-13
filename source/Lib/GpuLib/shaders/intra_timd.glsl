@@ -1,11 +1,11 @@
 // Template predictions of TIMD's kind (IntraPrediction::initTimdIntraPatternLuma, initPredTimdIntraParams,
 // predTimdIntraAng) for a luma template, and their SATD costs (RdCost::xGetHADs_SIMD), which intra merge ranks its
-// candidates with, or TIMD-SAD's mean-removed SAD; a TIMD CU's node. The template block is the CU extended by tw
-// columns to the left and th rows above (W + tw by H + th; an arm the template lacks is 0, CU::deriveTimdRefType's
-// ABOVE_NEIGHBOR / LEFT_NEIGHBOR at the picture's left / top edge); the template is its top th rows right of the
-// corner and its left tw columns below the corner. Its
-// reference line, one sample further out, is filled into s_ref[0] (the row: (W + tw) * 8 + 1 samples from the corner)
-// and s_ref[1] (the column: (H + th) * 8 + 1). Modes are of the 131-mode set (MAP67TO131). Included by intra_rec.comp.
+// candidates with, or TIMD-SAD's mean-removed SAD; the nodes of TIMD CUs and of TIMD merge CUs. The template block is
+// the CU extended by tw columns to the left and th rows above (W + tw by H + th; an arm the template lacks is 0,
+// CU::deriveTimdRefType's ABOVE_NEIGHBOR / LEFT_NEIGHBOR at the picture's left / top edge); the template is its top th
+// rows right of the corner and its left tw columns below the corner. Its reference line, one sample further out, is
+// filled into s_ref[0] (the row: (W + tw) * 8 + 1 samples from the corner) and s_ref[1] (the column: (H + th) * 8 + 1).
+// Modes are of the 131-mode set (MAP67TO131). Included by intra_rec.comp.
 #ifndef INTRA_TIMD_GLSL
 #define INTRA_TIMD_GLSL
 
@@ -427,7 +427,56 @@ int timdScaleSqrt8( int sad )
   return q;
 }
 
-// the SATD of block (bx, by) of size kw x kh (2x2, 4x4, 8x4 or 4x8) of an arm
+// (int)( sad / sqrt( 8.0 ) * 2 ) of the 1x8 kernel: floor( sad / sqrt( 2 ) ) = the largest q with 2 q^2 <= sad^2 (sad
+// below 2^24: the double expression has no rounding that crosses an integer, checked exhaustively)
+int timdScaleSqrt2( int sad )
+{
+  const int64_t s2 = int64_t( sad ) * int64_t( sad );
+  int q = int( float( sad ) * 0.70710678f );
+  while( 2 * int64_t( q + 1 ) * int64_t( q + 1 ) <= s2 ) q++;
+  while( q > 0 && 2 * int64_t( q ) * int64_t( q ) > s2 ) q--;
+  return q;
+}
+
+// the SATD of the n differences d along an arm one sample thick (JVET-AJ0096's kernels of xGetHADs_SIMD, the DC term a
+// quarter: JVET-R0164): 16 by xCalcHADs1x16_SSE - the butterflies of strides 8, 4 and 2 only (its last stage left
+// out), the DC term that of the even samples, the sum halved; 8 by xCalcHADs1x8_SSE - the full transform, scaled by
+// 2 / sqrt( 8 ); 4 by xCalcHADs1xN - the full transform, scaled by 2 / sqrt( 4 ) = 1
+int timdHadLine( int d[32], int n )
+{
+  if( n == 16 )
+  {
+    int m1[4][4];   // per 4 lanes k: the stride-8 sum / difference, each with the stride-4 sum and difference
+    for( int k = 0; k < 4; k++ )
+    {
+      const int s0 = d[k] + d[k + 8], s1 = d[k + 4] + d[k + 12], t0 = d[k] - d[k + 8], t1 = d[k + 4] - d[k + 12];
+      m1[0][k] = s0 + s1;
+      m1[1][k] = s0 - s1;
+      m1[2][k] = t0 + t1;
+      m1[3][k] = t0 - t1;
+    }
+    int sad = 0;
+    for( int v = 0; v < 4; v++ )
+    {
+      sad += abs( m1[v][0] + m1[v][2] ) + abs( m1[v][1] + m1[v][3] ) + abs( m1[v][0] - m1[v][2] ) + abs( m1[v][1] - m1[v][3] );
+    }
+    const int dc = abs( m1[0][0] + m1[0][2] );
+    return ( sad - dc + ( dc >> 2 ) ) >> 1;
+  }
+  int sad = 0, dc = 0;
+  for( int i = 0; i < n; i++ )
+  {
+    int s = 0;
+    for( int k = 0; k < n; k++ ) s += ( bitCount( uint( i & k ) ) & 1 ) != 0 ? -d[k] : d[k];
+    sad += abs( s );
+    dc = i == 0 ? abs( s ) : dc;
+  }
+  sad = sad - dc + ( dc >> 2 );
+  return n == 8 ? timdScaleSqrt2( sad ) : sad;
+}
+
+// the SATD of block (bx, by) of size kw x kh (2x2, 4x4, 8x4 or 4x8; along an arm one sample thick 16, 8 or 4 samples)
+// of an arm
 int timdHad( int ox, int oy, int predOffset, int w, int bx, int by, int kw, int kh )
 {
   int d[32];
@@ -437,6 +486,10 @@ int timdHad( int ox, int oy, int predOffset, int w, int bx, int by, int kw, int 
     {
       d[j * kw + i] = timdDiff( ox, oy, predOffset, w, bx + i, by + j );
     }
+  }
+  if( WITH_TIMD_MERGE && ( kw == 1 || kh == 1 ) )   // (TIMD merge's template only)
+  {
+    return timdHadLine( d, kw * kh );
   }
   if( kw == 2 )   // xCalcHADs2x2 (the DC term a quarter: JVET-R0164)
   {
@@ -470,9 +523,15 @@ int timdHad( int ox, int oy, int predOffset, int w, int bx, int by, int kw, int 
   return kw == kh ? ( sad + 1 ) >> 1 : timdScaleSqrt8( sad );
 }
 
-// the kernel xGetHADs_SIMD takes for an arm of w x h (the template's arms are 2 or 4 thin)
+// the kernel xGetHADs_SIMD takes for an arm of w x h: of the arms 2 or 4 thick of TIMD's templates 8x4, 4x8, 4x4 or 2x2;
+// along an arm one sample thick (TIMD merge's template) 16 or 8 samples where they divide it, else the whole arm
 ivec2 timdKernel( int w, int h )
 {
+  if( WITH_TIMD_MERGE && ( w == 1 || h == 1 ) )   // (TIMD merge's template only)
+  {
+    const int len = max( w, h ), n = len % 16 == 0 ? 16 : len % 8 == 0 ? 8 : len;
+    return h == 1 ? ivec2( n, 1 ) : ivec2( 1, n );
+  }
   return w > h && ( w & 7 ) == 0 && ( h & 3 ) == 0 ? ivec2( 8, 4 )
        : w < h && ( h & 7 ) == 0 && ( w & 3 ) == 0 ? ivec2( 4, 8 )
        : ( h & 3 ) == 0 && ( w & 3 ) == 0         ? ivec2( 4, 4 ) : ivec2( 2, 2 );
@@ -569,13 +628,14 @@ void timdTemplateCosts( Cu c, TemplateUnits t, int candBase, int numCands, int c
   }
 }
 
-// ----- a TIMD CU's node (IntraPrediction::deriveTimdMode, a TIMD-SAD CU's also deriveTimdModeSad; without TIMD merge
-// and block vectors): the template costs of its candidates in two batches - planar, DC, the angular modes of a list and
-// the wide angles beyond the regular ones, then the neighbours of the best and the secondary mode - computed in
-// parallel, the CPU's sequential choice among them replayed by invocation 0 (with its early ends: computing more costs
-// than the CPU does changes no choice), then the fusion weights. deriveTimdMode's list is the MPM list and its costs
-// the SATD; deriveTimdModeSad's list is made of the modes deriveTimdMode costed first, the CU's DIMD modes and the modes
-// around those found, and its costs the mean-removed SAD of a template up to twice as thick
+// ----- a TIMD CU's node (IntraPrediction::deriveTimdMode, a TIMD-SAD CU's also deriveTimdModeSad; without block
+// vectors; TIMD merge CUs have a node of their own, below): the template costs of its candidates in two batches -
+// planar, DC, the angular modes of a list and the wide angles beyond the regular ones, then the neighbours of the best
+// and the secondary mode - computed in parallel, the CPU's sequential choice among them replayed by invocation 0 (with
+// its early ends: computing more costs than the CPU does changes no choice), then the fusion weights. deriveTimdMode's
+// list is the MPM list and its costs the SATD; deriveTimdModeSad's list is made of the modes deriveTimdMode costed
+// first, the CU's DIMD modes and the modes around those found, and its costs the mean-removed SAD of a template up to
+// twice as thick
 
 // in s_spCost (free in a node): the candidates (timdCand words; a first-batch candidate's cost slot is its index, a
 // second-batch one's numCands + its neighbour index, so that an invalid neighbour leaves its slot unused) and their
@@ -618,9 +678,17 @@ struct TimdAngleRange
 // a TIMD CU's record (TimdHead) at timdData[at]
 TimdHead timdHeadAt( int at )
 {
-  BufI32 timdData = BufI32( P.timdData );
+  BufI32    timdData = BufI32( P.timdData );
+  const int tr = at + TIMD_HEAD_MTS_TR_IDX, merge = at + TIMD_HEAD_MERGE;
+  int mergeNbr[TIMD_MERGE_CANDS];
+  for( int k = 0; k < TIMD_MERGE_CANDS; k++ )
+  {
+    mergeNbr[k] = timdData.v[merge + 1 + k];
+  }
   return TimdHead( timdData.v[at], timdData.v[at + 1], timdData.v[at + 2], templateUnitsAt( timdData, at + TIMD_HEAD_T ),
-                   timdData.v[at + TIMD_HEAD_SAD], templateUnitsAt( timdData, at + TIMD_HEAD_TS ) );
+                   timdData.v[at + TIMD_HEAD_SAD], templateUnitsAt( timdData, at + TIMD_HEAD_TS ), timdData.v[tr],
+                   timdData.v[tr + 1], timdData.v[tr + 2], timdData.v[merge], mergeNbr,
+                   timdData.v[merge + 1 + TIMD_MERGE_CANDS] );
 }
 
 // deriveTimdMode's range of modes for a CU of W x H whose PUs above-right / below-left reach further (waip:
@@ -1076,6 +1144,21 @@ void timdStore( int outBase, int fields[TIMD_OUT_FIELDS] )
   }
 }
 
+// in the pipelines with TIMD merge, which reads them: the transform types of TIMD CU c's luma block (the CU's
+// timdmTrType as DecCu sets it after the reconstruction, TrQuant::getTrTypes), explicit MTS's by its mode (67-mode set)
+// where that chooses them, else the host's, into its TimdOut
+void timdStoreTransforms( TimdHead head, Cu c, int mode )
+{
+  if( WITH_TIMD_MERGE )
+  {
+    const ivec2 types   = head.mtsTrIdx >= 0 ? explicitMtsTypes( c.w, c.h, mode, 0, head.mtsTrIdx ) : ivec2( head.trHor, head.trVer );
+    CBufI32     timdOut = CBufI32( P.timdOut );
+    const int   outBase = head.index * TIMD_OUT;
+    timdOut.v[outBase + TIMD_OUT_TR_HOR] = types.x;
+    timdOut.v[outBase + TIMD_OUT_TR_VER] = types.y;
+  }
+}
+
 // the node of TIMD CU c (all invocations, uniform control flow): its TIMD (a TIMD-SAD CU's also its TIMD-SAD) into its
 // TimdOut; returns (invocation 0) the mode its blocks predict as the neighbours read it (MAP131TO67) and in mtssSecond
 // the second mode MTSS tries first (the secondary where those modes blend, else -1: none). nbrMode, dimdModes:
@@ -1101,6 +1184,7 @@ int timdNode( Cu c, int cuIndex, int nbrMode[MPM_NEIGHBOURS], int dimdModes[3], 
       {
         timdStore( outBase + TIMD_OUT_SAD, fields );
       }
+      timdStoreTransforms( head, c, PLANAR_IDX );
     }
     return PLANAR_IDX;
   }
@@ -1178,6 +1262,134 @@ int timdNode( Cu c, int cuIndex, int nbrMode[MPM_NEIGHBOURS], int dimdModes[3], 
     return -1;
   }
   // the modes the blocks predict: a TIMD-SAD CU's deriveTimdModeSad's
+  if( fields[TIMD_OUT_BLENDED] != 0 )
+  {
+    mtssSecond = timdMode67( fields[TIMD_OUT_SECONDARY] );
+  }
+  const int mode = timdMode67( fields[TIMD_OUT_MODE] );
+  timdStoreTransforms( head, c, mode );
+  return mode;
+}
+
+// ----- a TIMD merge CU's node (IntraPrediction::deriveTimdMergeModes, JVET-AJ0061; NUM_TIMD_MERGE_MODES 1): its
+// candidates from the TIMD of its neighbours (genTimdMrgList over searchTimdMrgCus' neighbours, which the host found),
+// with two or more ranked by the template cost of their modes (calcTimdMrgCandCosts: the SATD of each candidate's mode
+// on the CU's template of arms one sample thick, TimdHead::t), the choice into its TimdOut
+
+// calcTimdMrgCandCosts' swap: whether a candidate of cost second ranks before the cheapest one, of cost best, as the
+// CPU compares second < 1.1 * best in doubles. 1.1 is a double 0.4 * 2^-52 above 1.1, so only where 1.1 * best is an
+// integer n can the rounding decide: second = n is below where the product rounds up from n, i.e. where best * 0.4 *
+// 2^-52 exceeds half n's unit in the last place, 2^(e - 53) for 2^e <= n < 2^(e + 1) (a tie rounds to n, which is
+// even there); checked against the doubles for every best below 2^20 and millions of others up to 2^40
+bool timdMergeSwaps( uint64_t second, uint64_t best )
+{
+  if( best % 10ul != 0ul )
+  {
+    return 10ul * second < 11ul * best;
+  }
+  const uint64_t n = best / 10ul * 11ul;
+  if( second != n || best == 0ul )
+  {
+    return second < n;
+  }
+  const int e = n >> 32 != 0ul ? 32 + findMSB( uint( n >> 32 ) ) : findMSB( uint( n ) );
+  return 4ul * best > 5ul << e;
+}
+
+// the node of TIMD merge CU c (all invocations, uniform control flow): its candidate's fields into its TimdOut, its
+// transform types those the candidate gives (in dual tree, else DCT-II); returns (invocation 0) its mode as the
+// neighbours read it (MAP131TO67) and in mtssSecond the second mode MTSS tries first (the secondary where the
+// candidate's modes blend, else -1)
+int timdMergeNode( Cu c, int bitDepth, bool noPdpc, out int mtssSecond, int lid, int NT )
+{
+  const TimdHead head    = timdHeadAt( c.timd );
+  const int      outBase = head.index * TIMD_OUT;
+  CBufI32        timdOut = CBufI32( P.timdOut );
+  mtssSecond = -1;
+  // genTimdMrgList (invocation 0): per neighbour the fields its blocks predict (a TIMD merge neighbour's candidate, a
+  // TIMD-SAD one's TIMD-SAD), unless a candidate has its mode and secondary mode already or its mode is not set (the
+  // CPU checks a TIMD merge or TIMD-SAD neighbour's only: a TIMD CU's is always set), as the candidates of the costs
+  int source[TIMD_MERGE_CANDS];   // the neighbour each candidate comes from (invocation 0's)
+  int num = 0;
+  if( lid == 0 )
+  {
+    int modes[TIMD_MERGE_CANDS], secondaries[TIMD_MERGE_CANDS];
+    for( int k = 0; k < head.merge; k++ )
+    {
+      const int predBase  = timdPredBase( head.mergeNbr[k] );
+      const int mode      = timdOut.v[predBase + TIMD_OUT_MODE];
+      const int secondary = timdOut.v[predBase + TIMD_OUT_SECONDARY];
+      bool known = false;
+      for( int i = 0; i < num; i++ )
+      {
+        known = known || ( modes[i] == mode && secondaries[i] == secondary );
+      }
+      if( !known && mode != -1 )
+      {
+        source[num]      = head.mergeNbr[k];
+        modes[num]       = mode;
+        secondaries[num] = secondary;
+        s_spCost[TC_CAND + num]   = timdCand( mode, mode, true, num );
+        s_spCost[TC_COST_A + num] = 0u;
+        s_spCost[TC_COST_L + num] = 0u;
+        num++;
+      }
+    }
+    s_spCost[TC_NUM] = uint( num );
+  }
+  SYNC();
+  // calcTimdMrgCandCosts where there are two or more: the SATD of each candidate's mode on the template
+  const int numCands = int( s_spCost[TC_NUM] );
+  if( numCands >= 2 )
+  {
+    timdFillReference( head.t, BufI32( P.timdData ), c.timd + TIMD_HEAD, c.x, c.y, c.w, c.h, bitDepth, lid, NT );
+    const int dc = timdDc( head.t, c.w, c.h, lid, NT );
+    timdTemplateCosts( c, head.t, TC_CAND, numCands, TC_COST_A, TC_COST_L, dc, ( 1 << bitDepth ) - 1, noPdpc, false, lid, NT );
+  }
+  if( lid != 0 )
+  {
+    return -1;
+  }
+  // the two cheapest (updateCandList: the earlier of equal costs first), the second where it costs less than 1.1 times
+  // the cheapest
+  int chosen = 0;
+  if( num >= 2 )
+  {
+    int best = 0, second = -1;
+    for( int i = 1; i < num; i++ )
+    {
+      if( timdCost( i ) < timdCost( best ) )
+      {
+        second = best;
+        best   = i;
+      }
+      else if( second < 0 || timdCost( i ) < timdCost( second ) )
+      {
+        second = i;
+      }
+    }
+    chosen = timdMergeSwaps( timdCost( second ), timdCost( best ) ) ? second : best;
+  }
+  // its fields (every mode's wide angle getWideAngleExt's: timdMrgModeCheckWA), its transform types; without a
+  // candidate (the CPU cannot decode such a CU) planar
+  int fields[TIMD_OUT_FIELDS] = int[TIMD_OUT_FIELDS]( PLANAR_IDX, -1, -1, 0, -1, -1, -1, 0, 0, 0, 1, 1 );
+  int trHor = TR_DCT2, trVer = TR_DCT2;
+  if( num > 0 )
+  {
+    const int predBase = timdPredBase( source[chosen] ), sourceBase = timdOutBase( source[chosen] );
+    for( int f = 0; f < TIMD_OUT_CHECK_WA; f++ )
+    {
+      fields[f] = timdOut.v[predBase + f];
+    }
+    if( head.inheritTr != 0 )
+    {
+      trHor = timdOut.v[sourceBase + TIMD_OUT_TR_HOR];
+      trVer = timdOut.v[sourceBase + TIMD_OUT_TR_VER];
+    }
+  }
+  timdStore( outBase, fields );
+  timdOut.v[outBase + TIMD_OUT_TR_HOR] = trHor;
+  timdOut.v[outBase + TIMD_OUT_TR_VER] = trVer;
   if( fields[TIMD_OUT_BLENDED] != 0 )
   {
     mtssSecond = timdMode67( fields[TIMD_OUT_SECONDARY] );

@@ -60,11 +60,11 @@ int mergeSource( int n, int cls, int pf, int w )
 // CU::setIntraMergeCandParamFromTimd into candidate slot (zero) from TIMD CU nbr's TimdOut: its mode (MAP131TO67), where
 // angular with its secondary mode as the blend mode (where both map to one mode, the mode two of their distances
 // beyond) weighed [mode, non-angular as planar, secondary], or without a secondary planar at 16; false where the CPU
-// gives up (a mode or blend mode planar / DC) and takes the CU's DIMD instead
+// gives up (a mode or blend mode planar / DC)
 bool mergeTimdParams( int slot, int nbr )
 {
   CBufI32   timdOut = CBufI32( P.timdOut );
-  const int outBase = timdPredBase( nbr );   // (a TIMD-SAD CU's TIMD-SAD)
+  const int outBase = timdPredBase( nbr );   // (a TIMD-SAD CU's TIMD-SAD, a TIMD merge CU's candidate)
   const int mode = timdOut.v[outBase + TIMD_OUT_MODE], secondary = timdOut.v[outBase + TIMD_OUT_SECONDARY];
   const int mode67 = timdMode67( mode );
   if( mode67 <= DC_IDX )
@@ -97,7 +97,8 @@ bool mergeTimdParams( int slot, int nbr )
   return true;
 }
 // a TIMD CU's validity as a candidate (CU::isAValidNeighborForIntraMerge): its modes blend or its mode is angular (a
-// TIMD-SAD CU's TIMD-SAD, or its plain TIMD's mode is angular: the CPU tests timdMode before timdModeSad)
+// TIMD-SAD CU's TIMD-SAD, or its plain TIMD's mode is angular: the CPU tests timdMode before timdModeSad; a TIMD merge
+// CU's chosen candidate)
 bool mergeTimdValid( int nbr )
 {
   CBufI32   timdOut  = CBufI32( P.timdOut );
@@ -107,18 +108,22 @@ bool mergeTimdValid( int nbr )
 }
 
 // CU::setIntraMergeCandParam's parameters of neighbour n into candidate slot k: a TIMD CU's TIMD converted
-// (mergeTimdParams), where that gives up its DIMD; an OBIC CU's OBIC converted (its first four blend modes, their
-// weights, planar's weight from the last weighted one), else the DIMD or merge parameters of its DimdOut slot (blend
-// modes below 0 as planar)
-void mergeCandidateParams( int k, int n, int cls, int pf )
+// (mergeTimdParams), where that gives up its DIMD - a TIMD merge CU, which has none, is then no candidate (false); an
+// OBIC CU's OBIC converted (its first four blend modes, their weights, planar's weight from the last weighted one),
+// else the DIMD or merge parameters of its DimdOut slot (blend modes below 0 as planar)
+bool mergeCandidateParams( int k, int n, int cls, int pf )
 {
   for( int f = 0; f < MERGE_CAND; f++ )
   {
     mcSet( k, f, 0 );
   }
-  if( WITH_TIMD && cls == MERGE_NBR_TIMD && mergeTimdParams( k, n ) )
+  if( WITH_TIMD && ( cls == MERGE_NBR_TIMD || cls == MERGE_NBR_TIMD_MERGE ) && mergeTimdParams( k, n ) )
   {
-    return;
+    return true;
+  }
+  if( cls == MERGE_NBR_TIMD_MERGE )
+  {
+    return false;
   }
   if( cls == MERGE_NBR_OBIC )
   {
@@ -159,6 +164,7 @@ void mergeCandidateParams( int k, int n, int cls, int pf )
       mcSet( k, MC_LOC_DEP + i, mergeSource( n, cls, pf, DIMD_OUT_LOC_DEP + i ) );
     }
   }
+  return true;
 }
 
 // CU::areIntraParamsSame: slot k has the parameters of an earlier candidate
@@ -180,8 +186,8 @@ bool mergeSameParams( int k )
 }
 
 // deriveIntraMergeCand's walk over the list (one invocation; the entries' validity and positions and the first valid
-// ones' parameters in s_tmp): a valid entry at a position no candidate has yet whose parameters no candidate has is
-// the next candidate, up to five; their number at MC_NUM
+// ones' parameters in s_tmp): a valid entry at a position no candidate has yet whose parameters convert and no
+// candidate has is the next candidate, up to five; their number at MC_NUM
 void mergeWalk( int base, int nbrNum, int numFetch )
 {
   BufI32 md = BufI32( P.mergeData );
@@ -210,7 +216,10 @@ void mergeWalk( int base, int nbrNum, int numFetch )
     {
       continue;
     }
-    mergeCandidateParams( cnt, n, cls, pf );
+    if( !mergeCandidateParams( cnt, n, cls, pf ) )
+    {
+      continue;
+    }
     mcSet( cnt, MC_X, x );
     mcSet( cnt, MC_Y, y );
     cnt += mergeSameParams( cnt ) ? 0 : 1;
@@ -219,15 +228,16 @@ void mergeWalk( int base, int nbrNum, int numFetch )
 }
 
 // deriveIntraMergeCand over the CU's list (all invocations): the entries' validity (a DIMD or MPM neighbour where its
-// DIMD blends, a TIMD neighbour by mergeTimdValid) and positions, the first valid ones' parameters fetched at once (a
-// TIMD neighbour's DIMD, its TIMD read where converted), then the walk
+// DIMD blends, a TIMD or TIMD merge neighbour by mergeTimdValid) and positions, the first valid ones' parameters
+// fetched at once (a TIMD neighbour's DIMD, its TIMD read where converted; of a TIMD merge neighbour unused), then the walk
 void mergeCandidates( int base, int nbrNum, int lid, int NT )
 {
   BufI32 md = BufI32( P.mergeData );
   for( int k = lid; k < nbrNum; k += NT )
   {
-    const int n = md.v[base + MERGE_HEAD + 2 * k], cls = md.v[base + MERGE_HEAD + 2 * k + 1];
-    const bool valid = WITH_TIMD && cls == MERGE_NBR_TIMD ? mergeTimdValid( n )
+    const int  n = md.v[base + MERGE_HEAD + 2 * k], cls = md.v[base + MERGE_HEAD + 2 * k + 1];
+    const bool timd  = cls == MERGE_NBR_TIMD || cls == MERGE_NBR_TIMD_MERGE;
+    const bool valid = WITH_TIMD && timd ? mergeTimdValid( n )
                      : cls != MERGE_NBR_DIMD || CBufI32( P.dimdOut ).v[n * DIMD_OUT + DIMD_OUT_BLENDING] != 0;
     s_tmp[MT_ENTRY * k]     = int16_t( valid ? cls : 0 );
     s_tmp[MT_ENTRY * k + 1] = int16_t( BufCu( P.cus ).v[n].x );

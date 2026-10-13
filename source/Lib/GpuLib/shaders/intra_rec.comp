@@ -38,6 +38,7 @@ layout( constant_id = 1 ) const bool WITH_DERIVED_TRANSFORMS = true;   // blocks
 layout( constant_id = 2 ) const bool WITH_MERGE = true;                // intra merge CUs (and OBIC's merge neighbours)
 layout( constant_id = 3 ) const bool WITH_TIMD = true;                 // TIMD CUs (with DIMD and intra merge)
 layout( constant_id = 4 ) const bool WITH_TIMD_SAD = false;            // TIMD-SAD CUs (with TIMD; a picture's own pipeline)
+layout( constant_id = 5 ) const bool WITH_TIMD_MERGE = false;          // TIMD merge CUs (with TIMD-SAD)
 
 const int PAD     = 6;                        // interpFilterNumPadded (16 taps / 2 - 2)
 const int ANG     = 1792;                     // angular reference buffers (the CPU's are larger; blocks <= 128 use < 1700)
@@ -167,10 +168,17 @@ bool timdSadCu( int n )
 }
 
 // the start of the TimdOut fields TIMD CU n's blocks predict: its TIMD's, a TIMD-SAD CU's TIMD-SAD's (its prediction
-// takes the *Sad fields throughout: initPredIntraParams, predIntraAng's TIMD-SAD branch)
+// takes the *Sad fields throughout: initPredIntraParams, predIntraAng's TIMD-SAD branch), a TIMD merge CU's chosen
+// candidate's
 int timdPredBase( int n )
 {
   return timdOutBase( n ) + ( timdSadCu( n ) ? TIMD_OUT_SAD : 0 );
+}
+
+// whether TIMD CU c is a TIMD merge CU (TimdHead::merge; none outside the TIMD merge pipeline)
+bool timdMergeCu( Cu c )
+{
+  return WITH_TIMD_MERGE && BufI32( P.timdData ).v[c.timd + TIMD_HEAD_MERGE] != 0;
 }
 
 // the modes a CU's derivation reads (loaded by the invocations in parallel): luma the neighbours' at getSpatialIpm's
@@ -223,43 +231,69 @@ bool nsptTranspose( int im )
   return ( im >= NUM_LUMA_MODE && im >= NUM_LUMA_MODE + extHalf ) || ( im < NUM_LUMA_MODE && im > DIA_IDX );
 }
 
+// the transform types (horizontal, vertical) of ECM's explicit MTS for a luma block of W x H (TrQuant::getTrTypes with
+// MTSExt): kernel pair trIdx of the set of the size class and the mode's wide angle, clamped to 2 .. 66 (planar of
+// directional planar index plIdx as its direction), the identity transform near horizontal / vertical. mode: the
+// block's mode (67-mode set), the signalled one the identity transform's rule reads
+ivec2 explicitMtsTypes( int W, int H, int mode, int plIdx, int trIdx )
+{
+  BufI32    mt   = BufI32( P.matrices );
+  const int wide = puWideAngle( W, H, mode );
+  int pm = wide < 0 ? 2 : wide >= NUM_LUMA_MODE ? VDIA_IDX : wide;
+  if( pm == PLANAR_IDX )
+  {
+    pm = plIdx == 2 ? HOR_IDX : plIdx == 1 ? VER_IDX : pm;
+  }
+  const bool transposed = pm > DIA_IDX;
+  const int  mdIdx = transposed ? NUM_LUMA_MODE + 1 - pm : pm;
+  const int  szW = min( 3, findMSB( W ) - 2 ), szH = min( 3, findMSB( H ) - 2 );
+  const int  set  = mt.v[trTab( TR_TAB_IPM_TO_SET ) + ( transposed ? szH * 4 + szW : szW * 4 + szH ) * 36 + mdIdx];
+  const int  pair = mt.v[trTab( TR_TAB_SET ) + set * trTab( TR_TAB_SET_ROW ) + trIdx];
+  int ver = mt.v[trTab( TR_TAB_IDX_TO_TR ) + pair * 2 + ( transposed ? 1 : 0 )];
+  int hor = mt.v[trTab( TR_TAB_IDX_TO_TR ) + pair * 2 + ( transposed ? 0 : 1 )];
+  if( trIdx == 3 && W <= 16 && H <= 16 )   // the signalled mode decides
+  {
+    const int limit = mt.v[trTab( TR_TAB_ID_LUT ) + ( findMSB( W ) - 2 ) * 3 + findMSB( H ) - 2];
+    ver = abs( mode - HOR_IDX ) <= limit ? trTab( TR_TAB_IDTR ) : ver;
+    hor = abs( mode - VER_IDX ) <= limit ? trTab( TR_TAB_IDTR ) : hor;
+  }
+  return ivec2( hor, ver );
+}
+
+// the offset in matrices of the inverse transform matrix of a type for a side of size samples (-1: none)
+int trMatrix( int type, int size )
+{
+  return BufI32( P.matrices ).v[trTab( TR_TAB_MATRIX ) + type * 7 + findMSB( size ) - 1];
+}
+
 // the transforms of a derived mode (Tu::derive & DERIVE_TRANSFORM), as the host chooses them otherwise: the kernel
-// pair of ECM's explicit MTS (TrQuant::getTrTypes with MTSExt: the set of the size class and the mode's wide angle,
-// clamped to 2 .. 66, the identity transform near horizontal / vertical) and the LFNST / NSPT set, transposition and
-// matrix of getFinalIntraModeForTransform's mode (planar of a directional planar index as its direction, the wide
-// angle of the block, of the CU with ISP, in NSPT's numbering). mode: the CU's mode, which MTS takes, or a MIP block's
-// mipDimdMode (MIP has no MTS with LFNST); LFNST / NSPT take a DIMD or OBIC CU's DIMD main mode instead
-// (getFinalIntraModeForTransform's DIMD branch), with MTSS the mode and NSPT bucket chosen into the CU's DimdOut.
-// plIdx: the CU's directional planar index
+// pair of ECM's explicit MTS (explicitMtsTypes) and the LFNST / NSPT set, transposition and matrix of
+// getFinalIntraModeForTransform's mode (planar of a directional planar index as its direction, the wide angle of the
+// block, of the CU with ISP, in NSPT's numbering); a TIMD merge CU's block the types its chosen candidate gave on the
+// sides that take them (DERIVE_INHERIT_*). mode: the CU's mode, which MTS takes, or a MIP block's mipDimdMode (MIP has no
+// MTS with LFNST); LFNST / NSPT take a DIMD or OBIC CU's DIMD main mode instead (getFinalIntraModeForTransform's DIMD
+// branch), with MTSS the mode and NSPT bucket chosen into the CU's DimdOut. plIdx: the CU's directional planar index
 void selectTransform( inout Tu t, int mode, int plIdx )
 {
   BufI32     mt      = BufI32( P.matrices );
   const bool luma    = t.comp == 0;
   const int  W = t.w, H = t.h;
-  if( t.mtsSet != 0 )
+  if( t.mtsSet != 0 )   // (luma only)
   {
-    const int trIdx = t.mtsSet - 1;
-    const int wide  = puWideAngle( W, H, mode );
-    int pm = wide < 0 ? 2 : wide >= NUM_LUMA_MODE ? VDIA_IDX : wide;
-    if( luma && pm == PLANAR_IDX )
-    {
-      pm = plIdx == 2 ? HOR_IDX : plIdx == 1 ? VER_IDX : pm;
-    }
-    const bool transposed = pm > DIA_IDX;
-    const int  mdIdx = transposed ? NUM_LUMA_MODE + 1 - pm : pm;
-    const int  szW = min( 3, findMSB( W ) - 2 ), szH = min( 3, findMSB( H ) - 2 );
-    const int  set  = mt.v[trTab( TR_TAB_IPM_TO_SET ) + ( transposed ? szH * 4 + szW : szW * 4 + szH ) * 36 + mdIdx];
-    const int  pair = mt.v[trTab( TR_TAB_SET ) + set * trTab( TR_TAB_SET_ROW ) + trIdx];
-    int ver = mt.v[trTab( TR_TAB_IDX_TO_TR ) + pair * 2 + ( transposed ? 1 : 0 )];
-    int hor = mt.v[trTab( TR_TAB_IDX_TO_TR ) + pair * 2 + ( transposed ? 0 : 1 )];
-    if( trIdx == 3 && W <= 16 && H <= 16 )   // the signalled mode decides
-    {
-      const int limit = mt.v[trTab( TR_TAB_ID_LUT ) + ( findMSB( W ) - 2 ) * 3 + findMSB( H ) - 2];
-      ver = abs( mode - HOR_IDX ) <= limit ? trTab( TR_TAB_IDTR ) : ver;
-      hor = abs( mode - VER_IDX ) <= limit ? trTab( TR_TAB_IDTR ) : hor;
-    }
-    t.mtxV = mt.v[trTab( TR_TAB_MATRIX ) + ver * 7 + findMSB( H ) - 1];
-    t.mtxH = mt.v[trTab( TR_TAB_MATRIX ) + hor * 7 + findMSB( W ) - 1];
+    const ivec2 types = explicitMtsTypes( W, H, mode, plIdx, t.mtsSet - 1 );
+    t.mtxV = trMatrix( types.y, H );
+    t.mtxH = trMatrix( types.x, W );
+  }
+  if( WITH_TIMD_MERGE && ( t.derive & ( DERIVE_INHERIT_HOR | DERIVE_INHERIT_VER ) ) != 0 )
+  {
+    // (a type without a matrix of the side's size, for which the CPU would call no transform, keeps the host's: no
+    // decodable stream has one)
+    CBufI32   timdOut = CBufI32( P.timdOut );
+    const int outBase = timdOutBase( t.cu );
+    const int mtxH    = trMatrix( timdOut.v[outBase + TIMD_OUT_TR_HOR], W );
+    const int mtxV    = trMatrix( timdOut.v[outBase + TIMD_OUT_TR_VER], H );
+    t.mtxH = ( t.derive & DERIVE_INHERIT_HOR ) != 0 && mtxH >= 0 ? mtxH : t.mtxH;
+    t.mtxV = ( t.derive & DERIVE_INHERIT_VER ) != 0 && mtxV >= 0 ? mtxV : t.mtxV;
   }
   if( t.secKind != SEC_NONE )
   {
@@ -1289,8 +1323,8 @@ void main()
     // CU, on whose blocks it depends), the mode of a DIMD CU and the first entries of an MPM list; an OBIC CU's modes
     // then from its neighbours' (intra_obic.glsl: published by the nodes of those CUs, on which it depends); an intra
     // merge CU's parameters from its neighbours', ranked by template costs (intra_merge.glsl); a TIMD CU's modes from
-    // template costs of its MPM list's modes and more (intra_timd.glsl); with MTSS the LFNST / NSPT mode of the CU's
-    // block (mtssList, mtssChoice)
+    // template costs of its MPM list's modes and more, a TIMD merge CU's from its TIMD neighbours', ranked by template
+    // costs (intra_timd.glsl); with MTSS the LFNST / NSPT mode of the CU's block (mtssList, mtssChoice)
     if( ( t.derive & DERIVE_NODE ) != 0 )
     {
       const Cu c = BufCu( P.cus ).v[t.cu];
@@ -1336,6 +1370,10 @@ void main()
       else if( WITH_DIMD && WITH_MERGE && c.kind == CU_MERGE )   // intra_merge.glsl (no DIMD of its own)
       {
         cuMode = mergeNode( c, t.cu, t.bitDepth, ( t.derive & DERIVE_NO_PDPC ) != 0, lid, NT );
+      }
+      else if( WITH_TIMD_MERGE && c.kind == CU_TIMD && timdMergeCu( c ) )   // intra_timd.glsl, from its candidates
+      {
+        cuMode = timdMergeNode( c, t.bitDepth, ( t.derive & DERIVE_NO_PDPC ) != 0, timdSecond, lid, NT );
       }
       else if( WITH_TIMD && c.kind == CU_TIMD )   // intra_timd.glsl, its MPM list with its DIMD
       {
@@ -1460,11 +1498,14 @@ void main()
       {
         // TIMD (the 131-mode set): its mode with its wide angle; fusion where the modes do not blend as the CU's
         // fetchRef2nd and the slope allow it, where they blend TIMD's rule (the main mode then without fusion, the
-        // secondary from the next line alone: timdBlendFusion); the bilateral filter only on a blend
+        // secondary from the next line alone: timdBlendFusion), a TIMD merge CU's always (its secondary then by its
+        // slope, below); the bilateral filter only on a blend
         CBufI32 o = CBufI32( P.timdOut );
         timdModeParams( t, o.v[timdOut + TIMD_OUT_MODE], o.v[timdOut + TIMD_OUT_CHECK_WA] != 0 );
-        const bool blending = s_blendNum != 0;
-        t.fusion = blending ? ( ( t.derive & DERIVE_NO_FUSION ) == 0 && timdBlendFusion( timdOut, t.regW, t.h ) ? 1 : 0 )
+        const bool blending  = s_blendNum != 0;
+        const bool timdMerge = WITH_TIMD_MERGE && ( t.derive & DERIVE_TIMD_MERGE ) != 0;
+        const bool blendFuses = ( t.derive & DERIVE_NO_FUSION ) == 0 && ( timdMerge || timdBlendFusion( timdOut, t.regW, t.h ) );
+        t.fusion = blending ? ( blendFuses ? 1 : 0 )
                             : ( t.derive & DERIVE_FETCH2ND ) != 0 && t.dirMode > DC_IDX && ( abs( t.intraPredAngle ) & 63 ) != 0 ? 1 : 0;
         t.bf     = blending && ( t.derive & DERIVE_BF ) != 0 ? 1 : 0;   // (of the blend)
       }
@@ -1649,12 +1690,14 @@ void main()
     // the CU, no fusion, no bilateral filter), its references and its filter length (DIMD's by its weight), summed
     // (emitPred), then blended
     // A TIMD blend (predIntraAng's TIMD branch): its mode without fusion, its secondary (with the secondary's wide-angle
-    // choice; its non-angular mode with it) from the next line alone where TIMD's rule fuses them, their filter lengths
-    // by the modes blended (timdBlendTaps; a TIMD-SAD blend keeps the default lengths: xPredIntraAng takes numTapsTIMD
-    // only without TIMD-SAD)
+    // choice; its non-angular mode with it) from the next line alone where TIMD's rule fuses them - a TIMD merge CU's
+    // where its slope is fractional (its initPredIntraParams' fusion of a secondary mode) - their filter lengths by the
+    // modes blended (timdBlendTaps; a TIMD-SAD blend keeps the default lengths: xPredIntraAng takes numTapsTIMD only
+    // without TIMD-SAD)
     g_blendSum  = false;
     g_blendTaps = ( t.derive & DERIVE_DIMD ) != 0;
     const ivec2 timdTaps = timdBlend && !timdSadCu( t.cu ) ? timdBlendTaps( timdPredBase( t.cu ) ) : ivec2( 0, 0 );
+    const bool  timdMergeBlend = WITH_TIMD_MERGE && timdBlend && ( t.derive & DERIVE_TIMD_MERGE ) != 0;
     bool blendFirst = true;
     for( int sub = 0; sub < ( blend ? s_blendNum : 1 ); sub++ )
     {
@@ -1675,7 +1718,8 @@ void main()
         {
           applyModeParams( t, s_blendMode[sub], 0 );
         }
-        fuse         = timdBlend && sub == 1 && fusion ? FUSE_SECOND : FUSE_NONE;
+        const bool secondaryFuses = !timdMergeBlend || ( t.dirMode > DC_IDX && ( abs( t.intraPredAngle ) & 63 ) != 0 );
+        fuse         = timdBlend && sub == 1 && fusion && secondaryFuses ? FUSE_SECOND : FUSE_NONE;
         g_blendSum   = true;
         g_blendFirst = blendFirst;
         blendFirst   = false;

@@ -1380,7 +1380,8 @@ public:
 #endif
 #if JVET_AJ0061_TIMD_MERGE
   void deriveTimdMergeModes       ( const CPelBuf &recoBuf, const CompArea &area, CodingUnit &cu);
-  void searchTimdMrgCus           ( const CodingUnit &cu, static_vector<const CodingUnit*, NUM_TIMD_MERGE_CUS> &cuNeighbours );
+  /// (static: it reads only the CU's coding structure; the GPU reconstruction takes its neighbours too)
+  static void searchTimdMrgCus    ( const CodingUnit &cu, static_vector<const CodingUnit*, NUM_TIMD_MERGE_CUS> &cuNeighbours );
   void genTimdMrgList             ( const CodingUnit &cu, const static_vector<const CodingUnit*, NUM_TIMD_MERGE_CUS> &cuNeighbours, static_vector<TimdMergeInfo, NUM_TIMD_MERGE_CUS> &timdMrgList );
   template<typename T, size_t N>
   void calcTimdMrgCandCosts       ( const CodingUnit &cu, static_vector<TimdMergeInfo, NUM_TIMD_MERGE_CUS> &timdMrgList, static_vector<T, N>& uiModeList, static_vector<uint64_t, N>& candCostList );

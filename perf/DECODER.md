@@ -393,7 +393,11 @@ the reconstruction buffer; works in every frame-thread context):
   its TIMD into a candidate (or takes its DIMD where the conversion gives up), both from the neighbour's node. M26 is
   TIMD-SAD: after TIMD, the node repeats the scan over a second list (TIMD's cheapest modes, DIMD's, their
   neighbours) with the mean-removed SAD of a thicker template, and the CU's blocks predict those modes. M27 lets OBIC and
-  intra merge read TIMD-SAD neighbours.
+  intra merge read TIMD-SAD neighbours. M28 is TIMD merge: the CU's node takes up to five TIMD neighbours' modes (the
+  host finds the neighbours), ranks them by the SATD of their main mode on a template one sample thick (with that
+  thickness's own SATD kernels, one of which skips a butterfly stage), takes the second cheapest within 10 % of the
+  cheapest, and in dual tree inherits that neighbour's transform types for its sides longer than 16 (DST-VII for 4 to
+  16); its blocks predict like TIMD's with a fusion rule of their own.
   GpuIntraRec::supported()
   rejects every tool whose mode derivation or prediction reads reconstructed samples or that the kernels lack, before
   anything is skipped. All 19 regular streams now fall back to the CPU at TMRL, the next sequence-level check (before

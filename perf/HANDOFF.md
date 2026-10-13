@@ -13,9 +13,9 @@ wall-clock gains with threads are "the easy baseline". Decoder status: single-th
 (`--GpuLoopFilter=1`: ALF, SAO, BIF, CCSAO, LF-CCCM, offset refinement on Vulkan). The user then asked for **a full
 GPU decoder in Vulkan, optimized until nothing is left** ("The GPU decoder needs to fully decode the frame on the
 GPU"; "Your first Vulkan version is going to be slow. That's OK"). That work is branch `dec-gpurecon`: intra
-reconstruction on the GPU (`--GpuRecon`), tool levels M1-M27 done and verified bit-exact (M19: DIMD, M20: OBIC, M21:
+reconstruction on the GPU (`--GpuRecon`), tool levels M1-M28 done and verified bit-exact (M19: DIMD, M20: OBIC, M21:
 intra merge, M22: the transforms of DIMD CUs, M23: LFNST of MIP, M24: TIMD, M25: OBIC and intra merge with TIMD
-neighbours, M26: TIMD-SAD, M27: OBIC and intra merge with TIMD-SAD neighbours); it is **not yet
+neighbours, M26: TIMD-SAD, M27: OBIC and intra merge with TIMD-SAD neighbours, M28: TIMD merge); it is **not yet
 faster than the CPU decoder** (see section 8) and supports only a restricted tool set (all real CTC streams fall back
 to the CPU, first reason: TMRL).
 
@@ -416,7 +416,7 @@ fetchRef2nd (the next line is read in a CTU's first row too), and the bilateral 
 keeps its unfiltered line in `s_ref[0]` and the next line in `s_ref[1]`; its planar reads the filtered line from
 `s_tmp`. The read ranges of TIMD blocks are both lines' whole arms. Transforms: explicit MTS and LFNST / NSPT by the
 published mode, MTSS with the secondary (MAP131TO67) where the CU blends. The pictures with TIMD run a fifth pipeline
-(`WITH_TIMD`). Rejected: TIMD merge, TIMD with ISP or MRL (no test stream: the stock encoder's TIMD-MRL
+(`WITH_TIMD`). Rejected: TIMD merge (until M28), TIMD with ISP or MRL (no test stream: the stock encoder's TIMD-MRL
 candidates hardly ever survive its SATD checks, none in the m24 set), TIMD CUs of several blocks, TIMD above 10 bits,
 IntraTMP / IBC (the only sources of TIMD's block vector candidates). Test sets: m24, encTest4 (ECM_TEST_NO_OBIC,
 NO_INTRA_MERGE, NO_TIMD_SAD) with the m23 arguments and `--EnableTMnoninterTools=1 --TIMD=1 --TIMDMerge=0` (without
@@ -466,6 +466,37 @@ screen_352x288 the encoder chose no TIMD-SAD CU, even with the switch. TIMD-SAD'
 (VARIANT_TIMD_SAD, WITH_TIMD_SAD): in the TIMD pipeline it slowed the TIMD pictures without TIMD-SAD by ~5 %, and
 its MRSAD sums take s_dimdHist (shared memory of their own slowed every pipeline by ~3 %). GPU time: m26 96, m26o
 73 ms per picture; m24 and m25 1 to 1.5 % slower than with M25, the other sets unchanged.
+M27: OBIC and intra merge CUs with TIMD-SAD neighbours. OBIC's histogram (`obicHistogram`) and intra merge's
+conversion (`mergeTimdParams`) read a TIMD neighbour's modes from the fields its blocks predict (`timdPredBase`: a
+TIMD-SAD CU's *Sad fields); intra merge's validity of a TIMD-SAD neighbour (`mergeTimdValid`): its TIMD-SAD blends or
+its TIMD-SAD mode is angular, or its plain TIMD's mode is (CU::isAValidNeighborForIntraMerge tests timdMode before
+timdModeSad). Test sets: m27 (encTest8 with ECM_TEST_NO_OBIC and PREFER_TIMD_SAD, the m24 arguments: intra merge CUs
+with TIMD-SAD neighbours), m27o (encTest8 with m25o's switches and PREFER_TIMD_SAD: OBIC CUs with TIMD-SAD
+neighbours). GPU time: m27 92, m27o 75 ms per picture.
+M28: TIMD merge (JVET-AJ0061, one merge candidate: NUM_TIMD_MERGE_MODES). A TIMD merge CU (`CU_TIMD` with
+TimdHead::merge; no DIMD, no MPM list) gets a node (`timdMergeNode`) that does deriveTimdMergeModes. The host finds
+searchTimdMrgCus' neighbours (up to five TIMD CUs, the nearest, in its order; IntraPrediction::searchTimdMrgCus is now
+static) and puts their records in the TimdHead (their nodes are the merge node's dependencies). The node takes each
+neighbour's fields as its blocks predict them (a TIMD merge neighbour's candidate, a TIMD-SAD one's TIMD-SAD) unless
+a candidate has its mode and secondary already (genTimdMrgList), costs two or more by the SATD of their mode on the
+CU's template of arms one sample thick (calcTimdMrgCandCosts calls CU::deriveTimdRefType with 1, not TIMD's 2 / 4),
+with the SIMD kernels of such arms (JVET-AJ0096: 1x16, which leaves out its last butterfly stage and takes the even
+samples' DC term; 1x8 scaled by 2 / sqrt(8); 1xN for 4), and takes the cheapest, or the second cheapest where it costs
+less than 1.1 times as much (the CPU's comparison in doubles exactly in integers: `timdMergeSwaps`). Its TimdOut holds
+the candidate's fields with every checkWA set (timdMrgModeCheckWA); its blocks predict as a TIMD CU's but for the
+fusion of a blend (initPredIntraParams' TIMD merge branch, DERIVE_TIMD_MERGE): the next line always fetched, the
+secondary predicted from it alone where its slope is fractional. Transforms: no MTS or transform skip; without LFNST in
+dual tree (TrQuant::xIT's TIMD merge branch) a side of 4 to 16 takes DST-VII, one above IntraMTSMaxSize DCT-II, any
+other the candidate's type (timdmTrType: DERIVE_INHERIT_HOR / VER, with DERIVE_TRANSFORM), for which every TIMD CU's
+node stores its own getTrTypes types in its TimdOut (TIMD_OUT_TR_*: explicit MTS's by its mode, else the host's), in
+the pipeline with TIMD merge only. Intra merge drops a TIMD merge neighbour whose TIMD does not convert (it has no
+DIMD to fall back on: MERGE_NBR_TIMD_MERGE); OBIC reads it as a TIMD neighbour. Verification compares the candidate's
+fields and every TIMD CU's transform types. The pictures with TIMD merge run a pipeline of their own
+(VARIANT_TIMD_MERGE, WITH_TIMD_MERGE; with TIMD-SAD). Test sets: m28 (encTest4 with ECM_TEST_NO_OBIC and
+NO_INTRA_MERGE, TIMD-SAD allowed, the m24 arguments with `--TIMDMerge=1`: 36 to 164 TIMD merge CUs per CIF picture,
+573 per four720 picture, of whose blocks 62 inherit transform types), m28m (encTest4 without switches: ~930 intra
+merge CUs per four720 picture next to 287 TIMD merge CUs). GPU time: m28 96, m28m 110 ms per picture; the other sets
+unchanged within 0.4 % (the kernels of the one-sample template exist in the TIMD merge pipeline only).
 
 ## 8. Numbers (i7-10700 8C/16T, Win11, GCC 16.2, RTX 3070 driver 616.92)
 
@@ -495,7 +526,8 @@ Profile of a GPU-on decode (non-LTO, m2_park16, share of all samples): parsing ~
    (the m19 set, encoded by the stock encoder with DIMD: OBIC and intra merge everywhere), M22 the transforms of DIMD
    CUs and MTSS (the m22 and m22o sets), M23 LFNST / NSPT of MIP (the m23 set), M24 TIMD (the m24 and m24s sets),
    M25 OBIC and intra merge with TIMD neighbours (the m25, m25o, m25s and m25os sets), M26 TIMD-SAD (the m26 and
-   m26o sets), M27 OBIC and intra merge with TIMD-SAD neighbours (the m27 and m27o sets).
+   m26o sets), M27 OBIC and intra merge with TIMD-SAD neighbours (the m27 and m27o sets), M28 TIMD merge (the m28 and
+   m28m sets).
    All 19 regular streams now stop at "TMRL" (the next sequence-level check; the block-level tools of step 4 follow).
 3. Make the GPU path win on CPU time per picture: the derive-only pass (record during parsing or a leaner pass;
    speed up getSpatialIpm/getPURestricted, which also helps the CPU decoder), GPU behaviour with frame threads
@@ -516,9 +548,10 @@ Profile of a GPU-on decode (non-LTO, m2_park16, share of all samples): parsing ~
    cells of the CU's top left where the cell indices' sum is odd; with ECM_TEST_TIMD_SPARSE in all cells but those
    whose indices are both multiples of 4) and ECM_TEST_FORCE_OBIC (an OBIC mode's RD cost in estIntraPredLumaQT divided
    by 4; xCheckRDCostIntra recomputes the CU's cost from its bits and distortion, so the partitioning sees the true
-   cost); `bin\encTest8` (m26o) adds ECM_TEST_PREFER_TIMD_SAD (`testTimd` off where `testTimdSad`). Next TIMD merge,
-   MPM sorting / MDIP / PDP, TMRL, CCLM/CCCM and the other
-   cross-component tools, chroma reordering / DBV, IntraTMP / IBC, implicit MTS (not in CTC), then inter pictures.
+   cost); `bin\encTest8` (m26o) adds ECM_TEST_PREFER_TIMD_SAD (`testTimd` off where `testTimdSad`). Next MPM sorting /
+   MDIP / PDP, TMRL, CCLM/CCCM and the other cross-component tools, chroma reordering / DBV, IntraTMP / IBC, implicit
+   MTS (not in CTC; its test set, the m24 arguments with `--MTS=0 --MTSImplicit=1`, is encoded:
+   `streams_gpu\pending\imts_*`), then inter pictures.
    Intra merge's GPU time (m19: park720 152, four720 183 ms per picture, from 347 / 392 at first) has room: the
    candidate walk and the reference padding are single-invocation steps on the dependency chain. Each level: new
    test set with exactly that tool on, verify mode identical, ON mode identical (and `ECM_GPU_DUMP` +

@@ -93,6 +93,14 @@ const int DERIVE_MIP_DIMD = 2048;
 const int DERIVE_TIMD = 4096;
 // the SPS disables intra fusion (DisableIntraFusion), also blended TIMD's fusion of close modes
 const int DERIVE_NO_FUSION = 8192;
+// a block of a TIMD merge CU (with DERIVE_TIMD): where its modes blend, the secondary mode is predicted from the next
+// reference line wherever its slope is fractional (initPredIntraParams' TIMD merge branch), not by TIMD's rule
+const int DERIVE_TIMD_MERGE = 16384;
+// a block of a TIMD merge CU whose rows / columns take the transform type its chosen candidate gives (TrQuant::xIT's
+// TIMD merge branch: a side of 4 to 16 takes DST-VII, one above IntraMTSMaxSize DCT-II, which the host sets): the
+// type in the CU's TimdOut (TIMD_OUT_TR_HOR / TIMD_OUT_TR_VER), with DERIVE_TRANSFORM
+const int DERIVE_INHERIT_HOR = 32768;
+const int DERIVE_INHERIT_VER = 65536;
 
 // Params::dbgParams per block: the derived dirMode, isModeVer, intraPredAngle, absInvAngle, useCubic, refFilter,
 // applyPDPC, gradPDPC, angularScale, fusion, bf, plIdx, then mtxV, mtxH, secMatrix, secTranspose, secLayout
@@ -225,20 +233,32 @@ const int MERGE_HEAD      = MERGE_HEAD_T + TEMPLATE_UNITS;
 
 // a TIMD CU's record in Params::timdData (layout shared with GpuIntraRec.cpp): this header, then the availability
 // bits of its template's reference units, then those of its TIMD-SAD template's
+const int TIMD_MERGE_CANDS = 5;   // the neighbours searchTimdMrgCus keeps (its limitMaxNeigh)
 struct TimdHead
 {
   int           index;   // its index among the TIMD CUs (Params::timdOut)
   int           type;    // its template (CU::deriveTimdRefType): TIMD_NONE (the picture's top-left CU), TIMD_ABOVE,
                          // TIMD_LEFT, TIMD_BOTH
   int           waip;    // where deriveTimdMode's wide angles beyond the regular ones may reach: TIMD_WAIP_* bits
-  TemplateUnits t;       // its template, an arm it lacks 0
+  TemplateUnits t;       // its template, an arm it lacks 0 (a TIMD merge CU's calcTimdMrgCandCosts', one sample thick)
   int           sad;     // a TIMD-SAD CU (CodingUnit::timdSad): its node also does deriveTimdModeSad
   TemplateUnits ts;      // deriveTimdModeSad's template (arms of up to 8; of the same type), where sad
+  // the transform types of the CU's luma block as TrQuant::getTrTypes gives them (CodingUnit::timdmTrType, which a TIMD
+  // merge CU may take): explicit MTS's pair index where the mode chooses its kernels (-1: none), else the types
+  int           mtsTrIdx;
+  int           trHor, trVer;
+  // a TIMD merge CU (CodingUnit::timdMrg): its candidates' number (0: not TIMD merge) and records, searchTimdMrgCus'
+  // neighbours in its order; inheritTr: the candidates give their transform types (genTimdMrgList, dual tree), else DCT-II
+  int           merge;
+  int           mergeNbr[TIMD_MERGE_CANDS];
+  int           inheritTr;
 };
-const int TIMD_HEAD_T   = 3;                             // the offset of TimdHead::t
-const int TIMD_HEAD_SAD = TIMD_HEAD_T + TEMPLATE_UNITS;  // of TimdHead::sad
-const int TIMD_HEAD_TS  = TIMD_HEAD_SAD + 1;             // of TimdHead::ts
-const int TIMD_HEAD     = TIMD_HEAD_TS + TEMPLATE_UNITS;
+const int TIMD_HEAD_T          = 3;                               // the offset of TimdHead::t
+const int TIMD_HEAD_SAD        = TIMD_HEAD_T + TEMPLATE_UNITS;    // of TimdHead::sad
+const int TIMD_HEAD_TS         = TIMD_HEAD_SAD + 1;               // of TimdHead::ts
+const int TIMD_HEAD_MTS_TR_IDX = TIMD_HEAD_TS + TEMPLATE_UNITS;   // of TimdHead::mtsTrIdx
+const int TIMD_HEAD_MERGE      = TIMD_HEAD_MTS_TR_IDX + 3;        // of TimdHead::merge
+const int TIMD_HEAD            = TIMD_HEAD_MERGE + 2 + TIMD_MERGE_CANDS;
 const int TIMD_NONE   = 0;
 const int TIMD_ABOVE  = 1;
 const int TIMD_LEFT   = 2;
@@ -251,10 +271,14 @@ const int TIMD_WAIP_MIN_FAR   = 8;   // decreaseMinFar: a PU left, a CU height f
 // a TIMD CU's TIMD as its node derives it (TIMD_OUT int32 per TIMD CU in Params::timdOut): the CodingUnit fields
 // deriveTimdMode sets, those it does not at their initial values (-1 modes and weights, 0 location dependence); from
 // TIMD_OUT_SAD a TIMD-SAD CU's deriveTimdModeSad's alike (timdModeSad, ... timdModeSecondaryCheckWASad: the same
-// fields at the same offsets), which its blocks predict
+// fields at the same offsets), which its blocks predict; a TIMD merge CU's chosen candidate in the first fields (its
+// timdMrgList[0], ... timdMrgModeCheckWA[0]). Then, in the pipelines with TIMD merge, the CU's transform types
+// (timdmTrType: a TIMD merge CU's inherited ones, another's own)
 const int TIMD_OUT_FIELDS          = 12;   // the fields of one derivation
-const int TIMD_OUT                 = 2 * TIMD_OUT_FIELDS;
-const int TIMD_OUT_SAD             = TIMD_OUT_FIELDS;   // the offset of deriveTimdModeSad's
+const int TIMD_OUT_SAD             = TIMD_OUT_FIELDS;       // the offset of deriveTimdModeSad's
+const int TIMD_OUT_TR_HOR          = 2 * TIMD_OUT_FIELDS;   // timdmTrType's horizontal type
+const int TIMD_OUT_TR_VER          = TIMD_OUT_TR_HOR + 1;   // and vertical one
+const int TIMD_OUT                 = TIMD_OUT_TR_VER + 1;
 const int TIMD_OUT_MODE            = 0;    // timdMode (131-mode set; the regular mode of a wide angle beyond them)
 const int TIMD_OUT_SECONDARY       = 1;    // timdModeSecondary
 const int TIMD_OUT_NON_ANG         = 2;    // timdModeNonAng (planar / DC)
@@ -267,6 +291,7 @@ const int MERGE_NBR_MERGE = 1;   // an intra merge CU: always a candidate, its m
 const int MERGE_NBR_OBIC  = 2;   // an OBIC CU: always, its OBIC converted
 const int MERGE_NBR_DIMD  = 3;   // a DIMD CU or an MPM CU: where its DIMD blends, its DIMD
 const int MERGE_NBR_TIMD  = 4;   // a TIMD CU: where its modes blend or its mode is angular, its TIMD converted (or its DIMD)
+const int MERGE_NBR_TIMD_MERGE = 5;   // a TIMD merge CU: as a TIMD CU, but no candidate where its TIMD does not convert
 layout( buffer_reference, std430, buffer_reference_align = 8 ) buffer BufU64 { uint64_t v[]; };
 
 // the directory of the transform tables (in matrices at Params::trTables, GpuIntraRec.cpp's createShared): the
@@ -285,6 +310,7 @@ const int TR_TAB_EXT_MODES    = 10;   // value: NUM_EXT_LUMA_MODE
 const int TR_TAB_SET_ROW      = 11;   // value: the length of g_aucTrSet's rows
 const int TR_TAB_IDTR         = 12;   // value: the identity transform's type (IDTR)
 const int TR_TAB_NUM          = 13;
+const int TR_DCT2             = 0;    // DCT-II's transform type (TransType)
 
 // the NSPT shapes (w x h) of TR_TAB_NSPT_MATRIX
 int nsptShape( int w, int h )
