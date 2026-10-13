@@ -137,6 +137,18 @@ lower all-core turbo, one duplicated intra frame per chunk, unequal chunk comple
   ends (each picture buffer has its own unit cache, so it would keep them). RA 1080p with N = 8 and the automatic
   M = 8 (a synthetic sequence on the 8 P-cores, commit sampled every 2 s, from 75 to 150 s): about 8.9 GB on average
   (working set 6.0 GB), peak 9.6 GB (working set 6.9 GB).
+- No options, all 20 cores of the Core Ultra 7 265K (20 threads chosen), one run at a time, foreman 128x128 QP 32,
+  against one thread (the previous default) and `--ParallelSegments=20`; bitstreams identical:
+
+| test | one thread | `--ParallelSegments=20` | no options | vs one thread | vs ParallelSegments |
+|---|---|---|---|---|---|
+| AI, 33 pictures (TemporalSubsampleRatio 8) | 201.2 s | 16.8 s | 19.0 s | 10.6x | 0.88x |
+| RA, 65 frames (2 intra periods) | 540.0 s | 297.7 s | 206.7 s | 2.61x | 1.44x |
+| RA, 513 frames (16 intra periods) | (not run) | 423.2 s | 341.3 s | | 1.24x |
+
+  1080p RA with no options (a synthetic 300-frame sequence): 20 threads and 10 periods chosen; from 75 to 150 s the
+  commit averaged 14.1 GB (peak 15.1 GB), the working set 8.0 GB (peak 9.2 GB), about half the automatic budget's
+  estimate.
 - Core Ultra 7 265K, one run at a time on the 8 P-cores, foreman 128x128 QP 32 (ai_long's and ra_long's
   configurations), the previous commit's single-thread time as base, automatic M:
 
