@@ -1491,12 +1491,20 @@ public:
 };
 
 #if REUSE_CU_RESULTS
+// the best-encoding cache makes a slot's TU buffers at its first store (the configuration this repository builds)
+#define BEST_ENC_INFO_LAZY_TU_BUFFERS ( CONVERT_NUM_TU_SPLITS_TO_CFG && SIGN_PREDICTION && JVET_Y0141_SIGN_PRED_IMPROVE )
+
 struct BestEncodingInfo
 {
   CodingUnit     cu;
   PredictionUnit pu;
 #if CONVERT_NUM_TU_SPLITS_TO_CFG
   std::vector<TransformUnit> tus;
+#if BEST_ENC_INFO_LAZY_TU_BUFFERS
+  /// the TUs' coefficient, sign, PCM and run-type buffers, made at the slot's first store (most slots are never
+  /// stored): BestEncInfoCache::xCreateTuBuffers
+  std::unique_ptr<uint8_t[]> tuStorage;
+#endif
 #elif REUSE_CU_RESULTS_WITH_MULTIPLE_TUS
   TransformUnit  tus[MAX_NUM_TUS];
   size_t         numTus;
@@ -1561,6 +1569,12 @@ protected:
   void create   ( const ChromaFormat chFmt );
 #endif
   void destroy  ();
+#if BEST_ENC_INFO_LAZY_TU_BUFFERS
+private:
+  void xCreateTuBuffers( BestEncodingInfo& encInfo );
+  bool m_usePLT = false;   ///< palette mode: the TUs get run-type buffers
+protected:
+#endif
 
   bool setFromCs( const CodingStructure& cs, const Partitioner& partitioner );
   bool isValid  ( const CodingStructure &cs, const Partitioner &partitioner, int qp );

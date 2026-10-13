@@ -1047,6 +1047,7 @@ void BestEncInfoCache::destroy()
         delete[] m_bestEncInfo[treeIdx][x][y];
       }
     }
+#if !BEST_ENC_INFO_LAZY_TU_BUFFERS   // else the slots own their TU buffers
     delete[] m_pCoeff[treeIdx];
 #if SIGN_PREDICTION
     delete[] m_pCoeffSign[treeIdx];
@@ -1062,6 +1063,7 @@ void BestEncInfoCache::destroy()
       delete[] m_runType[treeIdx];
       m_runType[treeIdx] = nullptr;
     }
+#endif
 
   }
 
@@ -1091,6 +1093,7 @@ void BestEncInfoCache::destroy()
     }
   }
 
+#if !BEST_ENC_INFO_LAZY_TU_BUFFERS   // else the slots own their TU buffers
   delete[] m_pCoeff;
 #if SIGN_PREDICTION
   delete[] m_pCoeffSign;
@@ -1105,6 +1108,7 @@ void BestEncInfoCache::destroy()
     delete[] m_runType;
     m_runType = nullptr;
   }
+#endif
 
 #endif
 
@@ -1117,6 +1121,12 @@ void BestEncInfoCache::init( const Slice &slice )
   m_slice_bencinf = &slice;
 
   if( isInitialized ) return;
+
+#if BEST_ENC_INFO_LAZY_TU_BUFFERS
+  // the TU buffers of a slot are made at its first store (xCreateTuBuffers)
+  m_dummyCS.pcv = slice.getPPS()->pcv;
+  m_usePLT      = slice.getSPS()->getPLTMode();
+#else
 
   const unsigned numPos = slice.getSPS()->getMaxCUWidth() >> MIN_CU_LOG2;
 
@@ -1359,12 +1369,60 @@ void BestEncInfoCache::init( const Slice &slice )
 #if JVET_AI0136_ADAPTIVE_DUAL_TREE
   }
 #endif
+#endif   // !BEST_ENC_INFO_LAZY_TU_BUFFERS
 
 #if ENABLE_SPLIT_PARALLELISM
 
   m_currTemporalId = 0;
 #endif
 }
+
+#if BEST_ENC_INFO_LAZY_TU_BUFFERS
+void BestEncInfoCache::xCreateTuBuffers( BestEncodingInfo& encInfo )
+{
+  // one allocation, carved per TU and block as the shared buffers were: coefficients, sign scan indices, PCM samples,
+  // signs and (palette) run types of the first two blocks, largest element type first so each part stays aligned
+  size_t numSamples = 0;
+  for( const TransformUnit& tu : encInfo.tus )
+  {
+    for( const CompArea& blk : tu.blocks )
+    {
+      numSamples += blk.area();
+    }
+  }
+  const size_t bytesPerSample = sizeof( TCoeff ) + sizeof( unsigned ) + sizeof( Pel ) + sizeof( SIGN_PRED_TYPE )
+                                + ( m_usePLT ? sizeof( bool ) : 0 );
+  encInfo.tuStorage.reset( new uint8_t[numSamples * bytesPerSample] );
+  TCoeff*         coeffPtr   = reinterpret_cast<TCoeff*>( encInfo.tuStorage.get() );
+  unsigned*       scanIdxPtr = reinterpret_cast<unsigned*>( coeffPtr + numSamples );
+  Pel*            pcmPtr     = reinterpret_cast<Pel*>( scanIdxPtr + numSamples );
+  SIGN_PRED_TYPE* signPtr    = reinterpret_cast<SIGN_PRED_TYPE*>( pcmPtr + numSamples );
+  bool*           runTypePtr = m_usePLT ? reinterpret_cast<bool*>( signPtr + numSamples ) : nullptr;
+
+  for( TransformUnit& tu : encInfo.tus )
+  {
+    TCoeff*         coeff[MAX_NUM_TBLOCKS]       = {};
+    SIGN_PRED_TYPE* sign[MAX_NUM_TBLOCKS]        = {};
+    unsigned*       signScanIdx[MAX_NUM_TBLOCKS] = {};
+    Pel*            pcm[MAX_NUM_TBLOCKS]         = {};
+    bool*           runType[MAX_NUM_TBLOCKS - 1] = {};
+    for( int i = 0; i < (int) tu.blocks.size(); i++ )
+    {
+      const size_t area = tu.blocks[i].area();
+      coeff[i]       = coeffPtr;   coeffPtr   += area;
+      signScanIdx[i] = scanIdxPtr; scanIdxPtr += area;
+      pcm[i]         = pcmPtr;     pcmPtr     += area;
+      sign[i]        = signPtr;    signPtr    += area;
+      if( i < 2 && runTypePtr )
+      {
+        runType[i] = runTypePtr;   runTypePtr += area;
+      }
+    }
+    tu.cs = &m_dummyCS;
+    tu.init( coeff, sign, signScanIdx, pcm, runType );
+  }
+}
+#endif
 
 bool BestEncInfoCache::setFromCs( const CodingStructure& cs, const Partitioner& partitioner )
 {
@@ -1392,6 +1450,12 @@ bool BestEncInfoCache::setFromCs( const CodingStructure& cs, const Partitioner& 
   if (!(m_bestEncInfo[m_treeIdx][idx1][idx2][idx3][idx4]))
   {
     return false;
+  }
+#endif
+#if BEST_ENC_INFO_LAZY_TU_BUFFERS
+  if( !encInfo.tuStorage )
+  {
+    xCreateTuBuffers( encInfo );
   }
 #endif
   encInfo.poc            =  cs.picture->poc;
