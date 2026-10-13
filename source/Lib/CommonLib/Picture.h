@@ -133,6 +133,15 @@ void create(
   /// source read into a higher internal bit depth gives); unpackWaitingBufs restores them
   void packWaitingBufs( const BitDepths& bitDepths );
   void unpackWaitingBufs();
+  /// frame threads: a picture whose original is the input frame as read holds no original while it waits for its
+  /// search; the search start reads the frame again (EncTemporalFilter::readFrame into recreateOrigBuf)
+  void        dropWaitingOrig( const BitDepths& bitDepths );   // (the bit depths: for ORIG_RELOAD_CHECK)
+  PelStorage& recreateOrigBuf();
+#if ORIG_RELOAD_CHECK
+  void        checkReloadedOrig();   ///< compares the original read again with the dropped one
+#endif
+  int         inputFrameIndex = -1;    ///< the picture's frame in the input file (EncLib::encodePrep), -1 if unknown
+  bool        origDropped     = false; ///< dropWaitingOrig, until recreateOrigBuf
 
          PelBuf     getOrigBuf(const CompArea &blk);
   const CPelBuf     getOrigBuf(const CompArea &blk) const;

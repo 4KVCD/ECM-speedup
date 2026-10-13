@@ -1881,11 +1881,7 @@ void EncApp::createLib( const int layerIdx )
   m_ext360 = new TExt360AppEncTop( *this, m_cEncLib.getGOPEncoder()->getExt360Data(), *( m_cEncLib.getGOPEncoder() ), *m_orgPic );
 #endif
 
-#if JVET_Y0240_BIM
-  if( m_gopBasedTemporalFilterEnabled || m_bimEnabled )
-#else
-  if( m_gopBasedTemporalFilterEnabled )
-#endif
+  // always: the frame threads read originals again from the input file through it (EncTemporalFilter::readFrame)
   {
 #if JVET_AA0146_WRAP_AROUND_FIX
     m_cEncLib.getTemporalFilter().init(m_FrameSkip, m_inputBitDepth, m_MSBExtendedBitDepth, m_internalBitDepth, m_sourceWidth,

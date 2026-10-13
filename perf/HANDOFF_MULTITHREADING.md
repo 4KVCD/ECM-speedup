@@ -199,6 +199,14 @@ Commits on `enc-mt`, all bit-exact with stock ECM-20.0 (bitstream md5 of the sui
 - RAM step R6: the CCSAO edge statistics per CTU (`CcSaoCtuStatData`) sum in 32 bits: a running finish's SAO
   statistics 0.64 -> 0.43 GB at 1080p; 1.3 % faster on the suite. RA 1080p with 8 threads and 8 periods, 75-150 s,
   after R1-R6: about 8.9 GB on average (working set 6.0 GB), peak 9.6 GB (working set 6.9 GB).
+- RAM step R7: a waiting picture holds no original when the input is a file and the temporal filter left the frame
+  as read: the setup drops it (`Picture::dropWaitingOrig`) and the search start reads the frame again
+  (`EncTemporalFilter::readFrame`, the filter's own reader, initialized for every encode now; the frame index comes
+  from `EncLib::encodePrep`). Filtered pictures keep their packed originals as in R2. 1080p RA with no options (20
+  threads, 10 periods), 75-150 s: commit 14.07 -> 13.31 GB, working set 8.04 -> 7.27 GB. A check build
+  (`-DORIG_RELOAD_CHECK=1`) compares every frame read again with the dropped one. Found on the way: the application
+  sets the temporal filter's input file after `EncLib::init`, so the decision is made at the first setup
+  (`EncLib::isOrigReloadable`).
 - Speed step S1: in all intra, the pictures waiting for a search stack take them in order of decreasing luma activity
   (`EncGOP::xFtSearchPriority`, the cost estimate of `--ParallelSegments`) instead of coding order, so the expensive
   pictures do not start last. AI 33 pictures, 2 runs each alternating with the previous build: 8 P-cores 34.5 -> 33.0 s

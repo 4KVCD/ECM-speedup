@@ -37,6 +37,7 @@
 
 #include "EncTemporalFilter.h"
 #include "Utilities/VideoIOYuv.h"
+#include <fstream>
 #include <math.h>
 
 
@@ -156,6 +157,30 @@ bool EncTemporalFilter::filtersFrame( int receivedPoc ) const
     }
   }
   return false;
+}
+
+bool EncTemporalFilter::inputIsFile() const
+{
+  std::ifstream file( m_inputFileName, std::ios::binary );
+  return file.good() && m_inputFileName != "-";
+}
+
+bool EncTemporalFilter::readFrame( PelStorage& orgPic, int inputFrameIndex ) const
+{
+  VideoIOYuv yuvFrames;
+  yuvFrames.open( m_inputFileName, false, m_inputBitDepth, m_MSBExtendedBitDepth, m_internalBitDepth );
+  if( !yuvFrames.isOpen() )
+  {
+    return false;
+  }
+  yuvFrames.skipFrames( inputFrameIndex, m_sourceWidth - m_pad[0], m_sourceHeight - m_pad[1], m_chromaFormatIDC );
+  PelStorage trueOrg;   // the frame before the colour space conversion, which the application keeps apart
+  trueOrg.create( m_chromaFormatIDC, m_area, 0, m_padding );
+  const bool read = yuvFrames.read( orgPic, trueOrg, m_inputColourSpaceConvert, const_cast<int*>( m_pad ), m_chromaFormatIDC,
+                                    m_clipInputVideoToRec709Range );
+  trueOrg.destroy();
+  yuvFrames.close();
+  return read;
 }
 
 bool EncTemporalFilter::filter(PelStorage &orgPic, int receivedPoc)

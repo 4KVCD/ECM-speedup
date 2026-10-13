@@ -2739,6 +2739,7 @@ void EncGOP::compressGOP(int iPOCLast, int iNumPicRcvd, PicList &rcListPic, std:
     pcPic->scheduler.init( pcPic->cs->pcv->heightInCtus, pcPic->cs->pcv->widthInCtus, 1                          , 0                             , m_pcCfg->getNumSplitThreads() );
 #endif
     const bool isCurrentFrameFiltered = xUseFilteredOrig();
+    bool       origIsInputFrame       = pcPic->inputFrameIndex >= 0;   // the original is the input frame as read
     const SPS& sps = *pcPic->cs->sps;
     // frame threads: a picture that waits for its search holds of the temporary buffers only the true original, and
     // that only if the temporal filter changes its original; the search start creates the others (xStartPicSearch)
@@ -2752,6 +2753,7 @@ void EncGOP::compressGOP(int iPOCLast, int iNumPicRcvd, PicList &rcListPic, std:
     {
       pcPic->createTrueOrigBuf( pcPic->cs->pps->pcv->maxCUWidth );
       pcPic->getTrueOrigBuf().copyFrom( pcPic->getOrigBuf() );
+      origIsInputFrame = false;   // the filter changes the original below
     }
     if (m_pcEncLib->isResChangeInClvsEnabled())
     {
@@ -4205,6 +4207,10 @@ void EncGOP::compressGOP(int iPOCLast, int iNumPicRcvd, PicList &rcListPic, std:
     if( m_ftActive )
     {
       picOrder->searchPriority = xFtSearchPriority( *pcPic, *picOrder );
+      if( origIsInputFrame && m_pcEncLib->isOrigReloadable() )
+      {
+        pcPic->dropWaitingOrig( pcSlice->getSPS()->getBitDepths() );   // read again at its search start (xStartPicSearch)
+      }
       pcPic->packWaitingBufs( pcSlice->getSPS()->getBitDepths() );   // until its search starts
       picOrder->setup.reset( new EncSliceSetup );
       m_pcSliceEncoder->saveSetup( *picOrder->setup );
@@ -7675,6 +7681,14 @@ void EncGOP::xStartPicSearch( Picture* pic, PicHeader* picHeader, Slice* slice, 
     m_pcSliceEncoder = &m_pcSearchStack->sliceEncoder;
     m_pcSliceEncoder->loadSetup( *order.setup, *pic );
     order.setup.reset();
+    if( pic->origDropped )
+    {
+      const bool read = m_pcEncLib->getTemporalFilter().readFrame( pic->recreateOrigBuf(), pic->inputFrameIndex );
+      CHECK( !read, "Could not read the picture's original again from the input file" );
+#if ORIG_RELOAD_CHECK
+      pic->checkReloadedOrig();
+#endif
+    }
     pic->unpackWaitingBufs();
     // the temporary buffers the setup left out: the true original of a picture the temporal filter left as it was,
     // and the filtered original, are copies of the original, which nothing changes between the setup and here

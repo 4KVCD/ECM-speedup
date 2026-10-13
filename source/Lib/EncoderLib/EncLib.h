@@ -170,6 +170,10 @@ private:
   std::mutex                m_picListMutex;
   std::deque<Picture*>      m_ftOutputQueue;
   std::set<const Picture*>  m_ftBusyPics;
+  int                       m_numInputPics  = 0;       ///< pictures received (encodePrep): their frames in the input file
+  int                       m_origReloadable = -1;     ///< frame threads: the search start can read a picture's original
+                                                       ///< again from the input file (Picture::dropWaitingOrig); -1: not
+                                                       ///< decided yet (the application sets the input file after init)
   int                       m_layerId;
 
   // the slice and CU encoders and the searches, one stack per picture searched at the same time
@@ -342,6 +346,7 @@ public:
   ParameterSetMap<APS>*  getApsMap() { return &m_apsMap; }
 
   EncTemporalFilter&     getTemporalFilter()                    { return m_temporalFilter; }
+  bool                   isOrigReloadable();
 
   bool                   getPltEnc()                      const { return   m_doPlt; }
   void                   checkPltStats( Picture* pic );

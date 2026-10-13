@@ -1369,6 +1369,9 @@ bool EncLib::encodePrep(bool flush, PelStorage* pcPicYuvOrg, const InputColourSp
     {
       pcPicCurr->M_BUFS( 0, PIC_ORIGINAL ).swap( *pcPicYuvOrg );
     }
+    // the frames come in input order, FrameSkip and the subsampling applied by the application
+    pcPicCurr->inputFrameIndex = int( getFrameSkip() + m_numInputPics * getTemporalSubsampleRatio() );
+    m_numInputPics++;
 
 #if JVET_AK0065_TALF
     pcPicCurr->finalInit( m_vps, *pSPS, *pPPS, &m_picHeader, m_apss, m_apss2, m_lmcsAPS, m_scalinglistAPS );
@@ -1620,6 +1623,17 @@ bool EncLib::encode( const InputColourSpaceConversion snrCSC, std::list<PelUnitB
  .
  \retval rpcPic obtained picture buffer
  */
+bool EncLib::isOrigReloadable()
+{
+  if( m_origReloadable < 0 )
+  {
+    // frame threads: a waiting picture's original is read again from the input file at its search start, if the
+    // input is one (decided at the first setup: the application sets the temporal filter's input file after init)
+    m_origReloadable = getFrameThreads() > 1 && !isResChangeInClvsEnabled() && m_temporalFilter.inputIsFile();
+  }
+  return m_origReloadable > 0;
+}
+
 bool EncLib::getFrameThreadsOutput( PelUnitBuf& rec )
 {
   if( m_ftOutputQueue.empty() || !m_cGOPEncoder.isPicDone( m_ftOutputQueue.front() ) )

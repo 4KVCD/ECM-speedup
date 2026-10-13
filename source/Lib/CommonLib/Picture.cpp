@@ -36,6 +36,7 @@
  */
 
 #include "Picture.h"
+#include <atomic>
 #include "SEI.h"
 #include "ChromaFormat.h"
 #include "CommonLib/InterpolationFilter.h"
@@ -414,13 +415,64 @@ bool Picture::xPackBuf( PictureType type, const BitDepths& bitDepths )
   return true;
 }
 
+void Picture::dropWaitingOrig( const BitDepths& bitDepths )
+{
+#if ORIG_RELOAD_CHECK
+  if( !xPackBuf( PIC_ORIGINAL, bitDepths ) )   // kept for checkReloadedOrig
+#else
+  (void) bitDepths;
+#endif
+  {
+    M_BUFS( 0, PIC_ORIGINAL ).destroy();
+  }
+  origDropped = true;
+}
+
+PelStorage& Picture::recreateOrigBuf()
+{
+  M_BUFS( 0, PIC_ORIGINAL ).create( chromaFormat, Area( Position(), lumaSize() ) );   // as create() makes it
+  origDropped = false;
+  return M_BUFS( 0, PIC_ORIGINAL );
+}
+
+#if ORIG_RELOAD_CHECK
+void Picture::checkReloadedOrig()
+{
+  if( m_packedBufs.empty() || m_packedBufs.front().type != PIC_ORIGINAL )
+  {
+    return;   // the dropped original was not lossless in 8 bits: nothing kept to compare with
+  }
+  PelStorage reloaded;   // a copy of the original read again; the dropped one is unpacked over it
+  reloaded.create( chromaFormat, Area( Position(), lumaSize() ) );
+  reloaded.copyFrom( M_BUFS( 0, PIC_ORIGINAL ) );
+  M_BUFS( 0, PIC_ORIGINAL ).destroy();
+  unpackWaitingBufs();
+  const PelStorage& dropped = M_BUFS( 0, PIC_ORIGINAL );
+  for( uint32_t c = 0; c < dropped.bufs.size(); c++ )
+  {
+    const PelBuf& a = dropped.bufs[c];
+    const PelBuf& b = reloaded.bufs[c];
+    for( int y = 0; y < (int) a.height; y++ )
+    {
+      CHECK( memcmp( a.bufAt( 0, y ), b.bufAt( 0, y ), a.width * sizeof( Pel ) ) != 0, "The original read again differs" );
+    }
+  }
+  reloaded.destroy();
+  static std::atomic<int> checked( 0 );
+  if( ++checked % 10 == 1 )
+  {
+    fprintf( stderr, "ORIG_RELOAD_CHECK: %d originals read again as dropped\n", checked.load() );
+  }
+}
+#endif
+
 void Picture::unpackWaitingBufs()
 {
   for( PackedBuf& packed: m_packedBufs )
   {
     if( packed.type == PIC_ORIGINAL )
     {
-      M_BUFS( 0, PIC_ORIGINAL ).create( chromaFormat, Area( Position(), lumaSize() ) );   // as create() makes it
+      recreateOrigBuf();
     }
     else
     {
