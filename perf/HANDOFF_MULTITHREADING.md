@@ -225,6 +225,16 @@ Commits on `enc-mt`, all bit-exact with stock ECM-20.0 (bitstream md5 of the sui
   alone). AI 33 pictures, 2 runs each alternating with the previous commit: 20 threads unpinned 21.85 -> 19.0 s,
   8 threads on the P-cores 29.1 -> 29.2 s (coding order was already balanced there: about 7 s of CPU a picture on 8
   cores). `--ParallelSegments=20` takes 16.8 s. RA and LD: unchanged (coding order; the earliest is always first).
+- Speed step S5: `EncLib::create` and `init` make the search stacks and the finish objects in threads of their own
+  (`runInParallel`): 20 stacks took about a second serially before the first picture could start (memory-bound:
+  allocation and first touch of about 0.6 GB each). AI 33 pictures with 20 threads 21.6 -> 20.65 s (2 runs each).
+  Bounds found with `sim_prio.py` (the trace's costs, 17 periods): with unlimited cores the sequence reaches 14.8x;
+  the finish order costs 8 % of that and the same-layer CABAC chain 0.2 % (the chain pictures of layers 4 and 5 are no
+  references, so a search-end context store would cut it, for nothing). A period's critical path is its reference
+  chain plus the layer-4 chain (I, T1, T2, T3, then 8 layer-4 pictures each waiting for the previous one's contexts):
+  about half the period's work, so a period alone gains at most about 2x, and the heaviest period's chain (333 s)
+  exceeds the ideal 20-core time (246 s): long RA is bound by its heaviest period, bit-exactly. Only shorter pictures
+  (wavefront or tile parallelism inside a picture, which changes the bitstream) move that.
 - RA 513 frames with 20 threads, timeline (`ECM_FT_TRACE` probe, `C:\Code\work\mt\trace_patch2.py`): all 16
   periods start at once and all 20 stacks search from about 60 to 160 s; the second half is a tail (16 down to 1
   searching) of the heaviest periods' chains (period cost varies 6x on this sequence). The schedule simulation

@@ -128,6 +128,8 @@ lower all-core turbo, one duplicated intra frame per chunk, unequal chunk comple
   frames (5 periods) about 4.2x with 8 threads, RA 257 frames (9 periods) 4.16x with M = 4 and 6.49x with M = 8
   (`perf/mt/p5_sim.py` models 4.75x and 7.00x; the window has to hold the periods' pictures). LD gains nothing.
   `--ParallelSegments` combines with it.
+- The search stacks and the finish objects are created in threads of their own at start (20 stacks took about a
+  second serially before the first picture could start: AI 33 pictures with 20 threads 21.6 -> 20.65 s).
 - Memory: a search stack commits about 0.6 GB whatever the resolution; the setup stack and the finish stacks are
   small. Each period beyond the first adds a finish context (about 0.13 GB at 1080p while idle; a running finish
   creates the SAO statistics, 0.43 GB at 1080p, and frees them after its SAO and CCSAO; one finish at a time holds

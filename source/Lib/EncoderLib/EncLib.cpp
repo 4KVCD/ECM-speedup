@@ -49,6 +49,28 @@
 #include "EncLibCommon.h"
 #include "CommonLib/ProfileLevelTier.h"
 
+#include <functional>
+#include <thread>
+
+namespace
+{
+// Runs job( i ) for i in [first, count) in threads of their own and waits. The search stacks and the finish objects
+// are independent, and their creation is memory-bound (allocation and first touch, about 50 ms a stack): serially, 20
+// stacks took a second before the first picture could start.
+void runInParallel( size_t first, size_t count, const std::function<void( size_t )>& job )
+{
+  std::vector<std::thread> threads;
+  for( size_t i = first; i < count; i++ )
+  {
+    threads.emplace_back( job, i );
+  }
+  for( std::thread& thread: threads )
+  {
+    thread.join();
+  }
+}
+}   // namespace
+
 //! \ingroup EncoderLib
 //! \{
 
@@ -131,32 +153,26 @@ void EncLib::create( const int layerId )
 #endif
 #endif
   }
-  for( auto& stack: m_searchStacks )
+  const auto createStack = [&]( size_t i )
   {
-    stack->cuEncoder.create( this );
+    EncSearchStack& stack = *m_searchStacks[i];
+    stack.cuEncoder.create( this );
 #if JVET_V0094_BILATERAL_FILTER || JVET_X0071_CHROMA_BILATERAL_FILTER
-    stack->bilateralFilter.create();
+    stack.bilateralFilter.create();
 #if JVET_AJ0237_INTERNAL_12BIT
-    stack->bilateralFilter.setInternalBitDepth( m_bitDepth[COMPONENT_Y] );
+    stack.bilateralFilter.setInternalBitDepth( m_bitDepth[COMPONENT_Y] );
 #endif
 #endif
 #if JVET_J0090_MEMORY_BANDWITH_MEASURE
-    stack->interSearch.cacheAssign( &m_cacheModel );
+    stack.interSearch.cacheAssign( &m_cacheModel );
 #endif
-  }
-
-  for( auto& stack: m_searchStacks )
-  {
-    stack->loopFilter.create( floorLog2( m_maxCUWidth ) - MIN_CU_LOG2 );
-  }
-
-  if (!m_bLoopFilterDisable && m_encDbOpt)
-  {
-    for( auto& stack: m_searchStacks )
+    stack.loopFilter.create( floorLog2( m_maxCUWidth ) - MIN_CU_LOG2 );
+    if( !m_bLoopFilterDisable && m_encDbOpt )
     {
-      stack->loopFilter.initEncPicYuvBuffer( m_chromaFormatIDC, Size( getSourceWidth(), getSourceHeight() ), getMaxCUWidth() );
+      stack.loopFilter.initEncPicYuvBuffer( m_chromaFormatIDC, Size( getSourceWidth(), getSourceHeight() ), getMaxCUWidth() );
     }
-  }
+  };
+  runInParallel( 0, m_searchStacks.size(), createStack );
 
 #if ENABLE_SPLIT_PARALLELISM
   m_cReshaper = new EncReshape[m_numCuEncStacks];
@@ -210,10 +226,17 @@ void EncLib::create( const int layerId )
   for( int i = 1; i < ( getFrameThreads() > 1 ? getFramePeriods() : 1 ); i++ )
   {
     m_finishObjects.emplace_back( new EncFinishObjects );
-    EncFinishObjects& objects = *m_finishObjects.back();
-    // the SAO statistics of a picture's finish are created before its SAO and freed after it (EncGOP): an idle context
-    // holds none (625 MB at 1080p)
+  }
+  // the SAO statistics of a picture's finish are created before its SAO and freed after it (EncGOP): an idle context
+  // holds none (625 MB at 1080p)
+  runInParallel( 0, m_finishObjects.size(), [&]( size_t i )
+  {
+    EncFinishObjects& objects = *m_finishObjects[i];
     xCreateFinishObjects( objects.loopFilter, objects.alf, objects.sao, false );
+  } );
+  for( auto& objectsPtr: m_finishObjects )
+  {
+    EncFinishObjects& objects = *objectsPtr;
 #if JVET_AM0209_CHROMA_ALF_CCALF_REUSE_CTU
     objects.alf.m_pictureControlInfo = objects.pictureControlInfo;
 #endif
@@ -748,9 +771,9 @@ void EncLib::init( bool isFieldCoding, AUWriterIf* auWriterIf )
 
   // initialize processing unit classes
   m_cGOPEncoder.  init( this );
-  for( auto& stackPtr: m_searchStacks )
+  const auto initStack = [&]( size_t i )
   {
-    EncSearchStack& stack = *stackPtr;
+    EncSearchStack& stack = *m_searchStacks[i];
     stack.sliceEncoder.init( this, stack, sps0 );
     stack.cuEncoder.init( this, stack, sps0 );
 
@@ -806,7 +829,10 @@ void EncLib::init( bool isFieldCoding, AUWriterIf* auWriterIf )
 #if JVET_AH0200_INTRA_TMP_BV_REORDER
     stack.intraSearch.setInterPrediction( &stack.interSearch );
 #endif
-  }
+  };
+  // the other stacks share the first one's scaling-list tables, so it goes first; the rest in parallel, as created
+  initStack( 0 );
+  runInParallel( 1, m_searchStacks.size(), initStack );
   for( auto& stack: m_finishStacks )
   {
     stack->sliceEncoder.initFinish( this, stack->cabacEncoder, stack->rdCost, stack->reshaper, sps0 );
