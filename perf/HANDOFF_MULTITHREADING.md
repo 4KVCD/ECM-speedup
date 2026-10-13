@@ -206,6 +206,15 @@ Commits on `enc-mt`, all bit-exact with stock ECM-20.0 (bitstream md5 of the sui
 - `cu_matrix.py EXE TAG REFEXE`: the bit-exactness matrix of the thread options (default, CuThreads 2/4/8, the
   check, FrameThreads 2/4/8 and combinations), jobs on their own P-cores; `cu_scale.py EXE tests counts`: CuThreads timings, one run at
   a time on P-cores, with each run's peak commit.
+- `p5_test.py REFS|REFEXE EXE TAG tests threads [args]`: frame-thread output check (bitstream and reconstruction md5
+  against the single-thread references in `p5_refs.txt`, time and peak commit per run; `P5_MASK` = CPU mask).
+- `p5_par.py OUT EXE TAG mask:tests:threads[:args] ...`: several p5_test.py jobs at once, each on its own CPU mask.
+- `qmatrix.py EXE TAG REFEXE [groups]`: the matrix with every job on its own core pair, all at once.
+- Per step (correctness, about 5-10 minutes, the machine shared): `qmatrix.py EXE tag REFEXE default,ft8` and
+  `p5_par.py out EXE tag C3:ra65:8 3C00:ra33:4:--FramePeriods=2 3C000:ai33s8,ld13:4` (E-core and P-core masks of the
+  265K). Times only on an idle machine and once per series of steps: `bench.py ab` for the default path, p5_test.py
+  ra257 8 alone (or two builds at once on the two halves of the P-cores). No HD encodes for checks: a 1080p frame
+  takes 20-40 minutes on one core.
 
 ## Measurements (i7-10700 8C/16T, 64 GB, Windows 11, GCC 16.2)
 
