@@ -85,10 +85,10 @@ void obicHistogram( Cu c, int lid, int NT )
         }
       }
     }
-    else if( WITH_TIMD && kind == CU_TIMD )   // its node's TimdOut (MAP131TO67 of its modes)
+    else if( WITH_TIMD && kind == CU_TIMD )   // its node's TimdOut (MAP131TO67 of its modes; a TIMD-SAD CU's TIMD-SAD)
     {
       CBufI32   timdOut = CBufI32( P.timdOut );
-      const int outBase = timdOutBase( nb.cu );
+      const int outBase = timdPredBase( nb.cu );
       const int mode = timdOut.v[outBase + TIMD_OUT_MODE], secondary = timdOut.v[outBase + TIMD_OUT_SECONDARY];
       obicCount( timdMode67( mode ), timdOut.v[outBase + TIMD_OUT_LOC_DEP], ns );
       // where it blends, its secondary mode (not the mode again) and with it its non-angular one, by their weights

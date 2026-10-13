@@ -64,7 +64,7 @@ int mergeSource( int n, int cls, int pf, int w )
 bool mergeTimdParams( int slot, int nbr )
 {
   CBufI32   timdOut = CBufI32( P.timdOut );
-  const int outBase = timdOutBase( nbr );
+  const int outBase = timdPredBase( nbr );   // (a TIMD-SAD CU's TIMD-SAD)
   const int mode = timdOut.v[outBase + TIMD_OUT_MODE], secondary = timdOut.v[outBase + TIMD_OUT_SECONDARY];
   const int mode67 = timdMode67( mode );
   if( mode67 <= DC_IDX )
@@ -96,12 +96,14 @@ bool mergeTimdParams( int slot, int nbr )
   mcSet( slot, MC_LOC_DEP + 1, timdOut.v[outBase + TIMD_OUT_LOC_DEP + 1] );
   return true;
 }
-// a TIMD CU's validity as a candidate (CU::isAValidNeighborForIntraMerge): its modes blend or its mode is angular
+// a TIMD CU's validity as a candidate (CU::isAValidNeighborForIntraMerge): its modes blend or its mode is angular (a
+// TIMD-SAD CU's TIMD-SAD, or its plain TIMD's mode is angular: the CPU tests timdMode before timdModeSad)
 bool mergeTimdValid( int nbr )
 {
-  CBufI32   timdOut = CBufI32( P.timdOut );
-  const int outBase = timdOutBase( nbr );
-  return timdOut.v[outBase + TIMD_OUT_BLENDED] != 0 || timdOut.v[outBase + TIMD_OUT_MODE] > DC_IDX;
+  CBufI32   timdOut  = CBufI32( P.timdOut );
+  const int predBase = timdPredBase( nbr ), outBase = timdOutBase( nbr );
+  return timdOut.v[predBase + TIMD_OUT_BLENDED] != 0 || timdOut.v[predBase + TIMD_OUT_MODE] > DC_IDX
+         || timdOut.v[outBase + TIMD_OUT_MODE] > DC_IDX;
 }
 
 // CU::setIntraMergeCandParam's parameters of neighbour n into candidate slot k: a TIMD CU's TIMD converted

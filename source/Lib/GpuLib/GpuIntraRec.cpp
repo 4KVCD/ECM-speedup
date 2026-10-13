@@ -1548,11 +1548,6 @@ static bool addObicNeighbours( GpuIntraRec::Impl& m, const CodingUnit& cu, Cu& c
     {
       continue;
     }
-    if( nbrs[n]->timd && nbrs[n]->timdSad )   // deriveObicMode counts its TIMD-SAD modes, which the GPU's OBIC does not read
-    {
-      why = "a TIMD-SAD neighbour of OBIC";
-      return false;
-    }
     const auto rec = m.cuIndex[CHANNEL_TYPE_LUMA].find( nbrs[n] );
     if( rec == m.cuIndex[CHANNEL_TYPE_LUMA].end() )
     {
@@ -1628,11 +1623,6 @@ static bool addMergeRecord( GpuIntraRec::Impl& m, const CodingUnit& cu, Cu& c, c
     if( n->bvgDimdFlag )
     {
       why = "a BVG-DIMD neighbour of intra merge";
-      return false;
-    }
-    if( n->timd && n->timdSad )   // its candidate converts its TIMD-SAD modes, which the GPU's intra merge does not read
-    {
-      why = "a TIMD-SAD neighbour of intra merge";
       return false;
     }
     // CU::isAValidNeighborForIntraMerge's "MPM" CU
