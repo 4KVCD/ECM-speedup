@@ -522,6 +522,7 @@ protected:
   std::set<int64_t>        m_ftStackHolders;           ///< turns holding a stack
   std::set<const Picture*> m_ftPicsInFlight;           ///< set up and not done (not usable as a reference yet)
   std::mutex               m_ftApsMapMutex;            ///< EncLib's APS map: held by the finish, taken by a setup to use it
+  std::mutex               m_ftSaoStatsMutex;          ///< several periods: held by the finish that has SAO statistics
   template<class Pred> void xFtWait( Pred pred );      ///< waits until pred() holds (pred runs with m_ftMutex locked)
   void xFtRunInPool       ( std::function<void()> job );   ///< runs job on a worker thread
   void xFtSkip            ( int64_t turn );            ///< a GOP index without a picture passes both turns

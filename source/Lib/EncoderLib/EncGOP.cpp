@@ -4188,6 +4188,7 @@ void EncGOP::compressGOP(int iPOCLast, int iNumPicRcvd, PicList &rcListPic, std:
     xStartPicSearch( pcPic, picHeader, pcSlice, *picOrder, decPic );
     EncReshape* picReshaper = &m_pcSearchStack->reshaper;   // the finish's after xStartPicFinish
     std::unique_lock<std::mutex> apsMapLock( m_ftApsMapMutex, std::defer_lock );   // the finish's (frame threads)
+    std::unique_lock<std::mutex> saoStatsLock( m_ftSaoStatsMutex, std::defer_lock );   // the finish's (several periods)
 
     if( encPic )
     // now compress (trial encode) the various slice segments (slices, and dependent slices)
@@ -4494,6 +4495,11 @@ void EncGOP::compressGOP(int iPOCLast, int iNumPicRcvd, PicList &rcListPic, std:
         }
 
         // create SAO encoder data based on the picture size
+        if( m_ftActive && m_ftPeriods > 1 )
+        {
+          // the finishes of several periods hold their SAO statistics (0.64 GB at 1080p) one at a time
+          saoStatsLock.lock();
+        }
         m_pcSAO->destroyEncData();
         m_pcSAO->createEncData(m_pcCfg->getSaoCtuBoundary(), numCtuInFrame);
       }
@@ -4760,6 +4766,10 @@ void EncGOP::compressGOP(int iPOCLast, int iNumPicRcvd, PicList &rcListPic, std:
         )
       {
         m_pcSAO->destroyEncData();
+      }
+      if( saoStatsLock.owns_lock() )
+      {
+        saoStatsLock.unlock();
       }
 
 #if RPR_ENABLE && !JVET_AA0095_ALF_WITH_SAMPLES_BEFORE_DBF

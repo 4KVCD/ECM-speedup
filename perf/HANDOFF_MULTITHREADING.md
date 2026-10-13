@@ -175,6 +175,10 @@ Commits on `enc-mt`, all bit-exact with stock ECM-20.0 (bitstream md5 of the sui
   `destroyTemporaryCsData` returned to the picture's own unit cache; before, every picture buffer kept the units of the
   largest picture it had coded (a cache per buffer since 03aa9a96; foreman CIF: 6.4 MB for an intra picture, about
   20 times that at 1080p).
+- RAM step S: with several periods, `m_ftSaoStatsMutex` lets one finish at a time hold its SAO statistics
+  (createEncData to destroyEncData: pre-deblocking statistics, deblocking, SAO, CCSAO); finishes of several periods
+  at once had raised the peak by 0.64 GB each at 1080p. RA 1080p with 8 threads and 8 periods, 150 s: peak
+  18.3 -> 14.7 GB (working set 12.6 -> 9.1 GB); RA 257 frames with 8 threads 282.1 s, as before.
 - Tried and dropped (RAM): freeing the original and the per-4x4 arrays of a finished picture that waits only for its
   output and is no reference (`C:\Code\work\mt\ram\w_dropped.diff`). In the first minutes at 1080p with 8 threads
   and 8 periods the list holds about 280 waiting pictures, 9 being searched and at most 13 finished ones, all still
