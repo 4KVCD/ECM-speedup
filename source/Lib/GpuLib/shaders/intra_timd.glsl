@@ -487,7 +487,7 @@ int timdHad( int ox, int oy, int predOffset, int w, int bx, int by, int kw, int 
       d[j * kw + i] = timdDiff( ox, oy, predOffset, w, bx + i, by + j );
     }
   }
-  if( WITH_TIMD_MERGE && ( kw == 1 || kh == 1 ) )   // (TIMD merge's template only)
+  if( WITH_THIN_TEMPLATES && ( kw == 1 || kh == 1 ) )   // (TIMD merge's and TMRL's templates only)
   {
     return timdHadLine( d, kw * kh );
   }
@@ -524,10 +524,11 @@ int timdHad( int ox, int oy, int predOffset, int w, int bx, int by, int kw, int 
 }
 
 // the kernel xGetHADs_SIMD takes for an arm of w x h: of the arms 2 or 4 thick of TIMD's templates 8x4, 4x8, 4x4 or 2x2;
-// along an arm one sample thick (TIMD merge's template) 16 or 8 samples where they divide it, else the whole arm
+// along an arm one sample thick (TIMD merge's and TMRL's templates) 16 or 8 samples where they divide it, else the
+// whole arm
 ivec2 timdKernel( int w, int h )
 {
-  if( WITH_TIMD_MERGE && ( w == 1 || h == 1 ) )   // (TIMD merge's template only)
+  if( WITH_THIN_TEMPLATES && ( w == 1 || h == 1 ) )   // (TIMD merge's and TMRL's templates only)
   {
     const int len = max( w, h ), n = len % 16 == 0 ? 16 : len % 8 == 0 ? 8 : len;
     return h == 1 ? ivec2( n, 1 ) : ivec2( 1, n );

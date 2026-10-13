@@ -39,6 +39,9 @@ layout( constant_id = 2 ) const bool WITH_MERGE = true;                // intra 
 layout( constant_id = 3 ) const bool WITH_TIMD = true;                 // TIMD CUs (with DIMD and intra merge)
 layout( constant_id = 4 ) const bool WITH_TIMD_SAD = false;            // TIMD-SAD CUs (with TIMD; a picture's own pipeline)
 layout( constant_id = 5 ) const bool WITH_TIMD_MERGE = false;          // TIMD merge CUs (with TIMD-SAD)
+layout( constant_id = 6 ) const bool WITH_TMRL = false;                // TMRL CUs (with TIMD merge)
+// the template costs of arms one sample thick (TIMD merge's and TMRL's templates: their SATD kernels)
+const bool WITH_THIN_TEMPLATES = WITH_TIMD_MERGE || WITH_TMRL;
 
 const int PAD     = 6;                        // interpFilterNumPadded (16 taps / 2 - 2)
 const int ANG     = 1792;                     // angular reference buffers (the CPU's are larger; blocks <= 128 use < 1700)
@@ -749,6 +752,9 @@ bool timdBlendFusion( int outBase, int W, int H )
                      && ( wideMode - EXT_VER_IDX ) * ( wideSecondary - EXT_VER_IDX ) >= 0;
   return ( mode > DC_IDX && secondary > DC_IDX && close ) || ( mode == secondary && mode > DC_IDX );
 }
+
+#include "intra_tmrl.glsl"
+
 // bifApplyLut (the LUT row in s_bfLut, offset base: 0 distance 1, 16 diagonal, 32 distance 2)
 int bfLut( int diff, int base, int cutBits, int bdShift )
 {
@@ -1324,7 +1330,8 @@ void main()
     // then from its neighbours' (intra_obic.glsl: published by the nodes of those CUs, on which it depends); an intra
     // merge CU's parameters from its neighbours', ranked by template costs (intra_merge.glsl); a TIMD CU's modes from
     // template costs of its MPM list's modes and more, a TIMD merge CU's from its TIMD neighbours', ranked by template
-    // costs (intra_timd.glsl); with MTSS the LFNST / NSPT mode of the CU's block (mtssList, mtssChoice)
+    // costs (intra_timd.glsl); a TMRL CU's mode and reference line by template costs of a list's modes on several lines
+    // (intra_tmrl.glsl); with MTSS the LFNST / NSPT mode of the CU's block (mtssList, mtssChoice)
     if( ( t.derive & DERIVE_NODE ) != 0 )
     {
       const Cu c = BufCu( P.cus ).v[t.cu];
@@ -1374,6 +1381,10 @@ void main()
       else if( WITH_TIMD_MERGE && c.kind == CU_TIMD && timdMergeCu( c ) )   // intra_timd.glsl, from its candidates
       {
         cuMode = timdMergeNode( c, t.bitDepth, ( t.derive & DERIVE_NO_PDPC ) != 0, timdSecond, lid, NT );
+      }
+      else if( WITH_TMRL && c.kind == CU_TMRL )   // intra_tmrl.glsl, its mode list with its DIMD
+      {
+        cuMode = tmrlNode( t, c, dimdModes, t.bitDepth, lid, NT );
       }
       else if( WITH_TIMD && c.kind == CU_TIMD )   // intra_timd.glsl, its MPM list with its DIMD
       {
@@ -1508,6 +1519,10 @@ void main()
         t.fusion = blending ? ( blendFuses ? 1 : 0 )
                             : ( t.derive & DERIVE_FETCH2ND ) != 0 && t.dirMode > DC_IDX && ( abs( t.intraPredAngle ) & 63 ) != 0 ? 1 : 0;
         t.bf     = blending && ( t.derive & DERIVE_BF ) != 0 ? 1 : 0;   // (of the blend)
+      }
+      else if( WITH_TMRL && ( t.derive & DERIVE_TMRL ) != 0 )   // its node's mode and line (intra_tmrl.glsl)
+      {
+        tmrlBlockParams( t );
       }
       else
       {
@@ -1897,11 +1912,11 @@ void main()
         angClear = min( ANG, 2 * ( W + H ) + max( topRefLength, leftRefLength ) + 2 * PAD + 2 * mrl2 + ( mrl2 << abs( log2Ratio ) ) + 16 );
         angClear2 = fusion;
         SYNC();
-        // rows along the main direction (width/height swapped for horizontal modes); a TIMD block's angles in 1/64
-        // samples (bExtIntraDir)
+        // rows along the main direction (width/height swapped for horizontal modes); a TIMD or TMRL block's angles in
+        // 1/64 samples (bExtIntraDir)
         const int w = isVer ? W : H, h = isVer ? H : W;
         const bool isLuma = t.comp == 0;
-        const bool ext = WITH_TIMD && ( t.derive & DERIVE_TIMD ) != 0;
+        const bool ext = ( WITH_TIMD && ( t.derive & DERIVE_TIMD ) != 0 ) || ( WITH_TMRL && ( t.derive & DERIVE_TMRL ) != 0 );
         const int  fracBits = ext ? 6 : 5, fracMask = ( 1 << fracBits ) - 1;
         int taps = 0;
         if( isLuma )

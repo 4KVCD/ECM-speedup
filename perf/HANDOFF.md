@@ -13,11 +13,11 @@ wall-clock gains with threads are "the easy baseline". Decoder status: single-th
 (`--GpuLoopFilter=1`: ALF, SAO, BIF, CCSAO, LF-CCCM, offset refinement on Vulkan). The user then asked for **a full
 GPU decoder in Vulkan, optimized until nothing is left** ("The GPU decoder needs to fully decode the frame on the
 GPU"; "Your first Vulkan version is going to be slow. That's OK"). That work is branch `dec-gpurecon`: intra
-reconstruction on the GPU (`--GpuRecon`), tool levels M1-M28 done and verified bit-exact (M19: DIMD, M20: OBIC, M21:
+reconstruction on the GPU (`--GpuRecon`), tool levels M1-M29 done and verified bit-exact (M19: DIMD, M20: OBIC, M21:
 intra merge, M22: the transforms of DIMD CUs, M23: LFNST of MIP, M24: TIMD, M25: OBIC and intra merge with TIMD
-neighbours, M26: TIMD-SAD, M27: OBIC and intra merge with TIMD-SAD neighbours, M28: TIMD merge); it is **not yet
-faster than the CPU decoder** (see section 8) and supports only a restricted tool set (all real CTC streams fall back
-to the CPU, first reason: TMRL).
+neighbours, M26: TIMD-SAD, M27: OBIC and intra merge with TIMD-SAD neighbours, M28: TIMD merge, M29: TMRL of luma); it
+is **not yet faster than the CPU decoder** (see section 8) and supports only a restricted tool set (all real CTC
+streams fall back to the CPU, first reason: cross-component prediction).
 
 ## 2. The user's rules (follow them exactly)
 
@@ -497,6 +497,28 @@ NO_INTRA_MERGE, TIMD-SAD allowed, the m24 arguments with `--TIMDMerge=1`: 36 to 
 573 per four720 picture, of whose blocks 62 inherit transform types), m28m (encTest4 without switches: ~930 intra
 merge CUs per four720 picture next to 287 TIMD merge CUs). GPU time: m28 96, m28m 110 ms per picture; the other sets
 unchanged within 0.4 % (the kernels of the one-sample template exist in the TIMD merge pipeline only).
+M29: TMRL of luma (JVET-AB0157 with JVET-AD0085's 131-mode set, the DIMD modes first in its list: JVET-AL0125). A
+TMRL CU (`CU_TMRL`, with its DIMD and MPM neighbours; tmrlListIdx in Cu::ipredIdx) gets a node (`tmrlNode`,
+intra_tmrl.glsl) that does getTmrlList: the ten modes of getTmrlSearchRange (`tmrlModeList`: the CU's DIMD modes, the
+neighbours' modes in the 131-mode set - a TIMD neighbour's from its TimdOut, a TMRL one's from its TmrlOut, any other's
+MAP67TO131 - planar never, then fillMPMList's angles around them and its defaults), on each reference line 1, 3, 5, 7,
+12 inside the picture (L < y), each line filled as xFillReferenceSamples fills it for the CU (its availability scanned
+by the node: `refLineAvailability`, shared with intra_deps), predicted on the template one sample thick (the above arm,
+the left one where x > 0) as xPredTmrlIntraAng / xPredTmrlIntraDc do, costed by the SATD of TIMD merge's one-sample
+kernels; it takes the entry of rank tmrlListIdx in the costs' stable order (updateCandList keeps the earlier of equal
+costs first; the decoder's early skip of a candidate whose above cost alone exceeds the list's last changes nothing) and
+writes mode and line to its TmrlOut (Params::tmrlOut). Its block (DERIVE_TMRL) predicts that mode (1/64-sample angles,
+no PDPC, no reference filter) from that line, fused with the next line where the CU's fetchRef2nd (size and the SPS's
+switch only: a TMRL line is never 0, and 12 only below row 12) and the slope allow it, the bilateral filter for DC
+only; as intra_deps cannot know the line, the block depends on the whole arms of every line its node may choose and of
+the next one, and finds its line's availability itself. Rejected: chroma TMRL (JVET-AJ0081, next), TMRL CUs of several
+blocks, TMRL above 10 bits (the SATD's 16-bit lanes, as TIMD). The pictures with TMRL run a pipeline of their own
+(VARIANT_TMRL, WITH_TMRL; with TIMD merge). Test sets: m29 (encTest9, see section 9, with ECM_TEST_NO_CHROMA_TMRL; the
+m24 arguments with `--TIMDMerge=1 --TMRL=1`: 74 to 358 TMRL CUs per CIF picture, 462 per park720 and 389 per four720
+picture) and m29n_fore32 (the same with `--DIMD=0 --TIMD=0 --TIMDMerge=0 --MIP=0`: a mode list without DIMD modes;
+without DIMD the GPU rejects LFNST of MIP) and m29s_screen32 / 22 (screen_352x288: 135 to 181 TMRL CUs per picture).
+GPU time: m29 130, m29n_fore32 34 ms per picture (the TMRL nodes' up to
+50 template predictions and their line fills are the next speed candidate); the other sets unchanged within 1 %.
 
 ## 8. Numbers (i7-10700 8C/16T, Win11, GCC 16.2, RTX 3070 driver 616.92)
 
@@ -527,8 +549,9 @@ Profile of a GPU-on decode (non-LTO, m2_park16, share of all samples): parsing ~
    CUs and MTSS (the m22 and m22o sets), M23 LFNST / NSPT of MIP (the m23 set), M24 TIMD (the m24 and m24s sets),
    M25 OBIC and intra merge with TIMD neighbours (the m25, m25o, m25s and m25os sets), M26 TIMD-SAD (the m26 and
    m26o sets), M27 OBIC and intra merge with TIMD-SAD neighbours (the m27 and m27o sets), M28 TIMD merge (the m28 and
-   m28m sets).
-   All 19 regular streams now stop at "TMRL" (the next sequence-level check; the block-level tools of step 4 follow).
+   m28m sets). 2026-10-13: M29 TMRL of luma (the m29 set and m29n_fore32).
+   All 19 regular streams now stop at "cross-component prediction" (the next sequence-level check; the block-level
+   tools of step 4 follow).
 3. Make the GPU path win on CPU time per picture: the derive-only pass (record during parsing or a leaner pass;
    speed up getSpatialIpm/getPURestricted, which also helps the CPU decoder), GPU behaviour with frame threads
    (8 contexts x 32 persistent workgroups oversubscribe the GPU; spinning workgroups; try fewer groups per context,
@@ -548,10 +571,14 @@ Profile of a GPU-on decode (non-LTO, m2_park16, share of all samples): parsing ~
    cells of the CU's top left where the cell indices' sum is odd; with ECM_TEST_TIMD_SPARSE in all cells but those
    whose indices are both multiples of 4) and ECM_TEST_FORCE_OBIC (an OBIC mode's RD cost in estIntraPredLumaQT divided
    by 4; xCheckRDCostIntra recomputes the CU's cost from its bits and distortion, so the partitioning sees the true
-   cost); `bin\encTest8` (m26o) adds ECM_TEST_PREFER_TIMD_SAD (`testTimd` off where `testTimdSad`). Next MPM sorting /
-   MDIP / PDP, TMRL, CCLM/CCCM and the other cross-component tools, chroma reordering / DBV, IntraTMP / IBC, implicit
-   MTS (not in CTC; its test set, the m24 arguments with `--MTS=0 --MTSImplicit=1`, is encoded:
-   `streams_gpu\pending\imts_*`), then inter pictures.
+   cost); `bin\encTest8` (m26o) adds ECM_TEST_PREFER_TIMD_SAD (`testTimd` off where `testTimdSad`); `bin\encTest9`
+   (m29) adds ECM_TEST_NO_CHROMA_TMRL (the `PU::hasChromaTmrl(pu) && ...getUseTmrl()` conditions of the chroma search
+   false). The user's order (2026-10-13): all intra first, then inter. Next chroma TMRL (JVET-AJ0081; its test set m30,
+   encTest9 without ECM_TEST_NO_CHROMA_TMRL and m29's arguments, is encoded: 11 of its 12 pictures have chroma TMRL
+   CUs), then CCLM/CCCM
+   and the other cross-component tools, chroma reordering / DBV, BVG-DIMD, MDIP / MPM sorting, IntraTMP / IBC, EIP /
+   SGPM, PDP, NN intra, implicit MTS (not in CTC; its test set, the m24 arguments with `--MTS=0 --MTSImplicit=1`, is
+   encoded: `streams_gpu\pending\imts_*`), deblocking on the GPU, then inter pictures.
    Intra merge's GPU time (m19: park720 152, four720 183 ms per picture, from 347 / 392 at first) has room: the
    candidate walk and the reference padding are single-invocation steps on the dependency chain. Each level: new
    test set with exactly that tool on, verify mode identical, ON mode identical (and `ECM_GPU_DUMP` +

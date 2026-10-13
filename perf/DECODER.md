@@ -397,11 +397,16 @@ the reconstruction buffer; works in every frame-thread context):
   host finds the neighbours), ranks them by the SATD of their main mode on a template one sample thick (with that
   thickness's own SATD kernels, one of which skips a butterfly stage), takes the second cheapest within 10 % of the
   cheapest, and in dual tree inherits that neighbour's transform types for its sides longer than 16 (DST-VII for 4 to
-  16); its blocks predict like TIMD's with a fusion rule of their own.
+  16); its blocks predict like TIMD's with a fusion rule of their own. M29 is TMRL of luma: the CU's node predicts the
+  one-sample template from each of up to five reference lines with each of ten modes (its DIMD modes, its neighbours',
+  the angles around them), ranks those up to fifty candidates by SATD and takes the entry the bitstream selects; its block predicts that
+  mode from that line, and, since the line is known only on the GPU, depends on every line the node may choose and
+  finds the line's availability itself.
   GpuIntraRec::supported()
   rejects every tool whose mode derivation or prediction reads reconstructed samples or that the kernels lack, before
-  anything is skipped. All 19 regular streams now fall back to the CPU at TMRL, the next sequence-level check (before
-  M14: sign prediction, before M6: QCS, before M5: LMCS, before M4: dual tree); many block-level tools follow. The
+  anything is skipped. All 19 regular streams now fall back to the CPU at cross-component prediction, the next
+  sequence-level check (before M29: TMRL, before M14: sign prediction, before M6: QCS, before M5: LMCS, before M4:
+  dual tree); many block-level tools follow. The
   kernels' reference availability is "decoded earlier", while the CPU's (CodingStructure::getCURestricted) also
   excludes other tiles,
   with wavefronts the CTUs right of the current one in the row above, and with GDR the dirty area: until that fix

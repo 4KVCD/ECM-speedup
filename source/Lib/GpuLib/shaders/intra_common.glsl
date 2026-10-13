@@ -101,6 +101,9 @@ const int DERIVE_TIMD_MERGE = 16384;
 // type in the CU's TimdOut (TIMD_OUT_TR_HOR / TIMD_OUT_TR_VER), with DERIVE_TRANSFORM
 const int DERIVE_INHERIT_HOR = 32768;
 const int DERIVE_INHERIT_VER = 65536;
+// a block of a TMRL CU (CU_TMRL): its mode (131-mode set, 1/64-sample angles) and reference line come from the CU's node
+// (TmrlOut); the availability of that line, unknown to intra_deps, is found by the block itself (refLineAvailability)
+const int DERIVE_TMRL = 131072;
 
 // Params::dbgParams per block: the derived dirMode, isModeVer, intraPredAngle, absInvAngle, useCubic, refFilter,
 // applyPDPC, gradPDPC, angularScale, fusion, bf, plIdx, then mtxV, mtxH, secMatrix, secTranspose, secLayout
@@ -110,14 +113,14 @@ const int DBG_PARAMS = 17;
 // the non-adjacent ones
 const int MPM_NEIGHBOURS = 23;
 
-// a coding unit of one channel type whose blocks were recorded (46 int32, layout shared with GpuIntraRec.cpp)
+// a coding unit of one channel type whose blocks were recorded (47 int32, layout shared with GpuIntraRec.cpp)
 struct Cu
 {
   int kind;              // CU_*: how its intra mode is found
   int node;              // the record (DERIVE_NODE) that derives the mode and publishes it (Params::cuMode); -1 CU_KNOWN,
                          // but a MIP CU with MTSS (CU_KNOWN), whose node derives only MTSS's mode list
   int x, y, w, h;        // the CU (luma samples for luma)
-  int mpmFlag, secondMpmFlag, ipredIdx;   // luma: the parsed intra mode syntax
+  int mpmFlag, secondMpmFlag, ipredIdx;   // luma: the parsed intra mode syntax (a TMRL CU's tmrlListIdx in ipredIdx)
   int nbFirst, nbLast;   // luma: the modes CU::isIdxModeValid removes at the start / the end of the angular range
   int plIdx;             // luma: the CU's directional planar index (Tu::plIdx of planar blocks)
   int candId;            // chroma: the parsed candidate index (CU_CHROMA_CAND)
@@ -133,6 +136,7 @@ struct Cu
   int mtss;              // with MTSS the first of the MTSS_CALLS histograms of its mode list in Params::dimdCalls (-1: none)
   int mtssNspt;          // with MTSS: its luma block may use NSPT (CU::isNSPTAllowed)
   int timd;              // a TIMD CU's record in Params::timdData (TimdHead; -1: not TIMD)
+  int tmrl;              // a TMRL CU's index among the TMRL CUs (Params::tmrlOut; -1: not TMRL)
 };
 layout( buffer_reference, std430, buffer_reference_align = 4 ) buffer BufCu { Cu v[]; };
 
@@ -146,6 +150,28 @@ const int CU_CHROMA_DIMD = 5;   // chroma: DIMD chroma (DIMD_CHROMA_IDX), compar
 const int CU_OBIC        = 6;   // luma: an OBIC CU, its mode OBIC's first (from its neighbours' modes; intra_obic.glsl)
 const int CU_MERGE       = 7;   // luma: an intra merge CU, its mode its chosen candidate's (intra_merge.glsl)
 const int CU_TIMD        = 8;   // luma: a TIMD CU, its modes from template costs (intra_timd.glsl), with its DIMD
+const int CU_TMRL        = 9;   // luma: a TMRL CU, its mode and reference line from template costs (intra_tmrl.glsl), with
+                                // its DIMD
+
+// a TMRL CU's choice as its node derives it (TMRL_OUT int32 per TMRL CU in Params::tmrlOut): the mode (131-mode set)
+// and the reference line (multiRefIdx) of m_tmrlList[tmrlListIdx], which its blocks predict with
+const int TMRL_OUT      = 2;
+const int TMRL_OUT_MODE = 0;
+const int TMRL_OUT_MRL  = 1;
+
+// the reference lines TMRL tries (EXT_REF_LINE_IDX), of a CU at picture row y those inside the picture, line L < y
+// (getTmrlSearchRange: the lines before the first one at least y away)
+const int TMRL_LINES[5] = int[5]( 1, 3, 5, 7, 12 );
+
+int tmrlNumLines( int y )
+{
+  int n = 0;
+  while( n < 5 && TMRL_LINES[n] < y )
+  {
+    n++;
+  }
+  return n;
+}
 
 // one gradient histogram of a CU's DIMD (16 int32, layout shared with GpuIntraRec.cpp; IntraPrediction's
 // DimdHistogramCall, the arguments deriveDimdMode / deriveDimdModeAdaptive / deriveDimdChromaMode call buildHistogram
@@ -406,6 +432,56 @@ bool fillSource( int fx, int fy, int fw, int fh, int predSize, int predHSize, in
   return true;
 }
 
+// the blocks' owner map of one component (Params::owner: per unit the block covering it) with its size and unit size
+struct OwnerMap
+{
+  BufI32 owner;
+  int    width, height, log2X, log2Y;
+};
+
+// sample (x, y) lies in a unit of a block decoded before block `before`: the kernels' reference availability
+// ("decoded earlier"; supported() rejects what makes the CPU's getCURestricted differ)
+bool decodedBefore( OwnerMap m, int x, int y, int before )
+{
+  if( x < 0 || y < 0 || ( x >> m.log2X ) >= m.width || ( y >> m.log2Y ) >= m.height )
+  {
+    return false;
+  }
+  const int o = m.owner.v[( y >> m.log2Y ) * m.width + ( x >> m.log2X )];
+  return o >= 0 && o < before;
+}
+
+// the availability of reference line mrl of the area (fx, fy, fw, fh) whose arms have tAU above and tLU left units of
+// uW x uH (xFillReferenceSamples' units), for block `before`, in Tu::avail's layout (fillSource): the corner flag, then
+// the available prefixes of the above, above-right, left and below-left units, counted up to unitsTop / unitsLeft units
+// of each arm (at least one unit each: intra_deps counts only the units a prediction reads), and of the MRL units left
+// of the corner (downwards) and above it (rightwards)
+void refLineAvailability( OwnerMap m, int before, int fx, int fy, int fw, int fh, int tAU, int tLU, int mrl, int uW, int uH,
+                          int unitsTop, int unitsLeft, out int av[7] )
+{
+  const int x0 = fx - 1 - mrl, y0 = fy - 1 - mrl;
+  const int lM = mrl / uH, aM = mrl / uW;
+  const int numAbove = max( fw / uW, 1 ), numLeft = max( fh / uH, 1 );
+  const int limA  = max( 1, min( numAbove, unitsTop ) );
+  const int limAR = max( 1, min( tAU - numAbove, unitsTop - numAbove ) );
+  const int limL  = max( 1, min( numLeft, unitsLeft ) );
+  const int limBL = max( 1, min( tLU - numLeft, unitsLeft - numLeft ) );
+  av[0] = decodedBefore( m, x0, y0, before ) ? 1 : 0;
+  int k;
+  for( k = 0; k < limA && decodedBefore( m, fx + k * uW, y0, before ); k++ ) {}
+  av[1] = k;
+  for( k = 0; k < limAR && decodedBefore( m, fx + fw - 1 + uW + k * uW, y0, before ); k++ ) {}
+  av[2] = k;
+  for( k = 0; k < limL && decodedBefore( m, x0, fy + k * uH, before ); k++ ) {}
+  av[3] = k;
+  for( k = 0; k < limBL && decodedBefore( m, x0, fy + fh - 1 + uH + k * uH, before ); k++ ) {}
+  av[4] = k;
+  for( k = 0; k < lM && decodedBefore( m, x0, fy - lM * uH + k * uH, before ); k++ ) {}
+  av[5] = k;
+  for( k = 0; k < aM && decodedBefore( m, fx - aM * uW + k * uW, y0, before ); k++ ) {}
+  av[6] = k;
+}
+
 // the sample entry idx of the top or left arm of reference line ln of block t takes (false: the mid-level value;
 // GpuIntraRec.cpp's refSource): xFillReferenceSamples at the block with arms of 8x its size, or for an ISP
 // sub-partition initIntraPatternChTypeISP: the first one fills the CU's references with arms of twice the CU's size;
@@ -475,6 +551,7 @@ struct Params
   uint64_t mergeCost;   // uint64 per intra merge CU: the template cost of each mode (NUM_LUMA_MODE; ~0: none)
   uint64_t timdData;    // the TIMD CUs' records (Cu::timd, TimdHead)
   uint64_t timdOut;     // int32 per TIMD CU (TIMD_OUT): its TIMD, written by its node (for its blocks, the comparison)
+  uint64_t tmrlOut;     // int32 per TMRL CU (TMRL_OUT): its mode and line, written by its node (for its blocks, the comparison)
   int      origin[3];
   int      stride[3];
   int      width[3];

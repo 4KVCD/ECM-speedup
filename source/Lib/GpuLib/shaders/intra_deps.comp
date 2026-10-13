@@ -43,10 +43,15 @@ int ownerLumaAt( int x, int y )
   return BufI32( P.owner[0] ).v[( y >> P.unitLog2Y[0] ) * P.ownerW[0] + ( x >> P.unitLog2X[0] )];
 }
 
+// component c's owner map (its units those of the block's channel type)
+OwnerMap ownerMap( int c )
+{
+  return OwnerMap( BufI32( P.owner[c] ), P.ownerW[g_ch], P.ownerH[g_ch], P.unitLog2X[g_ch], P.unitLog2Y[g_ch] );
+}
+
 bool availAt( int c, int x, int y )
 {
-  const int a = ownerAt( c, x, y );
-  return a >= 0 && a < g_i;
+  return decodedBefore( ownerMap( c ), x, y, g_i );
 }
 
 // block g_i waits for block o
@@ -198,6 +203,45 @@ void addTemplateDeps( Cu c, int tw, int th )
   }
 }
 
+// a dependency on the blocks owning the samples of the whole arms of reference line mrl of the area at (fx, fy) whose
+// arms have predSize / predHSize samples (fillSource's samples, the padding's included)
+void lineDeps( int comp, int fx, int fy, int predSize, int predHSize, int mrl )
+{
+  const int x0 = fx - 1 - mrl, y0 = fy - 1 - mrl;
+  addAreaDeps( comp, x0, y0, fx - 1 + predSize, y0 );
+  addAreaDeps( comp, x0, y0, x0, fy - 1 + predHSize );
+}
+
+// the intra bilateral filter's neighbours of block t (rows y-2, y-1; columns x-2, x-1): its padding - line 0's corner and
+// above / left units of the area at (fx, fy) (the block, for ISP the CU, whose origin it pads at), also with MRL - into
+// t.bfAvail, and a dependency on the owners of a superset of the samples it copies
+void bilateralFilterDeps( inout Tu t, int comp, int availComp, int fx, int fy, int numAbove, int numLeft )
+{
+  int bfA, bfL;
+  for( bfA = 0; bfA < numAbove && availAt( availComp, fx + bfA * t.unitW, fy - 1 ); bfA++ ) {}
+  for( bfL = 0; bfL < numLeft && availAt( availComp, fx - 1, fy + bfL * t.unitH ); bfL++ ) {}
+  t.bfAvail[0] = availAt( availComp, fx - 1, fy - 1 ) ? 1 : 0;
+  t.bfAvail[1] = bfA;
+  t.bfAvail[2] = bfL;
+  if( t.bfAvail[0] != 0 )
+  {
+    addDep( ownerAt( comp, fx - 2, fy - 2 ) );
+    addDep( ownerAt( comp, fx - 1, fy - 2 ) );
+    addDep( ownerAt( comp, fx - 2, fy - 1 ) );
+    addDep( ownerAt( comp, fx - 1, fy - 1 ) );
+  }
+  for( int x = 0; x < bfA * t.unitW; x++ )
+  {
+    addDep( ownerAt( comp, fx + x, fy - 2 ) );
+    addDep( ownerAt( comp, fx + x, fy - 1 ) );
+  }
+  for( int y = 0; y < bfL * t.unitH; y++ )
+  {
+    addDep( ownerAt( comp, fx - 2, fy + y ) );
+    addDep( ownerAt( comp, fx - 1, fy + y ) );
+  }
+}
+
 // GpuIntraRec::endPicture's dependency loop for block g_i (passes 1 and 2); pass 1 writes the availability, read
 // ranges and ISP side flag into the block record, which refSource reads (from the local copy) and pass 2 reloads
 void dependencies( int comp )
@@ -206,7 +250,7 @@ void dependencies( int comp )
   if( ( t.derive & DERIVE_NODE ) != 0 )   // a CU's mode: the derived modes it reads, from those CUs' nodes
   {
     const Cu c = BufCu( P.cus ).v[t.cu];
-    if( c.kind == CU_MPM || c.kind == CU_TIMD )
+    if( c.kind == CU_MPM || c.kind == CU_TIMD || c.kind == CU_TMRL )
     {
       for( int k = 0; k < MPM_NEIGHBOURS; k++ )
       {
@@ -263,6 +307,15 @@ void dependencies( int comp )
         addModeDep( td.v[c.timd + TIMD_HEAD_MERGE + 1 + k] );
       }
     }
+    if( c.tmrl >= 0 )   // TMRL: the reference lines it tries (whole arms) and its template, one sample thick
+    {
+      for( int k = 0; k < tmrlNumLines( c.y ); k++ )
+      {
+        lineDeps( 0, c.x, c.y, c.w << 3, c.h << 3, TMRL_LINES[k] );
+      }
+      addAreaDeps( 0, c.x, c.y - 1, c.x + c.w - 1, c.y - 1 );
+      addAreaDeps( 0, c.x - 1, c.y, c.x - 1, c.y + c.h - 1 );
+    }
     return;
   }
   const int availComp = t.comp == 0 ? 0 : 1;
@@ -292,8 +345,12 @@ void dependencies( int comp )
   // A TIMD block's modes are of the 131-mode set, with wide angles beyond the regular ones, and blend, fused from the
   // next line also where the CU's fetchRef2nd is off: the whole arms of both lines, the filter's neighbours where it may
   // filter a blend
+  // A TMRL block's line comes from its node, which intra_deps cannot know: the whole arms of every line the node may
+  // choose and of the next one (intra fusion's), the filter's neighbours where it may filter (DC); the block finds its
+  // line's availability itself (its avail and readMax stay 0)
   const bool derived   = ( t.derive & DERIVE_MODE ) != 0;
   const bool timdBlock = ( t.derive & DERIVE_TIMD ) != 0;
+  const bool tmrlBlock = ( t.derive & DERIVE_TMRL ) != 0;
   Cu         c;
   int        numModes = 1;
   if( derived )
@@ -301,8 +358,13 @@ void dependencies( int comp )
     c        = BufCu( P.cus ).v[t.cu];
     numModes = timdBlock ? 0 : c.modes[0] < 0 ? NUM_LUMA_MODE : c.modes[1] < 0 ? 1 : 2;
   }
-  bool bfNeeded = ( !derived && t.bf != 0 ) || ( timdBlock && ( t.derive & DERIVE_BF ) != 0 );
-  for( int ln = 0; ln < 2; ln++ )
+  bool bfNeeded = ( !derived && t.bf != 0 ) || ( ( timdBlock || tmrlBlock ) && ( t.derive & DERIVE_BF ) != 0 );
+  for( int k = 0; tmrlBlock && k < tmrlNumLines( t.y ); k++ )
+  {
+    lineDeps( comp, fx, fy, predSize, predHSize, TMRL_LINES[k] );
+    lineDeps( comp, fx, fy, predSize, predHSize, TMRL_LINES[k] + 1 );
+  }
+  for( int ln = 0; ln < 2 && !tmrlBlock; ln++ )
   {
     const int mrl = t.mrl + ln;   // the reference line (multiRefIdx; the fusion line is the next one)
     int topMax = timdBlock ? topLen + mrl : -1, leftMax = timdBlock ? leftLen + mrl : -1;   // -1: the line is not read
@@ -331,57 +393,11 @@ void dependencies( int comp )
     t.readMax[ln][1] = max( mrl, min( leftMax, leftLen + mrl ) );
 
     // the availability (ISP: the CU's unit groups scanned whole)
-    const int x0 = fx - 1 - mrl, y0 = fy - 1 - mrl;
-    const int lM = mrl / t.unitH, aM = mrl / t.unitW;
     const int unitsTop  = isp ? tAU : t.readMax[ln][0] >= 1 + mrl ? ( t.readMax[ln][0] - 1 - mrl ) / t.unitW + 1 : 0;
     const int unitsLeft = isp ? tLU : t.readMax[ln][1] >= 1 + mrl ? ( t.readMax[ln][1] - 1 - mrl ) / t.unitH + 1 : 0;
-    const int limA  = max( 1, min( numAbove, unitsTop ) );
-    const int limAR = max( 1, min( tAU - numAbove, unitsTop - numAbove ) );
-    const int limL  = max( 1, min( numLeft, unitsLeft ) );
-    const int limBL = max( 1, min( tLU - numLeft, unitsLeft - numLeft ) );
-    t.avail[ln][0] = availAt( availComp, x0, y0 ) ? 1 : 0;
-    int k;
-    for( k = 0; k < limA && availAt( availComp, fx + k * t.unitW, y0 ); k++ ) {}
-    t.avail[ln][1] = k;
-    for( k = 0; k < limAR && availAt( availComp, fx + fw - 1 + t.unitW + k * t.unitW, y0 ); k++ ) {}
-    t.avail[ln][2] = k;
-    for( k = 0; k < limL && availAt( availComp, x0, fy + k * t.unitH ); k++ ) {}
-    t.avail[ln][3] = k;
-    for( k = 0; k < limBL && availAt( availComp, x0, fy + fh - 1 + t.unitH + k * t.unitH ); k++ ) {}
-    t.avail[ln][4] = k;
-    for( k = 0; k < lM && availAt( availComp, x0, fy - lM * t.unitH + k * t.unitH ); k++ ) {}   // left MRL, downwards
-    t.avail[ln][5] = k;
-    for( k = 0; k < aM && availAt( availComp, fx - aM * t.unitW + k * t.unitW, y0 ); k++ ) {}   // above MRL, rightwards
-    t.avail[ln][6] = k;
-
-    if( bfNeeded && ln == 0 )   // the bilateral filter's neighbours (rows y-2, y-1; columns x-2, x-1)
-    {
-      // its padding: line 0's corner and above / left units of the CU (the block, for ISP the CU, whose origin it
-      // pads at), also with MRL; a superset of the samples it copies
-      int bfA, bfL;
-      for( bfA = 0; bfA < numAbove && availAt( availComp, fx + bfA * t.unitW, fy - 1 ); bfA++ ) {}
-      for( bfL = 0; bfL < numLeft && availAt( availComp, fx - 1, fy + bfL * t.unitH ); bfL++ ) {}
-      t.bfAvail[0] = availAt( availComp, fx - 1, fy - 1 ) ? 1 : 0;
-      t.bfAvail[1] = bfA;
-      t.bfAvail[2] = bfL;
-      if( t.bfAvail[0] != 0 )
-      {
-        addDep( ownerAt( comp, fx - 2, fy - 2 ) );
-        addDep( ownerAt( comp, fx - 1, fy - 2 ) );
-        addDep( ownerAt( comp, fx - 2, fy - 1 ) );
-        addDep( ownerAt( comp, fx - 1, fy - 1 ) );
-      }
-      for( int x = 0; x < bfA * t.unitW; x++ )
-      {
-        addDep( ownerAt( comp, fx + x, fy - 2 ) );
-        addDep( ownerAt( comp, fx + x, fy - 1 ) );
-      }
-      for( int y = 0; y < bfL * t.unitH; y++ )
-      {
-        addDep( ownerAt( comp, fx - 2, fy + y ) );
-        addDep( ownerAt( comp, fx - 1, fy + y ) );
-      }
-    }
+    int av[7];
+    refLineAvailability( ownerMap( availComp ), g_i, fx, fy, fw, fh, tAU, tLU, mrl, t.unitW, t.unitH, unitsTop, unitsLeft, av );
+    t.avail[ln] = av;
     // the owners of the samples in range (intra_rec's fill rule); consecutive samples mostly share an owner
     int lastOwner = -2;
     for( int side = 0; side < 2; side++ )
@@ -400,6 +416,10 @@ void dependencies( int comp )
         }
       }
     }
+  }
+  if( bfNeeded )
+  {
+    bilateralFilterDeps( t, comp, availComp, fx, fy, numAbove, numLeft );
   }
   if( t.ispPrev >= 0 )   // the chain of an ISP CU's sub-partitions
   {

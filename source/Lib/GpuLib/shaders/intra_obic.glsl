@@ -118,7 +118,7 @@ void obicHistogram( Cu c, int lid, int NT )
         }
       }
     }
-    else   // its intra mode (firstPU->intraDir[0])
+    else   // its intra mode (firstPU->intraDir[0]; a TMRL CU's MAP131TO67 of it: cuModeOf's)
     {
       obicCount( cuModeOf( nb.cu ), 0, ns );
     }
