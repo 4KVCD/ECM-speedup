@@ -199,6 +199,14 @@ Commits on `enc-mt`, all bit-exact with stock ECM-20.0 (bitstream md5 of the sui
 - RAM step R6: the CCSAO edge statistics per CTU (`CcSaoCtuStatData`) sum in 32 bits: a running finish's SAO
   statistics 0.64 -> 0.43 GB at 1080p; 1.3 % faster on the suite. RA 1080p with 8 threads and 8 periods, 75-150 s,
   after R1-R6: about 8.9 GB on average (working set 6.0 GB), peak 9.6 GB (working set 6.9 GB).
+- Speed step S1: in all intra, the pictures waiting for a search stack take them in order of decreasing luma activity
+  (`EncGOP::xFtSearchPriority`, the cost estimate of `--ParallelSegments`) instead of coding order, so the expensive
+  pictures do not start last. AI 33 pictures, 2 runs each alternating with the previous build: 8 P-cores 34.5 -> 33.0 s
+  (4.5 %), all 20 cores 24.8 -> 23.6 s (4.9 %). Less than the schedule simulation's 23.3 -> 16.3 s: the setups run in
+  coding order and each picture takes a free stack as soon as its setup ends, so the first N pictures still start in
+  coding order; only the pictures that wait are reordered (more of them in a long sequence). 20 processes of
+  `--ParallelSegments` take 16.8 s: they keep 17-19 cores busy to 80 % of the run, the frame threads 17-18 cores to
+  50 % and fewer after (`C:\Code\work\mt\cpu_trace.py`). RA and LD keep coding order.
 - Tried and dropped (RAM): freeing the original and the per-4x4 arrays of a finished picture that waits only for its
   output and is no reference (`C:\Code\work\mt\ram\w_dropped.diff`). In the first minutes at 1080p with 8 threads
   and 8 periods the list holds about 280 waiting pictures, 9 being searched and at most 13 finished ones, all still

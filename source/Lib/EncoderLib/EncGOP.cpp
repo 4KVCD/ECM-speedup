@@ -363,23 +363,24 @@ void EncGOP::xUseFinishContext( const EncFinishContext& ctx )
 
 void EncGOP::xFtAcquireStack( EncPicOrder& order )
 {
-  // A picture whose search inputs are done takes the first free stack, the earliest waiting picture first. The
+  // A picture whose search inputs are done takes the first free stack, the waiting picture of the highest search
+  // priority first (xFtSearchPriority: the earliest, or for all-intra coding the most expensive). The
   // earliest picture not done, whose finish waits for no other picture, has a stack or one stays free for it: so the
-  // pictures holding the stacks cannot all wait for a picture without one. Only the earliest waiter takes a stack, so
+  // pictures holding the stacks cannot all wait for a picture without one. Only the first waiter takes a stack, so
   // the condition still holds when it does.
   {
     std::lock_guard<std::mutex> lock( m_ftMutex );
-    m_ftStackWaiters.insert( order.turn );
+    m_ftStackWaiters.insert( { -order.searchPriority, order.turn } );
   }
   xFtWait( [&]()
   {
     const int64_t earliest = m_ftFirstNotFinished;
     const int     numFree  = int( std::count( m_ftStackBusy.begin(), m_ftStackBusy.end(), false ) );
-    return *m_ftStackWaiters.begin() == order.turn && numFree > 0
+    return m_ftStackWaiters.begin()->second == order.turn && numFree > 0
            && ( order.turn == earliest || m_ftStackHolders.count( earliest ) || numFree > 1 );
   } );
   std::lock_guard<std::mutex> lock( m_ftMutex );
-  m_ftStackWaiters.erase( order.turn );
+  m_ftStackWaiters.erase( { -order.searchPriority, order.turn } );
   order.stackIdx = int( std::find( m_ftStackBusy.begin(), m_ftStackBusy.end(), false ) - m_ftStackBusy.begin() );
   m_ftStackBusy[order.stackIdx] = true;
   m_ftStackHolders.insert( order.turn );
@@ -4180,6 +4181,7 @@ void EncGOP::compressGOP(int iPOCLast, int iNumPicRcvd, PicList &rcListPic, std:
     xSetupPicOrder( pcSlice, picOrder );
     if( m_ftActive )
     {
+      picOrder->searchPriority = xFtSearchPriority( *pcPic, *picOrder );
       pcPic->packWaitingBufs( pcSlice->getSPS()->getBitDepths() );   // until its search starts
       picOrder->setup.reset( new EncSliceSetup );
       m_pcSliceEncoder->saveSetup( *picOrder->setup );
@@ -7709,6 +7711,28 @@ void EncGOP::xStartPicSearch( Picture* pic, PicHeader* picHeader, Slice* slice, 
   CHECK( decPic, "Several search stacks do not support decoding pictures from a debug bitstream" );
   CHECK( slice->getSliceQp() != order.ctxKeyQp, "The slice QP changed after the setup" );
   xLoadCodingOrderState( slice, order );
+}
+
+double EncGOP::xFtSearchPriority( Picture& pic, const EncPicOrder& order ) const
+{
+  if( m_pcCfg->getIntraPeriod() != 1 )
+  {
+    return -double( order.turn );   // the earliest first: inter pictures wait for their references in coding order
+  }
+  // all-intra pictures read no other picture, so the most expensive start first (as the chunks of --ParallelSegments):
+  // the luma activity, the sum of absolute horizontal and vertical differences on every other row and column
+  const CPelBuf luma     = pic.getOrigBuf().get( COMPONENT_Y );
+  double        activity = 0;
+  for( int y = 0; y + 1 < (int) luma.height; y += 2 )
+  {
+    const Pel* row  = luma.bufAt( 0, y );
+    const Pel* next = luma.bufAt( 0, y + 1 );
+    for( int x = 0; x + 1 < (int) luma.width; x += 2 )
+    {
+      activity += std::abs( row[x + 1] - row[x] ) + std::abs( next[x] - row[x] );
+    }
+  }
+  return activity;
 }
 
 bool EncGOP::xUseFilteredOrig() const

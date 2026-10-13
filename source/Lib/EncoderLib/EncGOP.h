@@ -114,6 +114,8 @@ struct EncPicOrder
 {
   int64_t                       turn   = 0;                     ///< setup and finish turn: the picture's index in coding order
                                                                 ///< over all GOPs (frame threads), else its index in the GOP
+  double                        searchPriority = 0;             ///< frame threads: waiting searches take stacks in
+                                                                ///< decreasing priority (xFtSearchPriority)
   const Picture*                pic    = nullptr;
   int                           stackIdx = 0;                   ///< the picture's search stack (frame threads: from the
                                                                 ///< start of the search, xFtAcquireStack)
@@ -485,6 +487,7 @@ protected:
   // of the search and of the finish, results recorded at the end of the finish
   void xSetupPicOrder ( Slice* slice, const std::shared_ptr<EncPicOrder>& order );
   void xStartPicSearch( Picture* pic, PicHeader* picHeader, Slice* slice, EncPicOrder& order, bool decPic );
+  double xFtSearchPriority( Picture& pic, const EncPicOrder& order ) const;
   bool xUseFilteredOrig() const;   // whether the pictures keep a filtered original (temporal filter or BIM)
   void xStartPicFinish( Slice* slice, EncPicOrder& order, std::unique_lock<std::mutex>& apsMapLock );
   void xEndPicFinish  ( Slice* slice, EncPicOrder& order, std::unique_lock<std::mutex>& apsMapLock );
@@ -518,7 +521,8 @@ protected:
   std::set<const Picture*> m_ftPicsDone;               ///< done and not yet forgotten (forgetPicDone)
   std::map<const Picture*, int> m_ftRefsInFlight;      ///< per picture: references to it by pictures set up and not done
   std::vector<bool>        m_ftStackBusy;
-  std::set<int64_t>        m_ftStackWaiters;           ///< turns whose search waits for a stack (xFtAcquireStack)
+  std::set<std::pair<double, int64_t>> m_ftStackWaiters;   ///< (-search priority, turn) of the searches waiting for a
+                                                          ///< stack (xFtAcquireStack): the first takes the next one
   std::set<int64_t>        m_ftStackHolders;           ///< turns holding a stack
   std::set<const Picture*> m_ftPicsInFlight;           ///< set up and not done (not usable as a reference yet)
   std::mutex               m_ftApsMapMutex;            ///< EncLib's APS map: held by the finish, taken by a setup to use it
