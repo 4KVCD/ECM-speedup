@@ -285,6 +285,13 @@ void CodingStructure::releasePicData()
 
 }
 
+void CodingStructure::freeCachedUnits()
+{
+  m_tuCache.deleteEntries();
+  m_puCache.deleteEntries();
+  m_cuCache.deleteEntries();
+}
+
 void CodingStructure::destroyTemporaryCsData()
 {
   destroyCoeffs();

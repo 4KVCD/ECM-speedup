@@ -5869,6 +5869,9 @@ void EncGOP::compressGOP(int iPOCLast, int iNumPicRcvd, PicList &rcListPic, std:
     pcPic->cs->setSplitPred();
 #endif
     pcPic->cs->destroyTemporaryCsData();
+    // nothing reads the picture's CUs, PUs and TUs any more (later pictures read its per-4x4 arrays); its own unit cache
+    // would keep them until the buffer is destroyed, and with frame threads there are hundreds of picture buffers
+    pcPic->cs->freeCachedUnits();
 #if JVET_AA0096_MC_BOUNDARY_PADDING
 #if JVET_AK0085_TM_BOUNDARY_PADDING
     if(!(pcPic->getUseTMBP() && pcPic->cs->sps->getTMBP()))

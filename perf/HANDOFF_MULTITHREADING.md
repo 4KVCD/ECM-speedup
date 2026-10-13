@@ -171,6 +171,16 @@ Commits on `enc-mt`, all bit-exact with stock ECM-20.0 (bitstream md5 of the sui
   between: a check build compared them on 168 pictures). 1080p: about 25 -> 7 MB a waiting picture; RA 1080p with 8
   threads and 8 periods on six E-cores, minutes 2.5-5: 22.3 -> 17.4 GB on average. The automatic FramePeriods counts a
   waiting picture at 6 bytes per luma sample.
+- RAM step U: `CodingStructure::freeCachedUnits` at the end of each picture's finish frees the CUs, PUs and TUs that
+  `destroyTemporaryCsData` returned to the picture's own unit cache; before, every picture buffer kept the units of the
+  largest picture it had coded (a cache per buffer since 03aa9a96; foreman CIF: 6.4 MB for an intra picture, about
+  20 times that at 1080p).
+- Tried and dropped (RAM): freeing the original and the per-4x4 arrays of a finished picture that waits only for its
+  output and is no reference (`C:\Code\work\mt\ram\w_dropped.diff`). In the first minutes at 1080p with 8 threads
+  and 8 periods the list holds about 280 waiting pictures, 9 being searched and at most 13 finished ones, all still
+  references (census probe); 5-minute runs: 20.1 vs 19.1 GB without it (noise). The commit peaks come from finishes
+  of several periods at once, each with its SAO/CCSAO statistics (0.64 GB at 1080p; the CCSAO edge statistics keep
+  every candidate of every CTU for the per-CTU decisions).
 - P2 for LD, motion search per reference picture (not committed; `C:\Code\work\mt\me_patch.py`, `me_job.cpp`):
   the AMVP and search of each reference picture of predInterSearch's uni-prediction loop on the CuThreads helpers
   (an InterSearch per helper stack), the loop replaying the results with the PU fields, RdCost predictor and cost

@@ -118,7 +118,8 @@ lower all-core turbo, one duplicated intra frame per chunk, unequal chunk comple
   creates the SAO statistics, 0.6 GB at 1080p, and frees them after its SAO), and up to max(N, GOPSize) x M pictures
   are in flight. A picture that waits for its search holds its original (6.2 MB at 1080p) and, if the temporal filter
   changed it, its true original (6.5 MB); its reconstruction, coding-structure arrays, temporary buffers and search
-  data (about 140 MB at 1080p) are created when its search starts. RA 1080p with N = 8 and the automatic M = 8 (a
+  data (about 140 MB at 1080p) are created when its search starts, and its CUs, PUs and TUs are freed when its finish
+  ends (each picture buffer has its own unit cache, so it would keep them). RA 1080p with N = 8 and the automatic M = 8 (a
   synthetic sequence on six E-cores, commit sampled every 2 s, minutes 2.5-5): about 17 GB on average (working set
   12 GB), peak 22 GB.
 - Core Ultra 7 265K, one run at a time on the 8 P-cores, foreman 128x128 QP 32 (ai_long's and ra_long's

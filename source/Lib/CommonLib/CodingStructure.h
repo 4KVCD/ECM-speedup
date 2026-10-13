@@ -137,6 +137,8 @@ public:
   bool m_isTopLayer;
   void destroyTemporaryCsData();
   void createTemporaryCsData(const bool isPLTused);
+  /// frees the CUs, PUs and TUs its unit caches keep (destroyTemporaryCsData returns its units to them)
+  void freeCachedUnits();
 #if JVET_AL0214_MV_REFINEMENT_FOR_TMVP
   void createTemporaryRefineTmvpCsData(bool isIntra, int* numRefPic, bool isDec);
 #endif
