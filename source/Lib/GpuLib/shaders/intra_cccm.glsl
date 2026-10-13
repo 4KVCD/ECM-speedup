@@ -21,7 +21,8 @@
 // block clears them again), a larger one or several in the workgroup's CCCM scratch (Params::scratch's CCCM part), the
 // models (64-bit parameters as two words) and the pivot row in sign prediction's costs (s_spCost), the scalars in
 // s_cclm after CCLM's availability; in s_tmp the sums of a model (64-bit, as four words) and its eliminated matrix,
-// then the template predictions of the costs, then the block's prediction (in the scratch where it does not fit)
+// then the template predictions of the costs, then the block's prediction (in the scratch where it does not fit; with
+// LFNST / NSPT both components', which their mode's DIMD reads: intra_cclm.glsl's cclmTransformMode)
 #ifndef INTRA_CCCM_GLSL
 #define INTRA_CCCM_GLSL
 
@@ -94,6 +95,7 @@ bool g_cccmSharedLuma;   // the luma buffer is in shared memory (else in the wor
 bool g_cccmGl;           // GL-CCCM: the model's features are gradients and positions
 int  g_cccmMdf;          // CCCM with several downsampling filters (cccmMultiFilterIdx 1 .. 3; 0: one filter)
 bool g_cccmNoSub;        // CCCM without subsampling (cccmNoSubFlag): the luma buffer holds the luma itself
+bool g_cccmBoth;         // the block predicts both chroma components (cccmPrediction's `both`)
 int  g_cccmShift;        // log2 of the luma buffer's samples per chroma sample and direction (1 without subsampling)
 int  g_cccmParams;       // the model's parameters
 int  g_cccmSet;          // the set of models that predicts (LBCCP's choice; 0 without it)
@@ -203,12 +205,18 @@ void cccmSetLuma( int b, int x, int y, int v )
   }
 }
 
-// where in the scratch a block too large for s_tmp keeps its prediction: after the luma buffers where they are there
+// where in the scratch a block too large for s_tmp keeps its prediction(s): after the luma buffers where they are there
 // too (the host allocates the scratch for such blocks)
 int cccmScratchPred()
 {
   return cccmScratchBase() + ( g_cccmSharedLuma ? 0 : cccmNumBuffers() * cccmBufferSize() );
 }
+
+// where component comp's prediction of block t begins among the block's: Cb's, then Cr's where it predicts both
+int cccmPredBase( Tu t, int comp ) { return g_cccmBoth ? ( comp - 1 ) * t.w * t.h : 0; }
+
+// whether the block's predictions fit s_tmp (else they are in the scratch)
+bool cccmPredInTmp( Tu t ) { return ( g_cccmBoth ? 2 : 1 ) * t.w * t.h <= CCCM_PRED_MAX; }
 
 // a barrier after which the luma buffer's and the prediction's writes are visible to the workgroup, also in the scratch
 void cccmSync()
@@ -816,19 +824,25 @@ void cccmCosts( Tu t, bool twoModels, int lid, int NT )
   SYNC();
 }
 
-// the prediction of CCCM block t into s_tmp, a larger block's into the scratch (rows of t.w; all invocations, ending
-// with a barrier; cccmBlockPrediction reads it): the reference area, the luma buffer(s), with two models the
-// thresholds (set 0: xCccmCalcRefAver's mean of the template's luma - without subsampling of all its luma samples,
-// four per chroma sample -, the mid level without one; LBCCP's set 1: the block's mean luma), the models, with LBCCP
-// (plain CCCM only: not GL-CCCM, several filters nor without subsampling) the set of the lower template cost (the
-// second only when strictly lower)
-void cccmPrediction( Tu t, int lid, int NT )
+// the prediction of CCCM block t into s_tmp, larger ones into the scratch (rows of t.w; all invocations, ending with a
+// barrier; cccmBlockPrediction reads it), with `both` (LFNST / NSPT's DIMD of the CU's predictions: predIntraCCCM
+// predicts both at the Cb block) both components' (Cb's, then Cr's): the reference area, the luma buffer(s), with two
+// models the thresholds (set 0: xCccmCalcRefAver's mean of the template's luma - without subsampling of all its luma
+// samples, four per chroma sample -, the mid level without one; LBCCP's set 1: the block's mean luma), the models,
+// with LBCCP (plain CCCM only: not GL-CCCM, several filters nor without subsampling) the set of the lower template cost
+// (the second only when strictly lower)
+void cccmPrediction( Tu t, bool both, int lid, int NT )
 {
   if( lid == 0 )
   {
     cclmAvailability( t );
     cccmArea( t );
   }
+  if( lid >= 2 && lid < 6 )   // the slots of its wgSum2 calls, zero before each (with LFNST / NSPT it runs twice)
+  {
+    s_red[lid] = 0;
+  }
+  g_cccmBoth   = both;
   g_cccmGl     = ( t.lm & LM_CCCM_GL ) != 0;
   g_cccmMdf    = ( t.lm >> LM_CCCM_MDF_SHIFT ) & 3;
   g_cccmNoSub  = ( t.lm & LM_CCCM_NOSUB ) != 0;
@@ -890,10 +904,11 @@ void cccmPrediction( Tu t, int lid, int NT )
     g_cccmSet = s_cclm[CCCM_COST + 1] < s_cclm[CCCM_COST] ? 1 : 0;
     SYNC();   // (the prediction overwrites the template predictions)
   }
-  const bool inTmp = W * H <= CCCM_PRED_MAX;
-  for( int i = lid; i < W * H; i += NT )
+  const bool inTmp = cccmPredInTmp( t );
+  for( int i = lid; i < ( g_cccmBoth ? 2 : 1 ) * W * H; i += NT )   // (at i: Cb's, then Cr's where both)
   {
-    const int v = cccmPredict( g_cccmSet, t.comp - 1, g_cccmSizeX + i % W, g_cccmSizeY + i / W, twoModels, bitDepth );
+    const int j = i % ( W * H ), comp = g_cccmBoth ? 1 + i / ( W * H ) : t.comp;
+    const int v = cccmPredict( g_cccmSet, comp - 1, g_cccmSizeX + j % W, g_cccmSizeY + j / W, twoModels, bitDepth );
     if( inTmp )
     {
       s_tmp[i] = int16_t( v );
@@ -906,11 +921,12 @@ void cccmPrediction( Tu t, int lid, int NT )
   cccmSync();
 }
 
-// the prediction of CCCM block t at (x, y) (cclmPredSample's, which LBCCP's inside filter reads around each sample)
+// the prediction of component t.comp of CCCM block t at (x, y) (cclmPredSample's, which LBCCP's inside filter reads
+// around each sample; the other component's where cccmPrediction predicted both)
 int cccmBlockPrediction( Tu t, int x, int y )
 {
-  return t.w * t.h <= CCCM_PRED_MAX ? int( s_tmp[y * t.w + x] )
-                                     : CBufI32( P.scratch ).v[cccmScratchPred() + y * t.w + x];
+  const int i = cccmPredBase( t, t.comp ) + y * t.w + x;
+  return cccmPredInTmp( t ) ? int( s_tmp[i] ) : CBufI32( P.scratch ).v[cccmScratchPred() + i];
 }
 
 #endif

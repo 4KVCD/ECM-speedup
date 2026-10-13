@@ -435,7 +435,8 @@ void cclmModel( Tu t, int lx, int ly, int predStride, int ref, int slot )
 
 // ----- the prediction (predIntraChromaLM, LBCCP's filterPredInside); `slot`: the model's in s_cclm
 
-int cccmBlockPrediction( Tu t, int x, int y );   // (intra_cccm.glsl)
+int  cccmBlockPrediction( Tu t, int x, int y );          // (intra_cccm.glsl)
+void cccmPrediction( Tu t, bool both, int lid, int NT );
 
 // the model applied to the co-located block's downsampled sample (i, j) (two models: split at the threshold); a CCCM
 // block's prediction
@@ -529,7 +530,9 @@ int cclmHistSample( Tu t, Tu o, bool stored, int comp, int x, int y, int maxPel 
 // has the same area, its template's and LBCCP's availability is the block's (decodedBefore on both components' owner
 // maps; neither reads the CU), its references go into s_ref[1], its model into slot 1 (its slope adjustments from
 // Tu::lm); the predictions into s_tmp, Cb's from 0, Cr's from 1024, where they fit (up to 32 x 32; larger blocks, rare,
-// compute each sample of the gradients again). All invocations, ending with a barrier; the prediction section predicts
+// compute each sample of the gradients again). A CCCM block (its kind in the other component's field, no slope
+// adjustments) predicts both components with cccmPrediction, which keeps them, and the gradients read them (through
+// LBCCP's inside filter where the CU has it). All invocations, ending with a barrier; the prediction section predicts
 // the block again
 void cclmTransformMode( Tu t, int predStride, int maxPel, int lid, int NT )
 {
@@ -537,32 +540,40 @@ void cclmTransformMode( Tu t, int predStride, int maxPel, int lid, int NT )
   const bool histCb = ( t.lm & LM_HIST_CB ) != 0, histCr = ( t.lm & LM_HIST_CR ) != 0;
   const bool own    = t.comp == 1 ? histCb : histCr;
   const bool other  = t.comp == 1 ? histCr : histCb;
-  const bool stored = W * H <= 1024;
+  const bool cccm   = WITH_CCCM && ( ( t.lm >> LM_CCCM_SHIFT ) & 3 ) != 0;
+  const bool stored = !cccm && W * H <= 1024;
   Tu o = t;
   o.comp = 3 - t.comp;
-  o.lm   = ( t.lm & ~( 0xff | ( 15 << LM_GLM_SHIFT ) ) ) | ( ( t.lm >> LM_OTHER_SHIFT ) & 0xff )
+  if( cccm )
+  {
+    cccmPrediction( t, true, lid, NT );
+  }
+  else
+  {
+    o.lm = ( t.lm & ~( 0xff | ( 15 << LM_GLM_SHIFT ) ) ) | ( ( t.lm >> LM_OTHER_SHIFT ) & 0xff )
            | ( ( ( t.lm >> LM_OTHER_GLM_SHIFT ) & 15 ) << LM_GLM_SHIFT );
-  if( other )
-  {
-    fillReferencePar( o, 0, 1, predStride, lid, NT );
-  }
-  if( lid == 0 )
-  {
-    cclmAvailability( t );
-  }
-  SYNC();
-  if( lid == 0 )   // (cclmModel's samples share s_tmp: one after the other)
-  {
-    if( own )
-    {
-      cclmModel( t, lx, ly, predStride, 0, 0 );
-    }
     if( other )
     {
-      cclmModel( o, lx, ly, predStride, 1, 1 );
+      fillReferencePar( o, 0, 1, predStride, lid, NT );
     }
+    if( lid == 0 )
+    {
+      cclmAvailability( t );
+    }
+    SYNC();
+    if( lid == 0 )   // (cclmModel's samples share s_tmp: one after the other)
+    {
+      if( own )
+      {
+        cclmModel( t, lx, ly, predStride, 0, 0 );
+      }
+      if( other )
+      {
+        cclmModel( o, lx, ly, predStride, 1, 1 );
+      }
+    }
+    SYNC();
   }
-  SYNC();
   for( int i = lid; i < W * H && stored; i += NT )
   {
     const int x = i % W, y = i / W;

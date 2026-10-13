@@ -2509,14 +2509,13 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
   // DIMD in the SPS leaves the mode the transforms read unset. Not above 10 bits (no test stream) nor with unequal bit
   // depths (the model takes the chroma bit depth, its division table m_auShiftLM the luma's)
   // CCCM (an LM mode with cccmFlag, JVET-AA0057): intra_cccm.glsl's plain models, GL-CCCM's (JVET-AC0054), those of
-  // several downsampling filters (JVET-AD0202) and without subsampling (JVET-AC0147); not with LFNST / NSPT (their mode
-  // a DIMD of CCCM predictions)
+  // several downsampling filters (JVET-AD0202) and without subsampling (JVET-AC0147); with LFNST / NSPT their mode is
+  // the DIMD of both components' CCCM predictions, which predIntraCCCM makes at the Cb block (each block on the GPU)
   else if( !isLuma( compID ) && pu.glmIdc.isActive() && !GPU_GLM ) why = "GLM of another configuration";
   else if( !isLuma( compID ) && ( pu.glmIdc.getIdc( compID, 0 ) > NUM_GLM_PATTERN
                                   || ( cu.lfnstIdx && pu.glmIdc.getIdc( compID == COMPONENT_Cb ? COMPONENT_Cr : COMPONENT_Cb, 0 ) > NUM_GLM_PATTERN ) ) )
     why = "GLM with luma";
   else if( !isLuma( compID ) && pu.cccmFlag && otherCccm( pu ) )   why = otherCccm( pu );
-  else if( !isLuma( compID ) && pu.cccmFlag && cu.lfnstIdx )       why = "CCCM with LFNST / NSPT";
   else if( !isLuma( compID ) && pu.isChromaFusion )                 why = "LM chroma fusion";
   else if( !isLuma( compID ) && PU::isLMCMode( dirMode ) && cu.lfnstIdx && !sps.getUseDimd() ) why = "CCLM with LFNST / NSPT without DIMD";
   // (DecCu::xIntraRecBlk with JVET-AK0064: the Cb block also predicts Cr, over the CU's area)
@@ -2586,13 +2585,15 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
       t.lm = LM_ACTIVE | ( pu.ccInsideFilter ? LM_INSIDE : 0 ) | ( pu.cccmFlag << LM_CCCM_SHIFT )
              | ( pu.glCccmFlag ? LM_CCCM_GL : 0 ) | ( pu.cccmMultiFilterIdx << LM_CCCM_MDF_SHIFT )
              | ( pu.cccmNoSubFlag ? LM_CCCM_NOSUB : 0 );
-      // the luma buffers of several filters, a larger one or a prediction beyond the shared ones take the workgroup's
-      // CCCM scratch: room for the largest reference area's buffers and the prediction
+      // the luma buffers of several filters, a larger one or predictions beyond the shared ones take the workgroup's
+      // CCCM scratch: room for the largest reference area's buffers and the predictions (with LFNST / NSPT both
+      // components', which their mode's DIMD reads)
       const int numBuffers = pu.cccmMultiFilterIdx == 0 ? 1 : pu.cccmMultiFilterIdx == 1 ? 4 : 2;
       const int lumaArea   = cccmLumaArea( area, pu.cccmNoSubFlag );
-      if( pu.cccmMultiFilterIdx || lumaArea > CCCM_LUMA_MAX || (int) area.area() > CCCM_PRED_MAX )
+      const int predWords  = ( cu.lfnstIdx ? 2 : 1 ) * (int) area.area();
+      if( pu.cccmMultiFilterIdx || lumaArea > CCCM_LUMA_MAX || predWords > CCCM_PRED_MAX )
       {
-        m.cccmScratchWords = std::max( m.cccmScratchWords, numBuffers * lumaArea + (int) area.area() );
+        m.cccmScratchWords = std::max( m.cccmScratchWords, numBuffers * lumaArea + predWords );
       }
     }
     else
@@ -2602,13 +2603,18 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
              | ( ( ( cb ? pu.cclmOffsets.cb1 : pu.cclmOffsets.cr1 ) + 8 ) << LM_DELTA1_SHIFT ) | ( pu.ccInsideFilter ? LM_INSIDE : 0 )
              | LM_ACTIVE | ( pu.glmIdc.getIdc( compID, 0 ) << LM_GLM_SHIFT );
     }
-    if( cu.lfnstIdx )   // the predictions the transforms' DIMD reads by the TU's joint CbCr mode, the other's parameters
+    // the predictions the transforms' DIMD reads by the TU's joint CbCr mode, the other's parameters (a CCCM block's
+    // other component has the same models, its kind's field is the other's)
+    if( cu.lfnstIdx )
     {
       const ComponentID other = cb ? COMPONENT_Cr : COMPONENT_Cb;
       t.lm |= ( tu.jointCbCr != 2 ? LM_HIST_CB : 0 ) | ( tu.jointCbCr != 1 ? LM_HIST_CR : 0 );
-      t.lm |= ( ( ( ( cb ? pu.cclmOffsets.cr0 : pu.cclmOffsets.cb0 ) + 8 ) << LM_DELTA0_SHIFT )
-                | ( ( ( cb ? pu.cclmOffsets.cr1 : pu.cclmOffsets.cb1 ) + 8 ) << LM_DELTA1_SHIFT ) ) << LM_OTHER_SHIFT;
-      t.lm |= pu.glmIdc.getIdc( other, 0 ) << LM_OTHER_GLM_SHIFT;
+      if( !pu.cccmFlag )
+      {
+        t.lm |= ( ( ( ( cb ? pu.cclmOffsets.cr0 : pu.cclmOffsets.cb0 ) + 8 ) << LM_DELTA0_SHIFT )
+                  | ( ( ( cb ? pu.cclmOffsets.cr1 : pu.cclmOffsets.cb1 ) + 8 ) << LM_DELTA1_SHIFT ) ) << LM_OTHER_SHIFT;
+        t.lm |= pu.glmIdc.getIdc( other, 0 ) << LM_OTHER_GLM_SHIFT;
+      }
     }
     // the LM prediction reads the unfiltered references (initPredIntraParams: no reference filter or fusion for a
     // chroma LM mode) and none of the angular and PDPC parameters, whose angles initPredIntraParams leaves as the

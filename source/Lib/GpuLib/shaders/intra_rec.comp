@@ -1832,7 +1832,8 @@ void main()
         const int lx = t.x << 1, ly = t.y << 1;   // the co-located luma block (4:2:0)
         if( WITH_CCCM && ( ( t.lm >> LM_CCCM_SHIFT ) & 3 ) != 0 )
         {
-          cccmPrediction( t, lid, NT );   // (its luma buffer in the angular arrays, cleared at the end, or the scratch)
+          cccmPrediction( t, false, lid, NT );   // (its luma buffer in the angular arrays, cleared at the end, or
+                                                 // the scratch)
           angClear  = g_cccmSharedLuma ? ( cccmBufferSize() + 3 ) >> 2 : 0;
           angClear2 = g_cccmSharedLuma;
         }
