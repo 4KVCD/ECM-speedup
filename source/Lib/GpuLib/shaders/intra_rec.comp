@@ -514,14 +514,17 @@ void storeRecon( Tu t, int x, int y, int pr )
   reconstruct( t, x, y, pr, re );
 }
 
+int cccmFusionBlend( Tu t, int x, int y, int pr );   // (intra_cccm.glsl)
+
 // sample (x, y) of the predicted region: reconstructed if it lies in the block (the region of an ISP sub-partition 1
-// or 2 wide is 4 wide; the CPU predicts it once and each sub-partition takes its columns)
+// or 2 wide is 4 wide; the CPU predicts it once and each sub-partition takes its columns); a block of LM chroma fusion
+// blends its final prediction with the CCCM one
 void storeRegion( Tu t, int x, int y, int pr )
 {
   const int bx = x - ( t.x - t.regX );
   if( bx >= 0 && bx < t.w )
   {
-    storeRecon( t, bx, y, pr );
+    storeRecon( t, bx, y, WITH_CCCM && ( t.lm & LM_FUSION ) != 0 ? cccmFusionBlend( t, bx, y, pr ) : pr );
   }
 }
 
@@ -1647,6 +1650,13 @@ void main()
       const int pelnum = ( hasLeft ? t.crsH : 0 ) + ( hasAbove ? t.crsW : 0 );
       const int lumaValue = pelnum > 0 ? clip3i( P.lumaClipMin, P.lumaClipMax, ( total + ( pelnum >> 1 ) ) / pelnum ) : P.lmcsLutSize >> 1;
       g_crsScale = BufI32( P.lmcs ).v[2 * P.lmcsLutSize + lumaValue];
+    }
+
+    // ----- LM chroma fusion (geneChromaFusionPred's first type): the CCCM prediction it blends in (storeRegion), into
+    // the scratch before the references and the prediction take s_tmp and the angular arrays (intra_cccm.glsl)
+    if( WITH_CCCM && ( t.lm & LM_FUSION ) != 0 )
+    {
+      cccmPrediction( t, false, lid, NT );
     }
 
     // ----- reference samples (and the second line of intra fusion)

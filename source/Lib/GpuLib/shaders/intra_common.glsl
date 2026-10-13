@@ -86,7 +86,10 @@ const int MMLM_T_IDX      = LM_CHROMA_IDX + 5;
 // and left, 2 left, 3 above; 0: not CCCM) and its kind in the other component's field (with LFNST / NSPT the other
 // component's kind is the same): GL-CCCM's gradients and locations (JVET-AC0054), several downsampling filters
 // (JVET-AD0202's cccmMultiFilterIdx 1 .. 3), no subsampling (JVET-AC0147's cccmNoSubFlag), GLM with luma (JVET-AB0092:
-// glmIdc 5 .. 8 in the GLM field, the template selection its LM mode's: 1 LM_CHROMA, 2 MDLM_L, 3 MDLM_T)
+// glmIdc 5 .. 8 in the GLM field, the template selection its LM mode's: 1 LM_CHROMA, 2 MDLM_L, 3 MDLM_T).
+// A block of LM chroma fusion (JVET-AC0119's first type: not an LM block) has the template selection 1 of the plain
+// CCCM models it blends in, LM_FUSION (a bit beyond every LM field: a CCLM block's other-component field reaches bit
+// 19) and the weight of its own prediction (1 .. 3 of 4) in the first slope adjustment's field (it has none)
 const int LM_DELTA0_SHIFT = 0;
 const int LM_DELTA1_SHIFT = 4;
 const int LM_INSIDE       = 256;
@@ -101,6 +104,8 @@ const int LM_CCCM_GL      = 4096;
 const int LM_CCCM_MDF_SHIFT = 13;   // 2 bits
 const int LM_CCCM_NOSUB   = 32768;
 const int LM_CCCM_GLM_LUMA = 65536;
+const int LM_FUSION       = 1 << 30;
+const int LM_FUSION_W_SHIFT = 0;    // 2 bits
 
 // Tu::derive
 const int DERIVE_NODE     = 32;  // not a block: the derivation of the mode of CU Tu::cu, before the CU's blocks

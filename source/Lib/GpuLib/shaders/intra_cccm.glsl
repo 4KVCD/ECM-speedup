@@ -21,6 +21,10 @@
 // two buffers), a bias - over the template of its LM mode (the left part for MDLM_L, the part above for MDLM_T, else
 // both without the units above-right / below-left), solved as CccmCovariance::solve1 (CCCM's elimination with the
 // matrix scaled to 28 bits) and clipped to the sample range alone.
+// LM chroma fusion (JVET-AC0119's first type, geneChromaFusionPred in an intra slice with JVET-AL0191) blends a block
+// of a regular chroma mode with the plain CCCM prediction of two models (MMLM_CHROMA_IDX's: the whole template, no
+// LBCCP), which the block computes first into the scratch (the regular prediction then takes s_tmp and the angular
+// arrays); intra_rec's storeRegion blends each sample (cccmFusionBlend).
 //
 // Shared memory, all free while an LM block predicts: one luma buffer in the four angular arrays (s_angA, s_angL; the
 // block clears them again), a larger one or several in the workgroup's CCCM scratch (Params::scratch's CCCM part), the
@@ -104,6 +108,7 @@ int  g_cccmMdf;          // CCCM with several downsampling filters (cccmMultiFil
 bool g_cccmNoSub;        // CCCM without subsampling (cccmNoSubFlag): the luma buffer holds the luma itself
 bool g_cccmBoth;         // the block predicts both chroma components (cccmPrediction's `both`)
 bool g_cccmGlmLuma;      // GLM with luma (glmIdc 5 .. 8): the model of a gradient pattern's value and the luma
+bool g_cccmFusion;       // LM chroma fusion's CCCM prediction (luma buffer and prediction in the scratch)
 int  g_cccmGlmPattern;   // its gradient pattern (1 .. NUM_GLM_PATTERN)
 int  g_cccmShift;        // log2 of the luma buffer's samples per chroma sample and direction (1 without subsampling)
 int  g_cccmParams;       // the model's parameters
@@ -172,7 +177,7 @@ void cccmLoadArea()
   g_cccmSizeX      = s_cclm[CCCM_SIZE_X];
   g_cccmSizeY      = s_cclm[CCCM_SIZE_Y];
   g_cccmLumaOffset = s_cclm[CCCM_LUMA_OFFSET];
-  g_cccmSharedLuma = cccmNumBuffers() == 1 && cccmBufferSize() <= CCCM_LUMA_MAX;
+  g_cccmSharedLuma = !g_cccmFusion && cccmNumBuffers() == 1 && cccmBufferSize() <= CCCM_LUMA_MAX;
 }
 
 // sample (x, y) of luma buffer b in the buffer's units, -pad <= x < areaW + pad and -pad <= y < areaH + pad of the
@@ -230,7 +235,7 @@ int cccmScratchPred()
 int cccmPredBase( Tu t, int comp ) { return g_cccmBoth ? ( comp - 1 ) * t.w * t.h : 0; }
 
 // whether the block's predictions fit s_tmp (else they are in the scratch)
-bool cccmPredInTmp( Tu t ) { return ( g_cccmBoth ? 2 : 1 ) * t.w * t.h <= CCCM_PRED_MAX; }
+bool cccmPredInTmp( Tu t ) { return !g_cccmFusion && ( g_cccmBoth ? 2 : 1 ) * t.w * t.h <= CCCM_PRED_MAX; }
 
 // a barrier after which the luma buffer's and the prediction's writes are visible to the workgroup, also in the scratch
 void cccmSync()
@@ -860,8 +865,8 @@ void cccmCosts( Tu t, bool twoModels, int lid, int NT )
 // predicts both at the Cb block) both components' (Cb's, then Cr's): the reference area, the luma buffer(s), with two
 // models the thresholds (set 0: xCccmCalcRefAver's mean of the template's luma - without subsampling of all its luma
 // samples, four per chroma sample -, the mid level without one; LBCCP's set 1: the block's mean luma), the models,
-// with LBCCP (plain CCCM only: not GL-CCCM, several filters, without subsampling nor GLM with luma) the set of the
-// lower template cost (the second only when strictly lower)
+// with LBCCP (plain CCCM only: not GL-CCCM, several filters, without subsampling, GLM with luma nor LM chroma
+// fusion's) the set of the lower template cost (the second only when strictly lower)
 void cccmPrediction( Tu t, bool both, int lid, int NT )
 {
   if( lid == 0 )
@@ -879,6 +884,7 @@ void cccmPrediction( Tu t, bool both, int lid, int NT )
   g_cccmNoSub      = ( t.lm & LM_CCCM_NOSUB ) != 0;
   g_cccmGlmLuma    = ( t.lm & LM_CCCM_GLM_LUMA ) != 0;
   g_cccmGlmPattern = ( ( t.lm >> LM_GLM_SHIFT ) & 15 ) - NUM_GLM_PATTERN;
+  g_cccmFusion     = ( t.lm & LM_FUSION ) != 0;
   g_cccmShift      = g_cccmNoSub ? 1 : 0;
   g_cccmParams     = g_cccmGlmLuma ? GLM_PARAMS
                    : g_cccmNoSub ? ( P.cclmFilter == CCLM_FILTER_AVERAGE ? 9 : 11 )
@@ -890,8 +896,10 @@ void cccmPrediction( Tu t, bool both, int lid, int NT )
     cccmBuildLuma( t, b, lid, NT );
   }
   const int  W = t.w, H = t.h, bitDepth = t.bitDepth;
-  const bool twoModels = cclmMultiModel( t.dirMode );   // (GLM with luma: never, its LM modes have a single model)
-  const bool lbccp     = P.cccmLbccp != 0 && !g_cccmGl && g_cccmMdf == 0 && !g_cccmNoSub && !g_cccmGlmLuma;
+  // (GLM with luma: never two models, its LM modes have a single one; LM chroma fusion's are MMLM_CHROMA_IDX's)
+  const bool twoModels = cclmMultiModel( t.dirMode ) || g_cccmFusion;
+  const bool lbccp     = P.cccmLbccp != 0 && !g_cccmGl && g_cccmMdf == 0 && !g_cccmNoSub && !g_cccmGlmLuma
+                         && !g_cccmFusion;
   if( twoModels )
   {
     const ivec4 r = cccmTemplate( t, false );
@@ -961,6 +969,14 @@ int cccmBlockPrediction( Tu t, int x, int y )
 {
   const int i = cccmPredBase( t, t.comp ) + y * t.w + x;
   return cccmPredInTmp( t ) ? int( s_tmp[i] ) : CBufI32( P.scratch ).v[cccmScratchPred() + i];
+}
+
+// LM chroma fusion's sample (x, y) of block t: its regular prediction pr blended with the CCCM prediction, weighted
+// w0 : 4 - w0 (geneChromaFusionPred: w0 by whether the CUs below-left and above-right are LM CUs, the host's)
+int cccmFusionBlend( Tu t, int x, int y, int pr )
+{
+  const int w0 = ( t.lm >> LM_FUSION_W_SHIFT ) & 3;
+  return ( pr * w0 + cccmBlockPrediction( t, x, y ) * ( 4 - w0 ) + 2 ) >> 2;
 }
 
 #endif

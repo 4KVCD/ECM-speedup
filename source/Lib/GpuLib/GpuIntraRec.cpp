@@ -138,12 +138,16 @@ constexpr int DERIVE_CCLM_DIMD    = 262144;  // a CCLM block with LFNST / NSPT: 
 // TMRL luma blocks), its slope adjustments (+ 8, in 4 bits each) and LBCCP's inside filter; with DERIVE_CCLM_DIMD the
 // predictions its transforms' DIMD reads and the other chroma component's slope adjustments; a CCCM block's template
 // selection (cccmFlag) and kind (GL-CCCM, several downsampling filters, no subsampling, GLM with luma: then the
-// template selection is its LM mode's, its glmIdc in the GLM field)
+// template selection is its LM mode's, its glmIdc in the GLM field); a block of LM chroma fusion (not an LM block):
+// the template selection of the CCCM models it blends in, the weight of its own prediction
 constexpr int LM_DELTA0_SHIFT = 0, LM_DELTA1_SHIFT = 4, LM_INSIDE = 256, LM_ACTIVE = 512;
 constexpr int LM_HIST_CB = 1024, LM_HIST_CR = 2048, LM_OTHER_SHIFT = 12;
 constexpr int LM_GLM_SHIFT = 20, LM_OTHER_GLM_SHIFT = 24;   // GLM's gradient pattern (glmIdc), the other component's
 constexpr int LM_CCCM_SHIFT = 28, LM_CCCM_GL = 4096, LM_CCCM_MDF_SHIFT = 13, LM_CCCM_NOSUB = 32768;
 constexpr int LM_CCCM_GLM_LUMA = 65536;
+// (LM chroma fusion's mark beyond every LM field: a CCLM block's other-component field reaches bit 19; its weight in
+// the first slope adjustment's field, which a fusion block does not have)
+constexpr int LM_FUSION = 1 << 30, LM_FUSION_W_SHIFT = 0;
 
 // the parameters intra_rec derives per DERIVE_MODE block, downloaded for the comparison (intra_common.glsl's
 // DBG_PARAMS): dirMode, isModeVer, intraPredAngle, absInvAngle, useCubic, refFilter, applyPDPC, gradPDPC, angularScale,
@@ -2519,7 +2523,15 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
                                                  || pu.glmIdc.getIdc( COMPONENT_Cr, 0 ) > NUM_GLM_PATTERN ) )
     why = "GLM with luma with LFNST / NSPT";
   else if( !isLuma( compID ) && pu.cccmFlag && otherCccm( pu ) )   why = otherCccm( pu );
-  else if( !isLuma( compID ) && pu.isChromaFusion )                 why = "LM chroma fusion";
+  // LM chroma fusion (JVET-AC0119; geneChromaFusionPred with JVET-AL0191): its first type blends the block with plain
+  // CCCM models of two (MMLM_CHROMA_IDX's), where PU::cccmMultiModeAvail allows them (else the CPU blends in a buffer
+  // of a previous block); not CFLM (types 2, 3: a model of the block's own prediction and the luma)
+  else if( !isLuma( compID ) && pu.isChromaFusion > 1 )             why = "CFLM";
+  else if( !isLuma( compID ) && pu.isChromaFusion && !GPU_CCCM )    why = "LM chroma fusion";
+  else if( !isLuma( compID ) && pu.isChromaFusion && !PU::cccmMultiModeAvail( pu, MMLM_CHROMA_IDX, true ) )
+    why = "LM chroma fusion without its CCCM models";
+  else if( !isLuma( compID ) && pu.isChromaFusion && area != cu.blocks[compID] )
+    why = "LM chroma fusion CU with several transform blocks";
   else if( !isLuma( compID ) && PU::isLMCMode( dirMode ) && cu.lfnstIdx && !sps.getUseDimd() ) why = "CCLM with LFNST / NSPT without DIMD";
   // (DecCu::xIntraRecBlk with JVET-AK0064: the Cb block also predicts Cr, over the CU's area)
   else if( !isLuma( compID ) && PU::isLMCMode( dirMode ) && area != cu.blocks[compID] ) why = "CCLM CU with several transform blocks";
@@ -2586,8 +2598,8 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
     const bool glmLuma = pu.glmIdc.getIdc( compID, 0 ) > NUM_GLM_PATTERN;
     if( pu.cccmFlag || glmLuma )
     {
-      // (GLM with luma: the template of its LM mode as a template selection, MDLM_L the left part, MDLM_T the one above;
-      // its glmIdc in the GLM field)
+      // (GLM with luma: the template of its LM mode as a template selection, MDLM_L the left part, MDLM_T the one
+      // above; its glmIdc in the GLM field)
       const int templateFlag = glmLuma ? ( dirMode == MDLM_L_IDX ? 2 : dirMode == MDLM_T_IDX ? 3 : 1 ) : pu.cccmFlag;
       t.lm = LM_ACTIVE | ( pu.ccInsideFilter ? LM_INSIDE : 0 ) | ( templateFlag << LM_CCCM_SHIFT )
              | ( pu.glCccmFlag ? LM_CCCM_GL : 0 ) | ( pu.cccmMultiFilterIdx << LM_CCCM_MDF_SHIFT )
@@ -2629,6 +2641,22 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
     // previous block's
     t.intraPredAngle = t.absInvAngle = t.angularScale = 0;
     t.refFilter = t.applyPDPC = t.gradPDPC = t.fusion = 0;
+  }
+#endif
+#if GPU_CCCM
+  // LM chroma fusion (geneChromaFusionPred, its first type): the plain CCCM models of MMLM_CHROMA_IDX blended in, the
+  // weight of the block's own prediction by whether the CUs below-left and above-right of the CU are LM CUs (1 both,
+  // 3 neither, else 2), its CCCM luma buffer and prediction in the scratch
+  if( !isLuma( compID ) && pu.isChromaFusion == 1 )
+  {
+    const Position        posBL = pu.Cb().bottomLeft(), posTR = pu.Cb().topRight();
+    const PredictionUnit* left  = cu.cs->getPURestricted( posBL.offset( -1, 0 ), pu, CHANNEL_TYPE_CHROMA );
+    const PredictionUnit* above = cu.cs->getPURestricted( posTR.offset( 0, -1 ), pu, CHANNEL_TYPE_CHROMA );
+    const bool leftLm  = left && PU::isLMCMode( left->intraDir[1] );
+    const bool aboveLm = above && PU::isLMCMode( above->intraDir[1] );
+    const int  w0      = leftLm && aboveLm ? 1 : !leftLm && !aboveLm ? 3 : 2;
+    t.lm = ( 1 << LM_CCCM_SHIFT ) | LM_FUSION | ( w0 << LM_FUSION_W_SHIFT );
+    m.cccmScratchWords = std::max( m.cccmScratchWords, cccmLumaArea( area, false ) + (int) area.area() );
   }
 #endif
   // ISP (luma; DecCu::xIntraRecBlk, IntraPrediction::initIntraPatternChTypeISP): the CU, whose references the first
@@ -4386,7 +4414,7 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
   int numDimdTransforms = 0, numMtss = 0, numMipDimd = 0, numInherited = 0;
   // (the LM modes' counts include CCCM blocks; CCCM's template selections: above alone, left alone; GLM's include GLM
   // with luma, CCCM's not)
-  int numCclm = 0, numMmlm = 0, numMdlm = 0, numLbccp = 0, numCclmDimd = 0, numGlm = 0, numGlmLuma = 0;
+  int numCclm = 0, numMmlm = 0, numMdlm = 0, numLbccp = 0, numCclmDimd = 0, numGlm = 0, numGlmLuma = 0, numLmFusion = 0;
   int numCccm = 0, numCccmAbove = 0, numCccmLeft = 0, numGlCccm = 0, numMdfCccm = 0, numNoSubCccm = 0;
   for( const Tu& t: m.rec )
   {
@@ -4407,6 +4435,7 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
       numMdfCccm += cccm && ( ( t.lm >> LM_CCCM_MDF_SHIFT ) & 3 ) != 0;
       numNoSubCccm += cccm && ( t.lm & LM_CCCM_NOSUB ) != 0;
     }
+    numLmFusion += ( t.lm & LM_FUSION ) != 0;
     numFilter += t.refFilter;
     numPdpc += t.applyPDPC;
     numGrad += t.applyPDPC && t.gradPDPC;
@@ -4437,7 +4466,7 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
       numTimdBlended += m.cpuTimd[size_t( th.index ) * TIMD_OUT + ( th.sad ? TIMD_OUT_SAD : 0 ) + TIMD_OUT_BLENDED] != 0;
     }
   }
-  printf( "\n[gpu-intra] POC %d: %d blocks, chain %d (ref filter %d, PDPC %d, gradient PDPC %d, fusion %d, bilateral filter candidates %d, CU nodes %d, DIMD %d, DIMD CUs %d, OBIC CUs %d, intra merge CUs %d, TIMD CUs %d (blended %d, TIMD-SAD %d, TIMD merge %d, inheriting transforms %d), TMRL CUs %d, chroma TMRL CUs %d, their MTS / LFNST / NSPT blocks %d, MTSS %d, MIP LFNST / NSPT %d, LM blocks %d (MMLM %d, MDLM %d, LBCCP %d, LFNST / NSPT %d, GLM %d (with luma %d), CCCM %d: above %d, left %d, GL %d, several filters %d, without subsampling %d)), GPU %.2f ms: %s%s%s", m.poc,
-          (int) m.rec.size() - numNodes, maxDepth, numFilter, numPdpc, numGrad, numFusion, numBf, numNodes, numDimd, numDimdCus, numObic, m.numMerge, m.numTimd, numTimdBlended, numTimdSad, m.numTimdMerge, numInherited, numTmrl, numChromaTmrl, numDimdTransforms, numMtss, numMipDimd, numCclm, numMmlm, numMdlm, numLbccp, numCclmDimd, numGlm, numGlmLuma, numCccm, numCccmAbove, numCccmLeft, numGlCccm, numMdfCccm, numNoSubCccm, ms, bad ? "MISMATCH, " : "identical",
+  printf( "\n[gpu-intra] POC %d: %d blocks, chain %d (ref filter %d, PDPC %d, gradient PDPC %d, fusion %d, bilateral filter candidates %d, CU nodes %d, DIMD %d, DIMD CUs %d, OBIC CUs %d, intra merge CUs %d, TIMD CUs %d (blended %d, TIMD-SAD %d, TIMD merge %d, inheriting transforms %d), TMRL CUs %d, chroma TMRL CUs %d, their MTS / LFNST / NSPT blocks %d, MTSS %d, MIP LFNST / NSPT %d, LM blocks %d (MMLM %d, MDLM %d, LBCCP %d, LFNST / NSPT %d, GLM %d (with luma %d), CCCM %d: above %d, left %d, GL %d, several filters %d, without subsampling %d), LM chroma fusion %d), GPU %.2f ms: %s%s%s", m.poc,
+          (int) m.rec.size() - numNodes, maxDepth, numFilter, numPdpc, numGrad, numFusion, numBf, numNodes, numDimd, numDimdCus, numObic, m.numMerge, m.numTimd, numTimdBlended, numTimdSad, m.numTimdMerge, numInherited, numTmrl, numChromaTmrl, numDimdTransforms, numMtss, numMipDimd, numCclm, numMmlm, numMdlm, numLbccp, numCclmDimd, numGlm, numGlmLuma, numCccm, numCccmAbove, numCccmLeft, numGlCccm, numMdfCccm, numNoSubCccm, numLmFusion, ms, bad ? "MISMATCH, " : "identical",
           bad ? first.c_str() : "", numBad ? ( ", " + std::to_string( numBad ) + " picture samples differ" ).c_str() : "" );
 }
