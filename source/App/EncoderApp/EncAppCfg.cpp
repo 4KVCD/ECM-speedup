@@ -3987,7 +3987,7 @@ bool EncAppCfg::xCheckParameter()
     if( periodsSupported && m_iIntraPeriod > 0 )
     {
       const int numPeriods = ( m_framesToBeEncoded + m_iIntraPeriod - 1 ) / m_iIntraPeriod;   // coded frames
-      // Measured at 1080p (perf/OPTIMIZATIONS.md): a search stack commits about 0.85 GB, a picture that waits for its
+      // Measured at 1080p (perf/OPTIMIZATIONS.md): a search stack commits about 0.6 GB, a picture that waits for its
       // search about 4 bytes per luma sample, an idle finish context about 63; up to max(N, GOPSize) pictures per
       // period are in flight, and about GOPSize + 2N more (references, pictures being searched) about 70 bytes per
       // sample. The encoder takes at most 70 % of the physical memory, with some margin on each figure; if the memory
@@ -3998,7 +3998,7 @@ bool EncAppCfg::xCheckParameter()
       const double   samples   = double( m_iSourceWidth ) * double( m_iSourceHeight );
 #endif
       const double   perPeriod = std::max( m_frameThreads, m_iGOPSize ) * 6.0 * samples + 80.0 * samples;
-      const double   base      = m_frameThreads * 1.0e9 + ( m_iGOPSize + 2 * m_frameThreads ) * 70.0 * samples;
+      const double   base      = m_frameThreads * 0.7e9 + ( m_iGOPSize + 2 * m_frameThreads ) * 70.0 * samples;
       const uint64_t memory    = getPhysicalMemoryBytes();
       const double   budget    = 0.7 * double( memory ) - base;
       const int      memPeriods = memory == 0 ? 4 : budget > perPeriod ? int( std::min( budget / perPeriod, 64.0 ) ) : 1;

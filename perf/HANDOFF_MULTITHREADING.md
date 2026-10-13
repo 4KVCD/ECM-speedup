@@ -179,6 +179,11 @@ Commits on `enc-mt`, all bit-exact with stock ECM-20.0 (bitstream md5 of the sui
   (createEncData to destroyEncData: pre-deblocking statistics, deblocking, SAO, CCSAO); finishes of several periods
   at once had raised the peak by 0.64 GB each at 1080p. RA 1080p with 8 threads and 8 periods, 150 s: peak
   18.3 -> 14.7 GB (working set 12.6 -> 9.1 GB); RA 257 frames with 8 threads 282.1 s, as before.
+- RAM step R1: the reused uni-prediction MV tables of a search stack (`InterSearch::ReusedUniMvs`, two per stack)
+  are sized for the CTU size in use instead of 256x256 CTUs: 2 x 167 -> 2 x 35 MB of commit per stack (calloc'ed,
+  hardly touched). Peak commit with 8 threads: RA 65 frames 8.29 -> 6.14 GB, AI 33 pictures 8.31 -> 6.14 GB. An
+  allocation probe (`C:\Code\work\mt\ram\allocprobe`: every live allocation with its call site and resident bytes,
+  QueryWorkingSetEx) showed these tables as 2.7 GB of the 9.1 GB committed at 1080p before the first picture.
 - Tried and dropped (RAM): freeing the original and the per-4x4 arrays of a finished picture that waits only for its
   output and is no reference (`C:\Code\work\mt\ram\w_dropped.diff`). In the first minutes at 1080p with 8 threads
   and 8 periods the list holds about 280 waiting pictures, 9 being searched and at most 13 finished ones, all still

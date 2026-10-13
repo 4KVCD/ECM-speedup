@@ -597,12 +597,28 @@ void InterSearch::init( EncCfg*        pcEncCfg,
     m_amvpSbTmvpMotionBuf = new MotionInfo[AMVP_SBTMVP_BUF_SIZE];
   }
 #endif
-  for( int lic = 0; lic < 2; lic++ )
+  for( ReusedUniMvs& reused: m_reusedUniMvs )
   {
-    m_reusedUniMvs[lic].reset( (ReusedUniMvs*) std::calloc( 1, sizeof( ReusedUniMvs ) ) );
-    CHECK( !m_reusedUniMvs[lic], "out of memory" );
+    reused.create( maxCUWidth >> MIN_CU_LOG2, gp_sizeIdxInfo->idxFrom( maxCUWidth ) + 1 );
   }
   m_isInitialized = true;
+}
+
+void InterSearch::ReusedUniMvs::create( unsigned numPositions, unsigned numSizes )
+{
+  m_numPositions = numPositions;
+  m_numSizes     = numSizes;
+  m_numEntries   = size_t( numPositions ) * numPositions * numSizes * numSizes;
+  m_mvs.reset( static_cast<MvSet*>( std::calloc( m_numEntries, sizeof( MvSet ) ) ) );
+  m_filled.reset( static_cast<bool*>( std::calloc( m_numEntries, sizeof( bool ) ) ) );
+  CHECK( !m_mvs || !m_filled, "out of memory" );
+}
+
+void InterSearch::ReusedUniMvs::store( unsigned x, unsigned y, unsigned w, unsigned h, const MvSet& mvs )
+{
+  const size_t i = index( x, y, w, h );
+  ::memcpy( m_mvs.get()[i], mvs, sizeof( MvSet ) );
+  m_filled.get()[i] = true;
 }
 
 void InterSearch::resetSavedAffineMotion()
@@ -6264,14 +6280,12 @@ void InterSearch::predInterSearch(CodingUnit& cu, Partitioner& partitioner)
 #if INTER_LIC
         if (cu.slice->getUseLIC() && cu.licFlag)
         {
-          ::memcpy(&(getReusedUniMvs( true ).mv[idx1][idx2][idx3][idx4][0][0]), cMvTemp, 2 * 33 * sizeof(Mv));
-          getReusedUniMvs( true ).filled[idx1][idx2][idx3][idx4] = true;
+          getReusedUniMvs( true ).store( idx1, idx2, idx3, idx4, cMvTemp );
         }
         else
         {
 #endif
-        ::memcpy(&(getReusedUniMvs( false ).mv[idx1][idx2][idx3][idx4][0][0]), cMvTemp, 2 * 33 * sizeof(Mv));
-        getReusedUniMvs( false ).filled[idx1][idx2][idx3][idx4] = true;
+        getReusedUniMvs( false ).store( idx1, idx2, idx3, idx4, cMvTemp );
 #if INTER_LIC
         }
 #endif
@@ -6478,10 +6492,10 @@ void InterSearch::predInterSearch(CodingUnit& cu, Partitioner& partitioner)
               aaiMvpIdxBi[iRefList][iRefIdxTemp] = bestMvpIdxLoop;
               unsigned idx1, idx2, idx3, idx4;
               getAreaIdx(cu.Y(), *cu.slice->getPPS()->pcv, idx1, idx2, idx3, idx4);
-              CHECK(getReusedUniMvs( false ).filled[idx1][idx2][idx3][idx4] == false, "this is not possible");
-              if (getReusedUniMvs( false ).filled[idx1][idx2][idx3][idx4])
+              CHECK(!getReusedUniMvs( false ).isFilled( idx1, idx2, idx3, idx4 ), "this is not possible");
+              if (getReusedUniMvs( false ).isFilled( idx1, idx2, idx3, idx4 ))
               {
-                cMvTemp[iRefList][iRefIdxTemp] = getReusedUniMvs( false ).mv[idx1][idx2][idx3][idx4][refListAmvp][iRefIdxTemp];
+                cMvTemp[iRefList][iRefIdxTemp] = getReusedUniMvs( false ).mvs( idx1, idx2, idx3, idx4 )[refListAmvp][iRefIdxTemp];
               }
               else
               {
@@ -8235,9 +8249,9 @@ void InterSearch::predInterSearchAdditionalHypothesis(PredictionUnit& pu, const 
         if ((pu.addHypData.size() + 1 - pu.numMergedAddHyps) < sps.getMaxNumAddHyps())
           uiBits++;
         Mv cMv(0, 0);
-        if (getReusedUniMvs( false ).filled[idx1][idx2][idx3][idx4])
+        if (getReusedUniMvs( false ).isFilled( idx1, idx2, idx3, idx4 ))
         {
-          cMv = getReusedUniMvs( false ).mv[idx1][idx2][idx3][idx4][iRefPicList][iRefIdxPred];
+          cMv = getReusedUniMvs( false ).mvs( idx1, idx2, idx3, idx4 )[iRefPicList][iRefIdxPred];
           uint32_t bitsDummy = 0;
           Distortion uiCostDummy = 0;
           xCheckBestMVP(eRefPicList, cMv, cMvPred, tempMHPredData.mvpIdx, amvpInfo, bitsDummy, uiCostDummy, pu.cu->imv);

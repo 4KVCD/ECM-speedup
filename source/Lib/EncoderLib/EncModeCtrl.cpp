@@ -3386,15 +3386,15 @@ bool EncModeCtrlMTnoRQT::tryMode( const EncTestMode& encTestmode, const CodingSt
     {
       unsigned idx1, idx2, idx3, idx4;
       getAreaIdx(partitioner.currArea().Y(), *slice.getPPS()->pcv, idx1, idx2, idx3, idx4);
-      if (m_pcInterSearch->getReusedUniMvs( false ).filled[idx1][idx2][idx3][idx4])
+      if (m_pcInterSearch->getReusedUniMvs( false ).isFilled( idx1, idx2, idx3, idx4 ))
       {
-        m_pcInterSearch->insertUniMvCands(partitioner.currArea().Y(), m_pcInterSearch->getReusedUniMvs( false ).mv[idx1][idx2][idx3][idx4]);
+        m_pcInterSearch->insertUniMvCands(partitioner.currArea().Y(), m_pcInterSearch->getReusedUniMvs( false ).mvs( idx1, idx2, idx3, idx4 ));
       }
 #if INTER_LIC
-      if (cs.slice->getUseLIC() && m_pcInterSearch->getReusedUniMvs( true ).filled[idx1][idx2][idx3][idx4])
+      if (cs.slice->getUseLIC() && m_pcInterSearch->getReusedUniMvs( true ).isFilled( idx1, idx2, idx3, idx4 ))
       {
         m_pcInterSearch->swapUniMvBuffer();
-        m_pcInterSearch->insertUniMvCands(partitioner.currArea().Y(), m_pcInterSearch->getReusedUniMvs( true ).mv[idx1][idx2][idx3][idx4]);
+        m_pcInterSearch->insertUniMvCands(partitioner.currArea().Y(), m_pcInterSearch->getReusedUniMvs( true ).mvs( idx1, idx2, idx3, idx4 ));
         m_pcInterSearch->swapUniMvBuffer();
       }
 #endif

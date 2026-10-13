@@ -1104,32 +1104,46 @@ public:
     m_uniMvListSizeLIC = tempInt;
   }
 #endif
-  /// Uni-prediction MVs of the motion search per block position and size, reused by later tests of the slice.
-  struct ReusedUniMvs
+  /// Uni-prediction MVs of the motion search per block position and size in the CTU (getAreaIdx), reused by later
+  /// tests of the slice. Sized for the CTU size in use and calloc'ed, so only the entries written take memory.
+  class ReusedUniMvs
   {
-#if CTU_256
-    Mv   mv    [MAX_CU_SIZE >> MIN_CU_LOG2][MAX_CU_SIZE >> MIN_CU_LOG2][MAX_CU_DEPTH + 1][MAX_CU_DEPTH + 1][2][33];
-    bool filled[MAX_CU_SIZE >> MIN_CU_LOG2][MAX_CU_SIZE >> MIN_CU_LOG2][MAX_CU_DEPTH + 1][MAX_CU_DEPTH + 1];
-#else
-    Mv   mv    [32][32][8][8][2][33];
-    bool filled[32][32][8][8];
-#endif
+  public:
+    using MvSet = Mv[2][33];   ///< [ref list][ref idx]
+
+    void create( unsigned numPositions, unsigned numSizes );
+    bool         isFilled( unsigned x, unsigned y, unsigned w, unsigned h ) const { return m_filled.get()[index( x, y, w, h )]; }
+    const MvSet& mvs( unsigned x, unsigned y, unsigned w, unsigned h ) const { return m_mvs.get()[index( x, y, w, h )]; }
+    void         store( unsigned x, unsigned y, unsigned w, unsigned h, const MvSet& mvs );
+    void         reset() { ::memset( m_filled.get(), 0, m_numEntries ); }
+
+  private:
+    struct FreeDeleter
+    {
+      void operator()( void* p ) const { std::free( p ); }
+    };
+    size_t index( unsigned x, unsigned y, unsigned w, unsigned h ) const
+    {
+      CHECKD( x >= m_numPositions || y >= m_numPositions || w >= m_numSizes || h >= m_numSizes, "Block outside the CTU" );
+      return ( ( size_t( x ) * m_numPositions + y ) * m_numSizes + w ) * m_numSizes + h;
+    }
+    unsigned m_numPositions = 0;   ///< 4x4 positions per CTU row
+    unsigned m_numSizes     = 0;   ///< block size indices (gp_sizeIdxInfo) up to the CTU size
+    size_t   m_numEntries   = 0;
+    std::unique_ptr<MvSet[], FreeDeleter> m_mvs;
+    std::unique_ptr<bool[], FreeDeleter>  m_filled;
   };
-  ReusedUniMvs& getReusedUniMvs( bool lic ) { return *m_reusedUniMvs[lic ? 1 : 0]; }
-  void          resetReusedUniMvs( bool lic ) { ::memset( m_reusedUniMvs[lic ? 1 : 0]->filled, 0, sizeof( ReusedUniMvs::filled ) ); }
+  ReusedUniMvs& getReusedUniMvs( bool lic ) { return m_reusedUniMvs[lic ? 1 : 0]; }
+  void          resetReusedUniMvs( bool lic ) { m_reusedUniMvs[lic ? 1 : 0].reset(); }
 private:
-  struct FreeDeleter
-  {
-    void operator()( void* p ) const { std::free( p ); }
-  };
-  std::unique_ptr<ReusedUniMvs, FreeDeleter> m_reusedUniMvs[2];   ///< [LIC]; calloc'ed, so only touched pages get memory
+  ReusedUniMvs m_reusedUniMvs[2];   ///< [LIC]
 public:
   void resetUniMvList() { m_uniMvListIdx = 0; m_uniMvListSize = 0; 
 #if INTER_LIC
                           m_uniMvListIdxLIC = 0; m_uniMvListSizeLIC = 0; 
 #endif
   }
-  void insertUniMvCands(CompArea blkArea, Mv cMvTemp[2][33])
+  void insertUniMvCands(CompArea blkArea, const Mv cMvTemp[2][33])
   {
     BlkUniMvInfo* curMvInfo = m_uniMvList + m_uniMvListIdx;
     int j = 0;
