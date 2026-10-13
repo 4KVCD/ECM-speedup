@@ -84,7 +84,7 @@ const int MMLM_T_IDX      = LM_CHROMA_IDX + 5;
 // With GLM (JVET-AA0126) the gradient pattern of the block (glmIdc 1 .. NUM_GLM_PATTERN, 0: none) and the other's.
 // A CCCM block (JVET-AA0057, intra_cccm.glsl; no slope adjustments, GLM, LFNST / NSPT) has its template selection
 // (cccmFlag: 1 above and left, 2 left, 3 above; 0: not CCCM) and its kind in the other component's field: GL-CCCM's
-// gradients and locations (JVET-AC0054)
+// gradients and locations (JVET-AC0054), several downsampling filters (JVET-AD0202's cccmMultiFilterIdx 1 .. 3)
 const int LM_DELTA0_SHIFT = 0;
 const int LM_DELTA1_SHIFT = 4;
 const int LM_INSIDE       = 256;
@@ -96,6 +96,7 @@ const int LM_GLM_SHIFT    = 20;   // 4 bits
 const int LM_OTHER_GLM_SHIFT = 24;
 const int LM_CCCM_SHIFT   = 28;   // 2 bits
 const int LM_CCCM_GL      = 4096;
+const int LM_CCCM_MDF_SHIFT = 13;   // 2 bits
 
 // Tu::derive
 const int DERIVE_NODE     = 32;  // not a block: the derivation of the mode of CU Tu::cu, before the CU's blocks
@@ -603,7 +604,8 @@ struct Params
                         // and the comparison)
   uint64_t obicNbrs;    // per OBIC CU (Cu::obic) its neighbours (OBIC_NBRS ObicNbr)
   uint64_t obicOut;     // int32 per OBIC CU (OBIC_OUT): its OBIC, written by its node (for its blocks, the comparison)
-  uint64_t blendAcc;    // int32 per intra_rec workgroup: 3 x 128 x 128 sums of DIMD / OBIC / merge blending (BLEND_ACC)
+  uint64_t scratch;     // int32, intra_rec's: per workgroup the 3 x 128 x 128 sums of DIMD / OBIC / merge blending
+                        // (BLEND_ACC), then from cccmScratchOffset per workgroup cccmScratchWords of CCCM data
   uint64_t mergeData;   // the intra merge CUs' records (Cu::merge, MergeHead)
   uint64_t mergeCost;   // uint64 per intra merge CU: the template cost of each mode (NUM_LUMA_MODE; ~0: none)
   uint64_t timdData;    // the TIMD CUs' records (Cu::timd, TimdHead)
@@ -627,6 +629,11 @@ struct Params
   int      cclmFilter;  // CCLM's luma downsampling filter by the SPS's collocated chroma flags (CCLM_FILTER_*)
   int      dualTree;    // CS::isDualITree: luma and chroma are separate trees (CCCM reads luma right of / below a block)
   int      cccmLbccp;   // CCCM's two sets of models (LBCCP, JVET-AD0120: an intra slice with the TM non-inter tools)
+  // scratch's CCCM part: a CCCM block's luma buffers and prediction beyond shared memory (several filters' buffers,
+  // larger blocks), after blending's sums, which keep their constant stride (blending indexing by a stride read from
+  // Params was 4 % slower; a buffer of its own, its address a further field, measured 0.7 % slower on CCCM streams)
+  int      cccmScratchOffset;   // its start (int32)
+  int      cccmScratchWords;    // its int32 per workgroup
 };
 layout( buffer_reference, std430, buffer_reference_align = 8 ) buffer BufParams { Params p; };
 

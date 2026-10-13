@@ -98,7 +98,8 @@ bool   g_crs;       // LMCS chroma residual scaling of the block
 int    g_crsScale;  // its scale (Reshape::calculateChromaAdj)
 // blending (a DERIVE_DIMD block whose CU's DIMD blends, a DERIVE_OBIC or DERIVE_MERGE block): the predictions of the
 // CU's modes (s_blendMode: DIMD's or the intra merge candidate's main mode, planar and blend modes, OBIC's modes) are
-// summed per location dependence class (emitPred), weighted, in the workgroup's BLEND_ACC sums (each class's N samples)
+// summed per location dependence class (emitPred), weighted, in the workgroup's BLEND_ACC sums at the start of the
+// scratch (Params::scratch; each class's N samples)
 const int BLEND_ACC = 3 * 128 * 128;
 const int BLEND_MAX = 8;
 shared int s_blendNum;                 // the block's predictions (0: no blending)
@@ -530,7 +531,7 @@ void emitPred( Tu t, int x, int y, int pr, bool bf )
 {
   if( WITH_DIMD && g_blendSum )
   {
-    CBufI32   acc = CBufI32( P.blendAcc );
+    CBufI32   acc = CBufI32( P.scratch );
     const int o   = int( gl_WorkGroupID.x ) * BLEND_ACC + y * t.regW + x;
     const int N   = t.regW * t.h;
     for( int c = 0; c < 3; c++ )
@@ -2125,7 +2126,7 @@ void main()
       }
       const bool needClipVer = wVer + rangeVer > clipVer || wVer - rangeVer < 0;
       const bool needClipHor = wHor + rangeHor > clipHor || wHor - rangeHor < 0;
-      CBufI32 acc = CBufI32( P.blendAcc );
+      CBufI32 acc = CBufI32( P.scratch );
       for( int i = lid; i < N; i += NT )
       {
         const int x = i % W, y = i / W, o = int( gl_WorkGroupID.x ) * BLEND_ACC + i;
