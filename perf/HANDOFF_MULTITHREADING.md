@@ -193,6 +193,9 @@ Commits on `enc-mt`, all bit-exact with stock ECM-20.0 (bitstream md5 of the sui
 - RAM step R4: `BestEncInfoCache` makes a slot's TU buffers at its first store (`xCreateTuBuffers`) instead of all
   slots' at the first CTU (about 128 MB of commit per stack, under 10 % touched). Peak commit RA 65 frames with 8
   threads 5.85 -> 5.14 GB; 1.2 % faster on the suite (compact buffers).
+- RAM step R5: `BestEncInfoCache` also makes a slot itself (CU, PU, TUs) at its first store (`xCreateSlot`), not
+  every slot at create (about 85 MB per stack, all touched). Peak commit RA 65 frames with 8 threads 5.14 -> 4.37 GB;
+  2.1 % faster on the suite.
 - Tried and dropped (RAM): freeing the original and the per-4x4 arrays of a finished picture that waits only for its
   output and is no reference (`C:\Code\work\mt\ram\w_dropped.diff`). In the first minutes at 1080p with 8 threads
   and 8 periods the list holds about 280 waiting pictures, 9 being searched and at most 13 finished ones, all still

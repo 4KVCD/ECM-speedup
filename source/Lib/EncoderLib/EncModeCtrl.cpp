@@ -902,6 +902,9 @@ void BestEncInfoCache::create( const ChromaFormat chFmt )
 #if CONVERT_NUM_TU_SPLITS_TO_CFG
   m_maxNumTUs = maxNumTUs;
 #endif
+#if BEST_ENC_INFO_LAZY_SLOTS
+  m_chFmt = chFmt;
+#endif
   const unsigned numPos = maxCuSize >> MIN_CU_LOG2;
   m_maxCuSize = maxCuSize;
 
@@ -933,6 +936,10 @@ void BestEncInfoCache::create( const ChromaFormat chFmt )
 #endif
           for( int hIdx = 0; hIdx < gp_sizeIdxInfo->numHeights(); hIdx++ )
           {
+#if BEST_ENC_INFO_LAZY_SLOTS
+            m_bestEncInfo[treeIdx][x][y][wIdx][hIdx] = nullptr;   // made at its first store (xCreateSlot)
+            continue;
+#endif
 #if JVET_AI0136_ADAPTIVE_DUAL_TREE
             if (treeIdx > 0 )// && (gp_sizeIdxInfo->sizeFrom(wIdx) > 64 || gp_sizeIdxInfo->sizeFrom(wIdx)>64))
             {
@@ -1047,7 +1054,7 @@ void BestEncInfoCache::destroy()
         delete[] m_bestEncInfo[treeIdx][x][y];
       }
     }
-#if !BEST_ENC_INFO_LAZY_TU_BUFFERS   // else the slots own their TU buffers
+#if !BEST_ENC_INFO_LAZY_SLOTS   // else the slots own their TU buffers
     delete[] m_pCoeff[treeIdx];
 #if SIGN_PREDICTION
     delete[] m_pCoeffSign[treeIdx];
@@ -1093,7 +1100,7 @@ void BestEncInfoCache::destroy()
     }
   }
 
-#if !BEST_ENC_INFO_LAZY_TU_BUFFERS   // else the slots own their TU buffers
+#if !BEST_ENC_INFO_LAZY_SLOTS   // else the slots own their TU buffers
   delete[] m_pCoeff;
 #if SIGN_PREDICTION
   delete[] m_pCoeffSign;
@@ -1122,8 +1129,8 @@ void BestEncInfoCache::init( const Slice &slice )
 
   if( isInitialized ) return;
 
-#if BEST_ENC_INFO_LAZY_TU_BUFFERS
-  // the TU buffers of a slot are made at its first store (xCreateTuBuffers)
+#if BEST_ENC_INFO_LAZY_SLOTS
+  // a slot and its TU buffers are made at its first store (xCreateSlot)
   m_dummyCS.pcv = slice.getPPS()->pcv;
   m_usePLT      = slice.getSPS()->getPLTMode();
 #else
@@ -1369,7 +1376,7 @@ void BestEncInfoCache::init( const Slice &slice )
 #if JVET_AI0136_ADAPTIVE_DUAL_TREE
   }
 #endif
-#endif   // !BEST_ENC_INFO_LAZY_TU_BUFFERS
+#endif   // !BEST_ENC_INFO_LAZY_SLOTS
 
 #if ENABLE_SPLIT_PARALLELISM
 
@@ -1377,7 +1384,31 @@ void BestEncInfoCache::init( const Slice &slice )
 #endif
 }
 
-#if BEST_ENC_INFO_LAZY_TU_BUFFERS
+#if BEST_ENC_INFO_LAZY_SLOTS
+bool BestEncInfoCache::xIsSlot( unsigned y, int hIdx ) const
+{
+  // as create made the slots: luma tree only, a CU height that fits in the CTU below row y
+  const int height = gp_sizeIdxInfo->sizeFrom( hIdx );
+  return m_treeIdx == 0 && gp_sizeIdxInfo->isCuSize( height )
+         && y + ( height >> MIN_CU_LOG2 ) <= unsigned( m_maxCuSize >> MIN_CU_LOG2 );
+}
+
+void BestEncInfoCache::xCreateSlot( BestEncodingInfo*& slot, int width, int height )
+{
+  // the CU, PU and TUs as create made them for every slot
+  const UnitArea area( m_chFmt, Area( 0, 0, width, height ) );
+  slot = new BestEncodingInfo;
+  new ( &slot->cu ) CodingUnit    ( area );
+  new ( &slot->pu ) PredictionUnit( area );
+  slot->tus.clear();
+  for( int i = 0; i < m_maxNumTUs; i++ )
+  {
+    slot->tus.push_back( TransformUnit( area ) );
+  }
+  slot->poc = -1;
+  xCreateTuBuffers( *slot );
+}
+
 void BestEncInfoCache::xCreateTuBuffers( BestEncodingInfo& encInfo )
 {
   // one allocation, carved per TU and block as the shared buffers were: coefficients, sign scan indices, PCM samples,
@@ -1438,9 +1469,19 @@ bool BestEncInfoCache::setFromCs( const CodingStructure& cs, const Partitioner& 
   }
 
   unsigned idx1, idx2, idx3, idx4;
-
   getAreaIdx( cs.area.Y(), *m_slice_bencinf->getPPS()->pcv, idx1, idx2, idx3, idx4 );
-
+#if BEST_ENC_INFO_LAZY_SLOTS
+  BestEncodingInfo*& slot = m_bestEncInfo[m_treeIdx][idx1][idx2][idx3][idx4];
+  if( !slot )
+  {
+    if( !xIsSlot( idx2, idx4 ) )
+    {
+      return false;
+    }
+    xCreateSlot( slot, gp_sizeIdxInfo->sizeFrom( idx3 ), gp_sizeIdxInfo->sizeFrom( idx4 ) );
+  }
+  BestEncodingInfo& encInfo = *slot;
+#else
 #if JVET_AI0136_ADAPTIVE_DUAL_TREE
   BestEncodingInfo& encInfo = *m_bestEncInfo[m_treeIdx][idx1][idx2][idx3][idx4];
 #else
@@ -1452,11 +1493,6 @@ bool BestEncInfoCache::setFromCs( const CodingStructure& cs, const Partitioner& 
     return false;
   }
 #endif
-#if BEST_ENC_INFO_LAZY_TU_BUFFERS
-  if( !encInfo.tuStorage )
-  {
-    xCreateTuBuffers( encInfo );
-  }
 #endif
   encInfo.poc            =  cs.picture->poc;
   encInfo.cu.repositionTo( *cs.cus.front() );
