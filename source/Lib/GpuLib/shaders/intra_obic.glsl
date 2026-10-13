@@ -87,19 +87,20 @@ void obicHistogram( Cu c, int lid, int NT )
     }
     else if( WITH_TIMD && kind == CU_TIMD )   // its node's TimdOut (MAP131TO67 of its modes)
     {
-      CBufI32   o    = CBufI32( P.timdOut );
-      const int base = timdOutBase( nb.cu );
-      const int mode = o.v[base + TIMD_OUT_MODE], sec = o.v[base + TIMD_OUT_SECONDARY];
-      obicCount( timdMode67( mode ), o.v[base + TIMD_OUT_LOC_DEP], ns );
+      CBufI32   timdOut = CBufI32( P.timdOut );
+      const int outBase = timdOutBase( nb.cu );
+      const int mode = timdOut.v[outBase + TIMD_OUT_MODE], secondary = timdOut.v[outBase + TIMD_OUT_SECONDARY];
+      obicCount( timdMode67( mode ), timdOut.v[outBase + TIMD_OUT_LOC_DEP], ns );
       // where it blends, its secondary mode (not the mode again) and with it its non-angular one, by their weights
       // relative to the mode's
-      const int w0 = o.v[base + TIMD_OUT_WEIGHT], w1 = o.v[base + TIMD_OUT_WEIGHT + 1], w2 = o.v[base + TIMD_OUT_WEIGHT + 2];
-      if( o.v[base + TIMD_OUT_BLENDED] != 0 && w1 > 0 && mode != sec )
+      const int w0 = timdOut.v[outBase + TIMD_OUT_WEIGHT], w1 = timdOut.v[outBase + TIMD_OUT_WEIGHT + 1];
+      const int w2 = timdOut.v[outBase + TIMD_OUT_WEIGHT + 2];
+      if( timdOut.v[outBase + TIMD_OUT_BLENDED] != 0 && w1 > 0 && mode != secondary )
       {
-        obicCount( timdMode67( sec ), o.v[base + TIMD_OUT_LOC_DEP + 1], ns * w1 / w0 );
+        obicCount( timdMode67( secondary ), timdOut.v[outBase + TIMD_OUT_LOC_DEP + 1], ns * w1 / w0 );
         if( w2 > 0 )
         {
-          obicCount( timdMode67( o.v[base + TIMD_OUT_NON_ANG] ), o.v[base + TIMD_OUT_LOC_DEP + 2], ns * w2 / w0 );
+          obicCount( timdMode67( timdOut.v[outBase + TIMD_OUT_NON_ANG] ), timdOut.v[outBase + TIMD_OUT_LOC_DEP + 2], ns * w2 / w0 );
         }
       }
     }

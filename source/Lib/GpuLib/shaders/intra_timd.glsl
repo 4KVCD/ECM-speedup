@@ -1,8 +1,9 @@
 // Template predictions of TIMD's kind (IntraPrediction::initTimdIntraPatternLuma, initPredTimdIntraParams,
 // predTimdIntraAng) for a luma template, and their SATD costs (RdCost::xGetHADs_SIMD), which intra merge ranks its
-// candidates with. The template block is the CU extended by tw columns to the left and th rows above (W + tw by H +
-// th; an arm the template lacks is 0, CU::deriveTimdRefType's ABOVE_NEIGHBOR / LEFT_NEIGHBOR at the picture's left /
-// top edge); the template is its top th rows right of the corner and its left tw columns below the corner. Its
+// candidates with, or TIMD-SAD's mean-removed SAD; a TIMD CU's node. The template block is the CU extended by tw
+// columns to the left and th rows above (W + tw by H + th; an arm the template lacks is 0, CU::deriveTimdRefType's
+// ABOVE_NEIGHBOR / LEFT_NEIGHBOR at the picture's left / top edge); the template is its top th rows right of the
+// corner and its left tw columns below the corner. Its
 // reference line, one sample further out, is filled into s_ref[0] (the row: (W + tw) * 8 + 1 samples from the corner)
 // and s_ref[1] (the column: (H + th) * 8 + 1). Modes are of the 131-mode set (MAP67TO131). Included by intra_rec.comp.
 #ifndef INTRA_TIMD_GLSL
@@ -26,7 +27,8 @@ const int EXT_VDIA_IDX = 130;
 // ----- the reference line
 
 // the availability bits of the reference's units (timdFillReference copies them from the CU's record): at most 2 x
-// (8 x 132 / 4) + 3 units of 4 (the host takes CUs up to 128 x 128 only)
+// (8 x 132 / 4) + 3 units of 4 for arms of 4 (the host takes CUs up to 128 x 128 only), fewer for TIMD-SAD's arms of 8
+// (intra slices keep its CUs at 1024 samples); the host rejects a template of more (TIMD_UNITS_MAX)
 shared uint s_timdUnits[17];
 
 bool timdUnitAvailable( int unit )
@@ -490,16 +492,33 @@ int  timdCandDir( uint w )  { return int( ( w >> 10 ) & 255u ); }
 bool timdCandWA( uint w )   { return ( w & ( 1u << 18 ) ) != 0u; }
 int  timdCandSlot( uint w ) { return int( w >> 19 ); }
 
+// the difference of the original (the reconstruction) and the prediction at sample s of a template (timdTemplateCosts'
+// order: the above arm's rows of c.w, then the left arm's rows of t.tw) predicted into s_tmp from predOffset
+int timdTemplateDiff( Cu c, TemplateUnits t, int predOffset, int s )
+{
+  const int nA = c.w * t.th;
+  return s < nA ? timdDiff( c.x, c.y - t.th, predOffset, c.w, s % c.w, s / c.w )
+                : timdDiff( c.x - t.tw, c.y, predOffset + nA, t.tw, ( s - nA ) % t.tw, ( s - nA ) / t.tw );
+}
+
+// the mean-removed SAD's sums of the differences per candidate of a pass and arm (above, left), 2 x TIMD_MRSAD_CANDS
+// ints. They take s_dimdHist (3 x 67 ints), which a TIMD node no longer reads once dimdSelect has (and which MTSS clears
+// before its histograms): shared memory of their own slowed every pipeline by ~3 %
+const int TIMD_MRSAD_CANDS = 64;
+#define s_timdArmDiff s_dimdHist
+
 // the template costs of the numCands candidates at s_spCost[candBase] for CU c with template t (all invocations; the
-// references filled, dc timdDc's): each arm's SATD added to its slot (the above arm's at costA, the left arm's at costL;
+// references filled, dc timdDc's): each arm's cost added to its slot (the above arm's at costA, the left arm's at costL;
 // zeroed by the caller), as many candidates at once as s_tmp holds their templates (the above arm's rows of c.w, then the
-// left arm's rows of tw), predicted in parallel, then the SATD of the reconstruction against each, block by block in
-// parallel
+// left arm's rows of tw), predicted in parallel, then the cost of the reconstruction against each in parallel: the SATD
+// block by block, or with mrsad deriveTimdModeSad's mean-removed SAD (RdCost::xGetMRSAD per arm: the sum of the
+// differences' distances from their mean, the mean truncated toward 0; its SIMD forms, whose 16-bit lanes saturate,
+// agree up to 11 bits, the GPU's TIMD up to 10)
 void timdTemplateCosts( Cu c, TemplateUnits t, int candBase, int numCands, int costA, int costL, int dc, int maxPel, bool noPdpc,
-                        int lid, int NT )
+                        bool mrsad, int lid, int NT )
 {
   const int   nA = c.w * t.th, T = nA + t.tw * c.h;   // template samples per candidate
-  const int   perPass = max( 1, MAX_REF / T );
+  const int   perPass = mrsad ? min( max( 1, MAX_REF / T ), TIMD_MRSAD_CANDS ) : max( 1, MAX_REF / T );
   const ivec2 ka = timdKernel( c.w, t.th ), kl = timdKernel( t.tw, c.h );
   const int   colsA = c.w / ka.x, colsL = t.tw / kl.x;
   const int   nbA = colsA * ( t.th / ka.y ), B = nbA + colsL * ( c.h / kl.y );   // SATD blocks per candidate
@@ -515,34 +534,67 @@ void timdTemplateCosts( Cu c, TemplateUnits t, int candBase, int numCands, int c
       const int y = s < nA ? s / c.w : t.th + ( s - nA ) / t.tw;
       s_tmp[i] = int16_t( timdPredict( timdCandMode( cand ), p, x, y, c.w, c.h, t.tw, t.th, dc, maxPel ) );
     }
-    SYNC();
-    for( int i = lid; i < n * B; i += NT )
+    for( int i = lid; mrsad && i < 2 * n; i += NT )
     {
-      const int m = i / B, b = i % B, k = b - nbA;
-      const int satd = b < nbA ? timdHad( c.x, c.y - t.th, m * T, c.w, ( b % colsA ) * ka.x, ( b / colsA ) * ka.y, ka.x, ka.y )
-                               : timdHad( c.x - t.tw, c.y, m * T + nA, t.tw, ( k % colsL ) * kl.x, ( k / colsL ) * kl.y, kl.x, kl.y );
-      atomicAdd( s_spCost[( b < nbA ? costA : costL ) + timdCandSlot( s_spCost[candBase + first + m] )], uint( satd ) );
+      s_timdArmDiff[i] = 0;
+    }
+    SYNC();
+    if( mrsad )
+    {
+      for( int i = lid; i < n * T; i += NT )
+      {
+        atomicAdd( s_timdArmDiff[2 * ( i / T ) + ( i % T < nA ? 0 : 1 )], timdTemplateDiff( c, t, ( i / T ) * T, i % T ) );
+      }
+      SYNC();
+      for( int i = lid; i < n * T; i += NT )
+      {
+        const int m = i / T, s = i % T, arm = s < nA ? 0 : 1;
+        const int sum = s_timdArmDiff[2 * m + arm], count = arm == 0 ? nA : T - nA;
+        const int mean = sum < 0 ? -( -sum / count ) : sum / count;
+        atomicAdd( s_spCost[( arm == 0 ? costA : costL ) + timdCandSlot( s_spCost[candBase + first + m] )],
+                   uint( abs( timdTemplateDiff( c, t, m * T, s ) - mean ) ) );
+      }
+    }
+    else
+    {
+      for( int i = lid; i < n * B; i += NT )
+      {
+        const int m = i / B, b = i % B, k = b - nbA;
+        const int satd = b < nbA ? timdHad( c.x, c.y - t.th, m * T, c.w, ( b % colsA ) * ka.x, ( b / colsA ) * ka.y, ka.x, ka.y )
+                                 : timdHad( c.x - t.tw, c.y, m * T + nA, t.tw, ( k % colsL ) * kl.x, ( k / colsL ) * kl.y, kl.x, kl.y );
+        atomicAdd( s_spCost[( b < nbA ? costA : costL ) + timdCandSlot( s_spCost[candBase + first + m] )], uint( satd ) );
+      }
     }
     SYNC();
   }
 }
 
-// ----- a TIMD CU's node (IntraPrediction::deriveTimdMode without TIMD-SAD, TIMD merge and block vectors): the template
-// costs of its candidates in two batches - planar, DC, the angular modes of its MPM list and the wide angles beyond the
-// regular ones, then the neighbours of the best and the secondary mode - computed in parallel, the CPU's sequential
-// choice among them replayed by invocation 0 (with its early ends: computing more costs than the CPU does changes no
-// choice), then the fusion weights
+// ----- a TIMD CU's node (IntraPrediction::deriveTimdMode, a TIMD-SAD CU's also deriveTimdModeSad; without TIMD merge
+// and block vectors): the template costs of its candidates in two batches - planar, DC, the angular modes of a list and
+// the wide angles beyond the regular ones, then the neighbours of the best and the secondary mode - computed in
+// parallel, the CPU's sequential choice among them replayed by invocation 0 (with its early ends: computing more costs
+// than the CPU does changes no choice), then the fusion weights. deriveTimdMode's list is the MPM list and its costs
+// the SATD; deriveTimdModeSad's list is made of the modes deriveTimdMode costed first, the CU's DIMD modes and the modes
+// around those found, and its costs the mean-removed SAD of a template up to twice as thick
 
 // in s_spCost (free in a node): the candidates (timdCand words; a first-batch candidate's cost slot is its index, a
 // second-batch one's numCands + its neighbour index, so that an invalid neighbour leaves its slot unused) and their
 // arms' costs
-const int TIMD_CANDS = 64;                        // at most 2 + 21 + 2 + the wide angles beyond (below 12), + 4
-const int TC_CAND    = 0;
-const int TC_COST_A  = TC_CAND + TIMD_CANDS;      // the above arm's (tmpCost0)
-const int TC_COST_L  = TC_COST_A + TIMD_CANDS;    // the left arm's (tmpCost1)
-const int TC_NUM     = TC_COST_L + TIMD_CANDS;    // the first batch's candidates
-const int TC_NUM_B   = TC_NUM + 1;                // the second batch's candidates
-const int TC_END_MPM = TC_NUM + 2;                // the end of the MPM list's modes in the first batch
+const int TIMD_CANDS  = 64;                        // at most 2 + 25 (deriveTimdModeSad's list) + the wide angles beyond
+                                                   // (below 12), + 4
+const int TC_CAND     = 0;
+const int TC_COST_A   = TC_CAND + TIMD_CANDS;      // the above arm's (tmpCost0)
+const int TC_COST_L   = TC_COST_A + TIMD_CANDS;    // the left arm's (tmpCost1)
+const int TC_NUM      = TC_COST_L + TIMD_CANDS;    // the first batch's candidates
+const int TC_NUM_B    = TC_NUM + 1;                // the second batch's candidates
+const int TC_END_LIST = TC_NUM + 2;                // the end of the list's modes in the first batch
+
+const int TIMD_COST_LIST     = NUM_MPM + 2;   // m_timdModeCostList: the MPM list's angular modes, HOR and VER
+const int TIMD_SAD_LIST      = 25;            // deriveTimdModeSad's list (TIMD_NUM_MODES_SORTED + 10)
+const int TIMD_SAD_SORTED    = 15;            // of which the first modes of m_timdModeCostList (TIMD_NUM_MODES_SORTED)
+const int TIMD_SAD_REFINED   = 12;            // the modes around the modes found it tries (deriveTimdModeSad's numRefine)
+const int TIMD_WIDE_STEP     = 5;             // the step between the wide angles beyond the regular ones it tries
+const int TIMD_SECOND_BATCH  = 4;             // the neighbours of the best mode (0, 1) and of the secondary (2, 3)
 
 // deriveTimdMode's running choice (invocation 0): the best and the secondary mode with their costs and whether their
 // parameters take getWideAngleExt's wide angles (else getTimdWideAngleExt's: the mode is a wide angle beyond the regular
@@ -554,6 +606,53 @@ struct TimdScan
   bool     bestWA, secWA;
   int      locDep[3];
 };
+
+// the modes of the 131-mode set deriveTimdMode tries for a CU's shape: the regular ones (minOrig to maxOrig, the wide
+// angles of WAIP included) and the wide angles beyond them that its reference reaches (newMin to newMax)
+struct TimdAngleRange
+{
+  int minOrig, maxOrig;
+  int newMin, newMax;
+};
+
+// a TIMD CU's record (TimdHead) at timdData[at]
+TimdHead timdHeadAt( int at )
+{
+  BufI32 timdData = BufI32( P.timdData );
+  return TimdHead( timdData.v[at], timdData.v[at + 1], timdData.v[at + 2], templateUnitsAt( timdData, at + TIMD_HEAD_T ),
+                   timdData.v[at + TIMD_HEAD_SAD], templateUnitsAt( timdData, at + TIMD_HEAD_TS ) );
+}
+
+// deriveTimdMode's range of modes for a CU of W x H whose PUs above-right / below-left reach further (waip:
+// TIMD_WAIP_* bits; its increase / decrease Close / Far)
+TimdAngleRange timdAngleRange( int waip, int W, int H )
+{
+  const int  deltaSize = abs( findMSB( W ) - findMSB( H ) );
+  const bool maxClose = ( waip & TIMD_WAIP_MAX_CLOSE ) != 0, maxFar = ( waip & TIMD_WAIP_MAX_FAR ) != 0;
+  const bool minClose = ( waip & TIMD_WAIP_MIN_CLOSE ) != 0, minFar = ( waip & TIMD_WAIP_MIN_FAR ) != 0;
+  TimdAngleRange range;
+  range.maxOrig = W >= H ? EXT_VDIA_IDX + TIMD_MODE_SHIFT[deltaSize] : EXT_VDIA_IDX - TIMD_MODE_SHIFT[deltaSize];
+  range.minOrig = W >= H ? 2 + TIMD_MODE_SHIFT[deltaSize] : 2 - TIMD_MODE_SHIFT[deltaSize];
+  range.newMin  = range.minOrig;
+  range.newMax  = range.maxOrig;
+  if( W >= H && ( maxFar || maxClose ) )
+  {
+    range.newMax += TIMD_MODE_SHIFT[min( deltaSize + ( maxFar ? 2 : 1 ), 5 )] - TIMD_MODE_SHIFT[deltaSize];
+  }
+  if( W <= H && ( minFar || minClose ) )
+  {
+    range.newMin -= TIMD_MODE_SHIFT[min( deltaSize + ( minFar ? 2 : 1 ), 5 )] - TIMD_MODE_SHIFT[deltaSize];
+  }
+  const int extRef = minFar || maxFar ? 2 : minClose || maxClose ? 1 : 0;
+  for( int e = 1, previous = deltaSize; e <= extRef; e++ )
+  {
+    const int step = abs( TIMD_MODE_SHIFT[abs( previous )] - TIMD_MODE_SHIFT[min( abs( deltaSize - e ), 5 )] );
+    range.newMin -= W > H ? step : 0;
+    range.newMax += W < H ? step : 0;
+    previous = deltaSize - e;
+  }
+  return range;
+}
 
 // the location dependence of a mode of arm costs c0 (above) and c1 (left): the arm a template lacks the other's, with
 // both the arm whose cost per sample is less than half the other's (1 above, 2 left), else none
@@ -586,202 +685,284 @@ int timdLutWeight( uint64_t best, uint64_t secondary )
   return min( 64, int( ( secondary * uint64_t( v ) * 64ul + ( 1ul << ( shift - 1 ) ) ) >> shift ) );
 }
 
-// the node of TIMD CU c (all invocations, uniform control flow): its TIMD into its TimdOut; returns (invocation 0) its
-// mode as the neighbours read it (MAP131TO67) and in mtssSecond the second mode MTSS tries first (the secondary where
-// the CU blends, else -1: none). nbrMode, dimdModes: deriveLumaMode's (invocation 0's)
-int timdNode( Cu c, int nbrMode[MPM_NEIGHBOURS], int dimdModes[3], int bitDepth, bool noPdpc, out int mtssSecond, int lid, int NT )
+// ----- the first batches (invocation 0)
+
+// the wide angles beyond the regular ones as candidates from slot n, newMin + 1 to newMax in steps of 5, skipping the
+// regular range (the CPU's loop jumps to maxOrig - 1: the next is maxOrig + 4); returns the next slot
+int timdWideAnglesBeyond( int n, int W, int H, TimdAngleRange range )
 {
-  BufI32         td = BufI32( P.timdData );
-  const TimdHead h  = TimdHead( td.v[c.timd], td.v[c.timd + 1], td.v[c.timd + 2], templateUnitsAt( td, c.timd + TIMD_HEAD_T ) );
-  const int      W = c.w, H = c.h;
-  CBufI32        o    = CBufI32( P.timdOut );
-  const int      base = h.index * TIMD_OUT;
-  mtssSecond = -1;
-  if( h.type == TIMD_NONE )   // the picture's top-left CU: planar
+  for( int i = range.newMin + 1; i < range.newMax; i += TIMD_WIDE_STEP )
   {
-    if( lid == 0 )
+    if( i >= range.minOrig && i <= range.maxOrig )
     {
-      for( int k = 0; k < TIMD_OUT; k++ )
-      {
-        o.v[base + k] = k >= TIMD_OUT_LOC_DEP && k < TIMD_OUT_LOC_DEP + 3 ? 0 : k >= TIMD_OUT_CHECK_WA ? 1 : -1;
-      }
-      o.v[base + TIMD_OUT_MODE]    = PLANAR_IDX;
-      o.v[base + TIMD_OUT_BLENDED] = 0;
+      i = range.maxOrig - 1;
+      continue;
     }
-    return PLANAR_IDX;
-  }
-  // the regular angles of the CU's shape (the wide angles of WAIP included), and those beyond its reference reaches,
-  // further where PUs lie further out above-right / below-left (deriveTimdMode's increase / decrease Close / Far)
-  const int  deltaSize = abs( findMSB( W ) - findMSB( H ) );
-  const int  maxOrig   = W >= H ? EXT_VDIA_IDX + TIMD_MODE_SHIFT[deltaSize] : EXT_VDIA_IDX - TIMD_MODE_SHIFT[deltaSize];
-  const int  minOrig   = W >= H ? 2 + TIMD_MODE_SHIFT[deltaSize] : 2 - TIMD_MODE_SHIFT[deltaSize];
-  const bool maxClose = ( h.waip & TIMD_WAIP_MAX_CLOSE ) != 0, maxFar = ( h.waip & TIMD_WAIP_MAX_FAR ) != 0;
-  const bool minClose = ( h.waip & TIMD_WAIP_MIN_CLOSE ) != 0, minFar = ( h.waip & TIMD_WAIP_MIN_FAR ) != 0;
-  int newMin = minOrig, newMax = maxOrig;
-  if( W >= H && ( maxFar || maxClose ) )
-  {
-    newMax += TIMD_MODE_SHIFT[min( deltaSize + ( maxFar ? 2 : 1 ), 5 )] - TIMD_MODE_SHIFT[deltaSize];
-  }
-  if( W <= H && ( minFar || minClose ) )
-  {
-    newMin -= TIMD_MODE_SHIFT[min( deltaSize + ( minFar ? 2 : 1 ), 5 )] - TIMD_MODE_SHIFT[deltaSize];
-  }
-  const int extRef = minFar || maxFar ? 2 : minClose || maxClose ? 1 : 0;
-  for( int d = 1, previous = deltaSize; d <= extRef; d++ )
-  {
-    const int step = abs( TIMD_MODE_SHIFT[abs( previous )] - TIMD_MODE_SHIFT[min( abs( deltaSize - d ), 5 )] );
-    newMin -= W > H ? step : 0;
-    newMax += W < H ? step : 0;
-    previous = deltaSize - d;
-  }
-
-  // the first batch (invocation 0): planar, DC, the angular modes of the MPM list with isForcedValid (all 22 entries)
-  // and HOR, VER where it lacks them (the CPU also appends DC, then skips it: DC is the second candidate already), then
-  // the wide angles beyond the regular ones from newMin + 1 to newMax in steps of 5, skipping the regular range (the
-  // CPU's loop jumps to maxOrig - 1: the next is maxOrig + 4)
-  SYNC();   // (dimdSelect has read its histograms)
-  if( lid == 0 )
-  {
-    int n = 0;
-    s_spCost[TC_CAND + n] = timdCand( PLANAR_IDX, PLANAR_IDX, true, n );
+    const int regular = timdRegularAngle( W, H, i );
+    s_spCost[TC_CAND + n] = timdCand( timdWaipAngle( W, H, regular ), regular, false, n );
     n++;
-    s_spCost[TC_CAND + n] = timdCand( DC_IDX, DC_IDX, true, n );
-    n++;
-    int  mpm[NUM_MPM];
-    uint included[3] = uint[3]( 0u, 0u, 0u );
-    const int numSpatial = mpmSpatial( c, nbrMode, dimdModes, true, mpm, included );
-    mpmFill( numSpatial, mpm, included );
-    for( int i = 0; i < NUM_MPM; i++ )
-    {
-      if( mpm[i] > DC_IDX )
-      {
-        s_spCost[TC_CAND + n] = timdCand( timdMode131( mpm[i] ), timdMode131( mpm[i] ), true, n );
-        n++;
-      }
-    }
-    for( int k = 0; k < 2; k++ )
-    {
-      const int mode = k == 0 ? HOR_IDX : VER_IDX;
-      if( !modeIn( included, mode ) )
-      {
-        s_spCost[TC_CAND + n] = timdCand( timdMode131( mode ), timdMode131( mode ), true, n );
-        n++;
-      }
-    }
-    s_spCost[TC_END_MPM] = uint( n );
-    for( int i = newMin + 1; i < newMax; i += 5 )
-    {
-      if( i >= minOrig && i <= maxOrig )
-      {
-        i = maxOrig - 1;
-        continue;
-      }
-      const int regular = timdRegularAngle( W, H, i );
-      s_spCost[TC_CAND + n] = timdCand( timdWaipAngle( W, H, regular ), regular, false, n );
-      n++;
-    }
-    s_spCost[TC_NUM] = uint( n );
-    for( int i = 0; i < TIMD_CANDS; i++ )
-    {
-      s_spCost[TC_COST_A + i] = 0u;
-      s_spCost[TC_COST_L + i] = 0u;
-    }
   }
-  // the template's references, DC's value, the first batch's costs
-  timdFillReference( h.t, td, c.timd + TIMD_HEAD, c.x, c.y, W, H, bitDepth, lid, NT );
-  const int dc       = timdDc( h.t, W, H, lid, NT );
-  const int maxPel   = ( 1 << bitDepth ) - 1;
-  const int numCands = int( s_spCost[TC_NUM] );
-  timdTemplateCosts( c, h.t, TC_CAND, numCands, TC_COST_A, TC_COST_L, dc, maxPel, noPdpc, lid, NT );
+  return n;
+}
 
-  // the CPU's scan of the first batch (invocation 0): the best and the secondary cost, strictly less replacing; planar
-  // and DC set the non-angular mode; the MPM list's modes, then the wide angles (where the scan gets that far) end once
-  // the secondary cost is at most maxCost, the wide angles after one at least. Then the second batch: the neighbours
-  // of the best and of the secondary mode (of a wide angle the neighbouring wide angles outside the regular range)
-  const int tw = W <= 8 ? 2 : 4, th = H <= 8 ? 2 : 4;   // (the costs' scale: of both arms, also where one is 0)
-  const uint64_t maxCost = uint64_t( tw * H + th * W );
-  const int      log2A = findMSB( th ) + findMSB( W ), log2L = findMSB( tw ) + findMSB( H );
-  TimdScan s;
-  int      modeB[4];    // the second batch's modes, around the best mode (0, 1) and the secondary (2, 3),
-  bool     validB[4];   // where the CPU tries them
-  if( lid == 0 )
+// a first batch's end: its list's modes ending at endList, the wide angles after them, the numbers, the costs zeroed
+void timdFirstBatchEnd( int endList, int W, int H, TimdAngleRange range )
+{
+  s_spCost[TC_END_LIST] = uint( endList );
+  s_spCost[TC_NUM]      = uint( timdWideAnglesBeyond( endList, W, H, range ) );
+  for( int i = 0; i < TIMD_CANDS; i++ )
   {
-    s.best = s.secondary = s.nonAng = ~0ul;
-    s.bestMode = s.secMode = s.nonAngMode = PLANAR_IDX;
-    s.bestWA = s.secWA = true;
-    s.locDep = int[3]( 0, 0, 0 );
-    const int endMpm = int( s_spCost[TC_END_MPM] );
-    for( int k = 0; k < numCands; k++ )
-    {
-      const uint64_t cost = timdCost( k );
-      const int      mode = timdCandMode( s_spCost[TC_CAND + k] );
-      const bool     wa   = timdCandWA( s_spCost[TC_CAND + k] );
-      const int      ld   = timdLocDep( h.type, s_spCost[TC_COST_A + k], s_spCost[TC_COST_L + k], log2A, log2L );
-      if( cost < s.best )
-      {
-        s.secondary = s.best;
-        s.secMode   = s.bestMode;
-        s.secWA     = s.bestWA;
-        s.best      = cost;
-        s.bestMode  = mode;
-        s.bestWA    = wa;
-        s.locDep[1] = s.locDep[0];
-        s.locDep[0] = ld;
-        if( k < 2 )   // planar, DC
-        {
-          s.nonAng     = cost;
-          s.nonAngMode = mode;
-          s.locDep[2]  = ld;
-        }
-      }
-      else if( cost < s.secondary )
-      {
-        s.secondary = cost;
-        s.secMode   = mode;
-        s.secWA     = wa;
-        s.locDep[1] = ld;
-      }
-      if( k >= 2 && s.secondary <= maxCost )
-      {
-        if( k >= endMpm )
-        {
-          break;          // the wide angles' scan ends
-        }
-        k = endMpm - 1;   // the MPM list's ends, the wide angles' starts
-      }
-    }
-    // the second batch: of a mode's neighbours those the CPU tries (angular ones; of a wide angle beyond the regular
-    // ones those outside the regular range, as such)
-    int nB = 0;
-    for( int j = 0; j < 4; j++ )
-    {
-      const int  mid = j < 2 ? s.bestMode : s.secMode;
-      const bool wa  = j < 2 ? s.bestWA : s.secWA;
-      const int  m   = mid + ( ( j & 1 ) == 0 ? -1 : 1 );
-      validB[j] = wa ? m > DC_IDX && m <= EXT_VDIA_IDX : m < minOrig || m > maxOrig;
-      if( validB[j] )
-      {
-        const int regular = wa ? m : timdRegularAngle( W, H, m );
-        modeB[j] = wa ? m : timdWaipAngle( W, H, regular );
-        s_spCost[TC_CAND + numCands + nB] = timdCand( modeB[j], regular, wa, numCands + j );
-        nB++;
-      }
-      s_spCost[TC_COST_A + numCands + j] = 0u;
-      s_spCost[TC_COST_L + numCands + j] = 0u;
-    }
-    s_spCost[TC_NUM_B] = uint( nB );
+    s_spCost[TC_COST_A + i] = 0u;
+    s_spCost[TC_COST_L + i] = 0u;
   }
-  SYNC();
-  timdTemplateCosts( c, h.t, TC_CAND + numCands, int( s_spCost[TC_NUM_B] ), TC_COST_A, TC_COST_L, dc, maxPel, noPdpc, lid, NT );
-  if( lid != 0 )
-  {
-    return -1;
-  }
+}
 
-  // the CPU's refinement, where the best cost is above maxCost: of the best mode (an angular one, or a wide angle beyond
-  // the regular ones) until that cost is at most maxCost, a cheaper neighbour replacing it (the best does not become the
-  // secondary); then of the secondary mode alike, until the secondary cost is (on the condition of the best cost, as
-  // the CPU has it)
+// a list mode m (67-mode set) as the candidate of slot n; returns the next slot
+int timdListCand( int n, int m )
+{
+  s_spCost[TC_CAND + n] = timdCand( timdMode131( m ), timdMode131( m ), true, n );
+  return n + 1;
+}
+
+// deriveTimdMode's first batch: planar, DC, the angular modes of the MPM list with isForcedValid (all 22 entries) and
+// HOR, VER where it lacks them (the CPU also appends DC, then skips it: DC is the second candidate already), then the
+// wide angles beyond the regular ones. nbrMode, dimdModes: deriveLumaMode's
+void timdMpmCandidates( Cu c, int nbrMode[MPM_NEIGHBOURS], int dimdModes[3], TimdAngleRange range )
+{
+  int n = 0;
+  s_spCost[TC_CAND + n] = timdCand( PLANAR_IDX, PLANAR_IDX, true, n );
+  n++;
+  s_spCost[TC_CAND + n] = timdCand( DC_IDX, DC_IDX, true, n );
+  n++;
+  int  mpm[NUM_MPM];
+  uint included[3] = uint[3]( 0u, 0u, 0u );
+  const int numSpatial = mpmSpatial( c, nbrMode, dimdModes, true, mpm, included );
+  mpmFill( numSpatial, mpm, included );
+  for( int i = 0; i < NUM_MPM; i++ )
+  {
+    if( mpm[i] > DC_IDX )
+    {
+      n = timdListCand( n, mpm[i] );
+    }
+  }
+  if( !modeIn( included, HOR_IDX ) )
+  {
+    n = timdListCand( n, HOR_IDX );
+  }
+  if( !modeIn( included, VER_IDX ) )
+  {
+    n = timdListCand( n, VER_IDX );
+  }
+  timdFirstBatchEnd( n, c.w, c.h, range );
+}
+
+// the i-th of the 12 modes around those found that deriveTimdModeSad's list tries (its refinedList): around TIMD's mode
+// and secondary (67-mode set), DIMD's main mode, DIMD's first blend mode where DIMD blends (else further around its
+// main mode), then again around TIMD's two
+int timdSadRefinedMode( int i, int timd67, int second67, int dimdMode, int dimdBlend, bool dimdBlending )
+{
+  switch( i )
+  {
+    case 0:  return timd67 + 1;
+    case 1:  return timd67 - 1;
+    case 2:  return second67 + 1;
+    case 3:  return second67 - 1;
+    case 4:  return dimdMode + 1;
+    case 5:  return dimdMode - 1;
+    case 6:  return dimdBlending ? dimdBlend + 1 : dimdMode + 2;
+    case 7:  return dimdBlending ? dimdBlend - 1 : dimdMode - 2;
+    case 8:  return timd67 + 2;
+    case 9:  return timd67 - 2;
+    case 10: return second67 + 2;
+    default: return second67 - 2;
+  }
+}
+
+// one step of deriveTimdModeSad's list after its sorted costs' modes: mode m, where the list (n of TIMD_SAD_LIST) is
+// not full and m is angular, taken as used where TIMD found it (its secondary only where TIMD blends), else added where
+// unused
+void timdSadListAdd( int m, int timdMode, int timdSecondary, bool blended, inout uint used[3], inout int list[TIMD_SAD_LIST],
+                     inout int n )
+{
+  if( n == TIMD_SAD_LIST || m <= DC_IDX || m >= NUM_LUMA_MODE )
+  {
+    return;
+  }
+  if( timdMode131( m ) == timdMode || ( blended && timdMode131( m ) == timdSecondary ) )
+  {
+    used[m >> 5] |= 1u << ( m & 31 );
+  }
+  if( !modeIn( used, m ) )
+  {
+    list[n++] = m;
+    used[m >> 5] |= 1u << ( m & 31 );
+  }
+}
+
+// deriveTimdModeSad's first batch: planar, DC, then a list of up to 25 modes - the first 15 angular modes of
+// m_timdModeCostList (those deriveTimdMode costed in its MPM list's scan to its early end, the first batch's candidates
+// 2 to lastList, by cost, then mode: std::stable_sort of the pairs), the CU's DIMD modes (its DimdOut slot cuIndex),
+// HOR, VER and the modes around those deriveTimdMode found (timdFields) and around DIMD's (timdSadRefinedMode); each
+// mode once, none of the modes TIMD found (its secondary only where they blend) - then the wide angles beyond the
+// regular ones as deriveTimdMode's (TIMD-SAD's code runs in a pipeline of its own: VARIANT_TIMD_SAD)
+void timdSadCandidates( int timdFields[TIMD_OUT_FIELDS], int cuIndex, int lastList, int W, int H, TimdAngleRange range )
+{
+  uint64_t costs[TIMD_COST_LIST];
+  int      modes[TIMD_COST_LIST];
+  int      numCosts = 0;
+  for( int k = 2; k <= lastList; k++ )   // (insertion sort)
+  {
+    const uint64_t cost = timdCost( k );
+    const int      mode = timdMode67( timdCandMode( s_spCost[TC_CAND + k] ) );
+    int i = numCosts++;
+    for( ; i > 0 && ( costs[i - 1] > cost || ( costs[i - 1] == cost && modes[i - 1] > mode ) ); i-- )
+    {
+      costs[i] = costs[i - 1];
+      modes[i] = modes[i - 1];
+    }
+    costs[i] = cost;
+    modes[i] = mode;
+  }
+  const int  timdMode = timdFields[TIMD_OUT_MODE], timdSecondary = timdFields[TIMD_OUT_SECONDARY];
+  const bool blended  = timdFields[TIMD_OUT_BLENDED] != 0;
+  uint used[3] = uint[3]( 0u, 0u, 0u );
+  int  list[TIMD_SAD_LIST];
+  int  n = 0;
+  // the sorted modes until min(15, the list's size) of them are taken (those skipped not counted)
+  for( int i = 0; i < numCosts && n < min( numCosts, TIMD_SAD_SORTED ); i++ )
+  {
+    const int m = modes[i];
+    if( timdMode131( m ) != timdMode && !( blended && timdMode131( m ) == timdSecondary ) && m > DC_IDX )
+    {
+      list[n++] = m;
+      used[m >> 5] |= 1u << ( m & 31 );
+    }
+  }
+  CBufI32   dimdOut  = CBufI32( P.dimdOut );
+  const int dimdBase = cuIndex * DIMD_OUT;
+  const int dimdMode = dimdOut.v[dimdBase + DIMD_OUT_MODE];
+  for( int i = 0; i < DIMD_FUSION_NUM; i++ )   // DIMD's main mode and blend modes
+  {
+    const int m = i == 0 ? dimdMode : dimdOut.v[dimdBase + DIMD_OUT_BLEND_MODE + i - 1];
+    timdSadListAdd( m, timdMode, timdSecondary, blended, used, list, n );
+  }
+  timdSadListAdd( HOR_IDX, timdMode, timdSecondary, blended, used, list, n );
+  timdSadListAdd( VER_IDX, timdMode, timdSecondary, blended, used, list, n );
+  const int  timd67 = timdMode67( timdMode ), second67 = timdMode67( timdSecondary );
+  const int  dimdBlend    = dimdOut.v[dimdBase + DIMD_OUT_BLEND_MODE];
+  const bool dimdBlending = dimdOut.v[dimdBase + DIMD_OUT_BLENDING] != 0;
+  for( int i = 0; i < TIMD_SAD_REFINED; i++ )
+  {
+    timdSadListAdd( timdSadRefinedMode( i, timd67, second67, dimdMode, dimdBlend, dimdBlending ), timdMode, timdSecondary,
+                    blended, used, list, n );
+  }
+  int slot = 0;
+  s_spCost[TC_CAND + slot] = timdCand( PLANAR_IDX, PLANAR_IDX, true, slot );
+  slot++;
+  s_spCost[TC_CAND + slot] = timdCand( DC_IDX, DC_IDX, true, slot );
+  slot++;
+  for( int i = 0; i < n; i++ )
+  {
+    slot = timdListCand( slot, list[i] );
+  }
+  timdFirstBatchEnd( slot, W, H, range );
+}
+
+// ----- the CPU's choice (invocation 0)
+
+// the CPU's scan of the first batch of numCands candidates: the best and the secondary cost, strictly less replacing;
+// planar and DC set the non-angular mode; the list's modes (to endList), then the wide angles (where the scan gets that
+// far) end once the secondary cost is at most maxCost, the wide angles after one at least. With skipAbove
+// (deriveTimdModeSad with both arms, JVET-AN0093) the scan passes over a list mode whose above arm alone costs the
+// secondary cost or more, before that test. Returns the slot of the last list mode the scan took (its early end)
+int timdScanFirst( inout TimdScan s, int numCands, int endList, int type, int log2A, int log2L, uint64_t maxCost, bool skipAbove )
+{
+  s.best = s.secondary = s.nonAng = ~0ul;
+  s.bestMode = s.secMode = s.nonAngMode = PLANAR_IDX;
+  s.bestWA = s.secWA = true;
+  s.locDep = int[3]( 0, 0, 0 );
+  int lastList = endList - 1;
+  for( int k = 0; k < numCands; k++ )
+  {
+    if( skipAbove && k >= 2 && k < endList && uint64_t( s_spCost[TC_COST_A + k] ) >= s.secondary )
+    {
+      continue;
+    }
+    const uint64_t cost = timdCost( k );
+    const int      mode = timdCandMode( s_spCost[TC_CAND + k] );
+    const bool     wa   = timdCandWA( s_spCost[TC_CAND + k] );
+    const int      ld   = timdLocDep( type, s_spCost[TC_COST_A + k], s_spCost[TC_COST_L + k], log2A, log2L );
+    if( cost < s.best )
+    {
+      s.secondary = s.best;
+      s.secMode   = s.bestMode;
+      s.secWA     = s.bestWA;
+      s.best      = cost;
+      s.bestMode  = mode;
+      s.bestWA    = wa;
+      s.locDep[1] = s.locDep[0];
+      s.locDep[0] = ld;
+      if( k < 2 )   // planar, DC
+      {
+        s.nonAng     = cost;
+        s.nonAngMode = mode;
+        s.locDep[2]  = ld;
+      }
+    }
+    else if( cost < s.secondary )
+    {
+      s.secondary = cost;
+      s.secMode   = mode;
+      s.secWA     = wa;
+      s.locDep[1] = ld;
+    }
+    if( k >= 2 && s.secondary <= maxCost )
+    {
+      if( k >= endList )
+      {
+        break;          // the wide angles' scan ends
+      }
+      lastList = k;
+      k = endList - 1;   // the list's scan ends, the wide angles' starts
+    }
+  }
+  return lastList;
+}
+
+// the second batch: of the best and the secondary mode's neighbours those the CPU tries (angular ones; of a wide angle
+// beyond the regular ones those outside the regular range, as such), as candidates from slot numCands; their modes in
+// neighbourMode (TIMD_SECOND_BATCH order) where neighbourValid
+void timdSecondBatch( TimdScan s, int numCands, int W, int H, TimdAngleRange range, out int neighbourMode[TIMD_SECOND_BATCH],
+                      out bool neighbourValid[TIMD_SECOND_BATCH] )
+{
+  int numSecond = 0;
+  for( int j = 0; j < TIMD_SECOND_BATCH; j++ )
+  {
+    const int  mid = j < 2 ? s.bestMode : s.secMode;
+    const bool wa  = j < 2 ? s.bestWA : s.secWA;
+    const int  m   = mid + ( ( j & 1 ) == 0 ? -1 : 1 );
+    neighbourValid[j] = wa ? m > DC_IDX && m <= EXT_VDIA_IDX : m < range.minOrig || m > range.maxOrig;
+    neighbourMode[j]  = -1;
+    if( neighbourValid[j] )
+    {
+      const int regular = wa ? m : timdRegularAngle( W, H, m );
+      neighbourMode[j] = wa ? m : timdWaipAngle( W, H, regular );
+      s_spCost[TC_CAND + numCands + numSecond] = timdCand( neighbourMode[j], regular, wa, numCands + j );
+      numSecond++;
+    }
+    s_spCost[TC_COST_A + numCands + j] = 0u;
+    s_spCost[TC_COST_L + numCands + j] = 0u;
+  }
+  s_spCost[TC_NUM_B] = uint( numSecond );
+}
+
+// the CPU's refinement, where the best cost is above maxCost: of the best mode (an angular one, or a wide angle beyond
+// the regular ones) until that cost is at most maxCost, a cheaper neighbour replacing it (the best does not become the
+// secondary); then of the secondary mode alike, until the secondary cost is (on the condition of the best cost, as the
+// CPU has it)
+void timdRefine( inout TimdScan s, int numCands, int neighbourMode[TIMD_SECOND_BATCH], bool neighbourValid[TIMD_SECOND_BATCH],
+                 int type, int log2A, int log2L, uint64_t maxCost )
+{
   for( int pass = 0; pass < 2; pass++ )
   {
     const bool ofBest = pass == 0;
@@ -791,22 +972,22 @@ int timdNode( Cu c, int nbrMode[MPM_NEIGHBOURS], int dimdModes[3], int bitDepth,
     }
     for( int j = 2 * pass; j < 2 * pass + 2; j++ )
     {
-      if( !validB[j] )
+      if( !neighbourValid[j] )
       {
         continue;
       }
       const uint64_t cost = timdCost( numCands + j );
-      const int      ld   = timdLocDep( h.type, s_spCost[TC_COST_A + numCands + j], s_spCost[TC_COST_L + numCands + j], log2A, log2L );
+      const int      ld   = timdLocDep( type, s_spCost[TC_COST_A + numCands + j], s_spCost[TC_COST_L + numCands + j], log2A, log2L );
       if( ofBest && cost < s.best )
       {
         s.best      = cost;
-        s.bestMode  = modeB[j];
+        s.bestMode  = neighbourMode[j];
         s.locDep[0] = ld;
       }
       else if( !ofBest && cost < s.secondary )
       {
         s.secondary = cost;
-        s.secMode   = modeB[j];
+        s.secMode   = neighbourMode[j];
         s.locDep[1] = ld;
       }
       if( ( ofBest ? s.best : s.secondary ) <= maxCost )
@@ -815,11 +996,15 @@ int timdNode( Cu c, int nbrMode[MPM_NEIGHBOURS], int dimdModes[3], int bitDepth,
       }
     }
   }
+}
 
-  // the final choice: the regular modes of the wide angles beyond, the cheaper as the mode; a secondary costing twice
-  // the best or more replaced by an angular best (which then blends with itself, JVET-AG0092); blending where the
-  // secondary costs less than twice the best, with the non-angular mode where it costs less than 1.5 times the best and
-  // is neither of them (weights from the three costs), else by X0149's weights of the two
+// the final choice: the regular modes of the wide angles beyond, the cheaper as the mode; a secondary costing twice the
+// best or more replaced by an angular best (which then blends with itself, JVET-AG0092); blending where the secondary
+// costs less than twice the best, with the non-angular mode where it costs less than 1.5 times the best and is neither
+// of them (weights from the three costs), else by X0149's weights of the two. Into fields the fields deriveTimdMode
+// sets (TIMD_OUT_*), with sad deriveTimdModeSad's, whose location dependences stay 0
+void timdFinal( TimdScan s, int W, int H, bool sad, out int fields[TIMD_OUT_FIELDS] )
+{
   if( !s.bestWA )
   {
     s.bestMode = timdRegularAngle( W, H, s.bestMode );
@@ -850,35 +1035,154 @@ int timdNode( Cu c, int nbrMode[MPM_NEIGHBOURS], int dimdModes[3], int bitDepth,
     s.secWA     = s.bestWA;
   }
   const bool blended = s.secondary - s.best < s.best;
-  int r[TIMD_OUT] = int[TIMD_OUT]( s.bestMode, -1, -1, blended ? 1 : 0, -1, -1, -1, s.locDep[0], s.locDep[1], s.locDep[2],
-                                   s.bestWA ? 1 : 0, 1 );
+  if( sad )
+  {
+    s.locDep = int[3]( 0, 0, 0 );
+  }
+  fields = int[TIMD_OUT_FIELDS]( s.bestMode, -1, -1, blended ? 1 : 0, -1, -1, -1, s.locDep[0], s.locDep[1], s.locDep[2],
+                                 s.bestWA ? 1 : 0, 1 );
   if( blended )
   {
-    r[TIMD_OUT_SECONDARY]    = s.secMode;
-    r[TIMD_OUT_SEC_CHECK_WA] = s.secWA ? 1 : 0;
+    fields[TIMD_OUT_SECONDARY]    = s.secMode;
+    fields[TIMD_OUT_SEC_CHECK_WA] = s.secWA ? 1 : 0;
     const bool nonAngFusion = ( s.nonAng < s.best || s.nonAng - s.best < ( s.best >> 1 ) ) && s.bestMode != s.nonAngMode
                               && s.secMode != s.nonAngMode;
     if( nonAngFusion )   // each weight (sum - cost) / (2 sum) in 1/64 rounded, as the CPU's doubles give it
     {
       const uint64_t sum = s.best + s.secondary + s.nonAng;
-      r[TIMD_OUT_NON_ANG]    = s.nonAngMode;
-      r[TIMD_OUT_WEIGHT]     = int( ( 64ul * ( sum - s.best ) + sum ) / ( 2ul * sum ) );
-      r[TIMD_OUT_WEIGHT + 1] = int( ( 64ul * ( sum - s.secondary ) + sum ) / ( 2ul * sum ) );
-      r[TIMD_OUT_WEIGHT + 2] = 64 - r[TIMD_OUT_WEIGHT] - r[TIMD_OUT_WEIGHT + 1];
+      fields[TIMD_OUT_NON_ANG]    = s.nonAngMode;
+      fields[TIMD_OUT_WEIGHT]     = int( ( 64ul * ( sum - s.best ) + sum ) / ( 2ul * sum ) );
+      fields[TIMD_OUT_WEIGHT + 1] = int( ( 64ul * ( sum - s.secondary ) + sum ) / ( 2ul * sum ) );
+      fields[TIMD_OUT_WEIGHT + 2] = 64 - fields[TIMD_OUT_WEIGHT] - fields[TIMD_OUT_WEIGHT + 1];
     }
     else
     {
-      r[TIMD_OUT_WEIGHT]     = timdLutWeight( s.best, s.secondary );
-      r[TIMD_OUT_WEIGHT + 1] = 64 - r[TIMD_OUT_WEIGHT];
-      r[TIMD_OUT_WEIGHT + 2] = 0;
+      fields[TIMD_OUT_WEIGHT]     = timdLutWeight( s.best, s.secondary );
+      fields[TIMD_OUT_WEIGHT + 1] = 64 - fields[TIMD_OUT_WEIGHT];
+      fields[TIMD_OUT_WEIGHT + 2] = 0;
     }
-    mtssSecond = timdMode67( s.secMode );
   }
-  for( int k = 0; k < TIMD_OUT; k++ )
+}
+
+// ----- the node
+
+// fields into TimdOut from outBase
+void timdStore( int outBase, int fields[TIMD_OUT_FIELDS] )
+{
+  CBufI32 timdOut = CBufI32( P.timdOut );
+  for( int k = 0; k < TIMD_OUT_FIELDS; k++ )
   {
-    o.v[base + k] = r[k];
+    timdOut.v[outBase + k] = fields[k];
   }
-  return timdMode67( s.bestMode );
+}
+
+// the node of TIMD CU c (all invocations, uniform control flow): its TIMD (a TIMD-SAD CU's also its TIMD-SAD) into its
+// TimdOut; returns (invocation 0) the mode its blocks predict as the neighbours read it (MAP131TO67) and in mtssSecond
+// the second mode MTSS tries first (the secondary where those modes blend, else -1: none). nbrMode, dimdModes:
+// deriveLumaMode's (invocation 0's); cuIndex: the CU's record, whose DimdOut slot holds its DIMD.
+// Each derivation is written out at its own call sites, with its kind (SATD / mean-removed SAD) a constant there: one
+// function for both, its kind a parameter, made the TIMD-SAD pictures ~8 % slower
+int timdNode( Cu c, int cuIndex, int nbrMode[MPM_NEIGHBOURS], int dimdModes[3], int bitDepth, bool noPdpc,
+              out int mtssSecond, int lid, int NT )
+{
+  const TimdHead head    = timdHeadAt( c.timd );
+  const int      outBase = head.index * TIMD_OUT;
+  const bool     sad     = WITH_TIMD_SAD && head.sad != 0;   // (TIMD-SAD in its own pipeline only)
+  const int      maxPel  = ( 1 << bitDepth ) - 1;
+  int            fields[TIMD_OUT_FIELDS];
+  mtssSecond = -1;
+  if( head.type == TIMD_NONE )   // the picture's top-left CU: planar, the other fields at their initial values
+  {
+    fields = int[TIMD_OUT_FIELDS]( PLANAR_IDX, -1, -1, 0, -1, -1, -1, 0, 0, 0, 1, 1 );
+    if( lid == 0 )
+    {
+      timdStore( outBase, fields );
+      if( sad )
+      {
+        timdStore( outBase + TIMD_OUT_SAD, fields );
+      }
+    }
+    return PLANAR_IDX;
+  }
+  const TimdAngleRange range = timdAngleRange( head.waip, c.w, c.h );
+  // the location dependences' scale, and deriveTimdMode's costs': TIMD's arms of both sides (also where the template
+  // lacks one)
+  const int      tw = c.w <= 8 ? 2 : 4, th = c.h <= 8 ? 2 : 4;
+  const int      log2A = findMSB( th ) + findMSB( c.w ), log2L = findMSB( tw ) + findMSB( c.h );
+  TimdScan       scan;
+  int            neighbourMode[TIMD_SECOND_BATCH];
+  bool           neighbourValid[TIMD_SECOND_BATCH];
+
+  // deriveTimdMode: its first batch, the template's references, DC's value and costs, the CPU's scan, the second
+  // batch's costs, the refinement and the final choice
+  SYNC();   // (dimdSelect has read its histograms)
+  if( lid == 0 )
+  {
+    timdMpmCandidates( c, nbrMode, dimdModes, range );
+  }
+  timdFillReference( head.t, BufI32( P.timdData ), c.timd + TIMD_HEAD, c.x, c.y, c.w, c.h, bitDepth, lid, NT );
+  const int dc       = timdDc( head.t, c.w, c.h, lid, NT );
+  const int numCands = int( s_spCost[TC_NUM] );
+  timdTemplateCosts( c, head.t, TC_CAND, numCands, TC_COST_A, TC_COST_L, dc, maxPel, noPdpc, false, lid, NT );
+  const uint64_t maxCost  = uint64_t( tw * c.h + th * c.w );
+  int            lastList = 0;
+  if( lid == 0 )
+  {
+    lastList = timdScanFirst( scan, numCands, int( s_spCost[TC_END_LIST] ), head.type, log2A, log2L, maxCost, false );
+    timdSecondBatch( scan, numCands, c.w, c.h, range, neighbourMode, neighbourValid );
+  }
+  SYNC();
+  timdTemplateCosts( c, head.t, TC_CAND + numCands, int( s_spCost[TC_NUM_B] ), TC_COST_A, TC_COST_L, dc, maxPel, noPdpc,
+                     false, lid, NT );
+  if( lid == 0 )
+  {
+    timdRefine( scan, numCands, neighbourMode, neighbourValid, head.type, log2A, log2L, maxCost );
+    timdFinal( scan, c.w, c.h, false, fields );
+    timdStore( outBase, fields );
+  }
+
+  // deriveTimdModeSad (a TIMD-SAD CU) alike: its first batch from deriveTimdMode's (its costs, the modes it found), its
+  // own template (its reference units after TIMD's) whose arms' sizes scale its costs (2 for an arm it lacks, as the
+  // CPU clips it), the mean-removed SAD, JVET-AN0093's pass with both arms, no location dependence
+  if( sad )
+  {
+    if( lid == 0 )
+    {
+      timdSadCandidates( fields, cuIndex, lastList, c.w, c.h, range );
+    }
+    SYNC();
+    const int unitsAt = c.timd + TIMD_HEAD + ( ( head.t.totalUnits + 31 ) >> 5 );
+    timdFillReference( head.ts, BufI32( P.timdData ), unitsAt, c.x, c.y, c.w, c.h, bitDepth, lid, NT );
+    const int dcSad   = timdDc( head.ts, c.w, c.h, lid, NT );
+    const int numSad  = int( s_spCost[TC_NUM] );
+    timdTemplateCosts( c, head.ts, TC_CAND, numSad, TC_COST_A, TC_COST_L, dcSad, maxPel, noPdpc, true, lid, NT );
+    const uint64_t maxCostSad = uint64_t( ( head.type == TIMD_ABOVE ? 2 : head.ts.tw ) * c.h
+                                          + ( head.type == TIMD_LEFT ? 2 : head.ts.th ) * c.w );
+    if( lid == 0 )
+    {
+      timdScanFirst( scan, numSad, int( s_spCost[TC_END_LIST] ), head.type, log2A, log2L, maxCostSad, head.type == TIMD_BOTH );
+      timdSecondBatch( scan, numSad, c.w, c.h, range, neighbourMode, neighbourValid );
+    }
+    SYNC();
+    timdTemplateCosts( c, head.ts, TC_CAND + numSad, int( s_spCost[TC_NUM_B] ), TC_COST_A, TC_COST_L, dcSad, maxPel, noPdpc,
+                       true, lid, NT );
+    if( lid == 0 )
+    {
+      timdRefine( scan, numSad, neighbourMode, neighbourValid, head.type, log2A, log2L, maxCostSad );
+      timdFinal( scan, c.w, c.h, true, fields );
+      timdStore( outBase + TIMD_OUT_SAD, fields );
+    }
+  }
+  if( lid != 0 )
+  {
+    return -1;
+  }
+  // the modes the blocks predict: a TIMD-SAD CU's deriveTimdModeSad's
+  if( fields[TIMD_OUT_BLENDED] != 0 )
+  {
+    mtssSecond = timdMode67( fields[TIMD_OUT_SECONDARY] );
+  }
+  return timdMode67( fields[TIMD_OUT_MODE] );
 }
 
 #endif

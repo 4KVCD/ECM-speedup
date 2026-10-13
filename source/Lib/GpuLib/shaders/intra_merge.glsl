@@ -57,51 +57,51 @@ int mergeSource( int n, int cls, int pf, int w )
                                : CBufI32( P.dimdOut ).v[n * DIMD_OUT + w];
 }
 
-// CU::setIntraMergeCandParamFromTimd into candidate slot k (zero) from TIMD CU n's TimdOut: its mode (MAP131TO67), where
+// CU::setIntraMergeCandParamFromTimd into candidate slot (zero) from TIMD CU nbr's TimdOut: its mode (MAP131TO67), where
 // angular with its secondary mode as the blend mode (where both map to one mode, the mode two of their distances
 // beyond) weighed [mode, non-angular as planar, secondary], or without a secondary planar at 16; false where the CPU
 // gives up (a mode or blend mode planar / DC) and takes the CU's DIMD instead
-bool mergeTimdParams( int k, int n )
+bool mergeTimdParams( int slot, int nbr )
 {
-  CBufI32   o    = CBufI32( P.timdOut );
-  const int base = timdOutBase( n );
-  const int mode = o.v[base + TIMD_OUT_MODE], sec = o.v[base + TIMD_OUT_SECONDARY];
-  const int m67  = timdMode67( mode );
-  if( m67 <= DC_IDX )
+  CBufI32   timdOut = CBufI32( P.timdOut );
+  const int outBase = timdOutBase( nbr );
+  const int mode = timdOut.v[outBase + TIMD_OUT_MODE], secondary = timdOut.v[outBase + TIMD_OUT_SECONDARY];
+  const int mode67 = timdMode67( mode );
+  if( mode67 <= DC_IDX )
   {
     return false;
   }
-  int blend = timdMode67( sec );   // (-1 where it does not blend)
-  if( blend == m67 )
+  int blend = timdMode67( secondary );   // (-1 where it does not blend)
+  if( blend == mode67 )
   {
-    blend = timdMode67( mode - 2 * max( 1, mode - sec ) );
+    blend = timdMode67( mode - 2 * max( 1, mode - secondary ) );
   }
   if( blend <= DC_IDX && blend != -1 )
   {
     return false;
   }
-  mcSet( k, MC_MODE, m67 );
-  mcSet( k, MC_LOC_DEP, o.v[base + TIMD_OUT_LOC_DEP] );
-  if( blend == -1 )
+  mcSet( slot, MC_MODE, mode67 );
+  mcSet( slot, MC_LOC_DEP, timdOut.v[outBase + TIMD_OUT_LOC_DEP] );
+  if( blend == -1 )   // the mode with planar at the CPU's fixed weight
   {
-    mcSet( k, MC_WEIGHT, 64 - 16 );
-    mcSet( k, MC_WEIGHT + 1, 16 );
+    const int planarWeight = 16;
+    mcSet( slot, MC_WEIGHT, 64 - planarWeight );
+    mcSet( slot, MC_WEIGHT + 1, planarWeight );
     return true;
   }
-  mcSet( k, MC_BLEND, blend );
-  mcSet( k, MC_WEIGHT, o.v[base + TIMD_OUT_WEIGHT] );
-  mcSet( k, MC_WEIGHT + 1, o.v[base + TIMD_OUT_WEIGHT + 2] );
-  mcSet( k, MC_WEIGHT + 2, o.v[base + TIMD_OUT_WEIGHT + 1] );
-  mcSet( k, MC_LOC_DEP + 1, o.v[base + TIMD_OUT_LOC_DEP + 1] );
+  mcSet( slot, MC_BLEND, blend );
+  mcSet( slot, MC_WEIGHT, timdOut.v[outBase + TIMD_OUT_WEIGHT] );
+  mcSet( slot, MC_WEIGHT + 1, timdOut.v[outBase + TIMD_OUT_WEIGHT + 2] );
+  mcSet( slot, MC_WEIGHT + 2, timdOut.v[outBase + TIMD_OUT_WEIGHT + 1] );
+  mcSet( slot, MC_LOC_DEP + 1, timdOut.v[outBase + TIMD_OUT_LOC_DEP + 1] );
   return true;
 }
-
 // a TIMD CU's validity as a candidate (CU::isAValidNeighborForIntraMerge): its modes blend or its mode is angular
-bool mergeTimdValid( int n )
+bool mergeTimdValid( int nbr )
 {
-  CBufI32   o    = CBufI32( P.timdOut );
-  const int base = timdOutBase( n );
-  return o.v[base + TIMD_OUT_BLENDED] != 0 || o.v[base + TIMD_OUT_MODE] > DC_IDX;
+  CBufI32   timdOut = CBufI32( P.timdOut );
+  const int outBase = timdOutBase( nbr );
+  return timdOut.v[outBase + TIMD_OUT_BLENDED] != 0 || timdOut.v[outBase + TIMD_OUT_MODE] > DC_IDX;
 }
 
 // CU::setIntraMergeCandParam's parameters of neighbour n into candidate slot k: a TIMD CU's TIMD converted
@@ -312,7 +312,7 @@ int mergeNode( Cu c, int cuIdx, int bitDepth, bool noPdpc, int lid, int NT )
     timdFillReference( h.t, md, c.merge + MERGE_HEAD + 2 * h.nbrNum, c.x, c.y, c.w, c.h, bitDepth, lid, NT );
     const int dc = timdDc( h.t, c.w, c.h, lid, NT );
     timdTemplateCosts( c, h.t, MC_MODES, int( s_spCost[MC_NUM_MODES] ), MC_COST, MC_COST, dc, ( 1 << bitDepth ) - 1, noPdpc,
-                       lid, NT );
+                       false, lid, NT );
   }
   if( pc.verify != 0 )   // the costs, which verification compares (~0 for the modes not ranked by)
   {

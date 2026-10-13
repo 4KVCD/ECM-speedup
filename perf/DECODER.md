@@ -390,7 +390,9 @@ the reconstruction buffer; works in every frame-thread context):
   dependence class like DIMD's (the secondary from the next reference line alone where both are close), the
   bilateral filter on the blend; neighbours read its mode in the 67-mode set. M25 lets OBIC and intra merge CUs have
   TIMD neighbours: OBIC's histogram counts a TIMD neighbour's modes by their blend weights, and intra merge converts
-  its TIMD into a candidate (or takes its DIMD where the conversion gives up), both from the neighbour's node.
+  its TIMD into a candidate (or takes its DIMD where the conversion gives up), both from the neighbour's node. M26 is
+  TIMD-SAD: after TIMD, the node repeats the scan over a second list (TIMD's cheapest modes, DIMD's, their
+  neighbours) with the mean-removed SAD of a thicker template, and the CU's blocks predict those modes.
   GpuIntraRec::supported()
   rejects every tool whose mode derivation or prediction reads reconstructed samples or that the kernels lack, before
   anything is skipped. All 19 regular streams now fall back to the CPU at TMRL, the next sequence-level check (before

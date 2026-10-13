@@ -224,7 +224,7 @@ const int MERGE_HEAD_T    = 2;                         // the offset of MergeHea
 const int MERGE_HEAD      = MERGE_HEAD_T + TEMPLATE_UNITS;
 
 // a TIMD CU's record in Params::timdData (layout shared with GpuIntraRec.cpp): this header, then the availability
-// bits of its template's reference units
+// bits of its template's reference units, then those of its TIMD-SAD template's
 struct TimdHead
 {
   int           index;   // its index among the TIMD CUs (Params::timdOut)
@@ -232,9 +232,13 @@ struct TimdHead
                          // TIMD_LEFT, TIMD_BOTH
   int           waip;    // where deriveTimdMode's wide angles beyond the regular ones may reach: TIMD_WAIP_* bits
   TemplateUnits t;       // its template, an arm it lacks 0
+  int           sad;     // a TIMD-SAD CU (CodingUnit::timdSad): its node also does deriveTimdModeSad
+  TemplateUnits ts;      // deriveTimdModeSad's template (arms of up to 8; of the same type), where sad
 };
-const int TIMD_HEAD_T = 3;                             // the offset of TimdHead::t
-const int TIMD_HEAD   = TIMD_HEAD_T + TEMPLATE_UNITS;
+const int TIMD_HEAD_T   = 3;                             // the offset of TimdHead::t
+const int TIMD_HEAD_SAD = TIMD_HEAD_T + TEMPLATE_UNITS;  // of TimdHead::sad
+const int TIMD_HEAD_TS  = TIMD_HEAD_SAD + 1;             // of TimdHead::ts
+const int TIMD_HEAD     = TIMD_HEAD_TS + TEMPLATE_UNITS;
 const int TIMD_NONE   = 0;
 const int TIMD_ABOVE  = 1;
 const int TIMD_LEFT   = 2;
@@ -245,8 +249,12 @@ const int TIMD_WAIP_MIN_CLOSE = 4;   // decreaseMinClose: a PU left of the CU's 
 const int TIMD_WAIP_MIN_FAR   = 8;   // decreaseMinFar: a PU left, a CU height further down
 
 // a TIMD CU's TIMD as its node derives it (TIMD_OUT int32 per TIMD CU in Params::timdOut): the CodingUnit fields
-// deriveTimdMode sets, those it does not at their initial values (-1 modes and weights, 0 location dependence)
-const int TIMD_OUT                 = 12;
+// deriveTimdMode sets, those it does not at their initial values (-1 modes and weights, 0 location dependence); from
+// TIMD_OUT_SAD a TIMD-SAD CU's deriveTimdModeSad's alike (timdModeSad, ... timdModeSecondaryCheckWASad: the same
+// fields at the same offsets), which its blocks predict
+const int TIMD_OUT_FIELDS          = 12;   // the fields of one derivation
+const int TIMD_OUT                 = 2 * TIMD_OUT_FIELDS;
+const int TIMD_OUT_SAD             = TIMD_OUT_FIELDS;   // the offset of deriveTimdModeSad's
 const int TIMD_OUT_MODE            = 0;    // timdMode (131-mode set; the regular mode of a wide angle beyond them)
 const int TIMD_OUT_SECONDARY       = 1;    // timdModeSecondary
 const int TIMD_OUT_NON_ANG         = 2;    // timdModeNonAng (planar / DC)
