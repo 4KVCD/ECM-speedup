@@ -42,6 +42,7 @@
 
 #include "EncoderLib/EncLibCommon.h"
 #include "EncApp.h"
+#include "CrashReport.h"
 #include "SegmentParallel.h"
 #include "Utilities/program_options_lite.h"
 
@@ -109,6 +110,8 @@ static void xSetPowerThrottling( bool allow )
 
 int main(int argc, char* argv[])
 {
+  installCrashReport();   // a crash prints the call stack (frame threads: a rare race is found from it)
+
   // print information
   fprintf( stdout, "\n" );
   fprintf( stdout, "VVCSoftware: ECM Encoder Version %s (VTM-%s) ", ECM_VERSION, VTM_VERSION );

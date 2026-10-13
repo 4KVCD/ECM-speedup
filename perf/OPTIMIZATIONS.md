@@ -197,6 +197,9 @@ lower all-core turbo, one duplicated intra frame per chunk, unequal chunk comple
   The times now equal those pinned to P-cores; benchmarks in this file are pinned, so they did not change.
 
 ## Notes
+- On Windows a crash prints the exception and the faulting thread's call stack as link-time addresses
+  (`CrashReport.cpp`); `addr2line -f -C -i -e EncoderApp.exe ADDRESS` on a build of the same source with `-g`
+  resolves them (GCC generates the same code with `-g`: checked on EncGOP.cpp, identical disassembly).
 - GCC 16 needed two build fixes (missing `<cstdint>`; `-fno-aggressive-loop-optimizations`, because
   `EncAdaptiveLoopFilter.cpp` reads `m_chromaScaleIdxFinal[4][1]` with alternative index up to 7).
 - MinGW/Win64: AVX code needs `-Wa,-muse-unaligned-vector-move` (GCC bug 54412, no 32-byte stack realignment).

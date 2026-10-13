@@ -216,6 +216,20 @@ Commits on `enc-mt`, all bit-exact with stock ECM-20.0 (bitstream md5 of the sui
   the 265K (20 threads chosen): AI 33 pictures 201.2 -> 23.1 s (8.7x), RA 65 frames 540.0 -> 202.7 s (2.66x; two
   periods, chain-bound: 2.8 busy cores), RA 513 frames 327.8 s (8 threads on the 8 P-cores took 612.3 s). `bench.py`
   pins before the encoder starts, so a pinned run picks one thread.
+- RA 513 frames with 20 threads, timeline (`ECM_FT_TRACE` probe, `C:\Code\work\mt\trace_patch2.py`): all 16
+  periods start at once and all 20 stacks search from about 60 to 160 s; the second half is a tail (16 down to 1
+  searching) of the heaviest periods' chains (period cost varies 6x on this sequence). The schedule simulation
+  (`C:\Code\work\mt\sim_prio.py`) gives 13 % for the critical-path order with the true costs, but no order without
+  them was better on both cost sets tried (per-layer critical path -6.8 % / +3.3 %, lowest layer first +0.5 % /
+  -4.9 %), and the input measures do not predict a period's cost here (spatial activity r = -0.77, frame differences
+  r = -0.15).
+- Tried and dropped (speed): `--FinishSaoStats=K`, letting K finishes of different periods hold their SAO statistics
+  at once instead of one (RAM step S; `C:\Code\work\mt\s3_patch.py`): RA 513 frames with 20 threads 360.5 s with
+  one, 367.4 s with 17 (the finishes are 3 % of the work; within a period they run in coding order anyway).
+- Open: one segmentation fault in RA 513 frames with 20 threads (a probe build of 42c9fbd3, about 46 s in, right
+  after POC 16's output); not reproduced since in 13 full runs (release and probe builds, with and without gdb) and
+  25 runs of the first 70 s (`C:\Code\work\mt\crash_loop3.sh`). The encoder now prints the faulting thread's call
+  stack on a crash (`CrashReport.cpp`); resolve the addresses with addr2line on a -g build of the same source.
 - Tried and dropped (RAM): freeing the original and the per-4x4 arrays of a finished picture that waits only for its
   output and is no reference (`C:\Code\work\mt\ram\w_dropped.diff`). In the first minutes at 1080p with 8 threads
   and 8 periods the list holds about 280 waiting pictures, 9 being searched and at most 13 finished ones, all still
