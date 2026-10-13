@@ -25,7 +25,7 @@ const int CCLM_MODEL = 16, CCLM_SLOT = 8;
 const int CCLM_A = 0, CCLM_B = 1, CCLM_SHIFT = 2, CCLM_A2 = 3, CCLM_B2 = 4, CCLM_SHIFT2 = 5, CCLM_THRES = 6;
 
 // the availability of block t's template units (xGetLMParametersLMS: chroma units of 2) and of LBCCP's positions
-// (isPosAvailable) into s_cclmAvail (invocation 0)
+// (isPosAvailable) into s_cclm (invocation 0)
 void cclmAvailability( Tu t )
 {
   const int ch = 1;
@@ -49,12 +49,47 @@ bool cclmMultiModel( int mode ) { return mode == MMLM_CHROMA_IDX || mode == MMLM
 bool cclmLeftOnly( int mode ) { return mode == MDLM_L_IDX || mode == MMLM_L_IDX; }
 bool cclmTopOnly( int mode ) { return mode == MDLM_T_IDX || mode == MMLM_T_IDX; }
 
-// ----- the downsampled luma (xGetLumaRecPixels; 4:2:0)
+// ----- the downsampled luma (xGetLumaRecPixels; 4:2:0), or with GLM its gradient
 
-// the co-located luma block's downsampled sample (i, j) (luma origin (lx, ly)); the side not available pads the filter
-int cclmLumaInner( int lx, int ly, int i, int j, bool leftAvail, bool aboveAvail )
+// GLM's gradient patterns (Rom.cpp's g_glmPattern with JVET-AN0090 and JVET-AP0105, NUM_GLM_PATTERN 4 with CCCM) per
+// chroma location type (xGetLumaRecPixels' chromaloctype: 0 one collocated flag, 1 neither, 2 both), 9 taps each: the
+// samples left of, at and right of the luma sample in its row, the row below, the row above (type 2 only)
+const int NUM_GLM_PATTERN = 4;
+const int GLM_PATTERN[3 * NUM_GLM_PATTERN * 9] = int[](
+   1,  0, -1,  1,  0, -1,  0,  0,  0,     1,  2,  1, -1, -2, -1,  0,  0,  0,
+   2,  1, -1,  1, -1, -2,  0,  0,  0,    -1,  1,  2, -2, -1,  1,  0,  0,  0,
+   0,  1, -1,  0,  1, -1,  0,  0,  0,     0,  1,  1,  0, -1, -1,  0,  0,  0,
+   0,  1,  0,  0,  0, -1,  0,  0,  0,     0,  0,  1,  0, -1,  0,  0,  0,  0,
+   2,  0, -2,  1,  0, -1,  1,  0, -1,     0,  0,  0, -1, -2, -1,  1,  2,  1,
+   1,  0, -1,  0, -1, -2,  2,  1,  0,    -1,  0,  1, -2, -1,  0,  0,  1,  2 );
+
+// xGlmGetLumaVal (JVET-AA0126; with JVET-AB0092 the gradient alone) of pattern glm (1 .. NUM_GLM_PATTERN) at the luma
+// sample (x, y) the downsampling centres on: the samples x - l .. x + 1 of rows y, y + 1 and y - u (l, u: 0 where that
+// side pads, as the downsampling's)
+int glmGradient( int glm, int x, int y, int l, int u )
+{
+  const int type = P.cclmFilter == CCLM_FILTER_6TAP ? 0 : P.cclmFilter == CCLM_FILTER_AVERAGE ? 1 : 2;
+  const int c    = ( type * NUM_GLM_PATTERN + glm - 1 ) * 9;
+  int g = GLM_PATTERN[c] * recoAt( 0, x - l, y ) + GLM_PATTERN[c + 1] * recoAt( 0, x, y ) + GLM_PATTERN[c + 2] * recoAt( 0, x + 1, y )
+          + GLM_PATTERN[c + 3] * recoAt( 0, x - l, y + 1 ) + GLM_PATTERN[c + 4] * recoAt( 0, x, y + 1 )
+          + GLM_PATTERN[c + 5] * recoAt( 0, x + 1, y + 1 );
+  if( type == 2 )
+  {
+    g += GLM_PATTERN[c + 6] * recoAt( 0, x - l, y - u ) + GLM_PATTERN[c + 7] * recoAt( 0, x, y - u )
+         + GLM_PATTERN[c + 8] * recoAt( 0, x + 1, y - u );
+  }
+  return int( int16_t( g ) );   // (a Pel)
+}
+
+// the co-located luma block's downsampled sample (i, j) (luma origin (lx, ly)), with GLM pattern glm (0: none) its
+// gradient; the side not available pads the filter
+int cclmLumaInner( int lx, int ly, int i, int j, bool leftAvail, bool aboveAvail, int glm )
 {
   const int x = lx + 2 * i, y = ly + 2 * j, l = i == 0 && !leftAvail ? 0 : 1;
+  if( glm != 0 )
+  {
+    return glmGradient( glm, x, y, l, j == 0 && !aboveAvail ? 0 : 1 );
+  }
   if( P.cclmFilter == CCLM_FILTER_AVERAGE )
   {
     return ( recoAt( 0, x, y ) + recoAt( 0, x + 1, y ) + recoAt( 0, x, y + 1 ) + recoAt( 0, x + 1, y + 1 ) + 2 ) >> 2;
@@ -69,10 +104,15 @@ int cclmLumaInner( int lx, int ly, int i, int j, bool leftAvail, bool aboveAvail
 }
 
 // the downsampled sample i of the row above the co-located block: in a CTU's first row from its one luma row above
-// (the line buffer), else from the two rows above it
-int cclmLumaAbove( int lx, int ly, int i, bool leftAvail )
+// (the line buffer), else from the two rows above it; with GLM the gradient around row ly - 2 (also in a CTU's first
+// row)
+int cclmLumaAbove( int lx, int ly, int i, bool leftAvail, int glm )
 {
   const int x = lx + 2 * i, l = i == 0 && !leftAvail ? 0 : 1;
+  if( glm != 0 )
+  {
+    return glmGradient( glm, x, ly - 2, l, 1 );
+  }
   if( ( ly & ( P.ctuSize - 1 ) ) == 0 )
   {
     return P.cclmFilter == CCLM_FILTER_AVERAGE ? ( recoAt( 0, x, ly - 1 ) + recoAt( 0, x + 1, ly - 1 ) + 1 ) >> 1
@@ -91,10 +131,15 @@ int cclmLumaAbove( int lx, int ly, int i, bool leftAvail )
            + recoAt( 0, x - l, y + 1 ) + 4 ) >> 3;
 }
 
-// the downsampled sample j of the column left of the co-located block (from the luma columns lx - 3 .. lx - 1)
-int cclmLumaLeft( int lx, int ly, int j, bool aboveAvail )
+// the downsampled sample j of the column left of the co-located block (from the luma columns lx - 3 .. lx - 1), with
+// GLM the gradient
+int cclmLumaLeft( int lx, int ly, int j, bool aboveAvail, int glm )
 {
   const int x = lx - 2, y = ly + 2 * j;
+  if( glm != 0 )
+  {
+    return glmGradient( glm, x, y, 1, j == 0 && !aboveAvail ? 0 : 1 );
+  }
   if( P.cclmFilter == CCLM_FILTER_AVERAGE )
   {
     return ( recoAt( 0, x, y ) + recoAt( 0, x + 1, y ) + recoAt( 0, x, y + 1 ) + recoAt( 0, x + 1, y + 1 ) + 2 ) >> 2;
@@ -213,6 +258,7 @@ void cclmAdjust( inout int a, inout int b, inout int shift, int midLuma, int del
 void cclmModel( Tu t, int lx, int ly, int predStride, int ref, int slot )
 {
   const int  W = t.w, H = t.h, mode = t.dirMode, bitDepth = t.bitDepth;
+  const int  glm = ( t.lm >> LM_GLM_SHIFT ) & 15;   // GLM's gradient pattern (0: none)
   const bool leftOnly = cclmLeftOnly( mode ), topOnly = cclmTopOnly( mode );
   bool aboveAvail = s_cclm[CCLM_ABOVE] != 0, leftAvail = s_cclm[CCLM_LEFT] != 0;
   const bool aboveAvailFill = aboveAvail, leftAvailFill = leftAvail;   // (the downsampling's padding)
@@ -245,7 +291,7 @@ void cclmModel( Tu t, int lx, int ly, int predStride, int ref, int slot )
     for( int j = 0; j < numSteps; j++ )
     {
       const int idx = ( j * actualTop ) / minDim;
-      s_tmp[j]       = int16_t( cclmLumaAbove( lx, ly, idx, leftAvailFill ) );
+      s_tmp[j]       = int16_t( cclmLumaAbove( lx, ly, idx, leftAvailFill, glm ) );
       s_tmp[256 + j] = s_ref[ref][1 + idx];
       sumLuma       += int( s_tmp[j] );
     }
@@ -256,7 +302,7 @@ void cclmModel( Tu t, int lx, int ly, int predStride, int ref, int slot )
     for( int i = 0; i < numSteps; i++ )
     {
       const int idx = ( i * actualLeft ) / minDim;
-      s_tmp[cntT + i]       = int16_t( cclmLumaLeft( lx, ly, idx, aboveAvailFill ) );
+      s_tmp[cntT + i]       = int16_t( cclmLumaLeft( lx, ly, idx, aboveAvailFill, glm ) );
       s_tmp[256 + cntT + i] = s_ref[ref][predStride + 1 + idx];
       sumLuma              += int( s_tmp[cntT + i] );
     }
@@ -393,7 +439,7 @@ void cclmModel( Tu t, int lx, int ly, int predStride, int ref, int slot )
 int cclmPredSample( Tu t, int lx, int ly, int i, int j, int maxPel, int slot )
 {
   const int  m      = CCLM_MODEL + slot * CCLM_SLOT;
-  const int  luma   = cclmLumaInner( lx, ly, i, j, s_cclm[CCLM_LEFT] != 0, s_cclm[CCLM_ABOVE] != 0 );
+  const int  luma   = cclmLumaInner( lx, ly, i, j, s_cclm[CCLM_LEFT] != 0, s_cclm[CCLM_ABOVE] != 0, ( t.lm >> LM_GLM_SHIFT ) & 15 );
   const bool second = cclmMultiModel( t.dirMode ) && luma > s_cclm[m + CCLM_THRES];
   const int  v = second ? ( ( s_cclm[m + CCLM_A2] * luma ) >> s_cclm[m + CCLM_SHIFT2] ) + s_cclm[m + CCLM_B2]
                         : ( ( s_cclm[m + CCLM_A] * luma ) >> s_cclm[m + CCLM_SHIFT] ) + s_cclm[m + CCLM_B];
@@ -487,7 +533,8 @@ void cclmTransformMode( Tu t, int predStride, int maxPel, int lid, int NT )
   const bool stored = W * H <= 1024;
   Tu o = t;
   o.comp = 3 - t.comp;
-  o.lm   = ( t.lm & ~0xff ) | ( ( t.lm >> LM_OTHER_SHIFT ) & 0xff );
+  o.lm   = ( t.lm & ~( 0xff | ( 15 << LM_GLM_SHIFT ) ) ) | ( ( t.lm >> LM_OTHER_SHIFT ) & 0xff )
+           | ( ( ( t.lm >> LM_OTHER_GLM_SHIFT ) & 15 ) << LM_GLM_SHIFT );
   if( other )
   {
     fillReferencePar( o, 0, 1, predStride, lid, NT );

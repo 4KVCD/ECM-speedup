@@ -13,10 +13,10 @@ wall-clock gains with threads are "the easy baseline". Decoder status: single-th
 (`--GpuLoopFilter=1`: ALF, SAO, BIF, CCSAO, LF-CCCM, offset refinement on Vulkan). The user then asked for **a full
 GPU decoder in Vulkan, optimized until nothing is left** ("The GPU decoder needs to fully decode the frame on the
 GPU"; "Your first Vulkan version is going to be slow. That's OK"). That work is branch `dec-gpurecon`: intra
-reconstruction on the GPU (`--GpuRecon`), tool levels M1-M32 done and verified bit-exact (M19: DIMD, M20: OBIC, M21:
+reconstruction on the GPU (`--GpuRecon`), tool levels M1-M33 done and verified bit-exact (M19: DIMD, M20: OBIC, M21:
 intra merge, M22: the transforms of DIMD CUs, M23: LFNST of MIP, M24: TIMD, M25: OBIC and intra merge with TIMD
 neighbours, M26: TIMD-SAD, M27: OBIC and intra merge with TIMD-SAD neighbours, M28: TIMD merge, M29: TMRL of luma,
-M30: chroma TMRL, M31: CCLM, M32: LFNST / NSPT of CCLM); it is **not yet faster than the CPU decoder** (see section 8) and supports only a restricted tool
+M30: chroma TMRL, M31: CCLM, M32: LFNST / NSPT of CCLM, M33: GLM's gradient patterns); it is **not yet faster than the CPU decoder** (see section 8) and supports only a restricted tool
 set (all real CTC streams fall back to the CPU, first reason: cross-component prediction).
 
 ## 2. The user's rules (follow them exactly)
@@ -587,6 +587,18 @@ for the host's transform choice (the GPU chooses again). Rejected: without DIMD 
 unset). Test set: m31 (M31's arguments with LFNST: 5 to 31 such blocks per CIF picture, 77 to 122 per 720p picture,
 one above 32 x 32 in park720). GPU time: m31 137.7 ms per picture; plain 12.38 -> 12.59 (code it never runs; a
 fillReferencePar with its old signature measured the same), the other sets within 0.6 %.
+M33: GLM's gradient patterns (JVET-AA0126; glmIdc 1 .. NUM_GLM_PATTERN = 4 with CCCM). A CCLM block with one models
+the pattern's gradient instead of the downsampled luma, everywhere xGetLumaRecPixels takes it: its template (the row
+above from the rows around ly - 2 also in a CTU's first row) and the co-located block (`glmGradient`: xGlmGetLumaVal,
+which with JVET-AB0092 returns the gradient alone, as a Pel; the taps left of, at and right of the luma sample in its
+row, the row below and, for the cross location type of JVET-AP0105, the row above, padded as the downsampling pads;
+the patterns of the three location types in intra_cclm.glsl's GLM_PATTERN, Rom.cpp's g_glmPattern). Tu::lm carries the
+pattern (LM_GLM_SHIFT) and with LFNST / NSPT the other component's (cclmTransformMode's other prediction). Rejected:
+GLM with luma (glmIdc 5 .. 8: a CCCM model, xGlmCalcModel; next after CCCM). Test sets (encTest11, see section 9, with
+ECM_TEST_GLM_GRADIENT_ONLY and ECM_TEST_NO_CHROMA_FUSION): m33 (M31n's arguments without its LFNST switches, which
+default off: 14 to 72 GLM blocks per CIF picture, 92 per four720 picture, none in park720), m33l_fore32 / 22 / 37
+(with LFNST and NSPT, as m31), m33a_fore22 / m33c_fore22 (the averaging and the cross location types, with LFNST).
+GPU time: m33 130.3 ms per picture; the other sets within 0.7 %.
 
 ## 8. Numbers (i7-10700 8C/16T, Win11, GCC 16.2, RTX 3070 driver 616.92)
 
@@ -618,7 +630,8 @@ Profile of a GPU-on decode (non-LTO, m2_park16, share of all samples): parsing ~
    M25 OBIC and intra merge with TIMD neighbours (the m25, m25o, m25s and m25os sets), M26 TIMD-SAD (the m26 and
    m26o sets), M27 OBIC and intra merge with TIMD-SAD neighbours (the m27 and m27o sets), M28 TIMD merge (the m28 and
    m28m sets). 2026-10-13: M29 TMRL of luma (the m29 set, m29n_fore32, m29s_screen32 / 22), M30 chroma TMRL (the m30
-   set), M31 CCLM (the m31n set, m31a_fore32 / 22, m31c_fore32 / 22), M32 LFNST / NSPT of CCLM (the m31 set).
+   set), M31 CCLM (the m31n set, m31a_fore32 / 22, m31c_fore32 / 22), M32 LFNST / NSPT of CCLM (the m31 set), M33
+   GLM's gradient patterns (the m33 set, m33l_fore32 / 22 / 37, m33a_fore22, m33c_fore22).
    All 19 regular streams now stop at "cross-component prediction" (the next sequence-level check; the block-level
    tools of step 4 follow).
 3. Make the GPU path win on CPU time per picture: the derive-only pass (record during parsing or a leaner pass;
@@ -643,8 +656,10 @@ Profile of a GPU-on decode (non-LTO, m2_park16, share of all samples): parsing ~
    cost); `bin\encTest8` (m26o) adds ECM_TEST_PREFER_TIMD_SAD (`testTimd` off where `testTimdSad`); `bin\encTest9`
    (m29) adds ECM_TEST_NO_CHROMA_TMRL (the `PU::hasChromaTmrl(pu) && ...getUseTmrl()` conditions of the chroma search
    false); `bin\encTest10` (m31) adds ECM_TEST_NO_GLM (the `PU::hasGlmFlag` conditions of the chroma search false) and
-   ECM_TEST_NO_CHROMA_FUSION (its `PU::hasChromaFusionFlag` conditions false). The user's order (2026-10-13): all intra
-   first, then inter. Next GLM, LM chroma fusion, CCCM
+   ECM_TEST_NO_CHROMA_FUSION (its `PU::hasChromaFusionFlag` conditions false); `bin\encTest11` (m33) adds
+   ECM_TEST_GLM_GRADIENT_ONLY (xFindBestGlmIdcSATD searches the gradient patterns only, not GLM with luma). The user's
+   order (2026-10-13): all intra first, then inter. Next LM chroma fusion, CCCM (with GLM with luma, which takes its
+   model)
    and the other cross-component tools, chroma reordering / DBV, BVG-DIMD, MDIP / MPM sorting, IntraTMP / IBC, EIP /
    SGPM, PDP, NN intra, implicit MTS (not in CTC; its test set, the m24 arguments with `--MTS=0 --MTSImplicit=1`, is
    encoded: `streams_gpu\pending\imts_*`), deblocking on the GPU, then inter pictures.

@@ -409,6 +409,8 @@ the reconstruction buffer; works in every frame-thread context):
   co-located block, adjusts the slopes by the CU's offsets, and applies the model to the downsampled co-located luma,
   smoothed by LBCCP's filter where the CU takes it. M32 is LFNST / NSPT of CCLM blocks: their mode is a DIMD of the
   CU's Cb and / or Cr predictions, so such a block also predicts the other chroma component before its transforms.
+  M33 is GLM's gradient patterns: the model is fitted to and applied on a luma gradient (one of four patterns of 6 or
+  9 taps) instead of the downsampled luma.
   GpuIntraRec::supported()
   rejects every tool whose mode derivation or prediction reads reconstructed samples or that the kernels lack, before
   anything is skipped. All 19 regular streams now fall back to the CPU at cross-component prediction, the next

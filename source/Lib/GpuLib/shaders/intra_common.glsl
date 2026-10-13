@@ -80,7 +80,8 @@ const int MMLM_T_IDX      = LM_CHROMA_IDX + 5;
 // 131-mode set, whose values from 67 on are angular), the slope adjustment (cclmOffsets, -4 .. 4) of its first and
 // second model, each + 8 in 4 bits, and whether the CU's prediction takes LBCCP's inside filter (ccInsideFilter).
 // With LFNST / NSPT (DERIVE_CCLM_DIMD) also the predictions whose DIMD gives their mode (deriveChromaIpmForTransform
-// by the TU's joint CbCr mode: Cb's for 1, Cr's for 2, both for 0 and 3) and the other component's slope adjustments
+// by the TU's joint CbCr mode: Cb's for 1, Cr's for 2, both for 0 and 3) and the other component's slope adjustments.
+// With GLM (JVET-AA0126) the gradient pattern of the block (glmIdc 1 .. NUM_GLM_PATTERN, 0: none) and the other's
 const int LM_DELTA0_SHIFT = 0;
 const int LM_DELTA1_SHIFT = 4;
 const int LM_INSIDE       = 256;
@@ -88,6 +89,8 @@ const int LM_ACTIVE       = 512;
 const int LM_HIST_CB      = 1024;
 const int LM_HIST_CR      = 2048;
 const int LM_OTHER_SHIFT  = 12;   // the other component's two adjustments, in LM_DELTA0 / 1's layout
+const int LM_GLM_SHIFT    = 20;   // 4 bits
+const int LM_OTHER_GLM_SHIFT = 24;
 
 // Tu::derive
 const int DERIVE_NODE     = 32;  // not a block: the derivation of the mode of CU Tu::cu, before the CU's blocks

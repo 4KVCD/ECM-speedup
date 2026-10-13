@@ -139,6 +139,7 @@ constexpr int DERIVE_CCLM_DIMD    = 262144;  // a CCLM block with LFNST / NSPT: 
 // predictions its transforms' DIMD reads and the other chroma component's slope adjustments
 constexpr int LM_DELTA0_SHIFT = 0, LM_DELTA1_SHIFT = 4, LM_INSIDE = 256, LM_ACTIVE = 512;
 constexpr int LM_HIST_CB = 1024, LM_HIST_CR = 2048, LM_OTHER_SHIFT = 12;
+constexpr int LM_GLM_SHIFT = 20, LM_OTHER_GLM_SHIFT = 24;   // GLM's gradient pattern (glmIdc), the other component's
 
 // the parameters intra_rec derives per DERIVE_MODE block, downloaded for the comparison (intra_common.glsl's
 // DBG_PARAMS): dirMode, isModeVer, intraPredAngle, absInvAngle, useCubic, refFilter, applyPDPC, gradPDPC, angularScale,
@@ -319,6 +320,14 @@ static_assert( MTSS_LIST_SIZE == 3, "MTSS's mode list" );
 #define GPU_CCLM 1
 #else
 #define GPU_CCLM 0
+#endif
+// GLM's gradient patterns the kernels have (intra_cclm.glsl's GLM_PATTERN: four with CCCM, of nine taps with
+// JVET-AP0105's location types); GLM with luma (glmIdc beyond them, a CCCM model) is rejected
+#if GPU_CCLM && JVET_AA0126_GLM && JVET_AB0092_GLM_WITH_LUMA && JVET_AA0057_CCCM && JVET_AP0105_SUBSAMPLING_FILTER_CCLM_CCCM_FIX
+#define GPU_GLM 1
+static_assert( NUM_GLM_PATTERN == 4, "intra_cclm.glsl's GLM_PATTERN" );
+#else
+#define GPU_GLM 0
 #endif
 constexpr int BLEND_ACC  = 3 * 128 * 128;    // int32 per intra_rec workgroup: the sums of DIMD / OBIC blending
 
@@ -2418,11 +2427,16 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
   else if( cu.eipFlag )                                             why = "EIP";
   else if( !isLuma( compID ) && ipa.multiRefIndex && !pu.chromaTmrlFlag ) why = "chroma MRL";
   // CCLM (chroma, the LM modes): the model from the template and the downsampled luma, its slope adjustment and LBCCP's
-  // filter; not GLM, CCCM nor the fusion of a chroma mode with LM (JVET-AC0119). With LFNST / NSPT their mode is a DIMD
-  // of the CU's Cb and / or Cr predictions (deriveChromaIpmForTransform), which without DIMD in the SPS leaves the mode
-  // the transforms read unset. Not above 10 bits (no test stream) nor with unequal bit depths (the model takes the
-  // chroma bit depth, its division table m_auShiftLM the luma's)
-  else if( !isLuma( compID ) && pu.glmIdc.isActive() )             why = "GLM";
+  // filter; with GLM (JVET-AA0126) the model of a gradient pattern's values instead of the downsampled luma; not GLM
+  // with luma (JVET-AB0092: glmIdc beyond the patterns, a CCCM model; also not as the other component of a CU whose
+  // LFNST / NSPT mode is a DIMD of both predictions), CCCM nor the fusion of a chroma mode with LM (JVET-AC0119). With
+  // LFNST / NSPT their mode is a DIMD of the CU's Cb and / or Cr predictions (deriveChromaIpmForTransform), which without
+  // DIMD in the SPS leaves the mode the transforms read unset. Not above 10 bits (no test stream) nor with unequal bit
+  // depths (the model takes the chroma bit depth, its division table m_auShiftLM the luma's)
+  else if( !isLuma( compID ) && pu.glmIdc.isActive() && !GPU_GLM ) why = "GLM of another configuration";
+  else if( !isLuma( compID ) && ( pu.glmIdc.getIdc( compID, 0 ) > NUM_GLM_PATTERN
+                                  || ( cu.lfnstIdx && pu.glmIdc.getIdc( compID == COMPONENT_Cb ? COMPONENT_Cr : COMPONENT_Cb, 0 ) > NUM_GLM_PATTERN ) ) )
+    why = "GLM with luma";
   else if( !isLuma( compID ) && pu.cccmFlag )                       why = "CCCM";
   else if( !isLuma( compID ) && pu.isChromaFusion )                 why = "LM chroma fusion";
   else if( !isLuma( compID ) && PU::isLMCMode( dirMode ) && cu.lfnstIdx && !sps.getUseDimd() ) why = "CCLM with LFNST / NSPT without DIMD";
@@ -2488,12 +2502,14 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
     const bool cb = compID == COMPONENT_Cb;
     t.lm = ( ( ( cb ? pu.cclmOffsets.cb0 : pu.cclmOffsets.cr0 ) + 8 ) << LM_DELTA0_SHIFT )
            | ( ( ( cb ? pu.cclmOffsets.cb1 : pu.cclmOffsets.cr1 ) + 8 ) << LM_DELTA1_SHIFT ) | ( pu.ccInsideFilter ? LM_INSIDE : 0 )
-           | LM_ACTIVE;
-    if( cu.lfnstIdx )   // the predictions the transforms' DIMD reads by the TU's joint CbCr mode, the other's adjustments
+           | LM_ACTIVE | ( pu.glmIdc.getIdc( compID, 0 ) << LM_GLM_SHIFT );
+    if( cu.lfnstIdx )   // the predictions the transforms' DIMD reads by the TU's joint CbCr mode, the other's parameters
     {
+      const ComponentID other = cb ? COMPONENT_Cr : COMPONENT_Cb;
       t.lm |= ( tu.jointCbCr != 2 ? LM_HIST_CB : 0 ) | ( tu.jointCbCr != 1 ? LM_HIST_CR : 0 );
       t.lm |= ( ( ( ( cb ? pu.cclmOffsets.cr0 : pu.cclmOffsets.cb0 ) + 8 ) << LM_DELTA0_SHIFT )
                 | ( ( ( cb ? pu.cclmOffsets.cr1 : pu.cclmOffsets.cb1 ) + 8 ) << LM_DELTA1_SHIFT ) ) << LM_OTHER_SHIFT;
+      t.lm |= pu.glmIdc.getIdc( other, 0 ) << LM_OTHER_GLM_SHIFT;
     }
     // the LM prediction reads the unfiltered references (initPredIntraParams: no reference filter or fusion for a
     // chroma LM mode) and none of the angular and PDPC parameters, whose angles initPredIntraParams leaves as the
@@ -4226,7 +4242,7 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
   }
   int numFilter = 0, numPdpc = 0, numGrad = 0, numFusion = 0, numBf = 0, numNodes = 0, numDimd = 0, numDimdCus = 0, numObic = 0;
   int numDimdTransforms = 0, numMtss = 0, numMipDimd = 0, numInherited = 0;
-  int numCclm = 0, numMmlm = 0, numMdlm = 0, numLbccp = 0, numCclmDimd = 0;
+  int numCclm = 0, numMmlm = 0, numMdlm = 0, numLbccp = 0, numCclmDimd = 0, numGlm = 0;
   for( const Tu& t: m.rec )
   {
     if( t.lm & LM_ACTIVE )
@@ -4236,6 +4252,7 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
       numMdlm += t.dirMode != LM_CHROMA_IDX && t.dirMode != MMLM_CHROMA_IDX;
       numLbccp += ( t.lm & LM_INSIDE ) != 0;
       numCclmDimd += ( t.derive & DERIVE_CCLM_DIMD ) && ( t.derive & DERIVE_TRANSFORM );
+      numGlm += ( ( t.lm >> LM_GLM_SHIFT ) & 15 ) != 0;
     }
     numFilter += t.refFilter;
     numPdpc += t.applyPDPC;
@@ -4267,7 +4284,7 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
       numTimdBlended += m.cpuTimd[size_t( th.index ) * TIMD_OUT + ( th.sad ? TIMD_OUT_SAD : 0 ) + TIMD_OUT_BLENDED] != 0;
     }
   }
-  printf( "\n[gpu-intra] POC %d: %d blocks, chain %d (ref filter %d, PDPC %d, gradient PDPC %d, fusion %d, bilateral filter candidates %d, CU nodes %d, DIMD %d, DIMD CUs %d, OBIC CUs %d, intra merge CUs %d, TIMD CUs %d (blended %d, TIMD-SAD %d, TIMD merge %d, inheriting transforms %d), TMRL CUs %d, chroma TMRL CUs %d, their MTS / LFNST / NSPT blocks %d, MTSS %d, MIP LFNST / NSPT %d, CCLM blocks %d (MMLM %d, MDLM %d, LBCCP %d, LFNST / NSPT %d)), GPU %.2f ms: %s%s%s", m.poc,
-          (int) m.rec.size() - numNodes, maxDepth, numFilter, numPdpc, numGrad, numFusion, numBf, numNodes, numDimd, numDimdCus, numObic, m.numMerge, m.numTimd, numTimdBlended, numTimdSad, m.numTimdMerge, numInherited, numTmrl, numChromaTmrl, numDimdTransforms, numMtss, numMipDimd, numCclm, numMmlm, numMdlm, numLbccp, numCclmDimd, ms, bad ? "MISMATCH, " : "identical",
+  printf( "\n[gpu-intra] POC %d: %d blocks, chain %d (ref filter %d, PDPC %d, gradient PDPC %d, fusion %d, bilateral filter candidates %d, CU nodes %d, DIMD %d, DIMD CUs %d, OBIC CUs %d, intra merge CUs %d, TIMD CUs %d (blended %d, TIMD-SAD %d, TIMD merge %d, inheriting transforms %d), TMRL CUs %d, chroma TMRL CUs %d, their MTS / LFNST / NSPT blocks %d, MTSS %d, MIP LFNST / NSPT %d, CCLM blocks %d (MMLM %d, MDLM %d, LBCCP %d, LFNST / NSPT %d, GLM %d)), GPU %.2f ms: %s%s%s", m.poc,
+          (int) m.rec.size() - numNodes, maxDepth, numFilter, numPdpc, numGrad, numFusion, numBf, numNodes, numDimd, numDimdCus, numObic, m.numMerge, m.numTimd, numTimdBlended, numTimdSad, m.numTimdMerge, numInherited, numTmrl, numChromaTmrl, numDimdTransforms, numMtss, numMipDimd, numCclm, numMmlm, numMdlm, numLbccp, numCclmDimd, numGlm, ms, bad ? "MISMATCH, " : "identical",
           bad ? first.c_str() : "", numBad ? ( ", " + std::to_string( numBad ) + " picture samples differ" ).c_str() : "" );
 }
