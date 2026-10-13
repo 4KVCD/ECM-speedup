@@ -57,7 +57,9 @@ Benchmark suite (`perf/bench.py`)
 | - | GPM split-mode reordering sort: carry-swap loop instead of the backward copy that GCC turns into two memmove calls per insertion | yes | 1.00x - dropped (AI 1.03-1.04x although all-intra never runs GPM, i.e. layout noise; LD 0.95x) | |
 
 Direct paired measurement stock vs current (LTO, no PGO, steps 4-22): **1.17x** (every test 1.15-1.19x, wall and
-CPU, bit-exact); with step 23: ~1.19x. PGO (+~6 %) is re-applied at the end.
+CPU, bit-exact); with step 23: ~1.19x. PGO (+~6 %) is re-applied at the end. On the frame-thread branch (639de215)
+PGO gained nothing: paired against the LTO build, suite, 3 repetitions on P-core pairs, CPU time ratio 0.995x
+(per test 0.974-1.021x); the code steps since took its gain.
 
 Steps 15-18 were measured on builds without LTO (perf/build.ps1 did not enable it; it does now), both sides of each
 comparison built the same way; steps 19+ on LTO builds.
