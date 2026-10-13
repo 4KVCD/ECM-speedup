@@ -317,7 +317,7 @@ public:
   std::vector<BMSubBlkInfo> m_bmSubBlkList;
 #endif
 #if JVET_AH0119_SUBBLOCK_TM
-  MotionInfo           m_sbMiBuf[3][(MAX_CU_SIZE * MAX_CU_SIZE) >> (MIN_CU_LOG2 << 1)];
+  CtuMotionBufs<3>     m_sbMiBuf;   // sized in init()
 #endif
 protected:
   InterpolationFilter  m_if;

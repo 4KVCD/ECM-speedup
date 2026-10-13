@@ -412,17 +412,17 @@ private:
 #endif
   double                m_AFFBestSATDCost;
   double                m_mergeBestSATDCost;
-#if JVET_AC0185_ENHANCED_TEMPORAL_MOTION_DERIVATION 
+#if JVET_AC0185_ENHANCED_TEMPORAL_MOTION_DERIVATION
 #if JVET_AG0098_AMVP_WITH_SBTMVP
-  MotionInfo            m_subPuMiBuf[SUB_BUFFER_SIZE][(MAX_CU_SIZE * MAX_CU_SIZE) >> (MIN_CU_LOG2 << 1)];
+  CtuMotionBufs<SUB_BUFFER_SIZE> m_subPuMiBuf;   // sized in create()
 #else
-  MotionInfo            m_subPuMiBuf[SUB_TMVP_NUM][(MAX_CU_SIZE * MAX_CU_SIZE) >> (MIN_CU_LOG2 << 1)];
+  CtuMotionBufs<SUB_TMVP_NUM>    m_subPuMiBuf;
 #endif
 #else
   MotionInfo            m_subPuMiBuf[(MAX_CU_SIZE * MAX_CU_SIZE) >> (MIN_CU_LOG2 << 1)];
 #endif
 #if JVET_AL0160_SBSMVP
-  MotionInfo            m_subSpatialPuMiBuf[NUM_SUB_SMVP][(MAX_CU_SIZE * MAX_CU_SIZE) >> (MIN_CU_LOG2 << 1)];
+  CtuMotionBufs<NUM_SUB_SMVP>    m_subSpatialPuMiBuf;   // sized in create()
 #endif
 #if MULTI_PASS_DMVR
   Mv                    m_mvBufBDMVR[(MRG_MAX_NUM_CANDS << 1)][MAX_NUM_SUBCU_DMVR];

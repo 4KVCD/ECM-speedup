@@ -126,6 +126,12 @@ void EncCu::create( EncCfg* encCfg )
 
   unsigned      uiMaxWidth    = encCfg->getMaxCUWidth();
   unsigned      uiMaxHeight   = encCfg->getMaxCUHeight();
+#if JVET_AC0185_ENHANCED_TEMPORAL_MOTION_DERIVATION
+  m_subPuMiBuf.create( uiMaxWidth );
+#endif
+#if JVET_AL0160_SBSMVP
+  m_subSpatialPuMiBuf.create( uiMaxWidth );
+#endif
   ChromaFormat  chromaFormat  = encCfg->getChromaFormatIdc();
 
   unsigned      numWidths     = gp_sizeIdxInfo->numWidths();

@@ -187,6 +187,9 @@ Commits on `enc-mt`, all bit-exact with stock ECM-20.0 (bitstream md5 of the sui
 - RAM step R2: a waiting picture keeps its original and true original in 8 bits per sample where that is lossless
   (`Picture::packWaitingBufs` at the setup end, `unpackWaitingBufs` at the search start). RA 1080p with 8 threads and
   8 periods, 75-150 s: 11.8 -> 10.9 GB on average (working set 8.1 -> 7.3 GB).
+- RAM step R3: the sub-PU, sub-spatial and sub-block motion buffers of EncCu, InterSearch and InterPrediction
+  (`CtuMotionBufs<N>`) are sized for the CTU in use instead of MAX_CU_SIZE: about 34 MB less per search stack, in the
+  working set. Peak commit with 8 threads: RA 65 frames 6.13 -> 5.85 GB, AI 33 pictures 6.14 -> 5.87 GB.
 - Tried and dropped (RAM): freeing the original and the per-4x4 arrays of a finished picture that waits only for its
   output and is no reference (`C:\Code\work\mt\ram\w_dropped.diff`). In the first minutes at 1080p with 8 threads
   and 8 periods the list holds about 280 waiting pictures, 9 being searched and at most 13 finished ones, all still

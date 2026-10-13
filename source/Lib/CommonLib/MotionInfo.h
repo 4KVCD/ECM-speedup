@@ -442,6 +442,32 @@ struct RefineTmvpCtxModellingParams
 #endif
 
 #if JVET_Z0054_BLK_REF_PIC_REORDER
+/// N motion buffers, each holding the 4x4 units of one CTU of the size given to create(); buffer i is [i]. The
+/// encoder's sub-PU and sub-block motion of a CU, sized for the CTU in use instead of MAX_CU_SIZE.
+template<int N>
+class CtuMotionBufs
+{
+public:
+  void create( int ctuSize )   // again with the same size: nothing to do
+  {
+    const size_t unitsPerBuf = ( size_t( ctuSize ) * ctuSize ) >> ( MIN_CU_LOG2 << 1 );
+    if( unitsPerBuf != m_unitsPerBuf || m_storage.empty() )
+    {
+      m_unitsPerBuf = unitsPerBuf;
+      m_storage.assign( N * m_unitsPerBuf, MotionInfo() );
+    }
+  }
+  MotionInfo* operator[]( int i )
+  {
+    CHECKD( i < 0 || i >= N || m_storage.empty(), "Motion buffer not created or out of range" );
+    return m_storage.data() + i * m_unitsPerBuf;
+  }
+
+private:
+  size_t                  m_unitsPerBuf = 0;
+  std::vector<MotionInfo> m_storage;
+};
+
 struct MotionInfoPred
 {
   int8_t     interDir;

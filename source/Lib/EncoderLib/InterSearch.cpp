@@ -601,6 +601,12 @@ void InterSearch::init( EncCfg*        pcEncCfg,
   {
     reused.create( maxCUWidth >> MIN_CU_LOG2, gp_sizeIdxInfo->idxFrom( maxCUWidth ) + 1 );
   }
+#if JVET_AI0183_MVP_EXTENSION
+  m_subPuMiBuf.create( maxCUWidth );
+#endif
+#if JVET_AL0160_SBSMVP
+  m_subSpatialPuMiBuf.create( maxCUWidth );
+#endif
   m_isInitialized = true;
 }
 

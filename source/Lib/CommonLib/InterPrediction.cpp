@@ -767,6 +767,9 @@ void InterPrediction::init( RdCost* pcRdCost, ChromaFormat chromaFormatIDC, cons
   }
 
   m_currChromaFormat = chromaFormatIDC;
+#if JVET_AH0119_SUBBLOCK_TM
+  m_sbMiBuf.create( ctuSize );
+#endif
 #if JVET_AJ0237_INTERNAL_12BIT
   m_dmvrCostLambda = 1 << std::max(0, std::min(14, bitDepth) - 10); // 14 is the maximum possible DMVR internal precision value, 10 is the baseline
 #endif
