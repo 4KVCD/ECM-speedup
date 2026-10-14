@@ -203,6 +203,10 @@ const int DERIVE_TMRL = 131072;
 // a CCLM block with LFNST / NSPT (JVET-AK0064): intra_rec derives their mode from a DIMD of the CU's chroma predictions
 // (Tu::lm's LM_HIST_*; cclmTransformMode), then its residual
 const int DERIVE_CCLM_DIMD = 262144;
+// a block of a CCP merge CU of fusion with DIMD chroma (JVET-AG0059's ccpMergeFusionType 1, its CU's node a
+// CU_CHROMA_DIMD one): intra_rec blends its merge prediction and the prediction of the DIMD chroma mode, each weighed
+// 1, the average rounded
+const int DERIVE_CCP_DIMD = 524288;
 
 // Params::dbgParams per block: the derived dirMode, isModeVer, intraPredAngle, absInvAngle, useCubic, refFilter,
 // applyPDPC, gradPDPC, angularScale, fusion, bf, plIdx, then mtxV, mtxH, secMatrix, secTranspose, secLayout

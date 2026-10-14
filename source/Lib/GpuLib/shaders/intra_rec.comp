@@ -1545,15 +1545,22 @@ void main()
       }
       // a DIMD CU's predictions where its DIMD blends (dimdPrediction), an intra merge CU's alike from its chosen
       // candidate (always), an OBIC CU's: its modes but those not set; a TIMD CU's where its modes blend: its mode, its
-      // secondary mode and its non-angular one (TimdOut; the weight of one not blended 0)
+      // secondary mode and its non-angular one (TimdOut; the weight of one not blended 0); a CCP merge block's of
+      // fusion with DIMD chroma: the merge prediction (no mode), then the DIMD chroma mode's, each weighed 1
       const bool dimdCu  = WITH_DIMD && ( t.derive & DERIVE_DIMD ) != 0, obicCu = WITH_DIMD && ( t.derive & DERIVE_OBIC ) != 0;
       const bool mergeCu = WITH_DIMD && WITH_MERGE && ( t.derive & DERIVE_MERGE ) != 0;
       const bool timdCu  = WITH_TIMD && ( t.derive & DERIVE_TIMD ) != 0;
+      const bool ccpCu   = WITH_CCP_MERGE && WITH_DIMD && ( t.derive & DERIVE_CCP_DIMD ) != 0;
       const int  timdOut = timdCu ? timdPredBase( t.cu ) : 0;
-      if( ( dimdCu || obicCu || mergeCu || timdCu ) && lid < BLEND_MAX )
+      if( ( dimdCu || obicCu || mergeCu || timdCu || ccpCu ) && lid < BLEND_MAX )
       {
         int mode = -1, w = 0, cls = 0;
-        if( timdCu )
+        if( ccpCu )
+        {
+          mode = lid == 1 ? cuModeOf( t.cu ) : -1;
+          w    = lid < 2 ? 1 : 0;
+        }
+        else if( timdCu )
         {
           CBufI32 o = CBufI32( P.timdOut );
           if( lid < 3 && o.v[timdOut + TIMD_OUT_BLENDED] != 0 )
@@ -1580,13 +1587,13 @@ void main()
         s_blendClass[lid] = cls;
         if( lid == 0 )
         {
-          s_blendNum = obicCu ? OBIC_MODES
+          s_blendNum = ccpCu ? 2 : obicCu ? OBIC_MODES
                        : timdCu ? ( CBufI32( P.timdOut ).v[timdOut + TIMD_OUT_BLENDED] != 0 ? 3 : 0 )
                        : mergeCu || CBufI32( P.dimdOut ).v[t.cu * DIMD_OUT + DIMD_OUT_BLENDING] != 0 ? DIMD_FUSION_NUM : 0;
         }
       }
       SYNC();
-      if( dimdCu || obicCu || mergeCu || timdCu )   // (the block's: the same for the whole workgroup)
+      if( dimdCu || obicCu || mergeCu || timdCu || ccpCu )   // (the block's: the same for the whole workgroup)
       {
         if( lid == 0 )
         {
@@ -1689,7 +1696,8 @@ void main()
     // the filtered in s_tmp. A TIMD blend, which can fuse, keeps the unfiltered ones in s_ref[0], its planar
     // predictions read the filtered ones in s_tmp (planarRef)
     const bool timdBlend = WITH_TIMD && ( t.derive & DERIVE_TIMD ) != 0 && s_blendNum != 0;
-    const bool blend     = ( WITH_DIMD && ( t.derive & ( DERIVE_DIMD | DERIVE_OBIC | DERIVE_MERGE ) ) != 0 && s_blendNum != 0 ) || timdBlend;
+    const int  blendCus  = DERIVE_DIMD | DERIVE_OBIC | DERIVE_MERGE | DERIVE_CCP_DIMD;
+    const bool blend     = ( WITH_DIMD && ( t.derive & blendCus ) != 0 && s_blendNum != 0 ) || timdBlend;
     if( t.refFilter != 0 || blend )   // xFilterReferenceSamples (multiRefIdx 0): in place, or for blending beside them
     {
       for( int i = lid; i <= predStride + predHSize; i += NT )
@@ -1817,10 +1825,14 @@ void main()
     // where its slope is fractional (its initPredIntraParams' fusion of a secondary mode) - their filter lengths by the
     // modes blended (timdBlendTaps; a TIMD-SAD blend keeps the default lengths: xPredIntraAng takes numTapsTIMD only
     // without TIMD-SAD)
+    // CCP merge fusion with DIMD chroma (predCCPCandidate's ccpMergeFusionType 1) blends alike: first the merge
+    // prediction (intra_ccp.glsl, with its inside filter), then that of the DIMD chroma mode its node derived, each
+    // weighed 1, averaged with rounding
     g_blendSum  = false;
     g_blendTaps = ( t.derive & DERIVE_DIMD ) != 0;
     const ivec2 timdTaps = timdBlend && !timdSadCu( t.cu ) ? timdBlendTaps( timdPredBase( t.cu ) ) : ivec2( 0, 0 );
     const bool  timdMergeBlend = WITH_TIMD_MERGE && timdBlend && ( t.derive & DERIVE_TIMD_MERGE ) != 0;
+    const bool  ccpDimd = WITH_CCP_MERGE && WITH_DIMD && ( t.derive & DERIVE_CCP_DIMD ) != 0;
     bool blendFirst = true;
     for( int sub = 0; sub < ( blend ? s_blendNum : 1 ); sub++ )
     {
@@ -1855,7 +1867,8 @@ void main()
       {
         for( int i = lid; i < N; i += NT ) emitPred( t, i % W, i / W, mipSample( i % W, i / W, mipPs, mipUpH, mipUpV, predStride ), bf );
       }
-      else if( WITH_CCLM && ( ( t.lm & LM_ACTIVE ) != 0 || ( WITH_CCP_MERGE && t.ccpMerge >= 0 ) ) )
+      else if( WITH_CCLM && !( ccpDimd && sub == 1 )   // (the merge's LM fields stay: its second prediction is angular)
+               && ( ( t.lm & LM_ACTIVE ) != 0 || ( WITH_CCP_MERGE && t.ccpMerge >= 0 ) ) )
       {
         // CCLM, CCCM (intra_cclm.glsl, intra_cccm.glsl): the model(s) from the template, then applied; CCP merge
         // (intra_ccp.glsl): the inherited model applied as the LM block of its type applies its own
@@ -2169,13 +2182,14 @@ void main()
       const bool needClipVer = wVer + rangeVer > clipVer || wVer - rangeVer < 0;
       const bool needClipHor = wHor + rangeHor > clipHor || wHor - rangeHor < 0;
       CBufI32 acc = CBufI32( P.scratch );
+      const int rounding = ccpDimd ? 1 : 0;   // (CCP merge fusion with DIMD chroma: (2 P0 + 2 P1 + 2) >> 2)
       for( int i = lid; i < N; i += NT )
       {
         const int x = i % W, y = i / W, o = int( gl_WorkGroupID.x ) * BLEND_ACC + i;
         int v[3];
         for( int c = 0; c < 3; c++ )
         {
-          v[c] = wt[c] != 0 ? asPel( divTrunc( acc.v[o + c * N], wt[c] ) ) : 0;
+          v[c] = wt[c] != 0 ? asPel( divTrunc( acc.v[o + c * N] + rounding, wt[c] ) ) : 0;
         }
         int pr = v[0];
         if( locDep )
