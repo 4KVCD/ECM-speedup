@@ -424,7 +424,8 @@ the reconstruction buffer; works in every frame-thread context):
   BVG-CCCM; their CUs are still rejected per block. M44 has every LM CU store its model in the form CCP merge inherits
   (the CPU's PredictionUnit::curCand), compared with the CPU's in verification; M45 adds LM chroma fusion CUs' models
   and LBCCP's inside filter flag. M46 is CCP merge: a chroma CU takes the model of a neighbour, of the CTU row's
-  history or a default slope, the one its index selects after the candidates are ranked by their template SADs.
+  history or a default slope, the one its index selects after the candidates are ranked by their template SADs. M47
+  is CCP merge fusion with CCCM: in all-intra streams the merge prediction averaged with a two-model CCCM prediction.
   GpuIntraRec::supported()
   rejects every tool whose mode derivation or prediction reads reconstructed samples or that the kernels lack, before
   anything is skipped. All 19 regular streams now fall back to the CPU at chroma reordering / DBV, the next

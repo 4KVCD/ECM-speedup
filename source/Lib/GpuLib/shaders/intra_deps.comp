@@ -271,14 +271,13 @@ void ccpWriterDeps( int r )
   }
 }
 
-// a dependency of CCP merge block t (intra_ccp.glsl) on the blocks owning the samples its candidates' predictions read
-// - a CCCM block's of any kind (cccmDeps: also CCLM's and GLM's luma, the costs' template, the inside filter's
-// neighbours) - and on the blocks writing the models it reads: its sources' and its CTU row's history's. Each block of
-// the CU ranks the list itself: the Cr block waiting for the Cb block's record would close a cycle where joint CbCr's
-// sign prediction has the Cb block wait for the Cr block (resiFrom), a deadlock
+// a dependency of CCP merge block t (intra_ccp.glsl) on the blocks writing the models it reads: its sources' and its
+// CTU row's history's (the samples its candidates' predictions read are a CCCM block's of any kind: cccmDeps, also
+// CCLM's and GLM's luma, the costs' template, the inside filter's neighbours). Each block of the CU ranks the list
+// itself: the Cr block waiting for the Cb block's record would close a cycle where joint CbCr's sign prediction has
+// the Cb block wait for the Cr block (resiFrom), a deadlock
 void ccpMergeDeps( Tu t )
 {
-  cccmDeps( t );
   BufI32    d = BufI32( P.ccpData );
   const int e = t.ccpMerge;
   for( int s = 0; s < d.v[e + CCP_MERGE_NUM_SPATIAL]; s++ )
@@ -560,7 +559,7 @@ void dependencies( int comp )
   {
     cclmDeps( t );
   }
-  if( ( ( t.lm >> LM_CCCM_SHIFT ) & 3 ) != 0 )
+  if( ( ( t.lm >> LM_CCCM_SHIFT ) & 3 ) != 0 || t.ccpMerge >= 0 )   // (a merge block's candidates: any CCCM kind)
   {
     cccmDeps( t );
   }

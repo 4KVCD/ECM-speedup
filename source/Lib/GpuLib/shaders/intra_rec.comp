@@ -521,7 +521,8 @@ void cflmStore( Tu t, int x, int y, int pr );
 
 // sample (x, y) of the predicted region: reconstructed if it lies in the block (the region of an ISP sub-partition 1
 // or 2 wide is 4 wide; the CPU predicts it once and each sub-partition takes its columns); a block of LM chroma fusion
-// blends its final prediction with the CCCM one, a CFLM block keeps it for its models (cflmPrediction)
+// or CCP merge fusion with CCCM blends its final prediction with the CCCM one, a CFLM block keeps it for its models
+// (cflmPrediction)
 void storeRegion( Tu t, int x, int y, int pr )
 {
   const int bx = x - ( t.x - t.regX );
@@ -1664,9 +1665,9 @@ void main()
       g_crsScale = BufI32( P.lmcs ).v[2 * P.lmcsLutSize + lumaValue];
     }
 
-    // ----- LM chroma fusion (geneChromaFusionPred): of its first type the CCCM prediction it blends in (storeRegion),
-    // into the scratch before the references and the prediction take s_tmp and the angular arrays; of CFLM the area
-    // whose chroma buffer keeps the regular prediction (intra_cccm.glsl)
+    // ----- LM chroma fusion (geneChromaFusionPred): of its first type, and of CCP merge fusion with CCCM, the CCCM
+    // prediction it blends in (storeRegion), into the scratch before the references and the prediction take s_tmp and
+    // the angular arrays; of CFLM the area whose chroma buffer keeps the regular prediction (intra_cccm.glsl)
     if( WITH_CCCM && lmFusionType( t ) == 1 )
     {
       cccmPrediction( t, false, lid, NT );

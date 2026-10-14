@@ -24,11 +24,13 @@
 // LM chroma fusion (JVET-AC0119's first type, geneChromaFusionPred in an intra slice with JVET-AL0191) blends a block
 // of a regular chroma mode with the plain CCCM prediction of two models (MMLM_CHROMA_IDX's: the whole template, no
 // LBCCP), which the block computes first into the scratch (the regular prediction then takes s_tmp and the angular
-// arrays); intra_rec's storeRegion blends each sample (cccmFusionBlend). Its types 2 and 3, CFLM, replace the block's
-// regular prediction by one model or two (LM_CHROMA_IDX's, MMLM_CHROMA_IDX's) of 3 parameters - the downsampled luma,
-// the regular prediction, a bias - fitted by solve1 to the template of CFLM_TEMPLATE lines above / columns left of the
-// block (no corner, no units above-right / below-left), whose regular prediction is the template's prediction by the
-// block's mode from the template block's reference line (intra_timd.glsl's chroma path; cflmPrediction).
+// arrays); intra_rec's storeRegion blends each sample (cccmFusionBlend). CCP merge fusion with CCCM (JVET-AG0059; the
+// SPS's ccpFusionMode 0, all-intra) blends the same CCCM prediction into a merge block's, half and half. LM chroma
+// fusion's types 2 and 3, CFLM, replace the block's regular prediction by one model or two (LM_CHROMA_IDX's,
+// MMLM_CHROMA_IDX's) of 3 parameters - the downsampled luma, the regular prediction, a bias - fitted by solve1 to the
+// template of CFLM_TEMPLATE lines above / columns left of the block (no corner, no units above-right / below-left),
+// whose regular prediction is the template's prediction by the block's mode from the template block's reference line
+// (intra_timd.glsl's chroma path; cflmPrediction).
 //
 // Shared memory, all free while an LM block predicts: one luma buffer in the four angular arrays (s_angA, s_angL; the
 // block clears them again), a larger one or several in the workgroup's CCCM scratch (Params::scratch's CCCM part), the
@@ -243,6 +245,11 @@ int cccmScratchPred()
 {
   return cccmScratchBase() + ( g_cccmSharedLuma ? 0 : cccmNumBuffers() * cccmBufferSize() );
 }
+
+// where LM chroma fusion's CCCM prediction of block t is: at the end of the workgroup's scratch, so that a CCP merge
+// fusion block's own prediction after it (luma buffers and predictions from the scratch's start) leaves it intact
+// (the host allocates room for both)
+int cccmFusionPredBase( Tu t ) { return cccmScratchBase() + P.cccmScratchWords - t.w * t.h; }
 
 // where component comp's prediction of block t begins among the block's: Cb's, then Cr's where it predicts both
 int cccmPredBase( Tu t, int comp ) { return g_cccmBoth ? ( comp - 1 ) * t.w * t.h : 0; }
@@ -1034,11 +1041,14 @@ void cccmPrediction( Tu t, bool both, int lid, int NT )
     g_cccmSet = s_cclm[CCCM_COST + 1] < s_cclm[CCCM_COST] ? 1 : 0;
     SYNC();   // (the prediction overwrites the template predictions)
   }
-  if( lid == 0 && t.ccp >= 0 && ( g_cccmGlmLuma || t.comp == 1 ) )   // (CCP merge's inheritance)
+  // the CU's record for CCP merge's inheritance (a merge fusion block's CU keeps the model it inherits, which
+  // ccpMergePrediction writes)
+  if( lid == 0 && t.ccp >= 0 && t.ccpMerge < 0 && ( g_cccmGlmLuma || t.comp == 1 ) )
   {
     cccmStoreCcp( t, twoModels );
   }
   const bool inTmp = cccmPredInTmp( t );
+  const int  pred  = g_cccmFusion ? cccmFusionPredBase( t ) : cccmScratchPred();
   for( int i = lid; i < ( g_cccmBoth ? 2 : 1 ) * W * H; i += NT )   // (at i: Cb's, then Cr's where both)
   {
     const int j = i % ( W * H ), comp = g_cccmBoth ? 1 + i / ( W * H ) : t.comp;
@@ -1049,7 +1059,7 @@ void cccmPrediction( Tu t, bool both, int lid, int NT )
     }
     else
     {
-      CBufI32( P.scratch ).v[cccmScratchPred() + i] = v;
+      CBufI32( P.scratch ).v[pred + i] = v;
     }
   }
   cccmSync();
@@ -1064,11 +1074,13 @@ int cccmBlockPrediction( Tu t, int x, int y )
 }
 
 // LM chroma fusion's sample (x, y) of block t: its regular prediction pr blended with the CCCM prediction, weighted
-// w0 : 4 - w0 (geneChromaFusionPred: w0 by whether the CUs below-left and above-right are LM CUs, the host's)
+// w0 : 4 - w0 (geneChromaFusionPred: w0 by whether the CUs below-left and above-right are LM CUs, the host's). A CCP
+// merge fusion block's: its merge prediction after the inside filter, w0 2 (applyBlendFusion's average without a
+// blend model, (pr + cccm + 1) >> 1)
 int cccmFusionBlend( Tu t, int x, int y, int pr )
 {
   const int w0 = ( t.lm >> LM_FUSION_W_SHIFT ) & 3;
-  return ( pr * w0 + cccmBlockPrediction( t, x, y ) * ( 4 - w0 ) + 2 ) >> 2;
+  return ( pr * w0 + CBufI32( P.scratch ).v[cccmFusionPredBase( t ) + y * t.w + x] * ( 4 - w0 ) + 2 ) >> 2;
 }
 
 // ----- CFLM (LM chroma fusion's types 2 and 3: xCflmCreateLumaRef, xCflmCreateChromaPred, xCflmCalcModels /

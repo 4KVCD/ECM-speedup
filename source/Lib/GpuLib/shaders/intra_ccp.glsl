@@ -9,12 +9,15 @@
 // may smooth the prediction. Here each block of the merge CU builds the list, ranks it and predicts its component with
 // the chosen model, which the Cb block writes into the CU's record. The host gives the list's sources (Params::ccpData
 // at Tu::ccpMerge: the records of the PUs at the positions, those of the CTU row's history, spare records for each
-// block's defaults; its scheduling waits for the blocks writing them) and rejects merge fusion, merge adjustment and
-// decoder-derived CCP fusion. A candidate predicts like the LM blocks of its type: a CCLM / GLM model as
-// intra_cclm.glsl's (the slots in s_cclm), the others with intra_cccm.glsl's luma buffers and cccmPredict (the CPU's
-// model applied to the CU's own luma, the candidate's luma offset taken in the buffer: xCccmGetLumaVal's luma minus
-// m_cccmLumaOffset plus m_cccmLumaOffset minus the candidate's offset). intra_rec.comp compiles with glslang -Os, whose
-// inlining of every call site brought it near SPIR-V's ID bound: each large function has one call site here.
+// block's defaults; its scheduling waits for the blocks writing them) and rejects merge fusion with DIMD chroma or
+// with a blend model (the SPS's ccpFusionMode 1: not all-intra), merge adjustment and decoder-derived CCP fusion.
+// Merge fusion with CCCM (predCCPCandidate's ccpMergeFusionType 0) is LM chroma fusion's first type with equal
+// weights: the block computes the CCCM prediction before its own and storeRegion averages them (intra_cccm.glsl's
+// cccmFusionBlend). A candidate predicts like the LM blocks of its type: a CCLM / GLM model as intra_cclm.glsl's (the
+// slots in s_cclm), the others with intra_cccm.glsl's luma buffers and cccmPredict (the CPU's model applied to the
+// CU's own luma, the candidate's luma offset taken in the buffer: xCccmGetLumaVal's luma minus m_cccmLumaOffset plus
+// m_cccmLumaOffset minus the candidate's offset). intra_rec.comp compiles with glslang -Os, whose inlining of every
+// call site brought it near SPIR-V's ID bound: each large function has one call site here.
 // Included by intra_rec.comp after intra_cccm.glsl
 #ifndef INTRA_CCP_GLSL
 #define INTRA_CCP_GLSL
@@ -418,9 +421,9 @@ void ccpMergePrediction( inout Tu t, int lid, int NT )
     }
     SYNC();
   }
-  // the chosen model as its LM block's
+  // the chosen model as its LM block's (a merge fusion block's fields kept: storeRegion blends its CCCM prediction)
   const int type = ccpWord( x, CCP_OUT_TYPE );
-  t.lm = inside != 0 ? LM_INSIDE : 0;
+  t.lm = ( t.lm & LM_FUSION_FIELDS ) | ( inside != 0 ? LM_INSIDE : 0 );
   if( ccpLinear( type ) )
   {
     t.dirMode = ( type & CCP_TYPE_MMLM ) != 0 ? MMLM_CHROMA_IDX : LM_CHROMA_IDX;

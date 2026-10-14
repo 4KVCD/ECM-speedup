@@ -99,7 +99,10 @@ const int MMLM_T_IDX      = LM_CHROMA_IDX + 5;
 // A block of LM chroma fusion (JVET-AC0119: not an LM block) has LM_FUSION (a bit beyond every LM field: a CCLM block's
 // other-component field reaches bit 19) and its type (isChromaFusion) in the second slope adjustment's field (it has no
 // slope adjustments): type 1 the template selection 1 of the plain CCCM models it blends in and the weight of its own
-// prediction (1 .. 3 of 4) in the first slope adjustment's field; CFLM's types 2 (one model) and 3 (two) Tu::cflm
+// prediction (1 .. 3 of 4) in the first slope adjustment's field; CFLM's types 2 (one model) and 3 (two) Tu::cflm.
+// A block of CCP merge fusion with CCCM (JVET-AG0059) has type 1's fields with the weight 2, which it keeps while it
+// predicts as the LM block of its model's type (LM_FUSION_FIELDS; the inherited model is applied, so no slope
+// adjustment is read)
 const int LM_DELTA0_SHIFT = 0;
 const int LM_DELTA1_SHIFT = 4;
 const int LM_INSIDE       = 256;
@@ -117,9 +120,10 @@ const int LM_CCCM_GLM_LUMA = 65536;
 const int LM_FUSION       = 1 << 30;
 const int LM_FUSION_W_SHIFT    = 0;   // 2 bits
 const int LM_FUSION_TYPE_SHIFT = 4;   // 2 bits
+const int LM_FUSION_FIELDS = LM_FUSION | ( 3 << LM_FUSION_TYPE_SHIFT ) | ( 3 << LM_FUSION_W_SHIFT );
 
 // the type of a block of LM chroma fusion (PredictionUnit::isChromaFusion: 1 the blend with CCCM, 2 / 3 CFLM of one /
-// two models), 0 for other blocks
+// two models; a CCP merge fusion block's 1), 0 for other blocks
 int lmFusionType( Tu t )
 {
   return ( t.lm & LM_FUSION ) != 0 ? ( t.lm >> LM_FUSION_TYPE_SHIFT ) & 3 : 0;
