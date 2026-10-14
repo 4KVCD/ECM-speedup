@@ -321,7 +321,8 @@ int mergeNode( Cu c, int cuIdx, int bitDepth, bool noPdpc, int lid, int NT )
       }
       s_spCost[MC_NUM_MODES] = uint( n );
     }
-    timdFillReference( h.t, md, c.merge + MERGE_HEAD + 2 * h.nbrNum, c.x, c.y, c.w, c.h, bitDepth, lid, NT );
+    timdFillReference( h.t, md, c.merge + MERGE_HEAD + 2 * h.nbrNum, 0, c.x, c.y, c.w, c.h, TIMD_REF_SHIFT, bitDepth,
+                       lid, NT );
     const int dc = timdDc( h.t, c.w, c.h, lid, NT );
     timdTemplateCosts( c, h.t, MC_MODES, int( s_spCost[MC_NUM_MODES] ), MC_COST, MC_COST, dc, ( 1 << bitDepth ) - 1, noPdpc,
                        false, lid, NT );

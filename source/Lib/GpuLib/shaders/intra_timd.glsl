@@ -26,10 +26,16 @@ const int EXT_VDIA_IDX = 130;
 
 // ----- the reference line
 
-// the availability bits of the reference's units (timdFillReference copies them from the CU's record): at most 2 x
+// the availability bits of the reference's units (timdFillReference copies them from the record): at most 2 x
 // (8 x 132 / 4) + 3 units of 4 for arms of 4 (the host takes CUs up to 128 x 128 only), fewer for TIMD-SAD's arms of 8
-// (intra slices keep its CUs at 1024 samples); the host rejects a template of more (TIMD_UNITS_MAX)
+// (intra slices keep its CUs at 1024 samples) and CFLM's (133 at most); the host rejects a template of more
+// (TIMD_UNITS_MAX)
 shared uint s_timdUnits[17];
+
+// the arms of the template block's reference line: 2^TIMD_REF_SHIFT x its sides (initTimdIntraPatternLuma), CFLM's
+// chroma 2^CFLM_REF_SHIFT x (xCflmCreateChromaPred)
+const int TIMD_REF_SHIFT = 3;
+const int CFLM_REF_SHIFT = 1;
 
 bool timdUnitAvailable( int unit )
 {
@@ -50,34 +56,53 @@ int timdLeftUnit( TemplateUnits t, int i )
   return i <= corner ? c : c - 1 - ( i - corner - 1 ) / t.unitH;
 }
 
-// xFillTimdReferenceSamples' step 2 for template t of CU (cx, cy, W, H), its units' availability bits at flags.v[flagsBase],
-// all invocations (ends with a barrier): the samples of the available units from the reconstruction (in parallel),
-// then the CPU's padding of the others in its order (one invocation: each unit takes the last sample before it);
-// without any unit the mid-level value
-void timdFillReference( TemplateUnits t, BufI32 flags, int flagsBase, int cx, int cy, int W, int H, int bitDepth, int lid, int NT )
+// xFillTimdReferenceSamples' step 2 for template t of block (cx, cy, W, H) of component comp (a CU's luma, CFLM's
+// chroma block), its units' availability bits at flags.v[flagsBase], the arms 2^refShift x the template block's sides
+// (TIMD's 8x, CFLM's 2x), all invocations (ends with a barrier): the samples of the available units from the
+// reconstruction (in parallel), then the CPU's padding of the others in its order (one invocation: each unit takes the
+// last sample before it); without any unit the mid-level value.
+// With some units available the CPU fills the row's units right of the corner unit, predSize / unitW of them rounded up
+// (beside the template's arm too): with an arm as thick as a unit (CFLM's chroma template of 2) the last one reaches
+// past the row (to topEnd), and its samples there land in the column's first entries (the CPU's buffer holds the
+// column right after the row, at predStride = predSize + 1): an available unit's in the fill, which the padding may
+// overwrite, an unavailable one's in its padding, the last write (TIMD's luma units of 4 end with the row)
+void timdFillReference( TemplateUnits t, BufI32 flags, int flagsBase, int comp, int cx, int cy, int W, int H,
+                        int refShift, int bitDepth, int lid, int NT )
 {
-  const int predSize = ( W + t.tw ) << 3, predHSize = ( H + t.th ) << 3;
-  const int x0 = cx - t.tw - 1, y0 = cy - t.th - 1;
+  const int  predSize = ( W + t.tw ) << refShift, predHSize = ( H + t.th ) << refShift;
+  const int  x0 = cx - t.tw - 1, y0 = cy - t.th - 1;
+  const bool partial = t.numIntraNeighbor != 0 && t.numIntraNeighbor != t.totalUnits;
+  const int  rest = ( predSize - t.tw ) % t.unitW;   // the last unit's samples (lastSample): rest, or a whole unit
+  // the last entry of the row the units write: from 1 + tw - aboveTempUnitNum x unitW on (luma's end with the row)
+  const int  topEnd = !WITH_CFLM ? predSize
+                      : t.tw + ( t.totalAboveUnits - 1 ) * t.unitW + ( rest != 0 ? rest : t.unitW );
   if( lid < ( t.totalUnits + 31 ) >> 5 )
   {
     s_timdUnits[lid] = uint( flags.v[flagsBase + lid] );
   }
   SYNC();
-  for( int j = lid; j <= predSize; j += NT )
+  for( int j = lid; j <= ( partial ? max( predSize, topEnd ) : predSize ); j += NT )
   {
     s_ref[0][j] = int16_t( t.numIntraNeighbor == 0 ? 1 << ( bitDepth - 1 )
-                           : timdUnitAvailable( timdTopUnit( t, j ) ) ? recoAt( 0, x0 + j, y0 ) : 0 );
+                           : timdUnitAvailable( timdTopUnit( t, j ) ) ? recoAt( comp, x0 + j, y0 ) : 0 );
   }
   for( int i = lid; i <= predHSize; i += NT )
   {
     s_ref[1][i] = int16_t( t.numIntraNeighbor == 0 ? 1 << ( bitDepth - 1 )
-                           : timdUnitAvailable( timdLeftUnit( t, i ) ) ? recoAt( 0, x0, y0 + i ) : 0 );
+                           : timdUnitAvailable( timdLeftUnit( t, i ) ) ? recoAt( comp, x0, y0 + i ) : 0 );
   }
   SYNC();
-  if( lid == 0 && t.numIntraNeighbor != 0 && t.numIntraNeighbor != t.totalUnits )
+  if( lid == 0 && partial )
   {
     const int c = t.totalLeftUnits + t.leftTempUnitNum, uw = t.unitW, uh = t.unitH;
     const int cornerCol = t.tw - t.aboveTempUnitNum * uw, cornerRow = t.th - t.leftTempUnitNum * uh;
+    if( WITH_CFLM && timdUnitAvailable( t.totalUnits - 1 ) )   // (the fill's samples past the row)
+    {
+      for( int j = predSize + 1; j <= topEnd; j++ )
+      {
+        s_ref[1][j - predSize - 1] = s_ref[0][j];
+      }
+    }
     int lastAvailUnit = 0;
     if( !timdUnitAvailable( 0 ) )   // from the first available sample down to the last below-left one
     {
@@ -144,10 +169,14 @@ void timdFillReference( TemplateUnits t, BufI32 flags, int flagsBase, int cx, in
         }
         else
         {
-          const int rest = ( predSize - t.tw ) % uw, num = unit == t.totalUnits - 1 && rest != 0 ? rest : uw;
+          const int num = unit == t.totalUnits - 1 && rest != 0 ? rest : uw;
           for( int j = lastAvailCol + 1; j <= lastAvailCol + num; j++ )
           {
             s_ref[0][j] = v;
+            if( WITH_CFLM && j > predSize )   // (past the row: the column's first entries)
+            {
+              s_ref[1][j - predSize - 1] = v;
+            }
           }
         }
       }
@@ -159,15 +188,19 @@ void timdFillReference( TemplateUnits t, BufI32 flags, int flagsBase, int cx, in
 
 // ----- the prediction
 
-// initPredTimdIntraParams for a CU of W x H (the angular ones of an angular mode, unused for planar / DC)
+// initPredTimdIntraParams for a CU of W x H (the angular ones of an angular mode, unused for planar / DC); for CFLM's
+// chroma template (chroma: xPredTimdIntraAng with a chroma channel type) initPredIntraParams' of the chroma block, its
+// regular 1/32-sample angles interpolated by two taps (xIntraPredTimdAngChroma) from the arms of its template block's
+// reference line, twice the sides long
 struct TimdParams
 {
   bool isModeVer;
-  int  angle;          // intraPredAngle, 1/64 sample per row
+  int  angle;          // intraPredAngle, 1/64 sample per row (chroma: 1/32)
   int  invAngle;       // absInvAngle
   bool pdpc;           // applyPDPC
   int  angularScale;
   bool gradPdpc;       // useGradPDPC (positive angles)
+  bool chroma;
 };
 
 // IntraPrediction::getWideAngleExt (without SGPM)
@@ -254,7 +287,8 @@ TimdParams timdParams( int dirMode, int W, int H, bool noPdpc, bool checkWA )
       p.gradPdpc     = true;
     }
   }
-  p.pdpc = p.pdpc && !noPdpc;
+  p.pdpc   = p.pdpc && !noPdpc;
+  p.chroma = false;
   return p;
 }
 
@@ -271,6 +305,7 @@ int timdLeft( int k )
 
 // xPredTimdIntraAng's refSide and refMain at index k: negative angles extend refMain below 0 by projecting refSide
 // (the block's sides wT x hT, the template block's), positive ones repeat its last sample beyond the reference length
+// (m_topRefLength / m_leftRefLength: 8 x the template block's side, CFLM's chroma 2 x)
 int timdSide( TimdParams p, int k )
 {
   return p.isModeVer ? timdLeft( k ) : timdTop( k );
@@ -283,7 +318,7 @@ int timdMain( TimdParams p, int k, int wT, int hT )
     const int sizeSide = p.isModeVer ? hT : wT;
     return timdSide( p, min( ( -k * p.invAngle + 256 ) >> 9, sizeSide ) );
   }
-  const int refLength = ( p.isModeVer ? wT : hT ) << 3;
+  const int refLength = ( p.isModeVer ? wT : hT ) << ( WITH_CFLM && p.chroma ? 1 : 3 );
   const int idx = p.angle >= 0 ? min( k, refLength ) : k;
   return p.isModeVer ? timdTop( idx ) : timdLeft( idx );
 }
@@ -318,7 +353,8 @@ int timdDc( TemplateUnits t, int W, int H, int lid, int NT )
 
 // sample (x, y) of the template (the template block's coordinates) predicted with mode (131) of parameters p
 // (predTimdIntraAng: planar / DC with their PDPC, angular - any other mode, also WAIP's wide angles below 0 - with the
-// 1/64 cubic filter and its PDPC kinds, clipped as the CPU clips); dc: timdDc's value
+// 1/64 cubic filter and its PDPC kinds, clipped as the CPU clips; CFLM's chroma template by p's regular angle, the
+// 1/32 two-tap interpolation unclipped); dc: timdDc's value
 int timdPredict( int mode, TimdParams p, int x, int y, int W, int H, int tw, int th, int dc, int maxPel )
 {
   const int wT = W + tw, hT = H + th;
@@ -366,21 +402,27 @@ int timdPredict( int mode, TimdParams p, int x, int y, int W, int H, int tw, int
     }
     return v;
   }
-  const int deltaPos = p.angle * ( yt + 1 ), deltaInt = deltaPos >> 6, frac = deltaPos & 63;
-  if( ( abs( p.angle ) & 63 ) != 0 )   // xIntraPredTimdAngLuma
+  const int fracBits = WITH_CFLM && p.chroma ? 5 : 6, fracMask = ( 1 << fracBits ) - 1;
+  const int deltaPos = p.angle * ( yt + 1 ), deltaInt = deltaPos >> fracBits, frac = deltaPos & fracMask;
+  const int idx      = deltaInt + 1 + xt;
+  if( ( abs( p.angle ) & fracMask ) == 0 )
   {
-    const int idx = deltaInt + 1 + xt;
-    BufI32    f   = BufI32( P.filters );
-    int sum = 128;
+    v = timdMain( p, idx, wT, hT );
+  }
+  else if( WITH_CFLM && p.chroma )   // xIntraPredTimdAngChroma
+  {
+    const int m0 = timdMain( p, idx, wT, hT );
+    v = m0 + ( ( frac * ( timdMain( p, idx + 1, wT, hT ) - m0 ) + 16 ) >> 5 );
+  }
+  else   // xIntraPredTimdAngLuma
+  {
+    BufI32 f   = BufI32( P.filters );
+    int    sum = 128;
     for( int k = 0; k < 4; k++ )
     {
       sum += f.v[EXT_CUBIC + frac * 4 + k] * timdMain( p, idx - 1 + k, wT, hT );
     }
     v = clamp( sum >> 8, 0, maxPel );
-  }
-  else
-  {
-    v = timdMain( p, xt + deltaInt + 1, wT, hT );
   }
   if( !p.pdpc )
   {
@@ -393,7 +435,7 @@ int timdPredict( int mode, TimdParams p, int x, int y, int W, int H, int tw, int
     {
       const int wL      = 32 >> ( ( 2 * ( xt - xOffset ) ) >> scale );
       const int m0      = timdMain( p, deltaInt, wT, hT ), m1 = timdMain( p, deltaInt + 1, wT, hT );
-      const int topLeft = m0 + ( ( frac * ( m1 - m0 ) + 32 ) >> 6 );
+      const int topLeft = m0 + ( ( frac * ( m1 - m0 ) + ( 1 << ( fracBits - 1 ) ) ) >> fracBits );
       v = clamp( v + ( ( wL * ( timdSide( p, 1 + yt ) - topLeft ) + 32 ) >> 6 ), 0, maxPel );
     }
   }
@@ -1205,7 +1247,8 @@ int timdNode( Cu c, int cuIndex, int nbrMode[MPM_NEIGHBOURS], int dimdModes[3], 
   {
     timdMpmCandidates( c, nbrMode, dimdModes, range );
   }
-  timdFillReference( head.t, BufI32( P.timdData ), c.timd + TIMD_HEAD, c.x, c.y, c.w, c.h, bitDepth, lid, NT );
+  timdFillReference( head.t, BufI32( P.timdData ), c.timd + TIMD_HEAD, 0, c.x, c.y, c.w, c.h, TIMD_REF_SHIFT,
+                     bitDepth, lid, NT );
   const int dc       = timdDc( head.t, c.w, c.h, lid, NT );
   const int numCands = int( s_spCost[TC_NUM] );
   timdTemplateCosts( c, head.t, TC_CAND, numCands, TC_COST_A, TC_COST_L, dc, maxPel, noPdpc, false, lid, NT );
@@ -1237,7 +1280,8 @@ int timdNode( Cu c, int cuIndex, int nbrMode[MPM_NEIGHBOURS], int dimdModes[3], 
     }
     SYNC();
     const int unitsAt = c.timd + TIMD_HEAD + ( ( head.t.totalUnits + 31 ) >> 5 );
-    timdFillReference( head.ts, BufI32( P.timdData ), unitsAt, c.x, c.y, c.w, c.h, bitDepth, lid, NT );
+    timdFillReference( head.ts, BufI32( P.timdData ), unitsAt, 0, c.x, c.y, c.w, c.h, TIMD_REF_SHIFT, bitDepth, lid,
+                       NT );
     const int dcSad   = timdDc( head.ts, c.w, c.h, lid, NT );
     const int numSad  = int( s_spCost[TC_NUM] );
     timdTemplateCosts( c, head.ts, TC_CAND, numSad, TC_COST_A, TC_COST_L, dcSad, maxPel, noPdpc, true, lid, NT );
@@ -1343,7 +1387,8 @@ int timdMergeNode( Cu c, int bitDepth, bool noPdpc, out int mtssSecond, int lid,
   const int numCands = int( s_spCost[TC_NUM] );
   if( numCands >= 2 )
   {
-    timdFillReference( head.t, BufI32( P.timdData ), c.timd + TIMD_HEAD, c.x, c.y, c.w, c.h, bitDepth, lid, NT );
+    timdFillReference( head.t, BufI32( P.timdData ), c.timd + TIMD_HEAD, 0, c.x, c.y, c.w, c.h, TIMD_REF_SHIFT,
+                       bitDepth, lid, NT );
     const int dc = timdDc( head.t, c.w, c.h, lid, NT );
     timdTemplateCosts( c, head.t, TC_CAND, numCands, TC_COST_A, TC_COST_L, dc, ( 1 << bitDepth ) - 1, noPdpc, false, lid, NT );
   }

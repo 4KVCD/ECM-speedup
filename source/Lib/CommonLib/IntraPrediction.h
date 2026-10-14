@@ -1399,8 +1399,7 @@ public:
   /// deriveIntraMergeCand's neighbours in its order, for the GPU reconstruction
   static void intraMergeNeighbours( const CodingUnit& cu, std::vector<const CodingUnit*>& nbrs );
 #if JVET_AJ0146_TIMDSAD && JVET_AC0094_REF_SAMPLES_OPT
-  /// the units of the reference line of a luma template (xFillTimdReferenceSamples' layout) and which of them are
-  /// available
+  /// the units of the reference line of a template (xFillTimdReferenceSamples' layout) and which of them are available
   struct TimdReferenceUnits
   {
     int  unitWidth, unitHeight;
@@ -1410,8 +1409,9 @@ public:
     bool flags[4 * ( MAX_NUM_PART_IDXS_IN_CTU_WIDTH << 2 ) + 1];
   };
   /// xFillTimdReferenceSamples' step 1 for a template of tw columns left of area and th rows above it (0: no such arm),
-  /// its block refW x refH, for the GPU reconstruction
-  static void timdReferenceUnits( const CodingUnit& cu, const CompArea& area, int tw, int th, int refW, int refH, TimdReferenceUnits& u );
+  /// the arms of its block's reference line predSize / predHSize long, for the GPU reconstruction
+  static void timdReferenceUnits( const CodingUnit& cu, const CompArea& area, int tw, int th, int predSize,
+                                  int predHSize, TimdReferenceUnits& u );
 #endif
   /// the template cost of each mode reorderIntraMergeCand ranked the candidates of the last CU with (MAX_UINT64: not
   /// a candidate's mode), where it computed costs (m_mergeTmCostValid), for the GPU reconstruction's comparison

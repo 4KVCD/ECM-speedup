@@ -418,7 +418,8 @@ the reconstruction buffer; works in every frame-thread context):
   the luma of two or four filters. M37 is CCCM without subsampling: models of 9 or 11 parameters over the luma
   samples around the chroma sample's co-located one. M38 is CCCM with LFNST / NSPT, whose mode is a DIMD of both
   components' CCCM predictions. M39 is GLM with luma: a CCCM-like model of a gradient pattern's value and the luma.
-  M40 is LM chroma fusion's first type: a regular chroma prediction blended with a CCCM one.
+  M40 is LM chroma fusion's first type: a regular chroma prediction blended with a CCCM one. M41 is CFLM, its types 2
+  and 3: a model of the block's own prediction and the luma, fitted where the template is predicted by the same mode.
   GpuIntraRec::supported()
   rejects every tool whose mode derivation or prediction reads reconstructed samples or that the kernels lack, before
   anything is skipped. All 19 regular streams now fall back to the CPU at cross-component prediction (CCP merge,

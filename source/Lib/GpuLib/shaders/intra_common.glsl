@@ -2,7 +2,7 @@
 #ifndef INTRA_COMMON_GLSL
 #define INTRA_COMMON_GLSL
 
-// one transform block of one component (100 int32, layout shared with GpuIntraRec.cpp)
+// one transform block of one component (101 int32, layout shared with GpuIntraRec.cpp)
 struct Tu
 {
   int comp, x, y, w, h;
@@ -65,6 +65,9 @@ struct Tu
   int secBucket;
   // a CCLM block's mark (dirMode LM_CHROMA_IDX ..; intra_cclm.glsl), slope adjustments and LBCCP filter (LM_* fields)
   int lm;
+  // a CFLM block's template (intra_cccm.glsl's cflmPrediction): its record in Params::timdData, TemplateUnits followed
+  // by its units' availability bits (-1: none)
+  int cflm;
 };
 layout( buffer_reference, std430, buffer_reference_align = 4 ) buffer BufTu { Tu v[]; };
 
@@ -87,9 +90,10 @@ const int MMLM_T_IDX      = LM_CHROMA_IDX + 5;
 // component's kind is the same): GL-CCCM's gradients and locations (JVET-AC0054), several downsampling filters
 // (JVET-AD0202's cccmMultiFilterIdx 1 .. 3), no subsampling (JVET-AC0147's cccmNoSubFlag), GLM with luma (JVET-AB0092:
 // glmIdc 5 .. 8 in the GLM field, the template selection its LM mode's: 1 LM_CHROMA, 2 MDLM_L, 3 MDLM_T).
-// A block of LM chroma fusion (JVET-AC0119's first type: not an LM block) has the template selection 1 of the plain
-// CCCM models it blends in, LM_FUSION (a bit beyond every LM field: a CCLM block's other-component field reaches bit
-// 19) and the weight of its own prediction (1 .. 3 of 4) in the first slope adjustment's field (it has none)
+// A block of LM chroma fusion (JVET-AC0119: not an LM block) has LM_FUSION (a bit beyond every LM field: a CCLM block's
+// other-component field reaches bit 19) and its type (isChromaFusion) in the second slope adjustment's field (it has no
+// slope adjustments): type 1 the template selection 1 of the plain CCCM models it blends in and the weight of its own
+// prediction (1 .. 3 of 4) in the first slope adjustment's field; CFLM's types 2 (one model) and 3 (two) Tu::cflm
 const int LM_DELTA0_SHIFT = 0;
 const int LM_DELTA1_SHIFT = 4;
 const int LM_INSIDE       = 256;
@@ -105,7 +109,18 @@ const int LM_CCCM_MDF_SHIFT = 13;   // 2 bits
 const int LM_CCCM_NOSUB   = 32768;
 const int LM_CCCM_GLM_LUMA = 65536;
 const int LM_FUSION       = 1 << 30;
-const int LM_FUSION_W_SHIFT = 0;    // 2 bits
+const int LM_FUSION_W_SHIFT    = 0;   // 2 bits
+const int LM_FUSION_TYPE_SHIFT = 4;   // 2 bits
+
+// the type of a block of LM chroma fusion (PredictionUnit::isChromaFusion: 1 the blend with CCCM, 2 / 3 CFLM of one /
+// two models), 0 for other blocks
+int lmFusionType( Tu t )
+{
+  return ( t.lm & LM_FUSION ) != 0 ? ( t.lm >> LM_FUSION_TYPE_SHIFT ) & 3 : 0;
+}
+
+// CFLM's template: the lines above / columns left of the block (xCflmGetRefBuf; as many as the picture has)
+const int CFLM_TEMPLATE = 2;
 
 // Tu::derive
 const int DERIVE_NODE     = 32;  // not a block: the derivation of the mode of CU Tu::cu, before the CU's blocks

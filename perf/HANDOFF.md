@@ -13,14 +13,14 @@ wall-clock gains with threads are "the easy baseline". Decoder status: single-th
 (`--GpuLoopFilter=1`: ALF, SAO, BIF, CCSAO, LF-CCCM, offset refinement on Vulkan). The user then asked for **a full
 GPU decoder in Vulkan, optimized until nothing is left** ("The GPU decoder needs to fully decode the frame on the
 GPU"; "Your first Vulkan version is going to be slow. That's OK"). That work is branch `dec-gpurecon`: intra
-reconstruction on the GPU (`--GpuRecon`), tool levels M1-M40 done and verified bit-exact (M19: DIMD, M20: OBIC, M21:
+reconstruction on the GPU (`--GpuRecon`), tool levels M1-M41 done and verified bit-exact (M19: DIMD, M20: OBIC, M21:
 intra merge, M22: the transforms of DIMD CUs, M23: LFNST of MIP, M24: TIMD, M25: OBIC and intra merge with TIMD
 neighbours, M26: TIMD-SAD, M27: OBIC and intra merge with TIMD-SAD neighbours, M28: TIMD merge, M29: TMRL of luma,
 M30: chroma TMRL, M31: CCLM, M32: LFNST / NSPT of CCLM, M33: GLM's gradient patterns, M34: CCCM, M35: GL-CCCM, M36:
 CCCM with several downsampling filters, M37: CCCM without subsampling, M38: CCCM with LFNST / NSPT, M39: GLM with
-luma, M40: LM chroma fusion of CCCM); it is **not yet faster than the CPU decoder** (see section 8) and supports only
-a restricted tool set (all real CTC streams fall back to the CPU, first reason: cross-component prediction - CCP
-merge, decoder-derived CCP fusion, BVG-CCCM).
+luma, M40: LM chroma fusion of CCCM, M41: CFLM); it is **not yet faster than the CPU decoder** (see section 8) and
+supports only a restricted tool set (all real CTC streams fall back to the CPU, first reason: cross-component
+prediction - CCP merge, decoder-derived CCP fusion, BVG-CCCM).
 
 ## 2. The user's rules (follow them exactly)
 
@@ -718,12 +718,41 @@ it. A first version had LM_FUSION at bit 17, inside a CCLM block's field of the 
 (bits 12 .. 19, with LFNST / NSPT): CCLM blocks of LFNST whose other component's second adjustment set that bit took
 the fusion path (the full regression's m38_park720 / four720 differed; the scratch they wrote beyond was unsized).
 Rejected where PU::cccmMultiModeAvail(MMLM, fusion) does not allow the CCCM models (the CPU then blends in the LM
-buffer of a previous block), for a CU of several transform blocks, and CFLM. Test sets (encTest15: encTest14 with ECM_TEST_CHROMA_FUSION_LM_ONLY, the fusion search without CFLM; encTest16
-adds ECM_TEST_PREFER_CHROMA_FUSION, a fusion candidate's RD cost divided by 4): m40 (m37's arguments, chroma fusion
-on: 0 to 8 fusion blocks per CIF picture, all of weight 2, 1 in park720, 28 in four720, of every weight),
-m40f_fore32 / 22 / 37 (fusion preferred: 192 to 292 fusion blocks per stream, every weight, sizes from 2 x 8 to 64 x
-64). Also verified with the shared capacities lowered (896 / 64 samples). GPU time: m40 147.1 ms per picture, m40f
-85.2; the CCCM sets 0.8 to 0.9 % slower (m34 136.1 -> 137.3), the others within 0.9 %.
+buffer of a previous block), for a CU of several transform blocks, and CFLM. Test sets (encTest15: encTest14 with
+ECM_TEST_CHROMA_FUSION_LM_ONLY, the fusion search without CFLM; encTest16 adds ECM_TEST_PREFER_CHROMA_FUSION, a
+fusion candidate's RD cost divided by 4): m40 (m37's arguments, chroma fusion on: 0 to 8 fusion blocks per CIF
+picture, all of weight 2, 1 in park720, 28 in four720, of every weight), m40f_fore32 / 22 / 37 (fusion preferred:
+192 to 292 fusion blocks per stream, every weight, sizes from 2 x 8 to 64 x 64). Also verified with the shared
+capacities lowered (896 / 64 samples). GPU time: m40 147.1 ms per picture, m40f 85.2; the CCCM sets 0.8 to 0.9 %
+slower (m34 136.1 -> 137.3), the others within 0.9 %.
+M41: CFLM, LM chroma fusion's types 2 and 3 (JVET-AC0119's isChromaFusion 2: one model, 3: two split at the
+template luma's mean, xCflmCalcRefAver's PU::getMeanValue): the block's regular prediction (any mode, after PDPC, MRL,
+intra fusion) is replaced by a model of 3 parameters - the downsampled luma minus the luma offset, the regular
+prediction minus the chroma offset, a bias - fitted by solve1 (GLM_MATRIX bits, xSetMinMaxClpRng's clipping) to the
+template of 2 lines above / 2 columns left of the block (those the picture has; no corner, no units above-right /
+below-left), where the regular prediction is the block's mode predicted for the template (xCflmCreateChromaPred:
+xFillTimdReferenceSamples for the template block with arms of twice its sides, predTimdIntraAng's chroma path with
+initPredIntraParams' parameters of the block: the 1/32-sample angles interpolated by two taps, planar, DC and the PDPC
+kinds as TIMD's). The GPU: intra_timd.glsl's template code with TimdParams::chroma and timdFillReference of any
+component and arm length; intra_cccm.glsl's cflmArea before the block's references, storeRegion keeping the regular
+prediction in the area's chroma buffer in the CCCM scratch (cflmStore), cflmPrediction once it is complete (the luma
+buffer like CCCM's, cccmAccumulate / cccmSolve / cccmPredict with g_cccmCflm: the template without its corner, the
+features, solve1). The host records the template's reference units (templateUnits of any block and arm length:
+IntraPrediction::timdReferenceUnits takes the component and the arms' lengths) in Params::timdData at Tu::cflm (a new
+field: Tu is 101 int32) and the fusion type in Tu::lm's bits 4, 5 (LM_FUSION_TYPE_SHIFT; the first type's records
+too). A CPU quirk the GPU reproduces: xFillTimdReferenceSamples' units of the row number predSize / unitW rounded up
+but begin after the corner unit, so with CFLM's arms of 2 and chroma units of 2 the last one writes 2 samples past the
+row, into the column's first entries (the CPU's buffer holds the column right after the row): in the fill where the
+unit is available (a later padding of the corner unit or from the first available unit overwrites them), in its
+padding where it is not (TIMD's luma units of 4 end with the row); the first verification found it (template samples
+next to the corner off by a few, the model's prediction by 1). The CFLM code is in pipelines of its own (WITH_CFLM,
+LmLevel's LEVEL_CFLM): in the CCCM pipelines it slowed the CCCM sets by ~2 %. Rejected: CFLM with cccmNoSubFlag, a
+CU of several transform blocks; LM chroma fusion of either type above 10 bits or with unequal bit depths (the first
+type's check is new). Test sets (encTest16 without ECM_TEST_CHROMA_FUSION_LM_ONLY: the fusion search with every type):
+m41 (m40's arguments: 2 to 92 CFLM blocks per stream, both types), m41f_fore32 / 22 / 37 (ECM_TEST_PREFER_CHROMA_FUSION
+too: 84 to 186 CFLM blocks per stream, every kind of mode, templates of both arms and of one, sizes 2 x 8 to 64 x 64).
+Also verified with the shared capacities lowered (896 / 64 samples). GPU time: m41 148.1 ms per picture, m41f 87.0;
+the other sets within 0.6 %.
 
 ## 8. Numbers (i7-10700 8C/16T, Win11, GCC 16.2, RTX 3070 driver 616.92)
 
@@ -759,9 +788,9 @@ Profile of a GPU-on decode (non-LTO, m2_park16, share of all samples): parsing ~
    GLM's gradient patterns (the m33 set, m33l_fore32 / 22 / 37, m33a_fore22, m33c_fore22), M34 CCCM (the m34 set,
    m34a_fore22, m34c_fore22), M35 GL-CCCM (the m35 set), M36 CCCM with several downsampling filters (the m36 set),
    M37 CCCM without subsampling (the m37 set, m37a_fore22, m37c_fore22), M38 CCCM with LFNST / NSPT (the m38 set),
-   M39 GLM with luma (the m39 set, m39a_fore22, m39c_fore22), M40 LM chroma fusion of CCCM (the m40 and m40f sets).
-   All 19 regular streams now stop at "cross-component prediction" (the next sequence-level check: CCP merge,
-   decoder-derived CCP fusion, BVG-CCCM; the block-level tools of step 4 follow).
+   M39 GLM with luma (the m39 set, m39a_fore22, m39c_fore22), M40 LM chroma fusion of CCCM (the m40 and m40f sets),
+   M41 CFLM (the m41 and m41f sets). All 19 regular streams now stop at "cross-component prediction" (the next
+   sequence-level check: CCP merge, decoder-derived CCP fusion, BVG-CCCM; the block-level tools of step 4 follow).
 3. Make the GPU path win on CPU time per picture: the derive-only pass (record during parsing or a leaner pass;
    speed up getSpatialIpm/getPURestricted, which also helps the CPU decoder), GPU behaviour with frame threads
    (8 contexts x 32 persistent workgroups oversubscribe the GPU; spinning workgroups; try fewer groups per context,
@@ -792,11 +821,12 @@ Profile of a GPU-on decode (non-LTO, m2_park16, share of all samples): parsing ~
    downsampling-filter switches of ECM_TEST_CCCM_PLAIN alone: GL-CCCM stays; m36: none of them; m37: none, with
    `--CCCM=2`; m38: m37's with LFNST / NSPT; m39: m33's arguments without ECM_TEST_GLM_GRADIENT_ONLY); `bin\encTest15`
    (m40) adds ECM_TEST_CHROMA_FUSION_LM_ONLY (the chroma fusion search's `uiFusionModeNum` 1: no CFLM) and
-   `bin\encTest16` (m40f) ECM_TEST_PREFER_CHROMA_FUSION (a fusion candidate's RD cost divided by 4). The user's order
-   (2026-10-13): all intra first, then inter. Next GLM with luma with LFNST / NSPT, CFLM and the other
-   cross-component tools, chroma reordering / DBV, BVG-DIMD, MDIP / MPM sorting, IntraTMP / IBC, EIP / SGPM, PDP, NN
-   intra, implicit MTS (not in CTC; its test set, the m24 arguments with `--MTS=0 --MTSImplicit=1`, is encoded:
-   `streams_gpu\pending\imts_*`), deblocking on the GPU, then inter pictures.
+   `bin\encTest16` (m40f) ECM_TEST_PREFER_CHROMA_FUSION (a fusion candidate's RD cost divided by 4; m41 / m41f: its
+   search with every type, without ECM_TEST_CHROMA_FUSION_LM_ONLY). The user's order (2026-10-13): all intra first,
+   then inter. Next GLM with luma with LFNST / NSPT and the other cross-component tools, chroma reordering / DBV,
+   BVG-DIMD, MDIP / MPM sorting, IntraTMP / IBC, EIP / SGPM, PDP, NN intra, implicit MTS (not in CTC; its test set,
+   the m24 arguments with `--MTS=0 --MTSImplicit=1`, is encoded: `streams_gpu\pending\imts_*`), deblocking on the GPU,
+   then inter pictures.
    Intra merge's GPU time (m19: park720 152, four720 183 ms per picture, from 347 / 392 at first) has room: the
    candidate walk and the reference padding are single-invocation steps on the dependency chain. Each level: new
    test set with exactly that tool on, verify mode identical, ON mode identical (and `ECM_GPU_DUMP` +

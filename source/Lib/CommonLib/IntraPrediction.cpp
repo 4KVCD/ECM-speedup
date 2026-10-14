@@ -12042,18 +12042,20 @@ void IntraPrediction::initTimdIntraPatternLuma(const CodingUnit &cu, const CompA
 }
 
 #if JVET_AJ0146_TIMDSAD && JVET_AC0094_REF_SAMPLES_OPT && JVET_AG0146_DIMD_ITMP_IBC && JVET_AM0074_INTRA_MERGE
-// xFillTimdReferenceSamples' step 1 for a luma template of tw columns left of area and th rows above it (0: no such
-// arm; keep in step with it): the units of the reference line of the template's block, refW x refH (area extended by
-// the arms), and which are available, for the GPU reconstruction
-void IntraPrediction::timdReferenceUnits( const CodingUnit& cu, const CompArea& area, int tw, int th, int refW, int refH, TimdReferenceUnits& u )
+// xFillTimdReferenceSamples' step 1 for a template of tw columns left of area and th rows above it (0: no such arm;
+// keep in step with it): the units of the reference line of the template's block (area extended by the arms), whose
+// arms are predSize / predHSize samples long (m_topRefLength / m_leftRefLength), and which are available, for the GPU
+// reconstruction. (Its luma templates are never of ISP CUs, whose sub-partitions 1 or 2 wide take units of their own)
+void IntraPrediction::timdReferenceUnits( const CodingUnit& cu, const CompArea& area, int tw, int th, int predSize,
+                                          int predHSize, TimdReferenceUnits& u )
 {
   const CodingStructure& cs  = *cu.cs;
   const PreCalcValues&   pcv = *cs.pcv;
-  const ChannelType   chType = CHANNEL_TYPE_LUMA;
-  const int predSize  = refW << 3;   // initTimdIntraPatternLuma's m_topRefLength, m_leftRefLength
-  const int predHSize = refH << 3;
-  u.unitWidth        = pcv.minCUWidth;
-  u.unitHeight       = pcv.minCUHeight;
+  const ChannelType   chType = toChannelType( area.compID );
+  const ChromaFormat  format = cs.sps->getChromaFormatIdc();
+  const bool         noShift = pcv.noChroma2x2 && area.width == 4;   // (xFillTimdReferenceSamples' units)
+  u.unitWidth        = pcv.minCUWidth >> ( noShift ? 0 : getComponentScaleX( area.compID, format ) );
+  u.unitHeight       = pcv.minCUHeight >> ( noShift ? 0 : getComponentScaleY( area.compID, format ) );
   u.leftTempUnitNum  = th >= 4 ? th / u.unitHeight : 0;
   u.aboveTempUnitNum = tw >= 4 ? tw / u.unitWidth : 0;
   u.totalAboveUnits  = ( predSize + ( u.unitWidth - 1 ) ) / u.unitWidth - u.aboveTempUnitNum;

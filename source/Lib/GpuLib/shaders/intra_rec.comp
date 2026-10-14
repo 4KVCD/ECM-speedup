@@ -42,6 +42,7 @@ layout( constant_id = 5 ) const bool WITH_TIMD_MERGE = false;          // TIMD m
 layout( constant_id = 6 ) const bool WITH_TMRL = false;                // TMRL CUs (with TIMD merge)
 layout( constant_id = 7 ) const bool WITH_CCLM = false;                // CCLM blocks (with any of the above: ~30 % without DIMD)
 layout( constant_id = 8 ) const bool WITH_CCCM = false;                // CCCM blocks (with CCLM)
+layout( constant_id = 9 ) const bool WITH_CFLM = false;                // CFLM blocks (with CCCM: ~2 % for CCCM's)
 // the template costs of arms one sample thick (TIMD merge's and TMRL's templates: their SATD kernels)
 const bool WITH_THIN_TEMPLATES = WITH_TIMD_MERGE || WITH_TMRL;
 
@@ -514,17 +515,26 @@ void storeRecon( Tu t, int x, int y, int pr )
   reconstruct( t, x, y, pr, re );
 }
 
-int cccmFusionBlend( Tu t, int x, int y, int pr );   // (intra_cccm.glsl)
+int  cccmFusionBlend( Tu t, int x, int y, int pr );   // (intra_cccm.glsl)
+void cflmStore( Tu t, int x, int y, int pr );
 
 // sample (x, y) of the predicted region: reconstructed if it lies in the block (the region of an ISP sub-partition 1
 // or 2 wide is 4 wide; the CPU predicts it once and each sub-partition takes its columns); a block of LM chroma fusion
-// blends its final prediction with the CCCM one
+// blends its final prediction with the CCCM one, a CFLM block keeps it for its models (cflmPrediction)
 void storeRegion( Tu t, int x, int y, int pr )
 {
   const int bx = x - ( t.x - t.regX );
   if( bx >= 0 && bx < t.w )
   {
-    storeRecon( t, bx, y, WITH_CCCM && ( t.lm & LM_FUSION ) != 0 ? cccmFusionBlend( t, bx, y, pr ) : pr );
+    const int fusion = WITH_CCCM ? lmFusionType( t ) : 0;
+    if( WITH_CFLM && fusion > 1 )
+    {
+      cflmStore( t, bx, y, pr );
+    }
+    else
+    {
+      storeRecon( t, bx, y, fusion == 1 ? cccmFusionBlend( t, bx, y, pr ) : pr );
+    }
   }
 }
 
@@ -1652,11 +1662,16 @@ void main()
       g_crsScale = BufI32( P.lmcs ).v[2 * P.lmcsLutSize + lumaValue];
     }
 
-    // ----- LM chroma fusion (geneChromaFusionPred's first type): the CCCM prediction it blends in (storeRegion), into
-    // the scratch before the references and the prediction take s_tmp and the angular arrays (intra_cccm.glsl)
-    if( WITH_CCCM && ( t.lm & LM_FUSION ) != 0 )
+    // ----- LM chroma fusion (geneChromaFusionPred): of its first type the CCCM prediction it blends in (storeRegion),
+    // into the scratch before the references and the prediction take s_tmp and the angular arrays; of CFLM the area
+    // whose chroma buffer keeps the regular prediction (intra_cccm.glsl)
+    if( WITH_CCCM && lmFusionType( t ) == 1 )
     {
       cccmPrediction( t, false, lid, NT );
+    }
+    else if( WITH_CFLM && lmFusionType( t ) > 1 )
+    {
+      cflmArea( t, lid );
     }
 
     // ----- reference samples (and the second line of intra fusion)
@@ -2284,6 +2299,15 @@ void main()
           storeRegion( t, i % W, i / W, lmcsBf ? fwdLut( pr ) : pr );
         }
       }
+    }
+    // ----- CFLM (geneChromaFusionPred's types 2 and 3): the block's prediction by its models from its regular one,
+    // complete in the chroma buffer, and the luma (intra_cccm.glsl; its luma buffer in the angular arrays, cleared at
+    // the end, or the scratch)
+    if( WITH_CFLM && lmFusionType( t ) > 1 )
+    {
+      cflmPrediction( t, lid, NT );
+      angClear  = max( angClear, g_cccmSharedLuma ? ( cccmBufferSize() + 3 ) >> 2 : 0 );
+      angClear2 = angClear2 || g_cccmSharedLuma;
     }
     if( t.spCoded >= 0 )   // the prediction is complete: decide the signs, reconstruct
     {

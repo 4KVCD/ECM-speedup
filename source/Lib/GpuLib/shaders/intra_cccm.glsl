@@ -24,14 +24,20 @@
 // LM chroma fusion (JVET-AC0119's first type, geneChromaFusionPred in an intra slice with JVET-AL0191) blends a block
 // of a regular chroma mode with the plain CCCM prediction of two models (MMLM_CHROMA_IDX's: the whole template, no
 // LBCCP), which the block computes first into the scratch (the regular prediction then takes s_tmp and the angular
-// arrays); intra_rec's storeRegion blends each sample (cccmFusionBlend).
+// arrays); intra_rec's storeRegion blends each sample (cccmFusionBlend). Its types 2 and 3, CFLM, replace the block's
+// regular prediction by one model or two (LM_CHROMA_IDX's, MMLM_CHROMA_IDX's) of 3 parameters - the downsampled luma,
+// the regular prediction, a bias - fitted by solve1 to the template of CFLM_TEMPLATE lines above / columns left of the
+// block (no corner, no units above-right / below-left), whose regular prediction is the template's prediction by the
+// block's mode from the template block's reference line (intra_timd.glsl's chroma path; cflmPrediction).
 //
 // Shared memory, all free while an LM block predicts: one luma buffer in the four angular arrays (s_angA, s_angL; the
 // block clears them again), a larger one or several in the workgroup's CCCM scratch (Params::scratch's CCCM part), the
 // models (64-bit parameters as two words) and the pivot row in sign prediction's costs (s_spCost), the scalars in
 // s_cclm after CCLM's availability; in s_tmp the sums of a model (64-bit, as four words) and its eliminated matrix,
 // then the template predictions of the costs, then the block's prediction (in the scratch where it does not fit; with
-// LFNST / NSPT both components', which their mode's DIMD reads: intra_cclm.glsl's cclmTransformMode)
+// LFNST / NSPT both components', which their mode's DIMD reads: intra_cclm.glsl's cclmTransformMode). CFLM's alike once
+// its regular prediction is complete, the template block's reference line in s_ref, its chroma predictions (the
+// template's and the block's regular one) in the scratch
 #ifndef INTRA_CCCM_GLSL
 #define INTRA_CCCM_GLSL
 
@@ -109,6 +115,8 @@ bool g_cccmNoSub;        // CCCM without subsampling (cccmNoSubFlag): the luma b
 bool g_cccmBoth;         // the block predicts both chroma components (cccmPrediction's `both`)
 bool g_cccmGlmLuma;      // GLM with luma (glmIdc 5 .. 8): the model of a gradient pattern's value and the luma
 bool g_cccmFusion;       // LM chroma fusion's CCCM prediction (luma buffer and prediction in the scratch)
+bool g_cccmCflm;         // CFLM's models (the features, the template without its corner, solve1; WITH_CFLM only)
+int  g_cflmComp;         // its block's component (both right-hand sides its chroma)
 int  g_cccmGlmPattern;   // its gradient pattern (1 .. NUM_GLM_PATTERN)
 int  g_cccmShift;        // log2 of the luma buffer's samples per chroma sample and direction (1 without subsampling)
 int  g_cccmParams;       // the model's parameters
@@ -426,12 +434,15 @@ ivec4 cccmTemplate( Tu t, bool twoLines )
   return ivec4( x0, y0, x1, y1 );
 }
 
-// the template's samples numbered: the part of rows above the block (rows y0 .. sizeY - 1, columns x0 .. x1 - 1) first,
-// then the part of rows beside it (columns x0 .. sizeX - 1); their counts, and the position of sample s
+// the template's samples numbered: the part of rows above the block (rows y0 .. sizeY - 1, columns x0 .. x1 - 1;
+// CFLM's without the corner, from column sizeX on: xCflmCalcModels) first, then the part of rows beside it (columns
+// x0 .. sizeX - 1); their counts, and the position of sample s
+int cccmAboveX0( ivec4 r ) { return WITH_CFLM && g_cccmCflm ? max( r.x, g_cccmSizeX ) : r.x; }
+
 ivec2 cccmTemplateCounts( ivec4 r )
 {
   const int sx = g_cccmSizeX, sy = g_cccmSizeY;
-  return ivec2( max( 0, min( r.w, sy ) - r.y ) * max( 0, r.z - r.x ),
+  return ivec2( max( 0, min( r.w, sy ) - r.y ) * max( 0, r.z - cccmAboveX0( r ) ),
                 max( 0, r.w - max( r.y, sy ) ) * max( 0, min( r.z, sx ) - r.x ) );
 }
 
@@ -439,8 +450,8 @@ ivec2 cccmTemplateSample( ivec4 r, ivec2 counts, int s )
 {
   if( s < counts.x )
   {
-    const int w = r.z - r.x;
-    return ivec2( r.x + s % w, r.y + s / w );
+    const int x0 = cccmAboveX0( r ), w = r.z - x0;
+    return ivec2( x0 + s % w, r.y + s / w );
   }
   const int w = min( r.z, g_cccmSizeX ) - r.x;
   s -= counts.x;
@@ -512,18 +523,25 @@ int cccmNoSubFeature( int f, int x, int y, int bitDepth )
 // - without subsampling: the luma taps around the co-located luma sample (cccmNoSubFeature), their nonlinear terms,
 //   the bias
 // - GLM with luma: the gradient pattern's value (buffer 1), the sample, the bias
+// - CFLM: the sample, the chroma prediction (cflmChroma), the bias; both chroma features its block's component's
 // Each below 2^15 in magnitude up to 10 bits (the nonlinear terms of the filters' gradients the largest): their
 // products fit 32 bits
+int cflmChroma( int x, int y );
+
 int cccmFeature( int f, int x, int y, int c, int bitDepth )
 {
   const int M = g_cccmParams;
   if( f >= M )
   {
-    return recoAt( 1 + f - M, g_cccmRefX + x, g_cccmRefY + y );
+    return recoAt( WITH_CFLM && g_cccmCflm ? g_cflmComp : 1 + f - M, g_cccmRefX + x, g_cccmRefY + y );
   }
   if( f == M - 1 )
   {
     return 1 << ( bitDepth - 1 );
+  }
+  if( WITH_CFLM && g_cccmCflm )
+  {
+    return f == 0 ? c : cflmChroma( x, y );
   }
   if( g_cccmGlmLuma )
   {
@@ -673,9 +691,9 @@ int cccmCeilLog2( int n )   // n > 0
 // over the samples, regularized, eliminated, then substituted back (invocation 0 Cb's, 1 Cr's), the chroma offset added
 // to the bias; without samples clearModel's model (a bias of 1). Then its clipping ranges (xSetMinMaxClpRng: none where
 // the template's chroma is flat, else its range widened by a margin for blocks under 32 samples and to the minimum span
-// of the CTU size, none for models above 7 parameters with a CTU of 256). GLM with luma's is solve1's (its matrix to
-// GLM_MATRIX bits; gaussElimination solves each right-hand side alone, so its component's model is solve2's), clipped
-// to the sample range alone. All invocations, ending with a barrier
+// of the CTU size, none for models above 7 parameters with a CTU of 256). GLM with luma's and CFLM's are solve1's (the
+// matrix to GLM_MATRIX bits; gaussElimination solves each right-hand side alone, so the component's model is solve2's),
+// GLM with luma's clipped to the sample range alone. All invocations, ending with a barrier
 void cccmSolve( Tu t, int k, int lid )
 {
   const int M = g_cccmParams, triangle = M * ( M + 1 ) >> 1, bitDepth = t.bitDepth, maxPel = ( 1 << bitDepth ) - 1;
@@ -706,7 +724,8 @@ void cccmSolve( Tu t, int k, int lid )
     const int64_t bias = cccmSum( cccmEntryIndex( lid, M - 1, M ) );
     a[M]     = cccmSum( triangle + lid ) - ( ( bias * int64_t( offCb ) ) >> ( bitDepth - 1 ) );
     a[M + 1] = cccmSum( triangle + M + lid ) - ( ( bias * int64_t( offCr ) ) >> ( bitDepth - 1 ) );
-    const int shift = ( g_cccmGlmLuma ? GLM_MATRIX : CCCM_MATRIX ) - 2 * bitDepth - cccmCeilLog2( n );
+    const int shift = ( g_cccmGlmLuma || ( WITH_CFLM && g_cccmCflm ) ? GLM_MATRIX : CCCM_MATRIX ) - 2 * bitDepth
+                      - cccmCeilLog2( n );
     for( int j = 0; j < M + 2; j++ )
     {
       a[j] = shift > 0 ? a[j] << shift : a[j] >> -shift;
@@ -884,7 +903,8 @@ void cccmPrediction( Tu t, bool both, int lid, int NT )
   g_cccmNoSub      = ( t.lm & LM_CCCM_NOSUB ) != 0;
   g_cccmGlmLuma    = ( t.lm & LM_CCCM_GLM_LUMA ) != 0;
   g_cccmGlmPattern = ( ( t.lm >> LM_GLM_SHIFT ) & 15 ) - NUM_GLM_PATTERN;
-  g_cccmFusion     = ( t.lm & LM_FUSION ) != 0;
+  g_cccmFusion     = lmFusionType( t ) == 1;
+  g_cccmCflm       = false;
   g_cccmShift      = g_cccmNoSub ? 1 : 0;
   g_cccmParams     = g_cccmGlmLuma ? GLM_PARAMS
                    : g_cccmNoSub ? ( P.cclmFilter == CCLM_FILTER_AVERAGE ? 9 : 11 )
@@ -977,6 +997,141 @@ int cccmFusionBlend( Tu t, int x, int y, int pr )
 {
   const int w0 = ( t.lm >> LM_FUSION_W_SHIFT ) & 3;
   return ( pr * w0 + cccmBlockPrediction( t, x, y ) * ( 4 - w0 ) + 2 ) >> 2;
+}
+
+// ----- CFLM (LM chroma fusion's types 2 and 3: xCflmCreateLumaRef, xCflmCreateChromaPred, xCflmCalcModels /
+// xCflmApplyModel, xCflmCalcRefAver)
+
+const int CFLM_PARAMS = 3;   // CFLM_NUM_PARAMS
+
+// the reference area of CFLM block t and CCCM's globals for its models (all invocations, ending with a barrier), before
+// its regular prediction, which storeRegion keeps in the area's chroma buffer (cflmStore): the block with the
+// CFLM_TEMPLATE lines above / columns left of it the picture has (xCflmGetRefBuf: no units above-right / below-left),
+// the luma offset (xCccmSetLumaRefValue) and the chroma offset (xCflmCreateChromaPred's chromaOffset: the chroma sample
+// above-left of the block, moved into the picture at its left / top edge, without any template the mid level; both
+// right-hand sides' offset, the block's component)
+void cflmArea( Tu t, int lid )
+{
+  if( lid == 0 )
+  {
+    const int sizeX = min( t.x, CFLM_TEMPLATE ), sizeY = min( t.y, CFLM_TEMPLATE );
+    s_cclm[CCCM_REF_X]  = t.x - sizeX;
+    s_cclm[CCCM_REF_Y]  = t.y - sizeY;
+    s_cclm[CCCM_AREA_W] = sizeX + t.w;
+    s_cclm[CCCM_AREA_H] = sizeY + t.h;
+    s_cclm[CCCM_SIZE_X] = sizeX;
+    s_cclm[CCCM_SIZE_Y] = sizeY;
+    const int mid = 1 << ( t.bitDepth - 1 ), lx = t.x << 1, ly = t.y << 1;
+    s_cclm[CCCM_LUMA_OFFSET] = lx != 0 || ly != 0 ? recoAt( 0, max( lx - 1, 0 ), max( ly - 1, 0 ) ) : mid;
+    const int offset = sizeX != 0 || sizeY != 0 ? recoAt( t.comp, max( t.x - 1, 0 ), max( t.y - 1, 0 ) ) : mid;
+    s_cclm[CCCM_CHROMA_OFFSET]     = offset;
+    s_cclm[CCCM_CHROMA_OFFSET + 1] = offset;
+  }
+  g_cccmCflm    = true;
+  g_cflmComp    = t.comp;
+  g_cccmBoth    = false;
+  g_cccmGl      = false;
+  g_cccmMdf     = 0;
+  g_cccmNoSub   = false;
+  g_cccmGlmLuma = false;
+  g_cccmFusion  = false;
+  g_cccmShift   = 0;
+  g_cccmParams  = CFLM_PARAMS;
+  g_cccmSet     = 0;
+  SYNC();
+  cccmLoadArea();
+}
+
+// the chroma buffer of CFLM's area (rows of areaW in the scratch after the luma buffer, if that is there too): the
+// template's prediction and the block's regular one
+int cflmChromaIndex( int x, int y ) { return cccmScratchPred() + y * g_cccmAreaW + x; }
+
+// sample (x, y) of block t's regular prediction (storeRegion's: after PDPC, MRL and intra fusion), kept for its models
+void cflmStore( Tu t, int x, int y, int pr )
+{
+  CBufI32( P.scratch ).v[cflmChromaIndex( g_cccmSizeX + x, g_cccmSizeY + y )] = pr;
+}
+
+// the chroma feature at (x, y) of the area: its prediction minus the chroma offset
+int cflmChroma( int x, int y )
+{
+  return CBufI32( P.scratch ).v[cflmChromaIndex( x, y )] - s_cclm[CCCM_CHROMA_OFFSET];
+}
+
+// CFLM block t's prediction from its regular one in the chroma buffer (visible to the workgroup), reconstructed (all
+// invocations; cflmArea before): the template's prediction by the block's mode (xCflmCreateChromaPred: the template
+// block's reference line - xFillTimdReferenceSamples' units of the record at Tu::cflm, arms twice its sides - and
+// predTimdIntraAng with initPredIntraParams' parameters of the block: intra_timd.glsl's chroma path), the area's luma
+// but the corner's (xCflmCreateLumaRef: the downsampled luma minus the luma offset; in the angular arrays where it
+// fits, which the block clears again, else in the scratch), with two models their threshold (xCflmCalcRefAver: the
+// template's luma mean by PU::getMeanValue, without a template the mid level), the models (solve1 of the luma, the
+// chroma prediction and the bias against the template's chroma; xSetMinMaxClpRng's clipping) and the block's samples
+// (xCflmApplyModel)
+void cflmPrediction( Tu t, int lid, int NT )
+{
+  const int  W = t.w, H = t.h, sx = g_cccmSizeX, sy = g_cccmSizeY, bitDepth = t.bitDepth;
+  const bool twoModels = lmFusionType( t ) == 3;   // (MMLM_CHROMA_IDX's)
+  if( lid >= 2 && lid < 6 )   // (the slots of wgSum2's calls)
+  {
+    s_red[lid] = 0;
+  }
+  if( sx > 0 || sy > 0 )
+  {
+    const TemplateUnits u = templateUnitsAt( BufI32( P.timdData ), t.cflm );
+    timdFillReference( u, BufI32( P.timdData ), t.cflm + TEMPLATE_UNITS, t.comp, t.x, t.y, W, H, CFLM_REF_SHIFT,
+                       bitDepth, lid, NT );
+    const int  dc = t.dirMode == DC_IDX ? timdDc( u, W, H, lid, NT ) : 0;
+    TimdParams p;
+    p.isModeVer    = t.isModeVer != 0;
+    p.angle        = t.intraPredAngle;
+    p.invAngle     = t.absInvAngle;
+    p.pdpc         = t.applyPDPC != 0;
+    p.angularScale = t.angularScale;
+    p.gradPdpc     = false;   // (initPredIntraParams' gradient PDPC is luma's)
+    p.chroma       = true;
+    // the part above the block (sy rows of W), then the part left of it (H rows of sx)
+    for( int i = lid; i < sy * W + H * sx; i += NT )
+    {
+      const bool above = i < sy * W;
+      const int  x = above ? sx + i % W : ( i - sy * W ) % sx, y = above ? i / W : sy + ( i - sy * W ) / sx;
+      CBufI32( P.scratch ).v[cflmChromaIndex( x, y )] = timdPredict( t.dirMode, p, x, y, W, H, sx, sy, dc,
+                                                                      ( 1 << bitDepth ) - 1 );
+    }
+  }
+  for( int i = lid; i < g_cccmAreaW * g_cccmAreaH; i += NT )
+  {
+    const int x = i % g_cccmAreaW, y = i / g_cccmAreaW;
+    if( x >= sx || y >= sy )
+    {
+      cccmSetLuma( 0, x, y, cccmFetch( x, y, 0 ) );
+    }
+  }
+  cccmSync();
+  if( twoModels )
+  {
+    const ivec4 r = cccmTemplate( t, false );
+    const ivec2 counts = cccmTemplateCounts( r );
+    int sum = 0;
+    for( int i = lid; i < counts.x + counts.y; i += NT )
+    {
+      const ivec2 q = cccmTemplateSample( r, counts, i );
+      sum += cccmColocated( q.x, q.y );
+    }
+    const int num = counts.x + counts.y, total = wgSum2( sum, 0, 2 ).x;
+    if( lid == 0 )
+    {
+      s_cclm[CCCM_THRESHOLD] = num == 0 ? 1 << ( bitDepth - 1 ) : cclmMean( total + ( num >> 1 ), num );
+    }
+  }
+  for( int k = 0; k < ( twoModels ? 2 : 1 ); k++ )
+  {
+    cccmAccumulate( t, k, twoModels, lid, NT );
+    cccmSolve( t, k, lid );
+  }
+  for( int i = lid; i < W * H; i += NT )
+  {
+    storeRecon( t, i % W, i / W, cccmPredict( 0, 0, sx + i % W, sy + i / W, twoModels, bitDepth ) );
+  }
 }
 
 #endif

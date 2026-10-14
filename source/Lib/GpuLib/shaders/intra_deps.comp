@@ -243,6 +243,25 @@ void cccmDeps( Tu t )
   addAreaDeps( 0, 2 * ( t.x - sx - 1 ) - 1, 2 * ( t.y - sy - 1 ) - 1, 2 * ( x1 + 1 ) + 1, 2 * ( y1 + 1 ) + 1 );
 }
 
+// a dependency of CFLM block t (intra_cccm.glsl's cflmPrediction) on the blocks owning the samples it reads: of its
+// component the reference line of the template's block (arms of twice its sides, the row's last unit up to sx samples
+// beyond: intra_timd.glsl's timdFillReference) and the template with the corner (the chroma offset's sample;
+// CFLM_TEMPLATE lines above / columns left of the block, those the picture has), of luma the area's downsampling (with
+// the luma offset's sample)
+void cflmDeps( Tu t )
+{
+  const int sx = min( t.x, CFLM_TEMPLATE ), sy = min( t.y, CFLM_TEMPLATE );
+  if( sx > 0 || sy > 0 )
+  {
+    const int x0 = t.x - sx - 1, y0 = t.y - sy - 1;
+    addAreaDeps( t.comp, x0, y0, x0 + 2 * ( t.w + sx ) + sx, y0 );
+    addAreaDeps( t.comp, x0, y0, x0, y0 + 2 * ( t.h + sy ) );
+    addAreaDeps( t.comp, t.x - sx, t.y - sy, t.x + t.w - 1, t.y - 1 );
+    addAreaDeps( t.comp, t.x - sx, t.y, t.x - 1, t.y + t.h - 1 );
+  }
+  addAreaDeps( 0, 2 * ( t.x - sx ) - 1, 2 * ( t.y - sy ) - 1, 2 * ( t.x + t.w ) - 1, 2 * ( t.y + t.h ) - 1 );
+}
+
 // a dependency of chroma TMRL CU c's node on the modes it reads - the luma CUs' at its five positions and the chroma
 // neighbours' (Cu::nbr; the co-located luma CU's is the chroma nodes' own) - and on the blocks owning the samples it
 // reads: of Cb and Cr each line's whole arms (2 x (the side + 1)) and the template, of luma the co-located block and
@@ -515,6 +534,10 @@ void dependencies( int comp )
   if( ( ( t.lm >> LM_CCCM_SHIFT ) & 3 ) != 0 )
   {
     cccmDeps( t );
+  }
+  if( lmFusionType( t ) > 1 )
+  {
+    cflmDeps( t );
   }
   if( t.ispPrev >= 0 )   // the chain of an ISP CU's sub-partitions
   {
