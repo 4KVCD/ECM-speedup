@@ -1048,16 +1048,18 @@ Profile of a GPU-on decode (non-LTO, m2_park16, share of all samples): parsing ~
   each). Since then intra_rec's variants are compiled on first use (`intraRecKernel`: ~19 s for a cold start that
   needs one), and the test scripts give the driver a cache of their own (`__GL_SHADER_DISK_CACHE_PATH`,
   `__GL_SHADER_DISK_CACHE_SIZE`, `__GL_SHADER_DISK_CACHE_SKIP_CLEANUP`, which the Windows driver honors).
-- Build time of a shader change (2026-10-13): ~15 s, of which glslang `-Os` on intra_rec.comp takes 14.1 s (0.3 s
-  without the optimizer, `-O` 12.2 s); without `-Os` the driver's cold compile of a pipeline takes 30.7 instead of
-  ~19 s, so `-Os` stays. Each shader depends on the includes glslang's depfile names (CMake 3.21+), not on all of them;
+- Build time of a shader change (2026-10-13): ~15 s, of which glslang `-Os` on intra_rec.comp took 14.1 s (0.3 s
+  without the optimizer, `-O` 12.2 s). Without the optimizer the driver's cold compile of a pipeline takes 30.7
+  instead of ~19 s and the kernels run up to 18 % slower (2026-10-14: m19 96.2 against 81.8 ms per picture, m24 102.3
+  against 93.4). Each shader depends on the includes glslang's depfile names (CMake 3.21+), not on all of them;
   moving the SPIR-V arrays out of GpuIntraRec.cpp gained nothing (its compile runs beside glslang's).
-- SPIR-V's ID bound (2026-10-14): `-Os` inlines every call site of every function, which made intra_rec's optimized
-  module ~3.7x its unoptimized size (890k words, bound 3.52M at M45; unoptimized 240k words, bound 39k). Past the
-  bound's limit (4 194 303) glslang prints "ID overflow. Try running compact-ids." and writes the unoptimized module,
-  with exit code 0 - the build succeeds and only the pipelines' cold compile gets slower. Check the bound of a large
-  change (word 3 of the module: glslang `-V --target-env vulkan1.3 -Os` into a short path) and keep new code to one call
-  site per large function (M46: 3.72M). A spirv-opt with `--compact-ids` in the recipe would lift it (not installed).
+- SPIR-V's ID bound: past its limit (4 194 303) glslang prints "ID overflow. Try running compact-ids." and writes the
+  unoptimized module, with exit code 0 - the build succeeds and the kernels get slower. `-Os` inlines every call site
+  of every function, which brought intra_rec's bound to 3.72M at M48 (unoptimized: 40k); since 2026-10-14 the build
+  uses `-O` (GpuLib's CMakeLists, GLSLANG_OPT): the same kernel speed (plain, m19, m24, m48 within noise) and cold
+  pipeline compile (24 s plain, 108 s CCP merge: the same), bound 1.96M. Check the bound of a large change (word 3 of
+  the module: glslang `-V --target-env vulkan1.3 -O` into a short path) and keep new code to one call site per large
+  function. A spirv-opt with `--compact-ids` in the recipe would lift the limit further (not installed).
 - Buffer references (device addresses) have no robustness: a read past a plane's end loses the device
   (VK_ERROR_DEVICE_LOST, nvlddmkm event 153; all three decodes running at the time failed), and one past a row's end reads
   the next row unnoticed. To find such a read without more device losses (M31's first version: luma TIMD / TMRL blocks

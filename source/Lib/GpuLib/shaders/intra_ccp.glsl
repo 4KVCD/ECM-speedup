@@ -18,9 +18,9 @@
 // predictions of weight 1, the average rounded). A candidate predicts like the LM blocks of its type: a
 // CCLM / GLM model as intra_cclm.glsl's (the slots in s_cclm), the others with intra_cccm.glsl's luma buffers and
 // cccmPredict (the CPU's model applied to the CU's own luma, the candidate's luma offset taken in the buffer:
-// xCccmGetLumaVal's luma minus m_cccmLumaOffset plus m_cccmLumaOffset minus the candidate's offset). intra_rec.comp
-// compiles with glslang -Os, whose inlining of every call site brought it near SPIR-V's ID bound: each large function
-// has one call site here.
+// xCccmGetLumaVal's luma minus m_cccmLumaOffset plus m_cccmLumaOffset minus the candidate's offset). glslang's
+// inlining multiplies intra_rec.comp's SPIR-V (its ID bound limits the module): each large function has one call site
+// here.
 // Included by intra_rec.comp after intra_cccm.glsl
 #ifndef INTRA_CCP_GLSL
 #define INTRA_CCP_GLSL
