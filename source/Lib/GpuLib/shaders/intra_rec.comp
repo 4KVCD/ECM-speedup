@@ -44,6 +44,7 @@ layout( constant_id = 7 ) const bool WITH_CCLM = false;                // CCLM b
 layout( constant_id = 8 ) const bool WITH_CCCM = false;                // CCCM blocks (with CCLM)
 layout( constant_id = 9 ) const bool WITH_CFLM = false;                // CFLM blocks (with CCCM: ~2 % for CCCM's)
 layout( constant_id = 10 ) const bool WITH_CCP_MERGE = false;          // CCP merge blocks (with CFLM)
+layout( constant_id = 11 ) const bool WITH_CCP_DERIVED = false;        // decoder-derived CCP fusion (with CCP merge)
 // the template costs of arms one sample thick (TIMD merge's and TMRL's templates: their SATD kernels)
 const bool WITH_THIN_TEMPLATES = WITH_TIMD_MERGE || WITH_TMRL;
 
@@ -1871,12 +1872,13 @@ void main()
                && ( ( t.lm & LM_ACTIVE ) != 0 || ( WITH_CCP_MERGE && t.ccpMerge >= 0 ) ) )
       {
         // CCLM, CCCM (intra_cclm.glsl, intra_cccm.glsl): the model(s) from the template, then applied; CCP merge
-        // (intra_ccp.glsl): the inherited model applied as the LM block of its type applies its own
+        // (intra_ccp.glsl): the inherited model applied as the LM block of its type applies its own, also the model
+        // decoder-derived CCP fusion chooses
         const int lx = t.x << 1, ly = t.y << 1;   // the co-located luma block (4:2:0)
         if( WITH_CCP_MERGE && t.ccpMerge >= 0 )
         {
-          ccpMergePrediction( t, lid, NT );   // (t: the chosen model's LM block; its luma buffers in the angular
-                                              // arrays, cleared at the end, or the scratch)
+          ccpMergePrediction( t, predStride, lid, NT );   // (t: the chosen model's LM block; its luma buffers in the
+                                                          // angular arrays, cleared at the end, or the scratch)
           angClear  = g_ccpAngUsed;
           angClear2 = g_ccpAngUsed > 0;
         }

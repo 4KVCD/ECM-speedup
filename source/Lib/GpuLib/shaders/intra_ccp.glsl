@@ -10,8 +10,8 @@
 // the chosen model, which the Cb block writes into the CU's record. The host gives the list's sources (Params::ccpData
 // at Tu::ccpMerge: the records of the PUs at the positions, those of the CTU row's history, spare records for each
 // block's defaults; its scheduling waits for the blocks writing them) and rejects merge fusion with CCCM by a blend
-// model (the SPS's ccpFusionMode 1: not all-intra) and decoder-derived CCP fusion. Merge adjustment (JVET-AL0126)
-// lists the CCCM models alone, adds models fitted on the fly (ccpFlyModels) and moves the chosen model's coefficients
+// model (the SPS's ccpFusionMode 1: not all-intra) and decoder-derived merge fusion. Merge adjustment (JVET-AL0126)
+// lists the CCCM models alone, adds models fitted on the fly (ccpFitModels) and moves the chosen model's coefficients
 // by template costs (ccpMergeAdjust). Merge fusion with CCCM (predCCPCandidate's ccpMergeFusionType 0) is LM chroma
 // fusion's first type with equal weights: the block computes the CCCM prediction before its own and storeRegion
 // averages them (intra_cccm.glsl's cccmFusionBlend). Merge fusion with DIMD chroma (ccpMergeFusionType 1): the CU's
@@ -20,9 +20,18 @@
 // LM blocks of its type: a CCLM / GLM model as intra_cclm.glsl's (the slots in s_cclm), the others with
 // intra_cccm.glsl's luma buffers and cccmPredict (the CPU's model applied to the CU's own luma, the candidate's luma
 // offset taken in the buffer: xCccmGetLumaVal's luma minus m_cccmLumaOffset plus m_cccmLumaOffset minus the
-// candidate's offset). glslang's inlining multiplies intra_rec.comp's SPIR-V (its ID bound limits the module): the
-// large functions have few call sites here (the costs and the prediction one loop; the adjustment's costs and the
-// on-the-fly fits one more each).
+// candidate's offset).
+// Decoder-derived CCP fusion (JVET-AG0154's decoderDerivedCcpMode CUs; DecCu at the Cb block: decoderDerivedCcp,
+// predDecoderDerivedIntraCCCMFusions) shares the merge code: its entry (kind CCP_KIND_DERIVED) has no sources and no
+// history, its list is its modes - a CCLM model and CCCM models the block fits itself (ccpDerivedLinear,
+// ccpFitModels) - whose costs are the SADs of their predictions of probe lines (the row above and the column left of
+// the block; for the modes with LBCCP's inside filter that line filtered with the lines beside it), and the mode of
+// the lowest cost alone or the pair of modes whose 3 : 1 blend of the probe lines costs less (ccpDerivedChoice)
+// predicts: list[0] as a merge block's chosen candidate, list[1] before it into the fusion slot that storeRegion blends
+// in (cccmFusionBlend with the weight 3). Each block derives the choice itself, from both components' costs. Its
+// branches are in the pipelines with WITH_CCP_DERIVED alone (the merge pictures' pipeline without them is faster).
+// glslang's inlining multiplies intra_rec.comp's SPIR-V (its ID bound limits the module): the large functions have
+// few call sites here (the costs and the predictions one loop; the adjustment's costs and the fits one more each).
 // Included by intra_rec.comp after intra_cccm.glsl
 #ifndef INTRA_CCP_GLSL
 #define INTRA_CCP_GLSL
@@ -38,12 +47,23 @@ const int CCP_DEFAULT_A[CCP_MAX_CANDS] = int[]( 0, 1, -1, 2, -2, 3, -3, 4, -4, 5
 
 // the candidate list in shared memory (s_dimdHist: a merge block derives no DIMD), which invocation 0 builds: per
 // candidate its record, its inside filter flag (the PU's curCand's for a spatial one, the history's copy's for a
-// history one, 0 for a default or an on-the-fly model) and its template cost; their number; the history's models
-// (most recent first) and their number; the first CCLM candidate's slopes (Cb's, Cr's, 64-bit as two words) and
-// shifts, which the defaults move, and whether there is one; which on-the-fly models are valid
+// history one, 0 for a default or an on-the-fly model; a decoder-derived fusion mode's own) and its template cost;
+// their number; the history's models (most recent first) and their number; the first CCLM candidate's slopes (Cb's,
+// Cr's, 64-bit as two words) and shifts, which the defaults move, and whether there is one; which on-the-fly models are
+// valid; decoder-derived fusion's costs of the pairs of modes and its choice (the list entries of list[0] and list[1],
+// -1 without fusion)
 #define s_ccp s_dimdHist
 const int CCP_LIST = 0, CCP_LIST_INSIDE = 15, CCP_LIST_COST = 30, CCP_LIST_NUM = 45, CCP_LUT = 46, CCP_LUT_NUM = 52;
-const int CCP_SCALE = 53, CCP_SHIFT = 57, CCP_FOUND = 59, CCP_FLY_VALID = 60;
+const int CCP_SCALE = 53, CCP_SHIFT = 57, CCP_FOUND = 59, CCP_FLY_VALID = 60, CCP_PAIR_COST = 66;
+const int CCP_DERIVED_FIRST = 81, CCP_DERIVED_SECOND = 82;
+
+// decoder-derived CCP fusion's modes in the CPU's order (decoderDerivedCcp): the CCLM model (LM_CHROMA_IDX), plain
+// CCCM of a single model without and with LBCCP's inside filter, of two models alike, GL-CCCM where the block has more
+// than 32 samples (the GPU path's intra slices); each mode's record among the block's spare ones (CCLM's, the single
+// model's, the two models', GL-CCCM's) and its inside filter flag
+const int CCP_DERIVED_MODES = 6;
+const int CCP_DERIVED_RECORD[CCP_DERIVED_MODES] = int[]( 0, 1, 1, 2, 2, 3 );
+const int CCP_DERIVED_INSIDE[CCP_DERIVED_MODES] = int[]( 0, 0, 1, 0, 1, 0 );
 
 int ccpWord( int r, int w )
 {
@@ -208,12 +228,12 @@ void ccpMergeDefaults( Tu t, int lid, int NT )
 // the list of merge block t (invocation 0, after the history and the defaults): the spatial sources in order, the
 // history, the defaults, each unless equal to one before it (the CPU compares a default with each the other way
 // round, the same for a CCLM model), at most CCP_MAX_CANDS. With adjustment the CCCM models alone (of a type above
-// CCP_TYPE_GLM4567's), at most CCP_MAX_LIST, no defaults (the on-the-fly models follow: ccpFlyModels)
+// CCP_TYPE_GLM4567's), at most CCP_MAX_LIST, no defaults (the on-the-fly models follow: ccpFitModels)
 void ccpMergeList( Tu t )
 {
   BufI32     d = BufI32( P.ccpData );
   const int  e = t.ccpMerge, numSpatial = d.v[e + CCP_MERGE_NUM_SPATIAL], numLut = s_ccp[CCP_LUT_NUM];
-  const bool adjust = d.v[e + CCP_MERGE_ADJUST] != 0;
+  const bool adjust = d.v[e + CCP_MERGE_KIND] != 0;
   const int  maxNum = adjust ? CCP_MAX_LIST : CCP_MAX_CANDS, numDefaults = adjust ? 0 : CCP_MAX_CANDS;
   int        num = 0;
   for( int s = 0; s < numSpatial + numLut + numDefaults && num < maxNum; s++ )
@@ -236,6 +256,18 @@ void ccpMergeList( Tu t )
                                    : s < numSpatial + numLut ? ccpWord( r, CCP_OUT_INSIDE_HIST ) : 0;
       num++;
     }
+  }
+  s_ccp[CCP_LIST_NUM] = num;
+}
+
+// the list of decoder-derived CCP fusion block t (invocation 0): its modes
+void ccpDerivedList( Tu t )
+{
+  const int num = t.w * t.h > 32 ? CCP_DERIVED_MODES : CCP_DERIVED_MODES - 1;
+  for( int m = 0; m < num; m++ )
+  {
+    s_ccp[CCP_LIST + m]        = ccpDefaultRecords( t ) + CCP_DERIVED_RECORD[m];
+    s_ccp[CCP_LIST_INSIDE + m] = CCP_DERIVED_INSIDE[m];
   }
   s_ccp[CCP_LIST_NUM] = num;
 }
@@ -330,30 +362,171 @@ void ccpCccmModel( Tu t, int x, bool ownLoc, int lid, int NT )
 
 // record x's prediction of component c (0: Cb, 1: Cr) as a CCLM model at the template sample of the row above the
 // block (top) or the column left of it, index q: the first model alone (xUpdateOffsetsAndGetCostCCLM's modelNum 1),
-// unclipped, as a Pel
+// neither clipped nor a Pel yet
 int ccpLinearTemplate( Tu t, int x, int c, bool top, int q )
 {
   const int lx = t.x << 1, ly = t.y << 1, glm = ccpWord( x, CCP_OUT_GLM_IDC );
   const int luma = top ? cclmLumaAbove( lx, ly, q, s_cclm[CCLM_LEFT] != 0, glm )
                        : cclmLumaLeft( lx, ly, q, s_cclm[CCLM_ABOVE] != 0, glm );
   const int a = int( ccpParam( x, false, c, 0 ) ), b = int( ccpParam( x, false, c, 1 ) );
-  return int( int16_t( ( ( a * luma ) >> ccpWord( x, CCP_OUT_SHIFT + c ) ) + b ) );
+  return ( ( a * luma ) >> ccpWord( x, CCP_OUT_SHIFT + c ) ) + b;
 }
 
-// ----- adjustment (JVET-AL0126): on-the-fly models, then the chosen model's coefficients moved
+// record x's CCLM model of block t's component into CCLM's slot 0 (invocation 0): its first model's a, b and shift,
+// its second's, the threshold between them
+void ccpLoadLinear( Tu t, int x )
+{
+  const int m = CCLM_MODEL, c = t.comp - 1;
+  s_cclm[m + CCLM_A]      = int( ccpParam( x, false, c, 0 ) );
+  s_cclm[m + CCLM_B]      = int( ccpParam( x, false, c, 1 ) );
+  s_cclm[m + CCLM_SHIFT]  = ccpWord( x, CCP_OUT_SHIFT + c );
+  s_cclm[m + CCLM_A2]     = int( ccpParam( x, true, c, 0 ) );
+  s_cclm[m + CCLM_B2]     = int( ccpParam( x, true, c, 1 ) );
+  s_cclm[m + CCLM_SHIFT2] = ccpWord( x, CCP_OUT_SHIFT2 + c );
+  s_cclm[m + CCLM_THRES]  = ccpWord( x, CCP_OUT_Y_THRES );
+}
 
-// record words w of an on-the-fly model just fitted (two: MMLM; its parameters in the parameter words, its ranges in
-// CCCM_MODEL_RANGE): cccmModelToCcpParams' fields - plain CCCM, the threshold of two models, the block's own luma
-// offset and corner offsets, 7 parameters, the template chroma's ranges - every other word 0
+// ----- decoder-derived CCP fusion (JVET-AG0154): its CCLM models, the probe lines, the choice
+
+// the CCLM models of decoder-derived CCP fusion block t (tmCostDecoderDerivedCcp's of LM_CHROMA_IDX: each component's
+// xGetLMParametersLMS, no slope adjustment; invocation 0, after cclmAvailability and before cccmArea, whose words
+// overlap CCLM's slots) into the first of the block's spare records: its own component's from its references (s_ref[0],
+// slot 0), the other's from the other's (s_ref[1], slot 1); the type, 2 parameters, per component the shift, the slope
+// and the offset (cclmModelToCcpParams), every other word 0
+void ccpDerivedLinear( Tu t, int predStride )
+{
+  const int lx = t.x << 1, ly = t.y << 1, base = ccpDefaultRecords( t ) * CCP_OUT;
+  for( int k = 0; k < 2; k++ )   // (cclmModel reads the references and the area of t alone, not its component)
+  {
+    cclmModel( t, lx, ly, predStride, k, k );
+  }
+  CBufI32 o = CBufI32( P.ccpOut );
+  for( int w = 0; w < CCP_OUT; w++ )
+  {
+    o.v[base + w] = 0;
+  }
+  o.v[base + CCP_OUT_TYPE]       = CCP_TYPE_CCLM;
+  o.v[base + CCP_OUT_NUM_PARAMS] = 2;
+  for( int c = 0; c < 2; c++ )
+  {
+    const int m = CCLM_MODEL + ( c == t.comp - 1 ? 0 : CCLM_SLOT );
+    o.v[base + CCP_OUT_SHIFT + c] = s_cclm[m + CCLM_SHIFT];
+    ccpStoreParam( base, false, c, 0, int64_t( s_cclm[m + CCLM_A] ) );
+    ccpStoreParam( base, false, c, 1, int64_t( s_cclm[m + CCLM_B] ) );
+  }
+}
+
+// where block t's probe samples are (the costs' step by step, Cb's then Cr's): the workgroup's scratch after the luma
+// buffer (where it is there), where the predictions go later (the host allocates room for both)
+int ccpProbeBase() { return cccmScratchPred(); }
+
+// the position of tap k (0 .. 8: 3 x 3, the line farthest from the block first) of decoder-derived fusion's probe
+// sample q of the row above block t (top) or of the column left of it with LBCCP's inside filter
+// (filterPredInsideProbeLine), tap 4 the sample itself: its position in the reference area to predict, or with `pad`
+// the picture's position of a reconstructed sample. Its three lines: the one two away from the block where a CU is
+// three away (else the next one again), the next one, the block's first; before a line's start the reconstruction
+// beside it where the block has a CU there (else the line's first sample), after its end the line's last sample
+ivec2 ccpProbeTap( Tu t, bool top, int q, int k, out bool pad )
+{
+  OwnerMap    om = OwnerMap( BufI32( P.owner[t.comp] ), P.ownerW[1], P.ownerH[1], P.unitLog2X[1], P.unitLog2Y[1] );
+  const int   across = k / 3, along = q + k % 3 - 1;
+  const ivec2 start = top ? ivec2( t.x - 1, t.y + across - 2 ) : ivec2( t.x + across - 2, t.y - 1 );
+  pad = along < 0 && decodedBefore( om, start.x, start.y, g_ti );
+  if( pad )
+  {
+    return start;
+  }
+  const ivec2 three = top ? ivec2( t.x, t.y - 3 ) : ivec2( t.x - 3, t.y );
+  const bool  far   = across == 0 && decodedBefore( om, three.x, three.y, g_ti );
+  const int   off   = across == 2 ? 0 : far ? -2 : -1, i = clamp( along, 0, ( top ? t.w : t.h ) - 1 );
+  return top ? ivec2( g_cccmSizeX + i, g_cccmSizeY + off ) : ivec2( g_cccmSizeX + off, g_cccmSizeY + i );
+}
+
+// the modes of pair p of num modes, in the CPU's order: (0, 1), (0, 2) .. (0, num - 1), (1, 2) ..
+ivec2 ccpDerivedPair( int p, int num )
+{
+  int a = 0;
+  while( p >= num - 1 - a )
+  {
+    p -= num - 1 - a;
+    a++;
+  }
+  return ivec2( a, a + 1 + p );
+}
+
+// decoder-derived CCP fusion's choice (decoderDerivedCcp; all invocations, ending with a barrier) from its modes'
+// costs and probe samples: the first mode of the lowest cost alone where that cost is at most (W + H) / 2; else the
+// pair of modes (in the CPU's order) whose blend of the probe samples costs least (ddccpFusionTemplateCost: Cb's and
+// Cr's SAD of (3 P + P' + 2) >> 2, P the samples of the mode of the lower cost, of the first of equal ones), where it
+// costs less than the mode alone: list[0] the pair's mode of the lower cost (the first of equal ones), list[1] the
+// other
+void ccpDerivedChoice( Tu t, int lid, int NT )
+{
+  const int  num = s_ccp[CCP_LIST_NUM], numPairs = num * ( num - 1 ) / 2, W = t.w, len = t.w + t.h;
+  const bool above = s_cclm[CCLM_POS_ABOVE] != 0, left = s_cclm[CCLM_POS_LEFT] != 0;
+  if( lid < numPairs )
+  {
+    s_ccp[CCP_PAIR_COST + lid] = 0;
+  }
+  cccmSync();   // (and the probe samples)
+  for( int i = lid; i < numPairs * 2 * len; i += NT )
+  {
+    const int  p = i / ( 2 * len ), s = i % ( 2 * len ), c = s / len, pos = s % len, q = pos < W ? pos : pos - W;
+    const bool top = pos < W;
+    if( top ? above : left )
+    {
+      const ivec2 ab = ccpDerivedPair( p, num );
+      const int   pa = CBufI32( P.scratch ).v[ccpProbeBase() + ab.x * 2 * len + s];
+      const int   pb = CBufI32( P.scratch ).v[ccpProbeBase() + ab.y * 2 * len + s];
+      const bool  bFirst = s_ccp[CCP_LIST_COST + ab.y] < s_ccp[CCP_LIST_COST + ab.x];
+      const int   v = bFirst ? ( 3 * pb + pa + 2 ) >> 2 : ( 3 * pa + pb + 2 ) >> 2;
+      const int   reco = top ? recoAt( c + 1, t.x + q, t.y - 1 ) : recoAt( c + 1, t.x - 1, t.y + q );
+      atomicAdd( s_ccp[CCP_PAIR_COST + p], abs( reco - v ) );
+    }
+  }
+  SYNC();
+  if( lid == 0 )
+  {
+    int best = 0;
+    for( int m = 1; m < num; m++ )
+    {
+      best = s_ccp[CCP_LIST_COST + m] < s_ccp[CCP_LIST_COST + best] ? m : best;
+    }
+    int first = best, second = -1;
+    if( s_ccp[CCP_LIST_COST + best] > ( W + t.h ) >> 1 )
+    {
+      int bestPair = 0;
+      for( int p = 1; p < numPairs; p++ )
+      {
+        bestPair = s_ccp[CCP_PAIR_COST + p] < s_ccp[CCP_PAIR_COST + bestPair] ? p : bestPair;
+      }
+      if( s_ccp[CCP_LIST_COST + best] > s_ccp[CCP_PAIR_COST + bestPair] )
+      {
+        const ivec2 ab = ccpDerivedPair( bestPair, num );
+        first  = s_ccp[CCP_LIST_COST + ab.y] < s_ccp[CCP_LIST_COST + ab.x] ? ab.y : ab.x;
+        second = ab.x + ab.y - first;
+      }
+    }
+    s_ccp[CCP_DERIVED_FIRST]  = first;
+    s_ccp[CCP_DERIVED_SECOND] = second;
+  }
+  SYNC();
+}
+
+// ----- models the block fits itself; adjustment (JVET-AL0126): the chosen model's coefficients moved
+
+// record words w of a model just fitted (two: MMLM; its parameters in the parameter words, its ranges in
+// CCCM_MODEL_RANGE): cccmModelToCcpParams' fields - plain CCCM or GL-CCCM (g_cccmGl), the threshold of two models, the
+// block's own luma offset and corner offsets, 7 parameters, the template chroma's ranges - every other word 0
 int ccpFlyWord( int w, bool two )
 {
-  if( w == CCP_OUT_TYPE ) return CCP_TYPE_CCCM | ( two ? CCP_TYPE_MMLM : 0 );
+  if( w == CCP_OUT_TYPE ) return ( g_cccmGl ? CCP_TYPE_GLCCCM : CCP_TYPE_CCCM ) | ( two ? CCP_TYPE_MMLM : 0 );
   if( w == CCP_OUT_Y_THRES ) return two ? s_cclm[CCCM_THRESHOLD] : 0;
   if( w == CCP_OUT_LUMA_OFFSET ) return g_cccmLumaOffset;
   if( w == CCP_OUT_COR_OFF ) return g_cccmSizeX;
   if( w == CCP_OUT_COR_OFF + 1 ) return g_cccmSizeY;
   if( w == CCP_OUT_NUM_PARAMS ) return 7;
-  if( w >= CCP_OUT_RANGE && w < CCP_OUT_RANGE + 12 )   // (per model and component: min, max, change)
+  if( w >= CCP_OUT_RANGE && w < CCP_OUT_RANGE + ( two ? 12 : 6 ) )   // (per model and component: min, max, change)
   {
     const int i = w - CCP_OUT_RANGE, k = i / 3, r = CCCM_MODEL_RANGE + 2 * k;
     const int lo = s_cclm[r], hi = s_cclm[r + 1];
@@ -369,15 +542,18 @@ int ccpFlyWord( int w, bool two )
   return 0;
 }
 
-// the on-the-fly models of merge block t with adjustment (deriveCcpMergeAdjustCands; all invocations, ending with a
-// barrier), each a record among the block's spare ones (ccpDefaultRecords' first CCP_FLY_MAX), valid where one of its
-// coefficients but the bias is not 0 (CCP_FLY_VALID): plain CCCM of the block's own luma buffer and luma offset over
-// the whole template - two models split at xCccmCalcRefAver's threshold (the template's mean luma), one model, one of
-// the template's two lines next to the block (trainingRange 2), one of the reference samples alone (useRefSampOnly),
-// two of them, two of the two lines. (The CPU selects the template by the block's position - the left part in the
-// picture's top row, the part above in its left column - which is the whole template there: a merge block's own
-// template selection, 0, gives the same.)
-void ccpFlyModels( Tu t, int lid, int NT )
+// the models merge block t fits itself (all invocations, ending with a barrier), each into a record among the block's
+// spare ones, of the block's own luma buffer and luma offset, plain CCCM unless said otherwise:
+// - with adjustment the on-the-fly models (deriveCcpMergeAdjustCands; the first CCP_FLY_MAX records), valid where one
+//   of its coefficients but the bias is not 0 (CCP_FLY_VALID), over the whole template: two models split at
+//   xCccmCalcRefAver's threshold (the template's mean luma), one model, one of the template's two lines next to the
+//   block (trainingRange 2), one of the reference samples alone (useRefSampOnly), two of them, two of the two lines.
+//   (The CPU selects the template by the block's position - the left part in the picture's top row, the part above in
+//   its left column - which is the whole template there: a merge block's own template selection, 0, gives the same.)
+// - decoder-derived CCP fusion's CCCM models (tmCostDecoderDerivedCcp; after its CCLM record): one model of the two
+//   lines, two models over the whole template split at the block's mean luma (xCccmCalcRefAver's trainingRange 2, as
+//   LBCCP's second set), where the block has more than 32 samples GL-CCCM's one over the whole template
+void ccpFitModels( Tu t, bool derived, int lid, int NT )
 {
   g_cccmGl         = false;
   g_cccmMdf        = 0;
@@ -402,24 +578,30 @@ void ccpFlyModels( Tu t, int lid, int NT )
     s_red[2 + lid] = 0;
   }
   SYNC();
+  // the threshold of two models: the template's mean luma, decoder-derived fusion's the block's
   const ivec4 r      = cccmTemplate( t, false );
   const ivec2 counts = cccmTemplateCounts( r );
+  const int   num    = derived ? t.w * t.h : counts.x + counts.y;
   int sum = 0;
-  for( int i = lid; i < counts.x + counts.y; i += NT )
+  for( int i = lid; i < num; i += NT )
   {
-    const ivec2 p = cccmTemplateSample( r, counts, i );
+    const ivec2 p = derived ? ivec2( g_cccmSizeX + i % t.w, g_cccmSizeY + i / t.w )
+                            : cccmTemplateSample( r, counts, i );
     sum += cccmLuma( p.x, p.y );
   }
-  const int num = counts.x + counts.y, total = wgSum2( sum, 0, 2 ).x;
+  const int total = wgSum2( sum, 0, 2 ).x, shift = findMSB( t.w ) + findMSB( t.h );
   if( lid == 0 )
   {
-    s_cclm[CCCM_THRESHOLD] = num == 0 ? 1 << ( t.bitDepth - 1 ) : cccmDivideLowPrec( total, num );
+    s_cclm[CCCM_THRESHOLD] = derived ? ( total + ( 1 << ( shift - 1 ) ) ) >> shift
+                           : num == 0 ? 1 << ( t.bitDepth - 1 ) : cccmDivideLowPrec( total, num );
   }
-  for( int k = 0; k < CCP_FLY_MAX; k++ )
+  const int numFits = !derived ? CCP_FLY_MAX : t.w * t.h > 32 ? 3 : 2;
+  for( int k = 0; k < numFits; k++ )
   {
-    const bool two   = k == 0 || k >= 4;
-    g_ccpFlyTwoLines = k == 2 || k == 5;
-    g_ccpFlyRefOnly  = k == 3 || k == 4;
+    const bool two   = derived ? k == 1 : k == 0 || k >= 4;
+    g_ccpFlyTwoLines = derived ? k == 0 : k == 2 || k == 5;
+    g_ccpFlyRefOnly  = !derived && ( k == 3 || k == 4 );
+    g_cccmGl         = derived && k == 2;
     for( int m = 0; m < ( two ? 2 : 1 ); m++ )
     {
       cccmAccumulate( t, m, two, lid, NT );
@@ -436,11 +618,11 @@ void ccpFlyModels( Tu t, int lid, int NT )
     {
       valid = ( i < 12 || two ) && cccmLoad( cccmParamWord( i / 12, ( i / 6 ) & 1, i % 6 ) ) != int64_t( 0 );
     }
-    if( lid == 0 )
+    if( lid == 0 && !derived )
     {
       s_ccp[CCP_FLY_VALID + k] = valid ? 1 : 0;
     }
-    const int base = ( ccpDefaultRecords( t ) + k ) * CCP_OUT;
+    const int base = ( ccpDefaultRecords( t ) + k + ( derived ? 1 : 0 ) ) * CCP_OUT;
     for( int w = lid; w < CCP_OUT; w += NT )
     {
       CBufI32( P.ccpOut ).v[base + w] = ccpFlyWord( w, two );
@@ -449,6 +631,7 @@ void ccpFlyModels( Tu t, int lid, int NT )
   }
   g_ccpFlyTwoLines = false;
   g_ccpFlyRefOnly  = false;
+  g_cccmGl         = false;
   cccmSync();
 }
 
@@ -583,31 +766,58 @@ void ccpMergeAdjust( Tu t, int x, int flag, int lid, int NT )
 // the CPU copies the candidate into curCand, which the history takes; a merge CU has no LBCCP flag of its own). t
 // becomes the LM block of the chosen model's type that cclmPrediction predicts: a CCLM model in s_cclm's slot 0 (its
 // mode MMLM's with two models, its pattern), else its prediction in s_tmp or the scratch (a CCCM block's), with the
-// inside filter flag
-void ccpMergePrediction( inout Tu t, int lid, int NT )
+// inside filter flag.
+// A block of decoder-derived CCP fusion ranks its modes by their probe samples' costs (decoderDerivedCclmCost: the
+// CCLM model's clipped; decoderDerivedCccmCost), which the scratch keeps for the choice (ccpDerivedChoice), then
+// predicts list[1] where it blends two (predDecoderDerivedIntraCCCMFusions: through its inside filter, into the fusion
+// slot), then list[0]. The CU's record is list[0]'s model with the inside filter flags 0 (DecCu clears the PU's flag
+// before CU::saveCcInsideFilterFlagInCCP would copy it)
+void ccpMergePrediction( inout Tu t, int predStride, int lid, int NT )
 {
-  const int adjust = BufI32( P.ccpData ).v[t.ccpMerge + CCP_MERGE_ADJUST];
+  const int  kind = BufI32( P.ccpData ).v[t.ccpMerge + CCP_MERGE_KIND];
+  const bool derived = WITH_CCP_DERIVED && kind == CCP_KIND_DERIVED;
+  const int  adjust = derived ? 0 : kind;
   g_ccpAngUsed = 0;
+  if( derived )   // (the other component's references, for its CCLM model)
+  {
+    Tu o = t;
+    o.comp = 3 - t.comp;
+    fillReferencePar( o, 0, 1, predStride, lid, NT );
+    SYNC();
+  }
   if( lid == 0 )
   {
     cclmAvailability( t );
+    if( derived )
+    {
+      ccpDerivedLinear( t, predStride );
+    }
     cccmArea( t );
-    ccpMergeHistory( t );
+    ccpMergeHistory( t );   // (a derived block's entry has neither sources nor a history)
   }
   SYNC();
-  if( adjust == 0 )
+  if( !derived && adjust == 0 )
   {
     ccpMergeDefaults( t, lid, NT );
   }
   if( lid == 0 )
   {
-    ccpMergeList( t );
+    if( derived )
+    {
+      ccpDerivedList( t );
+    }
+    else
+    {
+      ccpMergeList( t );
+    }
   }
   SYNC();
-  if( adjust != 0 && s_ccp[CCP_LIST_NUM] < CCP_MAX_LIST )   // (the on-the-fly models, appended while there is room)
+  // the models the block fits itself: decoder-derived fusion's, adjustment's on-the-fly ones (appended while the list
+  // has room)
+  if( derived || ( adjust != 0 && s_ccp[CCP_LIST_NUM] < CCP_MAX_LIST ) )
   {
-    ccpFlyModels( t, lid, NT );
-    if( lid == 0 )
+    ccpFitModels( t, derived, lid, NT );
+    if( lid == 0 && !derived )
     {
       int num = s_ccp[CCP_LIST_NUM];
       for( int k = 0; k < CCP_FLY_MAX && num < CCP_MAX_LIST; k++ )
@@ -623,24 +833,41 @@ void ccpMergePrediction( inout Tu t, int lid, int NT )
     }
     SYNC();
   }
-  const int  W = t.w, H = t.h, len = W + H, steps = s_ccp[CCP_LIST_NUM] + 1;
+  const int  W = t.w, H = t.h, len = W + H, numCost = s_ccp[CCP_LIST_NUM], maxPel = ( 1 << t.bitDepth ) - 1;
+  const int  steps = numCost + ( derived ? 2 : 1 );   // (decoder-derived fusion: list[1]'s prediction, then list[0]'s)
   const bool above = s_cclm[CCLM_POS_ABOVE] != 0, left = s_cclm[CCLM_POS_LEFT] != 0;
   int x = 0, inside = 0;
   for( int step = 0; step < steps; step++ )
   {
-    const bool cost = step < steps - 1;
+    const bool cost = step < numCost, last = step == steps - 1, fusionStep = derived && !cost && !last;
     if( cost )
     {
-      x = s_ccp[CCP_LIST + step];
+      x      = s_ccp[CCP_LIST + step];
+      inside = derived ? s_ccp[CCP_LIST_INSIDE + step] : 0;   // (a derived mode's inside filter filters its probes)
     }
     else
     {
-      if( lid == 0 )
+      if( step == numCost )   // the choice
       {
-        ccpMergeSort();
+        if( derived )
+        {
+          ccpDerivedChoice( t, lid, NT );
+        }
+        else
+        {
+          if( lid == 0 )
+          {
+            ccpMergeSort();
+          }
+          SYNC();
+        }
       }
-      SYNC();
-      const int idx = BufI32( P.ccpData ).v[t.ccpMerge + CCP_MERGE_INDEX];
+      const int idx = !derived ? BufI32( P.ccpData ).v[t.ccpMerge + CCP_MERGE_INDEX]
+                    : s_ccp[last ? CCP_DERIVED_FIRST : CCP_DERIVED_SECOND];
+      if( derived && idx < 0 )   // (no list[1]: one mode alone)
+      {
+        continue;
+      }
       x      = s_ccp[CCP_LIST + idx];
       inside = s_ccp[CCP_LIST_INSIDE + idx];
     }
@@ -653,16 +880,16 @@ void ccpMergePrediction( inout Tu t, int lid, int NT )
       // adjustment by the candidate's)
       ccpCccmModel( t, x, !cost && mdf && adjust == 0, lid, NT );
     }
-    if( !cost && adjust != 0 )   // (with adjustment the list holds CCCM models alone)
+    if( last && adjust != 0 )   // (with adjustment the list holds CCCM models alone)
     {
       ccpMergeAdjust( t, x, adjust, lid, NT );
       g_cccmLocDX = mdf ? 0 : g_cccmLocDX;
       g_cccmLocDY = mdf ? 0 : g_cccmLocDY;
     }
-    if( !cost )
+    if( last )
     {
-      // the CU's record: the candidate's (with its inside filter flag both as the CU's and as the history's), written
-      // by the Cb block; an adjusted model's coefficients of each component by its own block
+      // the CU's record: the candidate's (with its inside filter flag both as the CU's and as the history's; a derived
+      // block's 0), written by the Cb block; an adjusted model's coefficients of each component by its own block
       const int own = t.comp - 1, n = g_cccmParams;
       for( int w = lid; w < CCP_OUT; w += NT )
       {
@@ -673,8 +900,8 @@ void ccpMergePrediction( inout Tu t, int lid, int NT )
         {
           const ivec2 v     = coef ? unpackInt2x32( cccmLoad( cccmParamWord( m, c, p ) ) ) : ivec2( 0 );
           const bool  flags = w == CCP_OUT_INSIDE || w == CCP_OUT_INSIDE_HIST;
-          CBufI32( P.ccpOut ).v[t.ccp * CCP_OUT + w] = coef ? ( ( pw & 1 ) == 0 ? v.x : v.y ) : flags ? inside
-                                                                                                    : ccpWord( x, w );
+          CBufI32( P.ccpOut ).v[t.ccp * CCP_OUT + w] = coef ? ( ( pw & 1 ) == 0 ? v.x : v.y )
+                                                     : flags ? ( derived ? 0 : inside ) : ccpWord( x, w );
         }
       }
     }
@@ -682,22 +909,63 @@ void ccpMergePrediction( inout Tu t, int lid, int NT )
     {
       s_red[2 + lid] = 0;
     }
+    if( lid == 0 && fusionStep && linear )   // (list[1]'s CCLM model; list[0]'s follows after the steps)
+    {
+      ccpLoadLinear( t, x );
+    }
     SYNC();
-    // the template's samples of both components (costs) or the block's of its own (a CCCM prediction)
+    // the template's samples of both components (costs) or the block's of its own (a CCCM prediction); decoder-derived
+    // fusion's probe samples (those of its modes with the inside filter filtered: ccpProbeTap's taps, a CCLM model's
+    // clipped) and its list[1]'s prediction (into the fusion slot, through the inside filter below where it has it)
+    // apart, in the code of its pipelines alone
     const bool inTmp = cccmPredInTmp( t );
     int sad = 0;
-    for( int s = lid; s < ( cost ? 2 * len : linear ? 0 : W * H ); s += NT )
+    for( int s = lid; s < ( cost ? 2 * len : linear && last ? 0 : W * H ); s += NT )
     {
       const int  c = cost ? s / len : t.comp - 1, pos = s % len, q = pos < W ? pos : pos - W;
       const bool top = pos < W;
       if( !cost || ( top ? above : left ) )
       {
-        const int px = !cost ? g_cccmSizeX + s % W : top ? g_cccmSizeX + q : g_cccmSizeX - 1;
-        const int py = !cost ? g_cccmSizeY + s / W : top ? g_cccmSizeY - 1 : g_cccmSizeY + q;
-        const int v = linear ? ccpLinearTemplate( t, x, c, top, q ) : cccmPredict( 0, c, px, py, two, t.bitDepth );
+        int v = 0;
+        if( derived && cost )   // (a probe sample)
+        {
+          const int taps = inside != 0 ? 9 : 1;
+          int sum = 0;
+          for( int k = 4 - ( taps >> 1 ); k <= 4 + ( taps >> 1 ); k++ )   // (tap 4 the sample itself)
+          {
+            bool pad = false;
+            const ivec2 p = ccpProbeTap( t, top, q, k, pad );
+            v = pad ? recoAt( c + 1, p.x, p.y ) : linear ? clamp( ccpLinearTemplate( t, x, c, top, q ), 0, maxPel )
+              : cccmPredict( 0, c, p.x, p.y, two, t.bitDepth );
+            sum += ( k != 4 ? 1 : taps == 1 ? 16 : 8 ) * v;
+          }
+          v = ( sum + 8 ) >> 4;
+        }
+        else if( fusionStep && linear )   // (list[1]'s CCLM prediction)
+        {
+          Tu tl = t;   // (a CCLM block of slot 0's model)
+          tl.lm      = LM_ACTIVE;
+          tl.dirMode = LM_CHROMA_IDX;
+          v = cclmPredSample( tl, t.x << 1, t.y << 1, s % W, s / W, maxPel, 0 );
+        }
+        else
+        {
+          const int px = !cost ? g_cccmSizeX + s % W : top ? g_cccmSizeX + q : g_cccmSizeX - 1;
+          const int py = !cost ? g_cccmSizeY + s / W : top ? g_cccmSizeY - 1 : g_cccmSizeY + q;
+          v = linear ? int( int16_t( ccpLinearTemplate( t, x, c, top, q ) ) )
+                     : cccmPredict( 0, c, px, py, two, t.bitDepth );
+        }
         if( cost )
         {
           sad += abs( ( top ? recoAt( c + 1, t.x + q, t.y - 1 ) : recoAt( c + 1, t.x - 1, t.y + q ) ) - v );
+          if( derived )
+          {
+            CBufI32( P.scratch ).v[ccpProbeBase() + step * 2 * len + s] = v;
+          }
+        }
+        else if( fusionStep && inside == 0 )
+        {
+          CBufI32( P.scratch ).v[cccmFusionPredBase( t ) + s] = v;
         }
         else if( inTmp )
         {
@@ -709,6 +977,17 @@ void ccpMergePrediction( inout Tu t, int lid, int NT )
         }
       }
     }
+    if( fusionStep && inside != 0 )   // (list[1]'s prediction filtered into the fusion slot)
+    {
+      cccmSync();
+      Tu tf = t;   // (a CCCM block: cclmPredSample reads the prediction it stored)
+      tf.lm = 1 << LM_CCCM_SHIFT;
+      for( int s = lid; s < W * H; s += NT )
+      {
+        CBufI32( P.scratch ).v[cccmFusionPredBase( t ) + s] = cclmInsideFiltered( tf, t.x << 1, t.y << 1, s % W, s / W,
+                                                                                   maxPel, 0 );
+      }
+    }
     const int total = wgSum2( sad, 0, 2 ).x;
     if( cost && lid == 0 )
     {
@@ -716,23 +995,21 @@ void ccpMergePrediction( inout Tu t, int lid, int NT )
     }
     SYNC();
   }
-  // the chosen model as its LM block's (a merge fusion block's fields kept: storeRegion blends its CCCM prediction)
+  // the chosen model as its LM block's; a merge fusion block's fields kept: storeRegion blends its CCCM prediction in,
+  // decoder-derived fusion's list[1] with the weight 3 for list[0]
   const int type = ccpWord( x, CCP_OUT_TYPE );
   t.lm = ( t.lm & LM_FUSION_FIELDS ) | ( inside != 0 ? LM_INSIDE : 0 );
+  if( derived && s_ccp[CCP_DERIVED_SECOND] >= 0 )
+  {
+    t.lm |= LM_FUSION | ( 1 << LM_FUSION_TYPE_SHIFT ) | ( 3 << LM_FUSION_W_SHIFT );
+  }
   if( ccpLinear( type ) )
   {
     t.dirMode = ( type & CCP_TYPE_MMLM ) != 0 ? MMLM_CHROMA_IDX : LM_CHROMA_IDX;
     t.lm     |= LM_ACTIVE | ( ccpWord( x, CCP_OUT_GLM_IDC ) << LM_GLM_SHIFT );
     if( lid == 0 )
     {
-      const int m = CCLM_MODEL, c = t.comp - 1;
-      s_cclm[m + CCLM_A]      = int( ccpParam( x, false, c, 0 ) );
-      s_cclm[m + CCLM_B]      = int( ccpParam( x, false, c, 1 ) );
-      s_cclm[m + CCLM_SHIFT]  = ccpWord( x, CCP_OUT_SHIFT + c );
-      s_cclm[m + CCLM_A2]     = int( ccpParam( x, true, c, 0 ) );
-      s_cclm[m + CCLM_B2]     = int( ccpParam( x, true, c, 1 ) );
-      s_cclm[m + CCLM_SHIFT2] = ccpWord( x, CCP_OUT_SHIFT2 + c );
-      s_cclm[m + CCLM_THRES]  = ccpWord( x, CCP_OUT_Y_THRES );
+      ccpLoadLinear( t, x );
     }
   }
   else

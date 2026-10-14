@@ -106,10 +106,10 @@ void cccmTmpStore( int slot, int64_t v )
   s_tmp[4 * slot + 3] = p.w;
 }
 
-// CCP merge adjustment's on-the-fly models (intra_ccp.glsl's ccpFlyModels, deriveCcpMergeAdjustCands' fits): the
-// template's two lines next to the block alone (trainingRange 2), the reference samples alone (useRefSampOnly: the
-// template's row above the block and its column left of it take their own sample for the neighbour below / right of
-// it, which lies in the block)
+// the models a CCP merge block fits itself (intra_ccp.glsl's ccpFitModels: adjustment's on-the-fly ones,
+// deriveCcpMergeAdjustCands' fits; decoder-derived CCP fusion's): the template's two lines next to the block alone
+// (trainingRange 2), the reference samples alone (useRefSampOnly: the template's row above the block and its column
+// left of it take their own sample for the neighbour below / right of it, which lies in the block)
 bool g_ccpFlyTwoLines = false;
 bool g_ccpFlyRefOnly  = false;
 

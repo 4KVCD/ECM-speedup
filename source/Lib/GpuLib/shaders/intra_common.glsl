@@ -157,13 +157,15 @@ const int CCP_TYPE_GLCCCM = 32, CCP_TYPE_NSCCCM = 64, CCP_TYPE_MDFCCCM = 128;
 // entry at Tu::ccpMerge: where its CTU row's history begins in ccpData (the records CU::saveModelsInHCCP pushed into
 // cs.ccpLut before the CU, in decoding order), their number, the candidate the bitstream selects (idxNonLocalCCP - 1),
 // the first of the 24 records its blocks' default candidates take (after the PUs' records: the Cb block's 12, then
-// the Cr block's; with adjustment its on-the-fly models), its adjustment (ccpMergeAdjustFlag: 0 none, 1 the
-// coefficient of the co-located luma sample, 2 that, then those of its neighbours), the number of spatial sources,
-// then those records (PU::getCCPModelCandidateList's adjacent and non-adjacent positions' PUs, decoded before the CU,
-// typed, each once)
+// the Cr block's; with adjustment its on-the-fly models, for decoder-derived CCP fusion its models), its kind (the
+// adjustment, ccpMergeAdjustFlag: 0 none, 1 the coefficient of the co-located luma sample, 2 that, then those of its
+// neighbours; CCP_KIND_DERIVED a block of decoder-derived CCP fusion, which shares the merge code: no sources, no
+// history), the number of spatial sources, then those records (PU::getCCPModelCandidateList's adjacent and
+// non-adjacent positions' PUs, decoded before the CU, typed, each once)
 const int CCP_WRITERS = 2;
 const int CCP_MERGE_HIST = 0, CCP_MERGE_HIST_NUM = 1, CCP_MERGE_INDEX = 2, CCP_MERGE_DEFAULTS = 3;
-const int CCP_MERGE_ADJUST = 4, CCP_MERGE_NUM_SPATIAL = 5, CCP_MERGE_SPATIAL = 6;
+const int CCP_MERGE_KIND = 4, CCP_MERGE_NUM_SPATIAL = 5, CCP_MERGE_SPATIAL = 6;
+const int CCP_KIND_DERIVED = 3;
 
 // Tu::derive
 const int DERIVE_NODE     = 32;  // not a block: the derivation of the mode of CU Tu::cu, before the CU's blocks

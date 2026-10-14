@@ -428,7 +428,9 @@ the reconstruction buffer; works in every frame-thread context):
   is CCP merge fusion with CCCM: in all-intra streams the merge prediction averaged with a two-model CCCM prediction.
   M48 is CCP merge fusion with DIMD chroma: the merge prediction averaged with the CU's DIMD chroma mode's. M49 is
   CCP merge adjustment: CCCM candidates alone, up to six models fitted on the fly, and the chosen model's
-  coefficients moved by template costs.
+  coefficients moved by template costs. M50 is decoder-derived CCP fusion: a chroma CU fits a CCLM model and CCCM
+  models itself, ranks them (and LBCCP's inside filter on two of them) by their predictions of the lines next to the
+  block, and predicts with the best one or, where it fits those lines better, a 3 : 1 blend of the best pair.
   GpuIntraRec::supported()
   rejects every tool whose mode derivation or prediction reads reconstructed samples or that the kernels lack, before
   anything is skipped. All 19 regular streams now fall back to the CPU at chroma reordering / DBV, the next
