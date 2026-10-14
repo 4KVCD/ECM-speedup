@@ -615,16 +615,22 @@ void InterSearch::ReusedUniMvs::create( unsigned numPositions, unsigned numSizes
   m_numPositions = numPositions;
   m_numSizes     = numSizes;
   m_numEntries   = size_t( numPositions ) * numPositions * numSizes * numSizes;
-  m_mvs.reset( static_cast<MvSet*>( std::calloc( m_numEntries, sizeof( MvSet ) ) ) );
+  m_chunks.clear();
+  m_chunks.resize( size_t( numSizes ) * numSizes );
   m_filled.reset( static_cast<bool*>( std::calloc( m_numEntries, sizeof( bool ) ) ) );
-  CHECK( !m_mvs || !m_filled, "out of memory" );
+  CHECK( !m_filled, "out of memory" );
 }
 
 void InterSearch::ReusedUniMvs::store( unsigned x, unsigned y, unsigned w, unsigned h, const MvSet& mvs )
 {
-  const size_t i = index( x, y, w, h );
-  ::memcpy( m_mvs.get()[i], mvs, sizeof( MvSet ) );
-  m_filled.get()[i] = true;
+  std::unique_ptr<MvSet[], FreeDeleter>& sets = m_chunks[chunk( w, h )];
+  if( !sets )
+  {
+    sets.reset( static_cast<MvSet*>( std::calloc( size_t( m_numPositions ) * m_numPositions, sizeof( MvSet ) ) ) );
+    CHECK( !sets, "out of memory" );
+  }
+  ::memcpy( sets.get()[position( x, y )], mvs, sizeof( MvSet ) );
+  m_filled.get()[index( x, y, w, h )] = true;
 }
 
 void InterSearch::resetSavedAffineMotion()

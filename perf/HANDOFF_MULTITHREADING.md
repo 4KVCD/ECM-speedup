@@ -218,6 +218,9 @@ Commits on `enc-mt`, all bit-exact with stock ECM-20.0 (bitstream md5 of the sui
   stack with 30 KB used (R10); at CIF after 900 s nearly every picture of the window (286 of 288) held its motion
   field, original and reconstruction: finished pictures keep them until their buffer is reused, and completed periods
   wait for earlier ones' output (R11).
+- RAM step R10: `InterSearch::ReusedUniMvs` keeps its motion vector sets in a chunk per block size (w, h), made at
+  the first store into that size (34 MB a table before, two per stack, about 30 KB used early and 7 MB after 900 s).
+  1080p, 20 threads, 75-150 s: commit 12.47 -> 11.22 GB; working set unchanged.
 - Speed step S1: in all intra, the pictures waiting for a search stack take them in order of decreasing luma activity
   (`EncGOP::xFtSearchPriority`, the cost estimate of `--ParallelSegments`) instead of coding order, so the expensive
   pictures do not start last. AI 33 pictures, 2 runs each alternating with the previous build: 8 P-cores 34.5 -> 33.0 s

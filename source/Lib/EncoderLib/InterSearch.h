@@ -1113,7 +1113,11 @@ public:
 
     void create( unsigned numPositions, unsigned numSizes );
     bool         isFilled( unsigned x, unsigned y, unsigned w, unsigned h ) const { return m_filled.get()[index( x, y, w, h )]; }
-    const MvSet& mvs( unsigned x, unsigned y, unsigned w, unsigned h ) const { return m_mvs.get()[index( x, y, w, h )]; }
+    const MvSet& mvs( unsigned x, unsigned y, unsigned w, unsigned h ) const
+    {
+      CHECKD( !m_chunks[chunk( w, h )], "No motion vectors stored for this block size" );
+      return m_chunks[chunk( w, h )].get()[position( x, y )];
+    }
     void         store( unsigned x, unsigned y, unsigned w, unsigned h, const MvSet& mvs );
     void         reset() { ::memset( m_filled.get(), 0, m_numEntries ); }
 
@@ -1122,16 +1126,27 @@ public:
     {
       void operator()( void* p ) const { std::free( p ); }
     };
+    unsigned chunk( unsigned w, unsigned h ) const
+    {
+      CHECKD( w >= m_numSizes || h >= m_numSizes, "Block larger than the CTU" );
+      return w * m_numSizes + h;
+    }
+    unsigned position( unsigned x, unsigned y ) const
+    {
+      CHECKD( x >= m_numPositions || y >= m_numPositions, "Block outside the CTU" );
+      return x * m_numPositions + y;
+    }
     size_t index( unsigned x, unsigned y, unsigned w, unsigned h ) const
     {
-      CHECKD( x >= m_numPositions || y >= m_numPositions || w >= m_numSizes || h >= m_numSizes, "Block outside the CTU" );
-      return ( ( size_t( x ) * m_numPositions + y ) * m_numSizes + w ) * m_numSizes + h;
+      return size_t( chunk( w, h ) ) * m_numPositions * m_numPositions + position( x, y );
     }
     unsigned m_numPositions = 0;   ///< 4x4 positions per CTU row
     unsigned m_numSizes     = 0;   ///< block size indices (gp_sizeIdxInfo) up to the CTU size
     size_t   m_numEntries   = 0;
-    std::unique_ptr<MvSet[], FreeDeleter> m_mvs;
-    std::unique_ptr<bool[], FreeDeleter>  m_filled;
+    /// the sets per block size (w, h), each made at the first store into that size: a table of every position and
+    /// size took 34 MB (two per search stack) with about 30 KB in use
+    std::vector<std::unique_ptr<MvSet[], FreeDeleter>> m_chunks;
+    std::unique_ptr<bool[], FreeDeleter>              m_filled;
   };
   ReusedUniMvs& getReusedUniMvs( bool lic ) { return m_reusedUniMvs[lic ? 1 : 0]; }
   void          resetReusedUniMvs( bool lic ) { m_reusedUniMvs[lic ? 1 : 0].reset(); }
