@@ -41,6 +41,10 @@
 
 #include "EncLib.h"
 #include "EncGOP.h"
+
+#include <deque>
+#include <functional>
+#include <thread>
 #include "Analyze.h"
 #include "libmd5/MD5.h"
 #include "CommonLib/SEI.h"
@@ -83,6 +87,499 @@ int getLSB(int poc, int maxLSB)
   {
     return (maxLSB - ((-poc) % maxLSB)) % maxLSB;
   }
+}
+
+thread_local int             EncGOP::m_iNumPicCoded   = 0;
+thread_local EncSlice*       EncGOP::m_pcSliceEncoder = nullptr;
+thread_local EncSearchStack* EncGOP::m_pcSearchStack  = nullptr;
+thread_local EncPicOrder*    EncGOP::m_pcPicOrder     = nullptr;
+thread_local int64_t         EncGOP::m_ftTurn         = 0;
+thread_local RdCost*          EncGOP::m_pcSetupRdCost     = nullptr;
+thread_local EncReshape*      EncGOP::m_pcSetupReshaper   = nullptr;
+thread_local CABACEncoder*    EncGOP::m_pcFinishCabac     = nullptr;
+thread_local CtxCache*        EncGOP::m_pcFinishCtxCache  = nullptr;
+thread_local IntraPrediction* EncGOP::m_pcFinishIntraPred = nullptr;
+thread_local RdCost*          EncGOP::m_pcFinishRdCost    = nullptr;
+thread_local EncReshape*      EncGOP::m_pcFinishReshaper  = nullptr;
+thread_local HLSWriter*               EncGOP::m_HLSWriter        = nullptr;
+thread_local LoopFilter*              EncGOP::m_pcLoopFilter     = nullptr;
+#if JVET_AA0096_MC_BOUNDARY_PADDING
+thread_local InterPrediction*         EncGOP::m_pcFrameMcPadPrediction = nullptr;
+#endif
+thread_local EncSampleAdaptiveOffset* EncGOP::m_pcSAO            = nullptr;
+thread_local EncAdaptiveLoopFilter*   EncGOP::m_pcALF            = nullptr;
+thread_local ParameterSetMap<APS>*    EncGOP::m_pcApsMap         = nullptr;
+#if JVET_AL0153_ALF_CCCM
+thread_local EncLoopFilterCccm*       EncGOP::m_pcLoopFilterCccm = nullptr;
+#endif
+thread_local bool                     EncGOP::m_audIrapOrGdrAuFlag            = false;
+thread_local bool                     EncGOP::m_bufferingPeriodSEIPresentInAU = false;
+#if EMBEDDED_APS
+thread_local std::vector<APS>         EncGOP::m_aps;
+#endif
+
+// Worker threads for the frame threads. They are started when first needed and never end (the process ends them): a
+// thread that exits runs the destructors of its thread_local objects, which crashes with MinGW's emulated TLS.
+namespace
+{
+struct FtPool
+{
+  std::mutex                         mutex;
+  std::condition_variable            cv;
+  std::deque<std::function<void()>>  jobs;
+  int                                numThreads = 0;
+  int                                numIdle    = 0;
+};
+FtPool& ftPool()
+{
+  static FtPool* pool = new FtPool;   // never destroyed: the workers may still wait on it when the process ends
+  return *pool;
+}
+}   // namespace
+
+void EncGOP::xFtRunInPool( std::function<void()> job )
+{
+  FtPool& pool = ftPool();
+  std::lock_guard<std::mutex> lock( pool.mutex );
+  pool.jobs.push_back( std::move( job ) );
+  if( pool.numIdle < (int) pool.jobs.size() )
+  {
+    // every job may block until later ones run, so each queued job needs a thread of its own
+    pool.numThreads++;
+    pool.numIdle++;
+    std::thread( [&pool]()
+    {
+      std::unique_lock<std::mutex> lock( pool.mutex );
+      while( true )
+      {
+        pool.cv.wait( lock, [&]() { return !pool.jobs.empty(); } );
+        std::function<void()> job = std::move( pool.jobs.front() );
+        pool.jobs.pop_front();
+        pool.numIdle--;
+        lock.unlock();
+        job();
+        lock.lock();
+        pool.numIdle++;
+      }
+    } ).detach();
+  }
+  pool.cv.notify_one();
+}
+
+template<class Pred> void EncGOP::xFtWait( Pred pred )
+{
+  std::unique_lock<std::mutex> lock( m_ftMutex );
+  m_ftCv.wait( lock, [&]() { return m_ftError || pred(); } );
+  if( m_ftError )
+  {
+    throw FtAbort();
+  }
+}
+
+void EncGOP::compressGOPFrameThreads( int numPics, int iPOCLast, int iNumPicRcvd, PicList& rcListPic,
+                                      std::list<PelUnitBuf*>& rcListPicYuvRecOut, bool isField, bool isTff,
+                                      const InputColourSpaceConversion snr_conversion, const bool printFrameMSE,
+#if MSSIM_UNIFORM_METRICS_LOG
+                                      const bool printMSSSIM,
+#endif
+                                      bool isEncodeLtRef )
+{
+  if( !m_ftActive )
+  {
+    m_ftActive     = true;
+    m_ftSetupTurn  = 0;
+    m_ftInputWaits = false;
+    m_ftPeriods    = m_pcEncLib->getNumFinishContexts();
+    m_ftPeriod     = -1;
+    m_ftCtxLast.assign( m_ftPeriods, nullptr );
+    m_ftFirstNotFinished = 0;
+    m_ftFinishedAhead.clear();
+    m_ftOutputTurn = 0;
+    m_ftNumTurns   = 0;
+    m_ftNumDone    = 0;
+    m_ftNumFinished = 0;
+    m_ftError      = false;
+    m_ftFirstError = nullptr;
+    m_ftStackBusy.assign( m_pcEncLib->getNumSearchStacks(), false );
+    m_ftStackWaiters.clear();
+    m_ftStackHolders.clear();
+    m_ftRefsInFlight.clear();
+#if JVET_AI0136_ADAPTIVE_DUAL_TREE
+    m_ftWriterPartitionerSST.reset();
+#endif
+    m_ftPicsInFlight.clear();
+    m_ftPicsFinished.clear();
+  }
+  int64_t firstTurn;
+  {
+    std::lock_guard<std::mutex> lock( m_ftMutex );   // the searches read it (xFtAcquireStack)
+    firstTurn = m_ftNumTurns;
+    m_ftNumTurns += numPics;
+  }
+  // the GOP's arguments by value: the call returns before the pictures are done
+  for( int i = 0; i < numPics; i++ )
+  {
+    xFtRunInPool( [=, &rcListPic, &rcListPicYuvRecOut]()
+    {
+      m_ftTurn = firstTurn + i;
+      xUseFinishContext( EncFinishContext() );   // the finish sets its period's (xStartPicFinish)
+      try
+      {
+        compressGOP( iPOCLast, iNumPicRcvd, rcListPic, rcListPicYuvRecOut, isField, isTff, snr_conversion, printFrameMSE,
+#if MSSIM_UNIFORM_METRICS_LOG
+                     printMSSSIM,
+#endif
+                     isEncodeLtRef, i );
+      }
+      catch( const FtAbort& )
+      {
+      }
+      catch( ... )
+      {
+        std::lock_guard<std::mutex> lock( m_ftMutex );
+        if( !m_ftError )
+        {
+          m_ftFirstError = std::current_exception();
+          m_ftError      = true;
+        }
+      }
+      g_msgCapture = nullptr;
+      std::lock_guard<std::mutex> lock( m_ftMutex );
+      m_ftNumDone++;
+      m_ftCv.notify_all();
+    } );
+  }
+}
+
+void EncGOP::waitFrameThreads( int64_t maxPending )
+{
+  std::unique_lock<std::mutex> lock( m_ftMutex );
+  const auto ready = [&]() { return m_ftError || m_ftNumTurns - m_ftNumDone <= maxPending; };
+  if( !ready() )
+  {
+    // no picture is passed in until it returns: all-intra searches may take stacks (xFtAcquireStack)
+    m_ftInputWaits = true;
+    m_ftCv.notify_all();
+    m_ftCv.wait( lock, ready );
+    m_ftInputWaits = false;
+  }
+  if( m_ftError )
+  {
+    // the other pictures stop at their next wait (FtAbort)
+    m_ftCv.wait( lock, [&]() { return m_ftNumDone == m_ftNumTurns; } );
+    std::rethrow_exception( m_ftFirstError );
+  }
+}
+
+bool EncGOP::waitFrameThreadsFinished( int64_t& numFinished )
+{
+  std::unique_lock<std::mutex> lock( m_ftMutex );
+  // no picture is passed in any more: all-intra searches may take stacks (xFtAcquireStack), else none would start
+  m_ftInputWaits = true;
+  m_ftCv.notify_all();
+  m_ftCv.wait( lock, [&]() { return m_ftError || m_ftNumFinished > numFinished || m_ftNumDone == m_ftNumTurns; } );
+  m_ftInputWaits = false;
+  numFinished = m_ftNumFinished;
+  return m_ftError || m_ftNumDone == m_ftNumTurns;   // an error: finishFrameThreads rethrows it
+}
+
+void EncGOP::finishFrameThreads()
+{
+  if( !m_ftActive )
+  {
+    return;
+  }
+  waitFrameThreads( 0 );
+  m_ftActive = false;
+  if( m_lastPicOrder && m_lastPicOrder->picHeader )
+  {
+    // the shared picture header continues from the last picture (xUsePicHeaderCopy)
+    *m_lastPicOrder->sharedPicHeader = *m_lastPicOrder->picHeader;
+  }
+}
+
+bool EncGOP::isPicReferencedInFlight( const Picture* pic )
+{
+  std::lock_guard<std::mutex> lock( m_ftMutex );
+  return m_ftRefsInFlight.count( pic ) > 0;
+}
+
+void EncGOP::forgetPicFinished( const Picture* pic )
+{
+  std::lock_guard<std::mutex> lock( m_ftMutex );
+  m_ftPicsFinished.erase( pic );
+}
+
+bool EncGOP::isPicFinished( const Picture* pic )
+{
+  std::lock_guard<std::mutex> lock( m_ftMutex );
+  return m_ftPicsFinished.count( pic ) > 0;
+}
+
+void EncGOP::xFtSkip( int64_t turn )
+{
+  {
+    std::lock_guard<std::mutex> lock( m_ftMutex );
+    m_ftSetupTurn = turn + 1;
+    xFtMarkFinished( turn );
+    m_ftCv.notify_all();
+  }
+  if( m_ftPeriods > 1 )
+  {
+    xFtWait( [&]() { return m_ftOutputTurn == turn; } );
+    std::lock_guard<std::mutex> lock( m_ftMutex );
+    m_ftOutputTurn = turn + 1;
+    m_ftCv.notify_all();
+  }
+}
+
+void EncGOP::xFtMarkFinished( int64_t turn )
+{
+  m_ftFinishedAhead.insert( turn );
+  while( m_ftFinishedAhead.count( m_ftFirstNotFinished ) )
+  {
+    m_ftFinishedAhead.erase( m_ftFirstNotFinished++ );
+  }
+}
+
+void EncGOP::xFtOutput( EncPicOrder& order )
+{
+  // several periods at a time: the finishes' logs, access units and PSNR sums go out in coding order
+  xFtWait( [&]() { return m_ftOutputTurn == order.turn; } );
+  if( order.analyze )
+  {
+    m_gcAnalyzeAll.add( order.analyze->all );
+    m_gcAnalyzeI.add( order.analyze->i );
+    m_gcAnalyzeP.add( order.analyze->p );
+    m_gcAnalyzeB.add( order.analyze->b );
+#if WCG_WPSNR
+    m_gcAnalyzeWPSNR.add( order.analyze->wpsnr );
+#endif
+    m_vRVM_RP.insert( m_vRVM_RP.end(), order.analyze->rvmBits.begin(), order.analyze->rvmBits.end() );
+  }
+  fputs( order.log.c_str(), stdout );
+  fflush( stdout );
+  if( order.au )
+  {
+    m_AUWriterIf->outputAU( *order.au );
+  }
+  order.log = std::string();
+  order.au.reset();
+  order.analyze.reset();
+  std::lock_guard<std::mutex> lock( m_ftMutex );
+  m_ftOutputTurn = order.turn + 1;
+  m_ftCv.notify_all();
+}
+
+void EncGOP::xUseFinishContext( const EncFinishContext& ctx )
+{
+  m_pcALF            = ctx.alf;
+  m_pcSAO            = ctx.sao;
+  m_pcLoopFilter     = ctx.loopFilter;
+#if JVET_AL0153_ALF_CCCM
+  m_pcLoopFilterCccm = ctx.loopFilterCccm;
+#endif
+#if JVET_AA0096_MC_BOUNDARY_PADDING
+  m_pcFrameMcPadPrediction = ctx.mcPad;
+#endif
+  m_HLSWriter        = ctx.hlsWriter;
+  m_pcApsMap         = ctx.apsMap;
+}
+
+void EncGOP::xFtAcquireStack( EncPicOrder& order )
+{
+  // A picture whose search inputs are done takes the first free stack, the waiting picture of the highest search
+  // priority first (xFtSearchPriority: the earliest, or for all-intra coding the most expensive). The
+  // earliest picture not done, whose finish waits for no other picture, has a stack or one stays free for it: so the
+  // pictures holding the stacks cannot all wait for a picture without one. Only the first waiter takes a stack, or
+  // the earliest picture the one kept for it (it need not be the first in priority order), so the condition still
+  // holds when one does. In all intra, the setups take microseconds, so each picture would take a
+  // free stack as soon as its setup ends and the first N would start in coding order: the waiters take stacks only
+  // while the input side waits (waitFrameThreads: at the in-flight limit or at the end) and every picture passed is
+  // set up, so that the priority order covers them all.
+  {
+    std::lock_guard<std::mutex> lock( m_ftMutex );
+    m_ftStackWaiters.insert( { -order.searchPriority, order.turn } );
+  }
+  const bool allIntra = m_pcCfg->getIntraPeriod() == 1;
+  xFtWait( [&]()
+  {
+    if( allIntra && !( m_ftInputWaits && m_ftSetupTurn == m_ftNumTurns ) )
+    {
+      return false;
+    }
+    const int64_t earliest = m_ftFirstNotFinished;
+    const int     numFree  = int( std::count( m_ftStackBusy.begin(), m_ftStackBusy.end(), false ) );
+    const bool    first    = m_ftStackWaiters.begin()->second == order.turn;
+    return numFree > 0
+           && ( order.turn == earliest || ( first && ( m_ftStackHolders.count( earliest ) || numFree > 1 ) ) );
+  } );
+  std::lock_guard<std::mutex> lock( m_ftMutex );
+  m_ftStackWaiters.erase( { -order.searchPriority, order.turn } );
+  order.stackIdx = int( std::find( m_ftStackBusy.begin(), m_ftStackBusy.end(), false ) - m_ftStackBusy.begin() );
+  m_ftStackBusy[order.stackIdx] = true;
+  m_ftStackHolders.insert( order.turn );
+  m_ftCv.notify_all();   // the next waiter may take one too
+}
+
+void EncGOP::xFtReleaseStack( EncPicOrder& order )
+{
+  // the finish uses the stack of its context, with these copies
+  order.finishRdCost.reset( new RdCost( m_pcSearchStack->rdCost ) );
+  order.finishReshaper.reset( new EncReshape( m_pcSearchStack->reshaper ) );
+#if JVET_AI0136_ADAPTIVE_DUAL_TREE
+  order.finishPartitionerSST.reset( new QTBTPartitioner( m_pcSearchStack->cabacEncoder.getPartitionerSST() ) );
+#endif
+#if JVET_AG0098_AMVP_WITH_SBTMVP
+  order.finishAmvpSbTmvpArea = m_pcSliceEncoder->m_picAmvpSbTmvpEnabledArea;   // the search reset it; the writer counts
+#endif
+  m_pcSearchStack  = nullptr;
+  m_pcSliceEncoder = nullptr;
+  std::lock_guard<std::mutex> lock( m_ftMutex );
+  m_ftStackBusy[order.stackIdx] = false;
+  m_ftStackHolders.erase( order.turn );
+  m_ftCv.notify_all();
+}
+
+void EncGOP::xFtEndSetup( EncPicOrder& order )
+{
+  // The references stay in use until the picture is done. Later setups may already have marked them unused for
+  // reference (the next intra period's CRA marks the previous one's pictures), and EncLib may read new pictures into
+  // buffers that are not referenced (isPicReferencedInFlight).
+  const Slice& slice = *order.pic->slices[0];
+  for( int list = 0; list < NUM_REF_PIC_LIST_01; list++ )
+  {
+    for( int refIdx = 0; refIdx < slice.getNumRefIdx( RefPicList( list ) ); refIdx++ )
+    {
+      order.refs.push_back( slice.getRefPic( RefPicList( list ), refIdx ) );
+    }
+  }
+  std::lock_guard<std::mutex> lock( m_ftMutex );
+  for( const Picture* ref: order.refs )
+  {
+    m_ftRefsInFlight[ref]++;
+  }
+  m_ftPicsInFlight.insert( order.pic );
+  m_ftSetupTurn = order.turn + 1;
+  m_ftCv.notify_all();
+}
+
+void EncGOP::xFtWaitSearchInputs( Slice* slice, EncPicOrder& order )
+{
+  // the CABAC init table of the previous picture, unless loaded contexts replace what it initialises
+  const bool needPrevious = order.cabacTableIdxDeferred
+#if JVET_Z0135_TEMP_CABAC_WIN_WEIGHT
+                            && !( order.ctxSource && slice->getSPS()->getTempCabacInitMode() )
+#endif
+    ;
+  xFtWait( [&]()
+  {
+    for( int list = 0; list < NUM_REF_PIC_LIST_01; list++ )
+    {
+      for( int refIdx = 0; refIdx < slice->getNumRefIdx( RefPicList( list ) ); refIdx++ )
+      {
+        if( m_ftPicsInFlight.count( slice->getRefPic( RefPicList( list ), refIdx ) ) )
+        {
+          return false;
+        }
+      }
+    }
+#if JVET_Z0135_TEMP_CABAC_WIN_WEIGHT
+    if( order.ctxSource && !order.ctxSource->finished )
+    {
+      return false;
+    }
+#endif
+#if JVET_AG0098_AMVP_WITH_SBTMVP
+    if( order.sbTmvpSource && !order.sbTmvpSource->finished )
+    {
+      return false;
+    }
+#endif
+    for( const auto& contributor: order.amaxbtContributors )
+    {
+      if( !contributor->finished )
+      {
+        return false;
+      }
+    }
+    return !( needPrevious && order.previous && !order.previous->finished );
+  } );
+}
+
+PicHeader* EncGOP::xUsePicHeaderCopy( Picture* pic, EncPicOrder& order )
+{
+  // The pictures share one picture header (EncLib's), which every setup changes. The search and the finish use a copy
+  // as the setup leaves it, so the next picture's setup can run at the same time. The copy goes back to the shared
+  // header when the picture is done (xEndPicture), with frame threads after the last picture (finishFrameThreads).
+  // With frame threads, the copy is the picture's own: the setup stack's would change with the next setup.
+  if( m_ftActive )
+  {
+    order.picHeader.reset( new PicHeader );
+  }
+  PicHeader& copy         = m_ftActive ? *order.picHeader : m_pcSearchStack->picHeader;
+  order.sharedPicHeader   = pic->cs->picHeader;
+  order.referencedAtSetup = pic->referenced;
+  copy                    = *order.sharedPicHeader;
+  pic->cs->picHeader      = &copy;
+  for( Slice* slice: pic->slices )
+  {
+    slice->setPicHeader( &copy );
+  }
+
+  // With frame threads, the next picture's setup runs before this picture's header is written. Of the values that
+  // HLSWriter::codePictureHeader sets, the next pictures read only these before setting them: every setup sets the
+  // others, or only the finish that sets them reads them, or they never change.
+  if( m_ftActive && copy.getPicInterSliceAllowedFlag() )
+  {
+    const SPS& sps = *pic->cs->sps;
+    if( sps.getUseAffine() )
+    {
+      order.sharedPicHeader->setMaxNumAffineMergeCand( sps.getMaxNumAffineMergeCand() );
+#if JVET_AG0276_LIC_FLAG_SIGNALING
+      order.sharedPicHeader->setMaxNumAffineOppositeLicMergeCand( sps.getMaxNumAffineOppositeLicMergeCand() );
+#endif
+    }
+    else
+    {
+      order.sharedPicHeader->setMaxNumAffineMergeCand( sps.getSbTMVPEnabledFlag() && copy.getEnableTMVPFlag() );
+#if JVET_AG0276_LIC_FLAG_SIGNALING
+      order.sharedPicHeader->setMaxNumAffineOppositeLicMergeCand( 0 );
+#endif
+    }
+  }
+  return &copy;
+}
+
+void EncGOP::xEndPicture( EncPicOrder& order )
+{
+  // the picture header copy goes back (xUsePicHeaderCopy)
+  order.pic->cs->picHeader = order.sharedPicHeader;
+  for( Slice* slice: order.pic->slices )
+  {
+    slice->setPicHeader( order.sharedPicHeader );
+  }
+  if( !m_ftActive )
+  {
+    *order.sharedPicHeader = m_pcSearchStack->picHeader;
+    order.finished         = true;
+    return;
+  }
+  std::lock_guard<std::mutex> lock( m_ftMutex );
+  order.finished = true;
+  m_ftPicsInFlight.erase( order.pic );
+  m_ftPicsFinished.insert( order.pic );
+  m_ftNumFinished++;
+  for( const Picture* ref: order.refs )
+  {
+    if( --m_ftRefsInFlight[ref] == 0 )
+    {
+      m_ftRefsInFlight.erase( ref );
+    }
+  }
+  order.refs.clear();
+  xFtMarkFinished( order.turn );
+  m_ftCv.notify_all();
 }
 
 EncGOP::EncGOP()
@@ -229,6 +726,7 @@ void EncGOP::init ( EncLib* pcEncLib )
   m_pcLoopFilter         = pcEncLib->getLoopFilter();
   m_pcSAO                = pcEncLib->getSAO();
   m_pcALF                = pcEncLib->getALF();
+  m_pcApsMap             = pcEncLib->getApsMap();
   m_pcRateCtrl           = pcEncLib->getRateCtrl();
 #if JVET_AL0153_ALF_CCCM
   m_pcLoopFilterCccm     = pcEncLib->getLoopFilterCccmEncoder();
@@ -256,23 +754,39 @@ void EncGOP::init ( EncLib* pcEncLib )
 
 
 #if WCG_EXT
-  if (m_pcCfg->getLmcs())
+  // m_lmcsWeights holds the luma level weights in coding order; every search stack starts with the same
+  std::vector<RdCost*> lumaWeightOwners = { &m_lmcsWeights };
+  for( int i = 0; i < pcEncLib->getNumSearchStacks(); i++ )
   {
-    pcEncLib->getRdCost()->setReshapeInfo(m_pcCfg->getReshapeSignalType(), m_pcCfg->getBitDepth(CHANNEL_TYPE_LUMA));
-    pcEncLib->getRdCost()->initLumaLevelToWeightTableReshape();
+    lumaWeightOwners.push_back( &pcEncLib->getSearchStack( i ).rdCost );
   }
-  else if (m_pcCfg->getLumaLevelToDeltaQPMapping().mode)
+  if( pcEncLib->getSetupStack() )
   {
-    pcEncLib->getRdCost()->setReshapeInfo(RESHAPE_SIGNAL_PQ, m_pcCfg->getBitDepth(CHANNEL_TYPE_LUMA));
-    pcEncLib->getRdCost()->initLumaLevelToWeightTableReshape();
+    lumaWeightOwners.push_back( &pcEncLib->getSetupStack()->rdCost );
   }
-  pcEncLib->getALF()->getLumaLevelWeightTable() = pcEncLib->getRdCost()->getLumaLevelWeightTable();
+  for( RdCost* rdCost: lumaWeightOwners )
+  {
+    if (m_pcCfg->getLmcs())
+    {
+      rdCost->setReshapeInfo(m_pcCfg->getReshapeSignalType(), m_pcCfg->getBitDepth(CHANNEL_TYPE_LUMA));
+      rdCost->initLumaLevelToWeightTableReshape();
+    }
+    else if (m_pcCfg->getLumaLevelToDeltaQPMapping().mode)
+    {
+      rdCost->setReshapeInfo(RESHAPE_SIGNAL_PQ, m_pcCfg->getBitDepth(CHANNEL_TYPE_LUMA));
+      rdCost->initLumaLevelToWeightTableReshape();
+    }
+  }
+  pcEncLib->getALF()->getLumaLevelWeightTable() = m_lmcsWeights.getLumaLevelWeightTable();
   int alfWSSD = 0;
   if (m_pcCfg->getLmcs() && m_pcCfg->getReshapeSignalType() == RESHAPE_SIGNAL_PQ )
   {
     alfWSSD = 1;
   }
-  pcEncLib->getALF()->setAlfWSSD(alfWSSD);
+  for( int i = 0; i < pcEncLib->getNumFinishContexts(); i++ )
+  {
+    pcEncLib->getFinishContext( i ).alf->setAlfWSSD( alfWSSD );
+  }
 #endif
   m_pcReshaper = pcEncLib->getReshaper();
 
@@ -530,6 +1044,7 @@ void EncGOP::xWriteSEI (NalUnitType naluType, SEIMessages& seiMessages, AccessUn
   {
     return;
   }
+  std::lock_guard<std::mutex> seiLock( m_ftSeiMutex );   // finishes of several periods
   OutputNALUnit nalu( naluType, m_pcEncLib->getLayerId(), temporalId );
   m_seiWriter.writeSEImessages(nalu.m_Bitstream, seiMessages, *m_HRD, false, temporalId);
   auPos = accessUnit.insert(auPos, new NALUnitEBSP(nalu));
@@ -538,6 +1053,7 @@ void EncGOP::xWriteSEI (NalUnitType naluType, SEIMessages& seiMessages, AccessUn
 
 void EncGOP::xWriteSEISeparately (NalUnitType naluType, SEIMessages& seiMessages, AccessUnit &accessUnit, AccessUnit::iterator &auPos, int temporalId)
 {
+  std::lock_guard<std::mutex> seiLock( m_ftSeiMutex );   // finishes of several periods
   // don't do anything, if we get an empty list
   if (seiMessages.empty())
   {
@@ -1925,14 +2441,14 @@ void EncGOP::xPicInitLMCS(Picture *pic, PicHeader *picHeader, Slice *slice)
       if (m_pcCfg->getReshapeSignalType() == RESHAPE_SIGNAL_PQ)
       {
         m_pcReshaper->initLUTfromdQPModel();
-        m_pcEncLib->getRdCost()->updateReshapeLumaLevelToWeightTableChromaMD(m_pcReshaper->getInvLUT());
+        m_lmcsWeights.updateReshapeLumaLevelToWeightTableChromaMD(m_pcReshaper->getInvLUT());
       }
       else if (m_pcCfg->getReshapeSignalType() == RESHAPE_SIGNAL_SDR || m_pcCfg->getReshapeSignalType() == RESHAPE_SIGNAL_HLG)
       {
         if (m_pcReshaper->getReshapeFlag())
         {
           m_pcReshaper->constructReshaperLMCS();
-          m_pcEncLib->getRdCost()->updateReshapeLumaLevelToWeightTable(m_pcReshaper->getSliceReshaperInfo(), m_pcReshaper->getWeightTable(), m_pcReshaper->getCWeight());
+          m_lmcsWeights.updateReshapeLumaLevelToWeightTable(m_pcReshaper->getSliceReshaperInfo(), m_pcReshaper->getWeightTable(), m_pcReshaper->getCWeight());
         }
       }
       else
@@ -1959,7 +2475,7 @@ void EncGOP::xPicInitLMCS(Picture *pic, PicHeader *picHeader, Slice *slice)
 
       if (m_pcCfg->getReshapeSignalType() == RESHAPE_SIGNAL_PQ)
       {
-        m_pcEncLib->getRdCost()->restoreReshapeLumaLevelToWeightTable();
+        m_lmcsWeights.restoreReshapeLumaLevelToWeightTable();
       }
       else if (m_pcCfg->getReshapeSignalType() == RESHAPE_SIGNAL_SDR || m_pcCfg->getReshapeSignalType() == RESHAPE_SIGNAL_HLG)
       {
@@ -1974,7 +2490,7 @@ void EncGOP::xPicInitLMCS(Picture *pic, PicHeader *picHeader, Slice *slice)
         {
           m_pcReshaper->getSliceReshaperInfo().setSliceReshapeModelPresentFlag(true);
           m_pcReshaper->constructReshaperLMCS();
-          m_pcEncLib->getRdCost()->updateReshapeLumaLevelToWeightTable(m_pcReshaper->getSliceReshaperInfo(), m_pcReshaper->getWeightTable(), m_pcReshaper->getCWeight());
+          m_lmcsWeights.updateReshapeLumaLevelToWeightTable(m_pcReshaper->getSliceReshaperInfo(), m_pcReshaper->getWeightTable(), m_pcReshaper->getCWeight());
         }
       }
       else
@@ -1982,6 +2498,9 @@ void EncGOP::xPicInitLMCS(Picture *pic, PicHeader *picHeader, Slice *slice)
         THROW("Reshaper for other signal currently not defined!");
       }
     }
+
+    // the picture's search uses the weights as they are after its LMCS setup
+    m_pcSetupRdCost->copyReshapeLumaLevelWeights( m_lmcsWeights );
 
     //set all necessary information in LMCS APS and picture header
     picHeader->setLmcsEnabledFlag(m_pcReshaper->getSliceReshaperInfo().getUseSliceReshaper());
@@ -1994,6 +2513,11 @@ void EncGOP::xPicInitLMCS(Picture *pic, PicHeader *picHeader, Slice *slice)
       APS* lmcsAPS = picHeader->getLmcsAPS();
       if (lmcsAPS == nullptr)
       {
+        std::unique_lock<std::mutex> apsMapLock( m_ftApsMapMutex, std::defer_lock );
+        if( m_ftActive )
+        {
+          apsMapLock.lock();   // a finish may change the map at the same time
+        }
         ParameterSetMap<APS> *apsMap = m_pcEncLib->getApsMap();
         lmcsAPS = apsMap->getPS((apsId << NUM_APS_TYPE_LEN) + LMCS_APS);
         if (lmcsAPS == NULL)
@@ -2004,15 +2528,7 @@ void EncGOP::xPicInitLMCS(Picture *pic, PicHeader *picHeader, Slice *slice)
         }
         picHeader->setLmcsAPS(lmcsAPS);
       }
-      //m_pcReshaper->copySliceReshaperInfo(lmcsAPS->getReshaperAPSInfo(), m_pcReshaper->getSliceReshaperInfo());
-      SliceReshapeInfo& tInfo = lmcsAPS->getReshaperAPSInfo();
-      SliceReshapeInfo& sInfo = m_pcReshaper->getSliceReshaperInfo();
-      tInfo.reshaperModelMaxBinIdx = sInfo.reshaperModelMaxBinIdx;
-      tInfo.reshaperModelMinBinIdx = sInfo.reshaperModelMinBinIdx;
-      memcpy(tInfo.reshaperModelBinCWDelta, sInfo.reshaperModelBinCWDelta, sizeof(int)*(PIC_CODE_CW_BINS));
-      tInfo.maxNbitsNeededDeltaCW = sInfo.maxNbitsNeededDeltaCW;
-      tInfo.chrResScalingOffset = sInfo.chrResScalingOffset;
-      m_pcEncLib->getApsMap()->setChangedFlag((lmcsAPS->getAPSId() << NUM_APS_TYPE_LEN) + LMCS_APS);
+      // the finish fills the APS from the picture's copy of the reshaper (xStartPicFinish)
     }
 
 
@@ -2063,6 +2579,13 @@ void EncGOP::compressGOP(int iPOCLast, int iNumPicRcvd, PicList &rcListPic, std:
                          bool isEncodeLtRef, const int picIdInGOP)
 {
   // TODO: Split this function up.
+  // with frame threads, the setup holds EncLib's picture list: the encoder reads the next pictures into it meanwhile
+  std::unique_lock<std::mutex> picListLock( m_pcEncLib->getPicListMutex(), std::defer_lock );
+  if( m_ftActive )
+  {
+    xFtWait( [&]() { return m_ftSetupTurn == m_ftTurn; } );
+    picListLock.lock();
+  }
 
   Picture*        pcPic = NULL;
   PicHeader*      picHeader = NULL;
@@ -2142,6 +2665,11 @@ void EncGOP::compressGOP(int iPOCLast, int iNumPicRcvd, PicList &rcListPic, std:
       {
         iGOPid=effFieldIRAPMap.restoreGOPid(iGOPid);
       }
+      if( m_ftActive )
+      {
+        picListLock.unlock();
+        xFtSkip( m_ftTurn );
+      }
       continue;
     }
 
@@ -2150,11 +2678,37 @@ void EncGOP::compressGOP(int iPOCLast, int iNumPicRcvd, PicList &rcListPic, std:
       m_iLastIDR = pocCurr;
     }
 
+    // the pictures use the search stacks in turn; with frame threads, the setup runs on the setup stack and the search
+    // takes a search stack when it can start (xStartPicSearch)
+    const std::shared_ptr<EncPicOrder> picOrder = std::make_shared<EncPicOrder>();
+    picOrder->turn     = m_ftActive ? m_ftTurn : picIdInGOP;
+    picOrder->previous = m_lastPicOrder;
+    m_lastPicOrder     = picOrder;
+    m_pcPicOrder       = picOrder.get();
+    if( m_ftActive )
+    {
+      EncSetupStack& setup = *m_pcEncLib->getSetupStack();
+      m_pcSearchStack   = nullptr;
+      m_pcSliceEncoder  = &setup.sliceEncoder;
+      m_pcSetupRdCost   = &setup.rdCost;
+      m_pcSetupReshaper = &setup.reshaper;
+    }
+    else
+    {
+      picOrder->stackIdx = int( m_numPicsStarted++ % m_pcEncLib->getNumSearchStacks() );
+      m_pcSearchStack    = &m_pcEncLib->getSearchStack( picOrder->stackIdx );
+      m_pcSliceEncoder   = &m_pcSearchStack->sliceEncoder;
+      m_pcSetupRdCost    = &m_pcSearchStack->rdCost;
+      m_pcSetupReshaper  = &m_pcSearchStack->reshaper;
+      xUseFinishContext( m_pcEncLib->getFinishContext( 0 ) );
+    }
+
     // start a new access unit: create an entry in the list of output access units
     AccessUnit accessUnit;
     accessUnit.temporalId = m_pcCfg->getGOPEntry( iGOPid ).m_temporalId;
     xGetBuffer( rcListPic, rcListPicYuvRecOut,
                 iNumPicRcvd, iTimeOffset, pcPic, pocCurr, isField );
+    picOrder->pic = pcPic;
     picHeader = pcPic->cs->picHeader;
     picHeader->setSPSId( pcPic->cs->pps->getSPSId() );
     picHeader->setPPSId( pcPic->cs->pps->getPPSId() );
@@ -2194,14 +2748,23 @@ void EncGOP::compressGOP(int iPOCLast, int iNumPicRcvd, PicList &rcListPic, std:
 #if ENABLE_SPLIT_PARALLELISM
     pcPic->scheduler.init( pcPic->cs->pcv->heightInCtus, pcPic->cs->pcv->widthInCtus, 1                          , 0                             , m_pcCfg->getNumSplitThreads() );
 #endif
-#if JVET_Y0240_BIM
-    const bool isCurrentFrameFiltered = m_pcCfg->getGopBasedTemporalFilterEnabled() || m_pcCfg->getBIM();
-#else
-    const bool isCurrentFrameFiltered = m_pcCfg->getGopBasedTemporalFilterEnabled();
-#endif
+    const bool isCurrentFrameFiltered = xUseFilteredOrig();
+    bool       origIsInputFrame       = pcPic->inputFrameIndex >= 0;   // the original is the input frame as read
     const SPS& sps = *pcPic->cs->sps;
-    pcPic->createTempBuffers(pcPic->cs->pps->pcv->maxCUWidth, isCurrentFrameFiltered, m_pcEncLib->isResChangeInClvsEnabled(), false);
-    pcPic->getTrueOrigBuf().copyFrom(pcPic->getOrigBuf());
+    // frame threads: a picture that waits for its search holds of the temporary buffers only the true original, and
+    // that only if the temporal filter changes its original; the search start creates the others (xStartPicSearch)
+    const bool tempBuffersAtSearch = m_ftActive;   // (frame threads reject RPR's resolution change)
+    if( !tempBuffersAtSearch )
+    {
+      pcPic->createTempBuffers(pcPic->cs->pps->pcv->maxCUWidth, isCurrentFrameFiltered, m_pcEncLib->isResChangeInClvsEnabled(), false);
+      pcPic->getTrueOrigBuf().copyFrom(pcPic->getOrigBuf());
+    }
+    else if( isCurrentFrameFiltered && m_pcEncLib->getTemporalFilter().filtersFrame( pocCurr ) )
+    {
+      pcPic->createTrueOrigBuf( pcPic->cs->pps->pcv->maxCUWidth );
+      pcPic->getTrueOrigBuf().copyFrom( pcPic->getOrigBuf() );
+      origIsInputFrame = false;   // the filter changes the original below
+    }
     if (m_pcEncLib->isResChangeInClvsEnabled())
     {
       pcPic->M_BUFS(0, PIC_TRUE_ORIGINAL_INPUT).copyFrom(pcPic->M_BUFS(0, PIC_ORIGINAL_INPUT));
@@ -2231,9 +2794,15 @@ void EncGOP::compressGOP(int iPOCLast, int iNumPicRcvd, PicList &rcListPic, std:
       {
         m_pcEncLib->getTemporalFilter().filter(pcPic->M_BUFS(0, PIC_ORIGINAL), pocCurr);
       }
-      pcPic->getFilteredOrigBuf().copyFrom(pcPic->getOrigBuf());
+      if( !tempBuffersAtSearch )
+      {
+        pcPic->getFilteredOrigBuf().copyFrom(pcPic->getOrigBuf());
+      }
     }
-    pcPic->cs->createTemporaryCsData((bool)pcPic->cs->sps->getPLTMode());
+    if( !m_ftActive )   // with frame threads, the search start creates the search data (xStartPicSearch)
+    {
+      pcPic->cs->createTemporaryCsData((bool)pcPic->cs->sps->getPLTMode());
+    }
 
     //  Slice data initialization
     pcPic->clearSliceBuffer();
@@ -2558,102 +3127,35 @@ void EncGOP::compressGOP(int iPOCLast, int iNumPicRcvd, PicList &rcListPic, std:
 
         if( m_bInitAMaxBT && pcSlice->getPOC() > m_uiPrevISlicePOC )
         {
-          ::memset( m_uiBlkSize, 0, sizeof( m_uiBlkSize ) );
-          ::memset( m_uiNumBlk,  0, sizeof( m_uiNumBlk ) );
+          for( auto& contributors: m_amaxbtContributors )
+          {
+            contributors.clear();
+          }
           m_bInitAMaxBT = false;
         }
 
-        if( refLayer >= 0 && m_uiNumBlk[refLayer] != 0 )
+        // the statistics of the depth: those of the pictures listed, summed when the search starts (xApplyAMaxBT)
+        if( refLayer >= 0 && !m_amaxbtContributors[refLayer].empty() )
         {
-          picHeader->setSplitConsOverrideFlag(true);
-          double dBlkSize = sqrt( ( double ) m_uiBlkSize[refLayer] / m_uiNumBlk[refLayer] );
-          unsigned int newMaxBtSize = picHeader->getMaxBTSize(pcSlice->getSliceType(), CHANNEL_TYPE_LUMA);
-          if( dBlkSize < AMAXBT_TH32 )
-          {
-            newMaxBtSize = 32;
-          }
-          else if( dBlkSize < AMAXBT_TH64 )
-          {
-            newMaxBtSize = 64;
-          }
-#if CTU_256
-          else if( dBlkSize < AMAXBT_TH128 )
-          {
-            newMaxBtSize = 128;
-          }
-          else
-          {
-            newMaxBtSize = 256;
-          }
-#else
-          else
-          {
-            newMaxBtSize = 128;
-          }
-#endif
-          newMaxBtSize = Clip3(picHeader->getMinQTSize(pcSlice->getSliceType()), pcPic->cs->sps->getCTUSize(), newMaxBtSize);
-          picHeader->setMaxBTSize(1, newMaxBtSize);
-
-          m_uiBlkSize[refLayer] = 0;
-          m_uiNumBlk [refLayer] = 0;
+          picOrder->amaxbtRead = true;
+          picOrder->amaxbtContributors.swap( m_amaxbtContributors[refLayer] );
         }
+        CHECK( pcSlice->getDepth() >= 10, "AMaxBT statistics are kept for 10 depths" );
+        m_amaxbtContributors[pcSlice->getDepth()].push_back( picOrder );
       }
       else
       {
         if( m_bInitAMaxBT )
         {
-          ::memset( m_uiBlkSize, 0, sizeof( m_uiBlkSize ) );
-          ::memset( m_uiNumBlk,  0, sizeof( m_uiNumBlk ) );
+          for( auto& contributors: m_amaxbtContributors )
+          {
+            contributors.clear();
+          }
         }
 
         m_uiPrevISlicePOC = pcSlice->getPOC();
         m_bInitAMaxBT = true;
       }
-#if JVET_S0133_PH_SYNTAX_OVERRIDE_ENC_FIX
-      bool identicalToSPS=true;
-      const SPS* sps =pcSlice->getSPS();
-
-      if (picHeader->getPicInterSliceAllowedFlag())
-      {
-        if (picHeader->getMinQTSize(pcSlice->getSliceType()) != pcSlice->getSPS()->getMinQTSize(pcSlice->getSliceType()) ||
-            picHeader->getMaxMTTHierarchyDepth(pcSlice->getSliceType()) != pcSlice->getSPS()->getMaxMTTHierarchyDepth() ||
-            picHeader->getMaxBTSize(pcSlice->getSliceType()) != pcSlice->getSPS()->getMaxBTSize() ||
-            picHeader->getMaxTTSize(pcSlice->getSliceType()) != pcSlice->getSPS()->getMaxTTSize()
-          )
-        {
-          identicalToSPS=false;
-        }
-      }
-
-      if (identicalToSPS && picHeader->getPicIntraSliceAllowedFlag())
-      {
-        if (picHeader->getMinQTSize(I_SLICE) != sps->getMinQTSize(I_SLICE) ||
-            picHeader->getMaxMTTHierarchyDepth(I_SLICE) != sps->getMaxMTTHierarchyDepthI() ||
-            picHeader->getMaxBTSize(I_SLICE) != sps->getMaxBTSizeI() ||
-            picHeader->getMaxTTSize(I_SLICE) != sps->getMaxTTSizeI()
-        )
-        {
-          identicalToSPS=false;
-        }
-
-        if (identicalToSPS && sps->getUseDualITree())
-        {
-          if (picHeader->getMinQTSize(I_SLICE, CHANNEL_TYPE_CHROMA) != sps->getMinQTSize(I_SLICE, CHANNEL_TYPE_CHROMA) ||
-              picHeader->getMaxMTTHierarchyDepth(I_SLICE, CHANNEL_TYPE_CHROMA) != sps->getMaxMTTHierarchyDepthIChroma() ||
-              picHeader->getMaxBTSize(I_SLICE, CHANNEL_TYPE_CHROMA) != sps->getMaxBTSizeIChroma() ||
-              picHeader->getMaxTTSize(I_SLICE, CHANNEL_TYPE_CHROMA) != sps->getMaxTTSizeIChroma()
-           )
-          {
-            identicalToSPS=false;
-          }
-        }
-      }
-
-      if (identicalToSPS)
-      {
-        picHeader->setSplitConsOverrideFlag(false);
-      }
-#endif
     }
 
     //  Slice info. refinement
@@ -2671,7 +3173,8 @@ void EncGOP::compressGOP(int iPOCLast, int iNumPicRcvd, PicList &rcListPic, std:
     }
     else
     {
-      pcSlice->setEncCABACTableIdx( m_pcSliceEncoder->getEncCABACTableIdx() );
+      // the table the previous picture's slice writing left (set at the start of the search and of the finish)
+      picOrder->cabacTableIdxDeferred = true;
     }
 
     if (pcSlice->getSliceType() == B_SLICE)
@@ -3521,11 +4024,11 @@ void EncGOP::compressGOP(int iPOCLast, int iNumPicRcvd, PicList &rcListPic, std:
     pcSlice->generateEqualPocDist();
 #endif
 #if JVET_AL0214_MV_REFINEMENT_FOR_TMVP
-    int refineTmvpNumRefIdx[2] = { pcSlice->getNumRefIdx(REF_PIC_LIST_0), pcSlice->getNumRefIdx(REF_PIC_LIST_1) };
-    pcSlice->getPic()->cs->createTemporaryRefineTmvpCsData(pcSlice->isIntra(), refineTmvpNumRefIdx, false);
-#endif
-#if JVET_AI0183_MVP_EXTENSION
-    pcSlice->generateIntersectingMv();
+    if( !m_ftActive )
+    {
+      int refineTmvpNumRefIdx[2] = { pcSlice->getNumRefIdx(REF_PIC_LIST_0), pcSlice->getNumRefIdx(REF_PIC_LIST_1) };
+      pcSlice->getPic()->cs->createTemporaryRefineTmvpCsData(pcSlice->isIntra(), refineTmvpNumRefIdx, false);
+    }
 #endif
 
     double lambda            = 0.0;
@@ -3685,6 +4188,11 @@ void EncGOP::compressGOP(int iPOCLast, int iNumPicRcvd, PicList &rcListPic, std:
       int apsId = std::min<int>( 7, m_pcEncLib->getVPS() == nullptr ? 0 : m_pcEncLib->getVPS()->getGeneralLayerIdx( m_pcEncLib->getLayerId() ) );
       picHeader->setScalingListAPSId( apsId );
 
+      std::unique_lock<std::mutex> apsMapLock( m_ftApsMapMutex, std::defer_lock );
+      if( m_ftActive )
+      {
+        apsMapLock.lock();   // a finish may change the map at the same time
+      }
       ParameterSetMap<APS> *apsMap = m_pcEncLib->getApsMap();
       APS*  scalingListAPS = apsMap->getPS( ( apsId << NUM_APS_TYPE_LEN ) + SCALING_LIST_APS );
       assert( scalingListAPS != NULL );
@@ -3704,6 +4212,26 @@ void EncGOP::compressGOP(int iPOCLast, int iNumPicRcvd, PicList &rcListPic, std:
     {
       m_pcSliceEncoder->setJointCbCrModes(*pcPic->cs, Position(0, 0), pcPic->cs->area.lumaSize());
     }
+    picHeader = xUsePicHeaderCopy( pcPic, *picOrder );
+    xSetupPicOrder( pcSlice, picOrder );
+    if( m_ftActive )
+    {
+      picOrder->searchPriority = xFtSearchPriority( *pcPic, *picOrder );
+      if( origIsInputFrame && m_pcEncLib->isOrigReloadable() )
+      {
+        pcPic->dropWaitingOrig( pcSlice->getSPS()->getBitDepths() );   // read again at its search start (xStartPicSearch)
+      }
+      pcPic->packWaitingBufs( pcSlice->getSPS()->getBitDepths() );   // until its search starts
+      picOrder->setup.reset( new EncSliceSetup );
+      m_pcSliceEncoder->saveSetup( *picOrder->setup );
+      picListLock.unlock();
+      xFtEndSetup( *picOrder );   // from here on, the next picture's setup runs at the same time
+    }
+    xStartPicSearch( pcPic, picHeader, pcSlice, *picOrder, decPic );
+    EncReshape* picReshaper = &m_pcSearchStack->reshaper;   // the finish's after xStartPicFinish
+    std::unique_lock<std::mutex> apsMapLock( m_ftApsMapMutex, std::defer_lock );   // the finish's (frame threads)
+    std::unique_lock<std::mutex> saoStatsLock( m_ftSaoStatsMutex, std::defer_lock );   // the finish's (several periods)
+
     if( encPic )
     // now compress (trial encode) the various slice segments (slices, and dependent slices)
     {
@@ -3753,14 +4281,14 @@ void EncGOP::compressGOP(int iPOCLast, int iNumPicRcvd, PicList &rcListPic, std:
 
             if (pcSlice->getLmcsEnabledFlag())
             {
-              pcPic->getOrigBuf(COMPONENT_Y).rspSignal(m_pcReshaper->getFwdLUT());
-              m_pcReshaper->setSrcReshaped(true);
-              m_pcReshaper->setRecReshaped(true);
+              pcPic->getOrigBuf(COMPONENT_Y).rspSignal(picReshaper->getFwdLUT());
+              picReshaper->setSrcReshaped(true);
+              picReshaper->setRecReshaped(true);
             }
             else
             {
-              m_pcReshaper->setSrcReshaped(false);
-              m_pcReshaper->setRecReshaped(false);
+              picReshaper->setSrcReshaped(false);
+              picReshaper->setRecReshaped(false);
             }
           }
         }
@@ -3782,15 +4310,21 @@ void EncGOP::compressGOP(int iPOCLast, int iNumPicRcvd, PicList &rcListPic, std:
 #if JVET_AJ0158_SUBBLOCK_INTER_EXTENSION
           clipMv2 = clipMvInSubpic2;
 #endif
-          m_pcEncLib->getInterSearch()->setClipMvInSubPic(true);
+          m_pcSearchStack->interSearch.setClipMvInSubPic(true);
         }
         else
         {
-          clipMv = clipMvInPic;
+          if( clipMv != clipMvInPic )
+          {
+            clipMv = clipMvInPic;
+          }
 #if JVET_AJ0158_SUBBLOCK_INTER_EXTENSION
-          clipMv2 = clipMvInPic2;
+          if( clipMv2 != clipMvInPic2 )
+          {
+            clipMv2 = clipMvInPic2;
+          }
 #endif
-          m_pcEncLib->getInterSearch()->setClipMvInSubPic(false);
+          m_pcSearchStack->interSearch.setClipMvInSubPic(false);
         }
 
         m_pcSliceEncoder->precompressSlice( pcPic );
@@ -3814,6 +4348,19 @@ void EncGOP::compressGOP(int iPOCLast, int iNumPicRcvd, PicList &rcListPic, std:
           uiNumSliceSegments++;
         }
       }
+
+      if( m_ftActive )
+      {
+#if JVET_AL0214_MV_REFINEMENT_FOR_TMVP
+        // the refined TMVP motion and the intersecting motion vectors cache the search's merge candidates; nothing after
+        // the search reads them, and a searched picture may wait long for its finish turn (at 1080p, dozens of pictures
+        // with about 46 MB of them each)
+        pcPic->cs->destroyTemporaryRefineTmvpCsData();
+#endif
+        xFtReleaseStack( *picOrder );
+      }
+      xStartPicFinish( pcSlice, *picOrder, apsMapLock );
+      picReshaper = m_pcFinishReshaper;
 
       duData.clear();
 
@@ -3878,7 +4425,7 @@ void EncGOP::compressGOP(int iPOCLast, int iNumPicRcvd, PicList &rcListPic, std:
       CodingStructure& cs = *pcPic->cs;
       pcSlice = pcPic->slices[0];
 
-      if (cs.sps->getUseLmcs() && m_pcReshaper->getSliceReshaperInfo().getUseSliceReshaper())
+      if (cs.sps->getUseLmcs() && picReshaper->getSliceReshaperInfo().getUseSliceReshaper())
       {
         picHeader->setLmcsEnabledFlag(true);
         int apsId = std::min<int>(3, m_pcEncLib->getVPS() == nullptr ? 0 : m_pcEncLib->getVPS()->getGeneralLayerIdx(m_pcEncLib->getLayerId()));
@@ -3895,7 +4442,7 @@ void EncGOP::compressGOP(int iPOCLast, int iNumPicRcvd, PicList &rcListPic, std:
               const uint32_t width = (xPos + pcv.maxCUWidth > pcv.lumaWidth) ? (pcv.lumaWidth - xPos) : pcv.maxCUWidth;
               const uint32_t height = (yPos + pcv.maxCUHeight > pcv.lumaHeight) ? (pcv.lumaHeight - yPos) : pcv.maxCUHeight;
               const UnitArea area(cs.area.chromaFormat, Area(xPos, yPos, width, height));
-              cs.getRecoBuf(area).get(COMPONENT_Y).rspSignal(m_pcReshaper->getInvLUT());
+              cs.getRecoBuf(area).get(COMPONENT_Y).rspSignal(picReshaper->getInvLUT());
             }
           }
         }
@@ -3910,19 +4457,19 @@ void EncGOP::compressGOP(int iPOCLast, int iNumPicRcvd, PicList &rcListPic, std:
             if( cu->slice->getLmcsEnabledFlag() )
             {
 #if JVET_Y0065_GPM_INTRA
-              if( ( ( cu->predMode == MODE_INTRA || cu->predMode == MODE_IBC || cu->predMode == MODE_PLT ) && cu->chType != CHANNEL_TYPE_CHROMA ) || ( cu->predMode == MODE_INTER && m_pcReshaper->getCTUFlag() && ( cu->firstPU->ciipFlag || cu->firstPU->gpmIntraFlag ) ) )
+              if( ( ( cu->predMode == MODE_INTRA || cu->predMode == MODE_IBC || cu->predMode == MODE_PLT ) && cu->chType != CHANNEL_TYPE_CHROMA ) || ( cu->predMode == MODE_INTER && picReshaper->getCTUFlag() && ( cu->firstPU->ciipFlag || cu->firstPU->gpmIntraFlag ) ) )
 #else
-              if( ( ( cu->predMode == MODE_INTRA || cu->predMode == MODE_IBC ) && cu->chType != CHANNEL_TYPE_CHROMA ) || ( cu->predMode == MODE_INTER && m_pcReshaper->getCTUFlag() && cu->firstPU->ciipFlag ) )
+              if( ( ( cu->predMode == MODE_INTRA || cu->predMode == MODE_IBC ) && cu->chType != CHANNEL_TYPE_CHROMA ) || ( cu->predMode == MODE_INTER && picReshaper->getCTUFlag() && cu->firstPU->ciipFlag ) )
 #endif
               {
-                pcPic->getPredBufCustom( cu->block( COMPONENT_Y ) ).rspSignal( m_pcReshaper->getInvLUT() );
+                pcPic->getPredBufCustom( cu->block( COMPONENT_Y ) ).rspSignal( picReshaper->getInvLUT() );
               }
             }
           }
         }
 #endif
         
-        m_pcReshaper->setRecReshaped(false);
+        picReshaper->setRecReshaped(false);
 
         if( m_pcCfg->getGopBasedTemporalFilterEnabled() )
         {
@@ -3992,10 +4539,15 @@ void EncGOP::compressGOP(int iPOCLast, int iNumPicRcvd, PicList &rcListPic, std:
 #if JVET_AJ0237_INTERNAL_12BIT
           m_pcSAO->m_bilateralFilter.setInternalBitDepth(pcSlice->getSPS()->getBitDepth(CHANNEL_TYPE_LUMA));
 #endif
-          m_pcSAO->setReshaper(m_pcReshaper);
+          m_pcSAO->setReshaper(picReshaper);
         }
 
         // create SAO encoder data based on the picture size
+        if( m_ftActive && m_ftPeriods > 1 )
+        {
+          // the finishes of several periods hold their SAO statistics (0.64 GB at 1080p) one at a time
+          saoStatsLock.lock();
+        }
         m_pcSAO->destroyEncData();
         m_pcSAO->createEncData(m_pcCfg->getSaoCtuBoundary(), numCtuInFrame);
       }
@@ -4140,7 +4692,7 @@ void EncGOP::compressGOP(int iPOCLast, int iNumPicRcvd, PicList &rcListPic, std:
           m_pcALF->copyPreNNVCDataToTemp(cs);
         }
 #endif
-        m_nnfilterUnified.initCabac( m_pcEncLib->getCABACEncoder(), m_pcEncLib->getCtxCache(), *pcSlice);
+        m_nnfilterUnified.initCabac( m_pcFinishCabac, m_pcFinishCtxCache, *pcSlice);
         m_nnfilterUnified.setPicprms(&pcPic->m_picprm);
         {
           m_nnfilterUnified.chooseParameters(*pcPic);
@@ -4197,13 +4749,13 @@ void EncGOP::compressGOP(int iPOCLast, int iNumPicRcvd, PicList &rcListPic, std:
 #endif
       {
         bool sliceEnabled[MAX_NUM_COMPONENT];
-        m_pcSAO->initCABACEstimator( m_pcEncLib->getCABACEncoder(), m_pcEncLib->getCtxCache(), pcSlice );
+        m_pcSAO->initCABACEstimator( m_pcFinishCabac, m_pcFinishCtxCache, pcSlice );
 #if JVET_V0094_BILATERAL_FILTER
-        BIFCabacEstImp est(m_pcEncLib->getCABACEncoder()->getCABACEstimator(cs.slice->getSPS()));
+        BIFCabacEstImp est(m_pcFinishCabac->getCABACEstimator(cs.slice->getSPS()));
 #endif      
         m_pcSAO->SAOProcess( cs, sliceEnabled, pcSlice->getLambdas(),
 #if ENABLE_QPA
-                             (m_pcCfg->getUsePerceptQPA() && !m_pcCfg->getUseRateCtrl() && pcSlice->getPPS()->getUseDQP() ? m_pcEncLib->getRdCost (PARL_PARAM0 (0))->getChromaWeight() : 0.0),
+                             (m_pcCfg->getUsePerceptQPA() && !m_pcCfg->getUseRateCtrl() && pcSlice->getPPS()->getUseDQP() ? m_pcFinishRdCost->getChromaWeight() : 0.0),
 #endif
                              m_pcCfg->getTestSAODisableAtPictureLevel(), m_pcCfg->getSaoEncodingRate(), m_pcCfg->getSaoEncodingRateChroma(), m_pcCfg->getSaoCtuBoundary(), m_pcCfg->getSaoGreedyMergeEnc()
 #if JVET_V0094_BILATERAL_FILTER
@@ -4240,7 +4792,7 @@ void EncGOP::compressGOP(int iPOCLast, int iNumPicRcvd, PicList &rcListPic, std:
 #if JVET_W0066_CCSAO
       if ( pcSlice->getSPS()->getCCSAOEnabledFlag() )
       {
-        m_pcSAO->initCABACEstimator( m_pcEncLib->getCABACEncoder(), m_pcEncLib->getCtxCache(), pcSlice );
+        m_pcSAO->initCABACEstimator( m_pcFinishCabac, m_pcFinishCtxCache, pcSlice );
         m_pcSAO->CCSAOProcess( cs, pcSlice->getLambdas(), m_pcCfg->getIntraPeriod() );
 
         //assign CCSAO slice header
@@ -4262,6 +4814,10 @@ void EncGOP::compressGOP(int iPOCLast, int iNumPicRcvd, PicList &rcListPic, std:
         )
       {
         m_pcSAO->destroyEncData();
+      }
+      if( saoStatsLock.owns_lock() )
+      {
+        saoStatsLock.unlock();
       }
 
 #if RPR_ENABLE && !JVET_AA0095_ALF_WITH_SAMPLES_BEFORE_DBF
@@ -4285,13 +4841,13 @@ void EncGOP::compressGOP(int iPOCLast, int iNumPicRcvd, PicList &rcListPic, std:
         cccmCorrection.create(cs.pcv->chrFormat, Area(0,0, cs.pcv->lumaWidth, cs.pcv->lumaHeight));
         cccmCorrection.copyFrom(cs.getRecoBuf());
 #endif
-        m_pcLoopFilterCccm->lfCccmInitIntraPred(m_pcEncLib->getIntraSearch());
+        m_pcLoopFilterCccm->lfCccmInitIntraPred(m_pcFinishIntraPred);
 #if JVET_AM0063_ALF_CCCM_ADAPTIVE_FACTOR
         pcSlice->setLfCccmImpEnabledFlag(false);
         pcSlice->setLfCccmImpFactorIdx(0);
-        m_pcLoopFilterCccm->lfCccmRDO(cs, cs.getRecoBuf(), m_pcEncLib->getCtxCache(), m_pcEncLib->getCABACEncoder(), pcSlice);
+        m_pcLoopFilterCccm->lfCccmRDO(cs, cs.getRecoBuf(), m_pcFinishCtxCache, m_pcFinishCabac, pcSlice);
 #else
-        m_pcLoopFilterCccm->lfCccmRDO(cs, cs.getRecoBuf(), cccmCorrection, m_pcEncLib->getCtxCache(), m_pcEncLib->getCABACEncoder(), pcSlice);
+        m_pcLoopFilterCccm->lfCccmRDO(cs, cs.getRecoBuf(), cccmCorrection, m_pcFinishCtxCache, m_pcFinishCabac, pcSlice);
 #endif
         if(pcSlice->getLfCccmEnabledFlag())
         {
@@ -4341,7 +4897,7 @@ void EncGOP::compressGOP(int iPOCLast, int iNumPicRcvd, PicList &rcListPic, std:
           pcPic->slices[s]->setTileGroupAlfEnabledFlag(COMPONENT_Y, false);
         }
 
-        m_pcALF->initCABACEstimator(m_pcEncLib->getCABACEncoder(), m_pcEncLib->getCtxCache(), pcSlice, m_pcEncLib->getApsMap());
+        m_pcALF->initCABACEstimator(m_pcFinishCabac, m_pcFinishCtxCache, pcSlice, m_pcApsMap);
 
 #if JVET_AL0153_ALF_CCCM
         if(pcSlice->getLfCccmEnabledFlag())
@@ -4351,7 +4907,7 @@ void EncGOP::compressGOP(int iPOCLast, int iNumPicRcvd, PicList &rcListPic, std:
 #endif
         m_pcALF->ALFProcess(cs, pcSlice->getLambdas()
 #if ENABLE_QPA
-          , (m_pcCfg->getUsePerceptQPA() && !m_pcCfg->getUseRateCtrl() && pcSlice->getPPS()->getUseDQP() ? m_pcEncLib->getRdCost(PARL_PARAM0(0))->getChromaWeight() : 0.0)
+          , (m_pcCfg->getUsePerceptQPA() && !m_pcCfg->getUseRateCtrl() && pcSlice->getPPS()->getUseDQP() ? m_pcFinishRdCost->getChromaWeight() : 0.0)
 #endif
           , pcPic, uiNumSliceSegments
 #if JVET_AC0162_ALF_RESIDUAL_SAMPLES_INPUT
@@ -4499,7 +5055,7 @@ void EncGOP::compressGOP(int iPOCLast, int iNumPicRcvd, PicList &rcListPic, std:
         {
           pcSlice->setAmvpSbTmvpEnabledFlag(true);
 
-          g_picAmvpSbTmvpEnabledArea = 0;
+          m_pcSliceEncoder->m_picAmvpSbTmvpEnabledArea = 0;
           uint32_t prevEnabledArea;
           bool isExist = m_pcSliceEncoder->loadAmvpSbTmvpStatArea(pcSlice->getTLayer(), prevEnabledArea);
           if (isExist)
@@ -4581,7 +5137,7 @@ void EncGOP::compressGOP(int iPOCLast, int iNumPicRcvd, PicList &rcListPic, std:
 
             m_pcALF->setApsIdStart( ALF_CTB_MAX_NUM_APS );
 
-            ParameterSetMap<APS>* apsMap = m_pcEncLib->getApsMap();
+            ParameterSetMap<APS>* apsMap = m_pcApsMap;
             apsMap->clear();
 
             for( int apsId = 0; apsId < ALF_CTB_MAX_NUM_APS; apsId++ )
@@ -4654,7 +5210,7 @@ void EncGOP::compressGOP(int iPOCLast, int iNumPicRcvd, PicList &rcListPic, std:
         int changedApsId = -1;
         for( int apsId = ALF_CTB_MAX_NUM_APS - 1; apsId >= 0; apsId-- )
         {
-          ParameterSetMap<APS>* apsMap = m_pcEncLib->getApsMap();
+          ParameterSetMap<APS>* apsMap = m_pcApsMap;
           int psId = ( apsId << NUM_APS_TYPE_LEN ) + ALF_APS;
           APS* aps = apsMap->getPS( psId );
           if( aps )
@@ -4675,7 +5231,7 @@ void EncGOP::compressGOP(int iPOCLast, int iNumPicRcvd, PicList &rcListPic, std:
         int changedApsId2 = -1;
         for( int apsId = ALF_CTB_MAX_NUM_APS - 1; apsId >= 0; apsId-- )
         {
-          ParameterSetMap<APS>* apsMap = m_pcEncLib->getApsMap();
+          ParameterSetMap<APS>* apsMap = m_pcApsMap;
           int psId = ( apsId << NUM_APS_TYPE_LEN ) + TALF_APS;
           APS* aps = apsMap->getPS( psId );
           if( aps )
@@ -4707,8 +5263,8 @@ void EncGOP::compressGOP(int iPOCLast, int iNumPicRcvd, PicList &rcListPic, std:
       {
         if( !pcSlice->isIntra() )
         {
-          m_uiBlkSize[pcSlice->getDepth()] += cu->Y().area();
-          m_uiNumBlk [pcSlice->getDepth()]++;
+          picOrder->amaxbtBlkSize += cu->Y().area();
+          picOrder->amaxbtNumBlk++;
         }
       }
     }
@@ -4724,10 +5280,18 @@ void EncGOP::compressGOP(int iPOCLast, int iNumPicRcvd, PicList &rcListPic, std:
 #endif
 
       // write various parameter sets
+      // frame threads: the first picture is decided in the setup, and the finishes share the parameter sets' changed
+      // flags, so their setting and the writing go together
+      const bool seqFirst = m_ftActive ? picOrder->seqFirst : m_bSeqFirst;
+      std::unique_lock<std::mutex> paramSetLock( m_ftParamSetMutex, std::defer_lock );
+      if( m_ftActive )
+      {
+        paramSetLock.lock();
+      }
 #if JVET_Z0118_GDR // note : insert SPS/PPS at every GDR picture
-      bool writePS = m_bSeqFirst || (m_pcCfg->getReWriteParamSets() && (pcSlice->isIRAP())) || pcSlice->isInterGDR();
+      bool writePS = seqFirst || (m_pcCfg->getReWriteParamSets() && (pcSlice->isIRAP())) || pcSlice->isInterGDR();
 #else
-      bool writePS = m_bSeqFirst || (m_pcCfg->getReWriteParamSets() && (pcSlice->isIRAP()));
+      bool writePS = seqFirst || (m_pcCfg->getReWriteParamSets() && (pcSlice->isIRAP()));
 #endif
       if (writePS)
       {
@@ -4745,13 +5309,20 @@ void EncGOP::compressGOP(int iPOCLast, int iNumPicRcvd, PicList &rcListPic, std:
 
       // it is assumed that layerIdx equal to 0 is always present
       actualTotalBits += xWriteParameterSets(accessUnit, pcSlice, writePS, layerIdx);
+      if( paramSetLock.owns_lock() )
+      {
+        paramSetLock.unlock();
+      }
       if (writePS)
       {
         // create prefix SEI messages at the beginning of the sequence
         CHECK(!(leadingSeiMessages.empty()), "Unspecified error");
         xCreateIRAPLeadingSEIMessages(leadingSeiMessages, pcSlice->getSPS(), pcSlice->getPPS());
 
-        m_bSeqFirst = false;
+        if( !m_ftActive )
+        {
+          m_bSeqFirst = false;
+        }
       }
 
 
@@ -4761,7 +5332,7 @@ void EncGOP::compressGOP(int iPOCLast, int iNumPicRcvd, PicList &rcListPic, std:
       {
         //only 1 LMCS data for 1 picture
         int apsId = picHeader->getLmcsAPSId();
-        ParameterSetMap<APS> *apsMap = m_pcEncLib->getApsMap();
+        ParameterSetMap<APS> *apsMap = m_pcApsMap;
         APS* aps = apsMap->getPS((apsId << NUM_APS_TYPE_LEN) + LMCS_APS);
         bool writeAPS = aps && apsMap->getChangedFlag((apsId << NUM_APS_TYPE_LEN) + LMCS_APS);
 #if JVET_Z0118_GDR // note : insert APS at every GDR picture
@@ -4792,7 +5363,7 @@ void EncGOP::compressGOP(int iPOCLast, int iNumPicRcvd, PicList &rcListPic, std:
       if( pcSlice->getSPS()->getScalingListFlag() && ( m_pcCfg->getUseScalingListId() == SCALING_LIST_FILE_READ ) )
       {
         int apsId = picHeader->getScalingListAPSId();
-        ParameterSetMap<APS> *apsMap = m_pcEncLib->getApsMap();
+        ParameterSetMap<APS> *apsMap = m_pcApsMap;
         APS* aps = apsMap->getPS( ( apsId << NUM_APS_TYPE_LEN ) + SCALING_LIST_APS );
         bool writeAPS = aps && apsMap->getChangedFlag( ( apsId << NUM_APS_TYPE_LEN ) + SCALING_LIST_APS );
 #if JVET_Z0118_GDR // note : insert APS at every GDR picture
@@ -4823,7 +5394,7 @@ void EncGOP::compressGOP(int iPOCLast, int iNumPicRcvd, PicList &rcListPic, std:
       {
         for (int apsId = 0; apsId < ALF_CTB_MAX_NUM_APS; apsId++)
         {
-          ParameterSetMap<APS> *apsMap = m_pcEncLib->getApsMap();
+          ParameterSetMap<APS> *apsMap = m_pcApsMap;
 
           APS* aps = apsMap->getPS((apsId << NUM_APS_TYPE_LEN) + ALF_APS);
           bool writeAPS = aps && apsMap->getChangedFlag((apsId << NUM_APS_TYPE_LEN) + ALF_APS);
@@ -4875,7 +5446,7 @@ void EncGOP::compressGOP(int iPOCLast, int iNumPicRcvd, PicList &rcListPic, std:
       {
         for (int apsId = 0; apsId < ALF_CTB_MAX_NUM_APS; apsId++)
         {
-          ParameterSetMap<APS> *apsMap = m_pcEncLib->getApsMap();
+          ParameterSetMap<APS> *apsMap = m_pcApsMap;
           APS *aps      = apsMap->getPS((apsId << NUM_APS_TYPE_LEN) + TALF_APS);
           bool writeAPS = aps && apsMap->getChangedFlag((apsId << NUM_APS_TYPE_LEN) + TALF_APS);
           if (!aps && pcSlice->getTAlfAPSs() && pcSlice->getTAlfAPSs()[apsId])
@@ -4938,7 +5509,7 @@ void EncGOP::compressGOP(int iPOCLast, int iNumPicRcvd, PicList &rcListPic, std:
           }
           //the inference for NoOutputPriorPicsFlag
           // KJS: This cannot happen at the encoder
-          if( !m_bFirst && ( pcSlice->isIRAP() || pcSlice->getNalUnitType() >= NAL_UNIT_CODED_SLICE_GDR ) && picHeader->getNoOutputBeforeRecoveryFlag() )
+          if( !( m_ftActive ? picOrder->first : m_bFirst ) && ( pcSlice->isIRAP() || pcSlice->getNalUnitType() >= NAL_UNIT_CODED_SLICE_GDR ) && picHeader->getNoOutputBeforeRecoveryFlag() )
           {
             if (pcSlice->getNalUnitType() == NAL_UNIT_CODED_SLICE_CRA || pcSlice->getNalUnitType() >= NAL_UNIT_CODED_SLICE_GDR)
             {
@@ -5306,7 +5877,17 @@ void EncGOP::compressGOP(int iPOCLast, int iNumPicRcvd, PicList &rcListPic, std:
       xWriteLeadingSEIMessages( leadingSeiMessages, duInfoSeiMessages, accessUnit, pcSlice->getTLayer(), pcSlice->getSPS(), duData );
       xWriteDuSEIMessages( duInfoSeiMessages, accessUnit, pcSlice->getTLayer(), duData );
 
-      m_AUWriterIf->outputAU( accessUnit );
+      if( m_ftActive && m_ftPeriods > 1 )
+      {
+        // written in coding order (xFtOutput)
+        picOrder->au.reset( new AccessUnit );
+        picOrder->au->temporalId = accessUnit.temporalId;
+        picOrder->au->swap( accessUnit );
+      }
+      else
+      {
+        m_AUWriterIf->outputAU( accessUnit );
+      }
 
       msg( NOTICE, "\n" );
       fflush( stdout );
@@ -5314,11 +5895,21 @@ void EncGOP::compressGOP(int iPOCLast, int iNumPicRcvd, PicList &rcListPic, std:
 
     DTRACE_UPDATE( g_trace_ctx, ( std::make_pair( "final", 0 ) ) );
 
+    xEndPicFinish( pcSlice, *picOrder, apsMapLock );
+
     pcPic->reconstructed = true;
-    m_bFirst = false;
+    if( !m_ftActive )
+    {
+      m_bFirst = false;
+    }
     m_iNumPicCoded++;
     if (!(m_pcCfg->getUseCompositeRef() && isEncodeLtRef))
     {
+      std::unique_lock<std::mutex> totalLock( m_ftMutex, std::defer_lock );   // finishes of several periods
+      if( m_ftActive )
+      {
+        totalLock.lock();
+      }
       for( int i = pcSlice->getTLayer() ; i < pcSlice->getSPS()->getMaxTLayers() ; i ++ )
       {
         m_totalCoded[i]++;
@@ -5336,12 +5927,15 @@ void EncGOP::compressGOP(int iPOCLast, int iNumPicRcvd, PicList &rcListPic, std:
     pcPic->cs->setSplitPred();
 #endif
     pcPic->cs->destroyTemporaryCsData();
+    // nothing reads the picture's CUs, PUs and TUs any more (later pictures read its per-4x4 arrays); its own unit cache
+    // would keep them until the buffer is destroyed, and with frame threads there are hundreds of picture buffers
+    pcPic->cs->freeCachedUnits();
 #if JVET_AA0096_MC_BOUNDARY_PADDING
 #if JVET_AK0085_TM_BOUNDARY_PADDING
     if(!(pcPic->getUseTMBP() && pcPic->cs->sps->getTMBP()))
 #endif
     {
-      m_pcFrameMcPadPrediction->init(m_pcEncLib->getRdCost(), pcSlice->getSPS()->getChromaFormatIdc(),
+      m_pcFrameMcPadPrediction->init(m_pcFinishRdCost, pcSlice->getSPS()->getChromaFormatIdc(),
 #if JVET_AJ0172_IBC_ITMP_ALIGN_REF_AREA
 #if JVET_AJ0237_INTERNAL_12BIT
                                    pcSlice->getSPS()->getMaxCUHeight(), NULL, pcPic->getPicWidthInLumaSamples(),pcPic->getPicHeightInLumaSamples(), pcSlice->getSPS()->getBitDepth(CHANNEL_TYPE_LUMA));
@@ -5365,6 +5959,19 @@ void EncGOP::compressGOP(int iPOCLast, int iNumPicRcvd, PicList &rcListPic, std:
     }
 #endif
 #endif
+    if( m_ftActive )
+    {
+      g_msgCapture = nullptr;
+    }
+    xEndPicture( *picOrder );
+    if( m_ftActive )
+    {
+      m_pcEncLib->releaseUnreadPics();   // this picture, or those it was the last to read
+    }
+    if( m_ftActive && m_ftPeriods > 1 )
+    {
+      xFtOutput( *picOrder );
+    }
   } // iGOPid-loop
 
   delete pcBitstreamRedirect;
@@ -5733,7 +6340,10 @@ void EncGOP::xGetBuffer( PicList&                  rcListPic,
   CHECK(!(rpcPic != NULL), "Unspecified error");
   CHECK(!(rpcPic->getPOC() == pocCurr), "Unspecified error");
 
-  (**iterPicYuvRec) = rpcPic->getRecoBuf();
+  if( !m_ftActive )   // with frame threads, EncLib hands the pictures out for output (EncLib::getFrameThreadsOutput)
+  {
+    (**iterPicYuvRec) = rpcPic->getRecoBuf();
+  }
   return;
 }
 
@@ -5918,7 +6528,7 @@ double EncGOP::xFindDistortionPlaneWPSNR(const CPelBuf& pic0, const CPelBuf& pic
       for (int x = 0; x < pic0.width; x++)
       {
         Intermediate_Int iTemp = pSrc0[x] - pSrc1[x];
-        double dW = m_pcEncLib->getRdCost()->getWPSNRLumaLevelWeight(pSrcLuma[(x << getComponentScaleX(compID, chfmt))]);
+        double dW = m_lmcsWeights.getWPSNRLumaLevelWeight(pSrcLuma[(x << getComponentScaleX(compID, chfmt))]);
         uiTotalDiffWPSNR += ((dW * (double)iTemp * (double)iTemp)) * (double)(1 >> rshift);
       }
       pSrc0 += pic0.stride;
@@ -5934,7 +6544,7 @@ double EncGOP::xFindDistortionPlaneWPSNR(const CPelBuf& pic0, const CPelBuf& pic
       for (int x = 0; x < pic0.width; x++)
       {
         Intermediate_Int iTemp = pSrc0[x] - pSrc1[x];
-        double dW = m_pcEncLib->getRdCost()->getWPSNRLumaLevelWeight(pSrcLuma[x << getComponentScaleX(compID, chfmt)]);
+        double dW = m_lmcsWeights.getWPSNRLumaLevelWeight(pSrcLuma[x << getComponentScaleX(compID, chfmt)]);
         uiTotalDiffWPSNR += dW * (double)iTemp * (double)iTemp;
       }
       pSrc0 += pic0.stride;
@@ -6042,6 +6652,15 @@ void EncGOP::xCalculateAddPSNR(Picture *pcPic, PelUnitBuf cPicD, const AccessUni
                                double *PSNR_Y,
                                bool isEncodeLtRef)
 {
+  // frame threads with several periods: the picture's own sums, added to these in coding order (xFtOutput)
+  EncPicAnalyze* const own = m_pcPicOrder ? m_pcPicOrder->analyze.get() : nullptr;
+  Analyze& analyzeAll = own ? own->all : m_gcAnalyzeAll;
+  Analyze& analyzeI   = own ? own->i   : m_gcAnalyzeI;
+  Analyze& analyzeP   = own ? own->p   : m_gcAnalyzeP;
+  Analyze& analyzeB   = own ? own->b   : m_gcAnalyzeB;
+#if WCG_WPSNR
+  Analyze& analyzeWPSNR = own ? own->wpsnr : m_gcAnalyzeWPSNR;
+#endif
   const SPS&         sps = *pcPic->cs->sps;
   const CPelUnitBuf& pic = cPicD;
   CHECK(!(conversion == IPCOLOURSPACE_UNCHANGED), "Unspecified error");
@@ -6246,10 +6865,10 @@ void EncGOP::xCalculateAddPSNR(Picture *pcPic, PelUnitBuf cPicD, const AccessUni
   }
 
   uint32_t uibits = numRBSPBytes * 8;
-  m_vRVM_RP.push_back( uibits );
+  ( own ? own->rvmBits : m_vRVM_RP ).push_back( uibits );
 
   //===== add PSNR =====
-  m_gcAnalyzeAll.addResult(dPSNR, (double) uibits, MSEyuvframe, upscaledPSNR,
+  analyzeAll.addResult(dPSNR, (double) uibits, MSEyuvframe, upscaledPSNR,
 #if MSSIM_UNIFORM_METRICS_LOG
                            msssim,
                            upscaledMsssim, 
@@ -6261,12 +6880,12 @@ void EncGOP::xCalculateAddPSNR(Picture *pcPic, PelUnitBuf cPicD, const AccessUni
 #if JVET_O0756_CALCULATE_HDRMETRICS
   if (calculateHdrMetrics)
   {
-    m_gcAnalyzeAll.addHDRMetricsResult(deltaE, psnrL);
+    analyzeAll.addHDRMetricsResult(deltaE, psnrL);
   }
 #endif
   if (pcSlice->isIntra())
   {
-    m_gcAnalyzeI.addResult(dPSNR, (double) uibits, MSEyuvframe, upscaledPSNR,
+    analyzeI.addResult(dPSNR, (double) uibits, MSEyuvframe, upscaledPSNR,
 #if MSSIM_UNIFORM_METRICS_LOG
                            msssim,
                            upscaledMsssim, 
@@ -6279,13 +6898,13 @@ void EncGOP::xCalculateAddPSNR(Picture *pcPic, PelUnitBuf cPicD, const AccessUni
 #if JVET_O0756_CALCULATE_HDRMETRICS
     if (calculateHdrMetrics)
     {
-      m_gcAnalyzeI.addHDRMetricsResult(deltaE, psnrL);
+      analyzeI.addHDRMetricsResult(deltaE, psnrL);
     }
 #endif
   }
   if (pcSlice->isInterP())
   {
-    m_gcAnalyzeP.addResult(dPSNR, (double) uibits, MSEyuvframe, upscaledPSNR,
+    analyzeP.addResult(dPSNR, (double) uibits, MSEyuvframe, upscaledPSNR,
 #if MSSIM_UNIFORM_METRICS_LOG
                            msssim,
                            upscaledMsssim, 
@@ -6298,13 +6917,13 @@ void EncGOP::xCalculateAddPSNR(Picture *pcPic, PelUnitBuf cPicD, const AccessUni
 #if JVET_O0756_CALCULATE_HDRMETRICS
     if (calculateHdrMetrics)
     {
-      m_gcAnalyzeP.addHDRMetricsResult(deltaE, psnrL);
+      analyzeP.addHDRMetricsResult(deltaE, psnrL);
     }
 #endif
   }
   if (pcSlice->isInterB())
   {
-    m_gcAnalyzeB.addResult(dPSNR, (double) uibits, MSEyuvframe, upscaledPSNR,
+    analyzeB.addResult(dPSNR, (double) uibits, MSEyuvframe, upscaledPSNR,
 #if MSSIM_UNIFORM_METRICS_LOG
                            msssim,
                            upscaledMsssim, 
@@ -6317,14 +6936,14 @@ void EncGOP::xCalculateAddPSNR(Picture *pcPic, PelUnitBuf cPicD, const AccessUni
 #if JVET_O0756_CALCULATE_HDRMETRICS
     if (calculateHdrMetrics)
     {
-      m_gcAnalyzeB.addHDRMetricsResult(deltaE, psnrL);
+      analyzeB.addHDRMetricsResult(deltaE, psnrL);
     }
 #endif
   }
 #if WCG_WPSNR
   if (useLumaWPSNR)
   {
-    m_gcAnalyzeWPSNR.addResult(dPSNRWeighted, (double) uibits, MSEyuvframeWeighted, upscaledPSNR,
+    analyzeWPSNR.addResult(dPSNRWeighted, (double) uibits, MSEyuvframeWeighted, upscaledPSNR,
 #if MSSIM_UNIFORM_METRICS_LOG
                                msssim,
                                upscaledMsssim, 
@@ -6334,7 +6953,8 @@ void EncGOP::xCalculateAddPSNR(Picture *pcPic, PelUnitBuf cPicD, const AccessUni
 #endif
 
   char c = (pcSlice->isIntra() ? 'I' : pcSlice->isInterP() ? 'P' : 'B');
-  if (! pcPic->referenced)
+  // with frame threads, the setups of the next pictures may have marked the reference pictures again
+  if( m_ftActive ? !m_pcPicOrder->referencedAtSetup : !pcPic->referenced )
   {
     c += 32;
   }
@@ -6986,6 +7606,438 @@ void EncGOP::xUpdateRasInit(Slice* slice)
   {
     m_lastRasPoc = slice->getPOC();
   }
+}
+
+void EncGOP::xSetupPicOrder( Slice* slice, const std::shared_ptr<EncPicOrder>& order )
+{
+  // the search and the finish use the picture's copy of the reshaper as the setup leaves it
+  *m_pcSetupReshaper = *m_pcReshaper;
+
+  if( m_ftActive )
+  {
+    // An intra period starts at a RAS-init IRAP. Its finish resets the state the filter encoders and the APSs carry
+    // (ALF APSs and controls, CCSAO history, ALF scales, the SAO disabled rates of the upper layers), and as an intra
+    // picture of the lowest layer it reads none of what the reset keeps (the SAO disabled rate of layer 0, which it
+    // sets). So the periods' finishes may run at the same time with a finish context each (m_ftPeriods); a context's
+    // next period finishes after its previous one. A RAS-init picture that is not an IRAP (the first one after POC 0
+    // without a CRA, LD) reads layer 0's rate and starts no period.
+    if( m_ftPeriod < 0 || ( slice->getPendingRasInit() && slice->isIRAP() ) )
+    {
+      m_ftPeriod++;
+    }
+    order->finishCtx  = int( m_ftPeriod % m_ftPeriods );
+    order->finishPrev = m_ftCtxLast[order->finishCtx];
+    m_ftCtxLast[order->finishCtx] = order;
+    // decided in coding order here, as the finishes of several periods may not run in coding order
+    order->first    = m_bFirst;
+    order->seqFirst = m_bSeqFirst;
+    m_bFirst        = false;
+    m_bSeqFirst     = false;
+  }
+
+  if( m_pcEncLib->getNumSearchStacks() == 1 )
+  {
+    return;   // one search stack keeps the live temporal context store and AMVP-SbTMVP areas
+  }
+  CHECK( slice->getPic()->cs->pps->getNumSlicesInPic() != 1, "Several search stacks need one slice per picture" );
+  order->ctxKeyQp = slice->getSliceQp();
+#if JVET_Z0135_TEMP_CABAC_WIN_WEIGHT
+  // CABACDataStore::updateBufferState, CtxStateStore::loadCtx and storeCtx in coding order (one store per picture)
+#if JVET_Z0118_GDR && JVET_AD0206_CABAC_INIT_AT_GDR
+  if( slice->getPendingRasInit() || slice->isInterGDR() )
+#else
+  if( slice->getPendingRasInit() )
+#endif
+  {
+    m_ctxOrder[0].clear();
+    m_ctxOrder[1].clear();
+  }
+  if( slice->getSliceType() != I_SLICE )
+  {
+#if JVET_AH0176_LOW_DELAY_B_CTX
+    auto& buf = m_ctxOrder[slice->getSliceType() == P_SLICE ? 1 : 0];
+#else
+    auto& buf = m_ctxOrder[slice->getSliceType()];
+#endif
+    const std::pair<int, int> key( slice->getTLayer(), slice->getSliceQp() );
+    const auto it = buf.find( key );
+    if( it != buf.end() )
+    {
+      order->ctxSource = it->second;
+    }
+    else if( buf.size() == TEMP_CABAC_BUFFER_SIZE )
+    {
+      buf.erase( buf.begin() );
+    }
+    buf[key] = order;
+  }
+#endif
+#if JVET_AG0098_AMVP_WITH_SBTMVP
+  // EncSlice::clearAmvpSbTmvpStatArea, loadAmvpSbTmvpStatArea and storeAmvpSbTmvpStatArea in coding order
+  if( slice->getPendingRasInit() || slice->isInterGDR() )
+  {
+    m_sbTmvpOrder.clear();
+  }
+  if( !slice->isIntra() )
+  {
+    const auto it = m_sbTmvpOrder.find( slice->getTLayer() );
+    if( it != m_sbTmvpOrder.end() )
+    {
+      order->sbTmvpSource = it->second;
+    }
+    m_sbTmvpOrder[slice->getTLayer()] = order;
+  }
+#endif
+}
+
+void EncGOP::xStartPicSearch( Picture* pic, PicHeader* picHeader, Slice* slice, EncPicOrder& order, bool decPic )
+{
+  if( m_ftActive )
+  {
+    xFtWaitSearchInputs( slice, order );
+    // the search stack takes over what the setup left in the setup stack
+    xFtAcquireStack( order );
+    m_pcSearchStack  = &m_pcEncLib->getSearchStack( order.stackIdx );
+    m_pcSliceEncoder = &m_pcSearchStack->sliceEncoder;
+    m_pcSliceEncoder->loadSetup( *order.setup, *pic );
+    order.setup.reset();
+    if( pic->origDropped )
+    {
+      const bool read = m_pcEncLib->getTemporalFilter().readFrame( pic->recreateOrigBuf(), pic->inputFrameIndex );
+      CHECK( !read, "Could not read the picture's original again from the input file" );
+#if ORIG_RELOAD_CHECK
+      pic->checkReloadedOrig();
+#endif
+    }
+    pic->unpackWaitingBufs();
+    // the temporary buffers the setup left out: the true original of a picture the temporal filter left as it was,
+    // and the filtered original, are copies of the original, which nothing changes between the setup and here
+    const bool trueOrigMade = !pic->getTrueOrigBuf().bufs.empty();
+    pic->createTempBuffers( pic->cs->pps->pcv->maxCUWidth, xUseFilteredOrig(), false, false );
+    if( !trueOrigMade )
+    {
+      pic->getTrueOrigBuf().copyFrom( pic->getOrigBuf() );
+    }
+    if( xUseFilteredOrig() )
+    {
+      pic->getFilteredOrigBuf().copyFrom( pic->getOrigBuf() );
+    }
+    // the picture's search data (reconstruction, per-4x4 arrays, CU, PU and TU maps, coefficients, refined TMVP
+    // motion), which the setup does not create with frame threads: a picture holds it only from here, not while it
+    // waits for its inputs and a stack
+    pic->createSearchBuffers();
+    pic->cs->createTemporaryCsData( (bool) pic->cs->sps->getPLTMode() );
+#if JVET_AL0214_MV_REFINEMENT_FOR_TMVP
+    int refineTmvpNumRefIdx[2] = { slice->getNumRefIdx( REF_PIC_LIST_0 ), slice->getNumRefIdx( REF_PIC_LIST_1 ) };
+    pic->cs->createTemporaryRefineTmvpCsData( slice->isIntra(), refineTmvpNumRefIdx, false );
+#endif
+#if JVET_AI0136_ADAPTIVE_DUAL_TREE
+    std::lock_guard<std::mutex> lock( m_ftMutex );
+    if( m_ftWriterPartitionerSST )
+    {
+      m_pcSearchStack->cabacEncoder.getPartitionerSST() = *m_ftWriterPartitionerSST;
+    }
+#endif
+  }
+#if JVET_AI0183_MVP_EXTENSION
+  slice->generateIntersectingMv();   // reads the motion of the reference pictures
+#endif
+  xApplyAMaxBT( pic, picHeader, slice, order );
+
+  const bool severalStacks = m_pcEncLib->getNumSearchStacks() > 1;
+  if( order.cabacTableIdxDeferred )
+  {
+#if JVET_Z0135_TEMP_CABAC_WIN_WEIGHT
+    if( severalStacks && order.ctxSource && slice->getSPS()->getTempCabacInitMode() )
+    {
+      // a loaded state replaces every context value the table initialises, so the search does not need the table;
+      // the finish sets the real one for the slice header
+      slice->setEncCABACTableIdx( slice->getSliceType() );
+    }
+    else
+#endif
+    {
+      CHECK( order.previous && !order.previous->finished, "The CABAC init table of a picture still being encoded" );
+      slice->setEncCABACTableIdx( order.previous ? order.previous->encCABACTableIdxAfter : I_SLICE );
+    }
+  }
+  if( !severalStacks )
+  {
+    return;
+  }
+  CHECK( decPic, "Several search stacks do not support decoding pictures from a debug bitstream" );
+  CHECK( slice->getSliceQp() != order.ctxKeyQp, "The slice QP changed after the setup" );
+  xLoadCodingOrderState( slice, order );
+}
+
+double EncGOP::xFtSearchPriority( Picture& pic, const EncPicOrder& order ) const
+{
+  if( m_pcCfg->getIntraPeriod() != 1 )
+  {
+    return -double( order.turn );   // the earliest first: inter pictures wait for their references in coding order
+  }
+  // all-intra pictures read no other picture, so the most expensive start first (as the chunks of --ParallelSegments):
+  // the luma activity, the sum of absolute horizontal and vertical differences on every other row and column
+  const CPelBuf luma     = pic.getOrigBuf().get( COMPONENT_Y );
+  double        activity = 0;
+  for( int y = 0; y + 1 < (int) luma.height; y += 2 )
+  {
+    const Pel* row  = luma.bufAt( 0, y );
+    const Pel* next = luma.bufAt( 0, y + 1 );
+    for( int x = 0; x + 1 < (int) luma.width; x += 2 )
+    {
+      activity += std::abs( row[x + 1] - row[x] ) + std::abs( next[x] - row[x] );
+    }
+  }
+  return activity;
+}
+
+bool EncGOP::xUseFilteredOrig() const
+{
+#if JVET_Y0240_BIM
+  return m_pcCfg->getGopBasedTemporalFilterEnabled() || m_pcCfg->getBIM();
+#else
+  return m_pcCfg->getGopBasedTemporalFilterEnabled();
+#endif
+}
+
+void EncGOP::xLoadCodingOrderState( Slice* slice, EncPicOrder& order )
+{
+  // what the picture's slice encoder reads of the earlier pictures in coding order (xSetupPicOrder)
+#if JVET_Z0135_TEMP_CABAC_WIN_WEIGHT
+  CHECK( order.ctxSource && !order.ctxSource->finished, "CABAC contexts of a picture still being encoded" );
+  m_pcSliceEncoder->getCABACDataStore()->setOnlyCtxStates( slice, order.ctxSource ? &order.ctxSource->ctxStored : nullptr );
+#endif
+#if JVET_AG0098_AMVP_WITH_SBTMVP
+  CHECK( order.sbTmvpSource && !order.sbTmvpSource->finished, "AMVP-SbTMVP area of a picture still being encoded" );
+  m_pcSliceEncoder->setOnlyAmvpSbTmvpStatArea( slice->getTLayer(), order.sbTmvpSource != nullptr,
+                                               order.sbTmvpSource ? order.sbTmvpSource->sbTmvpStoredArea : 0 );
+#endif
+}
+
+void EncGOP::xStartPicFinish( Slice* slice, EncPicOrder& order, std::unique_lock<std::mutex>& apsMapLock )
+{
+  if( !m_ftActive )
+  {
+    m_pcFinishCabac     = &m_pcSearchStack->cabacEncoder;
+    m_pcFinishCtxCache  = &m_pcSearchStack->ctxCache;
+    m_pcFinishIntraPred = &m_pcSearchStack->intraSearch;
+    m_pcFinishRdCost    = &m_pcSearchStack->rdCost;
+    m_pcFinishReshaper  = &m_pcSearchStack->reshaper;
+  }
+  if( m_ftActive )
+  {
+    // the finishes of a period run in coding order, its first after the last of the period that had the context before
+    xFtWait( [&]() { return !order.finishPrev || order.finishPrev->finished; } );
+    order.finishPrev.reset();
+    const EncFinishContext& ctx = m_pcEncLib->getFinishContext( order.finishCtx );
+    xUseFinishContext( ctx );
+    if( order.finishCtx == 0 )
+    {
+      apsMapLock.lock();   // the finish adds and changes EncLib's APSs; the next pictures' setups may look them up
+    }
+    // the context's finish stack takes over what the finish needs of the search stack
+    EncFinishStack& finish = *ctx.stack;
+    m_pcSliceEncoder    = &finish.sliceEncoder;
+    m_pcFinishCabac     = &finish.cabacEncoder;
+    m_pcFinishCtxCache  = &finish.ctxCache;
+    m_pcFinishIntraPred = &finish.intraPred;
+    m_pcFinishRdCost    = &finish.rdCost;
+    m_pcFinishReshaper  = &finish.reshaper;
+    finish.rdCost       = *order.finishRdCost;
+    finish.reshaper     = *order.finishReshaper;
+#if JVET_AI0136_ADAPTIVE_DUAL_TREE
+    finish.cabacEncoder.getPartitionerSST() = *order.finishPartitionerSST;
+    order.finishPartitionerSST.reset();
+#endif
+#if JVET_AG0098_AMVP_WITH_SBTMVP
+    m_pcSliceEncoder->m_picAmvpSbTmvpEnabledArea = order.finishAmvpSbTmvpArea;
+#endif
+    const SPS& sps = *slice->getSPS();
+    const PPS& pps = *slice->getPPS();
+    m_pcSliceEncoder->create( pps.getPicWidthInLumaSamples(), pps.getPicHeightInLumaSamples(), sps.getChromaFormatIdc(),
+                              sps.getMaxCUWidth(), sps.getMaxCUHeight(),
+                              floorLog2( sps.getMaxCUWidth() ) - sps.getLog2MinCodingBlockSize() );   // bin buffers
+    order.finishRdCost.reset();
+    order.finishReshaper.reset();
+    if( m_pcEncLib->getNumSearchStacks() > 1 )
+    {
+      xLoadCodingOrderState( slice, order );
+    }
+#if JVET_AL0142_CCSAO_REUSE_CTU && JVET_AE0151_CCSAO_HISTORY_OFFSETS_AND_EXT_EO
+    m_pcFinishCabac->getCABACWriter( slice->getSPS() )->m_ccSaoPrvParam    = m_pcSAO->m_ccSaoPrvParam;
+    m_pcFinishCabac->getCABACEstimator( slice->getSPS() )->m_ccSaoPrvParam = m_pcSAO->m_ccSaoPrvParam;
+#endif
+    if( m_ftPeriods > 1 )
+    {
+      order.analyze.reset( new EncPicAnalyze );
+      g_msgCapture = &order.log;   // printed in coding order (xFtOutput)
+    }
+  }
+  // the LMCS APS of a picture with a new reshaper model (set up in xPicInitLMCS)
+  const SliceReshapeInfo& sInfo = m_pcFinishReshaper->getSliceReshaperInfo();
+  if( slice->getSPS()->getUseLmcs() && sInfo.getSliceReshapeModelPresentFlag() )
+  {
+    APS* lmcsAPS = slice->getPicHeader()->getLmcsAPS();
+    if( m_pcApsMap != m_pcEncLib->getApsMap() )
+    {
+      // a finish context of its own: the period's LMCS APS (the setups put EncLib's into the picture header)
+      const int lmcsApsId = slice->getPicHeader()->getLmcsAPSId();
+      lmcsAPS             = m_pcApsMap->getPS( ( lmcsApsId << NUM_APS_TYPE_LEN ) + LMCS_APS );
+      if( lmcsAPS == nullptr )
+      {
+        lmcsAPS = m_pcApsMap->allocatePS( ( lmcsApsId << NUM_APS_TYPE_LEN ) + LMCS_APS );
+        lmcsAPS->setAPSId( lmcsApsId );
+        lmcsAPS->setAPSType( LMCS_APS );
+      }
+      order.picHeader->setLmcsAPS( lmcsAPS );   // the picture's copy (xUsePicHeaderCopy)
+    }
+    SliceReshapeInfo& tInfo = lmcsAPS->getReshaperAPSInfo();
+    tInfo.reshaperModelMaxBinIdx = sInfo.reshaperModelMaxBinIdx;
+    tInfo.reshaperModelMinBinIdx = sInfo.reshaperModelMinBinIdx;
+    memcpy(tInfo.reshaperModelBinCWDelta, sInfo.reshaperModelBinCWDelta, sizeof(int)*(PIC_CODE_CW_BINS));
+    tInfo.maxNbitsNeededDeltaCW = sInfo.maxNbitsNeededDeltaCW;
+    tInfo.chrResScalingOffset = sInfo.chrResScalingOffset;
+    m_pcApsMap->setChangedFlag((lmcsAPS->getAPSId() << NUM_APS_TYPE_LEN) + LMCS_APS);
+  }
+
+  if( order.cabacTableIdxDeferred )
+  {
+    CHECK( order.previous && !order.previous->finished, "The CABAC init table of a picture still being encoded" );
+    slice->setEncCABACTableIdx( order.previous ? order.previous->encCABACTableIdxAfter : I_SLICE );
+  }
+#if JVET_AG0098_AMVP_WITH_SBTMVP
+  // a picture without AMVP-SbTMVP stores the area of the last picture that counted one
+  if( slice->isIntra() || !slice->getAmvpSbTmvpEnabledFlag() )
+  {
+    m_pcSliceEncoder->m_picAmvpSbTmvpEnabledArea = m_sbTmvpLastArea;
+  }
+#endif
+}
+
+void EncGOP::xEndPicFinish( Slice* slice, EncPicOrder& order, std::unique_lock<std::mutex>& apsMapLock )
+{
+  if( apsMapLock.owns_lock() )
+  {
+    apsMapLock.unlock();
+  }
+  order.encCABACTableIdxAfter = m_pcSliceEncoder->getEncCABACTableIdx();
+#if JVET_AI0136_ADAPTIVE_DUAL_TREE
+  if( m_ftActive )
+  {
+    std::lock_guard<std::mutex> lock( m_ftMutex );
+    m_ftWriterPartitionerSST.reset( new QTBTPartitioner( m_pcFinishCabac->getPartitionerSST() ) );
+  }
+#endif
+#if JVET_AG0098_AMVP_WITH_SBTMVP
+  m_sbTmvpLastArea       = m_pcSliceEncoder->m_picAmvpSbTmvpEnabledArea;
+  order.sbTmvpStoredArea = m_sbTmvpLastArea;
+#endif
+#if JVET_Z0135_TEMP_CABAC_WIN_WEIGHT
+  if( m_pcEncLib->getNumSearchStacks() > 1 && slice->getSliceType() != I_SLICE )
+  {
+    CHECK( slice->getSliceQp() != order.ctxKeyQp, "The slice QP changed after the setup" );
+    const CtxStateArray* stored = m_pcSliceEncoder->getCABACDataStore()->findCtxStates( slice );
+    CHECK( !stored, "The picture stored no CABAC contexts" );
+    order.ctxStored = *stored;
+  }
+#endif
+  order.previous.reset();
+}
+
+void EncGOP::xApplyAMaxBT( Picture* pcPic, PicHeader* picHeader, Slice* pcSlice, EncPicOrder& order )
+{
+  if( !m_pcCfg->getUseAMaxBT() )
+  {
+    return;
+  }
+  if( order.amaxbtRead )
+  {
+    uint32_t blkSize = 0;
+    uint32_t numBlk  = 0;
+    for( const auto& contributor: order.amaxbtContributors )
+    {
+      CHECK( !contributor->finished, "AMaxBT statistics of a picture still being encoded" );
+      blkSize += contributor->amaxbtBlkSize;
+      numBlk  += contributor->amaxbtNumBlk;
+    }
+    order.amaxbtContributors.clear();
+    CHECK( numBlk == 0, "AMaxBT statistics without blocks" );
+
+    picHeader->setSplitConsOverrideFlag(true);
+    double dBlkSize = sqrt( ( double ) blkSize / numBlk );
+    unsigned int newMaxBtSize = picHeader->getMaxBTSize(pcSlice->getSliceType(), CHANNEL_TYPE_LUMA);
+    if( dBlkSize < AMAXBT_TH32 )
+    {
+      newMaxBtSize = 32;
+    }
+    else if( dBlkSize < AMAXBT_TH64 )
+    {
+      newMaxBtSize = 64;
+    }
+#if CTU_256
+    else if( dBlkSize < AMAXBT_TH128 )
+    {
+      newMaxBtSize = 128;
+    }
+    else
+    {
+      newMaxBtSize = 256;
+    }
+#else
+    else
+    {
+      newMaxBtSize = 128;
+    }
+#endif
+    newMaxBtSize = Clip3(picHeader->getMinQTSize(pcSlice->getSliceType()), pcPic->cs->sps->getCTUSize(), newMaxBtSize);
+    picHeader->setMaxBTSize(1, newMaxBtSize);
+  }
+#if JVET_S0133_PH_SYNTAX_OVERRIDE_ENC_FIX
+  bool identicalToSPS=true;
+  const SPS* sps =pcSlice->getSPS();
+
+  if (picHeader->getPicInterSliceAllowedFlag())
+  {
+    if (picHeader->getMinQTSize(pcSlice->getSliceType()) != pcSlice->getSPS()->getMinQTSize(pcSlice->getSliceType()) ||
+        picHeader->getMaxMTTHierarchyDepth(pcSlice->getSliceType()) != pcSlice->getSPS()->getMaxMTTHierarchyDepth() ||
+        picHeader->getMaxBTSize(pcSlice->getSliceType()) != pcSlice->getSPS()->getMaxBTSize() ||
+        picHeader->getMaxTTSize(pcSlice->getSliceType()) != pcSlice->getSPS()->getMaxTTSize()
+      )
+    {
+      identicalToSPS=false;
+    }
+  }
+
+  if (identicalToSPS && picHeader->getPicIntraSliceAllowedFlag())
+  {
+    if (picHeader->getMinQTSize(I_SLICE) != sps->getMinQTSize(I_SLICE) ||
+        picHeader->getMaxMTTHierarchyDepth(I_SLICE) != sps->getMaxMTTHierarchyDepthI() ||
+        picHeader->getMaxBTSize(I_SLICE) != sps->getMaxBTSizeI() ||
+        picHeader->getMaxTTSize(I_SLICE) != sps->getMaxTTSizeI()
+    )
+    {
+      identicalToSPS=false;
+    }
+
+    if (identicalToSPS && sps->getUseDualITree())
+    {
+      if (picHeader->getMinQTSize(I_SLICE, CHANNEL_TYPE_CHROMA) != sps->getMinQTSize(I_SLICE, CHANNEL_TYPE_CHROMA) ||
+          picHeader->getMaxMTTHierarchyDepth(I_SLICE, CHANNEL_TYPE_CHROMA) != sps->getMaxMTTHierarchyDepthIChroma() ||
+          picHeader->getMaxBTSize(I_SLICE, CHANNEL_TYPE_CHROMA) != sps->getMaxBTSizeIChroma() ||
+          picHeader->getMaxTTSize(I_SLICE, CHANNEL_TYPE_CHROMA) != sps->getMaxTTSizeIChroma()
+       )
+      {
+        identicalToSPS=false;
+      }
+    }
+  }
+
+  if (identicalToSPS)
+  {
+    picHeader->setSplitConsOverrideFlag(false);
+  }
+#endif
 }
 
 double EncGOP::xCalculateRVM()

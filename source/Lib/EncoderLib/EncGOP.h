@@ -38,7 +38,13 @@
 #ifndef __ENCGOP__
 #define __ENCGOP__
 
+#include <condition_variable>
+#include <functional>
 #include <list>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <set>
 
 #include <stdlib.h>
 
@@ -86,6 +92,76 @@
 //! \{
 
 class EncLib;
+struct EncSearchStack;
+
+/// What a picture takes from earlier pictures in coding order and leaves for later ones. EncGOP resolves the sources
+/// in the picture's setup; the search then reads only them, not what other pictures leave in shared objects (the
+/// search stacks keep nothing from picture to picture). Several search stacks use the records for everything listed;
+/// one stack uses them for the AMaxBT statistics and the CABAC init table only.
+struct EncFinishContext;
+
+/// Frame threads with several periods: a picture's PSNR sums, added to EncGOP's in coding order (EncGOP::xFtOutput)
+struct EncPicAnalyze
+{
+  Analyze all, i, p, b;
+#if WCG_WPSNR
+  Analyze wpsnr;
+#endif
+  std::vector<int> rvmBits;   ///< for EncGOP::m_vRVM_RP
+};
+
+struct EncPicOrder
+{
+  int64_t                       turn   = 0;                     ///< setup and finish turn: the picture's index in coding order
+                                                                ///< over all GOPs (frame threads), else its index in the GOP
+  double                        searchPriority = 0;             ///< frame threads: waiting searches take stacks in
+                                                                ///< decreasing priority (xFtSearchPriority)
+  const Picture*                pic    = nullptr;
+  int                           stackIdx = 0;                   ///< the picture's search stack (frame threads: from the
+                                                                ///< start of the search, xFtAcquireStack)
+  bool                          finished = false;               ///< the picture is done, including the padding as a reference
+  std::shared_ptr<EncPicOrder>  previous;                       ///< previous picture in coding order (until the finish)
+  bool                          cabacTableIdxDeferred = false;  ///< the CABAC init table comes from the previous picture
+  SliceType                     encCABACTableIdxAfter = I_SLICE;   ///< CABAC init table the slice writing leaves
+#if JVET_Z0135_TEMP_CABAC_WIN_WEIGHT
+  std::shared_ptr<EncPicOrder>  ctxSource;                      ///< picture whose stored CABAC contexts this one loads
+  CtxStateArray                 ctxStored;                      ///< the contexts this picture stores (after its finish)
+#endif
+#if JVET_AG0098_AMVP_WITH_SBTMVP
+  std::shared_ptr<EncPicOrder>  sbTmvpSource;                   ///< picture whose AMVP-SbTMVP area this one loads
+  uint32_t                      sbTmvpStoredArea = 0;           ///< the area this picture stores (after its finish)
+#endif
+  int                           ctxKeyQp = 0;                   ///< slice QP when the sources were resolved
+  bool                          amaxbtRead = false;             ///< reads the block statistics of amaxbtContributors
+  std::vector<std::shared_ptr<EncPicOrder>> amaxbtContributors;
+  uint32_t                      amaxbtBlkSize = 0;              ///< this picture's AMaxBT block statistics (after its finish)
+  uint32_t                      amaxbtNumBlk  = 0;
+  PicHeader*                    sharedPicHeader = nullptr;      ///< the picture header the pictures share (EncLib's)
+  std::unique_ptr<PicHeader>    picHeader;                      ///< frame threads: the picture's copy of the header
+  std::unique_ptr<EncSliceSetup> setup;                         ///< frame threads: what the setup left in the setup
+                                                                ///< stack, until the search stack takes it over
+  std::vector<const Picture*>   refs;                           ///< frame threads: the reference pictures (until done)
+  std::unique_ptr<RdCost>       finishRdCost;                   ///< frame threads: the search stack's RdCost and reshaper
+  std::unique_ptr<EncReshape>   finishReshaper;                 ///< at the end of the search, for the finish stack
+#if JVET_AI0136_ADAPTIVE_DUAL_TREE
+  std::unique_ptr<QTBTPartitioner> finishPartitionerSST;        ///< and the CABAC encoder's separate-tree partitioner
+#endif
+#if JVET_AG0098_AMVP_WITH_SBTMVP
+  uint32_t                      finishAmvpSbTmvpArea = 0;       ///< and the slice encoder's AMVP-SbTMVP area count
+#endif
+  // frame threads: the finishes of an intra period (from a RAS-init IRAP on) run in coding order with the period's
+  // finish context; periods in flight at the same time use different contexts (FramePeriods)
+  int                           finishCtx = 0;                  ///< EncLib::getFinishContext
+  std::shared_ptr<EncPicOrder>  finishPrev;                     ///< the picture that used the context before (until the
+                                                                ///< finish): the previous one of the period, or the last of
+                                                                ///< the period that had the context before
+  bool                          first     = false;              ///< the first picture in coding order (m_bFirst)
+  bool                          seqFirst  = false;              ///< writes the parameter sets as the first (m_bSeqFirst)
+  std::string                   log;                            ///< several periods: the finish's log, its access unit and
+  std::unique_ptr<AccessUnit>   au;                             ///< its PSNR sums, output in coding order (xFtOutput)
+  std::unique_ptr<EncPicAnalyze> analyze;
+  bool                          referencedAtSetup = false;      ///< Picture::referenced at the end of the setup (for the log)
+};
 
 // ====================================================================================================================
 // Class definition
@@ -135,7 +211,7 @@ private:
   bool                    m_ltRefPicUsedByCurrPicFlag[MAX_NUM_LONG_TERM_REF_PICS];
   int                     m_iLastIDR;
   int                     m_iGopSize;
-  int                     m_iNumPicCoded;
+  static thread_local int m_iNumPicCoded;             ///< pictures coded by the running compressGOP call
   bool                    m_bFirst;
   int                     m_iLastRecoveryPicPOC;
   int                     m_latestDRAPPOC;
@@ -144,19 +220,41 @@ private:
   //  Access channel
   EncLib*                 m_pcEncLib;
   EncCfg*                 m_pcCfg;
-  EncSlice*               m_pcSliceEncoder;
+  // the picture of the running compressGOP call (with frame threads, every picture has a thread)
+  static thread_local EncSlice*       m_pcSliceEncoder;   ///< the slice encoder of the picture's search stack
+  static thread_local EncSearchStack* m_pcSearchStack;    ///< search stack of the picture being encoded
+  static thread_local EncPicOrder*    m_pcPicOrder;       ///< order record of the picture being encoded
+  // the objects of the picture's setup that are not the slice encoder's: its search stack's, or the setup stack's
+  static thread_local RdCost*          m_pcSetupRdCost;
+  static thread_local EncReshape*      m_pcSetupReshaper;
+  // the objects of the picture's finish: its search stack's, or with frame threads the finish stack of its context
+  static thread_local CABACEncoder*    m_pcFinishCabac;
+  static thread_local CtxCache*        m_pcFinishCtxCache;
+  static thread_local IntraPrediction* m_pcFinishIntraPred;
+  static thread_local RdCost*          m_pcFinishRdCost;
+  static thread_local EncReshape*      m_pcFinishReshaper;
+  int64_t                 m_numPicsStarted = 0;       ///< pictures started so far (they use the stacks in turn)
+  // coding-order sources of the pictures (EncPicOrder), as the setup of the next picture sees them
+  std::shared_ptr<EncPicOrder> m_lastPicOrder;
+#if JVET_Z0135_TEMP_CABAC_WIN_WEIGHT
+  std::map<std::pair<int, int>, std::shared_ptr<EncPicOrder>> m_ctxOrder[2];   ///< as CtxStateStore, by slice type
+#endif
+#if JVET_AG0098_AMVP_WITH_SBTMVP
+  std::map<int, std::shared_ptr<EncPicOrder>> m_sbTmvpOrder;                   ///< as EncSlice's areas, by temporal layer
+  uint32_t                m_sbTmvpLastArea = 0;       ///< AMVP-SbTMVP area left by the last picture that counted one
+#endif
   PicList*                m_pcListPic;
 #if NN_LF_UNIFIED
   EncNNFilterUnified      m_nnfilterUnified;
 #endif
 
-  HLSWriter*              m_HLSWriter;
+  static thread_local HLSWriter* m_HLSWriter;          ///< the finish context's (EncLib::getFinishContext)
 #if !JVET_AJ0237_INTERNAL_12BIT
 #if JVET_V0094_BILATERAL_FILTER || JVET_X0071_CHROMA_BILATERAL_FILTER
   BilateralFilter         m_cBilateralFilter;
 #endif
 #endif
-  LoopFilter*             m_pcLoopFilter;
+  static thread_local LoopFilter* m_pcLoopFilter;      ///< the finish context's
 
   SEIWriter               m_seiWriter;
 
@@ -168,19 +266,21 @@ private:
   bool                    m_isUseLTRef;
   int                     m_lastLTRefPoc;
 #if JVET_AA0096_MC_BOUNDARY_PADDING
-  InterPrediction *m_pcFrameMcPadPrediction;   ///< encoder search class
+  static thread_local InterPrediction* m_pcFrameMcPadPrediction;   ///< the finish context's MC boundary padding
 #endif
   //--Adaptive Loop filter
-  EncSampleAdaptiveOffset*  m_pcSAO;
-  EncAdaptiveLoopFilter*    m_pcALF;
+  static thread_local EncSampleAdaptiveOffset* m_pcSAO;   ///< the finish context's
+  static thread_local EncAdaptiveLoopFilter*   m_pcALF;   ///< the finish context's
+  static thread_local ParameterSetMap<APS>*    m_pcApsMap;   ///< the finish context's APSs (the setups use EncLib's)
   EncReshape*               m_pcReshaper;
+  RdCost                    m_lmcsWeights;   ///< luma level weights of the weighted SSE in coding order (LMCS updates them per picture)
   RateCtrl*                 m_pcRateCtrl;
 #if JVET_AL0153_ALF_CCCM
-  EncLoopFilterCccm*        m_pcLoopFilterCccm;
+  static thread_local EncLoopFilterCccm* m_pcLoopFilterCccm;   ///< the finish context's
 #endif
   // indicate sequence first
   bool                    m_bSeqFirst;
-  bool                    m_audIrapOrGdrAuFlag;
+  static thread_local bool m_audIrapOrGdrAuFlag;      ///< set and used by the finish
 
   EncHRD*                 m_HRD;
 
@@ -194,16 +294,15 @@ private:
   uint32_t                    m_lastBPSEI[MAX_TLAYER];
   uint32_t                    m_totalCoded[MAX_TLAYER];
   bool                        m_rapWithLeading;
-  bool                    m_bufferingPeriodSEIPresentInAU;
+  static thread_local bool m_bufferingPeriodSEIPresentInAU;   ///< set and used by the finish
   SEIEncoder              m_seiEncoder;
 #if W0038_DB_OPT
   PelStorage*             m_pcDeblockingTempPicYuv;
   int                     m_DBParam[MAX_ENCODER_DEBLOCKING_QUALITY_LAYERS][4];   //[layer_id][0: available; 1: bDBDisabled; 2: Beta Offset Div2; 3: Tc Offset Div2;]
 #endif
 
-  // members needed for adaptive max BT size
-  uint32_t                    m_uiBlkSize[10];
-  uint32_t                    m_uiNumBlk[10];
+  // members needed for adaptive max BT size: per depth, the pictures whose statistics the next one of the depth reads
+  std::vector<std::shared_ptr<EncPicOrder>> m_amaxbtContributors[10];
   uint32_t                    m_uiPrevISlicePOC;
   bool                    m_bInitAMaxBT;
 
@@ -244,6 +343,29 @@ public:
 
   void  init        ( EncLib* pcEncLib );
 
+  /// Starts the first numPics pictures of the GOP in threads (FrameThreads): each runs compressGOP for its picIdInGOP.
+  /// Returns at once: the pictures of later GOPs may start before these are done (setups and finishes keep coding
+  /// order over all GOPs). The recon output list is not used.
+  void  compressGOPFrameThreads( int numPics, int iPOCLast, int iNumPicRcvd, PicList& rcListPic,
+                                 std::list<PelUnitBuf*>& rcListPicYuvRec, bool isField, bool isTff,
+                                 const InputColourSpaceConversion snr_conversion, const bool printFrameMSE,
+#if MSSIM_UNIFORM_METRICS_LOG
+                                 const bool printMSSSIM,
+#endif
+                                 bool isEncodeLtRef );
+  /// Waits until at most maxPending of the started pictures are not done; throws the error of a failed picture.
+  void  waitFrameThreads    ( int64_t maxPending );
+  /// Waits until a picture's finish has ended since the caller last saw numFinished (updated) or all pictures are done
+  /// (returns true): the application writes the finished pictures' reconstructions meanwhile.
+  bool  waitFrameThreadsFinished( int64_t& numFinished );
+  /// Waits until all started pictures are done; throws the error of a failed picture.
+  void  finishFrameThreads  ();
+  /// The picture's finish has ended (its log and access unit may still wait for earlier pictures, which read nothing
+  /// of it); until forgetPicFinished, before its buffer takes the next picture.
+  void  forgetPicFinished   ( const Picture* pic );
+  bool  isPicFinished       ( const Picture* pic );
+  /// Frame threads: a picture set up and not done references the picture (its buffer must not be reused).
+  bool  isPicReferencedInFlight( const Picture* pic );
   void  compressGOP ( int iPOCLast, int iNumPicRcvd, PicList& rcListPic, std::list<PelUnitBuf*>& rcListPicYuvRec,
                       bool isField, bool isTff, const InputColourSpaceConversion snr_conversion, const bool printFrameMSE,
 #if MSSIM_UNIFORM_METRICS_LOG
@@ -365,6 +487,63 @@ protected:
   double xCalculateRVM();
 
   void xUpdateRasInit(Slice* slice);
+  // the coding-order record of a picture (EncPicOrder): sources resolved at the end of the setup, applied at the start
+  // of the search and of the finish, results recorded at the end of the finish
+  void xSetupPicOrder ( Slice* slice, const std::shared_ptr<EncPicOrder>& order );
+  void xStartPicSearch( Picture* pic, PicHeader* picHeader, Slice* slice, EncPicOrder& order, bool decPic );
+  double xFtSearchPriority( Picture& pic, const EncPicOrder& order ) const;
+  bool xUseFilteredOrig() const;   // whether the pictures keep a filtered original (temporal filter or BIM)
+  void xStartPicFinish( Slice* slice, EncPicOrder& order, std::unique_lock<std::mutex>& apsMapLock );
+  void xEndPicFinish  ( Slice* slice, EncPicOrder& order, std::unique_lock<std::mutex>& apsMapLock );
+  void xApplyAMaxBT   ( Picture* pic, PicHeader* picHeader, Slice* slice, EncPicOrder& order );
+  PicHeader* xUsePicHeaderCopy( Picture* pic, EncPicOrder& order );
+  void xEndPicture    ( EncPicOrder& order );
+
+  // frame threads (compressGOPFrameThreads): the pictures of a GOP run compressGOP in threads of their own; setups
+  // and finishes take turns in coding order, a search starts when the pictures it reads are done
+  struct FtAbort {};                                   ///< thrown into the waiting threads when another one fails
+  bool                     m_ftActive = false;
+  std::mutex               m_ftMutex;
+  std::condition_variable  m_ftCv;
+  int64_t                  m_ftSetupTurn  = 0;         ///< turn (EncPicOrder::turn) whose setup may run
+  bool                     m_ftInputWaits = false;     ///< the input side waits for pictures to be done (waitFrameThreads)
+  int64_t                  m_ftNumFinished = 0;        ///< pictures whose finish ended (waitFrameThreadsFinished)
+  int                      m_ftPeriods    = 1;         ///< finish contexts (FramePeriods)
+  int64_t                  m_ftPeriod     = -1;        ///< the intra period of the last setup
+  std::vector<std::shared_ptr<EncPicOrder>> m_ftCtxLast;   ///< per finish context: the last picture set up to use it
+  int64_t                  m_ftFirstNotFinished = 0;   ///< the earliest turn not finished (xFtAcquireStack)
+  std::set<int64_t>        m_ftFinishedAhead;          ///< the finished turns after it
+  int64_t                  m_ftOutputTurn = 0;         ///< several periods: the turn whose output runs next (xFtOutput)
+  std::mutex               m_ftParamSetMutex;          ///< the parameter sets' changed flags, set and written in a finish
+  std::mutex               m_ftSeiMutex;               ///< the SEI writer
+#if JVET_AI0136_ADAPTIVE_DUAL_TREE
+  std::unique_ptr<QTBTPartitioner> m_ftWriterPartitionerSST;   ///< as the last slice writing left it, for the next search
+#endif
+  int64_t                  m_ftNumTurns   = 0;         ///< turns started (pictures and GOP indices without one)
+  int64_t                  m_ftNumDone    = 0;         ///< turns whose thread has returned
+  static thread_local int64_t m_ftTurn;                ///< the turn of the running compressGOP call
+  bool                     m_ftError      = false;
+  std::exception_ptr       m_ftFirstError;
+  std::set<const Picture*> m_ftPicsFinished;           ///< finish ended and not yet forgotten (forgetPicFinished)
+  std::map<const Picture*, int> m_ftRefsInFlight;      ///< per picture: references to it by pictures set up and not done
+  std::vector<bool>        m_ftStackBusy;
+  std::set<std::pair<double, int64_t>> m_ftStackWaiters;   ///< (-search priority, turn) of the searches waiting for a
+                                                          ///< stack (xFtAcquireStack): the first takes the next one
+  std::set<int64_t>        m_ftStackHolders;           ///< turns holding a stack
+  std::set<const Picture*> m_ftPicsInFlight;           ///< set up and not done (not usable as a reference yet)
+  std::mutex               m_ftApsMapMutex;            ///< EncLib's APS map: held by the finish, taken by a setup to use it
+  std::mutex               m_ftSaoStatsMutex;          ///< several periods: held by the finish that has SAO statistics
+  template<class Pred> void xFtWait( Pred pred );      ///< waits until pred() holds (pred runs with m_ftMutex locked)
+  void xFtRunInPool       ( std::function<void()> job );   ///< runs job on a worker thread
+  void xFtSkip            ( int64_t turn );            ///< a GOP index without a picture passes both turns
+  void xFtAcquireStack    ( EncPicOrder& order );
+  void xFtReleaseStack    ( EncPicOrder& order );     ///< at the end of the search (the finish has a stack of its own)
+  void xLoadCodingOrderState( Slice* slice, EncPicOrder& order );   ///< CABAC store and AMVP-SbTMVP areas into the stack
+  void xFtMarkFinished    ( int64_t turn );            ///< m_ftMutex held
+  void xFtOutput          ( EncPicOrder& order );
+  void xUseFinishContext  ( const EncFinishContext& ctx );
+  void xFtEndSetup        ( EncPicOrder& order );
+  void xFtWaitSearchInputs( Slice* slice, EncPicOrder& order );
 
   void xWriteAccessUnitDelimiter (AccessUnit &accessUnit, Slice *slice);
 
@@ -407,7 +586,7 @@ protected:
   bool xCheckMaxTidILRefPics(Picture* refPic, bool currentPicIsIRAP);
 
 #if EMBEDDED_APS
-  std::vector<APS> m_aps;
+  static thread_local std::vector<APS> m_aps;   ///< the APSs the picture header embeds, collected in the finish
 #endif
 };// END CLASS DEFINITION EncGOP
 

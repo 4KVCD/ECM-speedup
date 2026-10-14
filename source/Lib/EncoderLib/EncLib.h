@@ -61,11 +61,93 @@
 #include "EncReshape.h"
 #include "EncAdaptiveLoopFilter.h"
 #include "RateCtrl.h"
+#include "EncSearchStack.h"
+
+#include <deque>
+#include <memory>
+#include <mutex>
+#include <set>
+#include <vector>
 
 #if JVET_AL0153_ALF_CCCM
 #include "EncLoopFilterCccm.h"
 #endif
 class EncLibCommon;
+
+/// Frame threads: what a picture's setup uses (EncSlice::initSetup); the search stack the picture takes over its state
+/// (EncSlice::saveSetup, loadSetup).
+struct EncSetupStack
+{
+  EncSlice     sliceEncoder;
+  CABACEncoder cabacEncoder;
+  TrQuant      trQuant;
+  RdCost       rdCost;
+  EncReshape   reshaper;
+};
+
+/// Frame threads: what a finish uses besides the filter encoders: the slice writing and the CABAC estimators, the intra
+/// prediction ALF-CCCM computes in, and the picture's RdCost and reshaper (copied from its search stack). A finish
+/// without frame threads uses the search stack's.
+struct EncFinishStack
+{
+  EncSlice        sliceEncoder;
+  CABACEncoder    cabacEncoder;
+  CtxCache        ctxCache;
+#if JVET_V0094_BILATERAL_FILTER || JVET_X0071_CHROMA_BILATERAL_FILTER
+  BilateralFilter bilateralFilter;   ///< the intra prediction's (not used by ALF-CCCM)
+#endif
+  IntraPrediction intraPred;
+  RdCost          rdCost;
+  EncReshape      reshaper;
+};
+
+/// Frame threads: the objects whose state the finishes (loop filters, APSs, slice writing) of an intra period carry from
+/// picture to picture. A period starts at a RAS-init picture, whose finish resets that state, so periods in flight each
+/// take a context (EncGOP, FramePeriods); context 0 is EncLib's own objects.
+struct EncFinishContext
+{
+  EncAdaptiveLoopFilter*   alf        = nullptr;
+  EncSampleAdaptiveOffset* sao        = nullptr;
+  LoopFilter*              loopFilter = nullptr;
+#if JVET_AL0153_ALF_CCCM
+  EncLoopFilterCccm*       loopFilterCccm = nullptr;
+#endif
+#if JVET_AA0096_MC_BOUNDARY_PADDING
+  InterPrediction*         mcPad      = nullptr;
+#endif
+  HLSWriter*               hlsWriter  = nullptr;
+  ParameterSetMap<APS>*    apsMap     = nullptr;
+  EncFinishStack*          stack      = nullptr;   ///< frame threads: so a picture's search stack is free once it has
+                                                   ///< searched
+};
+
+/// The objects of a finish context other than the first
+struct EncFinishObjects
+{
+  int                      apsIdStart  = ALF_CTB_MAX_NUM_APS;
+  int                      apsIdStart2 = ALF_CTB_MAX_NUM_APS;
+#if JVET_AK0065_TALF
+  EncAdaptiveLoopFilter    alf { apsIdStart, apsIdStart2 };
+#else
+  EncAdaptiveLoopFilter    alf { apsIdStart };
+#endif
+  EncSampleAdaptiveOffset  sao;
+  LoopFilter               loopFilter;
+#if JVET_AL0153_ALF_CCCM
+  EncLoopFilterCccm        loopFilterCccm;
+#endif
+#if JVET_AA0096_MC_BOUNDARY_PADDING
+  InterPrediction          mcPad;
+#endif
+  HLSWriter                hlsWriter;
+  ParameterSetMap<APS>     apsMap { MAX_NUM_APS * MAX_NUM_APS_TYPE };
+#if JVET_AM0209_CHROMA_ALF_CCALF_REUSE_CTU
+  FrameCtrlInfo            pictureControlInfo[ALF_CTB_MAX_NUM_APS];   ///< as g_pictureControlInfo
+#endif
+#if JVET_AE0151_CCSAO_HISTORY_OFFSETS_AND_EXT_EO
+  std::vector<CcSaoPrvParam> ccSaoPrvParam[MAX_NUM_COMPONENT];        ///< as g_ccSaoPrvParam
+#endif
+};
 
 //! \ingroup EncoderLib
 //! \{
@@ -83,28 +165,30 @@ private:
   int                       m_iNumPicRcvd;                        ///< number of received pictures
   uint32_t                  m_uiNumAllPicCoded;                   ///< number of coded pictures
   PicList&                  m_cListPic;                           ///< dynamic list of pictures
+  // frame threads: the reading of a picture into m_cListPic (encodePrep) and the setups of the pictures in flight
+  // take turns; the pictures read wait in input order for the handout of their reconstruction
+  // (getFrameThreadsOutput), and their buffers are not reused before
+  std::mutex                m_picListMutex;
+  std::deque<std::pair<Picture*, int>> m_ftOutputQueue;   ///< the pictures read, with their frame index in the output
+  std::set<const Picture*>  m_ftBusyPics;
+  int                       m_numInputPics  = 0;       ///< pictures received (encodePrep): their frames in the input file
+  int                       m_origReloadable = -1;     ///< frame threads: the search start can read a picture's original
+                                                       ///< again from the input file (Picture::dropWaitingOrig); -1: not
+                                                       ///< decided yet (the application sets the input file after init)
   int                       m_layerId;
 
-  // encoder search
-#if ENABLE_SPLIT_PARALLELISM
-  InterSearch              *m_cInterSearch;                       ///< encoder search class
-  IntraSearch              *m_cIntraSearch;                       ///< encoder search class
-#else
-  InterSearch               m_cInterSearch;                       ///< encoder search class
-  IntraSearch               m_cIntraSearch;                       ///< encoder search class
-#endif
+  // the slice and CU encoders and the searches, one stack per picture searched at the same time
+  std::vector<std::unique_ptr<EncSearchStack>> m_searchStacks;
+  // CuThreads: the helpers of each search stack (stack i has the helpers i * CuThreads ... i * CuThreads + CuThreads - 1)
+  std::vector<std::unique_ptr<EncRdHelperStack>> m_rdHelperStacks;
+  // frame threads: the finish contexts of the intra periods in flight (FramePeriods); the first is EncLib's own objects
+  std::vector<EncFinishContext>                  m_finishContexts;
+  std::vector<std::unique_ptr<EncFinishObjects>> m_finishObjects;
+  // frame threads: the finish stacks of the contexts
+  std::vector<std::unique_ptr<EncFinishStack>>   m_finishStacks;
+  // frame threads: the stack of the picture setups
+  std::unique_ptr<EncSetupStack> m_setupStack;
   // coding tool
-#if ENABLE_SPLIT_PARALLELISM
-#if JVET_V0094_BILATERAL_FILTER || JVET_X0071_CHROMA_BILATERAL_FILTER
-  BilateralFilter          *m_bilateralFilter;
-#endif
-  TrQuant                  *m_cTrQuant;                           ///< transform & quantization class
-#else
-#if JVET_V0094_BILATERAL_FILTER || JVET_X0071_CHROMA_BILATERAL_FILTER
-  BilateralFilter           m_bilateralFilter;
-#endif
-  TrQuant                   m_cTrQuant;                           ///< transform & quantization class
-#endif
   LoopFilter                m_cLoopFilter;                        ///< deblocking filter class
   EncSampleAdaptiveOffset   m_cEncSAO;                            ///< sample adaptive offset class
   EncAdaptiveLoopFilter     m_cEncALF;
@@ -112,12 +196,6 @@ private:
 #if JVET_AL0153_ALF_CCCM
   EncLoopFilterCccm         m_cEncLoopFilterCccm;
 #endif
-#if ENABLE_SPLIT_PARALLELISM
-  CABACEncoder             *m_CABACEncoder;
-#else
-  CABACEncoder              m_CABACEncoder;
-#endif
-
 #if ENABLE_SPLIT_PARALLELISM
   EncReshape               *m_cReshaper;                        ///< reshaper class
 #else
@@ -130,25 +208,11 @@ private:
 
   // processing unit
   EncGOP                    m_cGOPEncoder;                        ///< GOP encoder
-  EncSlice                  m_cSliceEncoder;                      ///< slice encoder
-#if ENABLE_SPLIT_PARALLELISM
-  EncCu                    *m_cCuEncoder;                         ///< CU encoder
-#else
-  EncCu                     m_cCuEncoder;                         ///< CU encoder
-#endif
   // SPS
   ParameterSetMap<SPS>&     m_spsMap;                             ///< SPS. This is the base value. This is copied to PicSym
   ParameterSetMap<PPS>&     m_ppsMap;                             ///< PPS. This is the base value. This is copied to PicSym
   ParameterSetMap<APS>&     m_apsMap;                             ///< APS. This is the base value. This is copied to PicSym
   PicHeader                 m_picHeader;                          ///< picture header
-  // RD cost computation
-#if ENABLE_SPLIT_PARALLELISM
-  RdCost                   *m_cRdCost;                            ///< RD cost computation class
-  CtxCache                 *m_ctxCache;                           ///< buffer for temporarily stored context models
-#else
-  RdCost                    m_cRdCost;                            ///< RD cost computation class
-  CtxCache                  m_ctxCache;                           ///< buffer for temporarily stored context models
-#endif
   // quality control
   RateCtrl                  m_cRateCtrl;                          ///< Rate control class
 
@@ -200,6 +264,9 @@ protected:
   void  xInitPicHeader    (PicHeader &picHeader, const SPS &sps, const PPS &pps); ///< initialize Picture Header from encoder options
   void  xInitAPS          (APS &aps);                 ///< initialize APS from encoder options
   void  xInitScalingLists ( SPS &sps, APS &aps );     ///< initialize scaling lists
+  std::vector<TrQuant*> xAllTrQuants();               ///< the quantizers of the search stacks and their helpers
+  void xCreateFinishObjects( LoopFilter& loopFilter, EncAdaptiveLoopFilter& alf, EncSampleAdaptiveOffset& sao,
+                             bool saoEncData );
   void  xInitPPSforLT(PPS& pps);
   void  xInitHrdParameters(SPS &sps);                 ///< initialize HRDParameters parameters
 
@@ -213,6 +280,10 @@ public:
   void      destroy         ();
   void      init            ( bool isFieldCoding, AUWriterIf* auWriterIf );
   void      deletePicBuffer ();
+  /// frame threads: frees the search buffers of the finished pictures nothing reads any more (Picture::releaseUnreadBufs);
+  /// a reconstruction that is written is freed only from encodePrep, after the application wrote it
+  void      releaseUnreadPics();
+  void      xReleaseUnreadPics( bool afterOutput );   ///< with m_picListMutex held
 
   // -------------------------------------------------------------------------------------------------------------------
   // member access functions
@@ -220,51 +291,39 @@ public:
 
   AUWriterIf*             getAUWriterIf         ()              { return   m_AUWriterIf;           }
   PicList*                getListPic            ()              { return  &m_cListPic;             }
-#if ENABLE_SPLIT_PARALLELISM
-  InterSearch*            getInterSearch        ( int jId = 0 ) { return  &m_cInterSearch[jId];    }
-  IntraSearch*            getIntraSearch        ( int jId = 0 ) { return  &m_cIntraSearch[jId];    }
+  std::mutex&             getPicListMutex       ()              { return  m_picListMutex;          }
+  /// The stacks for the mode search of pictures; the getters below return the objects of the first one.
+  int                     getNumSearchStacks    () const        { return  int( m_searchStacks.size() ); }
+  EncSearchStack&         getSearchStack        ( int i = 0 )   { return  *m_searchStacks[i];      }
+  EncSetupStack*          getSetupStack         ()              { return  m_setupStack.get();      }
+  int                     getNumFinishContexts  () const        { return  int( m_finishContexts.size() ); }
+  const EncFinishContext& getFinishContext      ( int i ) const { return  m_finishContexts[i];     }
+  int                     getNumRdHelpers       () const        { return  m_searchStacks.empty() ? 0 : int( m_rdHelperStacks.size() / m_searchStacks.size() ); }
+  EncRdHelperStack&       getRdHelperStack      ( int i, int h ) { return *m_rdHelperStacks[i * getNumRdHelpers() + h]; }
+  InterSearch*            getInterSearch        ()              { return  &m_searchStacks[0]->interSearch; }
+  IntraSearch*            getIntraSearch        ()              { return  &m_searchStacks[0]->intraSearch; }
 
 #if JVET_V0094_BILATERAL_FILTER || JVET_X0071_CHROMA_BILATERAL_FILTER
-  BilateralFilter*        getBilateralFilter    ( int jId = 0 ) { return  &m_bilateralFilter[jId]; }
+  BilateralFilter*        getBilateralFilter    ()              { return  &m_searchStacks[0]->bilateralFilter; }
 #endif
-  TrQuant*                getTrQuant            ( int jId = 0 ) { return  &m_cTrQuant[jId];        }
-#else
-  InterSearch*            getInterSearch        ()              { return  &m_cInterSearch;         }
-  IntraSearch*            getIntraSearch        ()              { return  &m_cIntraSearch;         }
-
-#if JVET_V0094_BILATERAL_FILTER || JVET_X0071_CHROMA_BILATERAL_FILTER
-  BilateralFilter*        getBilateralFilter    ()              { return  &m_bilateralFilter;      }
-#endif
-  TrQuant*                getTrQuant            ()              { return  &m_cTrQuant;             }
-#endif
+  TrQuant*                getTrQuant            ()              { return  &m_searchStacks[0]->trQuant; }
   LoopFilter*             getLoopFilter         ()              { return  &m_cLoopFilter;          }
   EncSampleAdaptiveOffset* getSAO               ()              { return  &m_cEncSAO;              }
   EncAdaptiveLoopFilter*  getALF                ()              { return  &m_cEncALF;              }
   EncGOP*                 getGOPEncoder         ()              { return  &m_cGOPEncoder;          }
-  EncSlice*               getSliceEncoder       ()              { return  &m_cSliceEncoder;        }
+  EncSlice*               getSliceEncoder       ()              { return  &m_searchStacks[0]->sliceEncoder; }
   EncHRD*                 getHRD                ()              { return  &m_encHRD;               }
 #if JVET_AL0153_ALF_CCCM
   EncLoopFilterCccm*      getLoopFilterCccmEncoder ()           { return &m_cEncLoopFilterCccm;    }
 #endif
-#if ENABLE_SPLIT_PARALLELISM
-  EncCu*                  getCuEncoder          ( int jId = 0 ) { return  &m_cCuEncoder[jId];      }
-#else
-  EncCu*                  getCuEncoder          ()              { return  &m_cCuEncoder;           }
-#endif
+  EncCu*                  getCuEncoder          ()              { return  &m_searchStacks[0]->cuEncoder; }
   HLSWriter*              getHLSWriter          ()              { return  &m_HLSWriter;            }
-#if ENABLE_SPLIT_PARALLELISM
-  CABACEncoder*           getCABACEncoder       ( int jId = 0 ) { return  &m_CABACEncoder[jId];    }
-
-  RdCost*                 getRdCost             ( int jId = 0 ) { return  &m_cRdCost[jId];         }
-  CtxCache*               getCtxCache           ( int jId = 0 ) { return  &m_ctxCache[jId];        }
-#else
-  CABACEncoder*           getCABACEncoder       ()              { return  &m_CABACEncoder;         }
+  CABACEncoder*           getCABACEncoder       ()              { return  &m_searchStacks[0]->cabacEncoder; }
 #if JVET_AA0096_MC_BOUNDARY_PADDING
   InterPrediction *         getFrameMcPadPredSearch() { return &m_cFrameMcPadPredSearch; }
 #endif
-  RdCost*                 getRdCost             ()              { return  &m_cRdCost;              }
-  CtxCache*               getCtxCache           ()              { return  &m_ctxCache;             }
-#endif
+  RdCost*                 getRdCost             ()              { return  &m_searchStacks[0]->rdCost; }
+  CtxCache*               getCtxCache           ()              { return  &m_searchStacks[0]->ctxCache; }
   RateCtrl*               getRateCtrl           ()              { return  &m_cRateCtrl;            }
 
 
@@ -292,6 +351,7 @@ public:
   ParameterSetMap<APS>*  getApsMap() { return &m_apsMap; }
 
   EncTemporalFilter&     getTemporalFilter()                    { return m_temporalFilter; }
+  bool                   isOrigReloadable();
 
   bool                   getPltEnc()                      const { return   m_doPlt; }
   void                   checkPltStats( Picture* pic );
@@ -316,6 +376,16 @@ public:
   bool encode( const InputColourSpaceConversion snrCSC, // used for SNR calculations. Picture in original colour space.
                std::list<PelUnitBuf*>& rcListPicYuvRecOut,
                int& iNumEncoded );
+
+  /// Frame threads: the reconstruction of a picture whose finish has ended, with its frame index in the output, in
+  /// any order (else false; none while a picture's finish is pending). The caller writes it to the frame's position
+  /// before the next encodePrep, which may free the buffer.
+  bool getFrameThreadsOutput( PelUnitBuf& rec, int& frameIndex );
+  /// Frame threads: waits until every picture started is done.
+  void finishFrameThreads   () { m_cGOPEncoder.finishFrameThreads(); }
+  bool waitFrameThreadsFinished( int64_t& numFinished ) { return m_cGOPEncoder.waitFrameThreadsFinished( numFinished ); }
+  /// Frame threads: frees the buffers of the pictures the application wrote since (releaseUnreadPics after writing)
+  void releaseWrittenPics();
 
   bool encodePrep( bool bEos,
                PelStorage* pcPicYuvOrg,

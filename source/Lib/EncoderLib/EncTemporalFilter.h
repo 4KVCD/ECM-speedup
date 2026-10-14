@@ -137,6 +137,12 @@ public:
              );
 
   bool filter(PelStorage &orgPic, int frame);
+  /// whether filter() filters the frame (and changes orgPic)
+  bool filtersFrame( int receivedPoc ) const;
+  /// whether the input is a file the frames can be read again from (readFrame)
+  bool inputIsFile() const;
+  /// reads frame inputFrameIndex of the input file into orgPic as the application reads it; false if that fails
+  bool readFrame( PelStorage& orgPic, int inputFrameIndex ) const;
 
 private:
   // Private static member variables

@@ -37,8 +37,11 @@
     The RD search allocates and frees many small, short-lived std::vector buffers; the Windows heap spends ~1.3 %
     of the encoding time on them. Blocks of up to 1 KB come from per-size-class free lists (memory is kept for reuse,
     never returned), larger ones from malloc. Every block starts with a 16-byte header holding its size class, so
-    blocks stay 16-byte aligned and delete knows where a block came from. A spinlock makes it thread-safe (the
-    encoder itself is single-threaded, so the lock is uncontended). Over-aligned new/delete keep their defaults.
+    blocks stay 16-byte aligned and delete knows where a block came from. Each thread keeps its own free lists and
+    moves blocks to and from the shared ones in batches, under a spinlock (with FrameThreads and CuThreads, many
+    threads allocate at the same time; one shared list made them wait for each other and move its cache lines between
+    cores on every call). A block freed by another thread than the one that allocated it joins the freeing thread's
+    list. Over-aligned new/delete keep their defaults.
 
     Canary build (-DFASTALLOC_CANARY=1, for testing only): every block gets 16 guard bytes right after the requested
     size and a magic word in its header; fresh blocks are filled with 0xCB and freed blocks poisoned with 0xDD. Delete
@@ -53,6 +56,10 @@
 #include <cstdint>
 #include <cstring>
 #include <new>
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#endif
 
 #ifndef FASTALLOC_CANARY
 #define FASTALLOC_CANARY 0
@@ -67,6 +74,8 @@ constexpr size_t CLASS_SIZE[NUM_CLASSES] = { 16, 32, 48, 64, 96, 128, 160, 192, 
 constexpr size_t MAX_SMALL     = 1024;
 constexpr size_t CHUNK_BYTES   = 1 << 20;   // carved into blocks of one class at a time
 constexpr uint32_t LARGE_CLASS = 0xFFFFFFFFu;
+constexpr uint32_t CACHE_MAX   = 128;       // free blocks of a class a thread keeps
+constexpr uint32_t CACHE_MOVE  = 64;        // blocks moved between a thread's list and the shared one at a time
 
 #if FASTALLOC_CANARY
 constexpr size_t   GUARD       = 16;
@@ -139,6 +148,13 @@ struct FreeBlock
   FreeBlock* next;
 };
 
+// the free blocks of one thread
+struct ThreadCache
+{
+  FreeBlock* list[NUM_CLASSES];
+  uint32_t   count[NUM_CLASSES];
+};
+
 struct Allocator
 {
   std::atomic_flag lock      = ATOMIC_FLAG_INIT;
@@ -146,6 +162,9 @@ struct Allocator
   char*            chunkPos  = nullptr;
   size_t           chunkLeft = 0;
   uint8_t          classOf[MAX_SMALL / 16 + 1];   // (size + 15) / 16 -> class
+#ifdef _WIN32
+  DWORD            tls;                           // TLS slot of the threads' caches
+#endif
 
   Allocator()
   {
@@ -158,6 +177,9 @@ struct Allocator
       }
       classOf[i] = (uint8_t) c;
     }
+#ifdef _WIN32
+    tls = TlsAlloc();
+#endif
   }
 };
 
@@ -178,6 +200,143 @@ struct LockGuard
   }
   ~LockGuard() { f.clear( std::memory_order_release ); }
 };
+
+// the calling thread's cache, created on its first call (threads that end leave theirs unused); null if out of memory
+ThreadCache* threadCache( Allocator& a )
+{
+#ifdef _WIN32
+  ThreadCache* tc = (ThreadCache*) TlsGetValue( a.tls );
+#else
+  static thread_local ThreadCache* t_cache = nullptr;
+  ThreadCache* tc = t_cache;
+#endif
+  if( !tc )
+  {
+    tc = (ThreadCache*) std::calloc( 1, sizeof( ThreadCache ) );
+#ifdef _WIN32
+    if( tc && !TlsSetValue( a.tls, tc ) )
+    {
+      std::free( tc );
+      tc = nullptr;
+    }
+#else
+    t_cache = tc;
+#endif
+  }
+  return tc;
+}
+
+// a new block of class c from the current chunk (lock held); null if out of memory
+char* carve( Allocator& a, int c )
+{
+  const size_t need = CLASS_SIZE[c] + HEADER;
+  if( a.chunkLeft < need )
+  {
+    char* chunk = (char*) std::malloc( CHUNK_BYTES );
+    if( !chunk )
+    {
+      return nullptr;
+    }
+    a.chunkPos  = chunk;
+    a.chunkLeft = CHUNK_BYTES;
+  }
+  char* p = a.chunkPos;
+  a.chunkPos += need;
+  a.chunkLeft -= need;
+  return p;
+}
+
+// a free block of class c as the free lists hold it: header set, the canary build's poison and magic in place
+FreeBlock* asFreeBlock( char* p, int c )
+{
+#if FASTALLOC_CANARY
+  Header* h = (Header*) p;
+  h->cls    = (uint32_t) c;
+  h->magic  = MAGIC_FREED;
+  h->size   = CLASS_SIZE[c] - GUARD;
+  memset( p + HEADER, FREED_BYTE, CLASS_SIZE[c] );
+#else
+  *(uint32_t*) p = (uint32_t) c;
+#endif
+  return (FreeBlock*) ( p + HEADER );
+}
+
+// fills the thread's empty list of class c from the shared list, or with new blocks
+void refill( Allocator& a, ThreadCache& tc, int c )
+{
+  LockGuard guard( a.lock );
+  uint32_t  n = 0;
+  while( n < CACHE_MOVE && a.freeList[c] )
+  {
+    FreeBlock* blk = a.freeList[c];
+    a.freeList[c]  = blk->next;
+    blk->next      = tc.list[c];
+    tc.list[c]     = blk;
+    n++;
+  }
+  while( n < CACHE_MOVE )
+  {
+    char* p = carve( a, c );
+    if( !p )
+    {
+      break;
+    }
+    FreeBlock* blk = asFreeBlock( p, c );
+    blk->next      = tc.list[c];
+    tc.list[c]     = blk;
+    n++;
+  }
+  tc.count[c] += n;
+}
+
+// a block from the thread's list of class c (refilled when empty), checked by the canary build
+void* takeBlock( Allocator& a, ThreadCache& tc, int c, size_t size )
+{
+  if( !tc.list[c] )
+  {
+    refill( a, tc, c );
+    if( !tc.list[c] )
+    {
+      return nullptr;
+    }
+  }
+  FreeBlock* blk = tc.list[c];
+  tc.list[c]     = blk->next;
+  tc.count[c]--;
+#if FASTALLOC_CANARY
+  char*         p     = (char*) blk - HEADER;
+  const Header* h     = (const Header*) p;
+  const size_t  freed = h->size + GUARD;   // poisoned when freed; the first bytes held the free-list link
+  if( h->magic != MAGIC_FREED || h->cls != (uint32_t) c
+      || !allBytes( (const char*) blk + sizeof( FreeBlock ), freed - sizeof( FreeBlock ), FREED_BYTE ) )
+  {
+    canaryFail( "write after free (or corrupted free list)", blk );
+  }
+  return canaryArm( p, (uint32_t) c, size );
+#else
+  (void) size;
+  return blk;
+#endif
+}
+
+// puts a free block on the thread's list of class c; a full list gives a batch back to the shared one
+void putBlock( Allocator& a, ThreadCache& tc, int c, FreeBlock* blk )
+{
+  blk->next  = tc.list[c];
+  tc.list[c] = blk;
+  if( ++tc.count[c] > CACHE_MAX )
+  {
+    LockGuard guard( a.lock );
+    for( uint32_t n = 0; n < CACHE_MOVE; n++ )
+    {
+      FreeBlock* b  = tc.list[c];
+      tc.list[c]    = b->next;
+      b->next       = a.freeList[c];
+      a.freeList[c] = b;
+    }
+    tc.count[c] -= CACHE_MOVE;
+  }
+}
 
 void* allocate( size_t size )
 {
@@ -202,6 +361,11 @@ void* allocate( size_t size )
   }
   Allocator&  a   = allocator();
   const int   c   = a.classOf[( inner + 15 ) >> 4];
+  if( ThreadCache* tc = threadCache( a ) )
+  {
+    return takeBlock( a, *tc, c, size );
+  }
+  // no cache for this thread: the shared lists
   LockGuard   guard( a.lock );
   FreeBlock*  blk = a.freeList[c];
   if( blk )
@@ -221,20 +385,11 @@ void* allocate( size_t size )
     return blk;
 #endif
   }
-  const size_t need = CLASS_SIZE[c] + HEADER;
-  if( a.chunkLeft < need )
+  char* p = carve( a, c );
+  if( !p )
   {
-    char* chunk = (char*) std::malloc( CHUNK_BYTES );
-    if( !chunk )
-    {
-      return nullptr;
-    }
-    a.chunkPos  = chunk;
-    a.chunkLeft = CHUNK_BYTES;
+    return nullptr;
   }
-  char* p = a.chunkPos;
-  a.chunkPos += need;
-  a.chunkLeft -= need;
 #if FASTALLOC_CANARY
   return canaryArm( p, (uint32_t) c, size );
 #else
@@ -260,7 +415,6 @@ void release( void* ptr )
     return;
   }
   Allocator& a = allocator();
-  LockGuard  guard( a.lock );
 #if FASTALLOC_CANARY
   if( c >= (uint32_t) NUM_CLASSES )
   {
@@ -269,6 +423,12 @@ void release( void* ptr )
   canaryDisarm( p );
 #endif
   FreeBlock* blk = (FreeBlock*) ptr;
+  if( ThreadCache* tc = threadCache( a ) )
+  {
+    putBlock( a, *tc, (int) c, blk );
+    return;
+  }
+  LockGuard  guard( a.lock );
   blk->next      = a.freeList[c];
   a.freeList[c]  = blk;
 }

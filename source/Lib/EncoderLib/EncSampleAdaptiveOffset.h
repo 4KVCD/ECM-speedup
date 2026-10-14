@@ -80,10 +80,30 @@ struct SAOStatData //data structure for SAO statistics
 };
 
 #if JVET_W0066_CCSAO
+/// The CCSAO statistics of one CTU: 32-bit sums suffice (at most 256x256 samples of differences below 1 << 12)
+struct CcSaoCtuStatData
+{
+  int32_t  diff [MAX_CCSAO_CLASS_NUM];
+  uint32_t count[MAX_CCSAO_CLASS_NUM];
+
+  void reset()
+  {
+    ::memset(diff,  0, sizeof(diff));
+    ::memset(count, 0, sizeof(count));
+  }
+};
+
 struct CcSaoStatData
 {
   int64_t  diff [MAX_CCSAO_CLASS_NUM];
   uint32_t count[MAX_CCSAO_CLASS_NUM];
+
+  const CcSaoStatData& operator=(const CcSaoCtuStatData& src)
+  {
+    std::copy(src.diff, src.diff + MAX_CCSAO_CLASS_NUM, diff);
+    ::memcpy(count, src.count, sizeof(count));
+    return *this;
+  }
 
   CcSaoStatData(){}
   ~CcSaoStatData(){}
@@ -195,6 +215,9 @@ public:
 #endif
   void disabledRate( CodingStructure& cs, SAOBlkParam* reconParams, const double saoEncodingRate, const double saoEncodingRateChroma );
   void getPreDBFStatistics(CodingStructure& cs);
+#if JVET_AE0151_CCSAO_HISTORY_OFFSETS_AND_EXT_EO
+  std::vector<CcSaoPrvParam>* m_ccSaoPrvParam = g_ccSaoPrvParam;   ///< CCSAO history (frame threads: one per finish context)
+#endif
 private: //methods
 
   void deriveLoopFilterBoundaryAvailibility(CodingStructure& cs, const Position &pos, bool& isLeftAvail, bool& isAboveAvail, bool& isAboveLeftAvail) const;
@@ -279,7 +302,7 @@ private: //methods
                                , const int edgeCmp, const int edgeIdc
                                , const int edgeDir, const int edgeThr
                                 );
-  void resetCcSaoEdgeStats(CcSaoStatData *blkStatsEdge);
+  void resetCcSaoEdgeStats(CcSaoCtuStatData *blkStatsEdge);
 #else
   int  calcEdgeStatIndex(const int ctuRsAddr, const int mode, const int type, const int th);
   void resetblkStatsEdgePre(CcSaoStatData *blkStatsEdge[MAX_CCSAO_SET_NUM - 1]);
@@ -289,7 +312,7 @@ private: //methods
 #if JVET_AE0151_CCSAO_HISTORY_OFFSETS_AND_EXT_EO
   void prepareCcSaoEdgeStats(CodingStructure &cs, const ComponentID compID
                            , const CPelUnitBuf &orgYuv, const CPelUnitBuf &srcYuv, const CPelUnitBuf &dstYuv
-                           , CcSaoStatData *blkStats, const CcSaoEncParam &ccSaoParam);
+                           , CcSaoCtuStatData *blkStats, const CcSaoEncParam &ccSaoParam);
 #else
   void getCcSaoStatisticsEdgeNew(CodingStructure &cs, const CPelUnitBuf &orgYuv, const CPelUnitBuf &srcYuv,
                                  const CPelUnitBuf &dstYuv, CcSaoStatData *blkStats[MAX_CCSAO_SET_NUM],
@@ -300,7 +323,7 @@ private: //methods
                             , const CPelUnitBuf &orgYuv, const CPelUnitBuf &srcYuv, const CPelUnitBuf &dstYuv
                             , CcSaoStatData *blkStats[MAX_CCSAO_SET_NUM]
 #if JVET_AE0151_CCSAO_HISTORY_OFFSETS_AND_EXT_EO
-                            , CcSaoStatData *blkStatsEdgePre
+                            , CcSaoCtuStatData *blkStatsEdgePre
 #else
                             , CcSaoStatData *blkStatsEdgePre[MAX_CCSAO_SET_NUM - 1]
 #endif
@@ -308,7 +331,7 @@ private: //methods
 
 #if JVET_AE0151_CCSAO_HISTORY_OFFSETS_AND_EXT_EO
   void getCcSaoBlkStatsEdgePre(CodingStructure &cs, const ComponentID compID, const ChromaFormat chromaFormat, const int bitDepth
-                             , CcSaoStatData *blkStats, const int ctuRsAddr
+                             , CcSaoCtuStatData *blkStats, const int ctuRsAddr
 #else
   void getCcSaoBlkStatsEdgeNew(const ComponentID compID, const ChromaFormat chromaFormat, const int bitDepth
                              , const int setIdx, CcSaoStatData *blkStats[N_C - 1], const int ctuRsAddr
@@ -406,7 +429,7 @@ private: //members
   CcSaoStatData*         m_ccSaoStatDataEdge [MAX_CCSAO_SET_NUM];
   CcSaoStatData          m_ccSaoStatFrameEdge[MAX_CCSAO_SET_NUM];
 #if JVET_AE0151_CCSAO_HISTORY_OFFSETS_AND_EXT_EO
-  CcSaoStatData*         m_ccSaoStatDataEdgePre;
+  CcSaoCtuStatData*      m_ccSaoStatDataEdgePre;   ///< per CTU and edge candidate (32-bit sums)
 #else
   CcSaoStatData*         m_ccSaoStatDataEdgeNew[N_C];
 #endif

@@ -370,14 +370,7 @@ void CacheBlkInfoCtrl::create(const int maxCuSize)
               }
 #endif
 
-              if( gp_sizeIdxInfo->isCuSize( gp_sizeIdxInfo->sizeFrom( hIdx ) ) && y + ( gp_sizeIdxInfo->sizeFrom( hIdx ) >> MIN_CU_LOG2 ) <= ( MAX_CU_SIZE >> MIN_CU_LOG2 ) )
-              {
-                m_codedCUInfo[treeIdx][x][y][wIdx][hIdx] = new CodedCUInfo;
-              }
-              else
-              {
-                m_codedCUInfo[treeIdx][x][y][wIdx][hIdx] = nullptr;
-              }
+              m_codedCUInfo[treeIdx][x][y][wIdx][hIdx] = nullptr;   // made at its first use (xEntry)
             }
           }
           else
@@ -403,14 +396,7 @@ void CacheBlkInfoCtrl::create(const int maxCuSize)
 
           for( int hIdx = 0; hIdx < gp_sizeIdxInfo->numHeights(); hIdx++ )
           {
-            if( gp_sizeIdxInfo->isCuSize( gp_sizeIdxInfo->sizeFrom( hIdx ) ) && y + ( gp_sizeIdxInfo->sizeFrom( hIdx ) >> MIN_CU_LOG2 ) <= (maxCuSize >> MIN_CU_LOG2 ) )
-            {
-              m_codedCUInfo[x][y][wIdx][hIdx] = new CodedCUInfo;
-            }
-            else
-            {
-              m_codedCUInfo[x][y][wIdx][hIdx] = nullptr;
-            }
+            m_codedCUInfo[x][y][wIdx][hIdx] = nullptr;   // made at its first use (xEntry)
           }
         }
         else
@@ -483,56 +469,9 @@ void CacheBlkInfoCtrl::destroy()
 
 void CacheBlkInfoCtrl::init( const Slice &slice )
 {
-  const unsigned numPos = m_maxCuSize >> MIN_CU_LOG2;
-
-#if JVET_AI0136_ADAPTIVE_DUAL_TREE
-  for( unsigned treeIdx = 0; treeIdx < MAX_TREE_TYPE; treeIdx++ )
-  {
-    for( unsigned x = 0; x < numPos; x++ )
-    {
-      for( unsigned y = 0; y < numPos; y++ )
-      {
-        if (!m_codedCUInfo[treeIdx][x][y])
-        {
-          continue;
-        }
-        for( int wIdx = 0; wIdx < gp_sizeIdxInfo->numWidths(); wIdx++ )
-        {
-          if( m_codedCUInfo[treeIdx][x][y][wIdx] )
-          {
-            for( int hIdx = 0; hIdx < gp_sizeIdxInfo->numHeights(); hIdx++ )
-            {
-              if( m_codedCUInfo[treeIdx][x][y][wIdx][hIdx] )
-              {
-                std::fill_n( reinterpret_cast< char * >(m_codedCUInfo[treeIdx][x][y][wIdx][hIdx]), sizeof( CodedCUInfo ), 0 );
-              }
-            }
-          }
-        }
-      }
-    }
-  }
-#else
-  for( unsigned x = 0; x < numPos; x++ )
-  {
-    for( unsigned y = 0; y < numPos; y++ )
-    {
-      for( int wIdx = 0; wIdx < gp_sizeIdxInfo->numWidths(); wIdx++ )
-      {
-        if( m_codedCUInfo[x][y][wIdx] )
-        {
-          for( int hIdx = 0; hIdx < gp_sizeIdxInfo->numHeights(); hIdx++ )
-          {
-            if( m_codedCUInfo[x][y][wIdx][hIdx] )
-            {
-              std::fill_n( reinterpret_cast< char * >(m_codedCUInfo[x][y][wIdx][hIdx]), sizeof( CodedCUInfo ), 0 );
-            }
-          }
-        }
-      }
-    }
-  }
-#endif
+  // the entries are cleared at their first use in this CTU (xEntry) instead of all of them here
+  m_generation++;
+  CHECK( m_generation == 0, "Generation counter wrapped" );
 
   m_slice_chblk = &slice;
 #if ENABLE_SPLIT_PARALLELISM
@@ -601,16 +540,43 @@ void CacheBlkInfoCtrl::copyState( const CacheBlkInfoCtrl &other, const UnitArea&
 }
 #endif
 
+CodedCUInfo& CacheBlkInfoCtrl::xEntry( unsigned idx1, unsigned idx2, unsigned idx3, unsigned idx4 )
+{
+#if JVET_AI0136_ADAPTIVE_DUAL_TREE
+  CodedCUInfo*& entry = m_codedCUInfo[m_treeIdx][idx1][idx2][idx3][idx4];
+#else
+  CodedCUInfo*& entry = m_codedCUInfo[idx1][idx2][idx3][idx4];
+#endif
+  if( entry && entry->generation == m_generation )
+  {
+    return *entry;
+  }
+  if( !entry )
+  {
+    entry = new CodedCUInfo;
+  }
+  std::fill_n( reinterpret_cast<char*>( entry ), sizeof( CodedCUInfo ), 0 );   // as init() cleared every entry before
+  entry->generation = m_generation;
+  return *entry;
+}
+
+const CodedCUInfo& CacheBlkInfoCtrl::xEntry( unsigned idx1, unsigned idx2, unsigned idx3, unsigned idx4 ) const
+{
+  static const CodedCUInfo cleared = CodedCUInfo();   // what a cleared entry reads as
+#if JVET_AI0136_ADAPTIVE_DUAL_TREE
+  const CodedCUInfo* entry = m_codedCUInfo[m_treeIdx][idx1][idx2][idx3][idx4];
+#else
+  const CodedCUInfo* entry = m_codedCUInfo[idx1][idx2][idx3][idx4];
+#endif
+  return entry && entry->generation == m_generation ? *entry : cleared;
+}
+
 CodedCUInfo& CacheBlkInfoCtrl::getBlkInfo( const UnitArea& area )
 {
   unsigned idx1, idx2, idx3, idx4;
   getAreaIdx( area.Y(), *m_slice_chblk->getPPS()->pcv, idx1, idx2, idx3, idx4 );
 
-#if JVET_AI0136_ADAPTIVE_DUAL_TREE
-  return *m_codedCUInfo[m_treeIdx][idx1][idx2][idx3][idx4];
-#else
-  return *m_codedCUInfo[idx1][idx2][idx3][idx4];
-#endif
+  return xEntry( idx1, idx2, idx3, idx4 );
 }
 
 #if JVET_AI0136_ADAPTIVE_DUAL_TREE
@@ -625,7 +591,7 @@ CodedCUInfo* CacheBlkInfoCtrl::getBlkInfoPtr( const UnitArea& area )
 
   getAreaIdx( area.Y(), *m_slice_chblk->getPPS()->pcv, idx1, idx2, idx3, idx4 );
 
-  return m_codedCUInfo[m_treeIdx][idx1][idx2][idx3][idx4];
+  return &xEntry( idx1, idx2, idx3, idx4 );
 }
 #endif
 
@@ -636,9 +602,9 @@ bool CacheBlkInfoCtrl::isSkip( const UnitArea& area )
   getAreaIdx( area.Y(), *m_slice_chblk->getPPS()->pcv, idx1, idx2, idx3, idx4 );
 
 #if JVET_AI0136_ADAPTIVE_DUAL_TREE
-  return m_codedCUInfo[m_treeIdx][idx1][idx2][idx3][idx4]->isSkip;
+  return xEntry( idx1, idx2, idx3, idx4 ).isSkip;
 #else
-  return m_codedCUInfo[idx1][idx2][idx3][idx4]->isSkip;
+  return xEntry( idx1, idx2, idx3, idx4 ).isSkip;
 #endif
 }
 
@@ -648,9 +614,9 @@ char CacheBlkInfoCtrl::getSelectColorSpaceOption(const UnitArea& area)
   getAreaIdx(area.Y(), *m_slice_chblk->getPPS()->pcv, idx1, idx2, idx3, idx4);
 
 #if JVET_AI0136_ADAPTIVE_DUAL_TREE
-  return m_codedCUInfo[m_treeIdx][idx1][idx2][idx3][idx4]->selectColorSpaceOption;
+  return xEntry( idx1, idx2, idx3, idx4 ).selectColorSpaceOption;
 #else
-  return m_codedCUInfo[idx1][idx2][idx3][idx4]->selectColorSpaceOption;
+  return xEntry( idx1, idx2, idx3, idx4 ).selectColorSpaceOption;
 #endif
 }
 
@@ -660,9 +626,9 @@ bool CacheBlkInfoCtrl::isMMVDSkip(const UnitArea& area)
   getAreaIdx(area.Y(), *m_slice_chblk->getPPS()->pcv, idx1, idx2, idx3, idx4);
 
 #if JVET_AI0136_ADAPTIVE_DUAL_TREE
-  return m_codedCUInfo[m_treeIdx][idx1][idx2][idx3][idx4]->isMMVDSkip;
+  return xEntry( idx1, idx2, idx3, idx4 ).isMMVDSkip;
 #else
-  return m_codedCUInfo[idx1][idx2][idx3][idx4]->isMMVDSkip;
+  return xEntry( idx1, idx2, idx3, idx4 ).isMMVDSkip;
 #endif
 }
 
@@ -674,11 +640,11 @@ void CacheBlkInfoCtrl::setMv( const UnitArea& area, const RefPicList refPicList,
   getAreaIdx( area.Y(), *m_slice_chblk->getPPS()->pcv, idx1, idx2, idx3, idx4 );
 
 #if JVET_AI0136_ADAPTIVE_DUAL_TREE
-  m_codedCUInfo[m_treeIdx][idx1][idx2][idx3][idx4]->saveMv [refPicList][iRefIdx] = rMv;
-  m_codedCUInfo[m_treeIdx][idx1][idx2][idx3][idx4]->validMv[refPicList][iRefIdx] = true;
+  xEntry( idx1, idx2, idx3, idx4 ).saveMv [refPicList][iRefIdx] = rMv;
+  xEntry( idx1, idx2, idx3, idx4 ).validMv[refPicList][iRefIdx] = true;
 #else
-  m_codedCUInfo[idx1][idx2][idx3][idx4]->saveMv [refPicList][iRefIdx] = rMv;
-  m_codedCUInfo[idx1][idx2][idx3][idx4]->validMv[refPicList][iRefIdx] = true;
+  xEntry( idx1, idx2, idx3, idx4 ).saveMv [refPicList][iRefIdx] = rMv;
+  xEntry( idx1, idx2, idx3, idx4 ).validMv[refPicList][iRefIdx] = true;
 #endif
 #if ENABLE_SPLIT_PARALLELISM
 
@@ -694,19 +660,19 @@ bool CacheBlkInfoCtrl::getMv( const UnitArea& area, const RefPicList refPicList,
   if( iRefIdx >= MAX_STORED_CU_INFO_REFS )
   {
 #if JVET_AI0136_ADAPTIVE_DUAL_TREE
-    rMv = m_codedCUInfo[m_treeIdx][idx1][idx2][idx3][idx4]->saveMv[refPicList][0];
+    rMv = xEntry( idx1, idx2, idx3, idx4 ).saveMv[refPicList][0];
 #else
-    rMv = m_codedCUInfo[idx1][idx2][idx3][idx4]->saveMv[refPicList][0];
+    rMv = xEntry( idx1, idx2, idx3, idx4 ).saveMv[refPicList][0];
 #endif
     return false;
   }
 
 #if JVET_AI0136_ADAPTIVE_DUAL_TREE
-  rMv = m_codedCUInfo[m_treeIdx][idx1][idx2][idx3][idx4]->saveMv[refPicList][iRefIdx];
-  return m_codedCUInfo[m_treeIdx][idx1][idx2][idx3][idx4]->validMv[refPicList][iRefIdx];
+  rMv = xEntry( idx1, idx2, idx3, idx4 ).saveMv[refPicList][iRefIdx];
+  return xEntry( idx1, idx2, idx3, idx4 ).validMv[refPicList][iRefIdx];
 #else
-  rMv = m_codedCUInfo[idx1][idx2][idx3][idx4]->saveMv[refPicList][iRefIdx];
-  return m_codedCUInfo[idx1][idx2][idx3][idx4]->validMv[refPicList][iRefIdx];
+  rMv = xEntry( idx1, idx2, idx3, idx4 ).saveMv[refPicList][iRefIdx];
+  return xEntry( idx1, idx2, idx3, idx4 ).validMv[refPicList][iRefIdx];
 #endif
 }
 
@@ -822,9 +788,9 @@ bool CacheBlkInfoCtrl::getInter(const UnitArea& area)
   getAreaIdx(area.Y(), *m_slice_chblk->getPPS()->pcv, idx1, idx2, idx3, idx4);
 
 #if JVET_AI0136_ADAPTIVE_DUAL_TREE
-  return m_codedCUInfo[m_treeIdx][idx1][idx2][idx3][idx4]->isInter;
+  return xEntry( idx1, idx2, idx3, idx4 ).isInter;
 #else
-  return m_codedCUInfo[idx1][idx2][idx3][idx4]->isInter;
+  return xEntry( idx1, idx2, idx3, idx4 ).isInter;
 #endif
 }
 void CacheBlkInfoCtrl::setBcwIdx(const UnitArea& area, uint8_t gBiIdx)
@@ -832,9 +798,9 @@ void CacheBlkInfoCtrl::setBcwIdx(const UnitArea& area, uint8_t gBiIdx)
   unsigned idx1, idx2, idx3, idx4;
   getAreaIdx(area.Y(), *m_slice_chblk->getPPS()->pcv, idx1, idx2, idx3, idx4);
 #if JVET_AI0136_ADAPTIVE_DUAL_TREE
-  m_codedCUInfo[m_treeIdx][idx1][idx2][idx3][idx4]->bcwIdx = gBiIdx;
+  xEntry( idx1, idx2, idx3, idx4 ).bcwIdx = gBiIdx;
 #else
-  m_codedCUInfo[idx1][idx2][idx3][idx4]->bcwIdx = gBiIdx;
+  xEntry( idx1, idx2, idx3, idx4 ).bcwIdx = gBiIdx;
 #endif
 }
 uint8_t CacheBlkInfoCtrl::getBcwIdx(const UnitArea& area)
@@ -843,9 +809,9 @@ uint8_t CacheBlkInfoCtrl::getBcwIdx(const UnitArea& area)
   getAreaIdx(area.Y(), *m_slice_chblk->getPPS()->pcv, idx1, idx2, idx3, idx4);
 
 #if JVET_AI0136_ADAPTIVE_DUAL_TREE
-  return m_codedCUInfo[m_treeIdx][idx1][idx2][idx3][idx4]->bcwIdx;
+  return xEntry( idx1, idx2, idx3, idx4 ).bcwIdx;
 #else
-  return m_codedCUInfo[idx1][idx2][idx3][idx4]->bcwIdx;
+  return xEntry( idx1, idx2, idx3, idx4 ).bcwIdx;
 #endif
 }
 
@@ -902,6 +868,9 @@ void BestEncInfoCache::create( const ChromaFormat chFmt )
 #if CONVERT_NUM_TU_SPLITS_TO_CFG
   m_maxNumTUs = maxNumTUs;
 #endif
+#if BEST_ENC_INFO_LAZY_SLOTS
+  m_chFmt = chFmt;
+#endif
   const unsigned numPos = maxCuSize >> MIN_CU_LOG2;
   m_maxCuSize = maxCuSize;
 
@@ -933,6 +902,10 @@ void BestEncInfoCache::create( const ChromaFormat chFmt )
 #endif
           for( int hIdx = 0; hIdx < gp_sizeIdxInfo->numHeights(); hIdx++ )
           {
+#if BEST_ENC_INFO_LAZY_SLOTS
+            m_bestEncInfo[treeIdx][x][y][wIdx][hIdx] = nullptr;   // made at its first store (xCreateSlot)
+            continue;
+#endif
 #if JVET_AI0136_ADAPTIVE_DUAL_TREE
             if (treeIdx > 0 )// && (gp_sizeIdxInfo->sizeFrom(wIdx) > 64 || gp_sizeIdxInfo->sizeFrom(wIdx)>64))
             {
@@ -1047,6 +1020,7 @@ void BestEncInfoCache::destroy()
         delete[] m_bestEncInfo[treeIdx][x][y];
       }
     }
+#if !BEST_ENC_INFO_LAZY_SLOTS   // else the slots own their TU buffers
     delete[] m_pCoeff[treeIdx];
 #if SIGN_PREDICTION
     delete[] m_pCoeffSign[treeIdx];
@@ -1062,6 +1036,7 @@ void BestEncInfoCache::destroy()
       delete[] m_runType[treeIdx];
       m_runType[treeIdx] = nullptr;
     }
+#endif
 
   }
 
@@ -1091,6 +1066,7 @@ void BestEncInfoCache::destroy()
     }
   }
 
+#if !BEST_ENC_INFO_LAZY_SLOTS   // else the slots own their TU buffers
   delete[] m_pCoeff;
 #if SIGN_PREDICTION
   delete[] m_pCoeffSign;
@@ -1105,6 +1081,7 @@ void BestEncInfoCache::destroy()
     delete[] m_runType;
     m_runType = nullptr;
   }
+#endif
 
 #endif
 
@@ -1117,6 +1094,12 @@ void BestEncInfoCache::init( const Slice &slice )
   m_slice_bencinf = &slice;
 
   if( isInitialized ) return;
+
+#if BEST_ENC_INFO_LAZY_SLOTS
+  // a slot and its TU buffers are made at its first store (xCreateSlot)
+  m_dummyCS.pcv = slice.getPPS()->pcv;
+  m_usePLT      = slice.getSPS()->getPLTMode();
+#else
 
   const unsigned numPos = slice.getSPS()->getMaxCUWidth() >> MIN_CU_LOG2;
 
@@ -1359,12 +1342,84 @@ void BestEncInfoCache::init( const Slice &slice )
 #if JVET_AI0136_ADAPTIVE_DUAL_TREE
   }
 #endif
+#endif   // !BEST_ENC_INFO_LAZY_SLOTS
 
 #if ENABLE_SPLIT_PARALLELISM
 
   m_currTemporalId = 0;
 #endif
 }
+
+#if BEST_ENC_INFO_LAZY_SLOTS
+bool BestEncInfoCache::xIsSlot( unsigned y, int hIdx ) const
+{
+  // as create made the slots: luma tree only, a CU height that fits in the CTU below row y
+  const int height = gp_sizeIdxInfo->sizeFrom( hIdx );
+  return m_treeIdx == 0 && gp_sizeIdxInfo->isCuSize( height )
+         && y + ( height >> MIN_CU_LOG2 ) <= unsigned( m_maxCuSize >> MIN_CU_LOG2 );
+}
+
+void BestEncInfoCache::xCreateSlot( BestEncodingInfo*& slot, int width, int height )
+{
+  // the CU, PU and TUs as create made them for every slot
+  const UnitArea area( m_chFmt, Area( 0, 0, width, height ) );
+  slot = new BestEncodingInfo;
+  new ( &slot->cu ) CodingUnit    ( area );
+  new ( &slot->pu ) PredictionUnit( area );
+  slot->tus.clear();
+  for( int i = 0; i < m_maxNumTUs; i++ )
+  {
+    slot->tus.push_back( TransformUnit( area ) );
+  }
+  slot->poc = -1;
+  xCreateTuBuffers( *slot );
+}
+
+void BestEncInfoCache::xCreateTuBuffers( BestEncodingInfo& encInfo )
+{
+  // one allocation, carved per TU and block as the shared buffers were: coefficients, sign scan indices, PCM samples,
+  // signs and (palette) run types of the first two blocks, largest element type first so each part stays aligned
+  size_t numSamples = 0;
+  for( const TransformUnit& tu : encInfo.tus )
+  {
+    for( const CompArea& blk : tu.blocks )
+    {
+      numSamples += blk.area();
+    }
+  }
+  const size_t bytesPerSample = sizeof( TCoeff ) + sizeof( unsigned ) + sizeof( Pel ) + sizeof( SIGN_PRED_TYPE )
+                                + ( m_usePLT ? sizeof( bool ) : 0 );
+  encInfo.tuStorage.reset( new uint8_t[numSamples * bytesPerSample] );
+  TCoeff*         coeffPtr   = reinterpret_cast<TCoeff*>( encInfo.tuStorage.get() );
+  unsigned*       scanIdxPtr = reinterpret_cast<unsigned*>( coeffPtr + numSamples );
+  Pel*            pcmPtr     = reinterpret_cast<Pel*>( scanIdxPtr + numSamples );
+  SIGN_PRED_TYPE* signPtr    = reinterpret_cast<SIGN_PRED_TYPE*>( pcmPtr + numSamples );
+  bool*           runTypePtr = m_usePLT ? reinterpret_cast<bool*>( signPtr + numSamples ) : nullptr;
+
+  for( TransformUnit& tu : encInfo.tus )
+  {
+    TCoeff*         coeff[MAX_NUM_TBLOCKS]       = {};
+    SIGN_PRED_TYPE* sign[MAX_NUM_TBLOCKS]        = {};
+    unsigned*       signScanIdx[MAX_NUM_TBLOCKS] = {};
+    Pel*            pcm[MAX_NUM_TBLOCKS]         = {};
+    bool*           runType[MAX_NUM_TBLOCKS - 1] = {};
+    for( int i = 0; i < (int) tu.blocks.size(); i++ )
+    {
+      const size_t area = tu.blocks[i].area();
+      coeff[i]       = coeffPtr;   coeffPtr   += area;
+      signScanIdx[i] = scanIdxPtr; scanIdxPtr += area;
+      pcm[i]         = pcmPtr;     pcmPtr     += area;
+      sign[i]        = signPtr;    signPtr    += area;
+      if( i < 2 && runTypePtr )
+      {
+        runType[i] = runTypePtr;   runTypePtr += area;
+      }
+    }
+    tu.cs = &m_dummyCS;
+    tu.init( coeff, sign, signScanIdx, pcm, runType );
+  }
+}
+#endif
 
 bool BestEncInfoCache::setFromCs( const CodingStructure& cs, const Partitioner& partitioner )
 {
@@ -1380,9 +1435,19 @@ bool BestEncInfoCache::setFromCs( const CodingStructure& cs, const Partitioner& 
   }
 
   unsigned idx1, idx2, idx3, idx4;
-
   getAreaIdx( cs.area.Y(), *m_slice_bencinf->getPPS()->pcv, idx1, idx2, idx3, idx4 );
-
+#if BEST_ENC_INFO_LAZY_SLOTS
+  BestEncodingInfo*& slot = m_bestEncInfo[m_treeIdx][idx1][idx2][idx3][idx4];
+  if( !slot )
+  {
+    if( !xIsSlot( idx2, idx4 ) )
+    {
+      return false;
+    }
+    xCreateSlot( slot, gp_sizeIdxInfo->sizeFrom( idx3 ), gp_sizeIdxInfo->sizeFrom( idx4 ) );
+  }
+  BestEncodingInfo& encInfo = *slot;
+#else
 #if JVET_AI0136_ADAPTIVE_DUAL_TREE
   BestEncodingInfo& encInfo = *m_bestEncInfo[m_treeIdx][idx1][idx2][idx3][idx4];
 #else
@@ -1393,6 +1458,7 @@ bool BestEncInfoCache::setFromCs( const CodingStructure& cs, const Partitioner& 
   {
     return false;
   }
+#endif
 #endif
   encInfo.poc            =  cs.picture->poc;
   encInfo.cu.repositionTo( *cs.cus.front() );
@@ -3386,15 +3452,15 @@ bool EncModeCtrlMTnoRQT::tryMode( const EncTestMode& encTestmode, const CodingSt
     {
       unsigned idx1, idx2, idx3, idx4;
       getAreaIdx(partitioner.currArea().Y(), *slice.getPPS()->pcv, idx1, idx2, idx3, idx4);
-      if (g_isReusedUniMVsFilled[idx1][idx2][idx3][idx4])
+      if (m_pcInterSearch->getReusedUniMvs( false ).isFilled( idx1, idx2, idx3, idx4 ))
       {
-        m_pcInterSearch->insertUniMvCands(partitioner.currArea().Y(), g_reusedUniMVs[idx1][idx2][idx3][idx4]);
+        m_pcInterSearch->insertUniMvCands(partitioner.currArea().Y(), m_pcInterSearch->getReusedUniMvs( false ).mvs( idx1, idx2, idx3, idx4 ));
       }
 #if INTER_LIC
-      if (cs.slice->getUseLIC() && g_isReusedUniMVsFilledLIC[idx1][idx2][idx3][idx4])
+      if (cs.slice->getUseLIC() && m_pcInterSearch->getReusedUniMvs( true ).isFilled( idx1, idx2, idx3, idx4 ))
       {
         m_pcInterSearch->swapUniMvBuffer();
-        m_pcInterSearch->insertUniMvCands(partitioner.currArea().Y(), g_reusedUniMVsLIC[idx1][idx2][idx3][idx4]);
+        m_pcInterSearch->insertUniMvCands(partitioner.currArea().Y(), m_pcInterSearch->getReusedUniMvs( true ).mvs( idx1, idx2, idx3, idx4 ));
         m_pcInterSearch->swapUniMvBuffer();
       }
 #endif

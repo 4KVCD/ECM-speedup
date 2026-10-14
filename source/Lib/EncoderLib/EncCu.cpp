@@ -55,9 +55,6 @@
 
 
 
-#if JVET_AI0136_ADAPTIVE_DUAL_TREE
-Partitioner *g_compressPartitionerSST;
-#endif
 
 //! \ingroup EncoderLib
 //! \{
@@ -117,6 +114,13 @@ EncCu::EncCu() : m_GeoModeTest
 #endif
 }
 
+// the GPM and IBC candidate buffers beyond the first GEO_MAX_TRY_WEIGHTED_SAD are at most GEO_MAX_CU_SIZE (EncCu::create)
+template<size_t N> static void checkGeoBufferSize( const PelStorage ( &bufs )[N], const UnitArea& area )
+{
+  CHECK( area.lwidth() > bufs[N - 1].Y().width || area.lheight() > bufs[N - 1].Y().height,
+         "Block larger than the GPM candidate buffers" );
+}
+
 void EncCu::create( EncCfg* encCfg )
 {
 #if JVET_V0094_BILATERAL_FILTER || JVET_X0071_CHROMA_BILATERAL_FILTER
@@ -129,6 +133,12 @@ void EncCu::create( EncCfg* encCfg )
 
   unsigned      uiMaxWidth    = encCfg->getMaxCUWidth();
   unsigned      uiMaxHeight   = encCfg->getMaxCUHeight();
+#if JVET_AC0185_ENHANCED_TEMPORAL_MOTION_DERIVATION
+  m_subPuMiBuf.create( uiMaxWidth );
+#endif
+#if JVET_AL0160_SBSMVP
+  m_subSpatialPuMiBuf.create( uiMaxWidth );
+#endif
   ChromaFormat  chromaFormat  = encCfg->getChromaFormatIdc();
 
   unsigned      numWidths     = gp_sizeIdxInfo->numWidths();
@@ -339,7 +349,14 @@ void EncCu::create( EncCfg* encCfg )
   for( unsigned ui = 0; ui < GEO_MAX_TRY_WEIGHTED_SAD; ui++ )
 #endif
   {
-    m_acGeoWeightedBuffer[ui].create( chromaFormat, Area( 0, 0, uiMaxWidth, uiMaxHeight ) );
+    // the first GEO_MAX_TRY_WEIGHTED_SAD also hold the multi-hypothesis candidates (InterSearch::initMHPTmpBuffer) and
+    // the first the CIIP prediction with LMCS, of any block size; the others only GPM and IBC candidates, which
+    // EncModeCtrl::tryMode limits to GEO_MAX_CU_SIZE (GPM) and below 128 (IBC): at a CTU size of 256 the CTU-sized
+    // buffers committed 0.19 GB a search stack, mostly never touched
+    const bool anySize = ui < GEO_MAX_TRY_WEIGHTED_SAD;
+    m_acGeoWeightedBuffer[ui].create( chromaFormat, anySize ? Area( 0, 0, uiMaxWidth, uiMaxHeight )
+                                                            : Area( 0, 0, std::min<unsigned>( uiMaxWidth, GEO_MAX_CU_SIZE ),
+                                                                    std::min<unsigned>( uiMaxHeight, GEO_MAX_CU_SIZE ) ) );
   }
 #if JVET_W0097_GPM_MMVD_TM
 #if JVET_AG0164_AFFINE_GPM
@@ -663,23 +680,23 @@ EncCu::~EncCu()
 
 /** \param    pcEncLib      pointer of encoder class
  */
-void EncCu::init( EncLib* pcEncLib, const SPS& sps PARL_PARAM( const int tId ) )
+void EncCu::init( EncLib* pcEncLib, EncSearchStack& stack, const SPS& sps PARL_PARAM( const int tId ) )
 {
   m_pcEncCfg           = pcEncLib;
-  m_pcIntraSearch      = pcEncLib->getIntraSearch( PARL_PARAM0( tId ) );
-  m_pcInterSearch      = pcEncLib->getInterSearch( PARL_PARAM0( tId ) );
-  m_pcTrQuant          = pcEncLib->getTrQuant( PARL_PARAM0( tId ) );
-  m_pcRdCost           = pcEncLib->getRdCost ( PARL_PARAM0( tId ) );
-  m_CABACEstimator     = pcEncLib->getCABACEncoder( PARL_PARAM0( tId ) )->getCABACEstimator( &sps );
+  m_pcIntraSearch      = &stack.intraSearch;
+  m_pcInterSearch      = &stack.interSearch;
+  m_pcTrQuant          = &stack.trQuant;
+  m_pcRdCost           = &stack.rdCost;
+  m_CABACEstimator     = stack.cabacEncoder.getCABACEstimator( &sps );
   m_CABACEstimator->setEncCu(this);
-  m_ctxCache           = pcEncLib->getCtxCache( PARL_PARAM0( tId ) );
+  m_ctxCache           = &stack.ctxCache;
   m_pcRateCtrl         = pcEncLib->getRateCtrl();
-  m_pcSliceEncoder     = pcEncLib->getSliceEncoder();
+  m_pcSliceEncoder     = &stack.sliceEncoder;
 #if ENABLE_SPLIT_PARALLELISM
   m_pcEncLib           = pcEncLib;
   m_dataId             = tId;
 #endif
-  m_pcLoopFilter       = pcEncLib->getLoopFilter();
+  m_pcLoopFilter       = &stack.loopFilter;
 
 #if !JVET_AG0164_AFFINE_GPM
   m_GeoCostList.init(GEO_NUM_PARTITION_MODE, m_pcEncCfg->getMaxNumGeoCand());
@@ -764,7 +781,7 @@ void EncCu::compressCtu( CodingStructure& cs, const UnitArea& area, const unsign
   // init the partitioning manager
   QTBTPartitioner partitioner;
 #if JVET_AI0136_ADAPTIVE_DUAL_TREE
-  g_compressPartitionerSST = new QTBTPartitioner; 
+  m_partitionerSST = new QTBTPartitioner;
 #endif
   partitioner.initCtu(area, CH_L, *cs.slice);
 
@@ -846,7 +863,7 @@ void EncCu::compressCtu( CodingStructure& cs, const UnitArea& area, const unsign
   m_CurrCtx                  = 0;
 
 #if JVET_AI0136_ADAPTIVE_DUAL_TREE
-  delete g_compressPartitionerSST;
+  delete m_partitionerSST;
 #endif
 
   // Ensure that a coding was found
@@ -3325,7 +3342,7 @@ void EncCu::xCheckRDCostSeparateTreeIntra( CodingStructure *&tempCS, CodingStruc
   CHECK( !tempCS->slice->getSeparateTreeEnabled(),   "Invoked xCheckRDCostSeparateTreeIntra() when SST is disabled" );
 
   m_modeCtrl->setNonIntraCUECtx( m_modeCtrl->getComprCUCtx() );
-  Partitioner *& partitionerSST = g_compressPartitionerSST;
+  Partitioner *& partitionerSST = m_partitionerSST;
 
   bool inferredSeparateTreeFlag = false;
   int startFlagVal     = 0;
@@ -3932,13 +3949,13 @@ bool EncCu::xCheckRDCostIntra(CodingStructure *&tempCS, CodingStructure *&bestCS
 #if JVET_AJ0061_TIMD_MERGE
     for (int i = 0; i <= EXT_VDIA_IDX; i++)
     {
-      g_timdMrgCost[i] = MAX_UINT64;
+      m_pcIntraSearch->m_timdMrgCost[i] = MAX_UINT64;
     }
 #endif
 #if JVET_AK0059_MDIP
     for (int i = 0; i <= EXT_VDIA_IDX; i++)
     {
-      g_intraModeCost[i] = MAX_UINT64;
+      m_pcIntraSearch->m_intraModeCost[i] = MAX_UINT64;
     }
     if (CU::allowMdip(cu))
     { 
@@ -11539,6 +11556,7 @@ void EncCu::xCheckRDCostMerge2Nx2N( CodingStructure *&tempCS, CodingStructure *&
 #if JVET_W0097_GPM_MMVD_TM
 void EncCu::xCheckRDCostMergeGeoComb2Nx2N(CodingStructure *&tempCS, CodingStructure *&bestCS, Partitioner &pm, const EncTestMode& encTestMode, bool isSecondPass)
 {
+  checkGeoBufferSize( m_acGeoWeightedBuffer, pm.currArea() );
   int numSATDCands = (m_fastGpmMmvdSearch && isSecondPass) ? 60 : 70;
 
   tempCS->initStructData(encTestMode.qp);
@@ -21563,6 +21581,7 @@ void EncCu::xCheckRDCostMergeGeoComb2Nx2N(CodingStructure *&tempCS, CodingStruct
 #else
 void EncCu::xCheckRDCostMergeGeo2Nx2N(CodingStructure *&tempCS, CodingStructure *&bestCS, Partitioner &pm, const EncTestMode& encTestMode)
 {
+  checkGeoBufferSize( m_acGeoWeightedBuffer, pm.currArea() );
   const Slice &slice = *tempCS->slice;
   CHECK(slice.getSliceType() == I_SLICE, "Merge modes not available for I-slices");
 
@@ -25198,6 +25217,7 @@ void EncCu::xCheckRDCostTMMerge2Nx2N(CodingStructure *&tempCS, CodingStructure *
 // ibc merge/skip mode check
 void EncCu::xCheckRDCostIBCModeMerge2Nx2N(CodingStructure *&tempCS, CodingStructure *&bestCS, Partitioner &partitioner, const EncTestMode& encTestMode)
 {
+  checkGeoBufferSize( m_acGeoWeightedBuffer, partitioner.currArea() );
   CHECK(partitioner.chType != CHANNEL_TYPE_LUMA, "chType should be CHANNEL_TYPE_LUMA"); // chroma IBC is derived
 
 #if JVET_AD0208_IBC_ADAPT_FOR_CAM_CAPTURED_CONTENTS

@@ -137,8 +137,13 @@ public:
   bool m_isTopLayer;
   void destroyTemporaryCsData();
   void createTemporaryCsData(const bool isPLTused);
+  /// frees the CUs, PUs and TUs its unit caches keep (destroyTemporaryCsData returns its units to them)
+  void freeCachedUnits();
 #if JVET_AL0214_MV_REFINEMENT_FOR_TMVP
   void createTemporaryRefineTmvpCsData(bool isIntra, int* numRefPic, bool isDec);
+  /// frees what createTemporaryRefineTmvpCsData made (also done by destroyTemporaryCsData); the encoder's frame threads
+  /// free it at the end of a picture's search, as nothing after the search reads it
+  void destroyTemporaryRefineTmvpCsData();
 #endif
 #if JVET_Z0118_GDR
   bool isCuCrossIRA(int begX) const;
@@ -180,6 +185,10 @@ public:
 #endif
 
   void rebindPicBufs();
+  /// the per-4x4 arrays (motion, intra modes, CCP and EIP indices, QT depth), which a picture that waits for its search
+  /// does not hold with frame threads (Picture::releaseSearchBuffers)
+  void createPicData();
+  void releasePicData();
 #if JVET_AC0060_IBC_BVP_CLUSTER_RRIBC_BVD_SIGN_DERIV && !JVET_AD0208_IBC_ADAPT_FOR_CAM_CAPTURED_CONTENTS
   void createTMBuf(const int cbWidth, const int cbHeight);
   void destroyTMBuf();
@@ -267,8 +276,13 @@ public:
 #endif
   void initStructData  (const int &QP = MAX_INT, const bool &skipMotBuf = false);
   void initSubStructure(      CodingStructure& cs, const ChannelType chType, const UnitArea &subArea, const bool &isTuEnc);
+  /// As initSubStructure for TU encoding, with the CU and PU copied from the given objects instead of this structure's
+  /// (which another thread may be changing).
+  void initSubStructure(      CodingStructure& cs, const ChannelType chType, const UnitArea &subArea, const CodingUnit& cuFrom,
+                              const PredictionUnit& puFrom );
 
-  void copyStructure   (const CodingStructure& cs, const ChannelType chType, const bool copyTUs = false, const bool copyRecoBuffer = false);
+  void copyStructure   (const CodingStructure& cs, const ChannelType chType, const bool copyTUs = false, const bool copyRecoBuffer = false,
+                        const bool copyCUsAndPUs = true);
   void useSubStructure (const CodingStructure& cs, const ChannelType chType, const UnitArea &subArea, const bool cpyPred, const bool cpyReco, const bool cpyOrgResi, const bool cpyResi, const bool updateCost);
   void useSubStructure (const CodingStructure& cs, const ChannelType chType,                          const bool cpyPred, const bool cpyReco, const bool cpyOrgResi, const bool cpyResi, const bool updateCost) { useSubStructure(cs, chType, cs.area, cpyPred, cpyReco, cpyOrgResi, cpyResi, updateCost); }
 
@@ -312,7 +326,7 @@ public:
   template<class T> void addEipToLut(static_vector<T, MAX_NUM_HEIP_CANDS> &lut, const T &model, int reusePos);
   template<class T> void getOneModelFromEipLut(const static_vector<T, MAX_NUM_HEIP_CANDS> &lut, T &model, int pos);
 #endif
-  void addMiToLut(static_vector<MotionInfo, MAX_NUM_HMVP_CANDS>& lut, const MotionInfo &mi);
+  void addMiToLut(static_vector<HmvpMotionInfo, MAX_NUM_HMVP_CANDS>& lut, const HmvpMotionInfo &mi);
 #if JVET_Z0075_IBC_HMVP_ENLARGE
   void addMiToLutIBC(static_vector<MotionInfo, MAX_NUM_HMVP_IBC_CANDS>& lut, const MotionInfo &mi);
 #endif

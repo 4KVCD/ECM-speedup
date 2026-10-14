@@ -62,6 +62,7 @@
 //! \{
 
 class EncLib;
+struct EncSearchStack;
 class HLSWriter;
 class EncSlice;
 
@@ -289,6 +290,9 @@ private:
   int                   m_cuChromaQpOffsetIdxPlus1; // if 0, then cu_chroma_qp_offset_flag will be 0, otherwise cu_chroma_qp_offset_flag will be 1.
 
   XUCache               m_unitCache;
+#if JVET_AI0136_ADAPTIVE_DUAL_TREE
+  Partitioner*          m_partitionerSST = nullptr;   ///< separate-tree partitioner, created per CTU in compressCtu
+#endif
 
   CodingStructure    ***m_pTempCS;
   CodingStructure    ***m_pBestCS;
@@ -408,17 +412,17 @@ private:
 #endif
   double                m_AFFBestSATDCost;
   double                m_mergeBestSATDCost;
-#if JVET_AC0185_ENHANCED_TEMPORAL_MOTION_DERIVATION 
+#if JVET_AC0185_ENHANCED_TEMPORAL_MOTION_DERIVATION
 #if JVET_AG0098_AMVP_WITH_SBTMVP
-  MotionInfo            m_subPuMiBuf[SUB_BUFFER_SIZE][(MAX_CU_SIZE * MAX_CU_SIZE) >> (MIN_CU_LOG2 << 1)];
+  CtuMotionBufs<SUB_BUFFER_SIZE> m_subPuMiBuf;   // sized in create()
 #else
-  MotionInfo            m_subPuMiBuf[SUB_TMVP_NUM][(MAX_CU_SIZE * MAX_CU_SIZE) >> (MIN_CU_LOG2 << 1)];
+  CtuMotionBufs<SUB_TMVP_NUM>    m_subPuMiBuf;
 #endif
 #else
   MotionInfo            m_subPuMiBuf[(MAX_CU_SIZE * MAX_CU_SIZE) >> (MIN_CU_LOG2 << 1)];
 #endif
 #if JVET_AL0160_SBSMVP
-  MotionInfo            m_subSpatialPuMiBuf[NUM_SUB_SMVP][(MAX_CU_SIZE * MAX_CU_SIZE) >> (MIN_CU_LOG2 << 1)];
+  CtuMotionBufs<NUM_SUB_SMVP>    m_subSpatialPuMiBuf;   // sized in create()
 #endif
 #if MULTI_PASS_DMVR
   Mv                    m_mvBufBDMVR[(MRG_MAX_NUM_CANDS << 1)][MAX_NUM_SUBCU_DMVR];
@@ -513,7 +517,7 @@ private:
 #endif
 public:
   /// copy parameters from encoder class
-  void  init                ( EncLib* pcEncLib, const SPS& sps PARL_PARAM( const int jId = 0 ) );
+  void  init                ( EncLib* pcEncLib, EncSearchStack& stack, const SPS& sps PARL_PARAM( const int jId = 0 ) );
 
   void setDecCuReshaperInEncCU(EncReshape* pcReshape, ChromaFormat chromaFormatIDC) { initDecCuReshaper((Reshape*) pcReshape, chromaFormatIDC); }
   /// create internal buffers

@@ -37,6 +37,7 @@
 
 #include "EncTemporalFilter.h"
 #include "Utilities/VideoIOYuv.h"
+#include <fstream>
 #include <math.h>
 
 
@@ -143,21 +144,48 @@ void EncTemporalFilter::init( const int frameSkip, const int inputBitDepth[MAX_N
 // Public member functions
 // ====================================================================================================================
 
-bool EncTemporalFilter::filter(PelStorage &orgPic, int receivedPoc)
+bool EncTemporalFilter::filtersFrame( int receivedPoc ) const
 {
-  bool isFilterThisFrame = false;
   if (m_QP >= 17)  // disable filter for QP < 17
   {
-    for (std::map<int, double>::iterator it = m_temporalFilterStrengths.begin(); it != m_temporalFilterStrengths.end(); ++it)
+    for( const auto& strength : m_temporalFilterStrengths )
     {
-      int filteredFrame = it->first;
-      if (receivedPoc % filteredFrame == 0)
+      if( receivedPoc % strength.first == 0 )
       {
-        isFilterThisFrame = true;
-        break;
+        return true;
       }
     }
   }
+  return false;
+}
+
+bool EncTemporalFilter::inputIsFile() const
+{
+  std::ifstream file( m_inputFileName, std::ios::binary );
+  return file.good() && m_inputFileName != "-";
+}
+
+bool EncTemporalFilter::readFrame( PelStorage& orgPic, int inputFrameIndex ) const
+{
+  VideoIOYuv yuvFrames;
+  yuvFrames.open( m_inputFileName, false, m_inputBitDepth, m_MSBExtendedBitDepth, m_internalBitDepth );
+  if( !yuvFrames.isOpen() )
+  {
+    return false;
+  }
+  yuvFrames.skipFrames( inputFrameIndex, m_sourceWidth - m_pad[0], m_sourceHeight - m_pad[1], m_chromaFormatIDC );
+  PelStorage trueOrg;   // the frame before the colour space conversion, which the application keeps apart
+  trueOrg.create( m_chromaFormatIDC, m_area, 0, m_padding );
+  const bool read = yuvFrames.read( orgPic, trueOrg, m_inputColourSpaceConvert, const_cast<int*>( m_pad ), m_chromaFormatIDC,
+                                    m_clipInputVideoToRec709Range );
+  trueOrg.destroy();
+  yuvFrames.close();
+  return read;
+}
+
+bool EncTemporalFilter::filter(PelStorage &orgPic, int receivedPoc)
+{
+  const bool isFilterThisFrame = filtersFrame( receivedPoc );
 
   if (isFilterThisFrame)
   {

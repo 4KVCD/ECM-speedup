@@ -27,7 +27,8 @@ Remove-Item -Recurse -Force $build -ErrorAction SilentlyContinue -Confirm:$false
 Build "-fprofile-generate -fprofile-update=single"
 $exe = "$src\bin\ninja\gcc-mingw-16.2\x86_64\release\EncoderApp.exe"
 
-# 2) training (sequential: concurrent .gcda merging is not safe on MinGW)
+# 2) training (sequential: concurrent .gcda merging is not safe on MinGW; one frame thread each, since the
+#    instrumented counters are not atomic and the encoder picks threads automatically by default)
 New-Item -ItemType Directory -Force $train | Out-Null
 # (CrowdRun added: trained on FourPeople alone, the high-texture ai_parkjoy test ran about 1 % slower than without PGO)
 $runs = @(
@@ -39,7 +40,7 @@ $runs = @(
   @( "encoder_lowdelay_ecm.cfg",     "CrowdRun_256x256.yuv",   50, 3, 32 ) )
 foreach( $r in $runs )
 {
-  & $exe -c "$src\cfg\$($r[0])" -i "C:\Code\ECM\seq\$($r[1])" -wdt 256 -hgt 256 -fr $r[2] --InputBitDepth=8 -f $r[3] -q $r[4] -b "$train\t.bin" -o NUL | Select-String 'Total Time'
+  & $exe -c "$src\cfg\$($r[0])" -i "C:\Code\ECM\seq\$($r[1])" -wdt 256 -hgt 256 -fr $r[2] --InputBitDepth=8 -f $r[3] -q $r[4] -b "$train\t.bin" -o NUL --FrameThreads=1 | Select-String 'Total Time'
 }
 
 # 3) optimized build from the profile (same build tree, so .gcda paths match)

@@ -42,6 +42,7 @@
 
 #include "EncoderLib/EncLibCommon.h"
 #include "EncApp.h"
+#include "CrashReport.h"
 #include "SegmentParallel.h"
 #include "Utilities/program_options_lite.h"
 
@@ -82,8 +83,35 @@ static void printMacroSettings()
 // Main function
 // ====================================================================================================================
 
+// Windows 11 throttles background processes (EcoQoS: lower clocks, efficiency cores), which slowed encodes started
+// without a foreground window by up to a third on a hybrid CPU. Asking not to be throttled keeps the fast cores.
+// Declared here because windows.h clashes with the codec's names.
+#ifdef _WIN32
+extern "C" __declspec( dllimport ) int __stdcall SetProcessInformation( void* process, int infoClass, void* info,
+                                                                         unsigned long size );
+extern "C" __declspec( dllimport ) void* __stdcall GetCurrentProcess();
+#endif
+static void xSetPowerThrottling( bool allow )
+{
+#ifdef _WIN32
+  if( !allow )
+  {
+    // PROCESS_POWER_THROTTLING_STATE: current version, execution speed controlled, not throttled
+    struct
+    {
+      unsigned long version, controlMask, stateMask;
+    } state = { 1, 1, 0 };
+    SetProcessInformation( GetCurrentProcess(), 4 /* ProcessPowerThrottling */, &state, sizeof( state ) );
+  }
+#else
+  (void) allow;
+#endif
+}
+
 int main(int argc, char* argv[])
 {
+  installCrashReport();   // a crash prints the call stack (frame threads: a rare race is found from it)
+
   // print information
   fprintf( stdout, "\n" );
   fprintf( stdout, "VVCSoftware: ECM Encoder Version %s (VTM-%s) ", ECM_VERSION, VTM_VERSION );
@@ -193,6 +221,10 @@ int main(int argc, char* argv[])
       return 1;
     }
 
+    if( layerIdx == 0 )
+    {
+      xSetPowerThrottling( pcEncApp[0]->getPowerThrottling() );
+    }
     if( layerIdx == 0 && pcEncApp[0]->getParallelSegments() > 1 )
     {
       // encode intra-period chunks in concurrent child processes and join them (bit-exact)
@@ -207,6 +239,7 @@ int main(int argc, char* argv[])
       spc.bitstreamFile     = pcEncApp[0]->getBitstreamFileName();
       spc.reconFile         = pcEncApp[0]->getReconFileName();
       spc.pocOffsetChunks   = pcEncApp[0]->getPocOffsetChunksSupported();
+      spc.frameThreadsAutomatic = pcEncApp[0]->getFrameThreadsAutomatic();
       spc.inputFile         = pcEncApp[0]->getInputFileName();
       spc.inputWidth        = pcEncApp[0]->getInputFileWidth();
       spc.inputHeight       = pcEncApp[0]->getInputFileHeight();

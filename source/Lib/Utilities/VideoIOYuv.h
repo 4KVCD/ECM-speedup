@@ -71,6 +71,7 @@ private:
   ChromaFormat m_outChromaFormat       = CHROMA_420;
   bool         m_outY4m                = false;
 #endif
+  std::streamoff m_outHeaderBytes = 0;   ///< the output file's header (y4m), before frame 0 (seekFrame)
 
 public:
   VideoIOYuv()           {}
@@ -89,6 +90,9 @@ public:
 #else
   void skipFrames(uint32_t numFrames, uint32_t width, uint32_t height, ChromaFormat format);
 #endif
+  /// positions the output file at frame frameIndex of the given written (cropped) size: the frames may then be written
+  /// in any order (the encoder's frame threads finish pictures out of output order)
+  void  seekFrame( int frameIndex, uint32_t width, uint32_t height, ChromaFormat format );
   // if fileFormat<NUM_CHROMA_FORMAT, the format of the file is that format specified, else it is the format of the PicYuv.
 
 

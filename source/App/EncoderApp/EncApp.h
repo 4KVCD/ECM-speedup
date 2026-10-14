@@ -86,6 +86,8 @@ private:
   void xDestroyLib ();                           ///< destroy encoder class
 
   // file I/O
+  void xWriteReconAt( int frameIndex, const PelUnitBuf& rec );   ///< frame threads: a reconstruction to its frame's position
+  void xWriteFrameThreadsOutput();                               ///< frame threads: writes the pictures finished, frees their buffers
   void xWriteOutput     ( int iNumEncoded, std::list<PelUnitBuf*>& recBufList
                          );                      ///< write bitstream to file
   void rateStatsAccum   ( const AccessUnit& au, const std::vector<uint32_t>& stats);
@@ -104,6 +106,7 @@ private:
   TExt360AppEncTop*      m_ext360;
 #endif
   bool m_flush;
+  bool m_eos = false;   ///< the last GOP has been read
 
 public:
   EncApp( fstream& bitStream, EncLibCommon* encLibCommon );

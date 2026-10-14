@@ -464,17 +464,6 @@ extern const int32_t   g_aucNumTrCombo[5][5];
 extern bool g_mctsDecCheckEnabled;
 
 class  Mv;
-#if CTU_256
-extern Mv   g_reusedUniMVs        [MAX_CU_SIZE >> MIN_CU_LOG2][MAX_CU_SIZE >> MIN_CU_LOG2][MAX_CU_DEPTH + 1][MAX_CU_DEPTH + 1][2][33];
-extern bool g_isReusedUniMVsFilled[MAX_CU_SIZE >> MIN_CU_LOG2][MAX_CU_SIZE >> MIN_CU_LOG2][MAX_CU_DEPTH + 1][MAX_CU_DEPTH + 1];
-#else
-extern Mv   g_reusedUniMVs[32][32][8][8][2][33];
-extern bool g_isReusedUniMVsFilled[32][32][8][8];
-#endif
-#if INTER_LIC
-extern Mv   g_reusedUniMVsLIC        [MAX_CU_SIZE >> MIN_CU_LOG2][MAX_CU_SIZE >> MIN_CU_LOG2][MAX_CU_DEPTH + 1][MAX_CU_DEPTH + 1][2][33];
-extern bool g_isReusedUniMVsFilledLIC[MAX_CU_SIZE >> MIN_CU_LOG2][MAX_CU_SIZE >> MIN_CU_LOG2][MAX_CU_DEPTH + 1][MAX_CU_DEPTH + 1];
-#endif
 
 extern uint16_t g_paletteQuant[57];
 extern uint8_t g_paletteRunTopLut[5];
@@ -591,7 +580,6 @@ extern int g_ibcMbvdNeiOffsets[IBC_MBVD_NEI_NUM * 2];
 #if JVET_AG0098_AMVP_WITH_SBTMVP
 extern const int8_t g_amvpSbTmvp_mvd_dir[2][8];
 extern const int8_t g_amvpSbTmvp_mvd_offset[6];
-extern uint32_t g_picAmvpSbTmvpEnabledArea;
 #endif
 #if JVET_AG0058_EIP
 #if JVET_AH0086_EIP_BIAS_AND_CLIP
@@ -607,11 +595,7 @@ extern const EIPInfo  g_mmEipInfoLut[4][4][9];
 #if JVET_AG0276_LIC_SLOPE_ADJUST
 extern const int g_licSlopeDeltaSet[LIC_SLOPE_MAX_NUM_DELTA + 1];
 #endif
-#if JVET_AK0059_MDIP
-extern uint64_t g_intraModeCost[EXT_VDIA_IDX + 1];
-#endif
 #if JVET_AJ0061_TIMD_MERGE
-extern uint64_t g_timdMrgCost[EXT_VDIA_IDX + 1];
 extern const std::array<std::array<PosType, TIMD_MERGE_MAX_NONADJACENT>, MAX_CU_DEPTH - MIN_CU_LOG2 + 1> g_timdMergeOffsetXTable;
 extern const std::array<std::array<PosType, TIMD_MERGE_MAX_NONADJACENT>, MAX_CU_DEPTH - MIN_CU_LOG2 + 1> g_timdMergeOffsetYTable;
 #endif

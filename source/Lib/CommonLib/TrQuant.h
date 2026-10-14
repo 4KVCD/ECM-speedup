@@ -164,6 +164,17 @@ public:
 #if JVET_AK0217_INTRA_MTSS
   void   resetLfnstIntraModeIdx(const int lfnstIdx) { m_lfnstIntraModeIdx[lfnstIdx] = 0; }
   void   setLfnstIntraModeIdx(const int lfnstIdx, int modeIdx) { m_lfnstIntraModeIdx[lfnstIdx] = modeIdx; }
+  void   getLfnstIntraModeIdxAll( int ( &idx )[4] ) const { std::copy( m_lfnstIntraModeIdx, m_lfnstIntraModeIdx + 4, idx ); }
+  void   setLfnstIntraModeIdxAll( const int ( &idx )[4] ) { std::copy( idx, idx + 4, m_lfnstIntraModeIdx ); }
+  /// The settings a search changes per CU and candidate (lambdas, LFNST intra mode indices), from another TrQuant.
+  void   copySearchStateFrom( const TrQuant& other )
+  {
+    double lambdas[MAX_NUM_COMPONENT];
+    other.getLambdas( lambdas );
+    setLambdas( lambdas );
+    setLambda( other.getLambda() );
+    std::copy( other.m_lfnstIntraModeIdx, other.m_lfnstIntraModeIdx + 4, m_lfnstIntraModeIdx );
+  }
 #endif
 protected:
 

@@ -221,7 +221,19 @@ void CodingStructure::destroy()
 
   destroyTemporaryCsData();
 
+#if JVET_Z0118_GDR
+  if (picHeader && m_gdrEnabled)
+  {
+    delete picHeader;
+  }
 
+  picHeader = nullptr;
+#endif
+  releasePicData();
+}
+
+void CodingStructure::releasePicData()
+{
 #if JVET_Z0118_GDR
   delete[] m_motionBuf0;
   if (m_gdrEnabled)
@@ -230,13 +242,6 @@ void CodingStructure::destroy()
   }
   m_motionBuf0 = nullptr;
   m_motionBuf1 = nullptr;
-
-  if (picHeader && m_gdrEnabled)
-  {
-    delete picHeader;
-  }
-
-  picHeader = nullptr;  
 #else
   delete[] m_motionBuf;
   m_motionBuf = nullptr;
@@ -278,6 +283,13 @@ void CodingStructure::destroy()
 #endif
 #endif
 
+}
+
+void CodingStructure::freeCachedUnits()
+{
+  m_tuCache.deleteEntries();
+  m_puCache.deleteEntries();
+  m_cuCache.deleteEntries();
 }
 
 void CodingStructure::destroyTemporaryCsData()
@@ -329,6 +341,20 @@ void CodingStructure::destroyTemporaryCsData()
   }
   m_cuCache.cache(cus);
   m_numCUs = 0;
+#if JVET_AL0214_MV_REFINEMENT_FOR_TMVP
+  destroyTemporaryRefineTmvpCsData();
+#elif JVET_AI0183_MVP_EXTENSION
+  if (m_intersectingMvBuf != nullptr)
+  {
+    delete[] m_intersectingMvBuf;
+    m_intersectingMvBuf = nullptr;
+  }
+#endif
+}
+
+#if JVET_AL0214_MV_REFINEMENT_FOR_TMVP
+void CodingStructure::destroyTemporaryRefineTmvpCsData()
+{
 #if JVET_AI0183_MVP_EXTENSION
   if (m_intersectingMvBuf != nullptr)
   {
@@ -336,7 +362,6 @@ void CodingStructure::destroyTemporaryCsData()
     m_intersectingMvBuf = nullptr;
   }
 #endif
-#if JVET_AL0214_MV_REFINEMENT_FOR_TMVP
   for (int refineTmvpColIdx = 0; refineTmvpColIdx < 2; refineTmvpColIdx++)
   {
     for (int refineTmvpColRefList = 0; refineTmvpColRefList < 2; refineTmvpColRefList++)
@@ -367,8 +392,8 @@ void CodingStructure::destroyTemporaryCsData()
       tmvpRefinedAvailable[refineTmvpColIdx] = nullptr;
     }
   }
-#endif
 }
+#endif
 
 void CodingStructure::createTemporaryCsData(const bool isPLTused)
 {
@@ -2088,6 +2113,12 @@ void CodingStructure::createInternals(const UnitArea& _unit, const bool isTopLay
   m_isTopLayer = isTopLayer;
   if( !isTopLayer ) createTemporaryCsData(isPLTused);
 
+  createPicData();
+  if (!isTopLayer) initStructData();
+}
+
+void CodingStructure::createPicData()
+{
   unsigned _lumaAreaScaled = g_miScaling.scale( area.lumaSize() ).area();
 #if JVET_Z0118_GDR
   m_motionBuf0 = new MotionInfo[_lumaAreaScaled];
@@ -2121,10 +2152,9 @@ void CodingStructure::createInternals(const UnitArea& _unit, const bool isTopLay
   m_ipmBuf          = new uint8_t[_lumaAreaScaled];
 #endif
 #endif // JVET_W0123_TIMD_FUSION
-  if (!isTopLayer) initStructData();
 }
 
-void CodingStructure::addMiToLut(static_vector<MotionInfo, MAX_NUM_HMVP_CANDS> &lut, const MotionInfo &mi)
+void CodingStructure::addMiToLut(static_vector<HmvpMotionInfo, MAX_NUM_HMVP_CANDS> &lut, const HmvpMotionInfo &mi)
 {
   size_t currCnt = lut.size();
 
@@ -2547,6 +2577,24 @@ void CodingStructure::destroyCoeffs()
   }
 }
 
+void CodingStructure::initSubStructure( CodingStructure& subStruct, const ChannelType _chType, const UnitArea &subArea,
+                                        const CodingUnit& cuFrom, const PredictionUnit& puFrom )
+{
+  CHECK( cus.size() != 1 || pus.size() != 1, "One CU and one PU expected" );
+  initSubStructure( subStruct, _chType, subArea, false );
+  CHECKD( area != subStruct.area, "Trying to init sub-structure for TU-encoding of incompatible size" );
+  subStruct.m_isTuEnc = true;
+  CodingUnit &cu = subStruct.addCU( *cus[0], _chType );
+  cu = cuFrom;
+  PredictionUnit &pu = subStruct.addPU( *pus[0], _chType );
+  pu = puFrom;
+  unsigned numComp = ::getNumberValidChannels( area.chromaFormat );
+  for( unsigned i = 0; i < numComp; i++)
+  {
+    ::memcpy( subStruct.m_isDecomp[i], m_isDecomp[i], (unitScale[i].scale( area.blocks[i].size() ).area() * sizeof( bool ) ) );
+  }
+}
+
 void CodingStructure::initSubStructure( CodingStructure& subStruct, const ChannelType _chType, const UnitArea &subArea, const bool &isTuEnc )
 {
   CHECK( this == &subStruct, "Trying to init self as sub-structure" );
@@ -2874,7 +2922,8 @@ void CodingStructure::useSubStructure( const CodingStructure& subStruct, const C
   }
 }
 
-void CodingStructure::copyStructure( const CodingStructure& other, const ChannelType chType, const bool copyTUs, const bool copyRecoBuf )
+void CodingStructure::copyStructure( const CodingStructure& other, const ChannelType chType, const bool copyTUs, const bool copyRecoBuf,
+                                     const bool copyCUsAndPUs )
 {
   fracBits = other.fracBits;
   dist     = other.dist;
@@ -2889,7 +2938,7 @@ void CodingStructure::copyStructure( const CodingStructure& other, const Channel
 #endif
 
   // copy the CUs over
-  for (const auto &pcu : other.cus)
+  for( const auto &pcu: copyCUsAndPUs ? other.cus : std::vector<CodingUnit*>() )
   {
     if( !dualITreeArea.contains( *pcu ) )
     {
@@ -2905,7 +2954,7 @@ void CodingStructure::copyStructure( const CodingStructure& other, const Channel
   }
 
   // copy the PUs over
-  for (const auto &ppu : other.pus)
+  for( const auto &ppu: copyCUsAndPUs ? other.pus : std::vector<PredictionUnit*>() )
   {
     if( !dualITreeArea.contains( *ppu ) )
     {

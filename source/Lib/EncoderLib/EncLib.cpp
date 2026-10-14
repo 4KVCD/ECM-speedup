@@ -49,6 +49,28 @@
 #include "EncLibCommon.h"
 #include "CommonLib/ProfileLevelTier.h"
 
+#include <functional>
+#include <thread>
+
+namespace
+{
+// Runs job( i ) for i in [first, count) in threads of their own and waits. The search stacks and the finish objects
+// are independent, and their creation is memory-bound (allocation and first touch, about 50 ms a stack): serially, 20
+// stacks took a second before the first picture could start.
+void runInParallel( size_t first, size_t count, const std::function<void( size_t )>& job )
+{
+  std::vector<std::thread> threads;
+  for( size_t i = first; i < count; i++ )
+  {
+    threads.emplace_back( job, i );
+  }
+  for( std::thread& thread: threads )
+  {
+    thread.join();
+  }
+}
+}   // namespace
+
 //! \ingroup EncoderLib
 //! \{
 
@@ -111,51 +133,46 @@ void EncLib::create( const int layerId )
 #if JVET_AJ0237_INTERNAL_12BIT
   m_cGOPEncoder.m_cBilateralFilter.setInternalBitDepth(m_bitDepth[COMPONENT_Y]);
 #endif
-#if ENABLE_SPLIT_PARALLELISM
-#if ENABLE_SPLIT_PARALLELISM
-  m_numCuEncStacks  = m_numSplitThreads == 1 ? 1 : NUM_RESERVERD_SPLIT_JOBS;
-#else
-  m_numCuEncStacks  = 1;
-#endif
-
-  m_cCuEncoder      = new EncCu              [m_numCuEncStacks];
-  m_cInterSearch    = new InterSearch        [m_numCuEncStacks];
-  m_cIntraSearch    = new IntraSearch        [m_numCuEncStacks];
-#if JVET_V0094_BILATERAL_FILTER || JVET_X0071_CHROMA_BILATERAL_FILTER
-  m_bilateralFilter = new BilateralFilter    [m_numCuEncStacks];
-#endif
-  m_cTrQuant        = new TrQuant            [m_numCuEncStacks];
-  m_CABACEncoder    = new CABACEncoder       [m_numCuEncStacks];
-  m_cRdCost         = new RdCost             [m_numCuEncStacks];
-  m_ctxCache        = new CtxCache           [m_numCuEncStacks];
-
-  for( int jId = 0; jId < m_numCuEncStacks; jId++ )
+  m_searchStacks.clear();
+  for( int i = 0; i < std::max( getSearchStackCount(), getFrameThreads() ); i++ )
   {
-    m_cCuEncoder[jId].         create( this );
-#if JVET_V0094_BILATERAL_FILTER || JVET_X0071_CHROMA_BILATERAL_FILTER
-    m_bilateralFilter[jId].    create();
-#endif
-
+    m_searchStacks.emplace_back( new EncSearchStack );
   }
-#else
-  m_cCuEncoder.         create( this );
+  // frame threads: the setups run on a stack of their own, so a picture takes a search stack when its search starts
+  m_setupStack.reset( getFrameThreads() > 1 ? new EncSetupStack : nullptr );
+  // CuThreads: a helper per thread (the picture's own thread uses the first one); the check codes with one helper
+  m_rdHelperStacks.clear();
+  const int numRdHelpers = getCuThreads() > 1 ? getCuThreads() : ( getCuThreadsCheck() ? 1 : 0 );
+  for( int i = 0; i < int( m_searchStacks.size() ) * numRdHelpers; i++ )
+  {
+    m_rdHelperStacks.emplace_back( new EncRdHelperStack );
 #if JVET_V0094_BILATERAL_FILTER || JVET_X0071_CHROMA_BILATERAL_FILTER
-  m_bilateralFilter.    create();
+    m_rdHelperStacks.back()->bilateralFilter.create();
 #if JVET_AJ0237_INTERNAL_12BIT
-  m_bilateralFilter.setInternalBitDepth(m_bitDepth[COMPONENT_Y]);
+    m_rdHelperStacks.back()->bilateralFilter.setInternalBitDepth( m_bitDepth[COMPONENT_Y] );
 #endif
+#endif
+  }
+  const auto createStack = [&]( size_t i )
+  {
+    EncSearchStack& stack = *m_searchStacks[i];
+    stack.cuEncoder.create( this );
+#if JVET_V0094_BILATERAL_FILTER || JVET_X0071_CHROMA_BILATERAL_FILTER
+    stack.bilateralFilter.create();
+#if JVET_AJ0237_INTERNAL_12BIT
+    stack.bilateralFilter.setInternalBitDepth( m_bitDepth[COMPONENT_Y] );
 #endif
 #endif
 #if JVET_J0090_MEMORY_BANDWITH_MEASURE
-  m_cInterSearch.cacheAssign( &m_cacheModel );
+    stack.interSearch.cacheAssign( &m_cacheModel );
 #endif
-
-  m_cLoopFilter.create(floorLog2(m_maxCUWidth) - MIN_CU_LOG2);
-
-  if (!m_bLoopFilterDisable && m_encDbOpt)
-  {
-    m_cLoopFilter.initEncPicYuvBuffer(m_chromaFormatIDC, Size(getSourceWidth(), getSourceHeight()), getMaxCUWidth());
-  }
+    stack.loopFilter.create( floorLog2( m_maxCUWidth ) - MIN_CU_LOG2 );
+    if( !m_bLoopFilterDisable && m_encDbOpt )
+    {
+      stack.loopFilter.initEncPicYuvBuffer( m_chromaFormatIDC, Size( getSourceWidth(), getSourceHeight() ), getMaxCUWidth() );
+    }
+  };
+  runInParallel( 0, m_searchStacks.size(), createStack );
 
 #if ENABLE_SPLIT_PARALLELISM
   m_cReshaper = new EncReshape[m_numCuEncStacks];
@@ -171,6 +188,14 @@ void EncLib::create( const int layerId )
     m_cReshaper.createEnc( getSourceWidth(), getSourceHeight(), m_maxCUWidth, m_maxCUHeight, m_bitDepth[COMPONENT_Y]);
 #endif
   }
+  for( auto& stack: m_searchStacks )
+  {
+    stack->reshaper = m_cReshaper;
+  }
+  if( m_setupStack )
+  {
+    m_setupStack->reshaper = m_cReshaper;
+  }
   if ( m_RCEnableRateControl )
   {
 #if JVET_AA0146_WRAP_AROUND_FIX
@@ -182,12 +207,82 @@ void EncLib::create( const int layerId )
 #endif
   }
 
+  xCreateFinishObjects( m_cLoopFilter, m_cEncALF, m_cEncSAO, true );
+  // frame threads: a finish context per intra period whose finishes run at the same time
+  EncFinishContext own;
+  own.alf            = &m_cEncALF;
+  own.sao            = &m_cEncSAO;
+  own.loopFilter     = &m_cLoopFilter;
+#if JVET_AL0153_ALF_CCCM
+  own.loopFilterCccm = &m_cEncLoopFilterCccm;
+#endif
+#if JVET_AA0096_MC_BOUNDARY_PADDING
+  own.mcPad          = &m_cFrameMcPadPredSearch;
+#endif
+  own.hlsWriter      = &m_HLSWriter;
+  own.apsMap         = &m_apsMap;
+  m_finishContexts.assign( 1, own );
+  m_finishObjects.clear();
+  for( int i = 1; i < ( getFrameThreads() > 1 ? getFramePeriods() : 1 ); i++ )
+  {
+    m_finishObjects.emplace_back( new EncFinishObjects );
+  }
+  // the SAO statistics of a picture's finish are created before its SAO and freed after it (EncGOP): an idle context
+  // holds none (625 MB at 1080p)
+  runInParallel( 0, m_finishObjects.size(), [&]( size_t i )
+  {
+    EncFinishObjects& objects = *m_finishObjects[i];
+    xCreateFinishObjects( objects.loopFilter, objects.alf, objects.sao, false );
+  } );
+  for( auto& objectsPtr: m_finishObjects )
+  {
+    EncFinishObjects& objects = *objectsPtr;
+#if JVET_AM0209_CHROMA_ALF_CCALF_REUSE_CTU
+    objects.alf.m_pictureControlInfo = objects.pictureControlInfo;
+#endif
+#if JVET_AE0151_CCSAO_HISTORY_OFFSETS_AND_EXT_EO
+    objects.sao.m_ccSaoPrvParam = objects.ccSaoPrvParam;
+#endif
+    EncFinishContext context;
+    context.alf            = &objects.alf;
+    context.sao            = &objects.sao;
+    context.loopFilter     = &objects.loopFilter;
+#if JVET_AL0153_ALF_CCCM
+    context.loopFilterCccm = &objects.loopFilterCccm;
+#endif
+#if JVET_AA0096_MC_BOUNDARY_PADDING
+    context.mcPad          = &objects.mcPad;
+#endif
+    context.hlsWriter      = &objects.hlsWriter;
+    context.apsMap         = &objects.apsMap;
+    m_finishContexts.push_back( context );
+  }
+  m_finishStacks.clear();
+  if( getFrameThreads() > 1 )
+  {
+    for( EncFinishContext& ctx: m_finishContexts )
+    {
+      m_finishStacks.emplace_back( new EncFinishStack );
+      ctx.stack = m_finishStacks.back().get();
+    }
+  }
+}
+
+void EncLib::xCreateFinishObjects( LoopFilter& loopFilter, EncAdaptiveLoopFilter& alf, EncSampleAdaptiveOffset& sao,
+                                   bool saoEncData )
+{
+  loopFilter.create( floorLog2( m_maxCUWidth ) - MIN_CU_LOG2 );
+  if( !m_bLoopFilterDisable && m_encDbOpt )
+  {
+    loopFilter.initEncPicYuvBuffer( m_chromaFormatIDC, Size( getSourceWidth(), getSourceHeight() ), getMaxCUWidth() );
+  }
+
   if (m_alf)
   {
 #if JVET_AA0146_WRAP_AROUND_FIX
-    m_cEncALF.create(this, m_sourceWidth, m_sourceHeight, m_chromaFormatIDC, m_maxCUWidth, m_maxCUHeight, floorLog2(m_maxCUWidth) - m_log2MinCUSize, m_bitDepth, m_inputBitDepth);
+    alf.create(this, m_sourceWidth, m_sourceHeight, m_chromaFormatIDC, m_maxCUWidth, m_maxCUHeight, floorLog2(m_maxCUWidth) - m_log2MinCUSize, m_bitDepth, m_inputBitDepth);
 #else
-    m_cEncALF.create(this, m_iSourceWidth, m_iSourceHeight, m_chromaFormatIDC, m_maxCUWidth, m_maxCUHeight, floorLog2(m_maxCUWidth) - m_log2MinCUSize, m_bitDepth, m_inputBitDepth);
+    alf.create(this, m_iSourceWidth, m_iSourceHeight, m_chromaFormatIDC, m_maxCUWidth, m_maxCUHeight, floorLog2(m_maxCUWidth) - m_log2MinCUSize, m_bitDepth, m_inputBitDepth);
 #endif
   }
 #if JVET_V0094_BILATERAL_FILTER
@@ -224,16 +319,19 @@ void EncLib::create( const int layerId )
     const uint32_t widthInCtus = (m_sourceWidth + m_maxCUWidth - 1) / m_maxCUWidth;
     const uint32_t heightInCtus = (m_sourceHeight + m_maxCUHeight - 1) / m_maxCUHeight;
     const uint32_t numCtuInFrame = widthInCtus * heightInCtus;
-    m_cEncSAO.create(m_sourceWidth, m_sourceHeight, m_chromaFormatIDC, m_maxCUWidth, m_maxCUHeight, floorLog2(m_maxCUWidth) - m_log2MinCUSize, (uint32_t)std::max(0, m_bitDepth[CHANNEL_TYPE_LUMA] - MAX_SAO_TRUNCATED_BITDEPTH), (uint32_t)std::max(0, m_bitDepth[CHANNEL_TYPE_CHROMA] - MAX_SAO_TRUNCATED_BITDEPTH));
+    sao.create(m_sourceWidth, m_sourceHeight, m_chromaFormatIDC, m_maxCUWidth, m_maxCUHeight, floorLog2(m_maxCUWidth) - m_log2MinCUSize, (uint32_t)std::max(0, m_bitDepth[CHANNEL_TYPE_LUMA] - MAX_SAO_TRUNCATED_BITDEPTH), (uint32_t)std::max(0, m_bitDepth[CHANNEL_TYPE_CHROMA] - MAX_SAO_TRUNCATED_BITDEPTH));
 #else
     const uint32_t widthInCtus = (m_iSourceWidth + m_maxCUWidth - 1) / m_maxCUWidth;
     const uint32_t heightInCtus = (m_iSourceHeight + m_maxCUHeight - 1) / m_maxCUHeight;
     const uint32_t numCtuInFrame = widthInCtus * heightInCtus;
-    m_cEncSAO.create(m_iSourceWidth, m_iSourceHeight, m_chromaFormatIDC, m_maxCUWidth, m_maxCUHeight, floorLog2(m_maxCUWidth) - m_log2MinCUSize, (uint32_t)std::max(0, m_bitDepth[CHANNEL_TYPE_LUMA] - MAX_SAO_TRUNCATED_BITDEPTH), (uint32_t)std::max(0, m_bitDepth[CHANNEL_TYPE_CHROMA] - MAX_SAO_TRUNCATED_BITDEPTH));
+    sao.create(m_iSourceWidth, m_iSourceHeight, m_chromaFormatIDC, m_maxCUWidth, m_maxCUHeight, floorLog2(m_maxCUWidth) - m_log2MinCUSize, (uint32_t)std::max(0, m_bitDepth[CHANNEL_TYPE_LUMA] - MAX_SAO_TRUNCATED_BITDEPTH), (uint32_t)std::max(0, m_bitDepth[CHANNEL_TYPE_CHROMA] - MAX_SAO_TRUNCATED_BITDEPTH));
 #endif
-    m_cEncSAO.createEncData(m_saoCtuBoundary, numCtuInFrame);
+    if( saoEncData )
+    {
+      sao.createEncData(m_saoCtuBoundary, numCtuInFrame);
+    }
 #if JVET_AJ0237_INTERNAL_12BIT
-    m_cEncSAO.m_bilateralFilter.setInternalBitDepth(m_bitDepth[COMPONENT_Y]);
+    sao.m_bilateralFilter.setInternalBitDepth(m_bitDepth[COMPONENT_Y]);
 #endif
   }
 }
@@ -242,22 +340,35 @@ void EncLib::destroy ()
 {
   // destroy processing unit classes
   m_cGOPEncoder.        destroy();
-  m_cSliceEncoder.      destroy();
-#if ENABLE_SPLIT_PARALLELISM
-  for( int jId = 0; jId < m_numCuEncStacks; jId++ )
+  for( auto& stack: m_searchStacks )
   {
-    m_cCuEncoder[jId].destroy();
+    stack->sliceEncoder.destroy();
+    stack->cuEncoder.destroy();
   }
-#else
-  m_cCuEncoder.         destroy();
-#endif
   if( m_alf )
   {
     m_cEncALF.destroy();
   }
   m_cEncSAO.            destroy();
   m_cLoopFilter.        destroy();
+  for( auto& objects: m_finishObjects )
+  {
+    if( m_alf )
+    {
+      objects->alf.destroy();
+    }
+    objects->sao.destroy();
+    objects->loopFilter.destroy();
+  }
+  m_finishStacks.clear();
+  m_finishObjects.clear();
+  m_finishContexts.clear();
+  for( auto& stack: m_searchStacks )
+  {
+    stack->loopFilter.destroy();
+  }
   m_cRateCtrl.          destroy();
+  m_setupStack.reset();
 #if ENABLE_SPLIT_PARALLELISM
   for (int jId = 0; jId < m_numCuEncStacks; jId++)
   {
@@ -266,35 +377,22 @@ void EncLib::destroy ()
 #else
   m_cReshaper.          destroy();
 #endif
-#if ENABLE_SPLIT_PARALLELISM
-  for( int jId = 0; jId < m_numCuEncStacks; jId++ )
+  for( auto& stack: m_searchStacks )
   {
-    m_cInterSearch[jId].   destroy();
-    m_cIntraSearch[jId].   destroy();
+    stack->interSearch.destroy();
+    stack->intraSearch.destroy();
 #if JVET_V0094_BILATERAL_FILTER || JVET_X0071_CHROMA_BILATERAL_FILTER
-    m_bilateralFilter[jId].destroy();
+    stack->bilateralFilter.destroy();
 #endif
   }
-#else
-  m_cInterSearch.       destroy();
-  m_cIntraSearch.       destroy();
+  for( auto& helper: m_rdHelperStacks )
+  {
+    helper->intraSearch.destroy();
+    helper->interPrediction.destroy();
 #if JVET_V0094_BILATERAL_FILTER || JVET_X0071_CHROMA_BILATERAL_FILTER
-  m_bilateralFilter.    destroy();
+    helper->bilateralFilter.destroy();
 #endif
-#endif
-
-#if ENABLE_SPLIT_PARALLELISM
-  delete[] m_cCuEncoder;
-  delete[] m_cInterSearch;
-  delete[] m_cIntraSearch;
-#if JVET_V0094_BILATERAL_FILTER || JVET_X0071_CHROMA_BILATERAL_FILTER
-  delete[] m_bilateralFilter;
-#endif
-  delete[] m_cTrQuant;
-  delete[] m_CABACEncoder;
-  delete[] m_cRdCost;
-  delete[] m_ctxCache;
-#endif
+  }
 
   return;
 }
@@ -337,14 +435,14 @@ void EncLib::init( bool isFieldCoding, AUWriterIf* auWriterIf )
     m_cRateCtrl.initHrdParam(sps0.getGeneralHrdParameters(), sps0.getOlsHrdParameters(), m_iFrameRate, m_RCInitialCpbFullness);
   }
 #endif
-#if ENABLE_SPLIT_PARALLELISM
-  for( int jId = 0; jId < m_numCuEncStacks; jId++ )
+  for( auto& stack: m_searchStacks )
   {
-    m_cRdCost[jId].setCostMode ( m_costMode );
+    stack->rdCost.setCostMode( m_costMode );
   }
-#else
-  m_cRdCost.setCostMode ( m_costMode );
-#endif
+  if( m_setupStack )
+  {
+    m_setupStack->rdCost.setCostMode( m_costMode );
+  }
 
   // initialize PPS
 #if JVET_AA0146_WRAP_AROUND_FIX
@@ -673,116 +771,151 @@ void EncLib::init( bool isFieldCoding, AUWriterIf* auWriterIf )
 
   // initialize processing unit classes
   m_cGOPEncoder.  init( this );
-  m_cSliceEncoder.init( this, sps0 );
-#if ENABLE_SPLIT_PARALLELISM
-  for( int jId = 0; jId < m_numCuEncStacks; jId++ )
+  const auto initStack = [&]( size_t i )
   {
-    // precache a few objects
-    for( int i = 0; i < 10; i++ )
-    {
-      auto x = m_ctxCache[jId].get();
-      m_ctxCache[jId].cache( x );
-    }
+    EncSearchStack& stack = *m_searchStacks[i];
+    stack.sliceEncoder.init( this, stack, sps0 );
+    stack.cuEncoder.init( this, stack, sps0 );
 
-    m_cCuEncoder[jId].init( this, sps0, jId );
-
-    // initialize transform & quantization class
-    m_cTrQuant[jId].init( jId == 0 ? nullptr : m_cTrQuant[0].getQuant(),
-                          1 << m_log2MaxTbSize,
-
-                          m_useRDOQ,
-                          m_useRDOQTS,
+    // initialize transform & quantization class; the other stacks share the scaling-list tables of the first
+    stack.trQuant.init( &stack == m_searchStacks[0].get() ? nullptr : getTrQuant()->getQuant(),
+                        1 << m_log2MaxTbSize,
+                        m_useRDOQ,
+                        m_useRDOQTS,
 #if T0196_SELECTIVE_RDOQ
-                          m_useSelectiveRDOQ,
+                        m_useSelectiveRDOQ,
 #endif
-                          true
+                        true
     );
 
     // initialize encoder search class
-    CABACWriter* cabacEstimator = m_CABACEncoder[jId].getCABACEstimator( &sps0 );
-    m_cIntraSearch[jId].init( this,
+    CABACWriter* cabacEstimator = stack.cabacEncoder.getCABACEstimator( &sps0 );
+    stack.intraSearch.init( this,
 #if JVET_V0094_BILATERAL_FILTER || JVET_X0071_CHROMA_BILATERAL_FILTER
-                             &m_bilateralFilter[jId],
+                            &stack.bilateralFilter,
 #endif
-                              &m_cTrQuant[jId],
-                              &m_cRdCost[jId],
-                              cabacEstimator,
-                              getCtxCache( jId ), m_maxCUWidth, m_maxCUHeight, floorLog2(m_maxCUWidth) - m_log2MinCUSize
-                            , &m_cReshaper[jId]
-                            , sps0.getBitDepth(CHANNEL_TYPE_LUMA)
+                            &stack.trQuant,
+                            &stack.rdCost,
+                            cabacEstimator,
+                            &stack.ctxCache, m_maxCUWidth, m_maxCUHeight, floorLog2(m_maxCUWidth) - m_log2MinCUSize
+                          , &stack.reshaper
+                          , sps0.getBitDepth(CHANNEL_TYPE_LUMA)
     );
-    m_cInterSearch[jId].init( this,
+    stack.interSearch.init( this,
 #if JVET_V0094_BILATERAL_FILTER || JVET_X0071_CHROMA_BILATERAL_FILTER
-                             &m_bilateralFilter[jId],
+                            &stack.bilateralFilter,
 #endif
-                              &m_cTrQuant[jId],
-                              m_iSearchRange,
-                              m_bipredSearchRange,
-                              m_motionEstimationSearchMethod,
-                              getUseCompositeRef(),
-                              m_maxCUWidth, m_maxCUHeight, floorLog2(m_maxCUWidth) - m_log2MinCUSize, &m_cRdCost[jId], cabacEstimator, getCtxCache( jId )
-                           , &m_cReshaper[jId]
-    );
-
-    // link temporary buffets from intra search with inter search to avoid unnecessary memory overhead
-    m_cInterSearch[jId].setTempBuffers( m_cIntraSearch[jId].getSplitCSBuf(), m_cIntraSearch[jId].getFullCSBuf(), m_cIntraSearch[jId].getSaveCSBuf() );
-  }
-#else  // ENABLE_SPLIT_PARALLELISM || ENABLE_WPP_PARALLELISM
-  m_cCuEncoder.   init( this, sps0 );
-
-  // initialize transform & quantization class
-  m_cTrQuant.init( nullptr,
-                   1 << m_log2MaxTbSize,
-                   m_useRDOQ,
-                   m_useRDOQTS,
-#if T0196_SELECTIVE_RDOQ
-                   m_useSelectiveRDOQ,
-#endif
-                   true
-  );
-
-  // initialize encoder search class
-  CABACWriter* cabacEstimator = m_CABACEncoder.getCABACEstimator(&sps0);
-  m_cIntraSearch.init( this,
-#if JVET_V0094_BILATERAL_FILTER || JVET_X0071_CHROMA_BILATERAL_FILTER
-                       &m_bilateralFilter,
-#endif
-                       &m_cTrQuant,
-                       &m_cRdCost,
-                       cabacEstimator,
-                       getCtxCache(), m_maxCUWidth, m_maxCUHeight, floorLog2(m_maxCUWidth) - m_log2MinCUSize
-                     , &m_cReshaper
-                     , sps0.getBitDepth(CHANNEL_TYPE_LUMA)
-  );
-  m_cInterSearch.init( this,
-#if JVET_V0094_BILATERAL_FILTER || JVET_X0071_CHROMA_BILATERAL_FILTER
-                       &m_bilateralFilter,
-#endif
-                       &m_cTrQuant,
-                       m_iSearchRange,
-                       m_bipredSearchRange,
-                       m_motionEstimationSearchMethod,
-                       getUseCompositeRef(),
-    m_maxCUWidth, m_maxCUHeight, floorLog2(m_maxCUWidth) - m_log2MinCUSize, &m_cRdCost, cabacEstimator, getCtxCache()
-                     , &m_cReshaper
+                            &stack.trQuant,
+                            m_iSearchRange,
+                            m_bipredSearchRange,
+                            m_motionEstimationSearchMethod,
+                            getUseCompositeRef(),
+      m_maxCUWidth, m_maxCUHeight, floorLog2(m_maxCUWidth) - m_log2MinCUSize, &stack.rdCost, cabacEstimator, &stack.ctxCache
+                          , &stack.reshaper
 #if JVET_Z0153_IBC_EXT_REF
-                     , pps0.getPicWidthInLumaSamples()
+                          , pps0.getPicWidthInLumaSamples()
 #if JVET_AJ0172_IBC_ITMP_ALIGN_REF_AREA
-                     , pps0.getPicHeightInLumaSamples()
+                          , pps0.getPicHeightInLumaSamples()
 #endif
 #endif
-  );
+    );
 
-  // link temporary buffets from intra search with inter search to avoid unneccessary memory overhead
-  m_cInterSearch.setTempBuffers( m_cIntraSearch.getSplitCSBuf(), m_cIntraSearch.getFullCSBuf(), m_cIntraSearch.getSaveCSBuf() );
-#endif // ENABLE_SPLIT_PARALLELISM || ENABLE_WPP_PARALLELISM
+    // link temporary buffets from intra search with inter search to avoid unneccessary memory overhead
+    stack.interSearch.setTempBuffers( stack.intraSearch.getSplitCSBuf(), stack.intraSearch.getFullCSBuf(), stack.intraSearch.getSaveCSBuf() );
 
 #if JVET_AE0159_FIBC || JVET_AE0059_INTER_CCCM || JVET_AE0078_IBC_LIC_EXTENSION || JVET_AF0073_INTER_CCP_MERGE
-  m_cInterSearch.setIntraPrediction(&m_cIntraSearch);
+    stack.interSearch.setIntraPrediction( &stack.intraSearch );
 #endif
 #if JVET_AH0200_INTRA_TMP_BV_REORDER
-  m_cIntraSearch.setInterPrediction(&m_cInterSearch);
+    stack.intraSearch.setInterPrediction( &stack.interSearch );
 #endif
+  };
+  // the other stacks share the first one's scaling-list tables, so it goes first; the rest in parallel, as created
+  initStack( 0 );
+  runInParallel( 1, m_searchStacks.size(), initStack );
+  for( auto& stack: m_finishStacks )
+  {
+    stack->sliceEncoder.initFinish( this, stack->cabacEncoder, stack->rdCost, stack->reshaper, sps0 );
+    // as IntraSearch::init
+#if JVET_AJ0249_NEURAL_NETWORK_BASED
+#if JVET_AK0118_BF_FOR_INTRA_PRED
+    stack->intraPred.init( m_chromaFormatIDC, getBitDepth( CHANNEL_TYPE_LUMA ), getNnipMode(), &stack->reshaper,
+                           &stack->bilateralFilter );
+#else
+    stack->intraPred.init( m_chromaFormatIDC, getBitDepth( CHANNEL_TYPE_LUMA ), getNnipMode() );
+#endif
+#else
+    stack->intraPred.init( m_chromaFormatIDC, getBitDepth( CHANNEL_TYPE_LUMA ) );
+#endif
+  }
+  if( m_setupStack )
+  {
+    m_setupStack->sliceEncoder.initSetup( this, m_setupStack->cabacEncoder, m_setupStack->trQuant, m_setupStack->rdCost,
+                                          m_setupStack->reshaper, sps0, m_iSearchRange );
+    m_setupStack->trQuant.init( getTrQuant()->getQuant(), 1 << m_log2MaxTbSize, m_useRDOQ, m_useRDOQTS,
+#if T0196_SELECTIVE_RDOQ
+                                m_useSelectiveRDOQ,
+#endif
+                                true );
+  }
+  for( int i = 0; i < getNumSearchStacks(); i++ )
+  {
+    std::vector<IntraSearch*> helpers;
+    for( int h = 0; h < getNumRdHelpers(); h++ )
+    {
+      EncRdHelperStack& helper = getRdHelperStack( i, h );
+      helper.rdCost.setCostMode( m_costMode );
+      helper.trQuant.init( getTrQuant()->getQuant(), 1 << m_log2MaxTbSize, m_useRDOQ, m_useRDOQTS,
+#if T0196_SELECTIVE_RDOQ
+                           m_useSelectiveRDOQ,
+#endif
+                           true );
+      // the helpers predict with the reshaper of the picture's stack
+      helper.intraSearch.init( this,
+#if JVET_V0094_BILATERAL_FILTER || JVET_X0071_CHROMA_BILATERAL_FILTER
+                               &helper.bilateralFilter,
+#endif
+                               &helper.trQuant, &helper.rdCost, helper.cabacEncoder.getCABACEstimator( &sps0 ),
+                               &helper.ctxCache, m_maxCUWidth, m_maxCUHeight, floorLog2( m_maxCUWidth ) - m_log2MinCUSize,
+                               &getSearchStack( i ).reshaper, sps0.getBitDepth( CHANNEL_TYPE_LUMA ) );
+#if INTER_LIC || (TM_AMVP || TM_MRG || JVET_Z0084_IBC_TM) || JVET_W0090_ARMC_TM || JVET_Z0056_GPM_SPLIT_MODE_REORDERING
+#if JVET_Z0153_IBC_EXT_REF
+#if JVET_AJ0172_IBC_ITMP_ALIGN_REF_AREA
+#if JVET_AJ0237_INTERNAL_12BIT
+      helper.interPrediction.init( &helper.rdCost, m_chromaFormatIDC, m_maxCUHeight, &getSearchStack( i ).reshaper,
+                                   pps0.getPicWidthInLumaSamples(), pps0.getPicHeightInLumaSamples(),
+                                   getBitDepth( CHANNEL_TYPE_LUMA ) );
+#else
+      helper.interPrediction.init( &helper.rdCost, m_chromaFormatIDC, m_maxCUHeight, &getSearchStack( i ).reshaper,
+                                   pps0.getPicWidthInLumaSamples(), pps0.getPicHeightInLumaSamples() );
+#endif
+#else
+#if JVET_AJ0237_INTERNAL_12BIT
+      helper.interPrediction.init( &helper.rdCost, m_chromaFormatIDC, m_maxCUHeight, &getSearchStack( i ).reshaper,
+                                   pps0.getPicWidthInLumaSamples(), getBitDepth( CHANNEL_TYPE_LUMA ) );
+#else
+      helper.interPrediction.init( &helper.rdCost, m_chromaFormatIDC, m_maxCUHeight, &getSearchStack( i ).reshaper,
+                                   pps0.getPicWidthInLumaSamples() );
+#endif
+#endif
+#else
+      helper.interPrediction.init( &helper.rdCost, m_chromaFormatIDC, m_maxCUHeight, &getSearchStack( i ).reshaper );
+#endif
+#else
+      helper.interPrediction.init( &helper.rdCost, m_chromaFormatIDC, m_maxCUHeight );
+#endif
+#if JVET_AE0159_FIBC || JVET_AE0059_INTER_CCCM || JVET_AE0078_IBC_LIC_EXTENSION || JVET_AF0073_INTER_CCP_MERGE
+      helper.interPrediction.setIntraPrediction( &helper.intraSearch );
+#endif
+#if JVET_AH0200_INTRA_TMP_BV_REORDER
+      helper.intraSearch.setInterPrediction( &helper.interPrediction );
+#endif
+      helpers.push_back( &helper.intraSearch );
+    }
+    // the workers are never deleted: their threads run until the process ends
+    EncCuWorkers* workers = getCuThreads() > 1 ? new EncCuWorkers( getCuThreads() - 1 ) : nullptr;
+    getSearchStack( i ).intraSearch.setRdHelpers( helpers, workers, getCuThreadsCheck() );
+  }
   m_iMaxRefPicNum = 0;
 
 #if ER_CHROMA_QP_WCG_PPS
@@ -805,6 +938,7 @@ void EncLib::init( bool isFieldCoding, AUWriterIf* auWriterIf )
   if (getUseCompositeRef())
   {
     Picture *picBg = new Picture;
+    picBg->unitCache = new XUCache;
 
     picBg->create(
       sps0.getRprEnabledFlag(),
@@ -831,6 +965,7 @@ void EncLib::init( bool isFieldCoding, AUWriterIf* auWriterIf )
     picBg->createSpliceIdx(pps0.pcv->sizeInCtus);
     m_cGOPEncoder.setPicBg(picBg);
     Picture *picOrig = new Picture;
+    picOrig->unitCache = new XUCache;
 
     picOrig->create(
       sps0.getRprEnabledFlag(),
@@ -858,9 +993,27 @@ void EncLib::init( bool isFieldCoding, AUWriterIf* auWriterIf )
     for (int aps = 0; aps < ALF_CTB_MAX_NUM_APS; aps++)
     {
       g_pictureControlInfo[aps].resize(numCTUsInPic);
+      for( auto& objects: m_finishObjects )
+      {
+        objects->pictureControlInfo[aps].resize( numCTUsInPic );
+      }
     }
   }
 #endif
+}
+
+std::vector<TrQuant*> EncLib::xAllTrQuants()
+{
+  std::vector<TrQuant*> all;
+  for( auto& stack: m_searchStacks )
+  {
+    all.push_back( &stack->trQuant );
+  }
+  for( auto& helper: m_rdHelperStacks )
+  {
+    all.push_back( &helper->trQuant );
+  }
+  return all;
 }
 
 void EncLib::xInitScalingLists( SPS &sps, APS &aps )
@@ -873,32 +1026,24 @@ void EncLib::xInitScalingLists( SPS &sps, APS &aps )
     sps.getMaxLog2TrDynamicRange(CHANNEL_TYPE_CHROMA)
   };
 
-  Quant* quant = getTrQuant()->getQuant();
-
+  // every stack's quantizer runs the setup: the stacks share the scaling-list tables, but each quantizer keeps its
+  // own error scales without scaling list (QuantRDOQ::m_errScaleNoScalingList)
   if(getUseScalingListId() == SCALING_LIST_OFF)
   {
-    quant->setFlatScalingList(maxLog2TrDynamicRange, sps.getBitDepths());
-    quant->setUseScalingList(false);
-#if ENABLE_SPLIT_PARALLELISM
-    for( int jId = 1; jId < m_numCuEncStacks; jId++ )
+    for( TrQuant* trQuant: xAllTrQuants() )
     {
-      getTrQuant( jId )->getQuant()->setFlatScalingList( maxLog2TrDynamicRange, sps.getBitDepths() );
-      getTrQuant( jId )->getQuant()->setUseScalingList( false );
+      trQuant->getQuant()->setFlatScalingList( maxLog2TrDynamicRange, sps.getBitDepths() );
+      trQuant->getQuant()->setUseScalingList( false );
     }
-#endif
   }
   else if(getUseScalingListId() == SCALING_LIST_DEFAULT)
   {
     aps.getScalingList().setDefaultScalingList ();
-    quant->setScalingList( &( aps.getScalingList() ), maxLog2TrDynamicRange, sps.getBitDepths() );
-    quant->setUseScalingList(true);
-#if ENABLE_SPLIT_PARALLELISM
-    for( int jId = 1; jId < m_numCuEncStacks; jId++ )
+    for( TrQuant* trQuant: xAllTrQuants() )
     {
-      getTrQuant( jId )->getQuant()->setUseScalingList( true );
+      trQuant->getQuant()->setScalingList( &( aps.getScalingList() ), maxLog2TrDynamicRange, sps.getBitDepths() );
+      trQuant->getQuant()->setUseScalingList( true );
     }
-    sps.setDisableScalingMatrixForLfnstBlks(getDisableScalingMatrixForLfnstBlks());
-#endif
   }
   else if(getUseScalingListId() == SCALING_LIST_FILE_READ)
   {
@@ -910,14 +1055,11 @@ void EncLib::xInitScalingLists( SPS &sps, APS &aps )
       setUseScalingListId( SCALING_LIST_DEFAULT );
     }
     aps.getScalingList().setChromaScalingListPresentFlag((sps.getChromaFormatIdc()!=CHROMA_400));
-    quant->setScalingList( &( aps.getScalingList() ), maxLog2TrDynamicRange, sps.getBitDepths() );
-    quant->setUseScalingList(true);
-#if ENABLE_SPLIT_PARALLELISM
-    for( int jId = 1; jId < m_numCuEncStacks; jId++ )
+    for( TrQuant* trQuant: xAllTrQuants() )
     {
-      getTrQuant( jId )->getQuant()->setUseScalingList( true );
+      trQuant->getQuant()->setScalingList( &( aps.getScalingList() ), maxLog2TrDynamicRange, sps.getBitDepths() );
+      trQuant->getQuant()->setUseScalingList( true );
     }
-#endif
 
     sps.setDisableScalingMatrixForLfnstBlks(getDisableScalingMatrixForLfnstBlks());
   }
@@ -1189,7 +1331,21 @@ bool EncLib::encodePrep(bool flush, PelStorage* pcPicYuvOrg, const InputColourSp
       ppsID = m_vps->getGeneralLayerIdx( m_layerId );
     }
 
+    std::unique_lock<std::mutex> picListLock( m_picListMutex, std::defer_lock );
+    if( getFrameThreads() > 1 )
+    {
+      picListLock.lock();   // the setups of earlier GOPs may use the list (EncGOP::compressGOP)
+    }
     xGetNewPicBuffer( rcListPicYuvRecOut, pcPicCurr, ppsID );
+    if( getFrameThreads() > 1 )
+    {
+      xReleaseUnreadPics( true );   // the pictures whose reconstruction the application has written since
+      if( pcPicCurr->origReleased )
+      {
+        pcPicCurr->recreateOrigBuf();   // takes the frame below
+        pcPicCurr->origReleased = false;
+      }
+    }
 
     const PPS *pPPS = ( ppsID < 0 ) ? m_ppsMap.getFirstPS() : m_ppsMap.getPS( ppsID );
     const SPS *pSPS = m_spsMap.getPS( pPPS->getSPSId() );
@@ -1222,6 +1378,9 @@ bool EncLib::encodePrep(bool flush, PelStorage* pcPicYuvOrg, const InputColourSp
     {
       pcPicCurr->M_BUFS( 0, PIC_ORIGINAL ).swap( *pcPicYuvOrg );
     }
+    // the frames come in input order, FrameSkip and the subsampling applied by the application
+    pcPicCurr->inputFrameIndex = int( getFrameSkip() + m_numInputPics * getTemporalSubsampleRatio() );
+    m_numInputPics++;
 
 #if JVET_AK0065_TALF
     pcPicCurr->finalInit( m_vps, *pSPS, *pPPS, &m_picHeader, m_apss, m_apss2, m_lmcsAPS, m_scalinglistAPS );
@@ -1230,11 +1389,23 @@ bool EncLib::encodePrep(bool flush, PelStorage* pcPicYuvOrg, const InputColourSp
 #endif
 
     pcPicCurr->poc = m_iPOCLast;
+    if( getFrameThreads() > 1 )
+    {
+      // a reused buffer starts with no record of its previous picture: a stale 'finished' would hand the next picture
+      // out and free its buffers during its search (getFrameThreadsOutput, xReleaseUnreadPics)
+      m_cGOPEncoder.forgetPicFinished( pcPicCurr );
+      pcPicCurr->releaseSearchBuffers();   // until its search starts (EncGOP::xStartPicSearch)
+    }
 
     // compute image characteristics
     if( getUseAdaptiveQP() )
     {
       AQpPreanalyzer::preanalyze( pcPicCurr );
+    }
+    if( getFrameThreads() > 1 )
+    {
+      m_ftOutputQueue.emplace_back( pcPicCurr, m_numInputPics - 1 );   // the pictures come in output order
+      m_ftBusyPics.insert( pcPicCurr );
     }
   }
 
@@ -1271,12 +1442,31 @@ bool EncLib::encodePrep(bool flush, PelStorage* pcPicYuvOrg, const InputColourSp
 bool EncLib::encode( const InputColourSpaceConversion snrCSC, std::list<PelUnitBuf*>& rcListPicYuvRecOut, int& iNumEncoded )
 {
   // compress GOP
-  m_cGOPEncoder.compressGOP(m_iPOCLast, m_iNumPicRcvd, m_cListPic, rcListPicYuvRecOut, false, false, snrCSC,
-                            m_printFrameMSE,
+  if( getFrameThreads() > 1 )
+  {
+    // the first call starts all pictures of the GOP (the first picture of the sequence is a GOP of its own). It
+    // returns before they are done, so the next GOPs are read and started meanwhile: at most a GOP, or a picture per
+    // search stack, ahead of the pictures in flight.
+    if( m_picIdInGOP == 0 )
+    {
+      m_cGOPEncoder.waitFrameThreads( std::max( getNumSearchStacks(), m_iGOPSize ) * getNumFinishContexts() );
+      m_cGOPEncoder.compressGOPFrameThreads( m_iPOCLast ? m_iGOPSize : 1, m_iPOCLast, m_iNumPicRcvd, m_cListPic,
+                                             rcListPicYuvRecOut, false, false, snrCSC, m_printFrameMSE,
 #if MSSIM_UNIFORM_METRICS_LOG
-                            m_printMSSSIM,
+                                             m_printMSSSIM,
 #endif
-                            false, m_picIdInGOP);
+                                             false );
+    }
+  }
+  else
+  {
+    m_cGOPEncoder.compressGOP(m_iPOCLast, m_iNumPicRcvd, m_cListPic, rcListPicYuvRecOut, false, false, snrCSC,
+                              m_printFrameMSE,
+#if MSSIM_UNIFORM_METRICS_LOG
+                              m_printMSSSIM,
+#endif
+                              false, m_picIdInGOP);
+  }
 
   m_picIdInGOP++;
 
@@ -1445,6 +1635,68 @@ bool EncLib::encode( const InputColourSpaceConversion snrCSC, std::list<PelUnitB
  .
  \retval rpcPic obtained picture buffer
  */
+void EncLib::releaseUnreadPics()
+{
+  std::lock_guard<std::mutex> lock( m_picListMutex );
+  xReleaseUnreadPics( false );
+}
+
+void EncLib::releaseWrittenPics()
+{
+  std::lock_guard<std::mutex> lock( m_picListMutex );
+  xReleaseUnreadPics( true );
+}
+
+void EncLib::xReleaseUnreadPics( bool afterOutput )
+{
+  // A finished picture that nothing reads any more: no setup after the latest one references it (a picture marked
+  // unused for reference stays unused), no picture set up and not done references it, and its reconstruction is not
+  // written at all or was handed out (getFrameThreadsOutput) before the application's last writes (afterOutput: from
+  // encodePrep, which the application calls after writing). Its buffers would otherwise stay until the buffer takes
+  // the next picture: the pictures of a completed period wait for the output of the earlier periods.
+  for( Picture* pic: m_cListPic )
+  {
+    if( !pic->unreadBufsReleased && !pic->referenced && m_cGOPEncoder.isPicFinished( pic )
+        && !m_cGOPEncoder.isPicReferencedInFlight( pic )
+        && ( m_reconFileName.empty() || ( afterOutput && !m_ftBusyPics.count( pic ) ) ) )
+    {
+      pic->releaseUnreadBufs();
+    }
+  }
+}
+
+bool EncLib::isOrigReloadable()
+{
+  if( m_origReloadable < 0 )
+  {
+    // frame threads: a waiting picture's original is read again from the input file at its search start, if the
+    // input is one (decided at the first setup: the application sets the temporal filter's input file after init)
+    m_origReloadable = getFrameThreads() > 1 && !isResChangeInClvsEnabled() && m_temporalFilter.inputIsFile();
+  }
+  return m_origReloadable > 0;
+}
+
+bool EncLib::getFrameThreadsOutput( PelUnitBuf& rec, int& frameIndex )
+{
+  // the first picture whose finish ended, in input order (its log and access unit may still wait for earlier
+  // pictures, which keeps neither its reconstruction nor the buffers xReleaseUnreadPics frees)
+  auto it = m_ftOutputQueue.begin();
+  while( it != m_ftOutputQueue.end() && !m_cGOPEncoder.isPicFinished( it->first ) )
+  {
+    ++it;
+  }
+  if( it == m_ftOutputQueue.end() )
+  {
+    return false;
+  }
+  Picture* pic = it->first;
+  frameIndex   = it->second;
+  m_ftOutputQueue.erase( it );
+  m_ftBusyPics.erase( pic );
+  rec = pic->unreadBufsReleased ? PelUnitBuf() : pic->getRecoBuf();   // released: not written (no reconstruction file)
+  return true;
+}
+
 void EncLib::xGetNewPicBuffer ( std::list<PelUnitBuf*>& rcListPicYuvRecOut, Picture*& rpcPic, int ppsId )
 {
   // rotate the output buffer
@@ -1473,7 +1725,11 @@ void EncLib::xGetNewPicBuffer ( std::list<PelUnitBuf*>& rcListPicYuvRecOut, Pict
     for( int i = 0; i < iSize; i++ )
     {
       rpcPic = *iterPic;
-      if( !rpcPic->referenced && rpcPic->layerId == m_layerId )
+      // with frame threads, pictures read ahead may already be marked unused for reference, and a picture's buffer
+      // stays until its reconstruction is handed out (m_ftBusyPics, getFrameThreadsOutput; its log and access unit,
+      // which may still wait, read nothing of it) and no picture in flight references it
+      if( !rpcPic->referenced && rpcPic->layerId == m_layerId && !m_ftBusyPics.count( rpcPic )
+          && !( getFrameThreads() > 1 && m_cGOPEncoder.isPicReferencedInFlight( rpcPic ) ) )
       {
         break;
       }
@@ -1499,6 +1755,7 @@ void EncLib::xGetNewPicBuffer ( std::list<PelUnitBuf*>& rcListPicYuvRecOut, Pict
   if (rpcPic==0)
   {
     rpcPic = new Picture;
+    rpcPic->unitCache = new XUCache;   // own CU / PU / TU cache: pictures may be searched in parallel threads
 
     rpcPic->create(
       isRprEnabled(),
@@ -3662,7 +3919,7 @@ void EncLib::deriveHorCollocatedChroma(PelStorage* pcPicYuvOrg)
   if (m_horCollocatedChromaFlag < 0)
   {
     CHECK(m_chromaFormatIDC != CHROMA_420, "HorCollocatedChroma error");
-    m_horCollocatedChromaFlag = m_cIntraSearch.calcHorCollocatedChroma(pcPicYuvOrg, m_bitDepth[CH_C], &m_cRdCost);
+    m_horCollocatedChromaFlag = getIntraSearch()->calcHorCollocatedChroma(pcPicYuvOrg, m_bitDepth[CH_C], getRdCost());
     SPS &sps0 = *(m_spsMap.allocatePS( m_vps->getGeneralLayerIdx( m_layerId ) ));
     sps0.setHorCollocatedChromaFlag(m_horCollocatedChromaFlag);
   }

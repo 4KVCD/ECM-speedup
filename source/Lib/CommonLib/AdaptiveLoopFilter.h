@@ -629,6 +629,8 @@ public:
   std::vector<int>&  getAlfScalePrev( const int apsIdx, const int alt ) { return m_idxCorrPrev[apsIdx][alt]; }
   void    resetAlfScalePrev( Slice& slice );
   bool    m_alfScalePrevExternal = false;   ///< decoder threads: the scales of earlier pictures were resolved in decoding order before ALFProcess
+  bool    m_alfScaleIrapResetToBeDone = true;   ///< resetAlfScalePrev: the reset after an intra picture is still to come
+  int     m_alfScalePocLastIrap       = 0;      ///< resetAlfScalePrev: POC of the last intra picture
 #endif
 #if JVET_AM0209_CHROMA_ALF_CCALF_REUSE_CTU
   FrameCtrlInfo* m_pictureControlInfo = g_pictureControlInfo;   ///< reused CTU control (decoder threads: a per-picture copy)

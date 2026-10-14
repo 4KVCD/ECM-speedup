@@ -55,6 +55,9 @@
 #include "CommonLib/AffineGradientSearch.h"
 #include "CommonLib/IbcHashMap.h"
 #include "CommonLib/Hash.h"
+#include <cstdlib>
+#include <cstring>
+#include <memory>
 #include <unordered_map>
 #include <vector>
 #include "EncReshape.h"
@@ -811,6 +814,9 @@ private:
   int             m_affMVListSize;
   int             m_affMVListMaxSize;
   BlkUniMvInfo*   m_uniMvList;
+#if JVET_AD0208_IBC_ADAPT_FOR_CAM_CAPTURED_CONTENTS
+  std::vector<Mv> m_ibcMvdDerivedVec;   ///< predIBCSearch scratch
+#endif
   int             m_uniMvListIdx;
   int             m_uniMvListSize;
   int             m_uniMvListMaxSize;
@@ -982,11 +988,11 @@ public:
 #endif
 
 #if JVET_AI0183_MVP_EXTENSION
-  MotionInfo      m_subPuMiBuf[SUB_BUFFER_SIZE][(MAX_CU_SIZE * MAX_CU_SIZE) >> (MIN_CU_LOG2 << 1)];
+  CtuMotionBufs<SUB_BUFFER_SIZE> m_subPuMiBuf;   // sized in init()
 #endif
 
 #if JVET_AL0160_SBSMVP
-  MotionInfo      m_subSpatialPuMiBuf[NUM_SUB_SMVP][(MAX_CU_SIZE * MAX_CU_SIZE) >> (MIN_CU_LOG2 << 1)];
+  CtuMotionBufs<NUM_SUB_SMVP>    m_subSpatialPuMiBuf;   // sized in init()
 #endif
 
   InterSearch();
@@ -1098,12 +1104,61 @@ public:
     m_uniMvListSizeLIC = tempInt;
   }
 #endif
+  /// Uni-prediction MVs of the motion search per block position and size in the CTU (getAreaIdx), reused by later
+  /// tests of the slice. Sized for the CTU size in use and calloc'ed, so only the entries written take memory.
+  class ReusedUniMvs
+  {
+  public:
+    using MvSet = Mv[2][33];   ///< [ref list][ref idx]
+
+    void create( unsigned numPositions, unsigned numSizes );
+    bool         isFilled( unsigned x, unsigned y, unsigned w, unsigned h ) const { return m_filled.get()[index( x, y, w, h )]; }
+    const MvSet& mvs( unsigned x, unsigned y, unsigned w, unsigned h ) const
+    {
+      CHECKD( !m_chunks[chunk( w, h )], "No motion vectors stored for this block size" );
+      return m_chunks[chunk( w, h )].get()[position( x, y )];
+    }
+    void         store( unsigned x, unsigned y, unsigned w, unsigned h, const MvSet& mvs );
+    void         reset() { ::memset( m_filled.get(), 0, m_numEntries ); }
+
+  private:
+    struct FreeDeleter
+    {
+      void operator()( void* p ) const { std::free( p ); }
+    };
+    unsigned chunk( unsigned w, unsigned h ) const
+    {
+      CHECKD( w >= m_numSizes || h >= m_numSizes, "Block larger than the CTU" );
+      return w * m_numSizes + h;
+    }
+    unsigned position( unsigned x, unsigned y ) const
+    {
+      CHECKD( x >= m_numPositions || y >= m_numPositions, "Block outside the CTU" );
+      return x * m_numPositions + y;
+    }
+    size_t index( unsigned x, unsigned y, unsigned w, unsigned h ) const
+    {
+      return size_t( chunk( w, h ) ) * m_numPositions * m_numPositions + position( x, y );
+    }
+    unsigned m_numPositions = 0;   ///< 4x4 positions per CTU row
+    unsigned m_numSizes     = 0;   ///< block size indices (gp_sizeIdxInfo) up to the CTU size
+    size_t   m_numEntries   = 0;
+    /// the sets per block size (w, h), each made at the first store into that size: a table of every position and
+    /// size took 34 MB (two per search stack) with about 30 KB in use
+    std::vector<std::unique_ptr<MvSet[], FreeDeleter>> m_chunks;
+    std::unique_ptr<bool[], FreeDeleter>              m_filled;
+  };
+  ReusedUniMvs& getReusedUniMvs( bool lic ) { return m_reusedUniMvs[lic ? 1 : 0]; }
+  void          resetReusedUniMvs( bool lic ) { m_reusedUniMvs[lic ? 1 : 0].reset(); }
+private:
+  ReusedUniMvs m_reusedUniMvs[2];   ///< [LIC]
+public:
   void resetUniMvList() { m_uniMvListIdx = 0; m_uniMvListSize = 0; 
 #if INTER_LIC
                           m_uniMvListIdxLIC = 0; m_uniMvListSizeLIC = 0; 
 #endif
   }
-  void insertUniMvCands(CompArea blkArea, Mv cMvTemp[2][33])
+  void insertUniMvCands(CompArea blkArea, const Mv cMvTemp[2][33])
   {
     BlkUniMvInfo* curMvInfo = m_uniMvList + m_uniMvListIdx;
     int j = 0;
@@ -1261,6 +1316,7 @@ public:
 
   /// set ME search range
   void setAdaptiveSearchRange       ( int iDir, int iRefIdx, int iSearchRange) { CHECK(iDir >= MAX_NUM_REF_LIST_ADAPT_SR || iRefIdx>=int(MAX_IDX_ADAPT_SR), "Invalid index"); m_aaiAdaptSR[iDir][iRefIdx] = iSearchRange; }
+  int  getAdaptiveSearchRange       ( int iDir, int iRefIdx ) const { return m_aaiAdaptSR[iDir][iRefIdx]; }
 #if JVET_AD0208_IBC_ADAPT_FOR_CAM_CAPTURED_CONTENTS
   bool  predIBCSearch               ( CodingUnit& cu, Partitioner& partitioner, const int localSearchRangeX, const int localSearchRangeY, IbcHashMap& ibcHashMap
 #if JVET_AC0112_IBC_LIC || JVET_AC0112_IBC_CIIP
@@ -1382,16 +1438,23 @@ public:
 protected:
 #if JVET_AG0164_AFFINE_GPM
   uint32_t m_gpmacsSplitModeTmSelAvail [GEO_ENC_MMVD_MAX_REFINE_NUM_ADJ][GEO_ENC_MMVD_MAX_REFINE_NUM_ADJ][GEO_MAX_ALL_INTER_UNI_CANDS]; // Note: sizeof(uint16_t) should not be less than GEO_MAX_NUM_UNI_CANDS
-  uint8_t  m_gpmacsSplitModeTmSel      [GEO_ENC_MMVD_MAX_REFINE_NUM_ADJ][GEO_ENC_MMVD_MAX_REFINE_NUM_ADJ][GEO_MAX_ALL_INTER_UNI_CANDS][GEO_MAX_ALL_INTER_UNI_CANDS][GEO_NUM_PARTITION_MODE];
+  using GpmSplitModeTmSelBlock = uint8_t[GEO_MAX_ALL_INTER_UNI_CANDS][GEO_MAX_ALL_INTER_UNI_CANDS][GEO_NUM_PARTITION_MODE];
 #if JVET_AN0093_JRGPM_WITH_AFFINE_AND_INTRA
 public:
 #endif
   uint32_t m_gpmPartTplCost            [GEO_ENC_MMVD_MAX_REFINE_NUM_ADJ][GEO_MAX_ALL_INTER_UNI_CANDS][2][GEO_NUM_PARTITION_MODE]; // [][][0][]: partition 0, [][][1][]: partition 1
 #else
   uint16_t m_gpmacsSplitModeTmSelAvail [GEO_ENC_MMVD_MAX_REFINE_NUM_ADJ][GEO_ENC_MMVD_MAX_REFINE_NUM_ADJ][GEO_MAX_NUM_UNI_CANDS]; // Note: sizeof(uint16_t) should not be less than GEO_MAX_NUM_UNI_CANDS
-  uint8_t  m_gpmacsSplitModeTmSel      [GEO_ENC_MMVD_MAX_REFINE_NUM_ADJ][GEO_ENC_MMVD_MAX_REFINE_NUM_ADJ][GEO_MAX_NUM_UNI_CANDS][GEO_MAX_NUM_UNI_CANDS][GEO_NUM_PARTITION_MODE];
+  using GpmSplitModeTmSelBlock = uint8_t[GEO_MAX_NUM_UNI_CANDS][GEO_MAX_NUM_UNI_CANDS][GEO_NUM_PARTITION_MODE];
   uint32_t m_gpmPartTplCost            [GEO_ENC_MMVD_MAX_REFINE_NUM_ADJ][GEO_MAX_NUM_UNI_CANDS][2][GEO_NUM_PARTITION_MODE]; // [][][0][]: partition 0, [][][1][]: partition 1
 #endif
+  // memory: the split mode table of an MMVD index pair is read only in the CU that wrote it (initGeoAngleSelection), so
+  // a pair takes a block from a pool, reused from CU to CU, when the CU first uses it (gpmSelAvailRow). A CU used at
+  // most ~500 pairs in the tests; the table of all pairs was 250 MB.
+  GpmSplitModeTmSelBlock* m_gpmacsSplitModeTmSel[GEO_ENC_MMVD_MAX_REFINE_NUM_ADJ][GEO_ENC_MMVD_MAX_REFINE_NUM_ADJ] = {};
+  std::vector<std::unique_ptr<GpmSplitModeTmSelBlock[]>> m_gpmSplitModeTmSelPool;
+  size_t   m_gpmSplitModeTmSelPoolUsed = 0;
+  GpmSplitModeTmSelBlock& gpmSplitModeTmSel( int idx0, int idx1 ) { return *m_gpmacsSplitModeTmSel[idx0][idx1]; }
   // perf: initGeoAngleSelection used to clear both tables (1.6 MB) for every CU; now a row is cleared when it is first
   // used after initGeoAngleSelection (generation stamp per row), which gives the same values for every row read
   uint32_t m_gpmRowGen = 0;
@@ -1405,6 +1468,11 @@ public:
     {
       m_gpmSelAvailGen[idx0][idx1] = m_gpmRowGen;
       memset( m_gpmacsSplitModeTmSelAvail[idx0][idx1], 0, sizeof( m_gpmacsSplitModeTmSelAvail[idx0][idx1] ) );
+      if( m_gpmSplitModeTmSelPoolUsed == m_gpmSplitModeTmSelPool.size() )
+      {
+        m_gpmSplitModeTmSelPool.emplace_back( new GpmSplitModeTmSelBlock[1] );
+      }
+      m_gpmacsSplitModeTmSel[idx0][idx1] = &m_gpmSplitModeTmSelPool[m_gpmSplitModeTmSelPoolUsed++][0];
     }
     return m_gpmacsSplitModeTmSelAvail[idx0][idx1];
   }

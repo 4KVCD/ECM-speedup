@@ -211,7 +211,7 @@ void EncSampleAdaptiveOffset::createEncData(bool isPreDBFSamplesUsed, uint32_t n
 #if JVET_Y0106_CCSAO_EDGE_CLASSIFIER
 #if JVET_AE0151_CCSAO_HISTORY_OFFSETS_AND_EXT_EO
   int numStatsEdge = m_numCTUsInPic * MAX_CCSAO_EDGE_DIR * MAX_CCSAO_EDGE_THR * MAX_CCSAO_BAND_IDC * MAX_NUM_COMPONENT * MAX_CCSAO_EDGE_IDC;
-  m_ccSaoStatDataEdgePre = new CcSaoStatData[numStatsEdge];
+  m_ccSaoStatDataEdgePre = new CcSaoCtuStatData[numStatsEdge];
 #else
   for (int comp = Y_C; comp < N_C; comp++)
   {
@@ -3023,9 +3023,9 @@ void EncSampleAdaptiveOffset::CCSAOProcess(CodingStructure& cs, const double* la
   if( cs.slice->isIDRorBLA() || cs.slice->getPendingRasInit() )
 #endif
   {
-    g_ccSaoPrvParam[COMPONENT_Y ].clear();
-    g_ccSaoPrvParam[COMPONENT_Cb].clear();
-    g_ccSaoPrvParam[COMPONENT_Cr].clear();
+    m_ccSaoPrvParam[COMPONENT_Y ].clear();
+    m_ccSaoPrvParam[COMPONENT_Cb].clear();
+    m_ccSaoPrvParam[COMPONENT_Cr].clear();
   }
 #endif
 
@@ -3323,9 +3323,9 @@ void EncSampleAdaptiveOffset::deriveCcSao( CodingStructure& cs, const ComponentI
 #if JVET_AE0151_CCSAO_HISTORY_OFFSETS_AND_EXT_EO
   if (!cs.slice->isIntra())
   {
-    for (int prvId = 0; prvId < g_ccSaoPrvParam[compID].size(); prvId++)
+    for (int prvId = 0; prvId < m_ccSaoPrvParam[compID].size(); prvId++)
     {
-      if (g_ccSaoPrvParam[compID][prvId].temporalId > cs.slice->getTLayer())
+      if (m_ccSaoPrvParam[compID][prvId].temporalId > cs.slice->getTLayer())
       {
         continue;
       }
@@ -3333,9 +3333,9 @@ void EncSampleAdaptiveOffset::deriveCcSao( CodingStructure& cs, const ComponentI
 #if JVET_AL0142_CCSAO_REUSE_CTU
       for (int reuseMode = CCSAO_REUSE_PARAM; reuseMode < NUM_CCSAO_REUSE_MODES; reuseMode++)
       {
-        setupTempCcSaoParamFromPrv(cs, compID, prvId, reuseMode, m_tempCcSaoParam, g_ccSaoPrvParam[compID][prvId], m_tempCcSaoControl);
+        setupTempCcSaoParamFromPrv(cs, compID, prvId, reuseMode, m_tempCcSaoParam, m_ccSaoPrvParam[compID][prvId], m_tempCcSaoControl);
 #else
-        setupTempCcSaoParamFromPrv(cs, compID, prvId,            m_tempCcSaoParam, g_ccSaoPrvParam[compID][prvId], m_tempCcSaoControl);
+        setupTempCcSaoParamFromPrv(cs, compID, prvId,            m_tempCcSaoParam, m_ccSaoPrvParam[compID][prvId], m_tempCcSaoControl);
 #endif
 
         getCcSaoStatistics    (cs, compID, orgYuv, srcYuv, dstYuv, m_ccSaoStatData,                             m_tempCcSaoParam);
@@ -3750,7 +3750,7 @@ void EncSampleAdaptiveOffset::getCcSaoStatistics(CodingStructure& cs, const Comp
 }
 #if JVET_Y0106_CCSAO_EDGE_CLASSIFIER
 #if JVET_AE0151_CCSAO_HISTORY_OFFSETS_AND_EXT_EO
-void EncSampleAdaptiveOffset::resetCcSaoEdgeStats(CcSaoStatData *blkStatsEdge)
+void EncSampleAdaptiveOffset::resetCcSaoEdgeStats(CcSaoCtuStatData *blkStatsEdge)
 {
   int numStatsEdge = m_numCTUsInPic * MAX_CCSAO_BAND_IDC * MAX_CCSAO_EDGE_DIR * MAX_CCSAO_EDGE_THR
                    * MAX_NUM_COMPONENT * MAX_CCSAO_EDGE_IDC;
@@ -3785,7 +3785,7 @@ void EncSampleAdaptiveOffset::resetblkStatsEdgePre(CcSaoStatData *blkStatsEdge[M
 #if JVET_AE0151_CCSAO_HISTORY_OFFSETS_AND_EXT_EO
 void EncSampleAdaptiveOffset::prepareCcSaoEdgeStats(CodingStructure& cs, const ComponentID compID
                                                   , const CPelUnitBuf& orgYuv, const CPelUnitBuf& srcYuv, const CPelUnitBuf& dstYuv 
-                                                  , CcSaoStatData* blkStatsEdge, const CcSaoEncParam& ccSaoParam)
+                                                  , CcSaoCtuStatData* blkStatsEdge, const CcSaoEncParam& ccSaoParam)
 #else
 void EncSampleAdaptiveOffset::getCcSaoStatisticsEdgeNew(CodingStructure &cs, const CPelUnitBuf &orgYuv,
                                                         const CPelUnitBuf &srcYuv, const CPelUnitBuf &dstYuv,
@@ -3886,7 +3886,7 @@ void EncSampleAdaptiveOffset::getCcSaoStatisticsEdge(CodingStructure& cs, const 
                                                    , const CPelUnitBuf& orgYuv, const CPelUnitBuf& srcYuv, const CPelUnitBuf& dstYuv
                                                    , CcSaoStatData* blkStatsEdge[MAX_CCSAO_SET_NUM]
 #if JVET_AE0151_CCSAO_HISTORY_OFFSETS_AND_EXT_EO
-                                                   , CcSaoStatData* blkStatsEdgePre
+                                                   , CcSaoCtuStatData* blkStatsEdgePre
 #else
                                                    , CcSaoStatData* blkStatsEdgePre[MAX_CCSAO_SET_NUM - 1]
 #endif
@@ -4135,7 +4135,7 @@ struct CcSaoEdgeStatsAcc
   }
 
   // adds the histograms to the statistics (statIdx(bandIdc, edgeIdc, edgeThr) gives the statistics index) and clears them
-  template<class StatIdx> void flush( CcSaoStatData* stats, StatIdx statIdx )
+  template<class StatIdx> void flush( CcSaoCtuStatData* stats, StatIdx statIdx )
   {
     for( int idc = 0; idc < edgeIdcNum; idc++ )
     {
@@ -4150,7 +4150,7 @@ struct CcSaoEdgeStatsAcc
         const int nk  = numKeys[idc][cmp];
         for( int thr = 0; thr < MAX_CCSAO_EDGE_THR; thr++ )
         {
-          CcSaoStatData&  st = stats[statIdx( bandIdc, idc, thr )];
+          CcSaoCtuStatData& st = stats[statIdx( bandIdc, idc, thr )];
           const int64_t*  hd = diff.data() + histOff[idc][cmp] + thr * nk * edgeNum;
           const uint32_t* hc = count.data() + histOff[idc][cmp] + thr * nk * edgeNum;
           for( int k = 0; k < nk; k++ )
@@ -4161,7 +4161,7 @@ struct CcSaoEdgeStatsAcc
               if( hc[k * edgeNum + e] )
               {
                 CHECK( classOff + e >= MAX_CCSAO_CLASS_NUM, "Wrong CCSAO class" );
-                st.diff[classOff + e] += hd[k * edgeNum + e];
+                st.diff[classOff + e] += int32_t( hd[k * edgeNum + e] );   // one CTU's sum
                 st.count[classOff + e] += hc[k * edgeNum + e];
               }
             }
@@ -4178,7 +4178,7 @@ static thread_local CcSaoEdgeStatsAcc g_ccSaoEdgeAcc;
 
 #if JVET_AE0151_CCSAO_HISTORY_OFFSETS_AND_EXT_EO
 void EncSampleAdaptiveOffset::getCcSaoBlkStatsEdgePre(CodingStructure& cs, const ComponentID compID, const ChromaFormat chromaFormat, const int bitDepth
-                                                    , CcSaoStatData *blkStatsEdge, const int ctuRsAddr
+                                                    , CcSaoCtuStatData *blkStatsEdge, const int ctuRsAddr
 #else
 void EncSampleAdaptiveOffset::getCcSaoBlkStatsEdgeNew(const ComponentID compID, const ChromaFormat chromaFormat, const int bitDepth
                                                     , const int setIdx, CcSaoStatData *blkStatsEdge[N_C], const int ctuRsAddr
@@ -7152,9 +7152,9 @@ void EncSampleAdaptiveOffset::setupCcSaoPrv(CodingStructure &cs)
     if (m_ccSaoComParam.enabled[compIdx] && !m_ccSaoComParam.reusePrv[compIdx])
 #endif
     {
-      if (g_ccSaoPrvParam[compIdx].size() == MAX_CCSAO_PRV_NUM)
+      if (m_ccSaoPrvParam[compIdx].size() == MAX_CCSAO_PRV_NUM)
       {
-        g_ccSaoPrvParam[compIdx].pop_back();
+        m_ccSaoPrvParam[compIdx].pop_back();
       }
 
       CcSaoPrvParam prvParam;
@@ -7166,7 +7166,7 @@ void EncSampleAdaptiveOffset::setupCcSaoPrv(CodingStructure &cs)
       std::memcpy( prvParam.bandNum,    m_ccSaoComParam.bandNum   [compIdx], sizeof( prvParam.bandNum    ) );
       std::memcpy( prvParam.offset,     m_ccSaoComParam.offset    [compIdx], sizeof( prvParam.offset     ) );
 
-      g_ccSaoPrvParam[compIdx].insert(g_ccSaoPrvParam[compIdx].begin(), prvParam);
+      m_ccSaoPrvParam[compIdx].insert(m_ccSaoPrvParam[compIdx].begin(), prvParam);
     }
   }
 }

@@ -69,12 +69,12 @@ EncSlice::~EncSlice()
 void EncSlice::create( int iWidth, int iHeight, ChromaFormat chromaFormat, uint32_t iMaxCUWidth, uint32_t iMaxCUHeight, uint8_t uhTotalDepth )
 {
 #if JVET_AG0117_CABAC_SPATIAL_TUNING
-  int numBinBuffers = iWidth / iMaxCUWidth + 1;
-  
-  for ( int i = 0; i < numBinBuffers; i++ )
+  // a bin buffer per CTU column; EncGOP calls this per picture, the buffers of the earlier ones stay
+  const int numBinBuffers = iWidth / iMaxCUWidth + 1;
+  while( int( m_binVectors.size() ) < numBinBuffers )
   {
     m_binVectors.push_back( BinStoreVector() );
-    m_binVectors[i].reserve( CABAC_SPATIAL_MAX_BINS );
+    m_binVectors.back().reserve( CABAC_SPATIAL_MAX_BINS );
   }
 #endif
 }
@@ -90,25 +90,125 @@ void EncSlice::destroy()
 #endif
 }
 
-void EncSlice::init( EncLib* pcEncLib, const SPS& sps )
+void EncSlice::init( EncLib* pcEncLib, EncSearchStack& stack, const SPS& sps )
+{
+  xInit( pcEncLib, &stack.cuEncoder, &stack.interSearch, stack.cabacEncoder, &stack.trQuant, &stack.rdCost, &stack.reshaper,
+         sps );
+}
+
+void EncSlice::initFinish( EncLib* pcEncLib, CABACEncoder& cabacEncoder, RdCost& rdCost, EncReshape& reshaper,
+                           const SPS& sps )
+{
+  xInit( pcEncLib, nullptr, nullptr, cabacEncoder, nullptr, &rdCost, &reshaper, sps );
+}
+
+void EncSlice::initSetup( EncLib* pcEncLib, CABACEncoder& cabacEncoder, TrQuant& trQuant, RdCost& rdCost,
+                          EncReshape& reshaper, const SPS& sps, int searchRange )
+{
+  xInit( pcEncLib, nullptr, nullptr, cabacEncoder, &trQuant, &rdCost, &reshaper, sps );
+  for( int dir = 0; dir < MAX_NUM_REF_LIST_ADAPT_SR; dir++ )
+  {
+    for( int refIdx = 0; refIdx < MAX_IDX_ADAPT_SR; refIdx++ )
+    {
+      m_setupAdaptSR[dir][refIdx] = searchRange;   // as InterSearch::init
+    }
+  }
+}
+
+void EncSlice::xInit( EncLib* pcEncLib, EncCu* cuEncoder, InterSearch* interSearch, CABACEncoder& cabacEncoder,
+                      TrQuant* trQuant, RdCost* rdCost, EncReshape* reshaper, const SPS& sps )
 {
   m_pcCfg             = pcEncLib;
   m_pcLib             = pcEncLib;
   m_pcListPic         = pcEncLib->getListPic();
 
   m_pcGOPEncoder      = pcEncLib->getGOPEncoder();
-  m_pcCuEncoder       = pcEncLib->getCuEncoder();
-  m_pcInterSearch     = pcEncLib->getInterSearch();
-  m_CABACWriter       = pcEncLib->getCABACEncoder()->getCABACWriter   (&sps);
-  m_CABACEstimator    = pcEncLib->getCABACEncoder()->getCABACEstimator(&sps);
-  m_pcTrQuant         = pcEncLib->getTrQuant();
-  m_pcRdCost          = pcEncLib->getRdCost();
+  m_pcCuEncoder       = cuEncoder;
+  m_pcInterSearch     = interSearch;
+  m_CABACWriter       = cabacEncoder.getCABACWriter   (&sps);
+  m_CABACEstimator    = cabacEncoder.getCABACEstimator(&sps);
+  m_pcTrQuant         = trQuant;
+  m_pcRdCost          = rdCost;
+  m_pcReshaper        = reshaper;
+#if JVET_AG0098_AMVP_WITH_SBTMVP
+  m_CABACWriter->m_amvpSbTmvpEnabledArea = &m_picAmvpSbTmvpEnabledArea;
+#endif
 
   // create lambda and QP arrays
   m_vdRdPicLambda.resize(m_pcCfg->getDeltaQpRD() * 2 + 1 );
   m_vdRdPicQp.resize(    m_pcCfg->getDeltaQpRD() * 2 + 1 );
   m_viRdPicQp.resize(    m_pcCfg->getDeltaQpRD() * 2 + 1 );
   m_pcRateCtrl        = pcEncLib->getRateCtrl();
+}
+
+void EncSlice::saveSetup( EncSliceSetup& setup ) const
+{
+  setup.rdPicLambda     = m_vdRdPicLambda;
+  setup.rdPicQp         = m_vdRdPicQp;
+  setup.rdPicQpInt      = m_viRdPicQp;
+  setup.sliceSegmentIdx = m_uiSliceSegmentIdx;
+#if SHARP_LUMA_DELTA_QP || ENABLE_QPA_SUB_CTU
+  setup.gopId           = m_gopID;
+#endif
+#if ENABLE_QPA
+  setup.adaptedLumaQP   = m_adaptedLumaQP;
+#endif
+  setup.ibcHashInit     = m_ibcHashInit;
+  setup.rdCost          = *m_pcRdCost;
+#if RDOQ_CHROMA_LAMBDA
+  m_pcTrQuant->getLambdas( setup.trLambdas );
+#else
+  setup.trLambda        = m_pcTrQuant->getLambda();
+#endif
+  for( int dir = 0; dir < MAX_NUM_REF_LIST_ADAPT_SR; dir++ )
+  {
+    for( int refIdx = 0; refIdx < MAX_IDX_ADAPT_SR; refIdx++ )
+    {
+      setup.adaptSR[dir][refIdx] = m_pcInterSearch ? m_pcInterSearch->getAdaptiveSearchRange( dir, refIdx )
+                                                   : m_setupAdaptSR[dir][refIdx];
+    }
+  }
+  setup.reshaper        = *m_pcReshaper;
+}
+
+void EncSlice::loadSetup( const EncSliceSetup& setup, const Picture& pic )
+{
+  const SPS& sps = *pic.cs->sps;
+  const PPS& pps = *pic.cs->pps;
+  create( pps.getPicWidthInLumaSamples(), pps.getPicHeightInLumaSamples(), sps.getChromaFormatIdc(), sps.getMaxCUWidth(),
+          sps.getMaxCUHeight(), floorLog2( sps.getMaxCUWidth() ) - sps.getLog2MinCodingBlockSize() );
+  m_vdRdPicLambda     = setup.rdPicLambda;
+  m_vdRdPicQp         = setup.rdPicQp;
+  m_viRdPicQp         = setup.rdPicQpInt;
+  m_uiSliceSegmentIdx = setup.sliceSegmentIdx;
+#if SHARP_LUMA_DELTA_QP || ENABLE_QPA_SUB_CTU
+  m_gopID             = setup.gopId;
+#endif
+#if ENABLE_QPA
+  m_adaptedLumaQP     = setup.adaptedLumaQP;
+#endif
+  m_ibcHashInit       = setup.ibcHashInit;
+  *m_pcRdCost         = setup.rdCost;
+  // as setUpLambda
+  m_pcTrQuant->resetStore();
+#if RDOQ_CHROMA_LAMBDA
+  m_pcTrQuant->setLambdas( setup.trLambdas );
+#else
+  m_pcTrQuant->setLambda( setup.trLambda );
+#endif
+  for( int dir = 0; dir < MAX_NUM_REF_LIST_ADAPT_SR; dir++ )
+  {
+    for( int refIdx = 0; refIdx < MAX_IDX_ADAPT_SR; refIdx++ )
+    {
+      m_pcInterSearch->setAdaptiveSearchRange( dir, refIdx, setup.adaptSR[dir][refIdx] );
+    }
+  }
+  if( setup.ibcHashInit )
+  {
+    m_pcCuEncoder->getIbcHashMap().destroy();
+    m_pcCuEncoder->getIbcHashMap().init( pps.getPicWidthInLumaSamples(), pps.getPicHeightInLumaSamples() );
+  }
+  *m_pcReshaper       = setup.reshaper;
 }
 
 void
@@ -843,7 +943,8 @@ void EncSlice::initEncSlice(Picture* pcPic, const int pocLast, const int pocCurr
 
   rpcSlice->setDisableSATDForRD(false);
 
-  if( eSliceType == I_SLICE || ( m_pcCfg->getIBCHashSearch() && m_pcCfg->getIBCMode() ) || ( eSliceType != I_SLICE && m_pcCfg->getAllowDisFracMMVD() ) )
+  m_ibcHashInit = eSliceType == I_SLICE || ( m_pcCfg->getIBCHashSearch() && m_pcCfg->getIBCMode() ) || ( eSliceType != I_SLICE && m_pcCfg->getAllowDisFracMMVD() );
+  if( m_ibcHashInit && m_pcCuEncoder )   // the setup stack has none: the search stack's resets (loadSetup)
   {
     m_pcCuEncoder->getIbcHashMap().destroy();
     m_pcCuEncoder->getIbcHashMap().init( pcPic->cs->pps->getPicWidthInLumaSamples(), pcPic->cs->pps->getPicHeightInLumaSamples() );
@@ -851,9 +952,9 @@ void EncSlice::initEncSlice(Picture* pcPic, const int pocLast, const int pocCurr
 #if JVET_Z0118_GDR
   if (m_pcCfg->getGdrEnabled())
   {
-    int gdrPocStart = m_pcCuEncoder->getEncCfg()->getGdrPocStart();
-    int gdrPeriod = m_pcCuEncoder->getEncCfg()->getGdrPeriod();
-    int gdrInterval = m_pcCuEncoder->getEncCfg()->getGdrInterval();
+    int gdrPocStart = m_pcCfg->getGdrPocStart();
+    int gdrPeriod = m_pcCfg->getGdrPeriod();
+    int gdrInterval = m_pcCfg->getGdrInterval();
 
     int picWidth = rpcSlice->getPPS()->getPicWidthInLumaSamples();
 
@@ -1430,7 +1531,15 @@ void EncSlice::setSearchRange( Slice* pcSlice )
     {
       iRefPOC = pcSlice->getRefPic(e, iRefIdx)->getPOC();
       int newSearchRange = Clip3(m_pcCfg->getMinSearchWindow(), iMaxSR, (iMaxSR*ADAPT_SR_SCALE*abs(iCurrPOC - iRefPOC)+iOffset)/iGOPSize);
-      m_pcInterSearch->setAdaptiveSearchRange(iDir, iRefIdx, newSearchRange);
+      if( m_pcInterSearch )
+      {
+        m_pcInterSearch->setAdaptiveSearchRange(iDir, iRefIdx, newSearchRange);
+      }
+      else
+      {
+        CHECK( iDir >= MAX_NUM_REF_LIST_ADAPT_SR || iRefIdx >= int( MAX_IDX_ADAPT_SR ), "Invalid index" );
+        m_setupAdaptSR[iDir][iRefIdx] = newSearchRange;   // the setup stack (initSetup)
+      }
     }
   }
 }
@@ -1676,7 +1785,7 @@ void EncSlice::compressSlice( Picture* pcPic, const bool bCompressEntireSlice, c
     {
       pcSlice->setAmvpSbTmvpEnabledFlag(true);
 
-      g_picAmvpSbTmvpEnabledArea = 0;
+      m_picAmvpSbTmvpEnabledArea = 0;
       uint32_t prevEnabledArea;
       bool isExist = loadAmvpSbTmvpStatArea(pcSlice->getTLayer(), prevEnabledArea);
       if (isExist)
@@ -1805,11 +1914,11 @@ void EncSlice::compressSlice( Picture* pcPic, const bool bCompressEntireSlice, c
 #endif
   m_pcInterSearch->resetAffineMVList();
   m_pcInterSearch->resetUniMvList();
-  ::memset(g_isReusedUniMVsFilled, 0, sizeof(g_isReusedUniMVsFilled));
+  m_pcInterSearch->resetReusedUniMvs( false );
 #if INTER_LIC
   if (pcSlice->getUseLIC())
   {
-    ::memset(g_isReusedUniMVsFilledLIC, 0, sizeof(g_isReusedUniMVsFilledLIC));
+    m_pcInterSearch->resetReusedUniMvs( true );
   }
 #endif
   encodeCtus( pcPic, bCompressEntireSlice, bFastDeltaQP, m_pcLib );
@@ -1909,9 +2018,9 @@ void EncSlice::encodeCtus( Picture* pcPic, const bool bCompressEntireSlice, cons
 #if ENABLE_SPLIT_PARALLELISM
   const int       dataId          = 0;
 #endif
-  CABACWriter*    pCABACWriter    = pEncLib->getCABACEncoder( PARL_PARAM0( dataId ) )->getCABACEstimator( pcSlice->getSPS() );
-  TrQuant*        pTrQuant        = pEncLib->getTrQuant( PARL_PARAM0( dataId ) );
-  RdCost*         pRdCost         = pEncLib->getRdCost( PARL_PARAM0( dataId ) );
+  CABACWriter*    pCABACWriter    = m_CABACEstimator;   // the objects of this slice encoder's search stack
+  TrQuant*        pTrQuant        = m_pcTrQuant;
+  RdCost*         pRdCost         = m_pcRdCost;
   EncCfg*         pCfg            = pEncLib;
   RateCtrl*       pRateCtrl       = pEncLib->getRateCtrl();
   pRdCost->setLosslessRDCost(pcSlice->isLossless());
@@ -2387,7 +2496,7 @@ void EncSlice::encodeCtus( Picture* pcPic, const bool bCompressEntireSlice, cons
     if (pcSlice->getSPS()->getUseLmcs())
 #endif
     {
-      m_pcCuEncoder->setDecCuReshaperInEncCU(m_pcLib->getReshaper(), pcSlice->getSPS()->getChromaFormatIdc());
+      m_pcCuEncoder->setDecCuReshaperInEncCU(m_pcReshaper, pcSlice->getSPS()->getChromaFormatIdc());
 
 #if ENABLE_SPLIT_PARALLELISM
       for (int jId = 1; jId < m_pcLib->getNumCuEncStacks(); jId++)
@@ -2583,7 +2692,7 @@ void EncSlice::encodeSlice   ( Picture* pcPic, OutputBitstream* pcSubstreams, ui
   uint32_t uiSubStrm = 0;
 
 #if JVET_Z0135_TEMP_CABAC_WIN_WEIGHT
-  static Ctx storedCtx;
+  static thread_local Ctx storedCtx;   // set and used within the call (slice writings may run at the same time)
 #endif
   // for every CTU in the slice...
   for( uint32_t ctuIdx = 0; ctuIdx < pcSlice->getNumCtuInSlice(); ctuIdx++ )
@@ -2726,7 +2835,7 @@ void EncSlice::encodeSlice   ( Picture* pcPic, OutputBitstream* pcSubstreams, ui
 #if JVET_AG0098_AMVP_WITH_SBTMVP
   if (!pcSlice->isIntra())
   {
-    storeAmvpSbTmvpStatArea(pcSlice->getTLayer(), g_picAmvpSbTmvpEnabledArea);
+    storeAmvpSbTmvpStatArea(pcSlice->getTLayer(), m_picAmvpSbTmvpEnabledArea);
   }
 #endif
 }

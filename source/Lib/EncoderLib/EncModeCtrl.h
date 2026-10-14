@@ -1429,6 +1429,7 @@ struct CodedCUInfo
 #if JVET_AB0092_GLM_WITH_LUMA
   bool     skipGLM;
 #endif
+  uint32_t generation;   ///< CacheBlkInfoCtrl: the CTU (init) the entry was cleared for
 };
 
 class CacheBlkInfoCtrl
@@ -1468,6 +1469,11 @@ protected:
 public:
 #endif
   CodedCUInfo& getBlkInfo( const UnitArea& area );
+  /// the entry of a block, made at its first use and cleared at its first use after each CTU start (init): a stack uses
+  /// about 4 000 of the 150 000 position-size combinations, and clearing all of them per CTU is a 32 MB fill
+  CodedCUInfo&       xEntry( unsigned idx1, unsigned idx2, unsigned idx3, unsigned idx4 );
+  const CodedCUInfo& xEntry( unsigned idx1, unsigned idx2, unsigned idx3, unsigned idx4 ) const;
+  uint32_t           m_generation = 1;   ///< counts the CTU starts (init); 0 marks no entry
 #if JVET_AI0136_ADAPTIVE_DUAL_TREE
   CodedCUInfo* getBlkInfoPtr(const UnitArea& area);
 #endif
@@ -1491,12 +1497,21 @@ public:
 };
 
 #if REUSE_CU_RESULTS
+// the best-encoding cache makes a slot, with its TU buffers, at the slot's first store (the configuration this
+// repository builds)
+#define BEST_ENC_INFO_LAZY_SLOTS ( CONVERT_NUM_TU_SPLITS_TO_CFG && SIGN_PREDICTION && JVET_Y0141_SIGN_PRED_IMPROVE \
+                                   && JVET_AI0136_ADAPTIVE_DUAL_TREE )
+
 struct BestEncodingInfo
 {
   CodingUnit     cu;
   PredictionUnit pu;
 #if CONVERT_NUM_TU_SPLITS_TO_CFG
   std::vector<TransformUnit> tus;
+#if BEST_ENC_INFO_LAZY_SLOTS
+  /// the TUs' coefficient, sign, PCM and run-type buffers (BestEncInfoCache::xCreateTuBuffers)
+  std::unique_ptr<uint8_t[]> tuStorage;
+#endif
 #elif REUSE_CU_RESULTS_WITH_MULTIPLE_TUS
   TransformUnit  tus[MAX_NUM_TUS];
   size_t         numTus;
@@ -1561,6 +1576,15 @@ protected:
   void create   ( const ChromaFormat chFmt );
 #endif
   void destroy  ();
+#if BEST_ENC_INFO_LAZY_SLOTS
+private:
+  bool xIsSlot( unsigned y, int hIdx ) const;   ///< a slot exists for this height at row y (create made its width's array)
+  void xCreateSlot( BestEncodingInfo*& slot, int width, int height );
+  void xCreateTuBuffers( BestEncodingInfo& encInfo );
+  ChromaFormat m_chFmt  = CHROMA_420;
+  bool         m_usePLT = false;   ///< palette mode: the TUs get run-type buffers
+protected:
+#endif
 
   bool setFromCs( const CodingStructure& cs, const Partitioner& partitioner );
   bool isValid  ( const CodingStructure &cs, const Partitioner &partitioner, int qp );

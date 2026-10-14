@@ -317,7 +317,7 @@ public:
   std::vector<BMSubBlkInfo> m_bmSubBlkList;
 #endif
 #if JVET_AH0119_SUBBLOCK_TM
-  MotionInfo           m_sbMiBuf[3][(MAX_CU_SIZE * MAX_CU_SIZE) >> (MIN_CU_LOG2 << 1)];
+  CtuMotionBufs<3>     m_sbMiBuf;   // sized in init()
 #endif
 protected:
   InterpolationFilter  m_if;
@@ -1951,6 +1951,39 @@ private:
   int m_modeGetCheck[2];
 public:
   void setDIMDForOBMC                  (bool b) { m_dimdForOBMCFilled = b; }
+  /// CuThreads helpers: the OBMC state of the current CU (neighbour checks and DIMD modes), from another prediction.
+  void copyObmcCuStateFrom( const InterPrediction& other )
+  {
+    m_dimdForOBMCFilled = other.m_dimdForOBMCFilled;
+    std::memcpy( m_modeBuf, other.m_modeBuf, sizeof( m_modeBuf ) );
+    std::memcpy( m_modeGetCheck, other.m_modeGetCheck, sizeof( m_modeGetCheck ) );
+#if JVET_AK0076_EXTENDED_OBMC_IBC && !JVET_AK0212_GPM_OBMC_MODIFICATION
+    m_intraObmcPred = other.m_intraObmcPred;
+#endif
+    CHECK( other.m_obmcLoadMode, "OBMC load mode in a helper's candidate" );
+    m_obmcLoadMode     = other.m_obmcLoadMode;
+    m_nbIsSCC          = other.m_nbIsSCC;
+    m_neighbSccChecked = other.m_neighbSccChecked;
+#if JVET_AD0213_LIC_IMP
+    // the CU's LIC templates, kept by the first use (with the shifts of that use)
+    std::memcpy( m_fillLicTpl, other.m_fillLicTpl, sizeof( m_fillLicTpl ) );
+    std::memcpy( m_numTemplate, other.m_numTemplate, sizeof( m_numTemplate ) );
+    for( int c = 0; c < MAX_NUM_COMPONENT; c++ )
+    {
+      if( m_fillLicTpl[c] )
+      {
+        std::memcpy( m_pcLICRecLeftTemplate[c], other.m_pcLICRecLeftTemplate[c], MAX_CU_SIZE * sizeof( Pel ) );
+        std::memcpy( m_pcLICRecAboveTemplate[c], other.m_pcLICRecAboveTemplate[c], MAX_CU_SIZE * sizeof( Pel ) );
+      }
+    }
+#endif
+    m_intraObmcReload  = other.m_intraObmcReload;   // the neighbours' intra predictions of the CU, kept by the first use
+    if( m_intraObmcReload )
+    {
+      m_tmpNbIntraObmcBufL.copyFrom( other.m_tmpNbIntraObmcBufL );
+      m_tmpNbIntraObmcBufA.copyFrom( other.m_tmpNbIntraObmcBufA );
+    }
+  }
   void setModeGetCheck                 (int i, bool b) { m_modeGetCheck[i] = b; }
   void setClearModeBuf                 (int i) { memset(m_modeBuf[i], -1, sizeof(int) * (MAX_CU_SIZE >> MIN_CU_LOG2)); }
 #if JVET_AK0076_EXTENDED_OBMC_IBC && !JVET_AK0212_GPM_OBMC_MODIFICATION

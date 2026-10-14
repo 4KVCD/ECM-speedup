@@ -49,6 +49,7 @@
 #include "Hash.h"
 #include "MCTS.h"
 #include <deque>
+#include <memory>
 
 #if NN_LF_UNIFIED
 #include "CommonLib/NNFilterUnified.h"
@@ -120,6 +121,34 @@ void create(
 
   void createTempBuffers( const unsigned _maxCUSize, bool useFilterFrame, bool resChange, bool decoder );
   void destroyTempBuffers();
+  /// the true original alone, as createTempBuffers makes it (which then leaves it): with frame threads, the encoder's
+  /// setup makes only this one, and only for a picture whose original the temporal filter changes
+  void createTrueOrigBuf( const unsigned _maxCUSize );
+  /// frame threads: a picture that waits for its search holds neither its reconstruction nor its coding structure's
+  /// per-4x4 arrays (EncLib::encodePrep releases them, EncGOP::xStartPicSearch creates them)
+  void releaseSearchBuffers();
+  void createSearchBuffers();
+  /// frame threads: a finished picture frees its original, true original and search buffers once nothing reads it any
+  /// more (releaseUnreadBufs, EncLib::releaseUnreadPics; the setups of later pictures read a reference's original for
+  /// the picture-level LIC decision); the original is made again when the buffer takes the next picture, the search
+  /// buffers at the search start
+  void releaseUnreadBufs();
+  bool origReleased       = false;   ///< releaseUnreadBufs, until EncLib::encodePrep makes the original again
+  bool unreadBufsReleased = false;   ///< releaseUnreadBufs, until the search start makes the buffers again
+  /// frame threads: while a picture waits for its search, its original and true original are kept in 8 bits per
+  /// sample where that is lossless (every sample a multiple of 1 << (bit depth - 8) and below 256 << it, as an 8-bit
+  /// source read into a higher internal bit depth gives); unpackWaitingBufs restores them
+  void packWaitingBufs( const BitDepths& bitDepths );
+  void unpackWaitingBufs();
+  /// frame threads: a picture whose original is the input frame as read holds no original while it waits for its
+  /// search; the search start reads the frame again (EncTemporalFilter::readFrame into recreateOrigBuf)
+  void        dropWaitingOrig( const BitDepths& bitDepths );   // (the bit depths: for ORIG_RELOAD_CHECK)
+  PelStorage& recreateOrigBuf();
+#if ORIG_RELOAD_CHECK
+  void        checkReloadedOrig();   ///< compares the original read again with the dropped one
+#endif
+  int         inputFrameIndex = -1;    ///< the picture's frame in the input file (EncLib::encodePrep), -1 if unknown
+  bool        origDropped     = false; ///< dropWaitingOrig, until recreateOrigBuf
 
          PelBuf     getOrigBuf(const CompArea &blk);
   const CPelBuf     getOrigBuf(const CompArea &blk) const;
@@ -381,8 +410,9 @@ public:
   XUCache*           unitCache = nullptr;   ///< CU / PU / TU cache of cs, owned (null: g_globalUnitCache); the decoder gives each
                                             ///< picture its own, pictures being decoded in parallel threads
 
-  uint32_t           getPicWidthInLumaSamples() const                                { return  getRecoBuf( COMPONENT_Y ).width; }
-  uint32_t           getPicHeightInLumaSamples() const                               { return  getRecoBuf( COMPONENT_Y ).height; }
+  // the picture's area, the reconstruction's size (which a picture that waits for its search may not have yet)
+  uint32_t           getPicWidthInLumaSamples() const                                { return  lumaSize().width; }
+  uint32_t           getPicHeightInLumaSamples() const                               { return  lumaSize().height; }
   Window&            getConformanceWindow()                                          { return  m_conformanceWindow; }
   const Window&      getConformanceWindow() const                                    { return  m_conformanceWindow; }
   Window&            getScalingWindow()                                              { return  m_scalingWindow; }
@@ -412,9 +442,23 @@ public:
   MCTSInfo     mctsInfo;
   std::vector<AQpLayer*> aqlayer;
 
+private:
+  struct PackedBuf
+  {
+    PictureType                type;
+    int                        shift[MAX_NUM_CHANNEL_TYPE];   ///< sample = packed << shift
+    std::unique_ptr<uint8_t[]> samples;                       ///< the components one after the other, row by row
+  };
+  bool                   xPackBuf( PictureType type, const BitDepths& bitDepths );
+  std::vector<PackedBuf> m_packedBufs;   ///< packWaitingBufs
+
 #if !KEEP_PRED_AND_RESI_SIGNALS
 private:
   UnitArea m_ctuArea;
+  // how create() made the reconstruction, for createSearchBuffers
+  unsigned m_maxCUSizeReco    = 0;
+  int      m_numRecoBufs      = 1;
+  bool     m_useWrapAroundBuf = false;
 #endif
 #if JVET_AK0085_TM_BOUNDARY_PADDING
   bool m_useTMBP;

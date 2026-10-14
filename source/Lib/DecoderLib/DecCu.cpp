@@ -880,7 +880,7 @@ void DecCu::decompressCtu( CodingStructure& cs, const UnitArea& ctuArea )
           {
             for (int i = 0; i <= EXT_VDIA_IDX; i++)
             {
-              g_intraModeCost[i] = MAX_UINT64;
+              m_pcIntraPred->m_intraModeCost[i] = MAX_UINT64;
             }
           }
 #endif

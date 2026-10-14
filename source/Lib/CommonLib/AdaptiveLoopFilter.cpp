@@ -36,6 +36,8 @@
 */
 
 #include "AdaptiveLoopFilter.h"
+
+#include <mutex>
 #if ALF_IMPROVEMENT
 #include "AlfFixedFilters.h"
 #endif
@@ -3330,8 +3332,9 @@ void  AdaptiveLoopFilter::resetAlfScalePrev( Slice& slice )
   {
     return;
   }
-  static  bool  irapResetToBeDone = true;
-  static  int   pocLastIRAP       = 0;
+  // per filter object: with frame threads, each intra period in flight has an ALF encoder of its own
+  bool& irapResetToBeDone = m_alfScaleIrapResetToBeDone;
+  int&  pocLastIRAP       = m_alfScalePocLastIrap;
 
   if ( slice.getSliceType() == I_SLICE )
   {
@@ -10702,6 +10705,8 @@ void AdaptiveLoopFilter::choleskySolveLanes(cholesky_float_t* mat, const cholesk
 #if JVET_AK0123_ALF_COEFF_RESTRICTION
 
 std::map<ALFCoeffRestriction::InputParam, ALFCoeffRestriction::Param> ALFCoeffRestriction::m_cache;
+static std::mutex s_alfCoeffCacheMutex;     // the caches fill on first use; filter encoders may run at the same time
+static std::mutex s_alfHuffmanCacheMutex;
 
 void ALFCoeffRestriction::build()
 {
@@ -10772,6 +10777,7 @@ ALFCoeffRestriction::ALFCoeffRestriction(int bitWidth, int mantissa) : m_inputPa
 
 void ALFCoeffRestriction::init()
 {
+  std::lock_guard<std::mutex> lock( s_alfCoeffCacheMutex );
   m_param = &m_cache[m_inputParam];
   if (m_param->idxToCoeff.empty())
   {
@@ -10872,6 +10878,7 @@ HuffmanForALF::HuffmanForALF(bool isLuma, int bitWidth, int mantissa, int coeffG
 void HuffmanForALF::init()
 {
   m_coeff.init();
+  std::lock_guard<std::mutex> lock( s_alfHuffmanCacheMutex );
   m_param = &m_cache[m_inputParam];
   if (!m_param->root)
   {

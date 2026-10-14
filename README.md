@@ -1,24 +1,27 @@
 # ECM-speedup
 
-**The same bitstream, 1.5× faster on one core and up to 17× on twenty.**
+**The same bitstream, 1.5× faster on one core and 10–16× on twenty, with no options.**
 
 ECM-speedup is the ECM-20.0 reference software with a faster encoder and decoder. Every change keeps the output
 byte-for-byte identical to stock ECM-20.0: after each change, the md5 of the test bitstreams is compared with the stock
-encoder's, and the decoder's output pictures with the stock decoder's.
+encoder's, and the decoder's output pictures with the stock decoder's. By default one encode now runs on every core:
+it encodes several pictures at the same time, as far as the machine's memory holds them.
 
 | encoder | bitstream md5 | time | run on |
 |---|---|---:|---|
 | stock ECM-20.0 | `3072c03937f193a5ef4e467d5345773b` | 2647.9 s | 1 core |
 | ECM-speedup | `3072c03937f193a5ef4e467d5345773b` | 1842.8 s | 1 core |
 | ECM-speedup | `3072c03937f193a5ef4e467d5345773b` | 451.6 s | 8 processes |
+| ECM-speedup | `3072c03937f193a5ef4e467d5345773b` | 267.4 s | 20 cores, one encode, no options |
 
 *ra_long: foreman 128×128, 257 frames, random access, QP 32, intra period 32. Wall-clock time on a Core Ultra 7 265K.*
 
 | | speedup | how it was measured |
 |---|---:|---|
 | Encoder, one core | **1.51×** | CPU time over the 5 test encodes (all-intra, random access, low delay), paired runs |
-| Encoder, 20 processes | **17.0×** | all-intra, 33 pictures: 311.2 s on one stock core, 18.4 s with `--ParallelSegments=20` |
-| Encoder, 8 processes | **5.9×** | random access, 257 frames in 8 intra periods: 2647.9 s down to 451.6 s |
+| Encoder, 20 cores, no options | **9.9×** | random access, 257 frames: 2647.9 s on one stock core, 267.4 s |
+| Encoder, 20 cores, no options | **16.5×** | all-intra, 33 pictures: 311.2 s on one stock core, 18.9 s |
+| Encoder, 20 processes | **17.0×** | all-intra, 33 pictures with `--ParallelSegments=20`: 18.4 s |
 | Decoder, one core | **1.22×** | random access, 352×288, 289 frames; 1.19–1.30× on three other streams |
 
 ## Results
@@ -63,6 +66,27 @@ Low-delay sequences have no such split points and stay on one core.
 ra_long has 8 intra periods, so 8 processes is its maximum. In all-intra mode the most expensive pictures now start
 first, ranked by the luma detail of the input pictures; that alone made the 20-process run 1.34× faster (24.6 s to
 18.4 s).
+
+### Many cores in one encode: frame threads, the default
+
+Without options the encoder runs a frame thread per logical processor, at most one per picture and fewer if 70 % of
+the physical memory does not hold them. A picture's search starts as soon as its reference pictures are final; the
+loop filters and slice writing of an intra period run in coding order, and several intra periods run side by side,
+each with its own filter encoders. Bitstream, reconstruction and log equal a single-thread encode. This needs no
+splitting of the sequence, so random access uses all 20 cores where `--ParallelSegments` stopped at 8.
+
+| test | stock, 1 core | ECM-speedup, 1 core | ECM-speedup, no options | vs stock |
+|---|---:|---:|---:|---:|
+| ai_long · 33 pictures, all-intra | 311.2 s | 210.7 s | 18.9 s | 16.5× |
+| ra_long · 257 frames, random access | 2647.9 s | 1842.8 s | 267.4 s | 9.9× |
+
+Within one intra period, random access gains about 1.4×: ECM's temporal CABAC store chains each picture to the
+previous one of its temporal layer. The gain comes from running intra periods side by side, so long sequences gain
+most (65 frames: 2.75×, 129 frames: 4.19×, 257 frames: 6.77× over one thread). Low delay stays on one core.
+
+Memory with 20 threads, peak: 6.3–8.4 GB for these 128×128 tests; 1080p random access 16–23 GB over the first
+20 minutes; 2160p with the class A configuration (CTU 256) 28 GB over the first 40 minutes, where a 64 GB machine
+runs 20 threads and 4 intra periods at a time.
 
 ### Decoder: the faster prediction and transform code is shared
 
@@ -131,6 +155,16 @@ commit messages have the details.
 - ALF class merging with compact statistics and batched solves (+0.7 %; +0.8 %)
 - CC-ALF and CCSAO statistics reused for unchanged inputs (+1.5 %)
 
+**Frame threads** (`--FrameThreads=N`, `--FramePeriods=M`, both automatic by default)
+- Each search thread has its own copy of the search state; a picture's setup and its loop filters and slice writing
+  run in coding order, its search in parallel once its references are final.
+- The CABAC, ALF, CCSAO and statistics state that ECM carries from picture to picture is handed over in coding order,
+  so every decision equals the sequential encode.
+- Memory: a waiting picture reads its original again from the input file; a picture frees its search caches when its
+  search ends and its buffers when nothing reads it any more; the reconstruction file is written as pictures finish.
+  The last of these steps took the 1080p peak with 20 threads from 19.5 to 16.4 GB (300 frames) and from 27.2 to
+  23.2 GB (600 frames).
+
 **Parallel encoding** (`--ParallelSegments=N`)
 - Random access: each intra period is encoded by its own process. When the parts are joined, the copy of the shared
   intra picture at each joint is dropped and POC LSBs are rebased, so the result equals one sequential encode.
@@ -161,18 +195,23 @@ across threads changes decisions, unless each thread does only a self-contained 
 template-matching scan, is 2 % of the time and gained nothing.
 
 Between pictures, ECM's temporal CABAC store links every picture of a temporal layer to the previous one, and a
-low-delay picture needs the previous picture after its loop filters. Encoding independent random-access pictures at the
-same time could still add 1.3–1.8× per intra period (critical-path analysis of ra_long). That is not built yet.
+low-delay picture needs the previous picture after its loop filters. Frame threads encode the random-access pictures
+that do not wait for each other at the same time, which gains about 1.4× within one intra period; more would need
+wavefront or tile parallelism, which changes the bitstream.
 
 ## Build and run
 
-The options and configuration files are those of ECM-20.0; `--ParallelSegments` is the one addition.
+The options and configuration files are those of ECM-20.0; `--FrameThreads`, `--FramePeriods` (both automatic by
+default) and `--ParallelSegments` are the additions.
 
 ```bash
 # release build with link-time optimization and code for the host CPU
 # (perf/pgo.ps1 shows the profile-guided build used for the measurements)
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON -DECM_MARCH=native
 cmake --build build -j --target EncoderApp DecoderApp
+
+# random access on every core: the encoder picks the threads and intra periods
+EncoderApp -c cfg/encoder_randomaccess_ecm.cfg -c cfg/per-class/classB_randomaccess.cfg -i in.yuv -wdt 1920 -hgt 1080 -fr 60 -f 600 -q 32 -b out.bin
 
 # random access, one process per intra period (here up to 8 at a time)
 EncoderApp -c cfg/encoder_randomaccess_ecm.cfg -i in.yuv -wdt 1920 -hgt 1080 -fr 60 -f 600 -q 32 -b out.bin --ParallelSegments=8
@@ -183,8 +222,10 @@ EncoderApp -c cfg/encoder_intra_ecm.cfg -i in.yuv -wdt 1920 -hgt 1080 -fr 60 -f 
 
 ## Measurement setup
 
-Measured in October 2026 on an Intel Core Ultra 7 265K (8 performance and 12 efficiency cores), Windows 11, GCC 16.2
-(WinLibs, UCRT), static builds. Stock is ECM-20.0 built with the same compiler; it needed two fixes to build with GCC 16.
+Measured in October 2026 on an Intel Core Ultra 7 265K (8 performance and 12 efficiency cores, 64 GB), Windows 11,
+GCC 16.2 (WinLibs, UCRT), static builds. The one-core times use the profile-guided build; the frame-thread times
+(no options) a link-time-optimized build of 42019fbf. Stock is ECM-20.0 built with the same compiler; it needed two
+fixes to build with GCC 16.
 Test clips are center crops of xiph.org derf sequences: foreman 352×288, 176×144 and 128×128, ParkJoy 256×256, at
 QP 27–37 with the JVET ECM test configurations. Upstream ECM:
 [vcgit.hhi.fraunhofer.de/ecm/ECM](https://vcgit.hhi.fraunhofer.de/ecm/ECM).

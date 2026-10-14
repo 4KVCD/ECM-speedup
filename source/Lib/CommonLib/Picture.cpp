@@ -36,6 +36,7 @@
  */
 
 #include "Picture.h"
+#include <atomic>
 #include "SEI.h"
 #include "ChromaFormat.h"
 #include "CommonLib/InterpolationFilter.h"
@@ -239,12 +240,15 @@ void Picture::create(
   margin            =  rprEnabled?(MAX_SCALING_RATIO*_margin):_margin;
   const Area a      = Area( Position(), size );
 
+  m_maxCUSizeReco    = _maxCUSize;
+  m_useWrapAroundBuf = useWrapAround;
 #if JVET_Z0118_GDR
   int numPt = (gdrEnabled) ? 2 : 1;
+  m_numRecoBufs = numPt;
   for (int i = 0; i < numPt; i++)
   {
     M_BUFS(0, PIC_RECONSTRUCTION_0 + i).create(_chromaFormat, a, _maxCUSize, margin, MEMORY_ALIGN_DEF_SIZE);
-  }  
+  }
 #else
   M_BUFS( 0, PIC_RECONSTRUCTION ).create( _chromaFormat, a, _maxCUSize, margin, MEMORY_ALIGN_DEF_SIZE );
 #endif
@@ -323,6 +327,191 @@ void Picture::destroy()
   }
 }
 
+void Picture::releaseSearchBuffers()
+{
+#if JVET_Z0118_GDR
+  for( int i = 0; i < m_numRecoBufs; i++ )
+  {
+    M_BUFS( 0, PIC_RECONSTRUCTION_0 + i ).destroy();
+  }
+#else
+  M_BUFS( 0, PIC_RECONSTRUCTION ).destroy();
+#endif
+  M_BUFS( 0, PIC_RECON_WRAP ).destroy();
+  cs->releasePicData();
+  cs->rebindPicBufs();   // drops the coding structure's view of the reconstruction
+}
+
+void Picture::releaseUnreadBufs()
+{
+  for( PictureType type: { PIC_ORIGINAL, PIC_TRUE_ORIGINAL, PIC_ORIGINAL_INPUT, PIC_TRUE_ORIGINAL_INPUT } )
+  {
+    if( !M_BUFS( 0, type ).bufs.empty() )
+    {
+      M_BUFS( 0, type ).destroy();
+    }
+  }
+  origReleased = true;
+  releaseSearchBuffers();
+  unreadBufsReleased = true;
+}
+
+void Picture::createSearchBuffers()
+{
+  unreadBufsReleased = false;
+  const Area a( Position(), lumaSize() );
+#if JVET_Z0118_GDR
+  for( int i = 0; i < m_numRecoBufs; i++ )
+  {
+    M_BUFS( 0, PIC_RECONSTRUCTION_0 + i ).create( chromaFormat, a, m_maxCUSizeReco, margin, MEMORY_ALIGN_DEF_SIZE );
+  }
+#else
+  M_BUFS( 0, PIC_RECONSTRUCTION ).create( chromaFormat, a, m_maxCUSizeReco, margin, MEMORY_ALIGN_DEF_SIZE );
+#endif
+  if( m_useWrapAroundBuf )
+  {
+    M_BUFS( 0, PIC_RECON_WRAP ).create( chromaFormat, a, m_maxCUSizeReco, margin, MEMORY_ALIGN_DEF_SIZE );
+  }
+  cs->createPicData();
+  cs->rebindPicBufs();
+}
+
+void Picture::packWaitingBufs( const BitDepths& bitDepths )
+{
+  xPackBuf( PIC_ORIGINAL, bitDepths );
+  xPackBuf( PIC_TRUE_ORIGINAL, bitDepths );
+}
+
+bool Picture::xPackBuf( PictureType type, const BitDepths& bitDepths )
+{
+  PelStorage& buf = M_BUFS( 0, type );
+  if( buf.bufs.empty() )
+  {
+    return false;
+  }
+  PackedBuf packed{ type, {}, nullptr };
+  size_t    numSamples = 0;
+  for( uint32_t c = 0; c < buf.bufs.size(); c++ )
+  {
+    const ChannelType ch    = toChannelType( ComponentID( c ) );
+    const int         shift = std::max( 0, bitDepths.recon[ch] - 8 );
+    packed.shift[ch]        = shift;
+    const PelBuf& b         = buf.bufs[c];
+    for( int y = 0; y < (int) b.height; y++ )
+    {
+      const Pel* row = b.bufAt( 0, y );
+      for( int x = 0; x < (int) b.width; x++ )
+      {
+        if( row[x] < 0 || ( row[x] & ( ( 1 << shift ) - 1 ) ) || ( row[x] >> shift ) > 255 )
+        {
+          return false;   // not lossless in 8 bits
+        }
+      }
+    }
+    numSamples += size_t( b.width ) * b.height;
+  }
+  packed.samples.reset( new uint8_t[numSamples] );
+  uint8_t* dst = packed.samples.get();
+  for( uint32_t c = 0; c < buf.bufs.size(); c++ )
+  {
+    const int     shift = packed.shift[toChannelType( ComponentID( c ) )];
+    const PelBuf& b     = buf.bufs[c];
+    for( int y = 0; y < (int) b.height; y++ )
+    {
+      const Pel* row = b.bufAt( 0, y );
+      for( int x = 0; x < (int) b.width; x++ )
+      {
+        *dst++ = uint8_t( row[x] >> shift );
+      }
+    }
+  }
+  buf.destroy();
+  m_packedBufs.push_back( std::move( packed ) );
+  return true;
+}
+
+void Picture::dropWaitingOrig( const BitDepths& bitDepths )
+{
+#if ORIG_RELOAD_CHECK
+  if( !xPackBuf( PIC_ORIGINAL, bitDepths ) )   // kept for checkReloadedOrig
+#else
+  (void) bitDepths;
+#endif
+  {
+    M_BUFS( 0, PIC_ORIGINAL ).destroy();
+  }
+  origDropped = true;
+}
+
+PelStorage& Picture::recreateOrigBuf()
+{
+  M_BUFS( 0, PIC_ORIGINAL ).create( chromaFormat, Area( Position(), lumaSize() ) );   // as create() makes it
+  origDropped = false;
+  return M_BUFS( 0, PIC_ORIGINAL );
+}
+
+#if ORIG_RELOAD_CHECK
+void Picture::checkReloadedOrig()
+{
+  if( m_packedBufs.empty() || m_packedBufs.front().type != PIC_ORIGINAL )
+  {
+    return;   // the dropped original was not lossless in 8 bits: nothing kept to compare with
+  }
+  PelStorage reloaded;   // a copy of the original read again; the dropped one is unpacked over it
+  reloaded.create( chromaFormat, Area( Position(), lumaSize() ) );
+  reloaded.copyFrom( M_BUFS( 0, PIC_ORIGINAL ) );
+  M_BUFS( 0, PIC_ORIGINAL ).destroy();
+  unpackWaitingBufs();
+  const PelStorage& dropped = M_BUFS( 0, PIC_ORIGINAL );
+  for( uint32_t c = 0; c < dropped.bufs.size(); c++ )
+  {
+    const PelBuf& a = dropped.bufs[c];
+    const PelBuf& b = reloaded.bufs[c];
+    for( int y = 0; y < (int) a.height; y++ )
+    {
+      CHECK( memcmp( a.bufAt( 0, y ), b.bufAt( 0, y ), a.width * sizeof( Pel ) ) != 0, "The original read again differs" );
+    }
+  }
+  reloaded.destroy();
+  static std::atomic<int> checked( 0 );
+  if( ++checked % 10 == 1 )
+  {
+    fprintf( stderr, "ORIG_RELOAD_CHECK: %d originals read again as dropped\n", checked.load() );
+  }
+}
+#endif
+
+void Picture::unpackWaitingBufs()
+{
+  for( PackedBuf& packed: m_packedBufs )
+  {
+    if( packed.type == PIC_ORIGINAL )
+    {
+      recreateOrigBuf();
+    }
+    else
+    {
+      createTrueOrigBuf( m_maxCUSizeReco );
+    }
+    PelStorage&    buf = M_BUFS( 0, packed.type );
+    const uint8_t* src = packed.samples.get();
+    for( uint32_t c = 0; c < buf.bufs.size(); c++ )
+    {
+      const int shift = packed.shift[toChannelType( ComponentID( c ) )];
+      PelBuf&   b     = buf.bufs[c];
+      for( int y = 0; y < (int) b.height; y++ )
+      {
+        Pel* row = b.bufAt( 0, y );
+        for( int x = 0; x < (int) b.width; x++ )
+        {
+          row[x] = Pel( *src++ ) << shift;
+        }
+      }
+    }
+  }
+  m_packedBufs.clear();
+}
+
 void Picture::createTempBuffers( const unsigned _maxCUSize, bool useFilterFrame, bool resChange, bool decoder)
 {
 #if KEEP_PRED_AND_RESI_SIGNALS
@@ -370,11 +559,14 @@ void Picture::createTempBuffers( const unsigned _maxCUSize, bool useFilterFrame,
 
     if (!decoder)
     {
+      if( M_BUFS( jId, PIC_TRUE_ORIGINAL ).bufs.empty() )   // createTrueOrigBuf may have made it
+      {
 #if JVET_AC0162_ALF_RESIDUAL_SAMPLES_INPUT && !KEEP_PRED_AND_RESI_SIGNALS
-      M_BUFS(jId, PIC_TRUE_ORIGINAL).create(chromaFormat, aOld, _maxCUSize);
+        M_BUFS(jId, PIC_TRUE_ORIGINAL).create(chromaFormat, aOld, _maxCUSize);
 #else
-      M_BUFS(jId, PIC_TRUE_ORIGINAL).create(chromaFormat, a, _maxCUSize);
+        M_BUFS(jId, PIC_TRUE_ORIGINAL).create(chromaFormat, a, _maxCUSize);
 #endif
+      }
       if (useFilterFrame)
       {
 #if JVET_AC0162_ALF_RESIDUAL_SAMPLES_INPUT && !KEEP_PRED_AND_RESI_SIGNALS
@@ -405,6 +597,16 @@ void Picture::createTempBuffers( const unsigned _maxCUSize, bool useFilterFrame,
   {
     cs->rebindPicBufs();
   }
+}
+
+void Picture::createTrueOrigBuf( const unsigned _maxCUSize )
+{
+#if KEEP_PRED_AND_RESI_SIGNALS || JVET_AC0162_ALF_RESIDUAL_SAMPLES_INPUT
+  const Area a( Position{ 0, 0 }, lumaSize() );
+#else
+  const Area a = m_ctuArea.Y();
+#endif
+  M_BUFS( 0, PIC_TRUE_ORIGINAL ).create( chromaFormat, a, _maxCUSize );
 }
 
 void Picture::destroyTempBuffers()

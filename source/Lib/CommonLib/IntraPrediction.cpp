@@ -14671,9 +14671,9 @@ void IntraPrediction::deriveMPMSorted(
       iMode = MAP67TO131(iMode);
     }
 #if JVET_AK0059_MDIP && !JVET_AK0061_PDP_MPM
-    if(g_intraModeCost[iMode] != MAX_UINT64)
+    if(m_intraModeCost[iMode] != MAX_UINT64)
     {
-      uiCost = g_intraModeCost[iMode];
+      uiCost = m_intraModeCost[iMode];
     }
     else
     {
@@ -14714,7 +14714,7 @@ void IntraPrediction::deriveMPMSorted(
     }
 #endif
 #if JVET_AJ0061_TIMD_MERGE && !JVET_AK0061_PDP_MPM
-    g_timdMrgCost[iMode] = uiCost;
+    m_timdMrgCost[iMode] = uiCost;
 #endif    
     if (uiCostList.size() < iBestN || (uiCostList.size() >= iBestN && uiCost < uiCostList.back()))
     {
@@ -14858,12 +14858,12 @@ void IntraPrediction::deriveMdipSorted(const PredictionUnit& pu, int* list, int&
     }
 
 #if !JVET_AK0061_PDP_MPM
-    g_intraModeCost[iMode] = uiCost;
+    m_intraModeCost[iMode] = uiCost;
 #else
     const bool isEncoder = pu.cu->cs->pcv->isEncoder;
     if (isEncoder)
     {
-      g_intraModeCost[iMode] = uiCost;
+      m_intraModeCost[iMode] = uiCost;
     }
 #endif
 
@@ -15337,14 +15337,14 @@ void IntraPrediction::calcTimdMrgCandCosts(
   auto getCost = [&](int mode)
   {
     uint64_t cost;
-    if (isEncoder && g_timdMrgCost[mode] != MAX_UINT64)
+    if (isEncoder && m_timdMrgCost[mode] != MAX_UINT64)
     {
-      cost = g_timdMrgCost[mode];
+      cost = m_timdMrgCost[mode];
     }
 #if JVET_AK0059_MDIP
-    else if (isEncoder && g_intraModeCost[mode] != MAX_UINT64)
+    else if (isEncoder && m_intraModeCost[mode] != MAX_UINT64)
     {
-      cost = g_intraModeCost[mode];
+      cost = m_intraModeCost[mode];
     }
 #endif
     else

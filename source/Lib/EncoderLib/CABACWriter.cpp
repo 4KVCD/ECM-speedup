@@ -48,9 +48,6 @@
 #include <limits>
 
 
-#if JVET_AI0136_ADAPTIVE_DUAL_TREE
-static Partitioner *g_encPartitionerSST=nullptr;
-#endif
 
 //! \ingroup EncoderLib
 //! \{
@@ -275,12 +272,6 @@ void CABACWriter::coding_tree_unit( CodingStructure& cs, const UnitArea& area, i
   DTRACE(g_trace_ctx, D_SYNTAX, "coding_tree_unit() pos=(%d,%d)\n", area.lx(), area.ly());
   CUCtx cuCtx( qps[CH_L] );
   QTBTPartitioner partitioner;
-#if JVET_AI0136_ADAPTIVE_DUAL_TREE
-  if (g_encPartitionerSST == nullptr)
-  {
-    g_encPartitionerSST = new QTBTPartitioner;
-  }
-#endif
 
   partitioner.initCtu(area, CH_L, *cs.slice);
 
@@ -317,7 +308,7 @@ void CABACWriter::coding_tree_unit( CodingStructure& cs, const UnitArea& area, i
                             ctuRsAddr, cs.slice->m_ccSaoControl[compIdx], lumaPos, setNum);
 #if JVET_AL0142_CCSAO_REUSE_CTU
         // Allocated ccSaoControl in setupCcSaoPrv, assigned here
-        g_ccSaoPrvParam[compIdx][0].ccSaoControl[ctuRsAddr] = cs.slice->m_ccSaoControl[compIdx][ctuRsAddr];
+        ( m_ccSaoPrvParam ? m_ccSaoPrvParam : g_ccSaoPrvParam )[compIdx][0].ccSaoControl[ctuRsAddr] = cs.slice->m_ccSaoControl[compIdx][ctuRsAddr];
 #endif
       }
     }
@@ -861,7 +852,7 @@ void CABACWriter::coding_tree(const CodingStructure& cs, Partitioner& partitione
 #if JVET_AI0136_ADAPTIVE_DUAL_TREE
   if ( cs.slice->getSeparateTreeEnabled() && (CU::isIntra( cu ) || cu.slice->isIntra()) && !cs.slice->getProcessingIntraRegion() && cu.isSST && cu.separateTree)
   {
-    Partitioner *partitionerSST = g_encPartitionerSST;
+    Partitioner *partitionerSST = m_partitionerSST;
 
     partitionerSST->copyState( partitioner );
     partitionerSST->chType = CH_L;
@@ -5079,7 +5070,7 @@ void CABACWriter::amvpSbTmvpFlag(const PredictionUnit& pu)
     }
     if (isEncoding())
     {
-      g_picAmvpSbTmvpEnabledArea += pu.lwidth() * pu.lheight();
+      *m_amvpSbTmvpEnabledArea += pu.lwidth() * pu.lheight();
     }
   }
 }
@@ -11816,17 +11807,6 @@ void CABACWriter::rribcData(const CodingUnit& cu)
 
 #if SIGN_PREDICTION
 #if JVET_Y0141_SIGN_PRED_IMPROVE
-struct SignCombInfo
-{
-  unsigned idx;
-  bool     sign;
-  bool     isSignPred;
-
-  SignCombInfo(const unsigned _sign, const unsigned _idx, const bool _isPred)
-    : idx(_idx), sign(_sign), isSignPred(_isPred)
-  {
-  }
-};
 
 bool compareOrderIdx(SignCombInfo cand0, SignCombInfo cand1)
 {
@@ -11891,9 +11871,8 @@ void CABACWriter::codePredictedSigns( TransformUnit &tu, ComponentID compID )
   }
   else
   {
-    // perf: reuse the buffer instead of growing a new vector on every call (single-threaded encoder)
-    static std::vector<SignCombInfo>           signCombListBuf;
-    std::vector<SignCombInfo>&                 signCombList = signCombListBuf;
+    // perf: reuse the buffer instead of growing a new vector on every call
+    std::vector<SignCombInfo>&                 signCombList = m_signCombList;
     signCombList.clear();
 #if JVET_AL0181_ASBT
     const bool lfnstEnabled = ((tu.checkLFNSTApplied(compID)) || ( (tu.asbtDecimH[compID] || tu.asbtDecimW[compID])
@@ -11966,8 +11945,8 @@ void CABACWriter::codePredictedSigns( TransformUnit &tu, ComponentID compID )
     // put at its index directly; the stable sort by index (std::stable_sort with a temporary buffer above 32
     // entries) is kept for any other set of indices
     {
-      static std::vector<SignCombInfo> placed;
-      static std::vector<uint8_t>      used;
+      std::vector<SignCombInfo>&       placed = m_signCombPlaced;
+      std::vector<uint8_t>&            used   = m_signCombUsed;
       const size_t                     n = signCombList.size();
       placed.assign(n, SignCombInfo(0, 0, false));
       used.assign(n, 0);

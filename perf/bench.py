@@ -5,6 +5,8 @@
   bench.py cmp  <base> <new>                                   compare md5s and times of two result sets
 
 A test passes when its bitstream md5 equals the reference ("ref") result.
+Encoders with frame threads pick their number from the CPUs they may run on (FrameThreads 0, the default): a run
+pinned to one CPU (--cpus) uses one thread, an unpinned run all CPUs (pass --extra "--FrameThreads=1" to keep one).
 """
 import argparse
 import concurrent.futures as cf
@@ -58,7 +60,8 @@ class CpuJob:
         self.k32.CreateJobObjectW.restype = ctypes.c_void_p
         self.job = self.k32.CreateJobObjectW(None, None)
 
-    def start(self, cmd, **kw):
+    def start(self, cmd, before_resume=None, **kw):
+        """before_resume(proc), e.g. pinning it: the encoder reads its affinity at start (automatic FrameThreads)"""
         import ctypes
         CREATE_SUSPENDED = 0x4
         proc = subprocess.Popen(cmd, creationflags=CREATE_SUSPENDED, **kw)
@@ -67,6 +70,8 @@ class CpuJob:
             proc.kill()
             proc.wait()
             raise OSError("could not put the encoder into a job object")
+        if before_resume:
+            before_resume(proc)
         ctypes.windll.ntdll.NtResumeProcess(ctypes.c_void_p(int(proc._handle)))
         return proc
 
@@ -126,9 +131,8 @@ def run_test(exe, outdir, name, more_args=(), fixed_core=None):
             if os.name == "nt":
                 job = CpuJob()
                 try:
-                    proc = job.start(cmd, stdout=lf, stderr=subprocess.STDOUT)
-                    if core is not None:
-                        pin(proc, core)
+                    proc = job.start(cmd, before_resume=(lambda p: pin(p, core)) if core is not None else None,
+                                     stdout=lf, stderr=subprocess.STDOUT)
                     proc.wait()
                     cpu = job.cpu_seconds()   # the encoder and all its child processes
                 finally:

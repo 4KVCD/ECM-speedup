@@ -728,6 +728,7 @@ bool g_mctsDecCheckEnabled = false;
 //! \{
 
 MsgLevel g_verbosity = VERBOSE;
+thread_local std::string* g_msgCapture = nullptr;
 #if SIGN_PREDICTION
 #if JVET_Y0141_SIGN_PRED_IMPROVE
 #if JVET_W0119_LFNST_EXTENSION || EXTENDED_LFNST
@@ -5582,10 +5583,6 @@ void initROM()
 
   initGeoTemplate();
 
-  ::memset( g_isReusedUniMVsFilled, 0, sizeof( g_isReusedUniMVsFilled ) );
-#if INTER_LIC
-  ::memset( g_isReusedUniMVsFilledLIC, 0, sizeof( g_isReusedUniMVsFilledLIC ) );
-#endif
 
   for( int qp = 0; qp < 57; qp++ )
   {
@@ -6328,17 +6325,6 @@ const uint32_t g_scalingListId[ SCALING_LIST_SIZE_NUM ][ SCALING_LIST_NUM ] =
   {  0,  0,  0,  0,  0,  0},  // SCALING_LIST_128x128
 };
 
-#if CTU_256
-Mv   g_reusedUniMVs[ MAX_CU_SIZE >> MIN_CU_LOG2 ][ MAX_CU_SIZE >> MIN_CU_LOG2 ][ MAX_CU_DEPTH + 1 ][ MAX_CU_DEPTH + 1 ][ 2 ][ 33 ];
-bool g_isReusedUniMVsFilled[ MAX_CU_SIZE >> MIN_CU_LOG2 ][ MAX_CU_SIZE >> MIN_CU_LOG2 ][ MAX_CU_DEPTH + 1 ][ MAX_CU_DEPTH + 1 ];
-#else
-Mv   g_reusedUniMVs[ 32 ][ 32 ][ 8 ][ 8 ][ 2 ][ 33 ];
-bool g_isReusedUniMVsFilled[ 32 ][ 32 ][ 8 ][ 8 ];
-#endif
-#if INTER_LIC
-Mv   g_reusedUniMVsLIC[ MAX_CU_SIZE >> MIN_CU_LOG2 ][ MAX_CU_SIZE >> MIN_CU_LOG2 ][ MAX_CU_DEPTH + 1 ][ MAX_CU_DEPTH + 1 ][ 2 ][ 33 ];
-bool g_isReusedUniMVsFilledLIC[ MAX_CU_SIZE >> MIN_CU_LOG2 ][ MAX_CU_SIZE >> MIN_CU_LOG2 ][ MAX_CU_DEPTH + 1 ][ MAX_CU_DEPTH + 1 ];
-#endif
 
 uint16_t g_paletteQuant[ 57 ];
 uint8_t g_paletteRunTopLut[ 5 ] = { 0, 1, 1, 2, 2 };
@@ -6864,17 +6850,12 @@ const int8_t g_ibcGpmSecondSetSplitDir[ GEO_NUM_PARTITION_MODE ] = {
 const int8_t g_amvpSbTmvp_mvd_dir[ 2 ][ 8 ] = { { 1, -1,  0,  0,  1, -1,  1, -1 },
                                             { 0,  0,  1, -1,  1, -1, -1,  1 } };
 const int8_t g_amvpSbTmvp_mvd_offset[ 6 ] = { 4, 8, 12, 16, 24, 32 };
-uint32_t g_picAmvpSbTmvpEnabledArea = 0;
 #endif
 
 #if JVET_AG0276_LIC_SLOPE_ADJUST
 const int g_licSlopeDeltaSet[ LIC_SLOPE_MAX_NUM_DELTA + 1 ] = { 0, 1, -1 };
 #endif
-#if JVET_AK0059_MDIP
-uint64_t g_intraModeCost[EXT_VDIA_IDX + 1];
-#endif
 #if JVET_AJ0061_TIMD_MERGE
-uint64_t g_timdMrgCost[ EXT_VDIA_IDX + 1 ];
 static constexpr std::array<std::array<PosType, TIMD_MERGE_MAX_NONADJACENT>, MAX_CU_DEPTH - MIN_CU_LOG2 + 1> timdMergeOffsetXTable()
 {
   std::array<std::array<PosType, TIMD_MERGE_MAX_NONADJACENT>, MAX_CU_DEPTH - MIN_CU_LOG2 + 1> tab{ {{0}} };

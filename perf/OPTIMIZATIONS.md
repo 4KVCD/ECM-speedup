@@ -4,7 +4,9 @@ Ground rules
 - **Bit-exact**: every step must reproduce the stock ECM-20.0 bitstreams byte for byte (md5 of the `.bin`).
 - *Step* = speed increase vs. the previous step, *cumulative* = vs. the stock baseline
   (`t_prev / t_new - 1`, `t_base / t_new - 1`).
-- Machine: i7-10700 (8C/16T), Windows 11, GCC 16.2 (WinLibs), static builds.
+- Machines: steps 1-43 on an i7-10700 (8C/16T), steps 44 and later on a Core Ultra 7 265K (8 performance and 12
+  efficiency cores, measured on the performance cores); Windows 11, GCC 16.2 (WinLibs), static builds.
+- Setup, workflow and what to try next: `perf/HANDOFF.md`.
 
 Measurement method
 - Build-level steps 1-3 were measured with `perf/bench.py run <name> --jobs 5` on an otherwise idle machine.
@@ -57,7 +59,9 @@ Benchmark suite (`perf/bench.py`)
 | - | GPM split-mode reordering sort: carry-swap loop instead of the backward copy that GCC turns into two memmove calls per insertion | yes | 1.00x - dropped (AI 1.03-1.04x although all-intra never runs GPM, i.e. layout noise; LD 0.95x) | |
 
 Direct paired measurement stock vs current (LTO, no PGO, steps 4-22): **1.17x** (every test 1.15-1.19x, wall and
-CPU, bit-exact); with step 23: ~1.19x. PGO (+~6 %) is re-applied at the end.
+CPU, bit-exact); with step 23: ~1.19x. PGO (+~6 %) is re-applied at the end. On the frame-thread branch (639de215)
+PGO gained nothing: paired against the LTO build, suite, 3 repetitions on P-core pairs, CPU time ratio 0.995x
+(per test 0.974-1.021x); the code steps since took its gain.
 
 Steps 15-18 were measured on builds without LTO (perf/build.ps1 did not enable it; it does now), both sides of each
 comparison built the same way; steps 19+ on LTO builds.
@@ -65,6 +69,96 @@ comparison built the same way; steps 19+ on LTO builds.
 Paired totals (both builds run each test at the same time):
 - code steps 4-12 on top of PGO: `pgo` -> `best`: **+5.8 %** (every test 1.05-1.07x)
 - stock -> `best` (LTO + PGO + code steps): **1.15x** (every test 1.13-1.17x, wall and CPU)
+
+### Steps 24-43 (i7-10700): dependent quantization and the loop-filter encoders
+
+Paired against the previous step on LTO builds; "CPU" is the 5-test CPU-time ratio. The DepQuant steps also give the
+cycles spent in `DepQuant::quant` (paired short encodes); their product is about 1.7x.
+
+| # | optimization | commit | step |
+|---|---|---|---|
+| 24 | DepQuant: trellis states point to the sig/gtx rate tables instead of copying them | ea22f995 | 1.00x |
+| 25 | DepQuant: one decision per state and trellis stage, skipped sub-blocks resolved in the backtracking | 7aa76060 | 1.00x |
+| 26 | DepQuant: per-TU rate setup reads the context models through the concrete CtxStore | b37ce617 | 1.01x (quant, steps 24-26: 1.06x) |
+| 27 | DepQuant: sub-block levels kept as one 16-byte vector, outside-template init shared per sub-block | 5a8aaadd | 1.02x (quant 1.19x) |
+| 28 | DepQuant: branch-free decision per trellis state | 2dfd1992 | 1.00x (quant 1.015x) |
+| 29 | DepQuant: trellis loop templated on the number of states, decision and update inlined | 2babb37f | 1.00x (quant 1.03x) |
+| 30 | DepQuant: trellis states as a structure of arrays, the 8 state updates of a sub-block together | 9121b57a | 1.01x (quant 1.14x) |
+| 31 | DepQuant: decision templated on the scan position type, branch-free context-coded level bits | 838e5d3a | 1.01x (quant 1.07x) |
+| 32 | DepQuant: sig/gtx/sub-block rate tables reused while their context models are unchanged | e374a08a | noise (quant 1.055x) |
+| 33 | ALF clipping-search results reused within a picture for bit-identical inputs | 405e9e95 | +0.5 % wall, CPU 1.00x |
+| 34 | ALF clipping search solves all trials of a pass at once in AVX2 lanes | 106f722e | +2.2 % wall, CPU 1.02x |
+| 35 | ALF class merging with compact bin-0 statistics and batched pair solves | 7df0b34e | +0.7 % wall, CPU 1.01x |
+| 36 | CC-ALF training reuses filter derivations and CTU distortions for identical inputs | eb87d76b | +0.6 % wall, CPU 1.01x |
+| 37 | ALF block statistics class by class with a register-tiled AVX2 kernel | 08d3d948 | +1.7 % wall, CPU 1.01x |
+| 38 | CCSAO edge statistics in compact per-pass histograms | 968fa098 | +0.2 % wall, CPU 1.00x |
+| 39 | ALF class merging solves singular pair systems with the regularized lanes solve | 030a9e81 | +0.8 % wall, CPU 1.01x |
+| 40 | CCSAO band statistics of unchanged sets not recomputed during the parameter search | 20106d8d | +0.7 % wall, CPU 1.01x |
+| 41 | ALF coefficient quantization searches use the gathered covariance of their clipping | 8a33ab0f | 1.00x |
+| 42 | ALF clipping search batches reuse the shared factorization prefix of kE | 6acabdee | CPU 1.01x |
+| 43 | covariance tile kernel keeps its 8 accumulators in registers | 53fee4e2 | +0.7 % wall, CPU 1.00x |
+
+### Steps 44-64 (Core Ultra 7 265K)
+
+Paired on LTO builds with `-DECM_MARCH=arrowlake`: `perf/bench.py ab A B --reps 4 --cpus 0,1,6,7,8,9`. Each pair of
+performance cores runs one test with both builds at the same time, and the cores are swapped every repetition. The
+step is the time-weighted median of the per-repetition CPU ratios. A/A noise: ±0.8 % per test, ±0.3 % total. Steps
+named with a `*_CHECK` macro were first run as a check build that compares the old and the new result on every call.
+
+| # | optimization | commit | step |
+|---|---|---|---|
+| 44 | build: `-march=arrowlake` (`ECM_MARCH`) | - | +3 % |
+| 45 | intra luma mode bits: the mode flags coded once per CU state and replayed (MODEBITS_CHECK) | 15b98db3, 611cf47b | +0.3 % (AI +1.2 %) |
+| 46 | GPM split-mode tables (1.6 MB per CU) cleared row by row on first use | b5a45457 | +1.0 % |
+| 47 | pixel-level affine MC: 1-2 wide sub-blocks filtered in one fused 12-tap 2-D call (AFFINE_NARROW_CHECK) | 6fcd5f57 | +2.4 % |
+| 48 | InterPrediction clips MVs with an inlined clipMvInPic instead of the clipMv function pointer | 63dc9b0e | +0.5 % |
+| 49 | SIMD inverse transforms skip zero coefficients | 9f898094 | +0.7 % |
+| 50 | intra mode lists copy ModeInfo as plain memory (defaulted assignment) | ca587554 | +0.5 % |
+| 51 | multi-hypothesis search orders its results through an index array | 6562da2e | +0.8 % |
+| 52 | GPM split-mode ranking counts ranks without branches (GEOSORT_CHECK) | 23e178b2 | +1.0 % |
+| 53 | sign prediction orders its coefficient lists without std::stable_sort (SIGNSORT_CHECK) | 8b280616 | +0.3 % |
+| 54 | DIMD gradient histograms find the angle index without a search loop (DIMDANG_CHECK) | e886603f | +0.7 % |
+| 55 | long-tap angular interpolation, 8 samples per step in SSE4.1 | 619216e4 | +0.3 % |
+| 56 | DIMD gradient histogram, 8 pixels per step in AVX2 | e56f1fb5 | +0.2 % |
+| 57 | PGO trained on FourPeople and CrowdRun (`perf/pgo.ps1`) | 8a81c706 | PGO +3.8 % |
+| 58 | DepQuant rate-table reuse checks the context block stamps first | b18ffb02 | +0.2 % |
+| 59 | CCCM: 7-tap model applied and statistics summed in AVX2 (CCCMAPPLY_CHECK) | 2b37bc4e | +0.4 % |
+| 60 | GPM and multi-hypothesis searches build only the buffer views they use | c17d52d7 | +0.5 % |
+| 61 | PDP intra prediction loads each output pair's coefficients with one AVX2 load (PDPOPT_CHECK) | a9bc3137 | +0.4 % |
+| 62 | CCCM model parameters in a fixed-capacity vector instead of std::vector | 404c0296 | +0.5 % |
+| 63 | intra TMP linear-filter prediction through the CCCM AVX2 helper | 7a9d0401 | +0.2 % (AI +0.8 %) |
+| 64 | GPM rank counts in 64-bit AVX2 lanes | 49fa654f | +0.5 % (LD +1.1 %) |
+
+bd1be75c gates the new SIMD paths like the stock SIMD code and fixes builds other than the default one; the default
+build does not change. The other commits on the 265K are tooling (`bench.py` pinning and pairing bcfcdc96) and
+documentation.
+
+End to end, stock -> 49fa654f + PGO, paired, 4 repetitions (the encoder code of b8e5f2ba is the same):
+
+| test | stock | ECM-speedup | wall | CPU (median ratio) |
+|---|---|---|---|---|
+| ai_foreman | 49.5 s | 34.7 s | 1.42x | 1.436x |
+| ai_parkjoy | 74.6 s | 52.0 s | 1.43x | 1.440x |
+| ld_foreman | 72.5 s | 45.2 s | 1.60x | 1.604x |
+| ra_foreman | 144.9 s | 95.4 s | 1.52x | 1.523x |
+| ra_parkjoy | 92.3 s | 60.0 s | 1.54x | 1.533x |
+| total | 433.8 s | 287.4 s | 1.51x | **1.512x** |
+
+Dropped on the 265K (paired, bit-exact unless noted):
+- mode-bits memo extended to TMP/MIP/TIMD/EIP/SGPM/TMRL modes (0.997x)
+- bypass-sign counting in codePredictedSigns (1.001x)
+- CCCM training-sample gather in AVX2 with compaction (1.000x)
+- sign-prediction cost loop in AVX2 (1.001x)
+- BDOF parameter sums via lane permutes (0.999x / 0.997x)
+- TMP joint SAD two rows per step (0.993x)
+- bilateral filter small blocks packed per AVX2 step (1.001x)
+- MC filter-section result cache, exact with 70 M hits checked (0.972x, RA foreman 0.937x)
+- xGetPredBlkTpl result cache (-3 %)
+- DepQuant result cache (10 % repeats)
+- TM-refinement cache (its key misses inputs: not exact)
+- AVX2 DepQuant decision, AVX2 inverse transform on top of the zero skip, GEO std::sort of packed keys, inlined
+  buffer accessors, a neighbour-availability shortcut (no gain)
+- `-fipa-pta` (0.994x), `-flto-partition=one` (1.002x), `-funroll-loops` (-2 %), `-O2` (-5 %)
 
 ## Segment-parallel encoding (`--ParallelSegments=N`)
 
@@ -88,13 +182,215 @@ RA parallel efficiency is ~60 % (1.15x single-thread x 8 workers would be 9.2x):
 lower all-core turbo, one duplicated intra frame per chunk, unequal chunk complexity. With intra period 32 a
 257-frame sequence has only 8 chunks, so hyperthreads cannot be used.
 
+On the Core Ultra 7 265K (PGO builds; every md5 equals the sequential stock encode):
+
+| test | stock, 1 core | ECM-speedup, 1 core | 8 workers | 20 workers |
+|---|---|---|---|---|
+| ai_long | 311.2 s | 210.7 s | 34.9 s (8.9x) | 18.4 s (17.0x) |
+| ra_long | 2647.9 s | 1842.8 s | 451.6 s (5.9x) | - (8 intra periods) |
+
+- Chunk order (f19e21c3): with more chunks than workers, chunks start in order of decreasing luma gradient activity
+  of their input pictures. For ai_long, that activity correlates 0.95 with the per-picture encoding time.
+  - ai_long, 20 workers: 24.6 -> 18.4 s (1.34x).
+  - ai_long, 8 workers: 37.1 -> 34.9 s (1.06x).
+- Dropped: workers pinned by core type, with performance cores taking the expensive end of the order and efficiency
+  cores the cheap end. It was slower (22.9 / 20.3 s): a chunk pinned to the efficiency cores cannot move to a
+  performance core that has gone idle.
+- An efficiency core runs this encoder at 0.76x of a performance core (ai_foreman pinned: 45.7 s vs 34.7 s).
+- Parallel work inside a picture:
+  - A thread pool for the intra TMP sparse search was bit-exact (149 K searches compared with the sequential scan)
+    but 0 % faster (ai_foreman 42.0 s with 1, 4 and 8 threads). The scan is about 2 % of the time, and busy-waiting
+    workers lower the main core's turbo.
+  - CTUs are serial: each mode search starts from the exact CABAC state and reconstruction of the previous CTU.
+- Frame-level parallelism inside an intra period is limited by the temporal CABAC store, which chains the pictures of
+  each temporal layer and QP, and by the per-layer AMVP-SbTMVP statistics. `perf/ra_critical_path.py` on the serial
+  ra_long log gives a bound of 1.27-1.80x per intra period. Low delay is fully serial.
+
+## Frame threads (`--FrameThreads=N`, `--FramePeriods=M`)
+
+- N = 0 (the default) picks N: a thread per logical processor the encoder may run on (its CPU affinity), at most one
+  per coded picture, as far as 70 % of the physical memory holds them with one period (the figures below); 1 for low
+  delay in one intra period, which gains nothing, and when a coding tool does not support frame threads (rate
+  control, field coding, the composite reference, hash motion estimation, PerceptQPA, DeltaQpRD, subpictures,
+  reference picture resampling, DecodeBitstream, more than one layer, GDR, BIM, the NN loop filter), where N > 1 is
+  an error. The workers of `--ParallelSegments` get N = 1 unless FrameThreads is given. The parameter list shows the
+  choice, e.g. `FrameThreads:20 (automatic) FramePeriods:16`.
+
+- The pictures run in threads of their own, at most N searching at a time. The setups take turns in coding order on
+  a setup stack of their own; a picture takes a search stack once the pictures it reads are done, the earliest such
+  picture first (in all intra, which reads no other picture, the one of the highest luma activity, as the chunks of
+  `--ParallelSegments`; while pictures are still being passed in, all-intra pictures take stacks only when the input
+  waits and every picture passed is set up, so the first ones start in that order too: AI 33 pictures with 20
+  threads 4.9 % and then 13 % faster (21.9 -> 19.0 s), with 8 threads 4.5 % and then as before), and gives it back
+  when its search ends: its finish uses its intra period's finish stack (`perf/HANDOFF_MULTITHREADING.md`, P1 and
+  P5). The GOPs overlap: the next GOPs are read and started while a GOP's pictures are in flight, and the
+  reconstructions are written in output order as they are done.
+- The finishes (loop filters, APSs, slice writing) of an intra period run in coding order. With M > 1 the finishes of
+  up to M intra periods run at the same time, each period with its own copy of the filter encoders and APSs, while the
+  log lines, access units and PSNR sums still go out in coding order. A period starts at a RAS-init intra picture
+  (the CRA of each intra period in RA, every picture in AI), whose finish resets what the filter encoders carry.
+- Output identical at every N and M: bitstream, reconstruction and log (except the [ET] times and the two counts in
+  the parameter list).
+- M = 0 (default) uses a period per frame thread, as far as the sequence has periods and 70 % of the physical memory
+  holds them by the figures below (RA with 20 threads on a 64 GB machine: 1080p up to 19 periods, 2160p with the
+  class A configuration 4), and min(N, 4) for all intra. It uses 1 for one long period (IntraPeriod -1, LD) and for the
+  options whose finishes share state between periods (buffering period, picture timing, decoding unit, frame-field,
+  frame packing, scalable nesting and DRAP SEIs, DeblockingFilterMetric, a scaling-list file, HDR metrics), which
+  M > 1 rejects.
+- AI pictures are independent, so AI scales with N, also onto the efficiency cores: 33 pictures unpinned on all 20
+  cores of the 265K took 27.1 s with N = 12, 25.8 s with 16 and 23.7 s with 20 (7.96x, 8.37x, 9.12x; 24.7 GB at 20).
+  In RA the temporal CABAC context store chains each picture to the previous one of its temporal layer, so a single
+  intra period gains about 1.4x; the periods then overlap, so RA gains with the number of periods in flight: RA 129
+  frames (5 periods) about 4.2x with 8 threads, RA 257 frames (9 periods) 4.16x with M = 4 and 6.49x with M = 8
+  (`perf/mt/p5_sim.py` models 4.75x and 7.00x; the window has to hold the periods' pictures). LD gains nothing.
+  `--ParallelSegments` combines with it.
+- The search stacks and the finish objects are created in threads of their own at start (20 stacks took about a
+  second serially before the first picture could start: AI 33 pictures with 20 threads 21.6 -> 20.65 s).
+- Memory: a search stack commits about 0.33 GB with CTU 128 and 0.53 GB with CTU 256 whatever the resolution (AI
+  128x128 with 20 threads: 6.6 GB peak with CTU 128, 10.5 GB with CTU 256; the GPM candidate buffers beyond the
+  multi-hypothesis ones are 64x64, as GPM and IBC blocks are); the setup stack and the finish stacks are small. Peak
+  commit with 20 threads and the estimate the automatic choice uses (`EncAppCfg::xFrameThreadsMemoryBytes`, the
+  measured figures with about 20 % margin); 128x128 is foreman (AI 33 pictures, RA 65 frames), 1080p and 2160p RA on
+  synthetic sequences for 20 minutes (40 at 2160p); the first column before the 64x64 GPM buffers:
+
+| configuration | periods | measured before | measured | estimate |
+|---|---|---|---|---|
+| 128x128 AI, CTU 128 / 256 | 4 | 7.19 / 13.57 GB | 6.57 / 10.48 GB | 7.50 / 11.97 GB |
+| 128x128 RA, CTU 128 / 256 | 3 | 6.96 / 13.77 GB | - / 10.66 GB | 7.50 / 11.97 GB |
+| 1080p, CTU 128 | 10 / 19 | 16.43 / 23.15 GB | - | 20.93 / 30.14 GB |
+| 1080p, class B (CTU 256) | 1 / 3 / 10 / 19 | 15.56 / 19.16 / 22.78 / 30.94 GB | - / 15.92 / 19.66 / - GB | 16.19 / 18.24 / 25.40 / 34.61 GB |
+| 2160p, class A (CTU 256) | 4 | 30.90 GB | 27.77 GB | 41.28 GB |
+
+  Stock ECM-20.0 allows CCSAO at most 256 CTUs per picture (`MAX_CCSAO_CTU_NUM`): 2160p needs the class A
+  configuration's CTU 256. Each period beyond the first adds a finish context (about 0.13 GB at 1080p while idle; a running finish
+  creates the SAO statistics, 0.43 GB at 1080p, and frees them after its SAO and CCSAO; one finish at a time holds
+  them), and up to max(N, GOPSize) x M pictures
+  are in flight. A picture that waits for its search holds no original when the input is a file and the temporal
+  filter left the frame as read: its setup drops it and its search start reads the frame again from the file
+  (`EncTemporalFilter::readFrame`, about 2 ms at 1080p). A picture the temporal filter changed (every 8th in RA)
+  keeps its filtered original and its true original (6.2 MB each at 1080p; 3.1 MB in 8 bits per sample where that is
+  lossless, as for an 8-bit source), as does every picture when the input is not a file; its reconstruction,
+  coding-structure arrays, temporary buffers and search
+  data (about 140 MB at 1080p) are created when its search starts, and its CUs, PUs and TUs are freed when its finish
+  ends (each picture buffer has its own unit cache, so it would keep them). RA 1080p with N = 8 and the automatic
+  M = 8 (a synthetic sequence on the 8 P-cores, commit sampled every 2 s, from 75 to 150 s): about 8.9 GB on average
+  (working set 6.0 GB), peak 9.6 GB (working set 6.9 GB), before the originals were dropped. With no options on all
+  20 cores (20 threads, 10 periods), 75 to 150 s: 14.07 -> 13.31 GB on average (working set 8.04 -> 7.27 GB), peak
+  14.78 -> 14.05 GB (working set 8.94 -> 8.20 GB) by dropping the originals; 13.31 -> 12.47 GB (working set
+  7.27 -> 6.45 GB) by the smaller motion field entries (MotionInfo 224 -> 88 bytes, without the multi-hypothesis
+  data that only the HMVP table entries carry); 12.47 -> 11.22 GB commit by making the reused motion vector tables
+  of the search stacks per block size at the first store; 11.22 -> 10.67 GB (working set 6.48 -> 5.92 GB) by making
+  the coded-CU cache entries of a stack at their first use and clearing them per CTU by a generation stamp. A
+  finished picture frees its originals, reconstruction and per-4x4 arrays once nothing reads it any more (unused for
+  reference, no reference in flight, reconstruction written or not written), and the application writes each
+  picture's reconstruction to its frame's position in the file as soon as the picture is finished, in any order, so
+  that a completed intra period does not wait for the output of the earlier ones and the end of the input frees the
+  pictures as they finish (20 threads, 1080p, 600-1200 s: 300 frames 17.26 -> 15.68 GB commit, 600 frames
+  23.93 -> 23.51 GB). A searched picture frees its refined TMVP motion and intersecting motion vectors at the end
+  of its search instead of its finish (600 frames: 23.51 -> 20.67 GB commit, working set 17.85 -> 15.02 GB).
+- No options, all 20 cores of the Core Ultra 7 265K (20 threads chosen), one run at a time, foreman 128x128 QP 32,
+  against one thread (the previous default) and `--ParallelSegments=20`; bitstreams identical:
+
+| test | one thread | `--ParallelSegments=20` | no options | vs one thread | vs ParallelSegments |
+|---|---|---|---|---|---|
+| AI, 33 pictures (TemporalSubsampleRatio 8) | 201.2 s | 16.8 s | 19.0 s | 10.6x | 0.88x |
+| RA, 65 frames (2 intra periods) | 540.0 s | 297.7 s | 206.7 s | 2.61x | 1.44x |
+| RA, 513 frames (16 intra periods) | (not run) | 423.2 s | 341.3 s | | 1.24x |
+
+  1080p RA with no options (a synthetic 300-frame sequence): 20 threads and 10 periods chosen; from 75 to 150 s the
+  commit averaged 14.1 GB (peak 15.1 GB), the working set 8.0 GB (peak 9.2 GB), about half the automatic budget's
+  estimate.
+- Core Ultra 7 265K, one run at a time on the 8 P-cores, foreman 128x128 QP 32 (ai_long's and ra_long's
+  configurations), the previous commit's single-thread time as base, automatic M:
+
+| FrameThreads | AI, 33 pictures (TemporalSubsampleRatio 8) | RA, 65 frames (3 intra periods) | RA, 129 frames (5) | RA, 257 frames (9) | peak commit (AI / RA 65 / RA 129) |
+|---|---|---|---|---|---|
+| 1 | 215.7 s | 556.2 s | 1064.5 s | 1810.2 s | |
+| 2 | 104.0 s, 2.07x | | | | 2.8 GB |
+| 4 | 56.0 s, 3.85x | 203.2 s, 2.74x | | | 5.4 / 5.7 GB |
+| 8 | 30.9 s, 6.98x | 199.1 s, 2.79x | 259.8 s, 4.10x | 278.8 s, 6.49x | 10.2 / 10.2 / 10.8 GB |
+
+  RA 257 frames with the automatic M (8 periods); with M = 4 it took 435.6 s (4.16x). The peak commits are those of
+  the setup-stack commit; the later memory commits lowered them (8 threads: AI 8.3, RA 65 8.3, RA 129 9.0, RA 257
+  9.9 GB).
+
+  Earlier steps, same tests: finishes in coding order and stacks held to the end of the finish (P5 stage A, B-1): RA
+  65 387.6 s with 4 threads and 383.9 s with 8 (1.44x, 1.45x); finishes of several periods at the same time (B-2):
+  RA 65 327.1 s and 199.0 s (1.70x, 2.79x), RA 129 403.4-429.2 s with 8 (2.48-2.64x). LD 13 frames: 118.5 s with one
+  thread, 120.6 s with 8.
+
+## CU threads (`--CuThreads=N`)
+
+- In the intra luma RD passes without a running cost threshold (the DCT2 pass and the LFNST passes, not the MTS
+  pass), N helpers (the picture's own thread and N-1 workers) code the RD candidates of a CU at the same time. The
+  candidate loop runs twice: the first run sets every candidate up and records it (CU and PU bytes, LFNST mode
+  indices), the helpers code the recorded candidates, and the second run takes each result where it would code the
+  candidate, after checking that it set the candidate up the same way. Output identical at every N;
+  `--CuThreadsCheck=1` codes every candidate in the picture's own search too and stops at a difference
+  (`perf/HANDOFF_MULTITHREADING.md`, P2).
+- Coded serially as before: ISP, PNN, TMP with LIC, BDPCM, ACT, CUs larger than the maximum transform size, passes
+  with fewer than two candidates. A helper is a light stack of ~130 MB.
+- The small-object allocator keeps per-thread free lists; with one shared spinlock the helpers' candidate coding took
+  1.7x the serial time.
+- The gain is small: the candidates take ~5 us each, and the rest of the loop (setups, ISP, PNN) stays serial.
+  Workers spin 2 ms after each job (a sleeping thread wakes too late for a loop), which costs the picture's thread
+  ~3 % of turbo frequency: foreman in LD and RA, where intra RD is a small part, gains 0-1 %; ParkJoy in RA, with
+  many intra CUs, gains about as much as intra pictures.
+- Core Ultra 7 265K, one run at a time on 4 P-cores (8 for N=8):
+
+| test | CuThreads=1 | 2 | 4 | 8 | peak commit (1 / 4 / 8) | bit-exact |
+|---|---|---|---|---|---|---|
+| ai_foreman (CIF, 1 intra picture) | 33.2 s | 30.9 s, 1.07x | 29.8 s, 1.11x | 31.6 s, 1.05x | 1.5 / 2.0 / 2.5 GB | yes |
+| ai_parkjoy (256x256, 2 intra pictures) | 46.7 s | 44.2 s, 1.06x | 43.5 s, 1.07x | 44.5 s, 1.05x | 1.4 / 2.0 / 2.5 GB | yes |
+| ld_foreman (QCIF, 5 frames) | 41.8 s | 41.7 s, 1.00x | 41.7 s, 1.00x | 42.3 s, 0.99x | 1.5 / 2.0 / 2.5 GB | yes |
+| ra_parkjoy (256x256, 5 frames) | 55.9 s | 52.4 s, 1.07x | 51.1 s, 1.09x | 52.8 s, 1.06x | 1.5 / 2.0 / 2.5 GB | yes |
+| ra_foreman (QCIF, 9 frames) | 89.5 s | 88.4 s, 1.01x | 88.4 s, 1.01x | 91.1 s, 0.98x | 1.5 / 2.1 / 2.6 GB | yes |
+
+## Power throttling (`--PowerThrottling`, default 0)
+
+- Windows 11 throttles processes running in the background (EcoQoS: lower clocks, efficiency cores). An encoder started
+  without a foreground window (a script, a batch job) ran up to a third slower on the 265K, and its time varied with
+  where the scheduler put it. By default the encoder now asks Windows not to throttle it (SetProcessInformation,
+  ProcessPowerThrottling, for this process only and only while it runs); `--PowerThrottling=1` leaves it to Windows.
+  Output identical. Unpinned, one run at a time:
+
+| test | before | now | `--PowerThrottling=1` |
+|---|---|---|---|
+| ld_foreman, 1 thread | 52.4 s (49-56) | 41.5 s, 1.26x | 52.1 s |
+| ai_foreman, 1 thread | 39.7 s (36-44) | 32.0 s, 1.24x | 37.8 s |
+| AI 33 pictures, FrameThreads=8 | 37.6 s | 32.8 s, 1.15x | |
+
+  The times now equal those pinned to P-cores; benchmarks in this file are pinned, so they did not change.
+
+## Decoder
+
+Stock DecoderApp vs the PGO build of f19e21c3, measured with `perf/decbench_pair.py`: both decoders run at the same time
+on two performance cores, swapped every repetition. Times are the decoder's own timer, which includes writing the
+YUV. Every decoded YUV md5 is identical; 13 streams were checked in total.
+
+| stream | content | runs | stock | ECM-speedup | speedup |
+|---|---|---|---|---|---|
+| ra_cif | RA 352x288, 289 frames, QP 32 | 6 | 7.420 s | 6.061 s | 1.22x |
+| ld_cif | LD 352x288, 33 frames, QP 32 | 6 | 0.700 s | 0.589 s | 1.19x |
+| ra_long | RA 128x128, 257 frames, QP 32 | 20 | 1.166 s | 0.899 s | 1.30x |
+| ra_97 | RA 128x128, 97 frames, QP 32 | 6 | 0.608 s | 0.487 s | 1.25x |
+
+The decoder gains come from the shared CommonLib code and the build. PGO is trained on encoder runs only, and the
+decoder has not been profiled on its own.
+
 ## Notes
+- On Windows a crash prints the exception and the faulting thread's call stack as link-time addresses
+  (`CrashReport.cpp`); `addr2line -f -C -i -e EncoderApp.exe ADDRESS` on a build of the same source with `-g`
+  resolves them (GCC generates the same code with `-g`: checked on EncGOP.cpp, identical disassembly).
 - GCC 16 needed two build fixes (missing `<cstdint>`; `-fno-aggressive-loop-optimizations`, because
   `EncAdaptiveLoopFilter.cpp` reads `m_chromaScaleIdxFinal[4][1]` with alternative index up to 7).
 - MinGW/Win64: AVX code needs `-Wa,-muse-unaligned-vector-move` (GCC bug 54412, no 32-byte stack realignment).
 - The SADL intra-NN translation units pick implementations through `__AVX2__`/`__SSE4_2__` and are kept on the
   stock ISA whatever `ECM_MARCH` says.
 - Profile concentration (stock): 50 % of RA self time is spread over 37 functions, 90 % over 286 functions.
+  At 49fa654f (all 5 tests): 25 % of self time in 12 functions, 50 % in 47, 90 % in 331.
+- Stock ECM-20.0 does not compile with `ENABLE_HIGH_BITDEPTH=ON` or with `JVET_AG0061_INTER_LFNST_NSPT` set to 0;
+  bd1be75c keeps the new code ready for both.
 - Per-test differences of up to ~4 % can come from code layout alone (the dropped GPM step sped up all-intra
   tests, which never run GPM), so small steps are judged on the total and on the tests that run the code.
 - `bench.py` reports the CPU time of the whole process tree (a Windows job object); earlier CPU numbers of

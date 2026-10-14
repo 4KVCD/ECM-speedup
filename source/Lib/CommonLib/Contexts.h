@@ -943,6 +943,33 @@ public:
   {
     checkInit();
     src.syncVersions();
+    copyFromSynced( src );
+  }
+  /// copyFrom for a source that other threads copy at the same time: it must have no unsynced changes, and is only read
+  void copyFromShared( const CtxStore<BinProbModel>& src )
+  {
+    checkInit();
+    CHECKD( std::any_of( src.m_dirty, src.m_dirty + CTX_MAX_BLOCKS, []( uint8_t d ) { return d != 0; } ),
+            "A shared context store has unsynced changes" );
+    copyFromSynced( src );
+  }
+  /// exchanges the contents (and their version stamps) with another store
+  void swap( CtxStore<BinProbModel>& other )
+  {
+    checkInit();
+    other.checkInit();
+    std::swap( m_ctxBuffer, other.m_ctxBuffer );
+    std::swap( m_ctx, other.m_ctx );
+    std::swap( m_verCounter, other.m_verCounter );
+    std::swap( m_ver, other.m_ver );
+    std::swap( m_dirty, other.m_dirty );
+    std::swap( m_epoch, other.m_epoch );
+    std::swap( m_syncSrc, other.m_syncSrc );
+    std::swap( m_syncEpoch, other.m_syncEpoch );
+  }
+private:
+  void copyFromSynced( const CtxStore<BinProbModel>& src )
+  {
     uint64_t diff = takeDirtyMask();
     // Restores in a loop (the same snapshot copied back after each test) need no stamp comparison: if this store was
     // last synced with src and src's stamps have not changed since (same epoch), only this store's dirty blocks differ.
@@ -971,6 +998,7 @@ public:
       diff = first + run >= CTX_MAX_BLOCKS ? 0 : diff & ( ~uint64_t( 0 ) << ( first + run ) );
     }
   }
+public:
   void copyFrom(const CtxStore<BinProbModel>& src, const CtxSet& ctxSet)
   {
     checkInit();
@@ -1149,6 +1177,24 @@ public:
     }
     ::memcpy( m_GRAdaptStats, ctx.m_GRAdaptStats, sizeof( unsigned ) * RExt__GOLOMB_RICE_ADAPTATION_STATISTICS_SETS );
     return *this;
+  }
+  /// operator= for a source that other threads copy at the same time (see CtxStore::copyFromShared)
+  void copyFromShared( const Ctx& ctx )
+  {
+    m_BPMType = ctx.m_BPMType;
+    switch( m_BPMType )
+    {
+    case BPM_Std:   m_ctxStore_Std  .copyFromShared( ctx.m_ctxStore_Std );  break;
+    default:        break;
+    }
+    ::memcpy( m_GRAdaptStats, ctx.m_GRAdaptStats, sizeof( unsigned ) * RExt__GOLOMB_RICE_ADAPTATION_STATISTICS_SETS );
+  }
+  /// exchanges the contents with another Ctx
+  void swap( Ctx& other )
+  {
+    std::swap( m_BPMType, other.m_BPMType );
+    m_ctxStore_Std.swap( other.m_ctxStore_Std );
+    std::swap( m_GRAdaptStats, other.m_GRAdaptStats );
   }
 
   SubCtx operator= ( SubCtx&& subCtx )
@@ -1535,7 +1581,42 @@ public:
     m_stateBuf[1].clear();
   }
 
+  /// The state stored for the slice's type, temporal layer and QP, or null.
+  const CtxStateArray* findCtx( const Slice* slice ) const
+  {
+    const int t = typeIdx( slice );
+    if( t < 0 )
+    {
+      return nullptr;
+    }
+    const auto it = m_stateBuf[t].find( std::pair<int, int>( slice->getTLayer(), slice->getSliceQp() ) );
+    return it == m_stateBuf[t].end() ? nullptr : &it->second;
+  }
+
+  /// Makes the store hold one entry: the given state for the slice's key (null: nothing).
+  void setOnlyCtx( const Slice* slice, const CtxStateArray* state )
+  {
+    clearValid();
+    const int t = typeIdx( slice );
+    if( state && t >= 0 )
+    {
+      m_stateBuf[t][std::pair<int, int>( slice->getTLayer(), slice->getSliceQp() )] = *state;
+    }
+  }
+
 private:
+  // the buffer of the slice type (as storeCtx and loadCtx choose it), -1 for I slices
+  static int typeIdx( const Slice* slice )
+  {
+#if JVET_AH0176_LOW_DELAY_B_CTX
+    const SliceType s = slice->getSliceType();
+    return s == I_SLICE ? -1 : ( s == P_SLICE ? 1 : 0 );
+#else
+    const SliceType t = slice->getSliceType();
+    return t == I_SLICE ? -1 : int( t );
+#endif
+  }
+
   std::map<std::pair<int, int>, CtxStateArray> m_stateBuf[2];
 };
 
@@ -1549,6 +1630,8 @@ public:
   bool loadCtxStates( const Slice* slice, Ctx& ctx ) { return m_ctxStateStore.loadCtx( slice, ctx ); }
 #endif
   void storeCtxStates( const Slice* slice, const Ctx& ctx ) { m_ctxStateStore.storeCtx( slice, ctx ); }
+  const CtxStateArray* findCtxStates( const Slice* slice ) const { return m_ctxStateStore.findCtx( slice ); }
+  void setOnlyCtxStates( const Slice* slice, const CtxStateArray* state ) { m_ctxStateStore.setOnlyCtx( slice, state ); }
 
   void updateBufferState( const Slice* slice )
   {

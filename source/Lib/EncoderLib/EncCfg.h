@@ -1133,6 +1133,11 @@ protected:
   bool        m_bs2ModPOCAndType;
 
   CfgVPSParameters m_cfgVPSParameters;
+  int         m_searchStackCount = 1;   ///< number of mode-search stacks (EncSearchStack), used by the pictures in turn
+  int         m_frameThreads     = 1;   ///< pictures of a GOP encoded at the same time (each needs a search stack)
+  int         m_framePeriods     = 1;   ///< frame threads: intra periods whose finishes run at the same time
+  int         m_cuThreads        = 1;   ///< threads that search the candidates of one picture's CUs (helpers + the picture's own)
+  bool        m_cuThreadsCheck   = false;   ///< evaluate the helpers' candidates serially too and compare
 
 #if ENABLE_SPLIT_PARALLELISM
   int         m_numSplitThreads;
@@ -3094,6 +3099,16 @@ public:
   bool         getBs2ModPOCAndType()                           const { return m_bs2ModPOCAndType; }
   void         setDebugCTU( int i )                                  { m_debugCTU = i; }
   int          getDebugCTU()                                   const { return m_debugCTU; }
+  void         setSearchStackCount( int n )                          { m_searchStackCount = n; }
+  int          getSearchStackCount()                           const { return m_searchStackCount; }
+  void         setFrameThreads( int n )                              { m_frameThreads = n; }
+  int          getFrameThreads()                               const { return m_frameThreads; }
+  void         setFramePeriods( int n )                              { m_framePeriods = n; }
+  int          getFramePeriods()                               const { return m_framePeriods; }
+  void         setCuThreads( int n )                                 { m_cuThreads = n; }
+  int          getCuThreads()                                  const { return m_cuThreads; }
+  void         setCuThreadsCheck( bool b )                           { m_cuThreadsCheck = b; }
+  bool         getCuThreadsCheck()                             const { return m_cuThreadsCheck; }
 
 #if ENABLE_SPLIT_PARALLELISM
   void         setNumSplitThreads( int n )                           { m_numSplitThreads = n; }

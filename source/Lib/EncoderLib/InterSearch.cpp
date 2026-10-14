@@ -597,7 +597,40 @@ void InterSearch::init( EncCfg*        pcEncCfg,
     m_amvpSbTmvpMotionBuf = new MotionInfo[AMVP_SBTMVP_BUF_SIZE];
   }
 #endif
+  for( ReusedUniMvs& reused: m_reusedUniMvs )
+  {
+    reused.create( maxCUWidth >> MIN_CU_LOG2, gp_sizeIdxInfo->idxFrom( maxCUWidth ) + 1 );
+  }
+#if JVET_AI0183_MVP_EXTENSION
+  m_subPuMiBuf.create( maxCUWidth );
+#endif
+#if JVET_AL0160_SBSMVP
+  m_subSpatialPuMiBuf.create( maxCUWidth );
+#endif
   m_isInitialized = true;
+}
+
+void InterSearch::ReusedUniMvs::create( unsigned numPositions, unsigned numSizes )
+{
+  m_numPositions = numPositions;
+  m_numSizes     = numSizes;
+  m_numEntries   = size_t( numPositions ) * numPositions * numSizes * numSizes;
+  m_chunks.clear();
+  m_chunks.resize( size_t( numSizes ) * numSizes );
+  m_filled.reset( static_cast<bool*>( std::calloc( m_numEntries, sizeof( bool ) ) ) );
+  CHECK( !m_filled, "out of memory" );
+}
+
+void InterSearch::ReusedUniMvs::store( unsigned x, unsigned y, unsigned w, unsigned h, const MvSet& mvs )
+{
+  std::unique_ptr<MvSet[], FreeDeleter>& sets = m_chunks[chunk( w, h )];
+  if( !sets )
+  {
+    sets.reset( static_cast<MvSet*>( std::calloc( size_t( m_numPositions ) * m_numPositions, sizeof( MvSet ) ) ) );
+    CHECK( !sets, "out of memory" );
+  }
+  ::memcpy( sets.get()[position( x, y )], mvs, sizeof( MvSet ) );
+  m_filled.get()[index( x, y, w, h )] = true;
 }
 
 void InterSearch::resetSavedAffineMotion()
@@ -4179,7 +4212,7 @@ bool InterSearch::predIBCSearch(CodingUnit& cu, Partitioner& partitioner, const 
       pu.bvdSuffixInfo.initPrefixes(pu.mvd[REF_PIC_LIST_0], pu.cu->imv, true);
 
 #if JVET_AD0208_IBC_ADAPT_FOR_CAM_CAPTURED_CONTENTS
-      static std::vector<Mv> cMvdDerivedVec;
+      std::vector<Mv>& cMvdDerivedVec = m_ibcMvdDerivedVec;
       cMvdDerivedVec.resize(0);
 #else
       std::vector<Mv> cMvdDerivedVec;
@@ -6259,14 +6292,12 @@ void InterSearch::predInterSearch(CodingUnit& cu, Partitioner& partitioner)
 #if INTER_LIC
         if (cu.slice->getUseLIC() && cu.licFlag)
         {
-          ::memcpy(&(g_reusedUniMVsLIC[idx1][idx2][idx3][idx4][0][0]), cMvTemp, 2 * 33 * sizeof(Mv));
-          g_isReusedUniMVsFilledLIC[idx1][idx2][idx3][idx4] = true;
+          getReusedUniMvs( true ).store( idx1, idx2, idx3, idx4, cMvTemp );
         }
         else
         {
 #endif
-        ::memcpy(&(g_reusedUniMVs[idx1][idx2][idx3][idx4][0][0]), cMvTemp, 2 * 33 * sizeof(Mv));
-        g_isReusedUniMVsFilled[idx1][idx2][idx3][idx4] = true;
+        getReusedUniMvs( false ).store( idx1, idx2, idx3, idx4, cMvTemp );
 #if INTER_LIC
         }
 #endif
@@ -6473,10 +6504,10 @@ void InterSearch::predInterSearch(CodingUnit& cu, Partitioner& partitioner)
               aaiMvpIdxBi[iRefList][iRefIdxTemp] = bestMvpIdxLoop;
               unsigned idx1, idx2, idx3, idx4;
               getAreaIdx(cu.Y(), *cu.slice->getPPS()->pcv, idx1, idx2, idx3, idx4);
-              CHECK(g_isReusedUniMVsFilled[idx1][idx2][idx3][idx4] == false, "this is not possible");
-              if (g_isReusedUniMVsFilled[idx1][idx2][idx3][idx4])
+              CHECK(!getReusedUniMvs( false ).isFilled( idx1, idx2, idx3, idx4 ), "this is not possible");
+              if (getReusedUniMvs( false ).isFilled( idx1, idx2, idx3, idx4 ))
               {
-                cMvTemp[iRefList][iRefIdxTemp] = g_reusedUniMVs[idx1][idx2][idx3][idx4][refListAmvp][iRefIdxTemp];
+                cMvTemp[iRefList][iRefIdxTemp] = getReusedUniMvs( false ).mvs( idx1, idx2, idx3, idx4 )[refListAmvp][iRefIdxTemp];
               }
               else
               {
@@ -8230,9 +8261,9 @@ void InterSearch::predInterSearchAdditionalHypothesis(PredictionUnit& pu, const 
         if ((pu.addHypData.size() + 1 - pu.numMergedAddHyps) < sps.getMaxNumAddHyps())
           uiBits++;
         Mv cMv(0, 0);
-        if (g_isReusedUniMVsFilled[idx1][idx2][idx3][idx4])
+        if (getReusedUniMvs( false ).isFilled( idx1, idx2, idx3, idx4 ))
         {
-          cMv = g_reusedUniMVs[idx1][idx2][idx3][idx4][iRefPicList][iRefIdxPred];
+          cMv = getReusedUniMvs( false ).mvs( idx1, idx2, idx3, idx4 )[iRefPicList][iRefIdxPred];
           uint32_t bitsDummy = 0;
           Distortion uiCostDummy = 0;
           xCheckBestMVP(eRefPicList, cMv, cMvPred, tempMHPredData.mvpIdx, amvpInfo, bitsDummy, uiCostDummy, pu.cu->imv);
@@ -8331,7 +8362,9 @@ void InterSearch::initGeoAngleSelection(PredictionUnit& pu
 )
 {
   xAMLGetCurBlkTemplate(pu, pu.lwidth(), pu.lheight());
-  // the rows of m_gpmacsSplitModeTmSelAvail (0) and m_gpmPartTplCost (-1) are cleared when first used
+  // the rows of m_gpmacsSplitModeTmSelAvail (0) and m_gpmPartTplCost (-1) are cleared when first used, and the split
+  // mode tables of the MMVD index pairs come from the pool again
+  m_gpmSplitModeTmSelPoolUsed = 0;
   if( ++m_gpmRowGen == 0 )
   {
     memset( m_gpmPartTplCostGen, 0, sizeof( m_gpmPartTplCostGen ) );
@@ -8423,7 +8456,7 @@ void InterSearch::setGeoSplitModeToSyntaxTable(PredictionUnit& pu, MergeCtx& mer
 #endif
     );
 
-    xSetGpmModeToSyntaxModeTable(numValidInList, modeList, m_gpmacsSplitModeTmSel[idx0][idx1][mergeCand0][mergeCand1]);
+    xSetGpmModeToSyntaxModeTable(numValidInList, modeList, gpmSplitModeTmSel(idx0, idx1)[mergeCand0][mergeCand1]);
     gpmSelAvailRow(idx0, idx1)[mergeCand0] |= ((uint16_t)1 << mergeCand1);
   }
 }
@@ -8455,7 +8488,7 @@ void InterSearch::setGeoTMSplitModeToSyntaxTable(PredictionUnit& pu, MergeCtx(&m
                         , modeList
     );
 
-    xSetGpmModeToSyntaxModeTable(numValidInList, modeList, m_gpmacsSplitModeTmSel[idx0][idx1][mergeCand0][mergeCand1]);
+    xSetGpmModeToSyntaxModeTable(numValidInList, modeList, gpmSplitModeTmSel(idx0, idx1)[mergeCand0][mergeCand1]);
     gpmSelAvailRow(idx0, idx1)[mergeCand0] |= ((uint16_t)1 << mergeCand1);
   }
 }
@@ -8472,7 +8505,7 @@ int InterSearch::convertGeoSplitModeToSyntax(int splitDir, int mergeCand0, int m
   xRemapMrgIndexAndMmvdIdx(mergeCand0, mergeCand1, mmvdCand0, mmvdCand1, isIntra[0], isIntra[1]);
 #endif
 #endif
-  return m_gpmacsSplitModeTmSel[mmvdCand0 + 1][mmvdCand1 + 1][mergeCand0][mergeCand1][splitDir];
+  return gpmSplitModeTmSel(mmvdCand0 + 1, mmvdCand1 + 1)[mergeCand0][mergeCand1][splitDir];
 }
 
 bool InterSearch::selectGeoSplitModes(PredictionUnit &pu,
