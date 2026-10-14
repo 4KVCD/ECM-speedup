@@ -276,9 +276,6 @@ struct MotionInfo
   int  rribcFlipType;
   Position centerPos;
 #endif
-#if MULTI_HYP_PRED  
-  MultiHypVec addHypData;
-#endif
   Mv      bv;
 #if JVET_AI0197_AFFINE_TMVP
   bool   isAffine;
@@ -402,6 +399,18 @@ struct MotionInfo
 };
 
 #if JVET_AL0214_MV_REFINEMENT_FOR_TMVP
+#if MULTI_HYP_PRED
+/// An HMVP table entry: the CU's motion with its additional hypotheses, which the merge candidates taken from the
+/// table inherit. The motion field (MotionInfo) carries none: nothing reads them from it, and they would be 136 of the
+/// 224 bytes of every 4x4 block of every picture.
+struct HmvpMotionInfo : MotionInfo
+{
+  MultiHypVec addHypData;
+};
+#else
+typedef MotionInfo HmvpMotionInfo;
+#endif
+
 struct RefineTmvpSbTmvpParams
 {
   bool     refineTmvpValid;
@@ -620,8 +629,8 @@ struct AffineInheritInfo
 struct LutMotionCand
 {
 #if JVET_Z0118_GDR
-  static_vector<MotionInfo, MAX_NUM_HMVP_CANDS> lut0;
-  static_vector<MotionInfo, MAX_NUM_HMVP_CANDS> lut1;
+  static_vector<HmvpMotionInfo, MAX_NUM_HMVP_CANDS> lut0;
+  static_vector<HmvpMotionInfo, MAX_NUM_HMVP_CANDS> lut1;
 
 #if JVET_Z0075_IBC_HMVP_ENLARGE
   static_vector<MotionInfo, MAX_NUM_HMVP_IBC_CANDS> lutIbc0;
@@ -638,7 +647,7 @@ struct LutMotionCand
   static_vector<AffineInheritInfo, MAX_NUM_AFF_INHERIT_HMVP_CANDS> lutAffInherit1;
 #endif
 #else
-  static_vector<MotionInfo, MAX_NUM_HMVP_CANDS> lut;
+  static_vector<HmvpMotionInfo, MAX_NUM_HMVP_CANDS> lut;
 #if JVET_Z0075_IBC_HMVP_ENLARGE
   static_vector<MotionInfo, MAX_NUM_HMVP_IBC_CANDS> lutIbc;
 #else

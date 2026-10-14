@@ -824,7 +824,8 @@ void CU::saveMotionInHMVP( const CodingUnit& cu, const bool isToBeDone )
 
   if (!cu.geoFlag && !cu.affine && !isToBeDone)
   {
-    MotionInfo mi = pu.getMotionInfo();
+    HmvpMotionInfo mi;
+    static_cast<MotionInfo&>( mi ) = pu.getMotionInfo();
 #if JVET_AD0193_ADAPTIVE_OBMC_CONTROL && JVET_AK0076_EXTENDED_OBMC_IBC
     mi.isSCC = false;
     mi.isRefSCC = false;
@@ -10456,7 +10457,7 @@ bool PU::addMergeHMVPCand(const CodingStructure &cs, MergeCtx &mrgCtx, const int
         mrgCtx.mvFieldNeighbours[(cnt << 1) + 1].setMvField(miNeighbor.mv[1], miNeighbor.refIdx[1]);
       }
 #if MULTI_HYP_PRED
-      mrgCtx.addHypNeighbours[cnt] = miNeighbor.addHypData;
+      mrgCtx.addHypNeighbours[cnt] = lut[num_avai_candInLUT - mrgIdx].addHypData;   // the table entry's
 #endif
 #if JVET_Y0129_MVD_SIGNAL_AMVP_MERGE_MODE
       if (pu.amvpMergeModeFlag[0] || pu.amvpMergeModeFlag[1])
@@ -10781,7 +10782,7 @@ bool PU::addIBCMergeHMVPCand(const CodingStructure &cs, MergeCtx &mrgCtx, const 
         mrgCtx.mvFieldNeighbours[(cnt << 1) + 1].setMvField(miNeighbor.mv[1], miNeighbor.refIdx[1]);
       }
 #if MULTI_HYP_PRED
-      mrgCtx.addHypNeighbours[cnt] = miNeighbor.addHypData;
+      mrgCtx.addHypNeighbours[cnt] = lut[num_avai_candInLUT - mrgIdx].addHypData;   // the table entry's
 #endif
 #endif
 
@@ -16753,7 +16754,7 @@ bool PU::addBMMergeHMVPCand(const CodingStructure &cs, MergeCtx &mrgCtx, const i
         && miNeighbor.bcwIdx == BCW_DEFAULT
 #endif
 #if MULTI_HYP_PRED
-        && miNeighbor.addHypData.empty()
+        && lut[numCandInLUT - mrgIdx].addHypData.empty()   // the table entry's
 #endif
         )
       {

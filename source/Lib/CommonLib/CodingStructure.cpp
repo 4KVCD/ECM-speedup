@@ -2141,7 +2141,7 @@ void CodingStructure::createPicData()
 #endif // JVET_W0123_TIMD_FUSION
 }
 
-void CodingStructure::addMiToLut(static_vector<MotionInfo, MAX_NUM_HMVP_CANDS> &lut, const MotionInfo &mi)
+void CodingStructure::addMiToLut(static_vector<HmvpMotionInfo, MAX_NUM_HMVP_CANDS> &lut, const HmvpMotionInfo &mi)
 {
   size_t currCnt = lut.size();
 

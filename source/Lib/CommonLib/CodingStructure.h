@@ -323,7 +323,7 @@ public:
   template<class T> void addEipToLut(static_vector<T, MAX_NUM_HEIP_CANDS> &lut, const T &model, int reusePos);
   template<class T> void getOneModelFromEipLut(const static_vector<T, MAX_NUM_HEIP_CANDS> &lut, T &model, int pos);
 #endif
-  void addMiToLut(static_vector<MotionInfo, MAX_NUM_HMVP_CANDS>& lut, const MotionInfo &mi);
+  void addMiToLut(static_vector<HmvpMotionInfo, MAX_NUM_HMVP_CANDS>& lut, const HmvpMotionInfo &mi);
 #if JVET_Z0075_IBC_HMVP_ENLARGE
   void addMiToLutIBC(static_vector<MotionInfo, MAX_NUM_HMVP_IBC_CANDS>& lut, const MotionInfo &mi);
 #endif

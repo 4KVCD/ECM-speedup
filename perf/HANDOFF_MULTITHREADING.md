@@ -207,6 +207,17 @@ Commits on `enc-mt`, all bit-exact with stock ECM-20.0 (bitstream md5 of the sui
   (`-DORIG_RELOAD_CHECK=1`) compares every frame read again with the dropped one. Found on the way: the application
   sets the temporal filter's input file after `EncLib::init`, so the decision is made at the first setup
   (`EncLib::isOrigReloadable`).
+- RAM step R8: `MotionInfo` (one per 4x4 block of every picture and temporary coding structure) no longer carries the
+  CU's additional hypotheses (`MultiHypVec`, 136 of its 224 bytes): the motion field never provided them (the span
+  functions build entries without them; merge candidates inherit hypotheses from the HMVP table only), so the table
+  entries keep them in `HmvpMotionInfo`. 224 -> 88 bytes; 1080p RA with no options, 75-150 s: commit 13.31 -> 12.47 GB,
+  working set 7.27 -> 6.45 GB. The decoder shares the code (decoded three bitstreams to the encoder's reconstruction).
+  Allocation probe at 20 threads (`C:\Code\work\mtam\probe2`, exe `bin/allocprobe2`, `dumps.py` for sites over
+  time): at 1080p a finish's ALF covariance statistics are 1.04 GB (147 per CTU x 52 KB; 4.2 GB at 4K), created
+  before `ALFProcess` and freed after it, so concurrent finishes add up; `InterSearch::ReusedUniMvs` commits 66 MB a
+  stack with 30 KB used (R10); at CIF after 900 s nearly every picture of the window (286 of 288) held its motion
+  field, original and reconstruction: finished pictures keep them until their buffer is reused, and completed periods
+  wait for earlier ones' output (R11).
 - Speed step S1: in all intra, the pictures waiting for a search stack take them in order of decreasing luma activity
   (`EncGOP::xFtSearchPriority`, the cost estimate of `--ParallelSegments`) instead of coding order, so the expensive
   pictures do not start last. AI 33 pictures, 2 runs each alternating with the previous build: 8 P-cores 34.5 -> 33.0 s

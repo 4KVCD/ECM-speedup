@@ -145,7 +145,9 @@ lower all-core turbo, one duplicated intra frame per chunk, unequal chunk comple
   M = 8 (a synthetic sequence on the 8 P-cores, commit sampled every 2 s, from 75 to 150 s): about 8.9 GB on average
   (working set 6.0 GB), peak 9.6 GB (working set 6.9 GB), before the originals were dropped. With no options on all
   20 cores (20 threads, 10 periods), 75 to 150 s: 14.07 -> 13.31 GB on average (working set 8.04 -> 7.27 GB), peak
-  14.78 -> 14.05 GB (working set 8.94 -> 8.20 GB) by dropping the originals.
+  14.78 -> 14.05 GB (working set 8.94 -> 8.20 GB) by dropping the originals; 13.31 -> 12.47 GB (working set
+  7.27 -> 6.45 GB) by the smaller motion field entries (MotionInfo 224 -> 88 bytes, without the multi-hypothesis
+  data that only the HMVP table entries carry).
 - No options, all 20 cores of the Core Ultra 7 265K (20 threads chosen), one run at a time, foreman 128x128 QP 32,
   against one thread (the previous default) and `--ParallelSegments=20`; bitstreams identical:
 
