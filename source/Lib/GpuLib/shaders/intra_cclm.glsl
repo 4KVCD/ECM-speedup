@@ -531,9 +531,9 @@ int cclmHistSample( Tu t, Tu o, bool stored, int comp, int x, int y, int maxPel 
 // maps; neither reads the CU), its references go into s_ref[1], its model into slot 1 (its slope adjustments from
 // Tu::lm); the predictions into s_tmp, Cb's from 0, Cr's from 1024, where they fit (up to 32 x 32; larger blocks, rare,
 // compute each sample of the gradients again). A CCCM block (its kind in the other component's field, no slope
-// adjustments) predicts both components with cccmPrediction, which keeps them, and the gradients read them (through
-// LBCCP's inside filter where the CU has it). All invocations, ending with a barrier; the prediction section predicts
-// the block again
+// adjustments; GLM with luma, whose glmIdc CABACReader gives both components alike, too) predicts both components with
+// cccmPrediction, which keeps them, and the gradients read them (through LBCCP's inside filter where the CU has it).
+// All invocations, ending with a barrier; the prediction section predicts the block again
 void cclmTransformMode( Tu t, int predStride, int maxPel, int lid, int NT )
 {
   const int  lx = t.x << 1, ly = t.y << 1, W = t.w, H = t.h;

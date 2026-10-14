@@ -420,6 +420,7 @@ the reconstruction buffer; works in every frame-thread context):
   components' CCCM predictions. M39 is GLM with luma: a CCCM-like model of a gradient pattern's value and the luma.
   M40 is LM chroma fusion's first type: a regular chroma prediction blended with a CCCM one. M41 is CFLM, its types 2
   and 3: a model of the block's own prediction and the luma, fitted where the template is predicted by the same mode.
+  M42 is GLM with luma with LFNST / NSPT.
   GpuIntraRec::supported()
   rejects every tool whose mode derivation or prediction reads reconstructed samples or that the kernels lack, before
   anything is skipped. All 19 regular streams now fall back to the CPU at cross-component prediction (CCP merge,

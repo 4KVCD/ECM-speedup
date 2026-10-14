@@ -2542,8 +2542,8 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
   else if( !isLuma( compID ) && ipa.multiRefIndex && !pu.chromaTmrlFlag ) why = "chroma MRL";
   // CCLM (chroma, the LM modes): the model from the template and the downsampled luma, its slope adjustment and LBCCP's
   // filter; with GLM (JVET-AA0126) the model of a gradient pattern's values instead of the downsampled luma; GLM with
-  // luma (JVET-AB0092: glmIdc beyond the patterns) a CCCM model (intra_cccm.glsl), but not with LFNST / NSPT (in
-  // either component: their mode a DIMD of both predictions); not the fusion of a chroma mode with LM (JVET-AC0119).
+  // luma (JVET-AB0092: glmIdc beyond the patterns) a CCCM model (intra_cccm.glsl), of the same kind in both components
+  // (CABACReader::glmIdc gives Cr Cb's glmIdc; with LFNST / NSPT both predictions are the block's cccmPrediction's).
   // With LFNST / NSPT their mode is a DIMD of the CU's Cb and / or Cr predictions (deriveChromaIpmForTransform), which
   // without DIMD in the SPS leaves the mode the transforms read unset. Not above 10 bits (no test stream) nor with
   // unequal bit depths (the model takes the chroma bit depth, its division table m_auShiftLM the luma's)
@@ -2552,9 +2552,10 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
   // the DIMD of both components' CCCM predictions, which predIntraCCCM makes at the Cb block (each block on the GPU)
   else if( !isLuma( compID ) && pu.glmIdc.isActive() && !GPU_GLM ) why = "GLM of another configuration";
   else if( !isLuma( compID ) && pu.glmIdc.getIdc( compID, 0 ) > NUM_GLM_PATTERN && !GPU_CCCM ) why = "GLM with luma";
-  else if( !isLuma( compID ) && cu.lfnstIdx && ( pu.glmIdc.getIdc( COMPONENT_Cb, 0 ) > NUM_GLM_PATTERN
-                                                 || pu.glmIdc.getIdc( COMPONENT_Cr, 0 ) > NUM_GLM_PATTERN ) )
-    why = "GLM with luma with LFNST / NSPT";
+  else if( !isLuma( compID ) && cu.lfnstIdx
+           && pu.glmIdc.getIdc( COMPONENT_Cb, 0 ) != pu.glmIdc.getIdc( COMPONENT_Cr, 0 )
+           && std::max( pu.glmIdc.getIdc( COMPONENT_Cb, 0 ), pu.glmIdc.getIdc( COMPONENT_Cr, 0 ) ) > NUM_GLM_PATTERN )
+    why = "GLM with luma with LFNST / NSPT, of another kind in the other component";
   else if( !isLuma( compID ) && pu.cccmFlag && otherCccm( pu ) )   why = otherCccm( pu );
   // LM chroma fusion (JVET-AC0119; geneChromaFusionPred with JVET-AL0191): its first type blends the block with plain
   // CCCM models of two (MMLM_CHROMA_IDX's), where PU::cccmMultiModeAvail allows them (else the CPU blends in a buffer
@@ -2665,13 +2666,13 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
              | ( ( ( cb ? pu.cclmOffsets.cb1 : pu.cclmOffsets.cr1 ) + 8 ) << LM_DELTA1_SHIFT ) | ( pu.ccInsideFilter ? LM_INSIDE : 0 )
              | LM_ACTIVE | ( pu.glmIdc.getIdc( compID, 0 ) << LM_GLM_SHIFT );
     }
-    // the predictions the transforms' DIMD reads by the TU's joint CbCr mode, the other's parameters (a CCCM block's
-    // other component has the same models, its kind's field is the other's)
+    // the predictions the transforms' DIMD reads by the TU's joint CbCr mode, the other's parameters (a CCCM block's -
+    // also GLM with luma's - other component has the same kind of model, its kind's field is the other's)
     if( cu.lfnstIdx )
     {
       const ComponentID other = cb ? COMPONENT_Cr : COMPONENT_Cb;
       t.lm |= ( tu.jointCbCr != 2 ? LM_HIST_CB : 0 ) | ( tu.jointCbCr != 1 ? LM_HIST_CR : 0 );
-      if( !pu.cccmFlag )
+      if( ( ( t.lm >> LM_CCCM_SHIFT ) & 3 ) == 0 )
       {
         t.lm |= ( ( ( ( cb ? pu.cclmOffsets.cr0 : pu.cclmOffsets.cb0 ) + 8 ) << LM_DELTA0_SHIFT )
                   | ( ( ( cb ? pu.cclmOffsets.cr1 : pu.cclmOffsets.cb1 ) + 8 ) << LM_DELTA1_SHIFT ) ) << LM_OTHER_SHIFT;
