@@ -109,7 +109,7 @@ struct Tu
   int32_t mtsSet, secIdx, secBucket;
   int32_t lm;     // a CCLM block's mark, slope adjustments and LBCCP filter (intra_common.glsl's LM_*)
   int32_t cflm;   // a CFLM block's template record in Params::timdData (TemplateUnits, its units' bits; -1: none)
-  int32_t ccp;    // an LM block's CU's CCP model record in Params::ccpOut (CCP_OUT; -1: none)
+  int32_t ccp;    // an LM / LM chroma fusion block's CU's CCP model record in Params::ccpOut (CCP_OUT; -1: none)
 };
 static_assert( sizeof( Tu ) == 102 * 4, "Tu layout" );
 
@@ -152,11 +152,13 @@ constexpr int LM_CCCM_GLM_LUMA = 65536;
 // block does not have)
 constexpr int LM_FUSION = 1 << 30, LM_FUSION_W_SHIFT = 0, LM_FUSION_TYPE_SHIFT = 4;
 
-// the CCP model record of an LM CU (intra_common.glsl's CCP_OUT_*, int32): the CCPModelCandidate fields
-// predIntraChromaLM / predIntraCCCM set (CCP merge's curCand), written by the CU's blocks, compared in verification
+// the CCP model record of an LM CU or an LM chroma fusion CU (intra_common.glsl's CCP_OUT_*, int32): the
+// CCPModelCandidate fields predIntraChromaLM / predIntraCCCM / geneChromaFusionPred set (CCP merge's curCand) and the
+// inside filter flags, written by the CU's blocks, compared in verification
 constexpr int CCP_OUT_TYPE = 0, CCP_OUT_GLM_IDC = 1, CCP_OUT_Y_THRES = 2, CCP_OUT_LUMA_OFFSET = 3, CCP_OUT_COR_OFF = 4;
-constexpr int CCP_OUT_MDF = 6, CCP_OUT_NUM_PARAMS = 7, CCP_OUT_SHIFT = 8, CCP_OUT_SHIFT2 = 10, CCP_OUT_RANGE = 12;
-constexpr int CCP_MAX_PARAMS = 11, CCP_OUT_PARAMS = 24, CCP_OUT_PARAMS2 = CCP_OUT_PARAMS + 4 * CCP_MAX_PARAMS;
+constexpr int CCP_OUT_MDF = 6, CCP_OUT_NUM_PARAMS = 7, CCP_OUT_SHIFT = 8, CCP_OUT_SHIFT2 = 10, CCP_OUT_INSIDE = 12;
+constexpr int CCP_OUT_INSIDE_HIST = 13, CCP_OUT_RANGE = 14;
+constexpr int CCP_MAX_PARAMS = 11, CCP_OUT_PARAMS = 26, CCP_OUT_PARAMS2 = CCP_OUT_PARAMS + 4 * CCP_MAX_PARAMS;
 constexpr int CCP_OUT = CCP_OUT_PARAMS2 + 4 * CCP_MAX_PARAMS;
 #if JVET_AD0188_CCP_MERGE
 static_assert( NUM_CCP_PARAMS == CCP_MAX_PARAMS && CCP_TYPE_CCLM == 1 && CCP_TYPE_MMLM == 2 && CCP_TYPE_GLM0123 == 4
@@ -1415,12 +1417,12 @@ struct GpuIntraRec::Impl
   int32_t                     cccmScratchWords = 0;  // the CCCM scratch each intra_rec workgroup needs (int32): the
                                                      // largest CCCM block's data beyond shared memory
   std::unordered_map<const CodingUnit*, int32_t> cuIndex[2];   // per channel type: the record of a CU
-  // the LM CUs' CCP models (CCP merge's curCand) the GPU computes (Tu::ccp: per PU, both components' blocks write it)
+  // the CCP models (CCP merge's curCand) of the LM CUs and LM chroma fusion CUs the GPU computes (Tu::ccp: per PU,
+  // both components' blocks write it), the PU of each record (verification compares its curCand after the picture)
   int                                                  numCcp = 0;
   std::unordered_map<const PredictionUnit*, int32_t>  ccpIndex;
-#if JVET_AD0188_CCP_MERGE
-  std::vector<CCPModelCandidate>                       cpuCcp;   // verification: per record the CPU's curCand
-#endif
+  std::vector<const PredictionUnit*>                   ccpPu;
+  std::vector<const PredictionUnit*>                   untypedCcpPu;   // the chroma PUs without a record
   // the sign prediction prepareSignPred took from a TU, for the record() of its coded component
   struct PendingSignPred
   {
@@ -1604,9 +1606,8 @@ void GpuIntraRec::beginPicture( const CodingStructure& cs )
   m.cccmScratchWords = 0;
   m.numCcp = 0;
   m.ccpIndex.clear();
-#if JVET_AD0188_CCP_MERGE
-  m.cpuCcp.clear();
-#endif
+  m.ccpPu.clear();
+  m.untypedCcpPu.clear();
   m.cuIndex[0].clear();
   m.cuIndex[1].clear();
   m.unsupportedWhy.clear();
@@ -2495,6 +2496,18 @@ static int32_t cuRecord( GpuIntraRec::Impl& m, const TransformUnit& tu, const Co
   return index;
 }
 
+// the CCP model record of PU pu (Tu::ccp; made at its first block, which each component's block writes its part of)
+static int32_t ccpRecord( GpuIntraRec::Impl& m, const PredictionUnit& pu )
+{
+  const auto r = m.ccpIndex.emplace( &pu, m.numCcp );
+  if( r.second )
+  {
+    m.numCcp++;
+    m.ccpPu.push_back( &pu );
+  }
+  return r.first->second;
+}
+
 void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, const IntraPrediction::IpaSnapshot& ipaIn,
                           const QpParam& qp, const CPelBuf* pred, const CPelBuf* resi )
 {
@@ -2719,31 +2732,17 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
     // previous block's
     t.intraPredAngle = t.absInvAngle = t.angularScale = 0;
     t.refFilter = t.applyPDPC = t.gradPDPC = t.fusion = 0;
-    // the CU's CCP model (CCP merge's curCand), one record per PU, which each component's block writes its part of;
-    // in verification the CPU's, after the block's prediction
-    const auto ccp = m.ccpIndex.emplace( &pu, m.numCcp );
-    if( ccp.second )
-    {
-      m.numCcp++;
-#if JVET_AD0188_CCP_MERGE
-      m.cpuCcp.emplace_back();
-#endif
-    }
-    t.ccp = ccp.first->second;
-#if JVET_AD0188_CCP_MERGE
-    if( pred )
-    {
-      m.cpuCcp[t.ccp] = pu.curCand;
-    }
-#endif
+    t.ccp = ccpRecord( m, pu );   // the CU's CCP model (CCP merge's curCand)
   }
 #endif
 #if GPU_CCCM
   // LM chroma fusion (geneChromaFusionPred, its first type): the plain CCCM models of MMLM_CHROMA_IDX blended in, the
   // weight of the block's own prediction by whether the CUs below-left and above-right of the CU are LM CUs (1 both,
-  // 3 neither, else 2), its CCCM luma buffer and prediction in the scratch
+  // 3 neither, else 2), its CCCM luma buffer and prediction in the scratch; the models are the CU's curCand (a CCP
+  // merge candidate of its neighbours, not of the CTU row's history: CU::saveModelsInHCCP takes LM CUs only)
   if( !isLuma( compID ) && pu.isChromaFusion == 1 )
   {
+    t.ccp = ccpRecord( m, pu );
     const Position        posBL = pu.Cb().bottomLeft(), posTR = pu.Cb().topRight();
     const PredictionUnit* left  = cu.cs->getPURestricted( posBL.offset( -1, 0 ), pu, CHANNEL_TYPE_CHROMA );
     const PredictionUnit* above = cu.cs->getPURestricted( posTR.offset( 0, -1 ), pu, CHANNEL_TYPE_CHROMA );
@@ -2778,6 +2777,11 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
     m.cccmScratchWords = std::max( m.cccmScratchWords, ( areaW + 2 ) * ( areaH + 2 ) + areaW * areaH );
   }
 #endif
+  // a chroma PU without a CCP record: verification expects its curCand untyped (no merge candidate of its neighbours)
+  if( !isLuma( compID ) && t.ccp < 0 )
+  {
+    m.untypedCcpPu.push_back( &pu );
+  }
   // ISP (luma; DecCu::xIntraRecBlk, IntraPrediction::initIntraPatternChTypeISP): the CU, whose references the first
   // sub-partition fills and the later ones shift; the prediction region, which for vertical sub-partitions 1 or 2 wide
   // is 4 wide and shared (CU::isPredRegDiffFromTB, adjustPredArea); and the previous sub-partition, which the
@@ -4409,15 +4413,15 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
     }
   }
 #if JVET_AD0188_CCP_MERGE
-  // the LM CUs' CCP models against the CPU's curCand: the fields of their type that CCPModelCandidate::operator== and
-  // predCCPCandidate read (CCLM's and GLM's patterns: per component a, b and the shift, with two models also the
-  // second's and the threshold; GLM with luma's: its parameters and the luma offset; CCCM's: the parameters, the
-  // template chroma's ranges, the luma offset, the corner offsets, the filters, the parameters' number, with two models
-  // also the second's and the threshold)
+  // the CCP models against the CPU's curCand after the picture (with CU::saveCcInsideFilterFlagInCCP's flag): the
+  // fields of their type that CCPModelCandidate::operator== and predCCPCandidate read (CCLM's and GLM's patterns: per
+  // component a, b and the shift, with two models also the second's and the threshold; GLM with luma's: its parameters
+  // and the luma offset; CCCM's: the parameters, the template chroma's ranges, the luma offset, the corner offsets, the
+  // filters, the parameters' number, with two models also the second's and the threshold) and the inside filter flag
   for( int r = 0; r < m.numCcp && first.empty(); r++ )
   {
     const int32_t*           g = gCcpDl + size_t( r ) * CCP_OUT;
-    const CCPModelCandidate& h = m.cpuCcp[r];
+    const CCPModelCandidate& h = m.ccpPu[r]->curCand;
     const char*              field = nullptr;
     long long                cpu = 0, gpu = 0;
     auto check = [&]( const char* name, long long a, long long b )
@@ -4436,6 +4440,7 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
     };
     const bool two = ( h.type & CCP_TYPE_MMLM ) != 0;
     check( "type", h.type, g[CCP_OUT_TYPE] );
+    check( "ccInsideFilter", h.ccInsideFilter, g[CCP_OUT_INSIDE] );
     if( h.type & ( CCP_TYPE_CCLM | CCP_TYPE_GLM0123 ) )
     {
       check( "glmIdc", h.glmIdc, g[CCP_OUT_GLM_IDC] );
@@ -4503,8 +4508,21 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
       }
       char buf[200];
       snprintf( buf, sizeof( buf ),
-                "CCP model's %s of record %d (LM block %d at %d,%d %dx%d, type %d): CPU %lld GPU %lld", field, r, b,
+                "CCP model's %s of record %d (block %d at %d,%d %dx%d, type %d): CPU %lld GPU %lld", field, r, b,
                 m.rec[b].x, m.rec[b].y, m.rec[b].w, m.rec[b].h, h.type, cpu, gpu );
+      first = buf;
+    }
+  }
+  // the chroma PUs without a record have no CCP model either (else a merge CU next to them would inherit one the GPU
+  // does not have)
+  for( size_t k = 0; k < m.untypedCcpPu.size() && first.empty(); k++ )
+  {
+    const PredictionUnit& pu = *m.untypedCcpPu[k];
+    if( pu.curCand.type != CCP_TYPE_NONE )
+    {
+      char buf[160];
+      snprintf( buf, sizeof( buf ), "the chroma CU at %d,%d %dx%d has a CCP model (type %d) but no record",
+                pu.Cb().x, pu.Cb().y, pu.Cb().width, pu.Cb().height, pu.curCand.type );
       first = buf;
     }
   }

@@ -422,7 +422,8 @@ the reconstruction buffer; works in every frame-thread context):
   and 3: a model of the block's own prediction and the luma, fitted where the template is predicted by the same mode.
   M42 is GLM with luma with LFNST / NSPT. M43 accepts the SPS switches of CCP merge, decoder-derived CCP fusion and
   BVG-CCCM; their CUs are still rejected per block. M44 has every LM CU store its model in the form CCP merge inherits
-  (the CPU's PredictionUnit::curCand), compared with the CPU's in verification.
+  (the CPU's PredictionUnit::curCand), compared with the CPU's in verification; M45 adds LM chroma fusion CUs' models
+  and LBCCP's inside filter flag.
   GpuIntraRec::supported()
   rejects every tool whose mode derivation or prediction reads reconstructed samples or that the kernels lack, before
   anything is skipped. All 19 regular streams now fall back to the CPU at chroma reordering / DBV, the next

@@ -13,13 +13,13 @@ wall-clock gains with threads are "the easy baseline". Decoder status: single-th
 (`--GpuLoopFilter=1`: ALF, SAO, BIF, CCSAO, LF-CCCM, offset refinement on Vulkan). The user then asked for **a full
 GPU decoder in Vulkan, optimized until nothing is left** ("The GPU decoder needs to fully decode the frame on the
 GPU"; "Your first Vulkan version is going to be slow. That's OK"). That work is branch `dec-gpurecon`: intra
-reconstruction on the GPU (`--GpuRecon`), tool levels M1-M44 done and verified bit-exact (M19: DIMD, M20: OBIC, M21:
+reconstruction on the GPU (`--GpuRecon`), tool levels M1-M45 done and verified bit-exact (M19: DIMD, M20: OBIC, M21:
 intra merge, M22: the transforms of DIMD CUs, M23: LFNST of MIP, M24: TIMD, M25: OBIC and intra merge with TIMD
 neighbours, M26: TIMD-SAD, M27: OBIC and intra merge with TIMD-SAD neighbours, M28: TIMD merge, M29: TMRL of luma,
 M30: chroma TMRL, M31: CCLM, M32: LFNST / NSPT of CCLM, M33: GLM's gradient patterns, M34: CCCM, M35: GL-CCCM, M36:
 CCCM with several downsampling filters, M37: CCCM without subsampling, M38: CCCM with LFNST / NSPT, M39: GLM with
 luma, M40: LM chroma fusion of CCCM, M41: CFLM, M42: GLM with luma with LFNST / NSPT, M43: the SPS switches of the
-CCP tools, M44: the LM CUs' CCP models); it is **not yet faster than the CPU decoder** (see section 8) and supports
+CCP tools, M44 / M45: the CCP models); it is **not yet faster than the CPU decoder** (see section 8) and supports
 only a restricted tool set (all real CTC streams fall back to the CPU, first reason: chroma reordering / DBV; CCP
 merge, decoder-derived CCP fusion and BVG-CCCM CUs are rejected per block).
 
@@ -796,6 +796,16 @@ components of a CCLM CU at the Cb block (JVET-AK0064), so its curCand is complet
 field of each type off, the threshold, the ranges, LBCCP's set, NS-CCCM's type / corner offsets / parameters' number,
 a record per block instead of per CU). GPU time against M43: the plain, CCLM, GLM, CCCM, CCCM-kinds, GLM-with-luma and
 CFLM sets within -0.3 % .. +0.7 % (m31 136.3 ms per picture, m41 148.8).
+M45: the rest of the CCP models a merge CU can inherit. LM chroma fusion CUs (the first type: a regular chroma mode)
+have a record too: geneChromaFusionPred stores their CCCM models of MMLM_CHROMA_IDX as curCand (CCCM | MMLM, never
+GL-CCCM: the CU has no glCccmFlag), so they are spatial candidates of their neighbours, though not in the CTU row's
+history (CU::saveModelsInHCCP takes LM CUs only); their Cb block writes it (cccmStoreCcp). The record holds LBCCP's
+inside filter twice (CCP_OUT_INSIDE: the CU's curCand after CU::saveCcInsideFilterFlagInCCP, the CU's flag;
+CCP_OUT_INSIDE_HIST: the history's copy, which saveModelsInHCCP took before that: 0 for an LM CU); a merge CU will
+write the inherited flag into both. Verification now reads the CPU's curCand after the picture (the PU of each record;
+with the flag) and checks that every chroma PU without a record has an untyped curCand (else a merge CU next to it
+would inherit a model the GPU lacks). Canaries: 4 (the fusion record not written, typed with one model, the inside
+flag dropped, a fusion CU without a record). GPU time against M44: the same sets and m40 within -0.2 % .. +0.4 %.
 
 ## 8. Numbers (i7-10700 8C/16T, Win11, GCC 16.2, RTX 3070 driver 616.92)
 
@@ -833,10 +843,10 @@ Profile of a GPU-on decode (non-LTO, m2_park16, share of all samples): parsing ~
    M37 CCCM without subsampling (the m37 set, m37a_fore22, m37c_fore22), M38 CCCM with LFNST / NSPT (the m38 set),
    M39 GLM with luma (the m39 set, m39a_fore22, m39c_fore22), M40 LM chroma fusion of CCCM (the m40 and m40f sets),
    M41 CFLM (the m41 and m41f sets), M42 GLM with luma with LFNST / NSPT (the m42 set), M43 the SPS switches of the
-   CCP tools (the m43 and m43c sets). 2026-10-14: M44 the LM CUs' CCP models (verified on the LM sets). All 19
-   regular streams now stop at "chroma reordering / DBV" (the next sequence-level check; the block-level tools of step
-   4 follow, CCP merge's first: M45 the CCP models of LM chroma fusion CUs and the inside filter's flag, M46 the merge
-   list, its costs and prediction, then merge fusion, merge adjustment, decoder-derived CCP fusion).
+   CCP tools (the m43 and m43c sets). 2026-10-14: M44 the LM CUs' CCP models, M45 those of LM chroma fusion CUs and
+   the inside filter's flags (verified on the LM sets). All 19 regular streams now stop at "chroma reordering / DBV"
+   (the next sequence-level check; the block-level tools of step 4 follow, CCP merge's first: M46 the merge list, its
+   costs and prediction, then merge fusion, merge adjustment, decoder-derived CCP fusion).
 3. Make the GPU path win on CPU time per picture: the derive-only pass (record during parsing or a leaner pass;
    speed up getSpatialIpm/getPURestricted, which also helps the CPU decoder), GPU behaviour with frame threads
    (8 contexts x 32 persistent workgroups oversubscribe the GPU; spinning workgroups; try fewer groups per context,

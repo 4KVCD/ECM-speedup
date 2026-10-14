@@ -454,9 +454,17 @@ void ccpStoreRange( int base, bool second, int c, int lo, int hi )
   CBufI32( P.ccpOut ).v[o + 2] = hi > lo ? 1 : 0;
 }
 
+// the CCP record's inside filter flags of block t's CU, an LM CU's: its curCand's after the CU its LBCCP flag, the
+// history's copy without it
+void ccpStoreInside( Tu t, int base )
+{
+  CBufI32( P.ccpOut ).v[base + CCP_OUT_INSIDE]      = ( t.lm & LM_INSIDE ) != 0 ? 1 : 0;
+  CBufI32( P.ccpOut ).v[base + CCP_OUT_INSIDE_HIST] = 0;
+}
+
 // CCLM block t's part of its CU's CCP record (predIntraChromaLM after the slope adjustments, cclmModelToCcpParams):
-// the type, glmIdc, its component's a, b and shift, with two models also the second's and the threshold (invocation 0;
-// the model in slot 0)
+// the type, glmIdc, its component's a, b and shift, with two models also the second's and the threshold, the inside
+// filter flags (invocation 0; the model in slot 0)
 void cclmStoreCcp( Tu t )
 {
   const int  base = t.ccp * CCP_OUT, c = t.comp - 1, m = CCLM_MODEL, glm = ( t.lm >> LM_GLM_SHIFT ) & 15;
@@ -465,6 +473,7 @@ void cclmStoreCcp( Tu t )
   o.v[base + CCP_OUT_TYPE]       = ( glm > 0 ? CCP_TYPE_GLM0123 : CCP_TYPE_CCLM ) | ( two ? CCP_TYPE_MMLM : 0 );
   o.v[base + CCP_OUT_GLM_IDC]    = glm;
   o.v[base + CCP_OUT_NUM_PARAMS] = 2;
+  ccpStoreInside( t, base );
   o.v[base + CCP_OUT_SHIFT + c]  = s_cclm[m + CCLM_SHIFT];
   ccpStoreParam( base, false, c, 0, int64_t( s_cclm[m + CCLM_A] ) );
   ccpStoreParam( base, false, c, 1, int64_t( s_cclm[m + CCLM_B] ) );

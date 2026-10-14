@@ -882,13 +882,15 @@ void cccmCosts( Tu t, bool twoModels, int lid, int NT )
 
 // CCCM block t's CU's CCP record (predIntraCCCM's curCand, cccmModelToCcpParams; invocation 0, after the models and
 // LBCCP's choice): the type, the threshold of two models (else 0), the luma offset, the reference area's columns / rows
-// left of / above the block (not without subsampling), the downsampling filters, the parameters' number, per model and
-// component the set's parameters and its template chroma's range. GLM with luma's (xGlmCalcModel, glmModelToCcpParams)
-// only its component's parameters, its glmIdc and the luma offset
+// left of / above the block (not without subsampling), the downsampling filters, the parameters' number, the inside
+// filter flags, per model and component the set's parameters and its template chroma's range. GLM with luma's
+// (xGlmCalcModel, glmModelToCcpParams) only its component's parameters, its glmIdc, the luma offset and the flags. LM
+// chroma fusion's (geneChromaFusionPred: its CCCM models of MMLM_CHROMA_IDX, plain CCCM; no LBCCP flag) alike
 void cccmStoreCcp( Tu t, bool twoModels )
 {
   const int base = t.ccp * CCP_OUT, M = g_cccmParams;
   CBufI32   o = CBufI32( P.ccpOut );
+  ccpStoreInside( t, base );
   if( g_cccmGlmLuma )
   {
     const int c = t.comp - 1;
@@ -1017,7 +1019,7 @@ void cccmPrediction( Tu t, bool both, int lid, int NT )
     g_cccmSet = s_cclm[CCCM_COST + 1] < s_cclm[CCCM_COST] ? 1 : 0;
     SYNC();   // (the prediction overwrites the template predictions)
   }
-  if( lid == 0 && t.ccp >= 0 && !g_cccmFusion && ( g_cccmGlmLuma || t.comp == 1 ) )   // (CCP merge's inheritance)
+  if( lid == 0 && t.ccp >= 0 && ( g_cccmGlmLuma || t.comp == 1 ) )   // (CCP merge's inheritance)
   {
     cccmStoreCcp( t, twoModels );
   }

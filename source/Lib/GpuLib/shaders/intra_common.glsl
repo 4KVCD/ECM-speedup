@@ -68,8 +68,8 @@ struct Tu
   // a CFLM block's template (intra_cccm.glsl's cflmPrediction): its record in Params::timdData, TemplateUnits followed
   // by its units' availability bits (-1: none)
   int cflm;
-  // an LM block's CU's CCP model, which the block writes its part of: its record in Params::ccpOut (CCP_OUT_*;
-  // -1: none)
+  // an LM or LM chroma fusion block's CU's CCP model, which the block writes its part of: its record in Params::ccpOut
+  // (CCP_OUT_*; -1: none)
   int ccp;
 };
 layout( buffer_reference, std430, buffer_reference_align = 4 ) buffer BufTu { Tu v[]; };
@@ -126,17 +126,21 @@ int lmFusionType( Tu t )
 const int CFLM_TEMPLATE = 2;
 
 // the CCP model of an LM CU (JVET-AD0188's CCPModelCandidate: PredictionUnit::curCand, which predIntraChromaLM /
-// predIntraCCCM set and CCP merge inherits) as its blocks compute it (CCP_OUT int32 per record in Params::ccpOut at
-// Tu::ccp; layout shared with GpuIntraRec.cpp): the type (CCP_TYPE_*), glmIdc, the luma threshold of two models
-// (yThres), the luma offset, the reference area's columns / rows left of / above the block (corOffX, corOffY), the
-// downsampling filters (cccmMultiFilterIdx), the parameters' number (numParams), per component the shifts of CCLM's
-// two models, per model and component the range of the template's chroma (rangeMin, rangeMax, rangeChange), then per
-// component the first model's parameters (64-bit, two words each, low first) and the second's. A CCLM or GLM block
-// writes its component's part, a CCCM block (the Cb block: predIntraCCCM predicts both components) both
+// predIntraCCCM set and CCP merge inherits; also an LM chroma fusion CU's, whose geneChromaFusionPred stores its CCCM
+// models) as its blocks compute it (CCP_OUT int32 per record in Params::ccpOut at Tu::ccp; layout shared with
+// GpuIntraRec.cpp): the type (CCP_TYPE_*), glmIdc, the luma threshold of two models (yThres), the luma offset, the
+// reference area's columns / rows left of / above the block (corOffX, corOffY), the downsampling filters
+// (cccmMultiFilterIdx), the parameters' number (numParams), per component the shifts of CCLM's two models, LBCCP's
+// inside filter (ccInsideFilter) as the CU's curCand has it after the CU (CU::saveCcInsideFilterFlagInCCP: the CU's
+// own flag) and as the CTU row's history holds it (CU::saveModelsInHCCP copies curCand before that: an LM CU's 0), per
+// model and component the range of the template's chroma (rangeMin, rangeMax, rangeChange), then per component the
+// first model's parameters (64-bit, two words each, low first) and the second's. A CCLM or GLM block writes its
+// component's part, a CCCM block (the Cb block: predIntraCCCM predicts both components) both
 const int CCP_OUT_TYPE = 0, CCP_OUT_GLM_IDC = 1, CCP_OUT_Y_THRES = 2, CCP_OUT_LUMA_OFFSET = 3, CCP_OUT_COR_OFF = 4;
-const int CCP_OUT_MDF = 6, CCP_OUT_NUM_PARAMS = 7, CCP_OUT_SHIFT = 8, CCP_OUT_SHIFT2 = 10, CCP_OUT_RANGE = 12;
+const int CCP_OUT_MDF = 6, CCP_OUT_NUM_PARAMS = 7, CCP_OUT_SHIFT = 8, CCP_OUT_SHIFT2 = 10, CCP_OUT_INSIDE = 12;
+const int CCP_OUT_INSIDE_HIST = 13, CCP_OUT_RANGE = 14;
 const int CCP_MAX_PARAMS = 11;   // NUM_CCP_PARAMS
-const int CCP_OUT_PARAMS = 24, CCP_OUT_PARAMS2 = CCP_OUT_PARAMS + 4 * CCP_MAX_PARAMS;
+const int CCP_OUT_PARAMS = 26, CCP_OUT_PARAMS2 = CCP_OUT_PARAMS + 4 * CCP_MAX_PARAMS;
 const int CCP_OUT = CCP_OUT_PARAMS2 + 4 * CCP_MAX_PARAMS;
 // CCPType
 const int CCP_TYPE_CCLM = 1, CCP_TYPE_MMLM = 2, CCP_TYPE_GLM0123 = 4, CCP_TYPE_GLM4567 = 8, CCP_TYPE_CCCM = 16;
@@ -655,7 +659,7 @@ struct Params
   uint64_t timdData;    // the TIMD CUs' records (Cu::timd, TimdHead)
   uint64_t timdOut;     // int32 per TIMD CU (TIMD_OUT): its TIMD, written by its node (for its blocks, the comparison)
   uint64_t tmrlOut;     // int32 per TMRL CU (TMRL_OUT): its mode and line, written by its node (for its blocks, the comparison)
-  uint64_t ccpOut;      // int32 per LM CU (CCP_OUT): its CCP model, written by its blocks (at Tu::ccp; the comparison)
+  uint64_t ccpOut;      // int32 per LM / LM chroma fusion CU (CCP_OUT): its CCP model, written by its blocks (Tu::ccp)
   int      origin[3];
   int      stride[3];
   int      width[3];
