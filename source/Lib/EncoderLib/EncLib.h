@@ -279,6 +279,10 @@ public:
   void      destroy         ();
   void      init            ( bool isFieldCoding, AUWriterIf* auWriterIf );
   void      deletePicBuffer ();
+  /// frame threads: frees the search buffers of the finished pictures nothing reads any more (Picture::releaseUnreadBufs);
+  /// a reconstruction that is written is freed only from encodePrep, after the application wrote it
+  void      releaseUnreadPics();
+  void      xReleaseUnreadPics( bool afterOutput );   ///< with m_picListMutex held
 
   // -------------------------------------------------------------------------------------------------------------------
   // member access functions

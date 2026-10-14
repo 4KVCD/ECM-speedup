@@ -1337,6 +1337,15 @@ bool EncLib::encodePrep(bool flush, PelStorage* pcPicYuvOrg, const InputColourSp
       picListLock.lock();   // the setups of earlier GOPs may use the list (EncGOP::compressGOP)
     }
     xGetNewPicBuffer( rcListPicYuvRecOut, pcPicCurr, ppsID );
+    if( getFrameThreads() > 1 )
+    {
+      xReleaseUnreadPics( true );   // the pictures whose reconstruction the application has written since
+      if( pcPicCurr->origReleased )
+      {
+        pcPicCurr->recreateOrigBuf();   // takes the frame below
+        pcPicCurr->origReleased = false;
+      }
+    }
 
     const PPS *pPPS = ( ppsID < 0 ) ? m_ppsMap.getFirstPS() : m_ppsMap.getPS( ppsID );
     const SPS *pSPS = m_spsMap.getPS( pPPS->getSPSId() );
@@ -1623,6 +1632,30 @@ bool EncLib::encode( const InputColourSpaceConversion snrCSC, std::list<PelUnitB
  .
  \retval rpcPic obtained picture buffer
  */
+void EncLib::releaseUnreadPics()
+{
+  std::lock_guard<std::mutex> lock( m_picListMutex );
+  xReleaseUnreadPics( false );
+}
+
+void EncLib::xReleaseUnreadPics( bool afterOutput )
+{
+  // A finished picture that nothing reads any more: no setup after the latest one references it (a picture marked
+  // unused for reference stays unused), no picture set up and not done references it, and its reconstruction is not
+  // written at all or was handed out (getFrameThreadsOutput) before the application's last writes (afterOutput: from
+  // encodePrep, which the application calls after writing). Its buffers would otherwise stay until the buffer takes
+  // the next picture: the pictures of a completed period wait for the output of the earlier periods.
+  for( Picture* pic: m_cListPic )
+  {
+    if( !pic->unreadBufsReleased && !pic->referenced && m_cGOPEncoder.isPicFinished( pic )
+        && !m_cGOPEncoder.isPicReferencedInFlight( pic )
+        && ( m_reconFileName.empty() || ( afterOutput && !m_ftBusyPics.count( pic ) ) ) )
+    {
+      pic->releaseUnreadBufs();
+    }
+  }
+}
+
 bool EncLib::isOrigReloadable()
 {
   if( m_origReloadable < 0 )
@@ -1644,7 +1677,7 @@ bool EncLib::getFrameThreadsOutput( PelUnitBuf& rec )
   m_ftOutputQueue.pop_front();
   m_cGOPEncoder.forgetPicDone( pic );
   m_ftBusyPics.erase( pic );
-  rec = pic->getRecoBuf();
+  rec = pic->unreadBufsReleased ? PelUnitBuf() : pic->getRecoBuf();   // released: not written (no reconstruction file)
   return true;
 }
 

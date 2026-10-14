@@ -342,8 +342,23 @@ void Picture::releaseSearchBuffers()
   cs->rebindPicBufs();   // drops the coding structure's view of the reconstruction
 }
 
+void Picture::releaseUnreadBufs()
+{
+  for( PictureType type: { PIC_ORIGINAL, PIC_TRUE_ORIGINAL, PIC_ORIGINAL_INPUT, PIC_TRUE_ORIGINAL_INPUT } )
+  {
+    if( !M_BUFS( 0, type ).bufs.empty() )
+    {
+      M_BUFS( 0, type ).destroy();
+    }
+  }
+  origReleased = true;
+  releaseSearchBuffers();
+  unreadBufsReleased = true;
+}
+
 void Picture::createSearchBuffers()
 {
+  unreadBufsReleased = false;
   const Area a( Position(), lumaSize() );
 #if JVET_Z0118_GDR
   for( int i = 0; i < m_numRecoBufs; i++ )

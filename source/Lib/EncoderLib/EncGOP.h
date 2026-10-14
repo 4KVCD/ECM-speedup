@@ -360,6 +360,8 @@ public:
   /// A picture is done (encoded, written, its reconstruction final); forgetPicDone before the buffer is reused.
   bool  isPicDone           ( const Picture* pic );
   void  forgetPicDone       ( const Picture* pic );
+  /// The picture's finish has ended (its log and access unit may still wait for earlier pictures); until forgetPicDone.
+  bool  isPicFinished       ( const Picture* pic );
   /// Frame threads: a picture set up and not done references the picture (its buffer must not be reused).
   bool  isPicReferencedInFlight( const Picture* pic );
   void  compressGOP ( int iPOCLast, int iNumPicRcvd, PicList& rcListPic, std::list<PelUnitBuf*>& rcListPicYuvRec,
@@ -520,6 +522,7 @@ protected:
   bool                     m_ftError      = false;
   std::exception_ptr       m_ftFirstError;
   std::set<const Picture*> m_ftPicsDone;               ///< done and not yet forgotten (forgetPicDone)
+  std::set<const Picture*> m_ftPicsFinished;           ///< finish ended and not yet forgotten (forgetPicDone)
   std::map<const Picture*, int> m_ftRefsInFlight;      ///< per picture: references to it by pictures set up and not done
   std::vector<bool>        m_ftStackBusy;
   std::set<std::pair<double, int64_t>> m_ftStackWaiters;   ///< (-search priority, turn) of the searches waiting for a

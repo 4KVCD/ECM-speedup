@@ -128,6 +128,13 @@ void create(
   /// per-4x4 arrays (EncLib::encodePrep releases them, EncGOP::xStartPicSearch creates them)
   void releaseSearchBuffers();
   void createSearchBuffers();
+  /// frame threads: a finished picture frees its original, true original and search buffers once nothing reads it any
+  /// more (releaseUnreadBufs, EncLib::releaseUnreadPics; the setups of later pictures read a reference's original for
+  /// the picture-level LIC decision); the original is made again when the buffer takes the next picture, the search
+  /// buffers at the search start
+  void releaseUnreadBufs();
+  bool origReleased       = false;   ///< releaseUnreadBufs, until EncLib::encodePrep makes the original again
+  bool unreadBufsReleased = false;   ///< releaseUnreadBufs, until the search start makes the buffers again
   /// frame threads: while a picture waits for its search, its original and true original are kept in 8 bits per
   /// sample where that is lossless (every sample a multiple of 1 << (bit depth - 8) and below 256 << it, as an 8-bit
   /// source read into a higher internal bit depth gives); unpackWaitingBufs restores them

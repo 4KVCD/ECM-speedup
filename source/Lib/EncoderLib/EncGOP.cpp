@@ -208,6 +208,7 @@ void EncGOP::compressGOPFrameThreads( int numPics, int iPOCLast, int iNumPicRcvd
 #endif
     m_ftPicsInFlight.clear();
     m_ftPicsDone.clear();
+    m_ftPicsFinished.clear();
   }
   int64_t firstTurn;
   {
@@ -301,6 +302,13 @@ void EncGOP::forgetPicDone( const Picture* pic )
 {
   std::lock_guard<std::mutex> lock( m_ftMutex );
   m_ftPicsDone.erase( pic );
+  m_ftPicsFinished.erase( pic );
+}
+
+bool EncGOP::isPicFinished( const Picture* pic )
+{
+  std::lock_guard<std::mutex> lock( m_ftMutex );
+  return m_ftPicsFinished.count( pic ) > 0;
 }
 
 void EncGOP::xFtSkip( int64_t turn )
@@ -556,6 +564,7 @@ void EncGOP::xEndPicture( EncPicOrder& order )
   std::lock_guard<std::mutex> lock( m_ftMutex );
   order.finished = true;
   m_ftPicsInFlight.erase( order.pic );
+  m_ftPicsFinished.insert( order.pic );
   for( const Picture* ref: order.refs )
   {
     if( --m_ftRefsInFlight[ref] == 0 )
@@ -5948,6 +5957,10 @@ void EncGOP::compressGOP(int iPOCLast, int iNumPicRcvd, PicList &rcListPic, std:
       g_msgCapture = nullptr;
     }
     xEndPicture( *picOrder );
+    if( m_ftActive )
+    {
+      m_pcEncLib->releaseUnreadPics();   // this picture, or those it was the last to read
+    }
     if( m_ftActive && m_ftPeriods > 1 )
     {
       xFtOutput( *picOrder );
