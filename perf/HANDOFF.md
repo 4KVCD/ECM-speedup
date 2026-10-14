@@ -15,7 +15,8 @@ memory, scratchpad and claude.ai artifacts do not carry over.
    this file, in short form.
 3. Check the state:
    - `git -C C:/Code/opt status`: clean, branch `opt` at 7d41000f or a later handoff commit.
-   - `git -C C:/Code/opt fetch origin`: `origin/perf` = `origin/merge` = `opt`.
+   - `git -C C:/Code/opt pull`: `opt` tracks `origin/perf` (the `merge` branch, which mirrored `perf`, was deleted on
+     2026-10-14).
    - `gh auth status`: logged in as 4KVCD.
 4. Before changing code, confirm the setup: run the suite with the current build. Every md5 must match
    `C:\Code\runs\results\ref.json`.
@@ -27,8 +28,9 @@ memory, scratchpad and claude.ai artifacts do not carry over.
 
 ## 1. Where things stand
 
-- **Branches** on github.com/4KVCD/ECM-speedup: `perf` (default) and `merge` point to the same commit and hold all kept
-  work. Locally the work branch is `opt` in `C:\Code\opt`, which tracks `origin/merge`.
+- **Branches** on github.com/4KVCD/ECM-speedup: `perf` (default) holds all kept work; `merge`, which only mirrored it,
+  was deleted on 2026-10-14. Locally the work branch is `opt` in `C:\Code\opt`, which tracks `origin/perf`. The
+  frame-thread work was done on `enc-mt` in `C:\Code\vk` (perf/HANDOFF_MULTITHREADING.md) and merged into `perf`.
   - `dev` has 3 commits from an earlier session on the user's other PC (an i7-10700) that are not merged; see
     section 9.
   - The stock baseline is 6d442b2a: tag ECM-20.0 (3391a5f0) plus two GCC 16 build fixes.
@@ -98,7 +100,8 @@ memory, scratchpad and claude.ai artifacts do not carry over.
 ```
 C:\Code\ECM      main clone, branch perf at 2ffd9ac3 (behind origin/perf; pull before using it). Never commit here.
                  bench.py reads its cfg files from C:\Code\ECM\cfg (unchanged from stock).
-C:\Code\opt      work worktree, branch opt -> origin/merge (same commit as origin/perf)
+C:\Code\opt      work worktree, branch opt -> origin/perf (pull before using it)
+C:\Code\vk       worktree, branch enc-mt -> origin/enc-mt (the frame-thread work; merged into perf)
 C:\Code\stock    worktree at 6d442b2a (stock + GCC 16 fixes), built as C:\Code\bin\stock
 C:\Code\probe, probe2, probe3, probe4
                  detached scratch worktrees for experiments and probes; reset before use:
@@ -221,10 +224,11 @@ Push only after the user says yes for that push. The Git Credential Manager dial
 so use the gh login:
 
 ```bash
-git -C C:/Code/opt -c credential.helper= -c 'credential.helper=!gh auth git-credential' push origin opt:merge opt:perf
+git -C C:/Code/opt -c credential.helper= -c 'credential.helper=!gh auth git-credential' push origin opt:perf
 ```
 
-Both are fast-forwards today. `perf` is the default branch and shows the README.
+It is a fast-forward when the branch contains `origin/perf`; otherwise merge `origin/perf` into it first (no rebase,
+no force-push). `perf` is the default branch and shows the README.
 
 ## 5. Reference numbers (this PC)
 
