@@ -169,6 +169,7 @@ void VideoIOYuv::open( const std::string &fileName, bool bWriteMode, const int f
       m_outY4m = true;
     }
 #endif
+    m_outHeaderBytes = m_cHandle.tellp();
   }
   else
   {
@@ -338,6 +339,35 @@ bool VideoIOYuv::isEof()
 bool VideoIOYuv::isFail()
 {
   return m_cHandle.fail();
+}
+
+void VideoIOYuv::seekFrame( int frameIndex, uint32_t width, uint32_t height, ChromaFormat format )
+{
+  // the bytes of a written frame, as write() lays them out: every component's cropped plane, 2 bytes a sample if any
+  // file bit depth exceeds 8, after the y4m frame header
+  bool is16bit = false;
+  for( uint32_t ch = 0; ch < MAX_NUM_CHANNEL_TYPE; ch++ )
+  {
+    is16bit |= m_fileBitdepth[ch] > 8;
+  }
+  std::streamoff frameBytes = 0;
+  for( uint32_t comp = 0; comp < getNumberValidComponents( format ); comp++ )
+  {
+    const ComponentID compID = ComponentID( comp );
+    frameBytes += std::streamoff( width >> getComponentScaleX( compID, format ) ) * ( height >> getComponentScaleY( compID, format ) );
+  }
+  frameBytes *= is16bit ? 2 : 1;
+#if Y4M_SUPPORT
+  if( m_outY4m )
+  {
+    frameBytes += Y4M_FRAME_HEADER_LENGTH;
+  }
+#endif
+  m_cHandle.seekp( m_outHeaderBytes + frameBytes * frameIndex );
+  if( m_cHandle.fail() )
+  {
+    m_cHandle.clear();   // a device that cannot seek (NUL): the frames are written as they come
+  }
 }
 
 /**

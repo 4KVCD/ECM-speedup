@@ -197,6 +197,7 @@ void EncGOP::compressGOPFrameThreads( int numPics, int iPOCLast, int iNumPicRcvd
     m_ftOutputTurn = 0;
     m_ftNumTurns   = 0;
     m_ftNumDone    = 0;
+    m_ftNumFinished = 0;
     m_ftError      = false;
     m_ftFirstError = nullptr;
     m_ftStackBusy.assign( m_pcEncLib->getNumSearchStacks(), false );
@@ -207,7 +208,6 @@ void EncGOP::compressGOPFrameThreads( int numPics, int iPOCLast, int iNumPicRcvd
     m_ftWriterPartitionerSST.reset();
 #endif
     m_ftPicsInFlight.clear();
-    m_ftPicsDone.clear();
     m_ftPicsFinished.clear();
   }
   int64_t firstTurn;
@@ -271,6 +271,18 @@ void EncGOP::waitFrameThreads( int64_t maxPending )
   }
 }
 
+bool EncGOP::waitFrameThreadsFinished( int64_t& numFinished )
+{
+  std::unique_lock<std::mutex> lock( m_ftMutex );
+  // no picture is passed in any more: all-intra searches may take stacks (xFtAcquireStack), else none would start
+  m_ftInputWaits = true;
+  m_ftCv.notify_all();
+  m_ftCv.wait( lock, [&]() { return m_ftError || m_ftNumFinished > numFinished || m_ftNumDone == m_ftNumTurns; } );
+  m_ftInputWaits = false;
+  numFinished = m_ftNumFinished;
+  return m_ftError || m_ftNumDone == m_ftNumTurns;   // an error: finishFrameThreads rethrows it
+}
+
 void EncGOP::finishFrameThreads()
 {
   if( !m_ftActive )
@@ -286,22 +298,15 @@ void EncGOP::finishFrameThreads()
   }
 }
 
-bool EncGOP::isPicDone( const Picture* pic )
-{
-  std::lock_guard<std::mutex> lock( m_ftMutex );
-  return m_ftPicsDone.count( pic ) > 0;
-}
-
 bool EncGOP::isPicReferencedInFlight( const Picture* pic )
 {
   std::lock_guard<std::mutex> lock( m_ftMutex );
   return m_ftRefsInFlight.count( pic ) > 0;
 }
 
-void EncGOP::forgetPicDone( const Picture* pic )
+void EncGOP::forgetPicFinished( const Picture* pic )
 {
   std::lock_guard<std::mutex> lock( m_ftMutex );
-  m_ftPicsDone.erase( pic );
   m_ftPicsFinished.erase( pic );
 }
 
@@ -362,7 +367,6 @@ void EncGOP::xFtOutput( EncPicOrder& order )
   order.au.reset();
   order.analyze.reset();
   std::lock_guard<std::mutex> lock( m_ftMutex );
-  m_ftPicsDone.insert( order.pic );
   m_ftOutputTurn = order.turn + 1;
   m_ftCv.notify_all();
 }
@@ -565,6 +569,7 @@ void EncGOP::xEndPicture( EncPicOrder& order )
   order.finished = true;
   m_ftPicsInFlight.erase( order.pic );
   m_ftPicsFinished.insert( order.pic );
+  m_ftNumFinished++;
   for( const Picture* ref: order.refs )
   {
     if( --m_ftRefsInFlight[ref] == 0 )
@@ -573,10 +578,6 @@ void EncGOP::xEndPicture( EncPicOrder& order )
     }
   }
   order.refs.clear();
-  if( m_ftPeriods == 1 )
-  {
-    m_ftPicsDone.insert( order.pic );   // else after its output (xFtOutput)
-  }
   xFtMarkFinished( order.turn );
   m_ftCv.notify_all();
 }

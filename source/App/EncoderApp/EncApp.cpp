@@ -2064,20 +2064,15 @@ bool EncApp::encode()
       // the GOP's pictures may still be in flight: write the pictures done so far, at the end all of them
       if( m_eos )
       {
+        // the pictures still in flight: written as they finish, so that their buffers are freed meanwhile
+        int64_t numFinished = 0;
+        while( !m_cEncLib.waitFrameThreadsFinished( numFinished ) )
+        {
+          xWriteFrameThreadsOutput();
+        }
         m_cEncLib.finishFrameThreads();
       }
-      std::deque<PelUnitBuf> recs;
-      std::list<PelUnitBuf*> recList;
-      PelUnitBuf             rec;
-      while( m_cEncLib.getFrameThreadsOutput( rec ) )
-      {
-        recs.push_back( rec );
-        recList.push_back( &recs.back() );
-      }
-      if( !recList.empty() )
-      {
-        xWriteOutput( int( recList.size() ), recList );
-      }
+      xWriteFrameThreadsOutput();
     }
     // write bistream to file if necessary
     else if( m_numEncoded > 0 )
@@ -2114,6 +2109,48 @@ bool EncApp::encode()
   \param iNumEncoded    number of encoded frames
   \param accessUnits    list of access units to be written
  */
+void EncApp::xWriteFrameThreadsOutput()
+{
+  // each picture whose finish has ended goes to its frame's position in the reconstruction file at once, so that the
+  // encoder frees its buffers (a completed intra period would otherwise wait for the earlier periods' output)
+  PelUnitBuf rec;
+  int        frameIndex;
+  bool       written = false;
+  while( m_cEncLib.getFrameThreadsOutput( rec, frameIndex ) )
+  {
+    if( !m_reconFileName.empty() && !rec.bufs.empty() )
+    {
+      xWriteReconAt( frameIndex, rec );
+    }
+    written = true;
+  }
+  if( written )
+  {
+    m_cEncLib.releaseWrittenPics();
+  }
+}
+
+void EncApp::xWriteReconAt( int frameIndex, const PelUnitBuf& rec )
+{
+  // as xWriteOutput writes a picture without reference picture resampling (which frame threads do not support)
+  const InputColourSpaceConversion ipCSC = ( !m_outputInternalColourSpace ) ? m_inputColourSpaceConvert : IPCOLOURSPACE_UNCHANGED;
+  const ChromaFormat               chromaFormat = m_cEncLib.getChromaFormatIdc();
+#if JVET_AC0096
+  const Window& confWindow = m_cEncLib.getPPS( 0 )->getConformanceWindow();
+  const int     confLeft   = confWindow.getWindowLeftOffset() * SPS::getWinUnitX( chromaFormat );
+  const int     confRight  = confWindow.getWindowRightOffset() * SPS::getWinUnitX( chromaFormat );
+  const int     confTop    = confWindow.getWindowTopOffset() * SPS::getWinUnitY( chromaFormat );
+  const int     confBottom = confWindow.getWindowBottomOffset() * SPS::getWinUnitY( chromaFormat );
+#else
+  const int confLeft = m_confWinLeft, confRight = m_confWinRight, confTop = m_confWinTop, confBottom = m_confWinBottom;
+#endif
+  const uint32_t width  = rec.get( COMPONENT_Y ).width;
+  const uint32_t height = rec.get( COMPONENT_Y ).height;
+  m_cVideoIOYuvReconFile.seekFrame( frameIndex, width - confLeft - confRight, height - confTop - confBottom, chromaFormat );
+  m_cVideoIOYuvReconFile.write( width, height, rec, ipCSC, m_packedYUVMode, confLeft, confRight, confTop, confBottom,
+                                NUM_CHROMA_FORMAT, m_bClipOutputVideoToRec709Range );
+}
+
 void EncApp::xWriteOutput( int iNumEncoded, std::list<PelUnitBuf*>& recBufList )
 {
   const InputColourSpaceConversion ipCSC = (!m_outputInternalColourSpace) ? m_inputColourSpaceConvert : IPCOLOURSPACE_UNCHANGED;

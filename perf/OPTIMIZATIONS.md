@@ -151,7 +151,11 @@ lower all-core turbo, one duplicated intra frame per chunk, unequal chunk comple
   of the search stacks per block size at the first store; 11.22 -> 10.67 GB (working set 6.48 -> 5.92 GB) by making
   the coded-CU cache entries of a stack at their first use and clearing them per CTU by a generation stamp. A
   finished picture frees its originals, reconstruction and per-4x4 arrays once nothing reads it any more (unused for
-  reference, no reference in flight, reconstruction written or not written).
+  reference, no reference in flight, reconstruction written or not written), and the application writes each
+  picture's reconstruction to its frame's position in the file as soon as the picture is finished, in any order, so
+  that a completed intra period does not wait for the output of the earlier ones and the end of the input frees the
+  pictures as they finish (20 threads, 1080p, 600-1200 s: 300 frames 17.26 -> 15.68 GB commit, 600 frames
+  23.93 -> 23.51 GB).
 - No options, all 20 cores of the Core Ultra 7 265K (20 threads chosen), one run at a time, foreman 128x128 QP 32,
   against one thread (the previous default) and `--ParallelSegments=20`; bitstreams identical:
 

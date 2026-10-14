@@ -166,9 +166,10 @@ private:
   uint32_t                  m_uiNumAllPicCoded;                   ///< number of coded pictures
   PicList&                  m_cListPic;                           ///< dynamic list of pictures
   // frame threads: the reading of a picture into m_cListPic (encodePrep) and the setups of the pictures in flight
-  // take turns; the pictures read wait in input order for their output, and their buffers are not reused before
+  // take turns; the pictures read wait in input order for the handout of their reconstruction
+  // (getFrameThreadsOutput), and their buffers are not reused before
   std::mutex                m_picListMutex;
-  std::deque<Picture*>      m_ftOutputQueue;
+  std::deque<std::pair<Picture*, int>> m_ftOutputQueue;   ///< the pictures read, with their frame index in the output
   std::set<const Picture*>  m_ftBusyPics;
   int                       m_numInputPics  = 0;       ///< pictures received (encodePrep): their frames in the input file
   int                       m_origReloadable = -1;     ///< frame threads: the search start can read a picture's original
@@ -376,11 +377,15 @@ public:
                std::list<PelUnitBuf*>& rcListPicYuvRecOut,
                int& iNumEncoded );
 
-  /// Frame threads: the reconstruction of the next picture in output order, if it is done (else false). The picture's
-  /// buffer may be reused by the next encodePrep, so the caller writes it out before.
-  bool getFrameThreadsOutput( PelUnitBuf& rec );
+  /// Frame threads: the reconstruction of a picture whose finish has ended, with its frame index in the output, in
+  /// any order (else false; none while a picture's finish is pending). The caller writes it to the frame's position
+  /// before the next encodePrep, which may free the buffer.
+  bool getFrameThreadsOutput( PelUnitBuf& rec, int& frameIndex );
   /// Frame threads: waits until every picture started is done.
   void finishFrameThreads   () { m_cGOPEncoder.finishFrameThreads(); }
+  bool waitFrameThreadsFinished( int64_t& numFinished ) { return m_cGOPEncoder.waitFrameThreadsFinished( numFinished ); }
+  /// Frame threads: frees the buffers of the pictures the application wrote since (releaseUnreadPics after writing)
+  void releaseWrittenPics();
 
   bool encodePrep( bool bEos,
                PelStorage* pcPicYuvOrg,

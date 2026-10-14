@@ -1391,6 +1391,9 @@ bool EncLib::encodePrep(bool flush, PelStorage* pcPicYuvOrg, const InputColourSp
     pcPicCurr->poc = m_iPOCLast;
     if( getFrameThreads() > 1 )
     {
+      // a reused buffer starts with no record of its previous picture: a stale 'finished' would hand the next picture
+      // out and free its buffers during its search (getFrameThreadsOutput, xReleaseUnreadPics)
+      m_cGOPEncoder.forgetPicFinished( pcPicCurr );
       pcPicCurr->releaseSearchBuffers();   // until its search starts (EncGOP::xStartPicSearch)
     }
 
@@ -1401,7 +1404,7 @@ bool EncLib::encodePrep(bool flush, PelStorage* pcPicYuvOrg, const InputColourSp
     }
     if( getFrameThreads() > 1 )
     {
-      m_ftOutputQueue.push_back( pcPicCurr );   // the pictures come in output order
+      m_ftOutputQueue.emplace_back( pcPicCurr, m_numInputPics - 1 );   // the pictures come in output order
       m_ftBusyPics.insert( pcPicCurr );
     }
   }
@@ -1638,6 +1641,12 @@ void EncLib::releaseUnreadPics()
   xReleaseUnreadPics( false );
 }
 
+void EncLib::releaseWrittenPics()
+{
+  std::lock_guard<std::mutex> lock( m_picListMutex );
+  xReleaseUnreadPics( true );
+}
+
 void EncLib::xReleaseUnreadPics( bool afterOutput )
 {
   // A finished picture that nothing reads any more: no setup after the latest one references it (a picture marked
@@ -1667,15 +1676,22 @@ bool EncLib::isOrigReloadable()
   return m_origReloadable > 0;
 }
 
-bool EncLib::getFrameThreadsOutput( PelUnitBuf& rec )
+bool EncLib::getFrameThreadsOutput( PelUnitBuf& rec, int& frameIndex )
 {
-  if( m_ftOutputQueue.empty() || !m_cGOPEncoder.isPicDone( m_ftOutputQueue.front() ) )
+  // the first picture whose finish ended, in input order (its log and access unit may still wait for earlier
+  // pictures, which keeps neither its reconstruction nor the buffers xReleaseUnreadPics frees)
+  auto it = m_ftOutputQueue.begin();
+  while( it != m_ftOutputQueue.end() && !m_cGOPEncoder.isPicFinished( it->first ) )
+  {
+    ++it;
+  }
+  if( it == m_ftOutputQueue.end() )
   {
     return false;
   }
-  Picture* pic = m_ftOutputQueue.front();
-  m_ftOutputQueue.pop_front();
-  m_cGOPEncoder.forgetPicDone( pic );
+  Picture* pic = it->first;
+  frameIndex   = it->second;
+  m_ftOutputQueue.erase( it );
   m_ftBusyPics.erase( pic );
   rec = pic->unreadBufsReleased ? PelUnitBuf() : pic->getRecoBuf();   // released: not written (no reconstruction file)
   return true;
@@ -1710,7 +1726,8 @@ void EncLib::xGetNewPicBuffer ( std::list<PelUnitBuf*>& rcListPicYuvRecOut, Pict
     {
       rpcPic = *iterPic;
       // with frame threads, pictures read ahead may already be marked unused for reference, and a picture's buffer
-      // stays until it is output (m_ftBusyPics) and no picture in flight references it
+      // stays until its reconstruction is handed out (m_ftBusyPics, getFrameThreadsOutput; its log and access unit,
+      // which may still wait, read nothing of it) and no picture in flight references it
       if( !rpcPic->referenced && rpcPic->layerId == m_layerId && !m_ftBusyPics.count( rpcPic )
           && !( getFrameThreads() > 1 && m_cGOPEncoder.isPicReferencedInFlight( rpcPic ) ) )
       {

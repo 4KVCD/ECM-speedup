@@ -355,12 +355,14 @@ public:
                                  bool isEncodeLtRef );
   /// Waits until at most maxPending of the started pictures are not done; throws the error of a failed picture.
   void  waitFrameThreads    ( int64_t maxPending );
+  /// Waits until a picture's finish has ended since the caller last saw numFinished (updated) or all pictures are done
+  /// (returns true): the application writes the finished pictures' reconstructions meanwhile.
+  bool  waitFrameThreadsFinished( int64_t& numFinished );
   /// Waits until all started pictures are done; throws the error of a failed picture.
   void  finishFrameThreads  ();
-  /// A picture is done (encoded, written, its reconstruction final); forgetPicDone before the buffer is reused.
-  bool  isPicDone           ( const Picture* pic );
-  void  forgetPicDone       ( const Picture* pic );
-  /// The picture's finish has ended (its log and access unit may still wait for earlier pictures); until forgetPicDone.
+  /// The picture's finish has ended (its log and access unit may still wait for earlier pictures, which read nothing
+  /// of it); until forgetPicFinished, before its buffer takes the next picture.
+  void  forgetPicFinished   ( const Picture* pic );
   bool  isPicFinished       ( const Picture* pic );
   /// Frame threads: a picture set up and not done references the picture (its buffer must not be reused).
   bool  isPicReferencedInFlight( const Picture* pic );
@@ -505,6 +507,7 @@ protected:
   std::condition_variable  m_ftCv;
   int64_t                  m_ftSetupTurn  = 0;         ///< turn (EncPicOrder::turn) whose setup may run
   bool                     m_ftInputWaits = false;     ///< the input side waits for pictures to be done (waitFrameThreads)
+  int64_t                  m_ftNumFinished = 0;        ///< pictures whose finish ended (waitFrameThreadsFinished)
   int                      m_ftPeriods    = 1;         ///< finish contexts (FramePeriods)
   int64_t                  m_ftPeriod     = -1;        ///< the intra period of the last setup
   std::vector<std::shared_ptr<EncPicOrder>> m_ftCtxLast;   ///< per finish context: the last picture set up to use it
@@ -521,8 +524,7 @@ protected:
   static thread_local int64_t m_ftTurn;                ///< the turn of the running compressGOP call
   bool                     m_ftError      = false;
   std::exception_ptr       m_ftFirstError;
-  std::set<const Picture*> m_ftPicsDone;               ///< done and not yet forgotten (forgetPicDone)
-  std::set<const Picture*> m_ftPicsFinished;           ///< finish ended and not yet forgotten (forgetPicDone)
+  std::set<const Picture*> m_ftPicsFinished;           ///< finish ended and not yet forgotten (forgetPicFinished)
   std::map<const Picture*, int> m_ftRefsInFlight;      ///< per picture: references to it by pictures set up and not done
   std::vector<bool>        m_ftStackBusy;
   std::set<std::pair<double, int64_t>> m_ftStackWaiters;   ///< (-search priority, turn) of the searches waiting for a

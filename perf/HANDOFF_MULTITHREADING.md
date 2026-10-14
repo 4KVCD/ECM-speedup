@@ -232,6 +232,22 @@ Commits on `enc-mt`, all bit-exact with stock ECM-20.0 (bitstream md5 of the sui
   stack) makes an entry at its first use and clears entries per CTU by a generation stamp (`xEntry`) instead of
   making all at create and zero-filling all at every CTU. 1080p, 20 threads, 75-150 s: commit 11.22 -> 10.67 GB,
   working set 6.48 -> 5.92 GB.
+- RAM step R13: the application writes a picture's reconstruction to its frame's position in the reconstruction
+  file as soon as the picture's finish has ended (`EncLib::getFrameThreadsOutput` hands out any finished picture with
+  its frame index, `EncApp::xWriteReconAt`, `VideoIOYuv::seekFrame`; a device that cannot seek, NUL, is written as the
+  frames come), then frees the written pictures' buffers (`EncLib::releaseWrittenPics`); the flush at the end of the
+  input hands pictures out as they finish too (`EncGOP::waitFrameThreadsFinished`, which marks the input side as
+  waiting like `waitFrameThreads`: all-intra searches take stacks only then, and a first version without it hung on
+  1- and 2-picture all-intra encodes with 8 threads) instead of waiting for all. The log lines and access units
+  still go out in coding order. A reused picture buffer forgets its previous picture's 'finished' state at reuse
+  (`forgetPicFinished` in `encodePrep`): a stale flag handed the next picture out and freed its buffers during its
+  search (AI 33 pictures, 4 threads: access violation in the CU search, found with the crash report's call stack).
+  Measurement: the 300-frame 1080p sequence is shorter than the 20-thread window (320 pictures), so the whole encode
+  is the flush, and before this step nothing was handed out or freed in it (the 140 finished pictures holding 7 GB
+  in the earlier probe were that, not output order in general). 1080p RA, 20 threads, previous commit -> R13 (commit
+  / working set, GB, one run each after the other): 300 frames, 600-1200 s 17.26 / 12.66 -> 15.68 / 11.10, peak
+  19.49 -> 18.11; 600 frames (the window slides as periods complete), 600-1200 s 23.93 / 18.27 -> 23.51 / 17.85,
+  peak 27.20 -> 26.82. At 600 frames commit climbs from 18.5 to 25 GB between 600 and 900 s and stays there.
 - Speed step S1: in all intra, the pictures waiting for a search stack take them in order of decreasing luma activity
   (`EncGOP::xFtSearchPriority`, the cost estimate of `--ParallelSegments`) instead of coding order, so the expensive
   pictures do not start last. AI 33 pictures, 2 runs each alternating with the previous build: 8 P-cores 34.5 -> 33.0 s
