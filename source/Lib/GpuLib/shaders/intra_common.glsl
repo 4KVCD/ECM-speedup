@@ -2,7 +2,7 @@
 #ifndef INTRA_COMMON_GLSL
 #define INTRA_COMMON_GLSL
 
-// one transform block of one component (102 int32, layout shared with GpuIntraRec.cpp)
+// one transform block of one component (103 int32, layout shared with GpuIntraRec.cpp)
 struct Tu
 {
   int comp, x, y, w, h;
@@ -69,8 +69,11 @@ struct Tu
   // by its units' availability bits (-1: none)
   int cflm;
   // an LM or LM chroma fusion block's CU's CCP model, which the block writes its part of: its record in Params::ccpOut
-  // (CCP_OUT_*; -1: none)
+  // (CCP_OUT_*; -1: none); a CCP merge block's the model its CU inherits, which its Cb block writes
   int ccp;
+  // a CCP merge block (JVET-AD0188, intra_ccp.glsl): its CU's sources of candidates in Params::ccpData (CCP_MERGE_*;
+  // -1: not a merge block)
+  int ccpMerge;
 };
 layout( buffer_reference, std430, buffer_reference_align = 4 ) buffer BufTu { Tu v[]; };
 
@@ -145,6 +148,16 @@ const int CCP_OUT = CCP_OUT_PARAMS2 + 4 * CCP_MAX_PARAMS;
 // CCPType
 const int CCP_TYPE_CCLM = 1, CCP_TYPE_MMLM = 2, CCP_TYPE_GLM0123 = 4, CCP_TYPE_GLM4567 = 8, CCP_TYPE_CCCM = 16;
 const int CCP_TYPE_GLCCCM = 32, CCP_TYPE_NSCCCM = 64, CCP_TYPE_MDFCCCM = 128;
+// Params::ccpData (int32; layout shared with GpuIntraRec.cpp): from 0 per CCP record its blocks (CCP_WRITERS each: the
+// Cb block's, then the Cr block's index; -1: none), which intra_deps makes a merge block wait for; a CCP merge CU's
+// entry at Tu::ccpMerge: where its CTU row's history begins in ccpData (the records CU::saveModelsInHCCP pushed into
+// cs.ccpLut before the CU, in decoding order), their number, the candidate the bitstream selects (idxNonLocalCCP - 1),
+// the first of the 24 records its blocks' default candidates take (after the PUs' records: the Cb block's 12, then
+// the Cr block's), the number of spatial sources, then those records (PU::getCCPModelCandidateList's adjacent and
+// non-adjacent positions' PUs, decoded before the CU, typed, each once)
+const int CCP_WRITERS = 2;
+const int CCP_MERGE_HIST = 0, CCP_MERGE_HIST_NUM = 1, CCP_MERGE_INDEX = 2, CCP_MERGE_DEFAULTS = 3;
+const int CCP_MERGE_NUM_SPATIAL = 4, CCP_MERGE_SPATIAL = 5;
 
 // Tu::derive
 const int DERIVE_NODE     = 32;  // not a block: the derivation of the mode of CU Tu::cu, before the CU's blocks
@@ -659,7 +672,10 @@ struct Params
   uint64_t timdData;    // the TIMD CUs' records (Cu::timd, TimdHead)
   uint64_t timdOut;     // int32 per TIMD CU (TIMD_OUT): its TIMD, written by its node (for its blocks, the comparison)
   uint64_t tmrlOut;     // int32 per TMRL CU (TMRL_OUT): its mode and line, written by its node (for its blocks, the comparison)
-  uint64_t ccpOut;      // int32 per LM / LM chroma fusion CU (CCP_OUT): its CCP model, written by its blocks (Tu::ccp)
+  uint64_t ccpOut;      // int32 per LM / LM chroma fusion / CCP merge CU (CCP_OUT): its CCP model, which its blocks
+                        // write (Tu::ccp)
+  uint64_t ccpData;     // int32: per CCP record its writing blocks (CCP_WRITERS), the CTU rows' histories, the merge
+                        // CUs' sources (Tu::ccpMerge; intra_ccp.glsl)
   int      origin[3];
   int      stride[3];
   int      width[3];

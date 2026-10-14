@@ -262,6 +262,35 @@ void cflmDeps( Tu t )
   addAreaDeps( 0, 2 * ( t.x - sx ) - 1, 2 * ( t.y - sy ) - 1, 2 * ( t.x + t.w ) - 1, 2 * ( t.y + t.h ) - 1 );
 }
 
+// a dependency on the blocks writing CCP record r (CCP_WRITERS: its CU's chroma blocks)
+void ccpWriterDeps( int r )
+{
+  for( int k = 0; k < CCP_WRITERS; k++ )
+  {
+    addDep( BufI32( P.ccpData ).v[r * CCP_WRITERS + k] );
+  }
+}
+
+// a dependency of CCP merge block t (intra_ccp.glsl) on the blocks owning the samples its candidates' predictions read
+// - a CCCM block's of any kind (cccmDeps: also CCLM's and GLM's luma, the costs' template, the inside filter's
+// neighbours) - and on the blocks writing the models it reads: its sources' and its CTU row's history's. Each block of
+// the CU ranks the list itself: the Cr block waiting for the Cb block's record would close a cycle where joint CbCr's
+// sign prediction has the Cb block wait for the Cr block (resiFrom), a deadlock
+void ccpMergeDeps( Tu t )
+{
+  cccmDeps( t );
+  BufI32    d = BufI32( P.ccpData );
+  const int e = t.ccpMerge;
+  for( int s = 0; s < d.v[e + CCP_MERGE_NUM_SPATIAL]; s++ )
+  {
+    ccpWriterDeps( d.v[e + CCP_MERGE_SPATIAL + s] );
+  }
+  for( int h = 0; h < d.v[e + CCP_MERGE_HIST_NUM]; h++ )
+  {
+    ccpWriterDeps( d.v[d.v[e + CCP_MERGE_HIST] + h] );
+  }
+}
+
 // a dependency of chroma TMRL CU c's node on the modes it reads - the luma CUs' at its five positions and the chroma
 // neighbours' (Cu::nbr; the co-located luma CU's is the chroma nodes' own) - and on the blocks owning the samples it
 // reads: of Cb and Cr each line's whole arms (2 x (the side + 1)) and the template, of luma the co-located block and
@@ -538,6 +567,10 @@ void dependencies( int comp )
   if( lmFusionType( t ) > 1 )
   {
     cflmDeps( t );
+  }
+  if( t.ccpMerge >= 0 )
+  {
+    ccpMergeDeps( t );
   }
   if( t.ispPrev >= 0 )   // the chain of an ISP CU's sub-partitions
   {

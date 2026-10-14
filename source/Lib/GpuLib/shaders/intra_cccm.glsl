@@ -122,6 +122,10 @@ int  g_cccmGlmPattern;   // its gradient pattern (1 .. NUM_GLM_PATTERN)
 int  g_cccmShift;        // log2 of the luma buffer's samples per chroma sample and direction (1 without subsampling)
 int  g_cccmParams;       // the model's parameters
 int  g_cccmSet;          // the set of models that predicts (LBCCP's choice; 0 without it)
+// the offsets of the position features (GL-CCCM, several filters) from the reference area's coordinates: 0 for the
+// block's own models, a CCP merge candidate's corner offsets minus the block's where its costs or prediction place the
+// positions by the candidate's reference area (intra_ccp.glsl)
+int  g_cccmLocDX = 0, g_cccmLocDY = 0;
 
 // a luma buffer's row and its samples: the area padded by a chroma sample all around, in the buffer's units
 int cccmBufferW() { return ( g_cccmAreaW + 2 ) << g_cccmShift; }
@@ -555,7 +559,7 @@ int cccmFeature( int f, int x, int y, int c, int bitDepth )
   if( g_cccmMdf == 1 )
   {
     return f < 4 ? cccmLumaOf( f, x, y ) : f < 7 ? cccmNonlinear( cccmLumaOf( f - 4, x, y ), bitDepth )
-         : f == 7 ? ( y + 8 ) << 3 : ( x + 8 ) << 3;
+         : f == 7 ? ( y + g_cccmLocDY + 8 ) << 3 : ( x + g_cccmLocDX + 8 ) << 3;
   }
   if( g_cccmMdf != 0 )   // the neighbours of mode 2 (left, right), of mode 3 (above-right, below-left)
   {
@@ -564,7 +568,7 @@ int cccmFeature( int f, int x, int y, int c, int bitDepth )
     const ivec2 q = k == 0 ? ivec2( x, y ) : k == 1 ? ivec2( x + d.x, y + d.y ) : ivec2( x - d.x, y - d.y );
     return f < 3 ? cccmLumaOf( 0, q.x, q.y ) : f < 6 ? cccmLumaOf( 1, q.x, q.y )
          : f < 9 ? cccmNonlinear( cccmLumaOf( 0, q.x, q.y ), bitDepth )
-                 : g_cccmMdf == 2 ? ( x + 8 ) << 3 : ( y + 8 ) << 3;
+                 : g_cccmMdf == 2 ? ( x + g_cccmLocDX + 8 ) << 3 : ( y + g_cccmLocDY + 8 ) << 3;
   }
   if( g_cccmGl && f >= 1 && f <= 4 )
   {
@@ -576,8 +580,8 @@ int cccmFeature( int f, int x, int y, int c, int bitDepth )
     case 2:
       return ( 2 * cccmLuma( x - 1, y ) + cccmLuma( x - 1, y - 1 ) + cccmLuma( x - 1, y + 1 ) )
              - ( 2 * cccmLuma( x + 1, y ) + cccmLuma( x + 1, y - 1 ) + cccmLuma( x + 1, y + 1 ) );
-    case 3: return ( y + 8 ) << 3;
-    default: return ( x + 8 ) << 3;
+    case 3: return ( y + g_cccmLocDY + 8 ) << 3;
+    default: return ( x + g_cccmLocDX + 8 ) << 3;
     }
   }
   switch( f )
@@ -687,14 +691,39 @@ int cccmCeilLog2( int n )   // n > 0
   return n == 1 ? 0 : findMSB( n - 1 ) + 1;
 }
 
+// the clipping range of a model's prediction (xSetMinMaxClpRng) whose template chroma spanned lo .. hi (change: it
+// spans more than one value, rangeChange), of a block of `area` chroma samples: the span widened by MARGIN_PCT below
+// MIN_SAMPLES, then to the minimum span (DEF_DIFF_HIGH_RES with 256 x 256 CTUs, else DEF_DIFF_LOW_RES; none for the
+// models of more than 7 parameters fitted here, noMinimumDiff, but for CCP merge's inherited ones), within the sample
+// range; GLM with luma's the sample range alone
+ivec2 cccmClipRange( int lo, int hi, bool change, bool inherited, int area, int bitDepth )
+{
+  const int maxPel = ( 1 << bitDepth ) - 1;
+  int minV = 0, maxV = maxPel;
+  if( change && !g_cccmGlmLuma )
+  {
+    const int expected = ( P.ctuSize == 256 ? ( g_cccmParams > 7 && !inherited ? 0 : 105 ) : 21 ) << ( bitDepth - 8 );
+    const int margin   = area < 32 ? ( 20 * ( hi - lo ) ) / 100 : 0;
+    minV = lo - margin;
+    maxV = hi + margin;
+    if( maxV - minV < expected )
+    {
+      const int expand = ( expected - ( maxV - minV ) ) / 2;
+      minV -= expand;
+      maxV += expand;
+    }
+    minV = clamp( minV, 0, maxPel );
+    maxV = clamp( maxV, 0, maxPel );
+  }
+  return ivec2( minV, maxV );
+}
+
 // solve2 of model k from its sums, both components at once (gaussElimination with two right-hand sides): the matrix
 // rows (row i in invocation i), the chroma offsets removed from the cross-correlations, scaled to CCCM_MATRIX bits
 // over the samples, regularized, eliminated, then substituted back (invocation 0 Cb's, 1 Cr's), the chroma offset added
-// to the bias; without samples clearModel's model (a bias of 1). Then its clipping ranges (xSetMinMaxClpRng: none where
-// the template's chroma is flat, else its range widened by a margin for blocks under 32 samples and to the minimum span
-// of the CTU size, none for models above 7 parameters with a CTU of 256). GLM with luma's and CFLM's are solve1's (the
-// matrix to GLM_MATRIX bits; gaussElimination solves each right-hand side alone, so the component's model is solve2's),
-// GLM with luma's clipped to the sample range alone. All invocations, ending with a barrier
+// to the bias; without samples clearModel's model (a bias of 1). Then its clipping ranges (cccmClipRange). GLM with
+// luma's and CFLM's are solve1's (the matrix to GLM_MATRIX bits; gaussElimination solves each right-hand side alone,
+// so the component's model is solve2's). All invocations, ending with a barrier
 void cccmSolve( Tu t, int k, int lid )
 {
   const int M = g_cccmParams, triangle = M * ( M + 1 ) >> 1, bitDepth = t.bitDepth, maxPel = ( 1 << bitDepth ) - 1;
@@ -782,25 +811,9 @@ void cccmSolve( Tu t, int k, int lid )
       cccmStore( cccmParamWord( k, lid, p ), x[p] );
     }
     const int lo = s_cclm[CCCM_RANGE + 2 * lid], hi = s_cclm[CCCM_RANGE + 2 * lid + 1];
-    int minV = 0, maxV = maxPel;
-    if( hi > lo && !g_cccmGlmLuma )
-    {
-      // DEF_DIFF_HIGH_RES / DEF_DIFF_LOW_RES (noMinimumDiff: the models of several filters, not inherited ones)
-      const int expected = ( P.ctuSize == 256 ? ( M > 7 ? 0 : 105 ) : 21 ) << ( bitDepth - 8 );
-      const int margin   = t.w * t.h < 32 ? ( 20 * ( hi - lo ) ) / 100 : 0;       // MARGIN_PCT below MIN_SAMPLES
-      minV = lo - margin;
-      maxV = hi + margin;
-      if( maxV - minV < expected )
-      {
-        const int expand = ( expected - ( maxV - minV ) ) / 2;
-        minV -= expand;
-        maxV += expand;
-      }
-      minV = clamp( minV, 0, maxPel );
-      maxV = clamp( maxV, 0, maxPel );
-    }
-    s_cclm[CCCM_CLIP + ( k * 2 + lid ) * 2]     = minV;
-    s_cclm[CCCM_CLIP + ( k * 2 + lid ) * 2 + 1] = maxV;
+    const ivec2 clip = cccmClipRange( lo, hi, hi > lo, false, t.w * t.h, bitDepth );
+    s_cclm[CCCM_CLIP + ( k * 2 + lid ) * 2]     = clip.x;
+    s_cclm[CCCM_CLIP + ( k * 2 + lid ) * 2 + 1] = clip.y;
   }
   SYNC();
 }
@@ -953,6 +966,8 @@ void cccmPrediction( Tu t, bool both, int lid, int NT )
   g_cccmGlmPattern = ( ( t.lm >> LM_GLM_SHIFT ) & 15 ) - NUM_GLM_PATTERN;
   g_cccmFusion     = lmFusionType( t ) == 1;
   g_cccmCflm       = false;
+  g_cccmLocDX      = 0;
+  g_cccmLocDY      = 0;
   g_cccmShift      = g_cccmNoSub ? 1 : 0;
   g_cccmParams     = g_cccmGlmLuma ? GLM_PARAMS
                    : g_cccmNoSub ? ( P.cclmFilter == CCLM_FILTER_AVERAGE ? 9 : 11 )

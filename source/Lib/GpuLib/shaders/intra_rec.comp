@@ -43,6 +43,7 @@ layout( constant_id = 6 ) const bool WITH_TMRL = false;                // TMRL C
 layout( constant_id = 7 ) const bool WITH_CCLM = false;                // CCLM blocks (with any of the above: ~30 % without DIMD)
 layout( constant_id = 8 ) const bool WITH_CCCM = false;                // CCCM blocks (with CCLM)
 layout( constant_id = 9 ) const bool WITH_CFLM = false;                // CFLM blocks (with CCCM: ~2 % for CCCM's)
+layout( constant_id = 10 ) const bool WITH_CCP_MERGE = false;          // CCP merge blocks (with CFLM)
 // the template costs of arms one sample thick (TIMD merge's and TMRL's templates: their SATD kernels)
 const bool WITH_THIN_TEMPLATES = WITH_TIMD_MERGE || WITH_TMRL;
 
@@ -896,6 +897,7 @@ ivec2 angularArrays( bool isVer, int W, int H, int angle, int absInvAngle, int t
 #include "intra_tmrl.glsl"
 #include "intra_cclm.glsl"
 #include "intra_cccm.glsl"
+#include "intra_ccp.glsl"
 
 // the residual of block c in intra_rec (a derived mode's transforms, DERIVE_TRANSFORM, or sign prediction's
 // recomputation), as intra_resi computes it for the others: the dequantized coefficients, those at the positions in
@@ -1852,10 +1854,19 @@ void main()
       {
         for( int i = lid; i < N; i += NT ) emitPred( t, i % W, i / W, mipSample( i % W, i / W, mipPs, mipUpH, mipUpV, predStride ), bf );
       }
-      else if( WITH_CCLM && ( t.lm & LM_ACTIVE ) != 0 )   // CCLM, CCCM (intra_cclm.glsl, intra_cccm.glsl): the
-      {                                                     // model(s) from the template, then applied
+      else if( WITH_CCLM && ( ( t.lm & LM_ACTIVE ) != 0 || ( WITH_CCP_MERGE && t.ccpMerge >= 0 ) ) )
+      {
+        // CCLM, CCCM (intra_cclm.glsl, intra_cccm.glsl): the model(s) from the template, then applied; CCP merge
+        // (intra_ccp.glsl): the inherited model applied as the LM block of its type applies its own
         const int lx = t.x << 1, ly = t.y << 1;   // the co-located luma block (4:2:0)
-        if( WITH_CCCM && ( ( t.lm >> LM_CCCM_SHIFT ) & 3 ) != 0 )
+        if( WITH_CCP_MERGE && t.ccpMerge >= 0 )
+        {
+          ccpMergePrediction( t, lid, NT );   // (t: the chosen model's LM block; its luma buffers in the angular
+                                              // arrays, cleared at the end, or the scratch)
+          angClear  = g_ccpAngUsed;
+          angClear2 = g_ccpAngUsed > 0;
+        }
+        else if( WITH_CCCM && ( ( t.lm >> LM_CCCM_SHIFT ) & 3 ) != 0 )
         {
           cccmPrediction( t, false, lid, NT );   // (its luma buffer in the angular arrays, cleared at the end, or
                                                  // the scratch)
