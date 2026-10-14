@@ -265,6 +265,17 @@ Commits on `enc-mt`, all bit-exact with stock ECM-20.0 (bitstream md5 of the sui
   rising slowly). The class configurations (CTU 256) are bit-exact with frame threads too: RA 33 frames with class B and
   AI 33 pictures with CTU 256, stock ECM-20.0 = 1 thread = 8 threads (bitstream and reconstruction md5). Stock ECM-20.0
   allows CCSAO at most 256 CTUs per picture, so 2160p needs CTU 256 (class A).
+- RAM step R15: EncCu's GPM candidate buffers (`m_acGeoWeightedBuffer`, 1022 a search stack: 140 GPM candidates and
+  the SGPM inter, inter-intra and affine ones, 5 blendings each) were CTU-sized: 0.19 GB a stack at CTU 256, 3.8 GB
+  for 20 stacks, 0.68 GB of it ever touched (allocation probe, 1080p class B; addr2line on the probe build located
+  the site, EncCu.cpp `create`). Only GPM and IBC blocks use those beyond the first 140, both limited to 64x64 by
+  `EncModeCtrl::tryMode`; the first 140 also hold the multi-hypothesis candidates (`InterSearch::initMHPTmpBuffer`)
+  and the first the CIIP prediction with LMCS, of any size. The others are now min(CTU, 64) square, and the GPM and
+  IBC merge searches CHECK at their start that the block fits. 20 threads, 128x128: AI 33 pictures with CTU 256
+  37.9 -> 23.9 s and 13.59 -> 10.48 GB, RA 65 frames class B 224.6 -> 211.8 s and 13.78 -> 10.66 GB, AI with CTU 128
+  22.6 -> 18.3 s and 7.19 -> 6.57 GB (a GPM block in a CTU-wide buffer touched a page per row: fewer page faults).
+  The estimate's stack figures follow (0.64 GB with CTU 256, 0.40 GB with CTU 128): 2160p class A on this machine
+  20 threads and 4 periods, 27.77 GB peak over 40 minutes; 1080p class B 300 frames (20, 10) 22.78 -> 19.66 GB.
 - RAM step R14: the climb is the backlog of searched pictures waiting for their finish turn (allocation probe of
   R13 on 600 frames, `C:\Code\work\mt\ram\probe4`, `growth.py` compares two dumps by site): the pictures between
   search start and finish end grew from about 25 at 600 s to 65 at 1020 s, as searches run ahead of the finishes,
