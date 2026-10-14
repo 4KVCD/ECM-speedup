@@ -148,7 +148,10 @@ lower all-core turbo, one duplicated intra frame per chunk, unequal chunk comple
   14.78 -> 14.05 GB (working set 8.94 -> 8.20 GB) by dropping the originals; 13.31 -> 12.47 GB (working set
   7.27 -> 6.45 GB) by the smaller motion field entries (MotionInfo 224 -> 88 bytes, without the multi-hypothesis
   data that only the HMVP table entries carry); 12.47 -> 11.22 GB commit by making the reused motion vector tables
-  of the search stacks per block size at the first store.
+  of the search stacks per block size at the first store; 11.22 -> 10.67 GB (working set 6.48 -> 5.92 GB) by making
+  the coded-CU cache entries of a stack at their first use and clearing them per CTU by a generation stamp. A
+  finished picture frees its originals, reconstruction and per-4x4 arrays once nothing reads it any more (unused for
+  reference, no reference in flight, reconstruction written or not written).
 - No options, all 20 cores of the Core Ultra 7 265K (20 threads chosen), one run at a time, foreman 128x128 QP 32,
   against one thread (the previous default) and `--ParallelSegments=20`; bitstreams identical:
 

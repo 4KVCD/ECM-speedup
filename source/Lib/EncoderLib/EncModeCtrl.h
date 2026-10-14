@@ -1429,6 +1429,7 @@ struct CodedCUInfo
 #if JVET_AB0092_GLM_WITH_LUMA
   bool     skipGLM;
 #endif
+  uint32_t generation;   ///< CacheBlkInfoCtrl: the CTU (init) the entry was cleared for
 };
 
 class CacheBlkInfoCtrl
@@ -1468,6 +1469,11 @@ protected:
 public:
 #endif
   CodedCUInfo& getBlkInfo( const UnitArea& area );
+  /// the entry of a block, made at its first use and cleared at its first use after each CTU start (init): a stack uses
+  /// about 4 000 of the 150 000 position-size combinations, and clearing all of them per CTU is a 32 MB fill
+  CodedCUInfo&       xEntry( unsigned idx1, unsigned idx2, unsigned idx3, unsigned idx4 );
+  const CodedCUInfo& xEntry( unsigned idx1, unsigned idx2, unsigned idx3, unsigned idx4 ) const;
+  uint32_t           m_generation = 1;   ///< counts the CTU starts (init); 0 marks no entry
 #if JVET_AI0136_ADAPTIVE_DUAL_TREE
   CodedCUInfo* getBlkInfoPtr(const UnitArea& area);
 #endif

@@ -370,14 +370,7 @@ void CacheBlkInfoCtrl::create(const int maxCuSize)
               }
 #endif
 
-              if( gp_sizeIdxInfo->isCuSize( gp_sizeIdxInfo->sizeFrom( hIdx ) ) && y + ( gp_sizeIdxInfo->sizeFrom( hIdx ) >> MIN_CU_LOG2 ) <= ( MAX_CU_SIZE >> MIN_CU_LOG2 ) )
-              {
-                m_codedCUInfo[treeIdx][x][y][wIdx][hIdx] = new CodedCUInfo;
-              }
-              else
-              {
-                m_codedCUInfo[treeIdx][x][y][wIdx][hIdx] = nullptr;
-              }
+              m_codedCUInfo[treeIdx][x][y][wIdx][hIdx] = nullptr;   // made at its first use (xEntry)
             }
           }
           else
@@ -403,14 +396,7 @@ void CacheBlkInfoCtrl::create(const int maxCuSize)
 
           for( int hIdx = 0; hIdx < gp_sizeIdxInfo->numHeights(); hIdx++ )
           {
-            if( gp_sizeIdxInfo->isCuSize( gp_sizeIdxInfo->sizeFrom( hIdx ) ) && y + ( gp_sizeIdxInfo->sizeFrom( hIdx ) >> MIN_CU_LOG2 ) <= (maxCuSize >> MIN_CU_LOG2 ) )
-            {
-              m_codedCUInfo[x][y][wIdx][hIdx] = new CodedCUInfo;
-            }
-            else
-            {
-              m_codedCUInfo[x][y][wIdx][hIdx] = nullptr;
-            }
+            m_codedCUInfo[x][y][wIdx][hIdx] = nullptr;   // made at its first use (xEntry)
           }
         }
         else
@@ -483,56 +469,9 @@ void CacheBlkInfoCtrl::destroy()
 
 void CacheBlkInfoCtrl::init( const Slice &slice )
 {
-  const unsigned numPos = m_maxCuSize >> MIN_CU_LOG2;
-
-#if JVET_AI0136_ADAPTIVE_DUAL_TREE
-  for( unsigned treeIdx = 0; treeIdx < MAX_TREE_TYPE; treeIdx++ )
-  {
-    for( unsigned x = 0; x < numPos; x++ )
-    {
-      for( unsigned y = 0; y < numPos; y++ )
-      {
-        if (!m_codedCUInfo[treeIdx][x][y])
-        {
-          continue;
-        }
-        for( int wIdx = 0; wIdx < gp_sizeIdxInfo->numWidths(); wIdx++ )
-        {
-          if( m_codedCUInfo[treeIdx][x][y][wIdx] )
-          {
-            for( int hIdx = 0; hIdx < gp_sizeIdxInfo->numHeights(); hIdx++ )
-            {
-              if( m_codedCUInfo[treeIdx][x][y][wIdx][hIdx] )
-              {
-                std::fill_n( reinterpret_cast< char * >(m_codedCUInfo[treeIdx][x][y][wIdx][hIdx]), sizeof( CodedCUInfo ), 0 );
-              }
-            }
-          }
-        }
-      }
-    }
-  }
-#else
-  for( unsigned x = 0; x < numPos; x++ )
-  {
-    for( unsigned y = 0; y < numPos; y++ )
-    {
-      for( int wIdx = 0; wIdx < gp_sizeIdxInfo->numWidths(); wIdx++ )
-      {
-        if( m_codedCUInfo[x][y][wIdx] )
-        {
-          for( int hIdx = 0; hIdx < gp_sizeIdxInfo->numHeights(); hIdx++ )
-          {
-            if( m_codedCUInfo[x][y][wIdx][hIdx] )
-            {
-              std::fill_n( reinterpret_cast< char * >(m_codedCUInfo[x][y][wIdx][hIdx]), sizeof( CodedCUInfo ), 0 );
-            }
-          }
-        }
-      }
-    }
-  }
-#endif
+  // the entries are cleared at their first use in this CTU (xEntry) instead of all of them here
+  m_generation++;
+  CHECK( m_generation == 0, "Generation counter wrapped" );
 
   m_slice_chblk = &slice;
 #if ENABLE_SPLIT_PARALLELISM
@@ -601,16 +540,43 @@ void CacheBlkInfoCtrl::copyState( const CacheBlkInfoCtrl &other, const UnitArea&
 }
 #endif
 
+CodedCUInfo& CacheBlkInfoCtrl::xEntry( unsigned idx1, unsigned idx2, unsigned idx3, unsigned idx4 )
+{
+#if JVET_AI0136_ADAPTIVE_DUAL_TREE
+  CodedCUInfo*& entry = m_codedCUInfo[m_treeIdx][idx1][idx2][idx3][idx4];
+#else
+  CodedCUInfo*& entry = m_codedCUInfo[idx1][idx2][idx3][idx4];
+#endif
+  if( entry && entry->generation == m_generation )
+  {
+    return *entry;
+  }
+  if( !entry )
+  {
+    entry = new CodedCUInfo;
+  }
+  std::fill_n( reinterpret_cast<char*>( entry ), sizeof( CodedCUInfo ), 0 );   // as init() cleared every entry before
+  entry->generation = m_generation;
+  return *entry;
+}
+
+const CodedCUInfo& CacheBlkInfoCtrl::xEntry( unsigned idx1, unsigned idx2, unsigned idx3, unsigned idx4 ) const
+{
+  static const CodedCUInfo cleared = CodedCUInfo();   // what a cleared entry reads as
+#if JVET_AI0136_ADAPTIVE_DUAL_TREE
+  const CodedCUInfo* entry = m_codedCUInfo[m_treeIdx][idx1][idx2][idx3][idx4];
+#else
+  const CodedCUInfo* entry = m_codedCUInfo[idx1][idx2][idx3][idx4];
+#endif
+  return entry && entry->generation == m_generation ? *entry : cleared;
+}
+
 CodedCUInfo& CacheBlkInfoCtrl::getBlkInfo( const UnitArea& area )
 {
   unsigned idx1, idx2, idx3, idx4;
   getAreaIdx( area.Y(), *m_slice_chblk->getPPS()->pcv, idx1, idx2, idx3, idx4 );
 
-#if JVET_AI0136_ADAPTIVE_DUAL_TREE
-  return *m_codedCUInfo[m_treeIdx][idx1][idx2][idx3][idx4];
-#else
-  return *m_codedCUInfo[idx1][idx2][idx3][idx4];
-#endif
+  return xEntry( idx1, idx2, idx3, idx4 );
 }
 
 #if JVET_AI0136_ADAPTIVE_DUAL_TREE
@@ -625,7 +591,7 @@ CodedCUInfo* CacheBlkInfoCtrl::getBlkInfoPtr( const UnitArea& area )
 
   getAreaIdx( area.Y(), *m_slice_chblk->getPPS()->pcv, idx1, idx2, idx3, idx4 );
 
-  return m_codedCUInfo[m_treeIdx][idx1][idx2][idx3][idx4];
+  return &xEntry( idx1, idx2, idx3, idx4 );
 }
 #endif
 
@@ -636,9 +602,9 @@ bool CacheBlkInfoCtrl::isSkip( const UnitArea& area )
   getAreaIdx( area.Y(), *m_slice_chblk->getPPS()->pcv, idx1, idx2, idx3, idx4 );
 
 #if JVET_AI0136_ADAPTIVE_DUAL_TREE
-  return m_codedCUInfo[m_treeIdx][idx1][idx2][idx3][idx4]->isSkip;
+  return xEntry( idx1, idx2, idx3, idx4 ).isSkip;
 #else
-  return m_codedCUInfo[idx1][idx2][idx3][idx4]->isSkip;
+  return xEntry( idx1, idx2, idx3, idx4 ).isSkip;
 #endif
 }
 
@@ -648,9 +614,9 @@ char CacheBlkInfoCtrl::getSelectColorSpaceOption(const UnitArea& area)
   getAreaIdx(area.Y(), *m_slice_chblk->getPPS()->pcv, idx1, idx2, idx3, idx4);
 
 #if JVET_AI0136_ADAPTIVE_DUAL_TREE
-  return m_codedCUInfo[m_treeIdx][idx1][idx2][idx3][idx4]->selectColorSpaceOption;
+  return xEntry( idx1, idx2, idx3, idx4 ).selectColorSpaceOption;
 #else
-  return m_codedCUInfo[idx1][idx2][idx3][idx4]->selectColorSpaceOption;
+  return xEntry( idx1, idx2, idx3, idx4 ).selectColorSpaceOption;
 #endif
 }
 
@@ -660,9 +626,9 @@ bool CacheBlkInfoCtrl::isMMVDSkip(const UnitArea& area)
   getAreaIdx(area.Y(), *m_slice_chblk->getPPS()->pcv, idx1, idx2, idx3, idx4);
 
 #if JVET_AI0136_ADAPTIVE_DUAL_TREE
-  return m_codedCUInfo[m_treeIdx][idx1][idx2][idx3][idx4]->isMMVDSkip;
+  return xEntry( idx1, idx2, idx3, idx4 ).isMMVDSkip;
 #else
-  return m_codedCUInfo[idx1][idx2][idx3][idx4]->isMMVDSkip;
+  return xEntry( idx1, idx2, idx3, idx4 ).isMMVDSkip;
 #endif
 }
 
@@ -674,11 +640,11 @@ void CacheBlkInfoCtrl::setMv( const UnitArea& area, const RefPicList refPicList,
   getAreaIdx( area.Y(), *m_slice_chblk->getPPS()->pcv, idx1, idx2, idx3, idx4 );
 
 #if JVET_AI0136_ADAPTIVE_DUAL_TREE
-  m_codedCUInfo[m_treeIdx][idx1][idx2][idx3][idx4]->saveMv [refPicList][iRefIdx] = rMv;
-  m_codedCUInfo[m_treeIdx][idx1][idx2][idx3][idx4]->validMv[refPicList][iRefIdx] = true;
+  xEntry( idx1, idx2, idx3, idx4 ).saveMv [refPicList][iRefIdx] = rMv;
+  xEntry( idx1, idx2, idx3, idx4 ).validMv[refPicList][iRefIdx] = true;
 #else
-  m_codedCUInfo[idx1][idx2][idx3][idx4]->saveMv [refPicList][iRefIdx] = rMv;
-  m_codedCUInfo[idx1][idx2][idx3][idx4]->validMv[refPicList][iRefIdx] = true;
+  xEntry( idx1, idx2, idx3, idx4 ).saveMv [refPicList][iRefIdx] = rMv;
+  xEntry( idx1, idx2, idx3, idx4 ).validMv[refPicList][iRefIdx] = true;
 #endif
 #if ENABLE_SPLIT_PARALLELISM
 
@@ -694,19 +660,19 @@ bool CacheBlkInfoCtrl::getMv( const UnitArea& area, const RefPicList refPicList,
   if( iRefIdx >= MAX_STORED_CU_INFO_REFS )
   {
 #if JVET_AI0136_ADAPTIVE_DUAL_TREE
-    rMv = m_codedCUInfo[m_treeIdx][idx1][idx2][idx3][idx4]->saveMv[refPicList][0];
+    rMv = xEntry( idx1, idx2, idx3, idx4 ).saveMv[refPicList][0];
 #else
-    rMv = m_codedCUInfo[idx1][idx2][idx3][idx4]->saveMv[refPicList][0];
+    rMv = xEntry( idx1, idx2, idx3, idx4 ).saveMv[refPicList][0];
 #endif
     return false;
   }
 
 #if JVET_AI0136_ADAPTIVE_DUAL_TREE
-  rMv = m_codedCUInfo[m_treeIdx][idx1][idx2][idx3][idx4]->saveMv[refPicList][iRefIdx];
-  return m_codedCUInfo[m_treeIdx][idx1][idx2][idx3][idx4]->validMv[refPicList][iRefIdx];
+  rMv = xEntry( idx1, idx2, idx3, idx4 ).saveMv[refPicList][iRefIdx];
+  return xEntry( idx1, idx2, idx3, idx4 ).validMv[refPicList][iRefIdx];
 #else
-  rMv = m_codedCUInfo[idx1][idx2][idx3][idx4]->saveMv[refPicList][iRefIdx];
-  return m_codedCUInfo[idx1][idx2][idx3][idx4]->validMv[refPicList][iRefIdx];
+  rMv = xEntry( idx1, idx2, idx3, idx4 ).saveMv[refPicList][iRefIdx];
+  return xEntry( idx1, idx2, idx3, idx4 ).validMv[refPicList][iRefIdx];
 #endif
 }
 
@@ -822,9 +788,9 @@ bool CacheBlkInfoCtrl::getInter(const UnitArea& area)
   getAreaIdx(area.Y(), *m_slice_chblk->getPPS()->pcv, idx1, idx2, idx3, idx4);
 
 #if JVET_AI0136_ADAPTIVE_DUAL_TREE
-  return m_codedCUInfo[m_treeIdx][idx1][idx2][idx3][idx4]->isInter;
+  return xEntry( idx1, idx2, idx3, idx4 ).isInter;
 #else
-  return m_codedCUInfo[idx1][idx2][idx3][idx4]->isInter;
+  return xEntry( idx1, idx2, idx3, idx4 ).isInter;
 #endif
 }
 void CacheBlkInfoCtrl::setBcwIdx(const UnitArea& area, uint8_t gBiIdx)
@@ -832,9 +798,9 @@ void CacheBlkInfoCtrl::setBcwIdx(const UnitArea& area, uint8_t gBiIdx)
   unsigned idx1, idx2, idx3, idx4;
   getAreaIdx(area.Y(), *m_slice_chblk->getPPS()->pcv, idx1, idx2, idx3, idx4);
 #if JVET_AI0136_ADAPTIVE_DUAL_TREE
-  m_codedCUInfo[m_treeIdx][idx1][idx2][idx3][idx4]->bcwIdx = gBiIdx;
+  xEntry( idx1, idx2, idx3, idx4 ).bcwIdx = gBiIdx;
 #else
-  m_codedCUInfo[idx1][idx2][idx3][idx4]->bcwIdx = gBiIdx;
+  xEntry( idx1, idx2, idx3, idx4 ).bcwIdx = gBiIdx;
 #endif
 }
 uint8_t CacheBlkInfoCtrl::getBcwIdx(const UnitArea& area)
@@ -843,9 +809,9 @@ uint8_t CacheBlkInfoCtrl::getBcwIdx(const UnitArea& area)
   getAreaIdx(area.Y(), *m_slice_chblk->getPPS()->pcv, idx1, idx2, idx3, idx4);
 
 #if JVET_AI0136_ADAPTIVE_DUAL_TREE
-  return m_codedCUInfo[m_treeIdx][idx1][idx2][idx3][idx4]->bcwIdx;
+  return xEntry( idx1, idx2, idx3, idx4 ).bcwIdx;
 #else
-  return m_codedCUInfo[idx1][idx2][idx3][idx4]->bcwIdx;
+  return xEntry( idx1, idx2, idx3, idx4 ).bcwIdx;
 #endif
 }
 

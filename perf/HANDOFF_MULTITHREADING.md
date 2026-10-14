@@ -221,6 +221,17 @@ Commits on `enc-mt`, all bit-exact with stock ECM-20.0 (bitstream md5 of the sui
 - RAM step R10: `InterSearch::ReusedUniMvs` keeps its motion vector sets in a chunk per block size (w, h), made at
   the first store into that size (34 MB a table before, two per stack, about 30 KB used early and 7 MB after 900 s).
   1080p, 20 threads, 75-150 s: commit 12.47 -> 11.22 GB; working set unchanged.
+- RAM step R11: a finished picture frees its originals, reconstruction and per-4x4 arrays once nothing reads it any
+  more (`Picture::releaseUnreadBufs`, `EncLib::xReleaseUnreadPics`: unused for reference, no reference in flight, and
+  its reconstruction written or not written at all); a first version freed the originals at the finish's end and the
+  3-frame LD test mismatched: later setups read every reference's original for the picture-level LIC histogram
+  (`Slice.cpp`, updateHistogram). With the CTC's reconstruction file (`ReconFile rec.yuv`) the application wrote in
+  output order, and in a long 1080p encode later periods wait for the earlier ones' output (the 20-minute probe saw
+  no release), hence R13.
+- RAM step R12: `CacheBlkInfoCtrl` (a `CodedCUInfo` per tree, 4x4 position and block size: 150 000 entries, 32 MB a
+  stack) makes an entry at its first use and clears entries per CTU by a generation stamp (`xEntry`) instead of
+  making all at create and zero-filling all at every CTU. 1080p, 20 threads, 75-150 s: commit 11.22 -> 10.67 GB,
+  working set 6.48 -> 5.92 GB.
 - Speed step S1: in all intra, the pictures waiting for a search stack take them in order of decreasing luma activity
   (`EncGOP::xFtSearchPriority`, the cost estimate of `--ParallelSegments`) instead of coding order, so the expensive
   pictures do not start last. AI 33 pictures, 2 runs each alternating with the previous build: 8 P-cores 34.5 -> 33.0 s
