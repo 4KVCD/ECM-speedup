@@ -166,10 +166,11 @@ constexpr int CCP_MAX_PARAMS = 11, CCP_OUT_PARAMS = 26, CCP_OUT_PARAMS2 = CCP_OU
 constexpr int CCP_OUT = CCP_OUT_PARAMS2 + 4 * CCP_MAX_PARAMS;
 // Params::ccpData (intra_common.glsl's CCP_WRITERS, CCP_MERGE_*; int32): per record the Tu indices of its Cb and Cr
 // blocks, the CTU rows' histories, per CCP merge CU its entry (the history's position and number, idxNonLocalCCP - 1,
-// the first of its blocks' default records, CCP_DEFAULTS each, the spatial sources)
+// the first of its blocks' default records, CCP_DEFAULTS each - with adjustment its on-the-fly models' -,
+// ccpMergeAdjustFlag, the spatial sources)
 constexpr int CCP_WRITERS = 2, CCP_DEFAULTS = 12;
 constexpr int CCP_MERGE_HIST = 0, CCP_MERGE_HIST_NUM = 1, CCP_MERGE_INDEX = 2, CCP_MERGE_DEFAULTS = 3;
-constexpr int CCP_MERGE_NUM_SPATIAL = 4, CCP_MERGE_SPATIAL = 5;
+constexpr int CCP_MERGE_ADJUST = 4, CCP_MERGE_NUM_SPATIAL = 5, CCP_MERGE_SPATIAL = 6;
 #if JVET_AD0188_CCP_MERGE
 static_assert( NUM_CCP_PARAMS == CCP_MAX_PARAMS && CCP_TYPE_CCLM == 1 && CCP_TYPE_MMLM == 2 && CCP_TYPE_GLM0123 == 4
                  && CCP_TYPE_GLM4567 == 8 && CCP_TYPE_CCCM == 16 && CCP_TYPE_GLCCCM == 32 && CCP_TYPE_NSCCCM == 64
@@ -1460,6 +1461,7 @@ struct GpuIntraRec::Impl
   std::vector<int32_t>                                 ccpMerge;
   std::unordered_map<const PredictionUnit*, int32_t>  ccpMergeIndex;
   int                                                  numCcpMerge = 0;
+  int                                                  numCcpAdjust = 0;   // the merge blocks with adjustment
   // the sign prediction prepareSignPred took from a TU, for the record() of its coded component
   struct PendingSignPred
   {
@@ -1652,6 +1654,7 @@ void GpuIntraRec::beginPicture( const CodingStructure& cs )
   m.ccpMerge.clear();
   m.ccpMergeIndex.clear();
   m.numCcpMerge = 0;
+  m.numCcpAdjust = 0;
   m.cuIndex[0].clear();
   m.cuIndex[1].clear();
   m.unsupportedWhy.clear();
@@ -2562,11 +2565,12 @@ static int32_t ccpRecord( GpuIntraRec::Impl& m, const PredictionUnit& pu, bool* 
 
 #if JVET_AD0188_CCP_MERGE
 // the entry of CCP merge PU pu in m.ccpMerge (made at its first block, before its own record goes into the history):
-// the CTU row's history so far, idxNonLocalCCP - 1, its ordinal (its default records'), then the spatial sources of
-// PU::getCCPModelCandidateList - the PUs at its 5 adjacent positions and at the non-adjacent ones of its two rounds
-// (7 distances each; their intervals and offsets by the PU's chType sizes: a single-tree CU's luma ones, the CPU's,
-// added to the chroma position), each where getPUFromPos finds a PU (in the picture, decoded before: with one slice and
-// tile, recorded before) with a CCP model (typed: a record), each record once (a later one is left out as equal to it)
+// the CTU row's history so far, idxNonLocalCCP - 1, its ordinal (its default records'), its adjustment (JVET-AL0126's
+// ccpMergeAdjustFlag), then the spatial sources of PU::getCCPModelCandidateList - the PUs at its 5 adjacent positions
+// and at the non-adjacent ones of its two rounds (7 distances each; their intervals and offsets by the PU's chType
+// sizes: a single-tree CU's luma ones, the CPU's, added to the chroma position), each where getPUFromPos finds a PU (in
+// the picture, decoded before: with one slice and tile, recorded before) with a CCP model (typed: a record), each
+// record once (a later one is left out as equal to it)
 static int32_t ccpMergeEntry( GpuIntraRec::Impl& m, const PredictionUnit& pu )
 {
   std::vector<int32_t>& d = m.ccpMerge;
@@ -2575,6 +2579,11 @@ static int32_t ccpMergeEntry( GpuIntraRec::Impl& m, const PredictionUnit& pu )
   d.push_back( (int32_t)( m.ccpHist.size() - m.ccpHistRowStart ) );
   d.push_back( pu.idxNonLocalCCP - 1 );
   d.push_back( m.numCcpMerge++ );
+#if JVET_AL0126_CCP_MERGE_WITH_ADJUST
+  d.push_back( pu.ccpMergeAdjustFlag );
+#else
+  d.push_back( 0 );
+#endif
   d.push_back( 0 );
   const CodingStructure& cs  = *pu.cs;
   const CompArea&        cb  = pu.blocks[COMPONENT_Cb];
@@ -2700,15 +2709,15 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
   else if( cu.eipFlag )                                             why = "EIP";
   else if( !isLuma( compID ) && ipa.multiRefIndex && !pu.chromaTmrlFlag ) why = "chroma MRL";
   // CCP merge (JVET-AD0188: a model from a neighbour's, the history's or the defaults, the candidates ranked by
-  // template costs; intra_ccp.glsl) and its fusions (JVET-AG0059): with CCCM averaged where the SPS's ccpFusionMode
-  // gives no blend model, as the encoder's in all-intra, with DIMD chroma always averaged; but its fusion with CCCM by
-  // a blend model (JVET-AN0168's regression of the template predictions), its adjustment (JVET-AL0126), its
-  // decoder-derived fusion (JVET-AG0154) and LFNST / NSPT (the DIMD of its predictions), and decoder-derived CCP fusion
-  // (the models of the lowest template costs blended); their SPS switches leave the other LM blocks as they are
-  // (BVG-CCCM: otherCccm). Merge fusion exists in I slices with DIMD only (PU::hasCCPMergeFusionFlag): the GPU derives
-  // the DIMD chroma mode there
+  // template costs; intra_ccp.glsl), its fusions (JVET-AG0059): with CCCM averaged where the SPS's ccpFusionMode gives
+  // no blend model, as the encoder's in all-intra, with DIMD chroma always averaged, and its adjustment (JVET-AL0126:
+  // CCCM models only, on-the-fly ones added, the chosen model's coefficients moved by template costs); but its fusion
+  // with CCCM by a blend model (JVET-AN0168's regression of the template predictions), its decoder-derived fusion
+  // (JVET-AG0154) and LFNST / NSPT (the DIMD of its predictions), and decoder-derived CCP fusion (the models of the
+  // lowest template costs blended); their SPS switches leave the other LM blocks as they are (BVG-CCCM: otherCccm).
+  // Merge fusion exists in I slices with DIMD only (PU::hasCCPMergeFusionFlag): the GPU derives the DIMD chroma mode
+  // there
 #if JVET_AD0188_CCP_MERGE
-  else if( !isLuma( compID ) && pu.idxNonLocalCCP && pu.ccpMergeAdjustFlag ) why = "CCP merge adjustment";
 #if JVET_AN0168_REGRESSION_CCP_FUSION
   else if( !isLuma( compID ) && pu.idxNonLocalCCP && pu.ccpMergeFusionFlag && pu.ccpMergeFusionType == 0
            && sps.getCcpFusionMode() )
@@ -2914,6 +2923,9 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
                    ? ( 1 << LM_CCCM_SHIFT ) | LM_FUSION | ( 1 << LM_FUSION_TYPE_SHIFT ) | ( 2 << LM_FUSION_W_SHIFT )
                    : 0;
       t.ccpMerge = m.ccpMergeIndex.at( &pu );   // (relative until endPicture)
+#if JVET_AL0126_CCP_MERGE_WITH_ADJUST
+      m.numCcpAdjust += pu.ccpMergeAdjustFlag != 0;
+#endif
     }
 #endif
   }
@@ -4986,7 +4998,7 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
       numTimdBlended += m.cpuTimd[size_t( th.index ) * TIMD_OUT + ( th.sad ? TIMD_OUT_SAD : 0 ) + TIMD_OUT_BLENDED] != 0;
     }
   }
-  printf( "\n[gpu-intra] POC %d: %d blocks, chain %d (ref filter %d, PDPC %d, gradient PDPC %d, fusion %d, bilateral filter candidates %d, CU nodes %d, DIMD %d, DIMD CUs %d, OBIC CUs %d, intra merge CUs %d, TIMD CUs %d (blended %d, TIMD-SAD %d, TIMD merge %d, inheriting transforms %d), TMRL CUs %d, chroma TMRL CUs %d, their MTS / LFNST / NSPT blocks %d, MTSS %d, MIP LFNST / NSPT %d, LM blocks %d (MMLM %d, MDLM %d, LBCCP %d, LFNST / NSPT %d, GLM %d (with luma %d), CCCM %d: above %d, left %d, GL %d, several filters %d, without subsampling %d), LM chroma fusion %d (CFLM %d), CCP merge %d (fusion with CCCM %d, with DIMD chroma %d)), GPU %.2f ms: %s%s%s", m.poc,
-          (int) m.rec.size() - numNodes, maxDepth, numFilter, numPdpc, numGrad, numFusion, numBf, numNodes, numDimd, numDimdCus, numObic, m.numMerge, m.numTimd, numTimdBlended, numTimdSad, m.numTimdMerge, numInherited, numTmrl, numChromaTmrl, numDimdTransforms, numMtss, numMipDimd, numCclm, numMmlm, numMdlm, numLbccp, numCclmDimd, numGlm, numGlmLuma, numCccm, numCccmAbove, numCccmLeft, numGlCccm, numMdfCccm, numNoSubCccm, numLmFusion, numCflm, numCcpMerge, numCcpMergeFusion, numCcpMergeDimd, ms, bad ? "MISMATCH, " : "identical",
+  printf( "\n[gpu-intra] POC %d: %d blocks, chain %d (ref filter %d, PDPC %d, gradient PDPC %d, fusion %d, bilateral filter candidates %d, CU nodes %d, DIMD %d, DIMD CUs %d, OBIC CUs %d, intra merge CUs %d, TIMD CUs %d (blended %d, TIMD-SAD %d, TIMD merge %d, inheriting transforms %d), TMRL CUs %d, chroma TMRL CUs %d, their MTS / LFNST / NSPT blocks %d, MTSS %d, MIP LFNST / NSPT %d, LM blocks %d (MMLM %d, MDLM %d, LBCCP %d, LFNST / NSPT %d, GLM %d (with luma %d), CCCM %d: above %d, left %d, GL %d, several filters %d, without subsampling %d), LM chroma fusion %d (CFLM %d), CCP merge %d (fusion with CCCM %d, with DIMD chroma %d, adjusted %d)), GPU %.2f ms: %s%s%s", m.poc,
+          (int) m.rec.size() - numNodes, maxDepth, numFilter, numPdpc, numGrad, numFusion, numBf, numNodes, numDimd, numDimdCus, numObic, m.numMerge, m.numTimd, numTimdBlended, numTimdSad, m.numTimdMerge, numInherited, numTmrl, numChromaTmrl, numDimdTransforms, numMtss, numMipDimd, numCclm, numMmlm, numMdlm, numLbccp, numCclmDimd, numGlm, numGlmLuma, numCccm, numCccmAbove, numCccmLeft, numGlCccm, numMdfCccm, numNoSubCccm, numLmFusion, numCflm, numCcpMerge, numCcpMergeFusion, numCcpMergeDimd, m.numCcpAdjust, ms, bad ? "MISMATCH, " : "identical",
           bad ? first.c_str() : "", numBad ? ( ", " + std::to_string( numBad ) + " picture samples differ" ).c_str() : "" );
 }

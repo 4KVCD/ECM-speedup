@@ -106,6 +106,13 @@ void cccmTmpStore( int slot, int64_t v )
   s_tmp[4 * slot + 3] = p.w;
 }
 
+// CCP merge adjustment's on-the-fly models (intra_ccp.glsl's ccpFlyModels, deriveCcpMergeAdjustCands' fits): the
+// template's two lines next to the block alone (trainingRange 2), the reference samples alone (useRefSampOnly: the
+// template's row above the block and its column left of it take their own sample for the neighbour below / right of
+// it, which lies in the block)
+bool g_ccpFlyTwoLines = false;
+bool g_ccpFlyRefOnly  = false;
+
 int cccmTemplateFlag( Tu t ) { return ( t.lm >> LM_CCCM_SHIFT ) & 3; }
 
 // ----- the reference area and the luma buffer (xCccmCalcRefArea, xCccmCreateLumaRef)
@@ -591,13 +598,16 @@ int cccmFeature( int f, int x, int y, int c, int bitDepth )
     default: return ( x + g_cccmLocDX + 8 ) << 3;
     }
   }
+  // (an on-the-fly model of the reference samples alone: the sample itself below the row above the block, right of
+  // the column left of it)
+  const bool refOnly = WITH_CCP_MERGE && g_ccpFlyRefOnly;
   switch( f )
   {
   case 0: return c;
   case 1: return cccmLuma( x, y - 1 );
-  case 2: return cccmLuma( x, y + 1 );
+  case 2: return refOnly && y == g_cccmSizeY - 1 && x >= g_cccmSizeX ? c : cccmLuma( x, y + 1 );
   case 3: return cccmLuma( x - 1, y );
-  case 4: return cccmLuma( x + 1, y );
+  case 4: return refOnly && x == g_cccmSizeX - 1 && y >= g_cccmSizeY ? c : cccmLuma( x + 1, y );
   default: return cccmNonlinear( c, bitDepth );
   }
 }
@@ -618,7 +628,7 @@ void cccmAccumulate( Tu t, int k, bool twoModels, int lid, int NT )
   SYNC();
   const int   M = g_cccmParams, entries = cccmNumEntries( M ), lanes = NT / entries;
   const int   set = k >> 1, cls = k & 1, bitDepth = t.bitDepth;
-  const ivec4 r = cccmTemplate( t, set == 1 && !twoModels );
+  const ivec4 r = cccmTemplate( t, ( set == 1 && !twoModels ) || ( WITH_CCP_MERGE && g_ccpFlyTwoLines ) );
   const ivec2 counts = cccmTemplateCounts( r );
   const int   e = lid % entries, lane = lid / entries;
   if( lane < lanes )

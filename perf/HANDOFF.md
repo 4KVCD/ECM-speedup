@@ -13,16 +13,16 @@ wall-clock gains with threads are "the easy baseline". Decoder status: single-th
 (`--GpuLoopFilter=1`: ALF, SAO, BIF, CCSAO, LF-CCCM, offset refinement on Vulkan). The user then asked for **a full
 GPU decoder in Vulkan, optimized until nothing is left** ("The GPU decoder needs to fully decode the frame on the
 GPU"; "Your first Vulkan version is going to be slow. That's OK"). That work is branch `dec-gpurecon`: intra
-reconstruction on the GPU (`--GpuRecon`), tool levels M1-M48 done and verified bit-exact (M19: DIMD, M20: OBIC, M21:
+reconstruction on the GPU (`--GpuRecon`), tool levels M1-M49 done and verified bit-exact (M19: DIMD, M20: OBIC, M21:
 intra merge, M22: the transforms of DIMD CUs, M23: LFNST of MIP, M24: TIMD, M25: OBIC and intra merge with TIMD
 neighbours, M26: TIMD-SAD, M27: OBIC and intra merge with TIMD-SAD neighbours, M28: TIMD merge, M29: TMRL of luma,
 M30: chroma TMRL, M31: CCLM, M32: LFNST / NSPT of CCLM, M33: GLM's gradient patterns, M34: CCCM, M35: GL-CCCM, M36:
 CCCM with several downsampling filters, M37: CCCM without subsampling, M38: CCCM with LFNST / NSPT, M39: GLM with
 luma, M40: LM chroma fusion of CCCM, M41: CFLM, M42: GLM with luma with LFNST / NSPT, M43: the SPS switches of the
-CCP tools, M44 / M45: the CCP models, M46: CCP merge, M47 / M48: CCP merge fusion with CCCM / DIMD chroma); it is
-**not yet faster than the CPU decoder** (see section 8) and supports only a restricted tool set (all real CTC streams
-fall back to the CPU, first reason: chroma reordering / DBV; CCP merge's fusion with CCCM by a blend model and its
-adjustment, decoder-derived CCP fusion and BVG-CCCM CUs are rejected per block).
+CCP tools, M44 / M45: the CCP models, M46: CCP merge, M47 / M48: CCP merge fusion with CCCM / DIMD chroma, M49: CCP
+merge adjustment); it is **not yet faster than the CPU decoder** (see section 8) and supports only a restricted tool
+set (all real CTC streams fall back to the CPU, first reason: chroma reordering / DBV; CCP merge's fusion with CCCM by
+a blend model, decoder-derived CCP fusion and BVG-CCCM CUs are rejected per block).
 
 ## 2. The user's rules (follow them exactly)
 
@@ -891,6 +891,38 @@ chroma and 0 to 310 of fusion with CCCM per picture. Canaries: 4, all caught (th
 second prediction by the LM branch, the CU without its DIMD chroma node, planar instead of the node's mode). GPU
 time per picture: the plain, blending (m19, m20o, m24) and m47 sets as M47's (within noise), m48 162.09 ms (M47 sent
 its pictures to the CPU).
+M49: CCP merge adjustment (JVET-AL0126; ccpMergeAdjustFlag 1 or 2, then idxNonLocalCCP up to the SPS's
+maxNumCcpMergeAdjustCand; never at the picture's corner, never with merge fusion). DecCu's list for it
+(getCCPModelCandidateList with the flag) holds the CCCM models alone (types above CCP_TYPE_GLM4567), at most 15
+(MAX_CCP_CAND_LIST_INIT_SIZE), no defaults; deriveCcpMergeAdjustCands appends, unpruned while there is room, up to 6
+models fitted on the fly - plain CCCM of the block's own luma and luma offset over the template of the block's
+position (above and left; in the picture's top row the left part, in its left column the part above): two models
+split at xCccmCalcRefAver's threshold, one, one of the two template lines next to the block (trainingRange 2), one of
+the reference samples alone (useRefSampOnly: the template's row above the block and column left of it take their own
+sample for the neighbour that lies in the block), two of those, two of the two lines - each where a coefficient but
+the bias is not 0 (its second model's fields of a single model stay the previous fit's: never compared). The list is
+ranked as before, and adjustCCPCandidates moves the chosen model (flag 2: a pass of flag 1 first): per model and
+component a delta of the co-located sample's coefficient (flag 1: {1, -1, 3, -3, 5, -5, 7, -7}) or of its neighbours'
+(flag 2: {1, -1, 2, -2, 3, -3, 4, -4}; plain CCCM's 4, GL-CCCM's 2, without subsampling 3 to 5, several filters' 3 or
+2), each coefficient moved away from 0 by delta / 32, chosen by xGetCostCCCM (the component's template SAD, with two
+models over one model's samples): the first positive and negative deltas decide the sign (ties: the next two), the
+rest of it only while not costlier than its first, ties take the later delta, a model of two without template
+samples takes the set's last delta. On the GPU (intra_ccp.glsl) each block builds the list alike (s_ccp now 15 long),
+fits the on-the-fly models into its spare records (ccpFlyModels: intra_cccm.glsl's accumulation and solver with the
+merge pipelines' overrides g_ccpFlyTwoLines / g_ccpFlyRefOnly; the CPU's template selection by position is the whole
+template there, which the block's own selection gives: a canary of it cannot differ), ranks, and searches its own
+component's deltas in the CCCM parameter words (ccpMergeAdjust: every
+invocation decides alike from wgSum2's totals); the CU's record follows: the Cb block writes the candidate's words and
+its coefficients, the Cr block its own coefficients. The merge entry carries the flag (CCP_MERGE_ADJUST). Test set
+(encTest19 without its switch, m48's arguments with the encoder's default of 6 adjustment candidates): m49_fore32 /
+22 / 37, m49_park720, m49u_four720 (256 x 256 CTUs): 6 to 188 adjusted merge blocks per picture, besides merge fusion
+of both types. intra_rec's ID bound 2.08M. Canaries: 10, all caught (on the CIF streams the list keeping CCLM / GLM
+models, no two-line fits, no reference-sample fits, the delta not against the sign, ties keeping the earlier delta,
+an empty model unmoved, flag 2 without its first pass, the Cr coefficients not written; on the 720p ones every
+on-the-fly model valid and no early stop). GPU time per picture: the plain, CCCM and LM chroma fusion sets as M48's,
+the merge sets about 0.3 % slower (the merge pipeline's larger code; checked in both orders: m46 144.6 -> 145.1, m48
+160.5 -> 160.9 ms), m49 164.36 ms (M48 sent its pictures to the CPU). A follow-up could move the fits and the search
+out of the merge pipeline that blocks without adjustment take (a pipeline level of their own).
 
 ## 8. Numbers (i7-10700 8C/16T, Win11, GCC 16.2, RTX 3070 driver 616.92)
 
@@ -930,9 +962,9 @@ Profile of a GPU-on decode (non-LTO, m2_park16, share of all samples): parsing ~
    M41 CFLM (the m41 and m41f sets), M42 GLM with luma with LFNST / NSPT (the m42 set), M43 the SPS switches of the
    CCP tools (the m43 and m43c sets). 2026-10-14: M44 the LM CUs' CCP models, M45 those of LM chroma fusion CUs and
    the inside filter's flags (verified on the LM sets), M46 CCP merge (the m46 set, m46u_four720, h46_crowd), M47 CCP
-   merge fusion with CCCM (the m47 set), M48 with DIMD chroma (the m48 set). All 19 regular streams now stop at
-   "chroma reordering / DBV" (the next sequence-level check; the block-level tools of step 4 follow, CCP merge's rest
-   first: merge adjustment, decoder-derived CCP fusion).
+   merge fusion with CCCM (the m47 set), M48 with DIMD chroma (the m48 set), M49 CCP merge adjustment (the m49 set).
+   All 19 regular streams now stop at "chroma reordering / DBV" (the next sequence-level check; the block-level tools
+   of step 4 follow, the CCP tools' rest first: decoder-derived CCP fusion, merge with LFNST / NSPT, BVG-CCCM).
 3. Make the GPU path win on CPU time per picture: the derive-only pass (record during parsing or a leaner pass;
    speed up getSpatialIpm/getPURestricted, which also helps the CPU decoder), GPU behaviour with frame threads
    (8 contexts x 32 persistent workgroups oversubscribe the GPU; spinning workgroups; try fewer groups per context,
@@ -968,9 +1000,10 @@ Profile of a GPU-on decode (non-LTO, m2_park16, share of all samples): parsing ~
    search with every type, without ECM_TEST_CHROMA_FUSION_LM_ONLY); `bin\encTest17` (m43) ECM_TEST_NO_CCP (the
    chroma searches' PU::hasNonLocalCCP, hasBvgCccmFlag and hasDecoderDerivedCCP conditions false); `bin\encTest18`
    (m46) ECM_TEST_NO_CCP_FUSION (the merge searches' fusion modes, `fusionModeNum` 0); `bin\encTest19` (m47)
-   ECM_TEST_CCP_FUSION_CCCM (`fusionModeNum` 1: the modes none and CCCM; without it, m48: all three). The user's order
-   (2026-10-13): all intra first, then inter. Next the rest of the CCP tools' CUs (CCP merge's adjustment and its
-   LFNST / NSPT; decoder-derived CCP fusion; BVG-CCCM with IntraTMP / IBC), chroma reordering /
+   ECM_TEST_CCP_FUSION_CCCM (`fusionModeNum` 1: the modes none and CCCM; without it, m48: all three; m49 with the
+   encoder's default of 6 adjustment candidates). The user's order (2026-10-13): all intra first, then inter. Next the
+   rest of the CCP tools' CUs (decoder-derived CCP fusion; CCP merge with LFNST / NSPT; BVG-CCCM with IntraTMP / IBC),
+   chroma reordering /
    DBV, BVG-DIMD, MDIP / MPM sorting, IntraTMP / IBC, EIP / SGPM, PDP, NN
    intra, implicit MTS (not in CTC; its test set, the m24 arguments with `--MTS=0 --MTSImplicit=1`, is encoded:
    `streams_gpu\pending\imts_*`), deblocking on the GPU, then inter pictures.
