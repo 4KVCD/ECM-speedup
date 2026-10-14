@@ -66,7 +66,7 @@
 
 namespace
 {
-// layout shared with intra_rec.comp (struct Tu): 101 int32
+// layout shared with intra_rec.comp (struct Tu): 102 int32
 struct Tu
 {
   int32_t comp, x, y, w, h;
@@ -109,8 +109,9 @@ struct Tu
   int32_t mtsSet, secIdx, secBucket;
   int32_t lm;     // a CCLM block's mark, slope adjustments and LBCCP filter (intra_common.glsl's LM_*)
   int32_t cflm;   // a CFLM block's template record in Params::timdData (TemplateUnits, its units' bits; -1: none)
+  int32_t ccp;    // an LM block's CU's CCP model record in Params::ccpOut (CCP_OUT; -1: none)
 };
-static_assert( sizeof( Tu ) == 101 * 4, "Tu layout" );
+static_assert( sizeof( Tu ) == 102 * 4, "Tu layout" );
 
 // Tu::derive (intra_common.glsl's DERIVE_*)
 constexpr int DERIVE_NODE         = 32;   // not a block: the derivation of the mode of CU Tu::cu, before its blocks
@@ -150,6 +151,19 @@ constexpr int LM_CCCM_GLM_LUMA = 65536;
 // (isChromaFusion) in the second slope adjustment's field and the first type's weight in the first's, which a fusion
 // block does not have)
 constexpr int LM_FUSION = 1 << 30, LM_FUSION_W_SHIFT = 0, LM_FUSION_TYPE_SHIFT = 4;
+
+// the CCP model record of an LM CU (intra_common.glsl's CCP_OUT_*, int32): the CCPModelCandidate fields
+// predIntraChromaLM / predIntraCCCM set (CCP merge's curCand), written by the CU's blocks, compared in verification
+constexpr int CCP_OUT_TYPE = 0, CCP_OUT_GLM_IDC = 1, CCP_OUT_Y_THRES = 2, CCP_OUT_LUMA_OFFSET = 3, CCP_OUT_COR_OFF = 4;
+constexpr int CCP_OUT_MDF = 6, CCP_OUT_NUM_PARAMS = 7, CCP_OUT_SHIFT = 8, CCP_OUT_SHIFT2 = 10, CCP_OUT_RANGE = 12;
+constexpr int CCP_MAX_PARAMS = 11, CCP_OUT_PARAMS = 24, CCP_OUT_PARAMS2 = CCP_OUT_PARAMS + 4 * CCP_MAX_PARAMS;
+constexpr int CCP_OUT = CCP_OUT_PARAMS2 + 4 * CCP_MAX_PARAMS;
+#if JVET_AD0188_CCP_MERGE
+static_assert( NUM_CCP_PARAMS == CCP_MAX_PARAMS && CCP_TYPE_CCLM == 1 && CCP_TYPE_MMLM == 2 && CCP_TYPE_GLM0123 == 4
+                 && CCP_TYPE_GLM4567 == 8 && CCP_TYPE_CCCM == 16 && CCP_TYPE_GLCCCM == 32 && CCP_TYPE_NSCCCM == 64
+                 && CCP_TYPE_MDFCCCM == 128,
+               "intra_common.glsl's CCP record" );
+#endif
 
 // the type of a block of LM chroma fusion (isChromaFusion: 1 the blend with CCCM, 2 / 3 CFLM), 0 for other blocks
 int lmFusionType( const Tu& t )
@@ -951,6 +965,7 @@ struct Params
   uint64_t timdData;
   uint64_t timdOut;
   uint64_t tmrlOut;
+  uint64_t ccpOut;
   int32_t  origin[3];
   int32_t  stride[3];
   int32_t  width[3];
@@ -972,7 +987,7 @@ struct Params
   int32_t  cccmScratchOffset;
   int32_t  cccmScratchWords;
 };
-static_assert( offsetof( Params, origin ) == 288 && offsetof( Params, edgeCap ) == 368 && sizeof( Params ) == 424,
+static_assert( offsetof( Params, origin ) == 296 && offsetof( Params, edgeCap ) == 376 && sizeof( Params ) == 432,
                "Params layout" );
 
 struct Push
@@ -1400,6 +1415,12 @@ struct GpuIntraRec::Impl
   int32_t                     cccmScratchWords = 0;  // the CCCM scratch each intra_rec workgroup needs (int32): the
                                                      // largest CCCM block's data beyond shared memory
   std::unordered_map<const CodingUnit*, int32_t> cuIndex[2];   // per channel type: the record of a CU
+  // the LM CUs' CCP models (CCP merge's curCand) the GPU computes (Tu::ccp: per PU, both components' blocks write it)
+  int                                                  numCcp = 0;
+  std::unordered_map<const PredictionUnit*, int32_t>  ccpIndex;
+#if JVET_AD0188_CCP_MERGE
+  std::vector<CCPModelCandidate>                       cpuCcp;   // verification: per record the CPU's curCand
+#endif
   // the sign prediction prepareSignPred took from a TU, for the record() of its coded component
   struct PendingSignPred
   {
@@ -1581,6 +1602,11 @@ void GpuIntraRec::beginPicture( const CodingStructure& cs )
   m.cuMipDimd.clear();
   m.blendBlocks = false;
   m.cccmScratchWords = 0;
+  m.numCcp = 0;
+  m.ccpIndex.clear();
+#if JVET_AD0188_CCP_MERGE
+  m.cpuCcp.clear();
+#endif
   m.cuIndex[0].clear();
   m.cuIndex[1].clear();
   m.unsupportedWhy.clear();
@@ -2389,7 +2415,7 @@ static int32_t cuRecord( GpuIntraRec::Impl& m, const TransformUnit& tu, const Co
     node.y         = c.y;
     node.dbgOffset = (int32_t) m.numSamples;
     node.mipMatrix = -1;
-    node.ispPrev = node.spCoded = node.spOffset = node.resiFrom = node.cflm = -1;
+    node.ispPrev = node.spCoded = node.spOffset = node.resiFrom = node.cflm = node.ccp = -1;
     node.cu        = index;
     // with what the template predictions of intra merge, TIMD and TMRL need (the bit depth, the SPS's PDPC switch; the
     // availability units of TMRL's reference lines, chroma's as xFillReferenceSamples has them for the CU; the SPS's
@@ -2641,6 +2667,7 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
   // CCCM: the mark, LBCCP's inside filter and the template selection
   t.lm   = 0;
   t.cflm = -1;
+  t.ccp  = -1;
 #if GPU_CCLM
   if( !isLuma( compID ) && PU::isLMCMode( dirMode ) )
   {
@@ -2692,6 +2719,23 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
     // previous block's
     t.intraPredAngle = t.absInvAngle = t.angularScale = 0;
     t.refFilter = t.applyPDPC = t.gradPDPC = t.fusion = 0;
+    // the CU's CCP model (CCP merge's curCand), one record per PU, which each component's block writes its part of;
+    // in verification the CPU's, after the block's prediction
+    const auto ccp = m.ccpIndex.emplace( &pu, m.numCcp );
+    if( ccp.second )
+    {
+      m.numCcp++;
+#if JVET_AD0188_CCP_MERGE
+      m.cpuCcp.emplace_back();
+#endif
+    }
+    t.ccp = ccp.first->second;
+#if JVET_AD0188_CCP_MERGE
+    if( pred )
+    {
+      m.cpuCcp[t.ccp] = pu.curCand;
+    }
+#endif
   }
 #endif
 #if GPU_CCCM
@@ -3878,6 +3922,7 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
   const int32_t* gListDl = nullptr;
   const int32_t* gParamsDl = nullptr;
   const int32_t* gDimdDl   = nullptr;
+  const int32_t* gCcpDl    = nullptr;
   // the scheduling buffer (intra_deps fills it): pending counts, the dependents of each block (CSR, edgeCap entries),
   // the queue, the counters, then intra_deps' own arrays
   const size_t n = size_t( numTus );
@@ -3929,8 +3974,10 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
   const size_t nodeOutEnd     = cuBytes + dimdOutBytes + obicOutBytes + timdOutBytes + tmrlOutBytes;
   const size_t costOffset     = ( nodeOutEnd + 7 ) & ~size_t( 7 );   // 64-bit aligned
   const size_t costBytes      = size_t( m.numMerge ) * MERGE_COST * 8;
+  // then the LM CUs' CCP models, written by their blocks
+  const size_t ccpOffset      = costOffset + costBytes, ccpBytes = size_t( m.numCcp ) * CCP_OUT * 4;
   const size_t dbgParamsBytes = m.on ? 4 : n * DBG_PARAMS * 4;
-  m.cuBuf.ensure( ctx, std::max<size_t>( costOffset + costBytes, 4 ), gpu::Buffer::DEVICE );
+  m.cuBuf.ensure( ctx, std::max<size_t>( ccpOffset + ccpBytes, 4 ), gpu::Buffer::DEVICE );
   m.dbgParams.ensure( ctx, dbgParamsBytes, gpu::Buffer::DEVICE );
   P.cus       = m.cuBuf.addr;
   P.cuMode    = m.cuBuf.addr + cusBytes;
@@ -3943,6 +3990,7 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
   P.timdOut   = m.cuBuf.addr + cuBytes + dimdOutBytes + obicOutBytes;
   P.tmrlOut   = m.cuBuf.addr + cuBytes + dimdOutBytes + obicOutBytes + timdOutBytes;
   P.mergeCost = m.cuBuf.addr + costOffset;
+  P.ccpOut    = m.cuBuf.addr + ccpOffset;
   P.dbgParams = m.dbgParams.addr;
   std::vector<int32_t> cuData( cuBytes / 4 );
   if( cuBytes )
@@ -4055,9 +4103,10 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
     const size_t dPred = downBytes, dResi = dPred + dbgBytes, dTus = dResi + dbgBytes, dOffset = dTus + tuBytes;
     const size_t dList = dOffset + ( n + 1 ) * 4, dParams = dList + cap * 4, dDimd = dParams + dbgParamsBytes;
     const size_t nodeOutBytes = costOffset + costBytes - cuBytes;   // DimdOut, ObicOut, the merge costs
+    const size_t dCcp = dDimd + nodeOutBytes;                        // the CCP models
     if( !m.on )
     {
-      downBytes = dDimd + nodeOutBytes;
+      downBytes = dCcp + ccpBytes;
     }
     size_t dPlane[3] = {};
     for( int c = 0; c < numComp; c++ )
@@ -4136,6 +4185,10 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
       {
         s.copy( m.cuBuf, cuBytes, m.download, dDimd, nodeOutBytes );
       }
+      if( ccpBytes )
+      {
+        s.copy( m.cuBuf, ccpOffset, m.download, dCcp, ccpBytes );
+      }
     }
     for( int c = 0; c < numComp; c++ )
     {
@@ -4160,6 +4213,7 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
     gListDl  = (const int32_t*) ( (const char*) m.download.mapped + dList );
     gParamsDl = (const int32_t*) ( (const char*) m.download.mapped + dParams );
     gDimdDl   = (const int32_t*) ( (const char*) m.download.mapped + dDimd );
+    gCcpDl    = (const int32_t*) ( (const char*) m.download.mapped + dCcp );
     break;
   }
   m.gpuMs += ms;
@@ -4354,6 +4408,107 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
       }
     }
   }
+#if JVET_AD0188_CCP_MERGE
+  // the LM CUs' CCP models against the CPU's curCand: the fields of their type that CCPModelCandidate::operator== and
+  // predCCPCandidate read (CCLM's and GLM's patterns: per component a, b and the shift, with two models also the
+  // second's and the threshold; GLM with luma's: its parameters and the luma offset; CCCM's: the parameters, the
+  // template chroma's ranges, the luma offset, the corner offsets, the filters, the parameters' number, with two models
+  // also the second's and the threshold)
+  for( int r = 0; r < m.numCcp && first.empty(); r++ )
+  {
+    const int32_t*           g = gCcpDl + size_t( r ) * CCP_OUT;
+    const CCPModelCandidate& h = m.cpuCcp[r];
+    const char*              field = nullptr;
+    long long                cpu = 0, gpu = 0;
+    auto check = [&]( const char* name, long long a, long long b )
+    {
+      if( !field && a != b )
+      {
+        field = name;
+        cpu   = a;
+        gpu   = b;
+      }
+    };
+    auto param = [&]( bool second, int c, int p )
+    {
+      const int o = ( second ? CCP_OUT_PARAMS2 : CCP_OUT_PARAMS ) + 2 * ( c * CCP_MAX_PARAMS + p );
+      return (long long) ( uint64_t( uint32_t( g[o] ) ) | ( uint64_t( uint32_t( g[o + 1] ) ) << 32 ) );
+    };
+    const bool two = ( h.type & CCP_TYPE_MMLM ) != 0;
+    check( "type", h.type, g[CCP_OUT_TYPE] );
+    if( h.type & ( CCP_TYPE_CCLM | CCP_TYPE_GLM0123 ) )
+    {
+      check( "glmIdc", h.glmIdc, g[CCP_OUT_GLM_IDC] );
+      for( int c = 0; c < 2; c++ )
+      {
+        check( "a", h.params[c][0], param( false, c, 0 ) );
+        check( "b", h.params[c][1], param( false, c, 1 ) );
+        check( "shift", h.shift[c], g[CCP_OUT_SHIFT + c] );
+        if( two )
+        {
+          check( "a2", h.params2[c][0], param( true, c, 0 ) );
+          check( "b2", h.params2[c][1], param( true, c, 1 ) );
+          check( "shift2", h.shift2[c], g[CCP_OUT_SHIFT2 + c] );
+        }
+      }
+    }
+    else if( h.type & CCP_TYPE_GLM4567 )
+    {
+      check( "glmIdc", h.glmIdc, g[CCP_OUT_GLM_IDC] );
+      check( "lumaOffset", h.lumaOffset, g[CCP_OUT_LUMA_OFFSET] );
+      for( int c = 0; c < 2; c++ )
+      {
+        for( int p = 0; p < GLM_NUM_PARAMS; p++ )
+        {
+          check( "params", h.params[c][p], param( false, c, p ) );
+        }
+      }
+    }
+    else
+    {
+      const int ranges[2][2][3] = { { { h.rangeMinCb, h.rangeMaxCb, h.rangeChangeCb },
+                                      { h.rangeMinCr, h.rangeMaxCr, h.rangeChangeCr } },
+                                    { { h.rangeMinCb2, h.rangeMaxCb2, h.rangeChangeCb2 },
+                                      { h.rangeMinCr2, h.rangeMaxCr2, h.rangeChangeCr2 } } };
+      check( "lumaOffset", h.lumaOffset, g[CCP_OUT_LUMA_OFFSET] );
+      check( "corOffX", h.corOffX, g[CCP_OUT_COR_OFF] );
+      check( "corOffY", h.corOffY, g[CCP_OUT_COR_OFF + 1] );
+      check( "cccmMultiFilterIdx", h.cccmMultiFilterIdx, g[CCP_OUT_MDF] );
+      check( "numParams", h.numParams, g[CCP_OUT_NUM_PARAMS] );
+      for( int k = 0; k < ( two ? 2 : 1 ); k++ )
+      {
+        for( int c = 0; c < 2; c++ )
+        {
+          for( int i = 0; i < 3; i++ )
+          {
+            check( "range", ranges[k][c][i], g[CCP_OUT_RANGE + 3 * ( 2 * k + c ) + i] );
+          }
+          for( int p = 0; p < std::min( h.numParams, CCP_MAX_PARAMS ); p++ )
+          {
+            check( k ? "params2" : "params", k ? h.params2[c][p] : h.params[c][p], param( k != 0, c, p ) );
+          }
+        }
+      }
+    }
+    if( two )
+    {
+      check( "yThres", h.yThres, g[CCP_OUT_Y_THRES] );
+    }
+    if( field )
+    {
+      int b = 0;   // (the record's first block)
+      while( b < numTus - 1 && m.rec[b].ccp != r )
+      {
+        b++;
+      }
+      char buf[200];
+      snprintf( buf, sizeof( buf ),
+                "CCP model's %s of record %d (LM block %d at %d,%d %dx%d, type %d): CPU %lld GPU %lld", field, r, b,
+                m.rec[b].x, m.rec[b].y, m.rec[b].w, m.rec[b].h, h.type, cpu, gpu );
+      first = buf;
+    }
+  }
+#endif
   // the modes and parameters intra_rec derived against the CPU's: every field the kernels read for the mode (the
   // angular ones of angular modes, PDPC's scale for positive angles); of a MIP or CCLM block the transforms only
   for( int i = 0; i < numTus && first.empty(); i++ )

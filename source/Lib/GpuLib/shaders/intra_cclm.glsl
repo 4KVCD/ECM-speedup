@@ -433,6 +433,50 @@ void cclmModel( Tu t, int lx, int ly, int predStride, int ref, int slot )
   s_cclm[m + CCLM_THRES] = thres;
 }
 
+// ----- the CCP model (JVET-AD0188's PredictionUnit::curCand, which CCP merge inherits: intra_common.glsl's CCP_OUT_*)
+
+// parameter p of component c (0: Cb, 1: Cr) of model `second` of the CCP record from base
+void ccpStoreParam( int base, bool second, int c, int p, int64_t v )
+{
+  const ivec2 w = unpackInt2x32( v );
+  const int   o = base + ( second ? CCP_OUT_PARAMS2 : CCP_OUT_PARAMS ) + 2 * ( c * CCP_MAX_PARAMS + p );
+  CBufI32( P.ccpOut ).v[o]     = w.x;
+  CBufI32( P.ccpOut ).v[o + 1] = w.y;
+}
+
+// the range of the template's chroma of model `second`, component c: rangeMin, rangeMax, rangeChange (the range spans
+// more than one value; without samples resetRange's INT16_MAX, INT16_MIN)
+void ccpStoreRange( int base, bool second, int c, int lo, int hi )
+{
+  const int o = base + CCP_OUT_RANGE + 3 * ( ( second ? 2 : 0 ) + c );
+  CBufI32( P.ccpOut ).v[o]     = lo;
+  CBufI32( P.ccpOut ).v[o + 1] = hi;
+  CBufI32( P.ccpOut ).v[o + 2] = hi > lo ? 1 : 0;
+}
+
+// CCLM block t's part of its CU's CCP record (predIntraChromaLM after the slope adjustments, cclmModelToCcpParams):
+// the type, glmIdc, its component's a, b and shift, with two models also the second's and the threshold (invocation 0;
+// the model in slot 0)
+void cclmStoreCcp( Tu t )
+{
+  const int  base = t.ccp * CCP_OUT, c = t.comp - 1, m = CCLM_MODEL, glm = ( t.lm >> LM_GLM_SHIFT ) & 15;
+  const bool two = cclmMultiModel( t.dirMode );
+  CBufI32    o = CBufI32( P.ccpOut );
+  o.v[base + CCP_OUT_TYPE]       = ( glm > 0 ? CCP_TYPE_GLM0123 : CCP_TYPE_CCLM ) | ( two ? CCP_TYPE_MMLM : 0 );
+  o.v[base + CCP_OUT_GLM_IDC]    = glm;
+  o.v[base + CCP_OUT_NUM_PARAMS] = 2;
+  o.v[base + CCP_OUT_SHIFT + c]  = s_cclm[m + CCLM_SHIFT];
+  ccpStoreParam( base, false, c, 0, int64_t( s_cclm[m + CCLM_A] ) );
+  ccpStoreParam( base, false, c, 1, int64_t( s_cclm[m + CCLM_B] ) );
+  if( two )
+  {
+    o.v[base + CCP_OUT_Y_THRES]    = s_cclm[m + CCLM_THRES];
+    o.v[base + CCP_OUT_SHIFT2 + c] = s_cclm[m + CCLM_SHIFT2];
+    ccpStoreParam( base, true, c, 0, int64_t( s_cclm[m + CCLM_A2] ) );
+    ccpStoreParam( base, true, c, 1, int64_t( s_cclm[m + CCLM_B2] ) );
+  }
+}
+
 // ----- the prediction (predIntraChromaLM, LBCCP's filterPredInside); `slot`: the model's in s_cclm
 
 int  cccmBlockPrediction( Tu t, int x, int y );          // (intra_cccm.glsl)

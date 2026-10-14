@@ -6,7 +6,7 @@
 # (and beyond the availability, read ranges and ISP side, which intra_deps computes), with the first blocks.
 import struct, sys
 
-TU = 101   # int32 per Tu (intra_common.glsl)
+TU = 102   # int32 per Tu (intra_common.glsl)
 FIELDS = ["comp", "x", "y", "w", "h", "dirMode", "isModeVer", "intraPredAngle", "absInvAngle", "useCubic", "unitW",
           "unitH", "bitDepth", "cbf", "coeffOffset", "dqScale", "dqRightShift", "dqInMin", "dqInMax", "trMin", "trMax",
           "shift1", "shift2", "recMin", "recMax", "dbgOffset", "plIdx", "refFilter", "applyPDPC", "gradPDPC",
@@ -16,7 +16,7 @@ FIELDS = ["comp", "x", "y", "w", "h", "dirMode", "isModeVer", "intraPredAngle", 
           "mipSizeId", "secKind", "secMatrix", "secRowLength", "secNumIn", "secScan", "secLayout", "secSize",
           "secTranspose", "mrl", "bfAvail0", "bfAvail1", "bfAvail2", "isp", "cuX", "cuY", "cuW", "cuH", "regX", "regW",
           "ispSide", "ispPrev", "spCoded", "spOffset", "resiFrom", "cu", "derive", "mtsSet", "secIdx", "secBucket",
-          "lm", "cflm"]
+          "lm", "cflm", "ccp"]
 assert len(FIELDS) == TU
 # intra_rec derives these for DERIVE_MODE blocks (applyModeParams, DIMD), the transforms for DERIVE_TRANSFORM ones
 DERIVED   = {"dirMode", "isModeVer", "intraPredAngle", "absInvAngle", "useCubic", "refFilter", "applyPDPC", "gradPDPC",

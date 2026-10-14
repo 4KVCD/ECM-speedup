@@ -1872,6 +1872,10 @@ void main()
           if( lid == 0 )
           {
             cclmModel( t, lx, ly, predStride, 0, 0 );
+            if( t.ccp >= 0 )   // (CCP merge's inheritance)
+            {
+              cclmStoreCcp( t );
+            }
           }
           SYNC();
         }

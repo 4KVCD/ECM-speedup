@@ -60,6 +60,7 @@ const int CCCM_THRESHOLD     = 18;              // per set of models: the luma t
 const int CCCM_COST          = 20;              // per set: the template's SATD
 const int CCCM_RANGE         = 22;              // the template chroma's min and max (Cb's, Cr's) of the model being fitted
 const int CCCM_CLIP          = 26;              // per model and component: the prediction's clipping range (min, max)
+const int CCCM_MODEL_RANGE   = 42;              // per model and component: CCCM_RANGE as fitted (the CCP record's)
 
 // the words of s_spCost: per model (set * 2 + class) Cb's then Cr's parameters, then the pivot row of the model being
 // solved (its parameters and the two right-hand sides)
@@ -879,6 +880,51 @@ void cccmCosts( Tu t, bool twoModels, int lid, int NT )
   SYNC();
 }
 
+// CCCM block t's CU's CCP record (predIntraCCCM's curCand, cccmModelToCcpParams; invocation 0, after the models and
+// LBCCP's choice): the type, the threshold of two models (else 0), the luma offset, the reference area's columns / rows
+// left of / above the block (not without subsampling), the downsampling filters, the parameters' number, per model and
+// component the set's parameters and its template chroma's range. GLM with luma's (xGlmCalcModel, glmModelToCcpParams)
+// only its component's parameters, its glmIdc and the luma offset
+void cccmStoreCcp( Tu t, bool twoModels )
+{
+  const int base = t.ccp * CCP_OUT, M = g_cccmParams;
+  CBufI32   o = CBufI32( P.ccpOut );
+  if( g_cccmGlmLuma )
+  {
+    const int c = t.comp - 1;
+    o.v[base + CCP_OUT_TYPE]        = CCP_TYPE_GLM4567;
+    o.v[base + CCP_OUT_GLM_IDC]     = ( t.lm >> LM_GLM_SHIFT ) & 15;
+    o.v[base + CCP_OUT_LUMA_OFFSET] = g_cccmLumaOffset;
+    for( int p = 0; p < M; p++ )
+    {
+      ccpStoreParam( base, false, c, p, cccmLoad( cccmParamWord( 0, c, p ) ) );
+    }
+    return;
+  }
+  const int type = g_cccmNoSub ? CCP_TYPE_NSCCCM : g_cccmMdf != 0 ? CCP_TYPE_MDFCCCM
+                 : g_cccmGl ? CCP_TYPE_GLCCCM : CCP_TYPE_CCCM;
+  o.v[base + CCP_OUT_TYPE]        = type | ( twoModels ? CCP_TYPE_MMLM : 0 );
+  o.v[base + CCP_OUT_Y_THRES]     = twoModels ? s_cclm[CCCM_THRESHOLD + g_cccmSet] : 0;
+  o.v[base + CCP_OUT_LUMA_OFFSET] = g_cccmLumaOffset;
+  o.v[base + CCP_OUT_COR_OFF]     = g_cccmNoSub ? 0 : g_cccmSizeX;
+  o.v[base + CCP_OUT_COR_OFF + 1] = g_cccmNoSub ? 0 : g_cccmSizeY;
+  o.v[base + CCP_OUT_MDF]         = g_cccmMdf;
+  o.v[base + CCP_OUT_NUM_PARAMS]  = M;
+  for( int m = 0; m < ( twoModels ? 2 : 1 ); m++ )
+  {
+    const int k = 2 * g_cccmSet + m;
+    for( int c = 0; c < 2; c++ )
+    {
+      const int r = CCCM_MODEL_RANGE + 4 * k + 2 * c;
+      ccpStoreRange( base, m == 1, c, s_cclm[r], s_cclm[r + 1] );
+      for( int p = 0; p < M; p++ )
+      {
+        ccpStoreParam( base, m == 1, c, p, cccmLoad( cccmParamWord( k, c, p ) ) );
+      }
+    }
+  }
+}
+
 // the prediction of CCCM block t into s_tmp, larger ones into the scratch (rows of t.w; all invocations, ending with a
 // barrier; cccmBlockPrediction reads it), with `both` (LFNST / NSPT's DIMD of the CU's predictions: predIntraCCCM
 // predicts both at the Cb block) both components' (Cb's, then Cr's): the reference area, the luma buffer(s), with two
@@ -957,6 +1003,11 @@ void cccmPrediction( Tu t, bool both, int lid, int NT )
     {
       cccmAccumulate( t, k, twoModels, lid, NT );
       cccmSolve( t, k, lid );
+      if( lid < 2 )   // (the next model's cccmAccumulate resets CCCM_RANGE in the same invocations)
+      {
+        s_cclm[CCCM_MODEL_RANGE + 4 * k + 2 * lid]     = s_cclm[CCCM_RANGE + 2 * lid];
+        s_cclm[CCCM_MODEL_RANGE + 4 * k + 2 * lid + 1] = s_cclm[CCCM_RANGE + 2 * lid + 1];
+      }
     }
   }
   g_cccmSet = 0;
@@ -965,6 +1016,10 @@ void cccmPrediction( Tu t, bool both, int lid, int NT )
     cccmCosts( t, twoModels, lid, NT );
     g_cccmSet = s_cclm[CCCM_COST + 1] < s_cclm[CCCM_COST] ? 1 : 0;
     SYNC();   // (the prediction overwrites the template predictions)
+  }
+  if( lid == 0 && t.ccp >= 0 && !g_cccmFusion && ( g_cccmGlmLuma || t.comp == 1 ) )   // (CCP merge's inheritance)
+  {
+    cccmStoreCcp( t, twoModels );
   }
   const bool inTmp = cccmPredInTmp( t );
   for( int i = lid; i < ( g_cccmBoth ? 2 : 1 ) * W * H; i += NT )   // (at i: Cb's, then Cr's where both)
