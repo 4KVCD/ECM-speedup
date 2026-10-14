@@ -420,12 +420,13 @@ the reconstruction buffer; works in every frame-thread context):
   components' CCCM predictions. M39 is GLM with luma: a CCCM-like model of a gradient pattern's value and the luma.
   M40 is LM chroma fusion's first type: a regular chroma prediction blended with a CCCM one. M41 is CFLM, its types 2
   and 3: a model of the block's own prediction and the luma, fitted where the template is predicted by the same mode.
-  M42 is GLM with luma with LFNST / NSPT.
+  M42 is GLM with luma with LFNST / NSPT. M43 accepts the SPS switches of CCP merge, decoder-derived CCP fusion and
+  BVG-CCCM; their CUs are still rejected per block.
   GpuIntraRec::supported()
   rejects every tool whose mode derivation or prediction reads reconstructed samples or that the kernels lack, before
-  anything is skipped. All 19 regular streams now fall back to the CPU at cross-component prediction (CCP merge,
-  decoder-derived CCP fusion, BVG-CCCM), the next sequence-level check (before M34: CCCM, before M29: TMRL, before M14:
-  sign prediction, before M6: QCS, before M5: LMCS, before M4: dual tree); many block-level tools follow. The
+  anything is skipped. All 19 regular streams now fall back to the CPU at chroma reordering / DBV, the next
+  sequence-level check (before M43: cross-component prediction, before M34: CCCM, before M29: TMRL, before M14: sign
+  prediction, before M6: QCS, before M5: LMCS, before M4: dual tree); many block-level tools follow. The
   kernels' reference availability is "decoded earlier", while the CPU's (CodingStructure::getCURestricted) also
   excludes other tiles,
   with wavefronts the CTUs right of the current one in the row above, and with GDR the dirty area: until that fix

@@ -1534,7 +1534,6 @@ bool GpuIntraRec::supported( const Slice& slice, std::string& why )
   else if( sps.getUseTmrl() && !GPU_TMRL )                                                why = "TMRL of another configuration";
   else if( sps.getUseLMChroma() && !GPU_CCLM )                                           why = "CCLM of another configuration";
   else if( sps.getUseCccm() && !GPU_CCCM )                                                why = "CCCM of another configuration";
-  else if( sps.getUseCcpMerge() || sps.getUseDdCcpFusion() || sps.getUseBvgCccm() )      why = "cross-component prediction";
   else if( sps.getUseChromaReordering() || sps.getUseIntraDBV() )                         why = "chroma reordering / DBV";
   else if( sps.getUseDimd() && !GPU_DIMD )                                                why = "DIMD of another configuration";
   else if( sps.getUseTimd() && !GPU_TIMD )                                                why = "TIMD of another configuration";
@@ -2540,6 +2539,15 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
     why = "chroma TMRL in a picture smaller than the SPS's";
   else if( cu.eipFlag )                                             why = "EIP";
   else if( !isLuma( compID ) && ipa.multiRefIndex && !pu.chromaTmrlFlag ) why = "chroma MRL";
+  // CCP merge (JVET-AD0188: a model from a neighbour's, the history's or the template's, the candidates ranked by
+  // template costs) and decoder-derived CCP fusion (JVET-AG0154: the models of the lowest template costs blended);
+  // their SPS switches leave the other LM blocks as they are (BVG-CCCM: otherCccm)
+#if JVET_AD0188_CCP_MERGE
+  else if( !isLuma( compID ) && pu.idxNonLocalCCP )                 why = "CCP merge";
+#endif
+#if JVET_AG0154_DECODER_DERIVED_CCP_FUSION
+  else if( !isLuma( compID ) && pu.decoderDerivedCcpMode )          why = "decoder-derived CCP fusion";
+#endif
   // CCLM (chroma, the LM modes): the model from the template and the downsampled luma, its slope adjustment and LBCCP's
   // filter; with GLM (JVET-AA0126) the model of a gradient pattern's values instead of the downsampled luma; GLM with
   // luma (JVET-AB0092: glmIdc beyond the patterns) a CCCM model (intra_cccm.glsl), of the same kind in both components
