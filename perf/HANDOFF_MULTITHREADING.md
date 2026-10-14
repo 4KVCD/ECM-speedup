@@ -249,6 +249,22 @@ Commits on `enc-mt`, all bit-exact with stock ECM-20.0 (bitstream md5 of the sui
   19.49 -> 18.11; 600 frames (19 periods automatically, a window of 608 pictures: also read at once), 600-1200 s
   23.93 / 18.27 -> 23.51 / 17.85, peak 27.20 -> 26.82. At 600 frames commit climbs from 18.5 to 25 GB between 600
   and 900 s and stays there.
+- Speed step S6: the memory estimate of the automatic FrameThreads and FramePeriods (`xFrameThreadsMemoryBytes`) was
+  measured before R7-R14 at 1080p with CTU 128: 0.7 GB a search stack and (GOPSize + 2N) x 70 bytes per luma sample for
+  the pictures in flight. After the RAM steps it overestimated the base 2-3x, so 2160p RA with the class A configuration
+  on this 64 GB machine got 14 threads and 1 period (2160p, 20 threads, 4 periods: 60 GB estimated, 30.9 GB measured
+  over 40 minutes), and it had no margin for CTU 256 (128x128 AI with CTU 256: 13.57 GB measured, 13.09 estimated) and
+  too little per period (272 bytes per sample estimated, 360-440 measured; 1080p class B with 19 periods: 30.94 GB
+  measured, 32.75 estimated). New figures, measured peak commit with about 20 % margin: a search stack 0.43 GB with CTU
+  128 and 0.82 GB with CTU 256 plus 72 bytes per sample for the picture it searches, the references 7.5 bytes per sample
+  x GOPSize, a period (max(N, GOPSize) x 6 + 338) bytes per sample (table in OPTIMIZATIONS.md). 2160p class A on this
+  machine: 14 threads and 1 period -> 20 and 3; the other configurations measured keep their choice here. The same
+  choice on RA 129 frames 128x128 (5 periods, unpinned): 14 threads and 1 period 734.6 s (1.45x over one thread), 20
+  threads and 3 periods 339.2 s (3.14x), output identical. The per-period cost falls with M (1080p class B: about 1.8 GB
+  a period from 1 to 3, 0.9 GB from 10 to 19), so 3 periods have the smallest margin (13 % after 20 minutes, still
+  rising slowly). The class configurations (CTU 256) are bit-exact with frame threads too: RA 33 frames with class B and
+  AI 33 pictures with CTU 256, stock ECM-20.0 = 1 thread = 8 threads (bitstream and reconstruction md5). Stock ECM-20.0
+  allows CCSAO at most 256 CTUs per picture, so 2160p needs CTU 256 (class A).
 - RAM step R14: the climb is the backlog of searched pictures waiting for their finish turn (allocation probe of
   R13 on 600 frames, `C:\Code\work\mt\ram\probe4`, `growth.py` compares two dumps by site): the pictures between
   search start and finish end grew from about 25 at 600 s to 65 at 1020 s, as searches run ahead of the finishes,

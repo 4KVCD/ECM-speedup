@@ -3902,17 +3902,20 @@ const char* EncAppCfg::xFrameThreadsUnsupported() const
 
 double EncAppCfg::xFrameThreadsMemoryBytes( int threads, int periods ) const
 {
-  // Measured at 1080p (perf/OPTIMIZATIONS.md), with some margin on each figure: a search stack commits about 0.6 GB, a
-  // picture that waits for its search about 4 bytes per luma sample, an idle finish context about 63; up to
-  // max(N, GOPSize) pictures per period are in flight, and about GOPSize + 2N more (references, pictures being
-  // searched) about 70 bytes per sample.
+  // Peak commit measured with 20 threads (perf/OPTIMIZATIONS.md: 128x128 AI and RA, RA 1080p at 10 and 19 periods,
+  // RA 2160p at 4 periods, with CTU 128 and 256), with about 20 % margin on each figure: a search stack commits about
+  // 0.35 GB with CTU 128 and 0.69 GB with CTU 256 (its buffers per block size), and the picture it searches about 60
+  // bytes per luma sample; the references about 6 bytes per sample; a period about 440 bytes per sample (its finish
+  // context and ALF statistics, its pictures searched and waiting for their finish), of which a picture that waits
+  // for its search about 5 (max(N, GOPSize) per period are in flight).
 #if JVET_AA0146_WRAP_AROUND_FIX
   const double samples   = double( m_sourceWidth ) * double( m_sourceHeight );
 #else
   const double samples   = double( m_iSourceWidth ) * double( m_iSourceHeight );
 #endif
-  const double perPeriod = std::max( threads, m_iGOPSize ) * 6.0 * samples + 80.0 * samples;
-  return threads * 0.7e9 + ( m_iGOPSize + 2 * threads ) * 70.0 * samples + periods * perPeriod;
+  const double stack     = ( m_uiCTUSize > 128 ? 0.82e9 : 0.43e9 ) + 72.0 * samples;
+  const double perPeriod = std::max( threads, m_iGOPSize ) * 6.0 * samples + 338.0 * samples;
+  return threads * stack + m_iGOPSize * 7.5 * samples + periods * perPeriod;
 }
 
 int EncAppCfg::xAutomaticFrameThreads() const

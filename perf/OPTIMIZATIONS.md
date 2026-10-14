@@ -116,8 +116,9 @@ lower all-core turbo, one duplicated intra frame per chunk, unequal chunk comple
 - Output identical at every N and M: bitstream, reconstruction and log (except the [ET] times and the two counts in
   the parameter list).
 - M = 0 (default) uses a period per frame thread, as far as the sequence has periods and 70 % of the physical memory
-  holds them by the figures below (with 8 threads: up to 1080p 8 periods on a 32 GB machine, 2160p 3 on 64 GB and 1
-  on 32 GB), and min(N, 4) for all intra. It uses 1 for one long period (IntraPeriod -1, LD) and for the
+  holds them by the figures below (RA with 20 threads on a 64 GB machine: 1080p up to 19 periods, 2160p with the
+  class A configuration 3; on 32 GB, 1080p 3 periods with CTU 256 and 10 with CTU 128, 2160p 12 threads and 1
+  period), and min(N, 4) for all intra. It uses 1 for one long period (IntraPeriod -1, LD) and for the
   options whose finishes share state between periods (buffering period, picture timing, decoding unit, frame-field,
   frame packing, scalable nesting and DRAP SEIs, DeblockingFilterMetric, a scaling-list file, HDR metrics), which
   M > 1 rejects.
@@ -130,8 +131,22 @@ lower all-core turbo, one duplicated intra frame per chunk, unequal chunk comple
   `--ParallelSegments` combines with it.
 - The search stacks and the finish objects are created in threads of their own at start (20 stacks took about a
   second serially before the first picture could start: AI 33 pictures with 20 threads 21.6 -> 20.65 s).
-- Memory: a search stack commits about 0.6 GB whatever the resolution; the setup stack and the finish stacks are
-  small. Each period beyond the first adds a finish context (about 0.13 GB at 1080p while idle; a running finish
+- Memory: a search stack commits about 0.35 GB with CTU 128 and 0.69 GB with CTU 256 whatever the resolution (AI
+  128x128 with 20 threads: 7.2 GB peak with CTU 128, 13.6 GB with CTU 256); the setup stack and the finish stacks
+  are small. Peak commit with 20 threads and the estimate the automatic choice uses
+  (`EncAppCfg::xFrameThreadsMemoryBytes`, the measured figures with about 20 % margin); 128x128 is foreman (AI 33
+  pictures, RA 65 frames), 1080p and 2160p RA on synthetic sequences for 20 minutes (40 at 2160p):
+
+| configuration | periods | measured | estimate |
+|---|---|---|---|
+| 128x128 AI, CTU 128 / 256 | 4 | 7.19 / 13.57 GB | 8.06 / 15.32 GB |
+| 128x128 RA, CTU 128 / 256 | 3 | 6.96 / 13.77 GB | 8.06 / 15.32 GB |
+| 1080p, CTU 128 | 10 / 19 | 16.43 / 23.15 GB | 21.49 / 30.70 GB |
+| 1080p, class B (CTU 256) | 1 / 3 / 10 / 19 | 15.56 / 19.16 / 22.78 / 30.94 GB | 19.54 / 21.59 / 28.75 / 37.97 GB |
+| 2160p, class A (CTU 256) | 4 | 30.90 GB | 44.63 GB |
+
+  Stock ECM-20.0 allows CCSAO at most 256 CTUs per picture (`MAX_CCSAO_CTU_NUM`): 2160p needs the class A
+  configuration's CTU 256. Each period beyond the first adds a finish context (about 0.13 GB at 1080p while idle; a running finish
   creates the SAO statistics, 0.43 GB at 1080p, and frees them after its SAO and CCSAO; one finish at a time holds
   them), and up to max(N, GOPSize) x M pictures
   are in flight. A picture that waits for its search holds no original when the input is a file and the temporal
