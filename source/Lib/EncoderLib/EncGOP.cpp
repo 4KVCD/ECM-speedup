@@ -4351,6 +4351,12 @@ void EncGOP::compressGOP(int iPOCLast, int iNumPicRcvd, PicList &rcListPic, std:
 
       if( m_ftActive )
       {
+#if JVET_AL0214_MV_REFINEMENT_FOR_TMVP
+        // the refined TMVP motion and the intersecting motion vectors cache the search's merge candidates; nothing after
+        // the search reads them, and a searched picture may wait long for its finish turn (at 1080p, dozens of pictures
+        // with about 46 MB of them each)
+        pcPic->cs->destroyTemporaryRefineTmvpCsData();
+#endif
         xFtReleaseStack( *picOrder );
       }
       xStartPicFinish( pcSlice, *picOrder, apsMapLock );

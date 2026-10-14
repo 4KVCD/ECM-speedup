@@ -141,6 +141,9 @@ public:
   void freeCachedUnits();
 #if JVET_AL0214_MV_REFINEMENT_FOR_TMVP
   void createTemporaryRefineTmvpCsData(bool isIntra, int* numRefPic, bool isDec);
+  /// frees what createTemporaryRefineTmvpCsData made (also done by destroyTemporaryCsData); the encoder's frame threads
+  /// free it at the end of a picture's search, as nothing after the search reads it
+  void destroyTemporaryRefineTmvpCsData();
 #endif
 #if JVET_Z0118_GDR
   bool isCuCrossIRA(int begX) const;

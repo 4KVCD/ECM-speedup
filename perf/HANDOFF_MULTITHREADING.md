@@ -212,7 +212,7 @@ Commits on `enc-mt`, all bit-exact with stock ECM-20.0 (bitstream md5 of the sui
   functions build entries without them; merge candidates inherit hypotheses from the HMVP table only), so the table
   entries keep them in `HmvpMotionInfo`. 224 -> 88 bytes; 1080p RA with no options, 75-150 s: commit 13.31 -> 12.47 GB,
   working set 7.27 -> 6.45 GB. The decoder shares the code (decoded three bitstreams to the encoder's reconstruction).
-  Allocation probe at 20 threads (`C:\Code\work\mtam\probe2`, exe `bin/allocprobe2`, `dumps.py` for sites over
+  Allocation probe at 20 threads (`C:\Code\work\mt\ram\probe2`, exe `bin/allocprobe2`, `dumps.py` for sites over
   time): at 1080p a finish's ALF covariance statistics are 1.04 GB (147 per CTU x 52 KB; 4.2 GB at 4K), created
   before `ALFProcess` and freed after it, so concurrent finishes add up; `InterSearch::ReusedUniMvs` commits 66 MB a
   stack with 30 KB used (R10); at CIF after 900 s nearly every picture of the window (286 of 288) held its motion
@@ -246,8 +246,21 @@ Commits on `enc-mt`, all bit-exact with stock ECM-20.0 (bitstream md5 of the sui
   is the flush, and before this step nothing was handed out or freed in it (the 140 finished pictures holding 7 GB
   in the earlier probe were that, not output order in general). 1080p RA, 20 threads, previous commit -> R13 (commit
   / working set, GB, one run each after the other): 300 frames, 600-1200 s 17.26 / 12.66 -> 15.68 / 11.10, peak
-  19.49 -> 18.11; 600 frames (the window slides as periods complete), 600-1200 s 23.93 / 18.27 -> 23.51 / 17.85,
-  peak 27.20 -> 26.82. At 600 frames commit climbs from 18.5 to 25 GB between 600 and 900 s and stays there.
+  19.49 -> 18.11; 600 frames (19 periods automatically, a window of 608 pictures: also read at once), 600-1200 s
+  23.93 / 18.27 -> 23.51 / 17.85, peak 27.20 -> 26.82. At 600 frames commit climbs from 18.5 to 25 GB between 600
+  and 900 s and stays there.
+- RAM step R14: the climb is the backlog of searched pictures waiting for their finish turn (allocation probe of
+  R13 on 600 frames, `C:\Code\work\mt\ram\probe4`, `growth.py` compares two dumps by site): the pictures between
+  search start and finish end grew from about 25 at 600 s to 65 at 1020 s, as searches run ahead of the finishes,
+  which go in coding order per period. Of what such a picture holds, the refined TMVP motion (JVET_AL0214, about
+  37 MB at 1080p) and the intersecting motion vectors (JVET_AI0183, about 9 MB) are the search's merge-candidate
+  caches, which nothing after the search reads: with frame threads they are freed at the search end
+  (`CodingStructure::destroyTemporaryRefineTmvpCsData`, also called by `destroyTemporaryCsData`). 600 frames,
+  600-1200 s: commit 23.51 -> 20.67 GB, working set 17.85 -> 15.02 GB, peak 26.82 -> 23.15 GB; 300 frames
+  15.68 -> 14.61 GB. The rest of a waiting picture (about 80 MB at 1080p: coefficients, CU/PU/TU maps,
+  reconstruction, residual and prediction for ALF and the reshaper, originals) is read by its finish. Left: limiting
+  how far searches run ahead of the finishes (a speed trade-off on the RA chains), the ALF statistics of concurrent
+  finishes (1.08 GB each at 1080p), and the per-stack search data (20 stacks: about 2.7 GB).
 - Speed step S1: in all intra, the pictures waiting for a search stack take them in order of decreasing luma activity
   (`EncGOP::xFtSearchPriority`, the cost estimate of `--ParallelSegments`) instead of coding order, so the expensive
   pictures do not start last. AI 33 pictures, 2 runs each alternating with the previous build: 8 P-cores 34.5 -> 33.0 s

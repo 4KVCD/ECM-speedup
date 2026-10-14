@@ -341,6 +341,20 @@ void CodingStructure::destroyTemporaryCsData()
   }
   m_cuCache.cache(cus);
   m_numCUs = 0;
+#if JVET_AL0214_MV_REFINEMENT_FOR_TMVP
+  destroyTemporaryRefineTmvpCsData();
+#elif JVET_AI0183_MVP_EXTENSION
+  if (m_intersectingMvBuf != nullptr)
+  {
+    delete[] m_intersectingMvBuf;
+    m_intersectingMvBuf = nullptr;
+  }
+#endif
+}
+
+#if JVET_AL0214_MV_REFINEMENT_FOR_TMVP
+void CodingStructure::destroyTemporaryRefineTmvpCsData()
+{
 #if JVET_AI0183_MVP_EXTENSION
   if (m_intersectingMvBuf != nullptr)
   {
@@ -348,7 +362,6 @@ void CodingStructure::destroyTemporaryCsData()
     m_intersectingMvBuf = nullptr;
   }
 #endif
-#if JVET_AL0214_MV_REFINEMENT_FOR_TMVP
   for (int refineTmvpColIdx = 0; refineTmvpColIdx < 2; refineTmvpColIdx++)
   {
     for (int refineTmvpColRefList = 0; refineTmvpColRefList < 2; refineTmvpColRefList++)
@@ -379,8 +392,8 @@ void CodingStructure::destroyTemporaryCsData()
       tmvpRefinedAvailable[refineTmvpColIdx] = nullptr;
     }
   }
-#endif
 }
+#endif
 
 void CodingStructure::createTemporaryCsData(const bool isPLTused)
 {

@@ -155,7 +155,8 @@ lower all-core turbo, one duplicated intra frame per chunk, unequal chunk comple
   picture's reconstruction to its frame's position in the file as soon as the picture is finished, in any order, so
   that a completed intra period does not wait for the output of the earlier ones and the end of the input frees the
   pictures as they finish (20 threads, 1080p, 600-1200 s: 300 frames 17.26 -> 15.68 GB commit, 600 frames
-  23.93 -> 23.51 GB).
+  23.93 -> 23.51 GB). A searched picture frees its refined TMVP motion and intersecting motion vectors at the end
+  of its search instead of its finish (600 frames: 23.51 -> 20.67 GB commit, working set 17.85 -> 15.02 GB).
 - No options, all 20 cores of the Core Ultra 7 265K (20 threads chosen), one run at a time, foreman 128x128 QP 32,
   against one thread (the previous default) and `--ParallelSegments=20`; bitstreams identical:
 
