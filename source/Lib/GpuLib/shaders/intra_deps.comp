@@ -634,7 +634,7 @@ void main()
   if( g_pass == 0 )
   {
     const Tu t = BufTu( P.tus ).v[g_i];
-    if( ( t.derive & DERIVE_NODE ) != 0 )   // no samples
+    if( ( t.derive & DERIVE_NODE ) != 0 && ( t.derive & DERIVE_CPU_FILL ) == 0 )   // no samples
     {
       return;
     }

@@ -18,7 +18,7 @@ file( GLOB SHADER_INCLUDES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/shader
 # DEPFILE for every generator; before, each shader depends on all includes). glslang's optimizer matters (without it
 # the kernels run up to 18 % slower); -O gives the speed and cold pipeline compile of -Os with half the SPIR-V IDs
 # (intra_rec 1.96M against 3.72M of the 4.19M a module may have: -Os inlines every call site)
-set( GLSLANG_OPT -O )
+set( GLSLANG_OPT -O CACHE STRING "glslang's optimization option for the shaders (-O; empty: none)" )
 set( SPV_DIR "${CMAKE_CURRENT_BINARY_DIR}/spv" )
 file( MAKE_DIRECTORY "${SPV_DIR}" )
 set( SPV_HEADERS )

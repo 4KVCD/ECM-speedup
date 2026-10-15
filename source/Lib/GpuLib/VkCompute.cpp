@@ -705,7 +705,15 @@ void Kernel::create( Context& ctx, const uint32_t* spirv, size_t bytes, uint32_t
     pipelineInfo.stage.pName  = "main";
     pipelineInfo.stage.pSpecializationInfo = specialization.empty() ? nullptr : &spec;
     pipelineInfo.layout       = m_layout;
+    // (ECM_GPU_PIPELINE_TIMES: each pipeline's creation time on stderr; a cold intra_rec pipeline takes minutes, and
+    // VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT does not shorten it on NVIDIA's driver)
+    const auto start = std::chrono::steady_clock::now();
     res = vk.CreateComputePipelines( dev, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_pipeline );
+    if( getenv( "ECM_GPU_PIPELINE_TIMES" ) )
+    {
+      fprintf( stderr, "[gpu] pipeline %s: %.1f s\n", name,
+               std::chrono::duration<double>( std::chrono::steady_clock::now() - start ).count() );
+    }
   }
   vk.DestroyShaderModule( dev, module, nullptr );
   check( res, name );

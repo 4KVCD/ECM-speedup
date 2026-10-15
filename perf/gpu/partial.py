@@ -1,0 +1,48 @@
+# partial.py <build> [-j N] [stream...]: partial verification (ECM_GPU_PARTIAL=1 with --GpuRecon=2) of the regular
+# streams in C:/Code/ECM/streams (default: all), in parallel: the CUs of tools the GPU path lacks come from the CPU's
+# reconstruction, everything else is verified. Per stream the pictures verified / with differences, the first
+# difference (the first block in decoding order whose prediction or residual differs is in the log), and the CUs taken
+# from the CPU by reason (what to port next); then the reasons summed over all streams. Logs in runs/partial.
+# The NVIDIA driver's shader cache: runs/nvcache, a cache of its own (the shared one stops storing at 1 GB).
+import os, re, subprocess, sys
+from concurrent.futures import ThreadPoolExecutor
+from collections import Counter
+
+args = sys.argv[1:]
+build = args.pop(0)
+jobs = 4
+if args and args[0] == '-j':
+    jobs = int(args[1])
+    args = args[2:]
+streams = args or sorted(f[:-4] for f in os.listdir('C:/Code/ECM/streams') if f.endswith('.bin'))
+cache = 'C:/Code/ECM/runs/nvcache'
+env = dict(os.environ, ECM_GPU_PARTIAL='1', __GL_SHADER_DISK_CACHE_PATH=cache,
+           __GL_SHADER_DISK_CACHE_SIZE='8000000000', __GL_SHADER_DISK_CACHE_SKIP_CLEANUP='1')
+total = Counter()
+
+
+def run(name):
+    out = subprocess.run([f'C:/Code/ECM/bin/{build}/DecoderApp.exe', '-b', f'C:/Code/ECM/streams/{name}.bin', '-o', '',
+                          '--GpuRecon=2'], capture_output=True, text=True, env=env).stdout
+    os.makedirs('C:/Code/ECM/runs/partial', exist_ok=True)
+    open(f'C:/Code/ECM/runs/partial/{name}.{build}.log', 'w').write(out)
+    s = re.search(r'\[gpu-intra\] (\d+) pictures: (\d+) verified \((\d+) with differences\), (\d+) skipped([^;]*)', out)
+    first = next((m.group(1) for m in re.finditer(r' ms: (MISMATCH[^\n]*?)POC', out)), '')
+    reasons = Counter()
+    m = re.search(r'CUs taken from the CPU:(.*)', out)
+    if m:
+        for part in m.group(1).split(';'):
+            part = part.strip()
+            if part:
+                k, n = part.rsplit(' ', 1)
+                reasons[k] += int(n)
+    return name, s.groups() if s else None, first, reasons
+
+
+with ThreadPoolExecutor(jobs) as ex:
+    for name, s, first, reasons in ex.map(run, streams):
+        total.update(reasons)
+        print(f'{name:16s} {"pictures %s: verified %s, differ %s, skipped %s%s" % s if s else "no summary"}', flush=True)
+        if first:
+            print(f'{"":16s} first: {first[:400]}', flush=True)
+print('CUs from the CPU, all streams:', '; '.join(f'{k} {n}' for k, n in total.most_common()))

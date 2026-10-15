@@ -85,8 +85,9 @@ public:
   void setTrQuant( TrQuant* trQuant );
   /// the decoder's intra prediction: verification compares its template costs of each intra merge CU's ranking
   void setIntraPrediction( const IntraPrediction* intraPred );
-  /// whether the GPU path supports the slice's tools (sequence- and slice-level settings; per block record() checks)
-  static bool supported( const Slice& slice, std::string& why );
+  /// whether the GPU path supports the slice's tools (sequence- and slice-level settings; per block record() checks);
+  /// partial: partial verification's (the tool families it checks per CU left out)
+  static bool supported( const Slice& slice, std::string& why, bool partial = false );
 
   void beginPicture( const CodingStructure& cs );
   /// sign prediction (TrQuant::predCoeffSigns): takes the block's predicted levels and their coded signs for the next
@@ -100,6 +101,12 @@ public:
   bool failed() const;
   /// the picture uses something the GPU path does not support yet (the first reason is reported)
   void unsupported( const char* why );
+  /// CU cu is one the GPU path does not reconstruct (an inter, IBC or palette CU): with partial verification its
+  /// samples are taken from the CPU, else as unsupported()
+  void cpuCu( const CodingUnit& cu, const char* why );
+  /// partial verification: the CCP models of non-intra CU cu, which the CPU has reconstructed (JVET-AF0073: each TU's
+  /// a candidate of the merge CUs next to it and of the CTU row's history)
+  void cpuCuModels( const CodingUnit& cu );
   /// reconstructs the recorded picture on the GPU; on: into the picture's reconstruction buffer, off: compared with
   /// the CPU's reconstruction
   void endPicture( const CodingStructure& cs );

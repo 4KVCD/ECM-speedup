@@ -292,7 +292,7 @@ void DecCu::decompressCtu( CodingStructure& cs, const UnitArea& ctuArea )
 #if ECM_VULKAN
       if( m_gpuIntraRec && currCU.predMode != MODE_INTRA )
       {
-        m_gpuIntraRec->unsupported( "inter / IBC / palette CU" );
+        m_gpuIntraRec->cpuCu( currCU, "inter / IBC / palette CU" );
       }
 #endif
       if (currCU.predMode != MODE_INTRA && currCU.predMode != MODE_PLT && currCU.Y().valid())
@@ -519,6 +519,12 @@ void DecCu::decompressCtu( CodingStructure& cs, const UnitArea& ctuArea )
 #if JVET_AF0073_INTER_CCP_MERGE
         CU::saveModelsInHCCP(currCU);
         CU::saveProCcpInfo(currCU);
+#endif
+#if ECM_VULKAN
+        if( m_gpuIntraRec )   // (partial verification: its TUs' CCP models for the GPU's merge CUs)
+        {
+          m_gpuIntraRec->cpuCuModels( currCU );
+        }
 #endif
         break;
       case MODE_PLT:

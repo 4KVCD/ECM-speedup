@@ -214,6 +214,9 @@ const int DERIVE_CCLM_DIMD = 262144;
 // CU_CHROMA_DIMD one): intra_rec blends its merge prediction and the prediction of the DIMD chroma mode, each weighed
 // 1, the average rounded
 const int DERIVE_CCP_DIMD = 524288;
+// with DERIVE_NODE: a block partial verification takes from the CPU (its samples in the planes from the start); it
+// owns its area like a block (intra_deps' owner maps: the blocks after it read it as decoded) and does nothing
+const int DERIVE_CPU_FILL = 1048576;
 
 // Params::dbgParams per block: the derived dirMode, isModeVer, intraPredAngle, absInvAngle, useCubic, refFilter,
 // applyPDPC, gradPDPC, angularScale, fusion, bf, plIdx, then mtxV, mtxH, secMatrix, secTranspose, secLayout

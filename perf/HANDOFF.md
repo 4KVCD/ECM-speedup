@@ -1490,6 +1490,28 @@ averaged in, the average unrounded, the other component from the block's line, h
 taps rounded down); PDPC off changed no picture (a probe zeroing the angular predictions with PDPC did: the blocks
 have them, but PDPC never moved the histogram's maximum); no m53 block has a planar / DC DIMD chroma mode (a probe
 zeroing them changed nothing), so that branch is untested.
+Partial verification (2026-10-15; `ECM_GPU_PARTIAL=1` with `--GpuRecon=2`, `perf/gpu/partial.py <build>` over the
+regular streams in C:\Code\ECM\streams): the regular streams verify with the tools ported so far instead of falling back
+whole. supported() leaves out the tool families it checks per CU; a CU with a block the GPU cannot reconstruct is taken
+from the CPU (record()'s rejections, DecCu's inter / IBC / palette CUs: cpuCu): its blocks become nodes that own their
+areas (DERIVE_CPU_FILL with DERIVE_NODE: intra_deps' owner maps take them, so the blocks after them read them as
+decoded), the planes start as the CPU's reconstruction there and 0 in the GPU's blocks, it keeps a CU_KNOWN record of
+its mode as chroma CUs read a co-located one (an EIP CU's DIMD mode, TIMD / TMRL mapped to 67 modes), and its CCP models
+(an intra PU's curCand, a non-intra CU's TUs', JVET-AF0073) get records and their place in the CTU row's history, written
+from the CPU's models (cpuCcpWords). A CU whose mode derivation the GPU lacks takes the CPU's mode: CU_MPM where MPM
+sorting, MDIP or PDP change the MPM list, chroma DM / candidates with chroma reordering; TIMD and TMRL CUs are taken from
+the CPU then (their lists are MPM lists), as TIMD CUs with block vector candidates (JVET-AM0138) and PDP candidate blocks
+(pdpCandidate: predIntraAng's conditions but the references'). Reports: the first block in decoding order whose
+prediction or residual differs and the first CCP record that differs, beside the first check's, and per run the CUs
+taken from the CPU by reason. First results (2026-10-15): every regular stream's intra pictures identical but 3 of
+fp720_ai's 8 and ra720's first: a CCP merge block (ra720's at 208,144, chroma 16x16) whose GPU choice is GL-CCCM where the
+CPU takes two-model CCCM (a candidate the GPU lacks or ranks otherwise, not found yet). CUs from the CPU over all
+streams: PDP ~119000, inter / IBC / palette ~33000 (most in inter pictures), TIMD / TMRL behind MPM sorting / MDIP /
+PDP ~22000, IntraTMP ~9300, SGPM ~5600, EIP ~1700, MTSS ~280, DBV ~200, BVG-CCCM ~70: the order to port them in.
+Development speed (2026-10-15, at the user's request): the regular streams in partial verification are the test set of
+each tool family (no more test sets encoded per tool); canaries only for code no stream reaches, a full regression once
+a day or before a push, timing at the end of a phase. A cold intra_rec pipeline takes 30 s (plain) to 220 s (CCP LFNST)
+to create; VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT does not shorten it, SPIR-V without glslang's optimizer doubles it.
 
 ## 8. Numbers (i7-10700 8C/16T, Win11, GCC 16.2, RTX 3070 driver 616.92)
 
