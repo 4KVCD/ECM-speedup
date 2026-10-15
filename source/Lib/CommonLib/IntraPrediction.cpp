@@ -13300,6 +13300,38 @@ bool IntraPrediction::determinePDPEnable(const ComponentID compId, const Predict
 
   return false;
 }
+// xFillPDPTempReferenceSamples2's padding of the references of the CU shifted up (topPad*) and left (leftPad*) by
+// MPM_SORT_TEMPLATE_SIZE (keep in step with it)
+void IntraPrediction::pdpTemplatePads( const CodingUnit& cu, int& topPadW, int& topPadH, int& leftPadW, int& leftPadH )
+{
+  const CodingStructure& cs   = *cu.cs;
+  const CompArea&        area = cu.Y();
+  const int unitWidth  = cs.pcv->minCUWidth;
+  const int unitHeight = cs.pcv->minCUHeight;
+  auto available = [&]( const Position& pos )
+  {
+    return cs.isDecomp( pos, CHANNEL_TYPE_LUMA ) && cs.getCURestricted( pos, cu, CHANNEL_TYPE_LUMA );
+  };
+  for( int side = 0; side < 2; side++ )   // the template above, then the one left
+  {
+    const Position shift = side == 0 ? Position( 0, -MPM_SORT_TEMPLATE_SIZE ) : Position( -MPM_SORT_TEMPLATE_SIZE, 0 );
+    int padW = area.width;   // 2 * width - width
+    const Position posRT = cu.Y().topRight().offset( shift.x, shift.y );
+    for( int x = 0; x < area.width && available( posRT.offset( x + unitWidth, -1 ) ); x += unitWidth )
+    {
+      padW -= unitWidth;
+    }
+    int padH = area.height;
+    const Position posLB = cu.Y().bottomLeft().offset( shift.x, shift.y );
+    for( int y = 0; y < area.height && available( posLB.offset( -1, y + unitHeight ) ); y += unitHeight )
+    {
+      padH -= unitHeight;
+    }
+    ( side == 0 ? topPadW : leftPadW ) = padW;
+    ( side == 0 ? topPadH : leftPadH ) = padH;
+  }
+}
+
 void IntraPrediction::xFillPDPTempReferenceSamples2(const CPelBuf& recoBuf, const CompArea& area, const CodingUnit& cu) {
 
   m_refAvailable = true;
@@ -19929,6 +19961,88 @@ void IntraPrediction::dimdHistogramCalls( const CodingUnit& cu, const CompArea& 
     c.filterSizeIdx = 0;
   }
 }
+
+#if JVET_AK0059_MDIP
+// the histogram calls of deriveMdipMode, from the same availability checks (keep in step with it): the left column(s),
+// the above row(s) and the above-left corner, one line from the CU up to 128 samples (two from 2x2 operators' blocks
+// on), two lines above
+void IntraPrediction::mdipHistogramCalls( const CodingUnit& cu, const CompArea& area, DimdHistogramCall calls[3] )
+{
+  for( int k = 0; k < 3; k++ )
+  {
+    calls[k] = DimdHistogramCall();
+  }
+  const CodingStructure& cs  = *cu.cs;
+  const SPS&             sps = *cs.sps;
+  const PreCalcValues&   pcv = *cs.pcv;
+  const ChannelType   chType = toChannelType( area.compID );
+  const uint32_t uiWidth  = area.width;
+  const uint32_t uiHeight = area.height;
+  const int predSize  = uiWidth << 1;
+  const int predHSize = uiHeight << 1;
+  const bool noShift    = pcv.noChroma2x2 && uiWidth == 4;
+  const int  scaleX     = getComponentScaleX( area.compID, sps.getChromaFormatIdc() );
+  const int  scaleY     = getComponentScaleY( area.compID, sps.getChromaFormatIdc() );
+  const int  unitWidth  = pcv.minCUWidth >> ( noShift ? 0 : scaleX );
+  const int  unitHeight = pcv.minCUHeight >> ( noShift ? 0 : scaleY );
+  const int  totalAboveUnits    = ( predSize + ( unitWidth - 1 ) ) / unitWidth;
+  const int  totalLeftUnits     = ( predHSize + ( unitHeight - 1 ) ) / unitHeight;
+  const int  totalUnits         = totalAboveUnits + totalLeftUnits + 1;
+  const int  numAboveUnits      = std::max<int>( uiWidth / unitWidth, 1 );
+  const int  numLeftUnits       = std::max<int>( uiHeight / unitHeight, 1 );
+  const int  numAboveRightUnits = totalAboveUnits - numAboveUnits;
+  const int  numLeftBelowUnits  = totalLeftUnits - numLeftUnits;
+  const Position posLT = area;
+  bool neighborFlags[4 * MAX_NUM_PART_IDXS_IN_CTU_WIDTH + 1];
+  memset( neighborFlags, 0, totalUnits );
+  bool* const flagsAbove = neighborFlags + totalLeftUnits + 1;
+  bool* const flagsLeft  = neighborFlags + totalLeftUnits - 1;
+  const int numIntraAbove      = isAboveAvailable( cu, chType, posLT, numAboveUnits, unitWidth, flagsAbove );
+  const int numIntraLeft       = isLeftAvailable( cu, chType, posLT, numLeftUnits, unitHeight, flagsLeft );
+  const int numIntraAboveRight = isAboveRightAvailable( cu, chType, area.topRight(), numAboveRightUnits, unitWidth,
+                                                        flagsAbove + numAboveUnits );
+  const int numIntraBottomLeft = isBelowLeftAvailable( cu, chType, area.bottomLeft(), numLeftBelowUnits, unitHeight,
+                                                       flagsLeft - numLeftUnits );
+  const int  edgeOperatorSizeIdx = static_cast<int>( use2x2EdgeOperator( area ) );
+  const int  recoLineOffset      = edgeOperatorSizeIdx == 1 ? 0 : 1;
+  const bool small               = uiWidth * uiHeight <= 128;
+  const int  lines               = small ? 1 : 2;   // the template's lines along each arm
+  if( numIntraLeft )
+  {
+    DimdHistogramCall& c = calls[0];
+    c.kind      = 1;
+    c.histogram = 0;
+    c.x         = -lines - recoLineOffset;
+    c.y         = !numIntraAbove ? 1 : 0;
+    c.height    = ( numIntraLeft + numIntraBottomLeft ) * unitHeight - recoLineOffset - ( !numIntraAbove ? 1 : 0 );
+    c.width     = lines;
+    c.direction = 1;
+    c.filterSizeIdx = edgeOperatorSizeIdx;
+  }
+  if( numIntraAbove )
+  {
+    DimdHistogramCall& c = calls[1];
+    c.kind      = 1;
+    c.histogram = 1;
+    c.x         = !numIntraLeft ? 1 : 0;
+    c.y         = -lines - recoLineOffset;
+    c.height    = lines;
+    c.width     = ( numIntraAbove + numIntraAboveRight ) * unitWidth - recoLineOffset - ( !numIntraLeft ? 1 : 0 );
+    c.direction = 2;
+    c.filterSizeIdx = edgeOperatorSizeIdx;
+  }
+  if( numIntraLeft && numIntraAbove )
+  {
+    DimdHistogramCall& c = calls[2];
+    c.kind      = 1;
+    c.histogram = 2;
+    c.x = c.y   = -lines - recoLineOffset;
+    c.height = c.width = lines + ( edgeOperatorSizeIdx == 1 ? 0 : 1 );
+    c.direction = edgeOperatorSizeIdx == 1 ? 0 : 3;
+    c.filterSizeIdx = edgeOperatorSizeIdx;
+  }
+}
+#endif
 
 #if JVET_Z0050_DIMD_CHROMA_FUSION && JVET_AC0094_REF_SAMPLES_OPT
 // the histogram calls of deriveDimdChromaMode, in its order, from the same availability checks (keep in step with it):

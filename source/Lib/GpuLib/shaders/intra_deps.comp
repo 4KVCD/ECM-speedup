@@ -420,6 +420,28 @@ void dependencies( int comp )
         addModeDep( td.v[c.timd + TIMD_HEAD_MERGE + 1 + k] );
       }
     }
+    // MPM sorting / MDIP (intra_mpm.glsl): the template, MDIP's histograms, with PDP the reference vectors of the CU
+    // shifted up and left (two lines, arms of twice its sides, the corner)
+    if( c.mpm >= 0 )
+    {
+      BufI32 td = BufI32( P.timdData );
+      addTemplateDeps( c, td.v[c.mpm + MPM_HEAD_T], td.v[c.mpm + MPM_HEAD_T + 1] );
+      const int mdip = td.v[c.mpm + MPM_HEAD_MDIP];
+      for( int n = 0; mdip >= 0 && n < 3; n++ )
+      {
+        const DimdCall k = BufDimdCall( P.dimdCalls ).v[mdip + n];
+        if( k.kind != 0 )
+        {
+          addAreaDeps( k.comp, k.x - 1, k.y - 1, k.x + k.width, k.y + k.height );
+        }
+      }
+      for( int v = 0; ( td.v[c.mpm + 1] & MPM_PDP ) != 0 && v < 2; v++ )
+      {
+        const int vx = c.x - v, vy = c.y - 1 + v;
+        addAreaDeps( 0, vx - 2, vy - 2, vx + 2 * c.w - 1, vy - 1 );
+        addAreaDeps( 0, vx - 2, vy, vx - 1, vy + 2 * c.h - 1 );
+      }
+    }
     if( c.tmrl >= 0 && c.kind == CU_TMRL )   // TMRL: the reference lines it tries (whole arms), its one-sample template
     {
       for( int k = 0; k < tmrlNumLines( c.y ); k++ )

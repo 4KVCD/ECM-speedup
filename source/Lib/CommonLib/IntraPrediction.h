@@ -688,6 +688,16 @@ public:
   /// luma area and its Cb / Cr area); returns their number
   static int dimdChromaHistogramCalls( const CodingUnit& cu, const CompArea& areaCb, DimdHistogramCall calls[8] );
 #endif
+#if JVET_AK0059_MDIP
+  /// the histograms deriveMdipMode derives a luma CU's MDIP list and excluded modes from (its availability checks: arms
+  /// of twice the CU's sides; one template line up to 128 samples, two above)
+  static void mdipHistogramCalls( const CodingUnit& cu, const CompArea& area, DimdHistogramCall calls[3] );
+#endif
+#if JVET_AK0061_PDP_MPM
+  /// MPM sorting's PDP template predictions (deriveMPMSorted): the padding xFillPDPTempReferenceSamples2 gives the
+  /// references of the CU shifted up and left by the template (m_ref, m_leftRef): above-right and below-left, of each
+  static void pdpTemplatePads( const CodingUnit& cu, int& topPadW, int& topPadH, int& leftPadW, int& leftPadH );
+#endif
 #endif
 #if JVET_AH0076_OBIC && JVET_AK0056_WEIGHTED_OBIC
   /// the neighbours deriveObicMode counts the modes of, with the samples each counts; returns their number (-1: an

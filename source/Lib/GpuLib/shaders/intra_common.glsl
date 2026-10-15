@@ -272,6 +272,8 @@ struct Cu
   int mtssNspt;          // with MTSS: its luma block may use NSPT (CU::isNSPTAllowed)
   int timd;              // a TIMD CU's record in Params::timdData (TimdHead; -1: not TIMD)
   int tmrl;              // a TMRL CU's index among the TMRL CUs (Params::tmrlOut; -1: not TMRL)
+  int mpm;               // an MPM CU's record in Params::timdData where MPM sorting, MDIP or PDP shape its lists, an
+                         // MDIP CU's (MpmHead; -1: none, intra_modes.glsl's lists)
 };
 layout( buffer_reference, std430, buffer_reference_align = 4 ) buffer BufCu { Cu v[]; };
 
@@ -471,6 +473,31 @@ const int TIMD_OUT_WEIGHT          = 4;    // timdFusionWeight, 3 entries: the m
 const int TIMD_OUT_LOC_DEP         = 7;    // timdLocDep, 3 entries
 const int TIMD_OUT_CHECK_WA        = 10;   // timdModeCheckWA: 0 for a wide angle beyond the regular ones
 const int TIMD_OUT_SEC_CHECK_WA    = 11;   // timdModeSecondaryCheckWA
+// an MPM CU's record in Params::timdData (layout shared with GpuIntraRec.cpp; intra_mpm.glsl): this header, then the
+// availability bits of its template's reference units
+struct MpmHead
+{
+  int           index;       // its index among the MPM records (Params::mpmOut)
+  int           flags;       // MPM_*
+  int           type;        // its template (CU::deriveTimdRefType with arms of one sample): TIMD_NONE .. TIMD_BOTH
+  TemplateUnits t;           // that template (MPM sorting's and MDIP sorting's), an arm it lacks 0
+  int           pdpSize;     // with MPM_PDP its PDP size (g_size)
+  int           pdpPad[4];   // xFillPDPTempReferenceSamples2's padding of the CU shifted up (W, H), then left (W, H)
+  int           mdip;        // MDIP's 3 histograms in Params::dimdCalls (-1: none)
+};
+const int MPM_HEAD_T    = 3;                             // the offset of MpmHead::t
+const int MPM_HEAD_PDP  = MPM_HEAD_T + TEMPLATE_UNITS;   // of MpmHead::pdpSize
+const int MPM_HEAD_MDIP = MPM_HEAD_PDP + 5;              // of MpmHead::mdip
+const int MPM_HEAD      = MPM_HEAD_MDIP + 1;
+const int MPM_SORTED         = 1;    // DecCu sorts its list (allowMPMSorted, not where the syntax selects planar)
+const int MPM_PDP            = 2;    // PDP's list (PU::determinePDPTemp)
+const int MPM_PLANAR_DISABLE = 4;    // NN's prediction replaces planar (JVET-AL0125)
+const int MPM_MDIP           = 8;    // MDIP is allowed: deriveMdipMode, its mode and excluded modes
+const int MPM_EXCLUDED       = 16;   // the lists leave out the excluded modes (SPS MDIP, with DIMD or MDIP allowed)
+const int MPM_MDIP_CU        = 32;   // an MDIP CU: its mode MDIP's (without excluded modes)
+const int MPM_I_SLICE        = 64;   // an intra slice (sorting from 6 entries on, else from 2)
+// int32 per MPM record (Params::mpmOut): its MDIP mode (-1: none), its excluded modes (cu.excludingMode; 0: none)
+const int MPM_OUT = 21;
 const int MERGE_NBR_MERGE = 1;   // an intra merge CU: always a candidate, its merge parameters (its DimdOut slot)
 const int MERGE_NBR_OBIC  = 2;   // an OBIC CU: always, its OBIC converted
 const int MERGE_NBR_DIMD  = 3;   // a DIMD CU or an MPM CU: where its DIMD blends, its DIMD
@@ -716,6 +743,7 @@ struct Params
                         // write (Tu::ccp)
   uint64_t ccpData;     // int32: per CCP record its writing blocks (CCP_WRITERS), the CTU rows' histories, the merge
                         // CUs' sources (Tu::ccpMerge; intra_ccp.glsl)
+  uint64_t mpmOut;      // int32 per MPM record (MPM_OUT): its MDIP, written by its node (for the comparison)
   int      origin[3];
   int      stride[3];
   int      width[3];

@@ -449,7 +449,7 @@ wall-clock gains with threads are "the easy baseline". Decoder status: single-th
 (`--GpuLoopFilter=1`: ALF, SAO, BIF, CCSAO, LF-CCCM, offset refinement on Vulkan). The user then asked for **a full
 GPU decoder in Vulkan, optimized until nothing is left** ("The GPU decoder needs to fully decode the frame on the
 GPU"; "Your first Vulkan version is going to be slow. That's OK"). That work is branch `dec-gpurecon`: intra
-reconstruction on the GPU (`--GpuRecon`), tool levels M1-M56 done and verified bit-exact (M19: DIMD, M20: OBIC, M21:
+reconstruction on the GPU (`--GpuRecon`), tool levels M1-M57 done and verified bit-exact (M19: DIMD, M20: OBIC, M21:
 intra merge, M22: the transforms of DIMD CUs, M23: LFNST of MIP, M24: TIMD, M25: OBIC and intra merge with TIMD
 neighbours, M26: TIMD-SAD, M27: OBIC and intra merge with TIMD-SAD neighbours, M28: TIMD merge, M29: TMRL of luma,
 M30: chroma TMRL, M31: CCLM, M32: LFNST / NSPT of CCLM, M33: GLM's gradient patterns, M34: CCCM, M35: GL-CCCM, M36:
@@ -457,7 +457,8 @@ CCCM with several downsampling filters, M37: CCCM without subsampling, M38: CCCM
 luma, M40: LM chroma fusion of CCCM, M41: CFLM, M42: GLM with luma with LFNST / NSPT, M43: the SPS switches of the
 CCP tools, M44 / M45: the CCP models, M46: CCP merge, M47 / M48: CCP merge fusion with CCCM / DIMD chroma, M49: CCP
 merge adjustment, M50 / M51: decoder-derived CCP fusion, its merge fusion, M52: CCP merge fusion with CCCM by a blend
-model, M53 / M54: CCP merge and decoder-derived fusion with LFNST / NSPT, M55: PDP, M56: NN intra prediction); it is
+model, M53 / M54: CCP merge and decoder-derived fusion with LFNST / NSPT, M55: PDP, M56: NN intra prediction, M57: the
+MPM lists of MPM sorting, MDIP and PDP); it is
 **not yet faster than the CPU
 decoder** (see section 8) and supports only a restricted tool set (all real CTC streams fall back to the CPU, first
 reason: chroma reordering / DBV; BVG-CCCM CUs are rejected per block).
@@ -1499,12 +1500,13 @@ areas (DERIVE_CPU_FILL with DERIVE_NODE: intra_deps' owner maps take them, so th
 decoded), the planes start as the CPU's reconstruction there and 0 in the GPU's blocks, it keeps a CU_KNOWN record of
 its mode as chroma CUs read a co-located one (an EIP CU's DIMD mode, TIMD / TMRL mapped to 67 modes), and its CCP models
 (an intra PU's curCand, a non-intra CU's TUs', JVET-AF0073) get records and their place in the CTU row's history, written
-from the CPU's models (cpuCcpWords). A CU whose mode derivation the GPU lacks takes the CPU's mode: CU_MPM where MPM
-sorting, MDIP or PDP change the MPM list, chroma DM / candidates with chroma reordering; TIMD and TMRL CUs are taken from
-the CPU then (their lists are MPM lists), as TIMD CUs with block vector candidates (JVET-AM0138) and PDP candidate blocks
-(pdpCandidate: predIntraAng's conditions but the references'). Reports: the first block in decoding order whose
-prediction or residual differs and the first CCP record that differs, beside the first check's, and per run the CUs
-taken from the CPU by reason. First results (2026-10-15): every regular stream's intra pictures identical but 3 of
+from the CPU's models (cpuCcpWords). A CU whose mode derivation the GPU lacks takes the CPU's mode: chroma DM /
+candidates with chroma reordering (until M57 also CU_MPM where MPM sorting, MDIP or PDP change the MPM list, and TIMD /
+TMRL CUs were taken from the CPU then); TIMD CUs with block-vector candidates (JVET-AM0138, M57) and, until M55, PDP
+candidate blocks (pdpCandidate: predIntraAng's conditions but the references') are taken from the CPU. Reports: the
+first block in decoding order whose prediction or residual differs and the first CCP record that differs, beside the
+first check's, and per run the CUs taken from the CPU by reason. First results (2026-10-15): every regular stream's
+intra pictures identical but 3 of
 fp720_ai's 8 and ra720's first: a CCP merge block (ra720's at 208,144, chroma 16x16) whose GPU choice is GL-CCCM where the
 CPU takes two-model CCCM (a candidate the GPU lacks or ranks otherwise, not found yet). CUs from the CPU over all
 streams: PDP ~119000, inter / IBC / palette ~33000 (most in inter pictures), TIMD / TMRL behind MPM sorting / MDIP /
@@ -1541,6 +1543,28 @@ lists and chroma TMRL read; chroma DM reads indicesRepresentationPnn, still the 
 NN CUs above 32 x 32 or with MTSS. Bug found on the way: a workgroup sum in a slot the bilateral filter takes zero.
 partial.py now creates the driver cache's folder (runs/nvcache did not exist: nothing was cached, every run compiled
 every pipeline). The NN's layers are slow so far (ai720: GPU 122 -> 495 ms; each column's packs read serially).
+M57: CTC's MPM lists (intra_mpm.glsl): MPM sorting (JVET-AD0085), MDIP (JVET-AK0059) and PDP's list (JVET-AK0061) with
+JVET-AL0125's improvements. A regular CU whose lists they shape (an SPS with any of them; not where the syntax selects
+planar, the list's first entry) and an MDIP CU get a record (Cu::mpm, MpmHead in timdData: flags, the template of the
+sortings - TIMD's kind with arms of one sample -, PDP's size and the padding of the CU shifted up / left
+(IntraPrediction::pdpTemplatePads), MDIP's histograms (mdipHistogramCalls)); their node derives the mode as DecCu
+does: deriveDimdMode's excluded modes where MDIP is not allowed, deriveMdipMode (histograms of lines further out, its
+list, deriveMdipSorted's template SATD, buildExcludingMode), getSpatialIpm with the DIMD modes first and PDP's modes
+(getPDPPredMode), deriveMPMSorted (the template costs of the first entries - TIMD's predictions, or for a mode with PDP
+filters PDP's of the CU shifted up / left, from xFillPDPTempReferenceSamples2's vectors; the cheapest iBestN, the
+earlier of equal costs first), fillMPMList / fillNonMPMList with MDIP's mode and the excluded modes left out and PDP's
+modes first. Pictures with records take the WITH_MPM pipelines (VARIANT_MPM, above TMRL). Verification compares each
+record's mdipMode and excludingMode with the CPU's; the mode shows in the blocks. TIMD and TMRL CUs leave the CPU on
+the regular streams too (their lists are plain: TIMD's getIntraMPMs runs with isModeExcluded off, unsorted). Found on
+the way: a TIMD record took its index before its last rejections ("a TIMD merge neighbour that is not a recorded TIMD
+CU"), so every later TIMD CU's CPU fields were compared with another CU's (only partial verification records past a
+rejection); deriveTimdMode tries the block vectors of DecCu's list (getItmpMergeCandidate, getArBvMergeCandidate:
+IntraTMP / IBC CUs and those that took a vector around it) beside planar and DC, and one costing least there for a
+while zeroes the location dependences even where none is chosen: a TIMD CU with any such candidate is the CPU's.
+Results (grP19, grP20): every regular stream identical but the known CCP merge blocks; per 720p intra picture ~490
+records (~180 sorted, ~480 with MDIP). Not reached (partial verification takes intra slices only): the sorting of
+inter slices (from two entries, CUs up to 1024 samples) and with it PDP's template predictions of 16x32 .. 32x32
+(filters for every second sample, their averages from the long vector).
 
 ## 8. Numbers (i7-10700 8C/16T, Win11, GCC 16.2, RTX 3070 driver 616.92)
 
@@ -1584,7 +1608,8 @@ Profile of a GPU-on decode (non-LTO, m2_park16, share of all samples): parsing ~
    M50 decoder-derived CCP fusion (the m50 set), M51 decoder-derived CCP merge fusion (the m51 set), M52 CCP merge
    fusion with CCCM by a blend model (the m52 set). 2026-10-15: M53 CCP merge and decoder-derived fusion with LFNST /
    NSPT (the m53 set; intra_rec's second module), M54 its merge fusion with DIMD chroma, M55 PDP, M56 NN intra
-   prediction (partial verification of the regular streams).
+   prediction, M57 the MPM lists of MPM sorting, MDIP and PDP, TIMD / TMRL on the regular streams (partial verification
+   of the regular streams).
    All 19 regular streams now stop at "chroma reordering / DBV" (the next sequence-level check; the block-level tools
    of step 4 follow; BVG-CCCM needs IntraTMP / IBC first).
 3. Make the GPU path win on CPU time per picture: the derive-only pass (record during parsing or a leaner pass;
