@@ -420,9 +420,16 @@ void dependencies( int comp )
       {
         addTemplateDeps( c, td.v[c.timd + TIMD_HEAD_TS], td.v[c.timd + TIMD_HEAD_TS + 1] );
       }
+      // (taking their transform types: their luma blocks', which set them where they predict from a block vector)
+      const bool inheritTr = td.v[c.timd + TIMD_HEAD_MERGE + 1 + TIMD_MERGE_CANDS] != 0;
       for( int k = 0; k < td.v[c.timd + TIMD_HEAD_MERGE]; k++ )
       {
-        addModeDep( td.v[c.timd + TIMD_HEAD_MERGE + 1 + k] );
+        const int n = td.v[c.timd + TIMD_HEAD_MERGE + 1 + k];
+        addModeDep( n );
+        if( inheritTr )
+        {
+          addDep( td.v[BufCu( P.cus ).v[n].timd + TIMD_HEAD_BLOCK] );
+        }
       }
     }
     // EIP (intra_eip.glsl): its reference area (its model's samples, the clipping range), an EIP merge CU's sources'

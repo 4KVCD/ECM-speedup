@@ -388,8 +388,10 @@ layout( buffer_reference, std430, buffer_reference_align = 4 ) buffer BufDimdCal
 // with LFNST / NSPT writes its CU's: mipDimdMode as the mode, dimdDerivedIntraDir2nd as the second, with MTSS the result
 // (its node the list). An IntraTMP CU's: its node's list in place of the DIMD fields (the number of vectors it found,
 // then MTMP_NUM, repeated cyclically past that number: tmpXYdisp) and in DIMD_OUT_BV the vector its block copies, its
-// block's DIMD as a MIP block's (intraTmpDimdMode)
-const int DIMD_OUT             = 32;
+// block's DIMD as a MIP block's (intraTmpDimdMode). An intra merge CU's parts that its node gives vectors instead of
+// their modes (reorderIntraMergeCand: isBvDimdExt as bits by part - its candidate's main mode, planar, blend modes -,
+// bvDimdExt)
+const int DIMD_OUT             = 41;
 const int DIMD_OUT_PARAMS      = 24;
 const int DIMD_OUT_MODE        = 0;
 const int DIMD_OUT_SECOND      = 1;
@@ -405,6 +407,8 @@ const int DIMD_OUT_BV_FLAG     = 30;   // a DIMD, OBIC or intra merge CU's isBvD
 const int DIMD_OUT_BV          = 31;   // and its bvDimd (bvPack)
 const int DIMD_OUT_TMP_NUM     = 1;    // an IntraTMP CU's number of vectors found,
 const int DIMD_OUT_TMP_BV      = 2;    // then its list's MTMP_NUM vectors (bvPack)
+const int DIMD_OUT_EXT_FLAGS   = 32;   // an intra merge CU's parts predicted from vectors (bit by part),
+const int DIMD_OUT_EXT_BV      = 33;   // their vectors (8, bvPack)
 const int MTSS_CALLS           = 3;    // the histograms of MTSS's mode list (deriveDimdModeList: left, above, above-left)
 
 // a neighbour of an OBIC CU whose mode its histogram counts (layout shared with GpuIntraRec.cpp, OBIC_NBRS per OBIC CU
@@ -475,13 +479,15 @@ struct TimdHead
   int           merge;
   int           mergeNbr[TIMD_MERGE_CANDS];
   int           inheritTr;
+  // (then the host's TimdHead::block, its last luma block's record, which only intra_deps reads: TIMD_HEAD_BLOCK)
 };
 const int TIMD_HEAD_T          = 3;                               // the offset of TimdHead::t
 const int TIMD_HEAD_SAD        = TIMD_HEAD_T + TEMPLATE_UNITS;    // of TimdHead::sad
 const int TIMD_HEAD_TS         = TIMD_HEAD_SAD + 1;               // of TimdHead::ts
 const int TIMD_HEAD_MTS_TR_IDX = TIMD_HEAD_TS + TEMPLATE_UNITS;   // of TimdHead::mtsTrIdx
 const int TIMD_HEAD_MERGE      = TIMD_HEAD_MTS_TR_IDX + 3;        // of TimdHead::merge
-const int TIMD_HEAD            = TIMD_HEAD_MERGE + 2 + TIMD_MERGE_CANDS;
+const int TIMD_HEAD_BLOCK      = TIMD_HEAD_MERGE + 2 + TIMD_MERGE_CANDS;
+const int TIMD_HEAD            = TIMD_HEAD_BLOCK + 1;
 const int TIMD_NONE   = 0;
 const int TIMD_ABOVE  = 1;
 const int TIMD_LEFT   = 2;

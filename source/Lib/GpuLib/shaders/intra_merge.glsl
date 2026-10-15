@@ -363,6 +363,42 @@ int mergeNode( Cu c, int cuIdx, int bitDepth, bool noPdpc, int lid, int NT )
       }
     }
   }
+  // the vectors (where the candidates were ranked and the CUs around may have vectors: dimdVectorChoice's, in the
+  // workgroup's scratch), cheapest first: each replaces the last part of the chosen candidate - its main mode, planar,
+  // its blend modes - of nonzero weight not replaced yet whose mode's template cost is above the vector's; the main
+  // mode's or a blend mode's location dependence becomes the vector's
+  int   locDep[7];
+  int   extFlags = 0;
+  ivec2 extBv[MERGE_BVS];
+  for( int i = 0; i < 7; i++ )
+  {
+    locDep[i] = mcGet( best, MC_LOC_DEP + i );
+  }
+  if( rank && c.bvList >= 0 )
+  {
+    CBufI32   acc  = CBufI32( P.scratch );
+    const int base = int( gl_WorkGroupID.x ) * BLEND_ACC;
+    for( int i = 0; i < acc.v[base]; i++ )
+    {
+      const uint cost = uint( acc.v[base + 1 + 3 * i + 1] );
+      int        part = -1;
+      for( int j = 0; j < MERGE_BVS; j++ )
+      {
+        const int  mode   = j == 0 ? mcGet( best, MC_MODE ) : j == 1 ? PLANAR_IDX : mcGet( best, MC_BLEND + j - 2 );
+        const bool usable = mcGet( best, MC_WEIGHT + j ) > 0 && ( ( extFlags >> j ) & 1 ) == 0;
+        part = usable && mode >= PLANAR_IDX && cost < s_spCost[MC_COST + mode] ? j : part;
+      }
+      if( part >= 0 )
+      {
+        extFlags   |= 1 << part;
+        extBv[part] = bvUnpack( acc.v[base + 1 + 3 * i] );
+        if( part != 1 )   // (planar has no location dependence: the main mode's is the first, a blend mode's its own)
+        {
+          locDep[part == 0 ? 0 : part - 1] = acc.v[base + 1 + 3 * i + 2];
+        }
+      }
+    }
+  }
   CBufI32   d = CBufI32( P.dimdOut );
   const int o = cuIdx * DIMD_OUT;
   d.v[o + DIMD_OUT_MODE]     = mcGet( best, MC_MODE );
@@ -378,7 +414,12 @@ int mergeNode( Cu c, int cuIdx, int bitDepth, bool noPdpc, int lid, int NT )
   }
   for( int i = 0; i < 7; i++ )
   {
-    d.v[o + DIMD_OUT_LOC_DEP + i] = mcGet( best, MC_LOC_DEP + i );
+    d.v[o + DIMD_OUT_LOC_DEP + i] = locDep[i];
+  }
+  d.v[o + DIMD_OUT_EXT_FLAGS] = extFlags;
+  for( int j = 0; j < MERGE_BVS; j++ )
+  {
+    d.v[o + DIMD_OUT_EXT_BV + j] = ( ( extFlags >> j ) & 1 ) != 0 ? bvPack( extBv[j] ) : 0;
   }
   return mcGet( best, MC_MODE );
 }

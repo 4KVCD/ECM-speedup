@@ -417,7 +417,9 @@ constexpr int DIMD_OUT_BV_FLAG     = 30;
 constexpr int DIMD_OUT_BV          = 31;
 constexpr int DIMD_OUT_TMP_NUM     = 1;    // an IntraTMP CU's number of vectors found, then its list's MTMP_NUM
 constexpr int DIMD_OUT_TMP_BV      = 2;
-constexpr int DIMD_OUT             = 32;
+constexpr int DIMD_OUT_EXT_FLAGS   = 32;   // an intra merge CU's parts predicted from vectors (isBvDimdExt by bit),
+constexpr int DIMD_OUT_EXT_BV      = 33;   // their vectors (bvDimdExt, 8)
+constexpr int DIMD_OUT             = 41;
 constexpr int MTSS_CALLS           = 3;      // the histograms of deriveDimdModeList (left, above, above-left)
 // the transforms of DIMD CUs the kernels have: getFinalIntraModeForTransform's DIMD branch (JVET-AM0138; without
 // BVG-DIMD and intra merge it would take intra merge CUs too), MTSS (JVET-AK0217) with JVET-AK0187's mode pairs
@@ -613,8 +615,13 @@ struct TimdHead
   int32_t       merge;
   int32_t       mergeNbr[TIMD_MERGE_CANDS];
   int32_t       inheritTr;
+  // the record of its (last) luma block, -1 until that is recorded: one that predicts from a block vector sets the
+  // transform types (by the DIMD of its prediction), so a TIMD merge CU taking them waits for that block (whether it
+  // predicts from a vector is known only once its node has run; the host's dependencies are fixed before)
+  int32_t       block;
 };
-static_assert( sizeof( TimdHead ) == 34 * 4, "TimdHead layout" );
+static_assert( sizeof( TimdHead ) == 35 * 4, "TimdHead layout" );
+constexpr int TIMD_HEAD_BLOCK = offsetof( TimdHead, block ) / 4;
 // a CU's block vectors as later CUs' lists take them (intra_common.glsl's BV_OUT per luma CU, by its CodingStructure
 // index): their number, then up to BV_MAX (intra_bv.glsl's bvPack); the CUs at getItmpMergeCandidate's positions; the
 // GPU's room for a list; a list's record (intra_bv.glsl's BV_LIST_*): the CU's CodingStructure index, the length its
@@ -3170,6 +3177,7 @@ static bool addTimdRecord( GpuIntraRec::Impl& m, const CodingUnit& cu, Cu& c, co
 #endif
   const int W = cu.lwidth(), H = cu.lheight();
   TimdHead  head{};
+  head.block = -1;
   head.type = cu.lx() > 0 && cu.ly() > 0 ? TIMD_BOTH : cu.lx() > 0 ? TIMD_LEFT : cu.ly() > 0 ? TIMD_ABOVE : TIMD_NONE;
   std::vector<int32_t> unitBits, unitBitsSad;
   if( head.type != TIMD_NONE )   // (calcTimdMrgCandCosts' template of a TIMD merge CU has arms one sample thick)
@@ -3219,6 +3227,7 @@ static bool addTimdRecord( GpuIntraRec::Impl& m, const CodingUnit& cu, Cu& c, co
     static_vector<const CodingUnit*, NUM_TIMD_MERGE_CUS> nbrs;
     IntraPrediction::searchTimdMrgCus( cu, nbrs );
     CHECK( nbrs.size() > TIMD_MERGE_CANDS, "searchTimdMrgCus keeps at most five neighbours" );
+    head.inheritTr = CS::isDualITree( *cu.cs ) ? 1 : 0;
     for( const CodingUnit* n: nbrs )
     {
       const auto rec = m.cuIndex[CHANNEL_TYPE_LUMA].find( n );
@@ -3227,14 +3236,13 @@ static bool addTimdRecord( GpuIntraRec::Impl& m, const CodingUnit& cu, Cu& c, co
         why = "a TIMD merge neighbour that is not a recorded TIMD CU";
         return false;
       }
-#if JVET_AM0138_ENHANCED_TMP_MERGE_LIST_TIMD_BV
-      // (whose transform types, which a merge CU may take, its block chooses: by the DIMD of its prediction)
-      if( PU::isBvTimdApplied( const_cast<CodingUnit*>( n ) ) )
+      // (the transform types this CU takes are those of the neighbour's luma block, which sets them where it predicts
+      // from a block vector: the GPU's block)
+      if( head.inheritTr && m.timdData[m.cus[rec->second].timd + TIMD_HEAD_BLOCK] < 0 )
       {
-        why = "a TIMD merge neighbour predicting from a block vector";
+        why = "a TIMD merge neighbour whose luma block the CPU reconstructs";
         return false;
       }
-#endif
       head.mergeNbr[head.merge++] = rec->second;
     }
     if( head.merge == 0 )   // (the CPU cannot decode such a CU either)
@@ -3242,7 +3250,6 @@ static bool addTimdRecord( GpuIntraRec::Impl& m, const CodingUnit& cu, Cu& c, co
       why = "TIMD merge without a neighbour";
       return false;
     }
-    head.inheritTr = CS::isDualITree( *cu.cs ) ? 1 : 0;
   }
   // (counted only once nothing rejects it: the index places its CPU row and the node's output side by side)
   head.index = m.numTimd++;
@@ -3691,7 +3698,7 @@ static int32_t cuRecord( GpuIntraRec::Impl& m, const TransformUnit& tu, const Co
     {
       // (with a block vector chosen instead of planar its transforms take the DIMD of its prediction, which MTSS would
       // also take)
-      why = cu.bvgDimdFlag ? "BVG-DIMD" : cu.intraMergeMode && cu.isBvDimdExtAvail ? "intra merge with a block vector"
+      why = cu.bvgDimdFlag ? "BVG-DIMD"
             : PU::isBvDimdApplied( const_cast<CodingUnit*>( &cu ) ) && usesMtss( *cu.firstTU ) && !cu.intraMergeMode
             ? "DIMD with a block vector and MTSS"
             : cu.obicFlag && cu.obicMode[0] < 0 ? "OBIC without a mode" : nullptr;
@@ -3937,6 +3944,11 @@ static int32_t cuRecord( GpuIntraRec::Impl& m, const TransformUnit& tu, const Co
     d[8] = -1;
     std::copy_n( cu.dimdRelWeightMerge, 8, d + 9 );
     std::copy_n( cu.dimdLocDepMerge, 7, d + 17 );
+    for( int j = 0; j < 8; j++ )   // the parts its candidate's ranking gave vectors (isBvDimdExt, bvDimdExt)
+    {
+      d[DIMD_OUT_EXT_FLAGS] |= cu.isBvDimdExt[j] ? 1 << j : 0;
+      d[DIMD_OUT_EXT_BV + j] = cu.isBvDimdExt[j] ? bvPack( cu.bvDimdExt[j] ) : 0;
+    }
   }
 #if GPU_TMP
   else if( c.kind == CU_TMP )   // its list (the number its search found, tmpXYdisp), the DIMD of its prediction
@@ -5224,6 +5236,10 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
   {
     m.timdData[m.cus[cuIdx].eip + EIP_HEAD_BLOCK] = (int32_t) m.rec.size();
   }
+  if( t.derive & DERIVE_TIMD )   // (the block that sets the transform types a TIMD merge CU may take)
+  {
+    m.timdData[m.cus[cuIdx].timd + TIMD_HEAD_BLOCK] = (int32_t) m.rec.size();
+  }
   m.rec.push_back( t );
 }
 
@@ -5443,9 +5459,13 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
           {
             addTemplateAreas( h.ts );
           }
-          for( int k = 0; k < h.merge; k++ )
+          for( int k = 0; k < h.merge; k++ )   // (taking their transform types: their luma blocks', see TimdHead)
           {
             addModeNode( h.mergeNbr[k] );
+            if( h.inheritTr )
+            {
+              addBlock( m.timdData[m.cus[h.mergeNbr[k]].timd + TIMD_HEAD_BLOCK] );
+            }
           }
         }
         // EIP (intra_deps' copy): its reference area (its model's samples, the clipping range), an EIP merge CU's
@@ -6501,7 +6521,8 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
       // (an EIP CU with a vector: that of its search, pu.bv)
       const bool vector   = c.kind == CU_DIMD || c.kind == CU_OBIC || c.kind == CU_MERGE;
       const bool eipBv    = c.kind == CU_EIP && c.tmp >= 0;
-      const bool compared = k >= DIMD_OUT_BV_FLAG ? vector || ( eipBv && k == DIMD_OUT_BV )
+      const bool compared = k >= DIMD_OUT_EXT_FLAGS ? c.kind == CU_MERGE
+                            : k >= DIMD_OUT_BV_FLAG ? vector || ( eipBv && k == DIMD_OUT_BV )
                             : tmp ? k < DIMD_OUT_TMP_BV + MTMP_NUM || k == DIMD_OUT_TR_SECOND
                                     || ( k >= DIMD_OUT_MTSS_LIST && c.mtss >= 0 )
                             : mipDimd ? k == 0 || k == DIMD_OUT_TR_SECOND || ( k >= DIMD_OUT_MTSS_LIST && c.mtss >= 0 )
@@ -6553,9 +6574,11 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
                             : k < DIMD_OUT_TR_SECOND ? "dimdLocDep" : k == DIMD_OUT_TR_SECOND ? "candModeListForTransform"
                             : k < DIMD_OUT_MTSS_MODE ? "candModeListForTransformMtss" : k == DIMD_OUT_MTSS_MODE ? "MTSS's LFNST / NSPT mode"
                             : k == DIMD_OUT_MTSS_BUCKET ? "MTSS's secondBucket" : k == DIMD_OUT_BV_FLAG ? "isBvDimd"
-                            : "bvDimd";
+                            : k == DIMD_OUT_BV ? "bvDimd" : k == DIMD_OUT_EXT_FLAGS ? "isBvDimdExt (bits)"
+                            : "bvDimdExt (packed)";
         const int   entry = k < 2 ? 0 : k < 9 ? k - 2 : k < 17 ? k - 9 : k < DIMD_OUT_TR_SECOND ? k - 17
-                            : k == DIMD_OUT_TR_SECOND ? 1 : k < DIMD_OUT_MTSS_MODE ? k - DIMD_OUT_MTSS_LIST : 0;
+                            : k == DIMD_OUT_TR_SECOND ? 1 : k < DIMD_OUT_MTSS_MODE ? k - DIMD_OUT_MTSS_LIST
+                            : k > DIMD_OUT_EXT_FLAGS ? k - DIMD_OUT_EXT_BV : 0;
         char buf[200];
         snprintf( buf, sizeof( buf ), "%s[%d] of CU %d (%s at %d,%d %dx%d): CPU %d GPU %d", field, entry, (int) u,
                   pnnDimd ? "NN" : mipDimd ? "MIP" : cuKindName( c.kind ), c.x, c.y, c.w, c.h, h[k], g[k] );

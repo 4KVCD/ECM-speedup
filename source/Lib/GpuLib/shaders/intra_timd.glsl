@@ -1467,6 +1467,8 @@ int timdNode( Cu c, int cuIndex, int nbrMode[MPM_NEIGHBOURS], int dimdModes[3], 
   return mode;
 }
 
+const int MERGE_BVS = 8;   // DIMD_FUSION_NUM: the vectors an intra merge CU's parts may take
+
 // ----- a DIMD, OBIC or intra merge CU's choice of planar or a block vector (IntraPrediction::getBestNonAnglularMode,
 // JVET-AG0146): with both arms of TIMD's template (its record after the list's, BV_LIST), the SATD of planar's template
 // prediction and of the reconstruction at each vector of its list (getItmpMergeCandidate's, kept to its first 30 / 15)
@@ -1506,6 +1508,36 @@ void dimdVectorChoice( Cu c, int cuIndex, int bitDepth, bool noPdpc, int lid, in
     o.v[cuIndex * DIMD_OUT + DIMD_OUT_BV]      = best > 0 ? bvPack( bv ) : 0;
     ivec2 bvs[3] = ivec2[3]( bv, bv, bv );
     bvStore( c, best > 0 ? 1 : 0, bvs );
+    // an intra merge CU's vectors for its candidates (reorderIntraMergeCand: m_bvBasedMergeCostCandidates and
+    // m_bvBasedMergeLocDepCandidates, ordered by cost, the earlier of equal ones first, the first DIMD_FUSION_NUM) into
+    // the workgroup's scratch, which its node reads after ranking the candidates: their number, then per vector bvPack,
+    // its cost and the location dependence its arms' costs give
+    if( c.kind == CU_MERGE )
+    {
+      int order[BV_LIST_MAX];
+      for( int k = 1; k < n; k++ )   // (insertion sort of the vectors, 1 .. n - 1, stable)
+      {
+        int at = k - 1;
+        while( at > 0 && timdCost( order[at - 1] ) > timdCost( k ) )
+        {
+          order[at] = order[at - 1];
+          at--;
+        }
+        order[at] = k;
+      }
+      CBufI32   acc   = CBufI32( P.scratch );
+      const int base  = int( gl_WorkGroupID.x ) * BLEND_ACC, num = min( n - 1, MERGE_BVS );
+      const int log2A = findMSB( t.th ) + findMSB( c.w ), log2L = findMSB( t.tw ) + findMSB( c.h );
+      acc.v[base] = num;
+      for( int i = 0; i < num; i++ )
+      {
+        const int  k = order[i];
+        const uint a = s_spCost[TC_COST_A + k], l = s_spCost[TC_COST_L + k];
+        acc.v[base + 1 + 3 * i]     = bvPack( bvListAt( k - 1 ) );
+        acc.v[base + 1 + 3 * i + 1] = int( a + l );
+        acc.v[base + 1 + 3 * i + 2] = timdLocDep( TIMD_BOTH, a, l, log2A, log2L );
+      }
+    }
   }
 }
 

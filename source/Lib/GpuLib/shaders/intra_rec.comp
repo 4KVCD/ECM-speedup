@@ -759,12 +759,15 @@ void timdModeParams( inout Tu t, int mode, bool checkWA )
   t.plIdx     = 0;
 }
 
-// the block vector of prediction sub of block t (g_bvSubs): a TIMD block's of that prediction (TimdOut), another's its
-// CU's choice instead of planar (DimdOut's bvDimd)
+// the block vector of prediction sub of block t (g_bvSubs): a TIMD block's of that prediction (TimdOut), an intra merge
+// block's of that part where its node gave it one (bvDimdExt), another's its CU's choice instead of planar (bvDimd)
 ivec2 bvOfSub( Tu t, int sub )
 {
+  CBufI32    d   = CBufI32( P.dimdOut );
+  const int  o   = t.cu * DIMD_OUT;
+  const bool ext = ( t.derive & DERIVE_MERGE ) != 0 && ( ( d.v[o + DIMD_OUT_EXT_FLAGS] >> sub ) & 1 ) != 0;
   return bvUnpack( ( t.derive & DERIVE_TIMD ) != 0 ? CBufI32( P.timdOut ).v[timdPredBase( t.cu ) + TIMD_OUT_BV + sub]
-                                                   : CBufI32( P.dimdOut ).v[t.cu * DIMD_OUT + DIMD_OUT_BV] );
+                   : d.v[o + ( ext ? DIMD_OUT_EXT_BV + sub : DIMD_OUT_BV )] );
 }
 
 // a TIMD block's blend (xGetNumTapsTIMD): the filter lengths of its mode (x) and its secondary mode (y), from its modes
@@ -1532,6 +1535,22 @@ void main()
       }
       int cuMode = -1;       // invocation 0's
       int timdSecond = -1;   // a TIMD CU's second mode for MTSS (invocation 0's)
+      // a DIMD, OBIC or intra merge CU's choice of planar or a block vector (intra_timd.glsl), where the CUs around it
+      // may have vectors, before an intra merge CU's candidates, which take the vectors' costs (as DecCu orders them);
+      // else planar (its blocks read the choice from its DimdOut, which holds an earlier picture's)
+      if( WITH_DIMD && ( c.kind == CU_DIMD || c.kind == CU_OBIC || c.kind == CU_MERGE ) )
+      {
+        if( c.bvList >= 0 )
+        {
+          dimdVectorChoice( c, t.cu, t.bitDepth, ( t.derive & DERIVE_NO_PDPC ) != 0, lid, NT );
+        }
+        else if( lid == 0 )
+        {
+          CBufI32( P.dimdOut ).v[t.cu * DIMD_OUT + DIMD_OUT_BV_FLAG] = 0;
+          CBufI32( P.dimdOut ).v[t.cu * DIMD_OUT + DIMD_OUT_BV]      = 0;
+        }
+        SYNC();
+      }
       if( WITH_DIMD && c.kind == CU_OBIC )
       {
         SYNC();   // dimdSelect has read the histograms whose memory OBIC's takes
@@ -1608,20 +1627,6 @@ void main()
       if( lid == 0 && c.kind != CU_KNOWN )   // (a MIP CU's node, CU_KNOWN, keeps the host's mode)
       {
         CBufI32( P.cuMode ).v[t.cu] = cuMode;
-      }
-      // a DIMD, OBIC or intra merge CU's choice of planar or a block vector (intra_timd.glsl), where the CUs around it
-      // may have vectors; else planar (its blocks read the choice from its DimdOut, which holds an earlier picture's)
-      if( WITH_DIMD && ( c.kind == CU_DIMD || c.kind == CU_OBIC || c.kind == CU_MERGE ) )
-      {
-        if( c.bvList >= 0 )
-        {
-          dimdVectorChoice( c, t.cu, t.bitDepth, ( t.derive & DERIVE_NO_PDPC ) != 0, lid, NT );
-        }
-        else if( lid == 0 )
-        {
-          CBufI32( P.dimdOut ).v[t.cu * DIMD_OUT + DIMD_OUT_BV_FLAG] = 0;
-          CBufI32( P.dimdOut ).v[t.cu * DIMD_OUT + DIMD_OUT_BV]      = 0;
-        }
       }
       // MTSS (a DIMD, OBIC, intra merge, TIMD, MIP, EIP or IntraTMP CU with mdirIdx): its mode list from histograms of
       // its own (deriveDimdModeList), once dimdSelect and obicSelect have read theirs, then the LFNST / NSPT mode and
@@ -1763,8 +1768,15 @@ void main()
         t.fusion = blending ? 0 : t.fusion;
         t.bf     = blending && ( t.derive & DERIVE_BF ) != 0 ? 1 : 0;
         // with a block vector its planar predictions copies at it: a DIMD or intra merge blend's planar one, an OBIC
-        // blend's planar blend modes; then a DIMD or OBIC block's transforms by the DIMD of its prediction
-        if( t.isp == 0 && CBufI32( P.dimdOut ).v[t.cu * DIMD_OUT + DIMD_OUT_BV_FLAG] != 0 )
+        // blend's planar blend modes; then a DIMD or OBIC block's transforms by the DIMD of its prediction. An intra
+        // merge block whose node gave parts vectors (isBvDimdExtAvail) copies those parts instead (planar's not with
+        // ISP; then never planar from bvDimd)
+        const int ext = mergeCu ? CBufI32( P.dimdOut ).v[t.cu * DIMD_OUT + DIMD_OUT_EXT_FLAGS] : 0;
+        if( ext != 0 )
+        {
+          g_bvSubs = t.isp == 0 ? ext : ext & ~2;
+        }
+        else if( t.isp == 0 && CBufI32( P.dimdOut ).v[t.cu * DIMD_OUT + DIMD_OUT_BV_FLAG] != 0 )
         {
           for( int k = 1; blending && k < BLEND_MAX; k++ )
           {
