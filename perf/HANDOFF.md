@@ -1521,7 +1521,8 @@ A decoding process creates the pipelines it needs one after the other, and paral
 ones: after a shader change `perf/gpu/precompile.py <build>` first compiles all 63 (IntraRecVariant x LmLevel), one
 process per pipeline (ECM_GPU_PRECOMPILE=variant:level) on every CPU thread, into runs/nvcache - the cache partial.py
 uses; point the regressions there too (__GL_SHADER_DISK_CACHE_PATH, _SIZE 8000000000, _SKIP_CLEANUP 1). The M57
-regression without it spent ~25 min compiling.
+regression without it spent ~25 min compiling. (Since M65 also into pipeline cache files, runs/pipecache, which keep
+them all: see the note after M65.)
 M55: PDP (JVET-AH0209, intra_pdp.glsl): a luma block of a size with PDP filters whose references are available is
 predicted by its mode's filter per sample over two reference lines (one for 16x32 .. 32x32, whose filters cover every
 second sample and whose samples between are averaged in place, in the CPU's order); also a MIP block's by MIP's filter
@@ -1700,9 +1701,13 @@ CUs and the 644 intra merge CUs held back by a BVG-DIMD neighbour leave that rea
 CPU go 23345 -> 19093. Remaining: SGPM 5598, IntraTMP LIC 4159 (with fusion 813), intra merge with a neighbour of a
 kind the GPU lacks 2835 (an SGPM neighbour is one: the CPU takes SGPM CUs, which the merge record reads as MPM CUs),
 sub-sample vectors 1900, IntraTMP's OBMC 919, an IntraTMP neighbour of intra merge 855, fusion 731, FLM 589.
-Tooling note: the NVIDIA disk cache (runs/nvcache) does not keep all 63 intra_rec pipelines (each entry is ~100-350
-MB; __GL_SHADER_DISK_CACHE_SIZE=8000000000 may be read as 32 bits): a partial run after precompile.py can still spend
-~10 minutes per decoder compiling evicted pipelines.
+Pipeline cache files (2026-10-15): the NVIDIA disk cache (runs/nvcache) did not keep all 63 intra_rec pipelines (its
+files hold ~100-350 MB each and were rewritten as new pipelines came in): the M64 / M65 partial run after
+precompile.py still spent ~10 minutes per decoder compiling evicted ones. VkCompute's Kernel::create now takes
+ECM_GPU_PIPELINE_CACHE=<dir>: each pipeline's VkPipelineCache data in a file of its own (named by its kernel and a hash
+of its SPIR-V, specialization and the device's pipelineCacheUUID), written where it was compiled, loaded later (the
+MPM pipeline: 122 s cold, 0.0 s from its file of ~4 MB). precompile.py and partial.py set it to runs/pipecache;
+precompile.py trims that to 30 GB, oldest first. Point the regressions there too.
 
 ## 8. Numbers (i7-10700 8C/16T, Win11, GCC 16.2, RTX 3070 driver 616.92)
 

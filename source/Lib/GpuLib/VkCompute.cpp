@@ -39,6 +39,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -453,6 +454,9 @@ GPU_LOAD_INSTANCE( EnumerateDeviceExtensionProperties )
   GPU_LOAD_DEVICE( DestroyPipelineLayout )
   GPU_LOAD_DEVICE( CreateComputePipelines )
   GPU_LOAD_DEVICE( DestroyPipeline )
+  GPU_LOAD_DEVICE( CreatePipelineCache )
+  GPU_LOAD_DEVICE( GetPipelineCacheData )
+  GPU_LOAD_DEVICE( DestroyPipelineCache )
   GPU_LOAD_DEVICE( CreateCommandPool )
   GPU_LOAD_DEVICE( DestroyCommandPool )
   GPU_LOAD_DEVICE( AllocateCommandBuffers )
@@ -657,6 +661,83 @@ bool Buffer::ensure( Context& ctx, VkDeviceSize bytes, Kind kind )
 // Kernel
 // ====================================================================================================================
 
+// ECM_GPU_PIPELINE_CACHE=<dir>: each pipeline's driver cache data in a file of its own there, named by its kernel and
+// a hash of its SPIR-V, its specialization and the device's pipelineCacheUUID, so that a pipeline is compiled once (a
+// cold intra_rec pipeline takes minutes) and later runs load it. The driver's own disk cache holds too few of the
+// intra_rec pipelines, which are large, and evicts them. Empty without the variable
+static std::string pipelineCachePath( const Context& ctx, const uint32_t* spirv, size_t bytes, const char* name,
+                                      const std::vector<uint32_t>& specialization )
+{
+  const char* dir = getenv( "ECM_GPU_PIPELINE_CACHE" );
+  if( !dir || !*dir )
+  {
+    return std::string();
+  }
+  uint64_t hash = 1469598103934665603ull;   // FNV-1a
+  auto mix = [&hash]( const void* data, size_t n )
+  {
+    for( size_t i = 0; i < n; i++ )
+    {
+      hash = ( hash ^ static_cast<const uint8_t*>( data )[i] ) * 1099511628211ull;
+    }
+  };
+  mix( spirv, bytes );
+  mix( specialization.data(), specialization.size() * sizeof( uint32_t ) );
+  mix( ctx.properties().pipelineCacheUUID, VK_UUID_SIZE );
+  std::string file( name );
+  std::replace_if( file.begin(), file.end(), []( char c ) { return !isalnum( (unsigned char) c ); }, '_' );
+  char hex[17];
+  snprintf( hex, sizeof( hex ), "%016llx", (unsigned long long) hash );
+  return std::string( dir ) + "/" + file + "-" + hex + ".bin";
+}
+
+// the contents of file path (empty where it cannot be read)
+static std::vector<char> readFile( const std::string& path )
+{
+  std::vector<char> data;
+  if( FILE* f = fopen( path.c_str(), "rb" ) )
+  {
+    fseek( f, 0, SEEK_END );
+    const long size = ftell( f );
+    fseek( f, 0, SEEK_SET );
+    data.resize( size > 0 ? size_t( size ) : 0 );
+    if( fread( data.data(), 1, data.size(), f ) != data.size() )
+    {
+      data.clear();
+    }
+    fclose( f );
+  }
+  return data;
+}
+
+// cache's data into file path: written whole under a name of its own, then renamed (processes compiling the same
+// pipeline at once each write a complete file; where the file exists already the copy is dropped)
+static void writePipelineCache( const VkFn& vk, VkDevice dev, VkPipelineCache cache, const std::string& path )
+{
+  size_t size = 0;
+  if( vk.GetPipelineCacheData( dev, cache, &size, nullptr ) != VK_SUCCESS || size == 0 )
+  {
+    return;
+  }
+  std::vector<char> data( size );
+  if( vk.GetPipelineCacheData( dev, cache, &size, data.data() ) != VK_SUCCESS )
+  {
+    return;
+  }
+  const std::string tmp = path + "." + std::to_string( std::chrono::steady_clock::now().time_since_epoch().count() );
+  FILE* f = fopen( tmp.c_str(), "wb" );
+  if( !f )
+  {
+    return;
+  }
+  const bool written = fwrite( data.data(), 1, size, f ) == size;
+  fclose( f );
+  if( !written || rename( tmp.c_str(), path.c_str() ) != 0 )
+  {
+    remove( tmp.c_str() );
+  }
+}
+
 void Kernel::create( Context& ctx, const uint32_t* spirv, size_t bytes, uint32_t pushBytes, const char* name,
                      const std::vector<uint32_t>& specialization )
 {
@@ -707,12 +788,35 @@ void Kernel::create( Context& ctx, const uint32_t* spirv, size_t bytes, uint32_t
     pipelineInfo.layout       = m_layout;
     // (ECM_GPU_PIPELINE_TIMES: each pipeline's creation time on stderr; a cold intra_rec pipeline takes minutes, and
     // VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT does not shorten it on NVIDIA's driver)
-    const auto start = std::chrono::steady_clock::now();
-    res = vk.CreateComputePipelines( dev, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_pipeline );
+    const auto        start     = std::chrono::steady_clock::now();
+    const std::string cachePath = pipelineCachePath( ctx, spirv, bytes, name, specialization );
+    const std::vector<char> cached = cachePath.empty() ? std::vector<char>() : readFile( cachePath );
+    VkPipelineCache   cache     = VK_NULL_HANDLE;
+    if( !cachePath.empty() )
+    {
+      VkPipelineCacheCreateInfo cacheInfo{};
+      cacheInfo.sType           = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO;
+      cacheInfo.initialDataSize = cached.size();
+      cacheInfo.pInitialData    = cached.empty() ? nullptr : cached.data();
+      if( vk.CreatePipelineCache( dev, &cacheInfo, nullptr, &cache ) != VK_SUCCESS )
+      {
+        cache = VK_NULL_HANDLE;
+      }
+    }
+    res = vk.CreateComputePipelines( dev, cache, 1, &pipelineInfo, nullptr, &m_pipeline );
+    if( cache != VK_NULL_HANDLE )
+    {
+      if( res == VK_SUCCESS && cached.empty() )   // (compiled now: its file for the next runs)
+      {
+        writePipelineCache( vk, dev, cache, cachePath );
+      }
+      vk.DestroyPipelineCache( dev, cache, nullptr );
+    }
     if( getenv( "ECM_GPU_PIPELINE_TIMES" ) )
     {
-      fprintf( stderr, "[gpu] pipeline %s: %.1f s\n", name,
-               std::chrono::duration<double>( std::chrono::steady_clock::now() - start ).count() );
+      fprintf( stderr, "[gpu] pipeline %s: %.1f s%s\n", name,
+               std::chrono::duration<double>( std::chrono::steady_clock::now() - start ).count(),
+               !cached.empty() ? " (from its cache file)" : "" );
     }
   }
   vk.DestroyShaderModule( dev, module, nullptr );

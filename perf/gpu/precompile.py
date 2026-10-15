@@ -5,8 +5,13 @@
 # spent most of their time compiling; with this they start warm. Each process decodes a one-picture stream (partial
 # verification: the GPU path starts on any stream) with ECM_GPU_PRECOMPILE=variant:level: GpuIntraRec's createShared
 # compiles that pipeline and ends the process.
-import os, subprocess, sys, time
+# The pipelines also go into files of their own (VkCompute's ECM_GPU_PIPELINE_CACHE, runs/pipecache), which partial.py
+# reads: the driver's cache does not keep all of intra_rec's (an entry is ~100-350 MB). The oldest files go first where
+# the directory holds more than PIPECACHE_GB.
+import glob, os, subprocess, sys, time
 from concurrent.futures import ThreadPoolExecutor
+
+PIPECACHE_GB = 30
 
 NUM_VARIANTS, NUM_LEVELS = 9, 7   # GpuIntraRec.cpp's IntraRecVariant, LmLevel
 
@@ -19,8 +24,16 @@ if args and args[0] == '-j':
 pipelines = args or [f'{v}:{l}' for v in range(NUM_VARIANTS) for l in range(NUM_LEVELS)]
 cache = 'C:/Code/ECM/runs/nvcache'
 os.makedirs(cache, exist_ok=True)   # (the driver does not create it: without it nothing is cached)
+pipes = 'C:/Code/ECM/runs/pipecache'
+os.makedirs(pipes, exist_ok=True)
+files = sorted(glob.glob(pipes + '/*.bin'), key=os.path.getmtime)
+size = sum(os.path.getsize(f) for f in files)
+while files and size > PIPECACHE_GB << 30:
+    size -= os.path.getsize(files[0])
+    os.remove(files.pop(0))
 base = dict(os.environ, __GL_SHADER_DISK_CACHE_PATH=cache, __GL_SHADER_DISK_CACHE_SIZE='8000000000',
-            __GL_SHADER_DISK_CACHE_SKIP_CLEANUP='1', ECM_GPU_PIPELINE_TIMES='1', ECM_GPU_PARTIAL='1')
+            __GL_SHADER_DISK_CACHE_SKIP_CLEANUP='1', ECM_GPU_PIPELINE_TIMES='1', ECM_GPU_PARTIAL='1',
+            ECM_GPU_PIPELINE_CACHE=pipes)
 
 
 def run(p):

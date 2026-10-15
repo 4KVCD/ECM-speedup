@@ -3,7 +3,8 @@
 # reconstruction, everything else is verified. Per stream the pictures verified / with differences, the first
 # difference (the first block in decoding order whose prediction or residual differs is in the log), and the CUs taken
 # from the CPU by reason (what to port next); then the reasons summed over all streams. Logs in runs/partial.
-# The NVIDIA driver's shader cache: runs/nvcache, a cache of its own (the shared one stops storing at 1 GB).
+# The NVIDIA driver's shader cache: runs/nvcache, a cache of its own (the shared one stops storing at 1 GB); the
+# pipelines' own files (VkCompute's ECM_GPU_PIPELINE_CACHE, which precompile.py fills): runs/pipecache.
 import os, re, subprocess, sys
 from concurrent.futures import ThreadPoolExecutor
 from collections import Counter
@@ -17,8 +18,11 @@ if args and args[0] == '-j':
 streams = args or sorted(f[:-4] for f in os.listdir('C:/Code/ECM/streams') if f.endswith('.bin'))
 cache = 'C:/Code/ECM/runs/nvcache'
 os.makedirs(cache, exist_ok=True)   # (the driver does not create it: without it nothing is cached)
+pipes = 'C:/Code/ECM/runs/pipecache'
+os.makedirs(pipes, exist_ok=True)
 env = dict(os.environ, ECM_GPU_PARTIAL='1', __GL_SHADER_DISK_CACHE_PATH=cache,
-           __GL_SHADER_DISK_CACHE_SIZE='8000000000', __GL_SHADER_DISK_CACHE_SKIP_CLEANUP='1')
+           __GL_SHADER_DISK_CACHE_SIZE='8000000000', __GL_SHADER_DISK_CACHE_SKIP_CLEANUP='1',
+           ECM_GPU_PIPELINE_CACHE=pipes)
 total = Counter()
 
 
