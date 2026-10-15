@@ -161,12 +161,13 @@ const int CCP_TYPE_GLCCCM = 32, CCP_TYPE_NSCCCM = 64, CCP_TYPE_MDFCCCM = 128;
 // adjustment, ccpMergeAdjustFlag: 0 none, 1 the coefficient of the co-located luma sample, 2 that, then those of its
 // neighbours; CCP_KIND_DERIVED a block of decoder-derived CCP fusion, which shares the merge code: no sources, no
 // history; CCP_KIND_DD_FUSION a merge block of decoder-derived merge fusion, its index the pair's,
-// ddNonLocalCCPFusion - 1), the number of spatial sources, then those records (PU::getCCPModelCandidateList's
-// adjacent and non-adjacent positions' PUs, decoded before the CU, typed, each once)
+// ddNonLocalCCPFusion - 1; CCP_KIND_FUSION_BLEND one of merge fusion with CCCM by a blend model, the SPS's
+// ccpFusionMode), the number of spatial sources, then those records (PU::getCCPModelCandidateList's adjacent and
+// non-adjacent positions' PUs, decoded before the CU, typed, each once)
 const int CCP_WRITERS = 2;
 const int CCP_MERGE_HIST = 0, CCP_MERGE_HIST_NUM = 1, CCP_MERGE_INDEX = 2, CCP_MERGE_DEFAULTS = 3;
 const int CCP_MERGE_KIND = 4, CCP_MERGE_NUM_SPATIAL = 5, CCP_MERGE_SPATIAL = 6;
-const int CCP_KIND_DERIVED = 3, CCP_KIND_DD_FUSION = 4;
+const int CCP_KIND_DERIVED = 3, CCP_KIND_DD_FUSION = 4, CCP_KIND_FUSION_BLEND = 5;
 
 // Tu::derive
 const int DERIVE_NODE     = 32;  // not a block: the derivation of the mode of CU Tu::cu, before the CU's blocks

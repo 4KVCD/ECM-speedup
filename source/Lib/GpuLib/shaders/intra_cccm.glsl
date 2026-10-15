@@ -957,6 +957,8 @@ void cccmStoreCcp( Tu t, bool twoModels )
   }
 }
 
+int ccpFusionTemplateBase( Tu t );   // (intra_ccp.glsl)
+
 // the prediction of CCCM block t into s_tmp, larger ones into the scratch (rows of t.w; all invocations, ending with a
 // barrier; cccmBlockPrediction reads it), with `both` (LFNST / NSPT's DIMD of the CU's predictions: predIntraCCCM
 // predicts both at the Cb block) both components' (Cb's, then Cr's): the reference area, the luma buffer(s), with two
@@ -1059,17 +1061,37 @@ void cccmPrediction( Tu t, bool both, int lid, int NT )
   }
   const bool inTmp = cccmPredInTmp( t );
   const int  pred  = g_cccmFusion ? cccmFusionPredBase( t ) : cccmScratchPred();
-  for( int i = lid; i < ( g_cccmBoth ? 2 : 1 ) * W * H; i += NT )   // (at i: Cb's, then Cr's where both)
+  // CCP merge fusion with CCCM by a blend model also predicts both components' row above the block and column left of
+  // it, where the block has a CU there (ccpmComputeTemplateFusionModel), for the model (intra_ccp.glsl's probe samples,
+  // their slot CCP_MAX_CANDS). In the block's loop: with a loop of their own (a second cccmPredict) the pictures of
+  // decoder-derived CCP fusion were about 1 % slower still
+  const int  numPred = ( g_cccmBoth ? 2 : 1 ) * W * H, len = W + H;
+  const int  numTemplate = WITH_CCP_DERIVED && g_cccmFusion && t.ccpMerge >= 0
+                           && BufI32( P.ccpData ).v[t.ccpMerge + CCP_MERGE_KIND] == CCP_KIND_FUSION_BLEND ? 2 * len : 0;
+  const bool above = s_cclm[CCLM_POS_ABOVE] != 0, left = s_cclm[CCLM_POS_LEFT] != 0;
+  for( int i = lid; i < numPred + numTemplate; i += NT )   // (at i: Cb's, then Cr's where both; then the template's)
   {
-    const int j = i % ( W * H ), comp = g_cccmBoth ? 1 + i / ( W * H ) : t.comp;
-    const int v = cccmPredict( g_cccmSet, comp - 1, g_cccmSizeX + j % W, g_cccmSizeY + j / W, twoModels, bitDepth );
-    if( inTmp )
+    const bool block = i < numPred;
+    const int  j = i % ( W * H ), k = i - numPred, pos = k % len, q = pos < W ? pos : pos - W;
+    const bool top = pos < W;
+    if( block || ( top ? above : left ) )
     {
-      s_tmp[i] = int16_t( v );
-    }
-    else
-    {
-      CBufI32( P.scratch ).v[pred + i] = v;
+      const int comp = !block ? 1 + k / len : g_cccmBoth ? 1 + i / ( W * H ) : t.comp;
+      const int x = block ? g_cccmSizeX + j % W : top ? g_cccmSizeX + q : g_cccmSizeX - 1;
+      const int y = block ? g_cccmSizeY + j / W : top ? g_cccmSizeY - 1 : g_cccmSizeY + q;
+      const int v = cccmPredict( g_cccmSet, comp - 1, x, y, twoModels, bitDepth );
+      if( !block )
+      {
+        CBufI32( P.scratch ).v[ccpFusionTemplateBase( t ) + k] = v;
+      }
+      else if( inTmp )
+      {
+        s_tmp[i] = int16_t( v );
+      }
+      else
+      {
+        CBufI32( P.scratch ).v[pred + i] = v;
+      }
     }
   }
   cccmSync();

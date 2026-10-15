@@ -433,7 +433,9 @@ the reconstruction buffer; works in every frame-thread context):
   block, and predicts with the best one or, where it fits those lines better, a 3 : 1 blend of the best pair. M51 is
   decoder-derived CCP merge fusion: a merge CU signals a pair of its ranked candidates, which it blends by weights
   fitted to their template predictions (a linear model of the position) or averages, whichever fits the template
-  better.
+  better. M52 is CCP merge fusion with CCCM by a blend model: with the SPS's CCP fusion mode (which ECM's encoder sets
+  outside all-intra streams) the merge prediction and the two-model CCCM one are blended by such fitted weights
+  instead of averaged.
   GpuIntraRec::supported()
   rejects every tool whose mode derivation or prediction reads reconstructed samples or that the kernels lack, before
   anything is skipped. All 19 regular streams now fall back to the CPU at chroma reordering / DBV, the next

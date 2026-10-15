@@ -9,18 +9,18 @@
 // may smooth the prediction. Here each block of the merge CU builds the list, ranks it and predicts its component with
 // the chosen model, which the Cb block writes into the CU's record. The host gives the list's sources (Params::ccpData
 // at Tu::ccpMerge: the records of the PUs at the positions, those of the CTU row's history, spare records for each
-// block's defaults; its scheduling waits for the blocks writing them) and rejects merge fusion with CCCM by a blend
-// model (the SPS's ccpFusionMode 1: not all-intra) and decoder-derived merge fusion. Merge adjustment (JVET-AL0126)
+// block's defaults; its scheduling waits for the blocks writing them). Merge adjustment (JVET-AL0126)
 // lists the CCCM models alone, adds models fitted on the fly (ccpFitModels) and moves the chosen model's coefficients
 // by template costs (ccpMergeAdjust). Merge fusion with CCCM (predCCPCandidate's ccpMergeFusionType 0) is LM chroma
 // fusion's first type with equal weights: the block computes the CCCM prediction before its own and storeRegion
-// averages them (intra_cccm.glsl's cccmFusionBlend). Merge fusion with DIMD chroma (ccpMergeFusionType 1): the CU's
-// node derives the DIMD chroma mode as a DIMD_CHROMA_IDX CU's, and intra_rec's blending averages the block's merge
-// prediction and the mode's (two blended predictions of weight 1, the average rounded). A candidate predicts like the
-// LM blocks of its type: a CCLM / GLM model as intra_cclm.glsl's (the slots in s_cclm), the others with
-// intra_cccm.glsl's luma buffers and cccmPredict (the CPU's model applied to the CU's own luma, the candidate's luma
-// offset taken in the buffer: xCccmGetLumaVal's luma minus m_cccmLumaOffset plus m_cccmLumaOffset minus the
-// candidate's offset).
+// averages them (intra_cccm.glsl's cccmFusionBlend), or with the SPS's ccpFusionMode blends them by a model fitted to
+// their template predictions (as decoder-derived merge fusion's pairs). Merge fusion with DIMD chroma
+// (ccpMergeFusionType 1): the CU's node derives the DIMD chroma mode as a DIMD_CHROMA_IDX CU's, and intra_rec's
+// blending averages the block's merge prediction and the mode's (two blended predictions of weight 1, the average
+// rounded). A candidate predicts like the LM blocks of its type: a CCLM / GLM model as intra_cclm.glsl's (the slots in
+// s_cclm), the others with intra_cccm.glsl's luma buffers and cccmPredict (the CPU's model applied to the CU's own
+// luma, the candidate's luma offset taken in the buffer: xCccmGetLumaVal's luma minus m_cccmLumaOffset plus
+// m_cccmLumaOffset minus the candidate's offset).
 // Decoder-derived CCP fusion (JVET-AG0154's decoderDerivedCcpMode CUs; DecCu at the Cb block: decoderDerivedCcp,
 // predDecoderDerivedIntraCCCMFusions) shares the merge code: its entry (kind CCP_KIND_DERIVED) has no sources and no
 // history, its list is its modes - a CCLM model and CCCM models the block fits itself (ccpDerivedLinear,
@@ -437,15 +437,19 @@ void ccpDerivedLinear( Tu t, int predStride )
   }
 }
 
-// where decoder-derived fusion block t's probe samples (decoder-derived merge fusion's template samples) are, the costs'
-// step by step, Cb's then Cr's, and after them the pairs' words: in the workgroup's scratch before list[1]'s
-// prediction at its end, which the block's own prediction may overlap later (GpuIntraRec.cpp's ccpDerivedScratch)
+// where decoder-derived fusion block t's probe samples (decoder-derived merge fusion's and blend-model merge fusion's
+// template samples) are, the costs' step by step, Cb's then Cr's, then the CCP merge fusion's CCCM prediction's
+// (intra_cccm.glsl's cccmPrediction: slot CCP_MAX_CANDS), then the pairs' words: in the workgroup's scratch before
+// list[1]'s (or the CCCM) prediction at its end, which the block's own prediction may overlap later (GpuIntraRec.cpp's
+// ccpDerivedScratch)
 int ccpProbeBase( Tu t )
 {
-  return cccmFusionPredBase( t ) - CCP_MAX_CANDS * 2 * ( t.w + t.h ) - CCP_PAIRS_MAX * CCP_PAIR_WORDS;
+  return cccmFusionPredBase( t ) - ( CCP_MAX_CANDS + 1 ) * 2 * ( t.w + t.h ) - CCP_PAIRS_MAX * CCP_PAIR_WORDS;
 }
 
-int ccpPairBase( Tu t ) { return ccpProbeBase( t ) + CCP_MAX_CANDS * 2 * ( t.w + t.h ); }
+int ccpPairBase( Tu t ) { return ccpProbeBase( t ) + ( CCP_MAX_CANDS + 1 ) * 2 * ( t.w + t.h ); }
+
+int ccpFusionTemplateBase( Tu t ) { return ccpProbeBase( t ) + CCP_MAX_CANDS * 2 * ( t.w + t.h ); }
 
 // the position of tap k (0 .. 8: 3 x 3, the line farthest from the block first) of decoder-derived fusion's probe
 // sample q of the row above block t (top) or of the column left of it with LBCCP's inside filter
@@ -551,13 +555,14 @@ int ccpBlendWeight( int p0, int p1, int p2, int shift, int offset, int x, int y 
 
 // the cost and blend model of the pair of candidates whose template samples are the a-th and b-th in the scratch (one
 // invocation; reorderCCPCandidates with useBlendModelDdccp, always) into the pair's words at `dst`: the SAD of the
-// average of their samples (xGetCostCCPFusion) or, where lower, of their blend by xComputeBlendFusionModelJoint's
+// average of their samples (xGetCostCCPFusion) or, where lower (or always without `compare`: merge fusion's
+// ccpmComputeBlendFusionModelJoint), of their blend by xComputeBlendFusionModelJoint's
 // model - list[1]'s weight linear in the position, fitted to both components' template samples by solve1: the
 // features (P1 - P0) x where the block has a CU above, (P1 - P0) y where it has one left (x and y one less than the
 // sample's own along its line: AML_MERGE_TEMPLATE_SIZE) and P1 - P0, the target the reconstruction minus P0, each a
 // Pel; its parameters as ints (the CPU sizes them before it sets them, so it scales them by 1), its shift DECIM_BITS
 // - 5; equal weights (16) where those at the block's corners differ by 4 at most
-void ccpBlendModel( Tu t, int a, int b, int dst )
+void ccpBlendModel( Tu t, int a, int b, int dst, bool compare )
 {
   const bool above = s_cclm[CCLM_POS_ABOVE] != 0, left = s_cclm[CCLM_POS_LEFT] != 0;
   const int  W = t.w, H = t.h, len = W + H, bitDepth = t.bitDepth;
@@ -667,7 +672,7 @@ void ccpBlendModel( Tu t, int a, int b, int dst )
       costModel += abs( reco - int( int16_t( ( ( 32 - wgt ) * p0s + wgt * p1s + 16 ) >> 5 ) ) );
     }
   }
-  const bool blends = costModel < costAverage;
+  const bool blends = !compare || costModel < costAverage;
   s.v[dst + CCP_PAIR_COST_W]     = blends ? costModel : costAverage;
   s.v[dst + CCP_PAIR_VALID]      = blends ? 1 : 0;
   s.v[dst + CCP_PAIR_PARAMS]     = p0;
@@ -689,7 +694,8 @@ void ccpDdFusionChoice( Tu t, int lid, int NT )
   for( int p = lid; p < numPairs; p += NT )
   {
     const ivec2 ab = ccpDerivedPair( p, num );
-    ccpBlendModel( t, s_ccp[CCP_LIST_ORIG + ab.x], s_ccp[CCP_LIST_ORIG + ab.y], ccpPairBase( t ) + p * CCP_PAIR_WORDS );
+    ccpBlendModel( t, s_ccp[CCP_LIST_ORIG + ab.x], s_ccp[CCP_LIST_ORIG + ab.y], ccpPairBase( t ) + p * CCP_PAIR_WORDS,
+                   true );
   }
   cccmSync();
   if( lid == 0 )
@@ -1009,14 +1015,19 @@ void ccpMergeAdjust( Tu t, int x, int flag, int lid, int NT )
 // A merge block of decoder-derived merge fusion keeps its candidates' template samples alike, chooses its pair after
 // the sort (ccpDdFusionChoice) and predicts like a decoder-derived fusion block (predDecoderDerivedCcpMergeFusion: the
 // pair's second candidate, then its first, each through its inside filter), blended by the pair's model
-// (ccpFusionBlend); the CU's record is the first candidate's, as a merge CU's
+// (ccpFusionBlend); the CU's record is the first candidate's, as a merge CU's.
+// A merge block of fusion with CCCM by a blend model (the SPS's ccpFusionMode) keeps its candidates' template samples
+// alike, and after the sort fits the blend model of the chosen candidate's and the CCCM prediction's (cccmPrediction
+// keeps those: ccpmComputeTemplateFusionModel, ccpmComputeBlendFusionModelJoint) that storeRegion blends the two by
+// (applyBlendFusion)
 void ccpMergePrediction( inout Tu t, int predStride, int lid, int NT )
 {
   const int  kind = BufI32( P.ccpData ).v[t.ccpMerge + CCP_MERGE_KIND];
   const bool derived = WITH_CCP_DERIVED && kind == CCP_KIND_DERIVED;
   const bool ddFusion = WITH_CCP_DERIVED && kind == CCP_KIND_DD_FUSION;
+  const bool blendFusion = WITH_CCP_DERIVED && kind == CCP_KIND_FUSION_BLEND;
   const bool twoSteps = derived || ddFusion;   // (list[1]'s prediction, then list[0]'s)
-  const int  adjust = twoSteps ? 0 : kind;
+  const int  adjust = twoSteps || blendFusion ? 0 : kind;
   g_ccpAngUsed = 0;
   if( twoSteps )   // (where a prediction goes, also where no CCCM model of the block set them: list[1] a CCLM model)
   {
@@ -1108,6 +1119,20 @@ void ccpMergePrediction( inout Tu t, int predStride, int lid, int NT )
           if( ddFusion )
           {
             ccpDdFusionChoice( t, lid, NT );
+          }
+          if( blendFusion )   // (the blend model of the chosen candidate's and the CCCM prediction's template samples)
+          {
+            cccmSync();
+            if( lid == 0 )
+            {
+              const int idx = BufI32( P.ccpData ).v[t.ccpMerge + CCP_MERGE_INDEX];
+              ccpBlendModel( t, s_ccp[CCP_LIST_ORIG + idx], CCP_MAX_CANDS, ccpPairBase( t ), false );
+              for( int w = 0; w < CCP_PAIR_WORDS; w++ )
+              {
+                s_ccp[CCP_BLEND + w] = CBufI32( P.scratch ).v[ccpPairBase( t ) + w];
+              }
+            }
+            SYNC();
           }
         }
       }
@@ -1207,7 +1232,7 @@ void ccpMergePrediction( inout Tu t, int predStride, int lid, int NT )
         if( cost )
         {
           sad += abs( ( top ? recoAt( c + 1, t.x + q, t.y - 1 ) : recoAt( c + 1, t.x - 1, t.y + q ) ) - v );
-          if( twoSteps )
+          if( twoSteps || blendFusion )
           {
             CBufI32( P.scratch ).v[ccpProbeBase( t ) + step * 2 * len + s] = v;
           }
