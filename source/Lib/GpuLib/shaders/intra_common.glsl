@@ -233,12 +233,15 @@ const int DERIVE_CCP_DIMD = 524288;
 // with DERIVE_NODE: a block partial verification takes from the CPU (its samples in the planes from the start); it
 // owns its area like a block (intra_deps' owner maps: the blocks after it read it as decoded) and does nothing
 const int DERIVE_CPU_FILL = 1048576;
-// a block of NN intra prediction with LFNST / NSPT or explicit MTS (intra_nn.glsl): their mode is a DIMD of its
-// prediction (xPredIntraPnn's indicesRepresentationPnn), which intra_rec derives after the prediction, then the
-// residual and the reconstruction (with DERIVE_TRANSFORM); with DERIVE_PNN_LFNST_SEC LFNST / NSPT take planar, or the
-// second mode where the first is planar (getFinalIntraModeForTransform's lfnstSecFlag rule)
+// a block of NN intra prediction (intra_nn.glsl) or of EIP with LFNST / NSPT or explicit MTS: their mode is a DIMD of
+// its prediction (xPredIntraPnn's indicesRepresentationPnn, eipDimdMode), which intra_rec derives after the
+// prediction, then the residual and the reconstruction (with DERIVE_TRANSFORM); with DERIVE_PNN_LFNST_SEC LFNST / NSPT
+// take planar, or the second mode where the first is planar (getFinalIntraModeForTransform's lfnstSecFlag rule)
 const int DERIVE_PNN_DIMD = 2097152;
 const int DERIVE_PNN_LFNST_SEC = 4194304;
+// an EIP CU's luma block (intra_eip.glsl): predicted by its node's model; then the DIMD of its prediction in any case
+// (eipDimdMode, which chroma DM reads: the CU's mode its block writes)
+const int DERIVE_EIP = 8388608;
 
 // Params::dbgParams per block: the derived dirMode, isModeVer, intraPredAngle, absInvAngle, useCubic, refFilter,
 // applyPDPC, gradPDPC, angularScale, fusion, bf, plIdx, then mtxV, mtxH, secMatrix, secTranspose, secLayout
@@ -274,6 +277,7 @@ struct Cu
   int tmrl;              // a TMRL CU's index among the TMRL CUs (Params::tmrlOut; -1: not TMRL)
   int mpm;               // an MPM CU's record in Params::timdData where MPM sorting, MDIP or PDP shape its lists, an
                          // MDIP CU's (MpmHead; -1: none, intra_modes.glsl's lists)
+  int eip;               // an EIP CU's record in Params::timdData (intra_eip.glsl's EIP_HEAD_*; -1: not EIP)
 };
 layout( buffer_reference, std430, buffer_reference_align = 4 ) buffer BufCu { Cu v[]; };
 
@@ -292,6 +296,8 @@ const int CU_TMRL        = 9;   // luma: a TMRL CU, its mode and reference line 
 const int CU_CHROMA_TMRL = 10;  // chroma: a chroma TMRL CU, its mode and reference line from costs of the co-located luma
                                 // block's prediction and of its template (intra_tmrl.glsl), with its DIMD chroma (its
                                 // Cu::nbr: CHROMA_TMRL_NBR_*)
+const int CU_EIP         = 11;  // luma: an EIP CU (intra_eip.glsl): its node its model, its block the prediction and
+                                // the mode chroma DM reads (eipDimdMode; the MPM lists read planar instead)
 
 // a TMRL CU's choice as its node derives it (TMRL_OUT int32 per TMRL CU in Params::tmrlOut): the mode (131-mode set)
 // and the reference line (multiRefIdx) of m_tmrlList[tmrlListIdx], which its blocks predict with
@@ -498,6 +504,18 @@ const int MPM_MDIP_CU        = 32;   // an MDIP CU: its mode MDIP's (without exc
 const int MPM_I_SLICE        = 64;   // an intra slice (sorting from 6 entries on, else from 2)
 // int32 per MPM record (Params::mpmOut): its MDIP mode (-1: none), its excluded modes (cu.excludingMode; 0: none)
 const int MPM_OUT = 21;
+// an EIP CU's record in Params::timdData (layout shared with GpuIntraRec.cpp; intra_eip.glsl): its index
+// (Params::eipOut), how its model is found (EIP_DERIVED: its own fit, of recoType / shape / two models from its mode;
+// EIP_MERGE: a neighbour's, the merge index), its reference area (initEipParams: the template's lines above / left of
+// the block within it, the area's refSizeX columns left of and refSizeY rows above the block, refWidth x refHeight with
+// the available above-right / below-left units), its luma block (which writes the mode chroma DM reads); an EIP merge
+// CU's sources follow, each its CU record and EIP index: those at the neighbouring positions (their number first),
+// then its CTU row's EIP CUs before it, oldest first
+const int EIP_HEAD_INDEX = 0, EIP_HEAD_KIND = 1, EIP_HEAD_SHAPE = 2, EIP_HEAD_MM = 3, EIP_HEAD_RECO = 4;
+const int EIP_HEAD_MERGE_IDX = 5, EIP_HEAD_SIZE_X = 6, EIP_HEAD_SIZE_Y = 7, EIP_HEAD_WIDTH = 8, EIP_HEAD_HEIGHT = 9;
+const int EIP_HEAD_TPL_X = 10, EIP_HEAD_TPL_Y = 11, EIP_HEAD_BLOCK = 12;
+const int EIP_HEAD = 13;
+const int EIP_DERIVED = 0, EIP_MERGE = 1;
 const int MERGE_NBR_MERGE = 1;   // an intra merge CU: always a candidate, its merge parameters (its DimdOut slot)
 const int MERGE_NBR_OBIC  = 2;   // an OBIC CU: always, its OBIC converted
 const int MERGE_NBR_DIMD  = 3;   // a DIMD CU or an MPM CU: where its DIMD blends, its DIMD
@@ -744,6 +762,7 @@ struct Params
   uint64_t ccpData;     // int32: per CCP record its writing blocks (CCP_WRITERS), the CTU rows' histories, the merge
                         // CUs' sources (Tu::ccpMerge; intra_ccp.glsl)
   uint64_t mpmOut;      // int32 per MPM record (MPM_OUT): its MDIP, written by its node (for the comparison)
+  uint64_t eipOut;      // int32 per EIP CU (EIP_OUT): its model, written by its node (a CU from the CPU's uploaded)
   int      origin[3];
   int      stride[3];
   int      width[3];

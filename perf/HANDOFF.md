@@ -449,7 +449,7 @@ wall-clock gains with threads are "the easy baseline". Decoder status: single-th
 (`--GpuLoopFilter=1`: ALF, SAO, BIF, CCSAO, LF-CCCM, offset refinement on Vulkan). The user then asked for **a full
 GPU decoder in Vulkan, optimized until nothing is left** ("The GPU decoder needs to fully decode the frame on the
 GPU"; "Your first Vulkan version is going to be slow. That's OK"). That work is branch `dec-gpurecon`: intra
-reconstruction on the GPU (`--GpuRecon`), tool levels M1-M57 done and verified bit-exact (M19: DIMD, M20: OBIC, M21:
+reconstruction on the GPU (`--GpuRecon`), tool levels M1-M58 done and verified bit-exact (M19: DIMD, M20: OBIC, M21:
 intra merge, M22: the transforms of DIMD CUs, M23: LFNST of MIP, M24: TIMD, M25: OBIC and intra merge with TIMD
 neighbours, M26: TIMD-SAD, M27: OBIC and intra merge with TIMD-SAD neighbours, M28: TIMD merge, M29: TMRL of luma,
 M30: chroma TMRL, M31: CCLM, M32: LFNST / NSPT of CCLM, M33: GLM's gradient patterns, M34: CCCM, M35: GL-CCCM, M36:
@@ -458,7 +458,7 @@ luma, M40: LM chroma fusion of CCCM, M41: CFLM, M42: GLM with luma with LFNST / 
 CCP tools, M44 / M45: the CCP models, M46: CCP merge, M47 / M48: CCP merge fusion with CCCM / DIMD chroma, M49: CCP
 merge adjustment, M50 / M51: decoder-derived CCP fusion, its merge fusion, M52: CCP merge fusion with CCCM by a blend
 model, M53 / M54: CCP merge and decoder-derived fusion with LFNST / NSPT, M55: PDP, M56: NN intra prediction, M57: the
-MPM lists of MPM sorting, MDIP and PDP); it is
+MPM lists of MPM sorting, MDIP and PDP, M58: EIP); it is
 **not yet faster than the CPU
 decoder** (see section 8) and supports only a restricted tool set (all real CTC streams fall back to the CPU, first
 reason: chroma reordering / DBV; BVG-CCCM CUs are rejected per block).
@@ -1570,6 +1570,27 @@ Results (grP19, grP20): every regular stream identical but the known CCP merge b
 records (~180 sorted, ~480 with MDIP). Not reached (partial verification takes intra slices only): the sorting of
 inter slices (from two entries, CUs up to 1024 samples) and with it PDP's template predictions of 16x32 .. 32x32
 (filters for every second sample, their averages from the long vector).
+M58: EIP (intra_eip.glsl; JVET-AG0058 with JVET-AH0086's bias and clipping, JVET-AI0066's regularization by
+JVET-AL0106's tables, JVET-AJ0082's two models, JVET-AL0205's filter shapes). An EIP CU's record (Cu::eip, EIP_HEAD_*:
+its EIP index, fitted or merge, its mode's shape / regions / models, its reference area - IntraPrediction::
+eipReferenceArea, initEipParams' geometry - and its luma block; a merge CU's sources, each as CU record and EIP index:
+the EIP CUs at getNeiEipCands' positions - eipMergeNeighbours - and its CTU row's EIP CUs before it, the history).
+Its node (CU_EIP) fits the model as getCurEipCands / solveEip do: the area's clipping range and, with two models, the
+threshold (the mean of the area's inner half); the 135 sums of each model over its regions' samples (setInputsVec,
+each region's taps clamped to its own end; two models split by the chooser), one invocation per sum; the L2
+regularization; CCCM's elimination with 15 parameters (rows by invocations). An EIP merge CU's node takes the
+neighbours' models, then the history's 6 most recent distinct ones (addEipToLut's LUT, rebuilt backwards), each
+unless the list has the same model, up to 12, ranked by the SATD of the template row / column each predicts. Its luma
+block (DERIVE_EIP) predicts the block's diagonals one after the other (each sample's 14 inputs lie on earlier
+diagonals), then the DIMD of its prediction (mipTransformMode: eipDimdMode, eipDimdMode2nd) - written as the CU's mode,
+the one chroma DM reads - and the transforms where they depend on it (DERIVE_PNN_DIMD). The MPM lists read an EIP CU
+as planar (getIntraDirLuma: a CU_KNOWN record of planar, mpmPlanarCu), as do chroma TMRL's five luma positions; OBIC
+counts nothing of it in an intra slice. Verified per EIP CU: its model (parameters, shape, two models, threshold) and
+DIMD modes against the CPU's; EIP CUs from the CPU upload theirs (for merge and the history). Found on the way: OBIC
+counts an NN neighbour's indicesRepresentationPnn, which the GPU's NN blocks do not publish (no stream had met it: an
+EIP neighbour sent those OBIC CUs to the CPU before) - such OBIC CUs stay on the CPU now. Not yet: EIP with a block
+vector (IntraTMP's search), EIP in inter slices (temporal candidates). Results (grE4): every regular stream identical
+but the known CCP merge blocks; per 720p intra picture ~196 EIP CUs on the GPU (~63 merge, ~88 with two models).
 
 ## 8. Numbers (i7-10700 8C/16T, Win11, GCC 16.2, RTX 3070 driver 616.92)
 
@@ -1613,8 +1634,8 @@ Profile of a GPU-on decode (non-LTO, m2_park16, share of all samples): parsing ~
    M50 decoder-derived CCP fusion (the m50 set), M51 decoder-derived CCP merge fusion (the m51 set), M52 CCP merge
    fusion with CCCM by a blend model (the m52 set). 2026-10-15: M53 CCP merge and decoder-derived fusion with LFNST /
    NSPT (the m53 set; intra_rec's second module), M54 its merge fusion with DIMD chroma, M55 PDP, M56 NN intra
-   prediction, M57 the MPM lists of MPM sorting, MDIP and PDP, TIMD / TMRL on the regular streams (partial verification
-   of the regular streams).
+   prediction, M57 the MPM lists of MPM sorting, MDIP and PDP, TIMD / TMRL on the regular streams, M58 EIP (partial
+   verification of the regular streams).
    All 19 regular streams now stop at "chroma reordering / DBV" (the next sequence-level check; the block-level tools
    of step 4 follow; BVG-CCCM needs IntraTMP / IBC first).
 3. Make the GPU path win on CPU time per picture: the derive-only pass (record during parsing or a leaner pass;

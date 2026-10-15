@@ -921,6 +921,13 @@ ivec2 angularArrays( bool isVer, int W, int H, int angle, int absInvAngle, int t
 #include "intra_pdp.glsl"
 #include "intra_nn.glsl"
 #include "intra_mpm.glsl"
+#include "intra_eip.glsl"
+
+// the EipOut of EIP CU n (intra_eip.glsl)
+int eipOutBase( int n )
+{
+  return BufI32( P.timdData ).v[BufCu( P.cus ).v[n].eip + EIP_HEAD_INDEX] * EIP_OUT;
+}
 
 // the residual of block c in intra_rec (a derived mode's transforms, DERIVE_TRANSFORM, or sign prediction's
 // recomputation), as intra_resi computes it for the others: the dequantized coefficients, those at the positions in
@@ -1424,7 +1431,7 @@ void main()
       break;
     }
     Tu t = BufTu( P.tus ).v[g_ti];
-    g_deferRecon = WITH_DERIVED_TRANSFORMS && ( t.derive & DERIVE_PNN_DIMD ) != 0;
+    g_deferRecon = WITH_DERIVED_TRANSFORMS && ( t.derive & ( DERIVE_PNN_DIMD | DERIVE_EIP ) ) != 0;
     g_secMode    = -1;
     // the dependents, prefetched (their release ends the block)
     const int d0 = BufI32( P.depOffset ).v[g_ti], d1 = BufI32( P.depOffset ).v[g_ti + 1];
@@ -1517,6 +1524,18 @@ void main()
         }
         cuMode = mpmNode( c, modes, dimdModes, t.bitDepth, ( t.derive & DERIVE_NO_PDPC ) != 0, lid, NT );
       }
+      else if( WITH_MPM && c.kind == CU_EIP )   // intra_eip.glsl: its model, fitted or a merge candidate's (its block
+      {                                         // writes the mode chroma DM reads)
+        if( BufI32( P.timdData ).v[c.eip + EIP_HEAD_KIND] == EIP_MERGE )
+        {
+          eipMergeNode( c, c.eip, t.bitDepth, lid, NT );
+        }
+        else
+        {
+          eipNode( c, c.eip, t.bitDepth, lid, NT );
+        }
+        cuMode = PLANAR_IDX;
+      }
       else if( lid == 0 && c.kind != CU_KNOWN )
       {
         int modes[MPM_NEIGHBOURS];
@@ -1537,7 +1556,7 @@ void main()
       {
         SYNC();
         dimdHistogramsOf( c.mtss, MTSS_CALLS, c.w, c.h, lid, NT );
-        if( lid == 0 && c.kind == CU_KNOWN )
+        if( lid == 0 && ( c.kind == CU_KNOWN || c.kind == CU_EIP ) )   // (a MIP or EIP CU's block chooses itself)
         {
           const ivec3 list = mtssList();
           for( int k = 0; k < 3; k++ )
@@ -1941,6 +1960,10 @@ void main()
       {
         pdpPredict( t, pdpFilt, maxPel, lid, NT );
         pdpEmit( t, lid, NT );
+      }
+      else if( WITH_MPM && ( t.derive & DERIVE_EIP ) != 0 )   // EIP (intra_eip.glsl): its prediction in s_spPred
+      {
+        eipPredict( t, eipOutBase( t.cu ), lid, NT );
       }
       else if( t.pnn >= 0 )   // NN intra prediction (intra_nn.glsl), then the bilateral filter as for DC
       {
@@ -2411,10 +2434,11 @@ void main()
         }
       }
     }
-    // ----- an NN block whose transforms depend on its prediction (DERIVE_PNN_DIMD): their mode from a DIMD of the
-    // prediction kept in s_spPred, filtered (xPredIntraPnn's deriveIpmForTransform, as mipTransformMode derives a MIP
-    // block's), the transforms (LFNST / NSPT by the lfnstSecFlag rule where it applies), then the residual and the
-    // reconstruction (sign prediction's below where the block has it)
+    // ----- an NN block whose transforms depend on its prediction (DERIVE_PNN_DIMD), an EIP block (DERIVE_EIP): the
+    // mode of a DIMD of the prediction kept in s_spPred, filtered (xPredIntraPnn's / DecCu's deriveIpmForTransform, as
+    // mipTransformMode derives a MIP block's) - an EIP CU's mode, which chroma DM reads -, the transforms where they
+    // depend on it (LFNST / NSPT by the lfnstSecFlag rule where it applies), then the residual and the reconstruction
+    // (sign prediction's below where the block has it)
     if( WITH_DERIVED_TRANSFORMS && g_deferRecon )
     {
       for( int i = lid; i < NUM_LUMA_MODE; i += NT )
@@ -2428,15 +2452,22 @@ void main()
         const int second = CBufI32( P.dimdOut ).v[t.cu * DIMD_OUT + DIMD_OUT_TR_SECOND];
         g_secMode = s_predDimdMode == PLANAR_IDX ? second : PLANAR_IDX;
       }
-      selectTransform( t, s_predDimdMode, 0 );
-      if( pc.verify != 0 && lid == 0 )
+      if( WITH_MPM && ( t.derive & DERIVE_EIP ) != 0 && lid == 0 )   // (eipDimdMode: the mode chroma DM reads)
       {
-        storeDbgTransforms( t );
+        CBufI32( P.cuMode ).v[t.cu] = s_predDimdMode;
       }
-      if( t.spCoded < 0 && t.resiFrom < 0 )
+      if( ( t.derive & DERIVE_TRANSFORM ) != 0 )   // (an EIP block's may not depend on the mode)
       {
-        inChainResidual( t, lid, NT );
-        t.resiFrom = g_ti;   // storeRecon reads it device-coherent
+        selectTransform( t, s_predDimdMode, 0 );
+        if( pc.verify != 0 && lid == 0 )
+        {
+          storeDbgTransforms( t );
+        }
+        if( t.spCoded < 0 && t.resiFrom < 0 )
+        {
+          inChainResidual( t, lid, NT );
+          t.resiFrom = g_ti;   // storeRecon reads it device-coherent
+        }
       }
       g_deferRecon = false;
       for( int i = lid; i < N && t.spCoded < 0; i += NT )

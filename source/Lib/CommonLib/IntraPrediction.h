@@ -699,6 +699,16 @@ public:
   static void pdpTemplatePads( const CodingUnit& cu, int& topPadW, int& topPadH, int& leftPadW, int& leftPadH );
 #endif
 #endif
+#if JVET_AG0058_EIP && JVET_AJ0082_MM_EIP
+  /// EIP's reference area of a luma CU (initEipParams), for the GPU reconstruction: the template's columns left of /
+  /// rows above the block (tplX, tplY), the area's (sizeX, sizeY: the template and the filter's reach) and the area's
+  /// size with the available above-right / below-left units
+  static void eipReferenceArea( const CodingUnit& cu, int& tplX, int& tplY, int& sizeX, int& sizeY, int& width,
+                                int& height );
+  /// the CUs whose models getNeiEipCands takes in an intra slice, in its order (the adjacent positions, then the two
+  /// rounds of non-adjacent ones; EIP CUs only, a CU again where several positions find it)
+  static void eipMergeNeighbours( const PredictionUnit& pu, std::vector<const CodingUnit*>& cus );
+#endif
 #if JVET_AH0076_OBIC && JVET_AK0056_WEIGHTED_OBIC
   /// the neighbours deriveObicMode counts the modes of, with the samples each counts; returns their number (-1: an
   /// inter neighbour), for the GPU reconstruction

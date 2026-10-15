@@ -45492,6 +45492,109 @@ void IntraPrediction::reorderEipCands(const PredictionUnit& pu, static_vector<Ei
   }
 }
 
+#if JVET_AJ0082_MM_EIP
+// initEipParams' reference area of a luma CU (keep in step with it)
+void IntraPrediction::eipReferenceArea( const CodingUnit& cu, int& tplX, int& tplY, int& sizeX, int& sizeY, int& width,
+                                        int& height )
+{
+  const PreCalcValues& pcv  = *cu.cs->pcv;
+  const CompArea&      area = cu.Y();
+  const int  unitWidth  = pcv.minCUWidth;
+  const int  unitHeight = pcv.minCUHeight;
+  const int  totalAboveUnits    = ( 2 * area.width + ( unitWidth - 1 ) ) / unitWidth;
+  const int  totalLeftUnits     = ( 2 * area.height + ( unitHeight - 1 ) ) / unitHeight;
+  const int  numAboveRightUnits = totalAboveUnits - std::max<int>( area.width / unitWidth, 1 );
+  const int  numLeftBelowUnits  = totalLeftUnits - std::max<int>( area.height / unitHeight, 1 );
+  // (the flags are not read: the above-right ones go forwards, the below-left ones backwards)
+  bool neighborFlags[4 * MAX_NUM_PART_IDXS_IN_CTU_WIDTH + 1] = { false };
+  const int aboveRight = isAboveRightAvailable( cu, CHANNEL_TYPE_LUMA, area.topRight(), numAboveRightUnits, unitWidth,
+                                                neighborFlags );
+  const int belowLeft  = isBelowLeftAvailable( cu, CHANNEL_TYPE_LUMA, area.bottomLeft(), numLeftBelowUnits, unitHeight,
+                                               neighborFlags + 4 * MAX_NUM_PART_IDXS_IN_CTU_WIDTH );
+  const Position tplSize = getRecoLinesEIP( cu, COMPONENT_Y );
+  tplX   = tplSize.x;
+  tplY   = tplSize.y;
+  sizeX  = tplSize.x + EIP_FILTER_SIZE;
+  sizeY  = tplSize.y + EIP_FILTER_SIZE;
+  width  = area.width + sizeX + aboveRight * unitWidth;
+  height = area.height + sizeY + belowLeft * unitHeight;
+}
+
+// getNeiEipCands' positions in an intra slice (keep in step with it): the EIP CUs found there
+void IntraPrediction::eipMergeNeighbours( const PredictionUnit& pu, std::vector<const CodingUnit*>& cus )
+{
+  cus.clear();
+  if( !getAllowedEipMerge( *pu.cu, COMPONENT_Y ) )
+  {
+    return;
+  }
+  const CompArea&        area = pu.blocks[COMPONENT_Y];
+  const CodingStructure& cs   = *pu.cs;
+  const Position         topLeft = area.topLeft();
+  auto add = [&]( const Position& pos )
+  {
+    const PredictionUnit* neighborPu = cs.getPURestricted( pos, pu, CHANNEL_TYPE_LUMA );
+    if( neighborPu && neighborPu->cu->eipFlag )
+    {
+      cus.push_back( neighborPu->cu );
+    }
+  };
+  add( topLeft.offset( -1, area.height - 1 ) );
+  add( topLeft.offset( area.width - 1, -1 ) );
+  add( topLeft.offset( -1, -1 ) );
+  add( topLeft.offset( area.width, -1 ) );
+  add( topLeft.offset( -1, area.height ) );
+  int offsetX = 0, offsetY = 0;
+  int offsetX0 = 0, offsetX1 = 0, offsetX2 = area.width >> 1;
+  int offsetY0 = 0, offsetY1 = 0, offsetY2 = area.height >> 1;
+  const int horNAInterval = std::max( (int) ( area.width * 2 ) >> 1, 4 );
+  const int verNAInterval = std::max( (int) ( area.height * 2 ) >> 1, 4 );
+  for( int iDistanceIndex = 0; iDistanceIndex < 7; iDistanceIndex++ )   // non-adjacent, round 1
+  {
+    const int iNADistanceHor = horNAInterval * ( iDistanceIndex + 1 );
+    const int iNADistanceVer = verNAInterval * ( iDistanceIndex + 1 );
+    for( int naspIdx = 0; naspIdx < ( iDistanceIndex == 0 ? 5 : 9 ); naspIdx++ )
+    {
+      switch( naspIdx )
+      {
+      case 0: offsetX = offsetX0 = -iNADistanceHor - 1; offsetY = offsetY0 = verNAInterval + iNADistanceVer - 1; break;
+      case 1: offsetX = offsetX1 = horNAInterval + iNADistanceHor - 1; offsetY = offsetY1 = -iNADistanceVer - 1; break;
+      case 2: offsetX = offsetX2;      offsetY = offsetY1;      break;
+      case 3: offsetX = offsetX0;      offsetY = offsetY2;      break;
+      case 4: offsetX = offsetX0;      offsetY = offsetY1;      break;
+      case 5: offsetX = -1;            offsetY = offsetY0;      break;
+      case 6: offsetX = offsetX1;      offsetY = -1;            break;
+      case 7: offsetX = offsetX0 >> 1; offsetY = offsetY0;      break;
+      default: offsetX = offsetX1;     offsetY = offsetY1 >> 1; break;
+      }
+      add( topLeft.offset( offsetX, offsetY ) );
+    }
+  }
+  for( int iDistanceIndex = 0; iDistanceIndex < 7; iDistanceIndex++ )   // non-adjacent, round 2
+  {
+    const int horNADistance = horNAInterval * ( iDistanceIndex + 1 );
+    const int verNADistance = verNAInterval * ( iDistanceIndex + 1 );
+    for( int naspIdx = 0; naspIdx < 4; naspIdx++ )
+    {
+      switch( naspIdx )
+      {
+      case 0:
+        offsetX = offsetX0 = -horNADistance - 1;
+        offsetY = offsetY2 + ( ( verNAInterval + verNADistance - 1 - offsetY2 ) >> 1 );
+        break;
+      case 1:
+        offsetX = offsetX2 + ( ( horNAInterval + horNADistance - 1 - offsetX2 ) >> 1 );
+        offsetY = offsetY0 = -verNADistance - 1;
+        break;
+      case 2: offsetX = offsetX0; offsetY = offsetY0 + ( ( offsetY2 - offsetY0 ) >> 1 ); break;
+      default: offsetX = offsetX0 + ( ( offsetX2 - offsetX0 ) >> 1 ); offsetY = offsetY0; break;
+      }
+      add( topLeft.offset( offsetX, offsetY ) );
+    }
+  }
+}
+#endif
+
 #if JVET_AL0106_BV_EIP
 void IntraPrediction::setEipBvInfo(PredictionUnit& pu)
 {
