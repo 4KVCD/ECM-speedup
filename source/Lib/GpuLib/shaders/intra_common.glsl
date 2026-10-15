@@ -102,7 +102,8 @@ const int MMLM_T_IDX      = LM_CHROMA_IDX + 5;
 // prediction (1 .. 3 of 4) in the first slope adjustment's field; CFLM's types 2 (one model) and 3 (two) Tu::cflm.
 // A block of CCP merge fusion with CCCM (JVET-AG0059) has type 1's fields with the weight 2, which it keeps while it
 // predicts as the LM block of its model's type (LM_FUSION_FIELDS; the inherited model is applied, so no slope
-// adjustment is read)
+// adjustment is read). A CCP merge block with LFNST / NSPT has the LM_HIST_* bits too (intra_ccp.glsl's
+// ccpMergeTransformMode)
 const int LM_DELTA0_SHIFT = 0;
 const int LM_DELTA1_SHIFT = 4;
 const int LM_INSIDE       = 256;
@@ -207,7 +208,7 @@ const int DERIVE_INHERIT_VER = 65536;
 // (TmrlOut); the availability of that line, unknown to intra_deps, is found by the block itself (refLineAvailability)
 const int DERIVE_TMRL = 131072;
 // a CCLM block with LFNST / NSPT (JVET-AK0064): intra_rec derives their mode from a DIMD of the CU's chroma predictions
-// (Tu::lm's LM_HIST_*; cclmTransformMode), then its residual
+// (Tu::lm's LM_HIST_*; cclmTransformMode, a CCP merge block's ccpMergeTransformMode), then its residual
 const int DERIVE_CCLM_DIMD = 262144;
 // a block of a CCP merge CU of fusion with DIMD chroma (JVET-AG0059's ccpMergeFusionType 1, its CU's node a
 // CU_CHROMA_DIMD one): intra_rec blends its merge prediction and the prediction of the DIMD chroma mode, each weighed

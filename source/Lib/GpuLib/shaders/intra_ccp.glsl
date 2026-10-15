@@ -30,6 +30,8 @@
 // predicts: list[0] as a merge block's chosen candidate, list[1] before it into the fusion slot that storeRegion blends
 // in (cccmFusionBlend with the weight 3). Each block derives the choice itself, from both components' costs. Its
 // branches are in the pipelines with WITH_CCP_DERIVED alone (the merge pictures' pipeline without them is faster).
+// With LFNST / NSPT (JVET-AK0064) their mode is a DIMD of the CU's final chroma predictions (ccpMergeTransformMode, in
+// intra_rec's second module alone, CCP_LFNST_MODULE: the block predicts each component as its block does).
 // glslang's inlining multiplies intra_rec.comp's SPIR-V (its ID bound limits the module): the large functions have
 // few call sites here (the costs and the predictions one loop; the adjustment's costs and the fits one more each).
 // Included by intra_rec.comp after intra_cccm.glsl
@@ -45,7 +47,8 @@ const int CCP_DEFAULT_SHIFT = 3;    // the defaults' shift
 // these (towards 0 first), else these themselves
 const int CCP_DEFAULT_A[CCP_MAX_CANDS] = int[]( 0, 1, -1, 2, -2, 3, -3, 4, -4, 5, -5, 6 );
 
-// the candidate list in shared memory (s_dimdHist: a merge block derives no DIMD), which invocation 0 builds: per
+// the candidate list in shared memory (s_dimdHist: a merge block derives no DIMD of its own; with LFNST / NSPT the
+// histogram of its predictions after the list's words, CCP_DIMD_HIST), which invocation 0 builds: per
 // candidate its record, its inside filter flag (the PU's curCand's for a spatial one, the history's copy's for a
 // history one, 0 for a default or an on-the-fly model; a decoder-derived fusion mode's own) and its template cost;
 // their number; the history's models (most recent first) and their number; the first CCLM candidate's slopes (Cb's,
@@ -57,6 +60,7 @@ const int CCP_DEFAULT_A[CCP_MAX_CANDS] = int[]( 0, 1, -1, 2, -2, 3, -3, 4, -4, 5
 const int CCP_LIST = 0, CCP_LIST_INSIDE = 15, CCP_LIST_COST = 30, CCP_LIST_NUM = 45, CCP_LUT = 46, CCP_LUT_NUM = 52;
 const int CCP_SCALE = 53, CCP_SHIFT = 57, CCP_FOUND = 59, CCP_FLY_VALID = 60, CCP_PAIR_COST = 66;
 const int CCP_DERIVED_FIRST = 81, CCP_DERIVED_SECOND = 82, CCP_LIST_ORIG = 83, CCP_BLEND = 98;
+const int CCP_DIMD_HIST = 2 * NUM_LUMA_MODE;   // (s_dimdHist's last NUM_LUMA_MODE words)
 
 // decoder-derived CCP merge fusion (reorderCCPCandidates with ddNonLocalCCPFusion): pairs of the first 9 candidates,
 // per pair in the scratch its words (CCP_PAIR_*: its cost, whether its model blends, the model's three parameters,
@@ -178,10 +182,20 @@ void ccpMergeHistory( Tu t )
   }
 }
 
-// the first default record of merge block t: the Cb block's 12, then the Cr block's (each block ranks the list)
+// whether the block predicts the other chroma component (ccpMergeTransformMode): then it takes spare records of its own
+// (the other block may be using that component's) and writes no CU record; never in intra_rec's first module
+#ifdef CCP_LFNST_MODULE
+bool g_ccpOther = false;
+#else
+const bool g_ccpOther = false;
+#endif
+
+// the first default record of merge block t: the Cb block's 12, then the Cr block's (each block ranks the list); with
+// LFNST / NSPT 24 more, those of each block's prediction of the other component
 int ccpDefaultRecords( Tu t )
 {
-  return BufI32( P.ccpData ).v[t.ccpMerge + CCP_MERGE_DEFAULTS] + ( t.comp - 1 ) * CCP_MAX_CANDS;
+  return BufI32( P.ccpData ).v[t.ccpMerge + CCP_MERGE_DEFAULTS]
+         + ( t.comp - 1 + ( g_ccpOther ? 2 : 0 ) ) * CCP_MAX_CANDS;
 }
 
 // the default candidates' records of merge block t (all invocations, ending with a barrier): CCLM models of a slope k
@@ -1160,7 +1174,7 @@ void ccpMergePrediction( inout Tu t, int predStride, int lid, int NT )
       g_cccmLocDX = mdf ? 0 : g_cccmLocDX;
       g_cccmLocDY = mdf ? 0 : g_cccmLocDY;
     }
-    if( last )
+    if( last && !g_ccpOther )
     {
       // the CU's record: the candidate's (with its inside filter flag both as the CU's and as the history's; a derived
       // block's 0), written by the Cb block; an adjusted model's coefficients of each component by its own block
@@ -1293,5 +1307,95 @@ void ccpMergePrediction( inout Tu t, int predStride, int lid, int NT )
   }
   cccmSync();
 }
+
+// ----- LFNST / NSPT of a CCP merge block or a decoder-derived CCP fusion block (JVET-AK0064; intra_rec's second
+// module)
+
+#ifdef CCP_LFNST_MODULE
+
+// the CU's final prediction of component tc.comp at (x, y), after ccpMergePrediction( tc ): the chosen model's through
+// its inside filter (cclmPrediction), blended with the fusion slot's prediction as storeRegion blends it
+// (cccmFusionBlend: merge fusion with CCCM, decoder-derived fusion and its merge fusion)
+int ccpMergeFinalSample( Tu tc, int x, int y, int maxPel )
+{
+  const int pr = cclmPrediction( tc, tc.x << 1, tc.y << 1, x, y, maxPel, 0 );
+  return lmFusionType( tc ) == 1 ? cccmFusionBlend( tc, x, y, pr ) : pr;
+}
+
+// the LFNST / NSPT mode of CCP merge block t, also of a decoder-derived CCP fusion block (DERIVE_CCLM_DIMD): DecCu's
+// deriveChromaIpmForTransform of the CU's final chroma predictions (Tu::lm's LM_HIST_*: Cb's, Cr's or both into one
+// histogram) into s_predDimdMode. The block predicts each component the histogram reads as that component's block does,
+// the other one first (g_ccpOther), then its own, which also leaves the references and merge fusion's CCCM prediction
+// the block's again; the prediction section predicts the block again. A gradient's samples are computed again each
+// time. All invocations, ending with a barrier
+void ccpMergeTransformMode( Tu t, int predStride, int maxPel, int lid, int NT )
+{
+  const bool derived    = BufI32( P.ccpData ).v[t.ccpMerge + CCP_MERGE_KIND] == CCP_KIND_DERIVED;
+  const bool fusionCccm = lmFusionType( t ) == 1;   // (merge fusion with CCCM: its CCCM prediction comes first)
+  for( int i = lid; i < NUM_LUMA_MODE; i += NT )
+  {
+    s_dimdHist[CCP_DIMD_HIST + i] = 0;
+  }
+  const int iw = t.w - 2, inner = iw * ( t.h - 2 );
+  for( int pass = 0; pass < 2; pass++ )
+  {
+    Tu tc = t;
+    tc.comp = pass == 0 ? 3 - t.comp : t.comp;
+    const bool hist = ( t.lm & ( tc.comp == 1 ? LM_HIST_CB : LM_HIST_CR ) ) != 0;
+    if( pass == 0 && !hist )
+    {
+      continue;
+    }
+    g_ccpOther = pass == 0;
+    if( derived )   // (its CCLM model's references; the merge code takes the other component's into s_ref[1])
+    {
+      SYNC();
+      fillReferencePar( tc, 0, 0, predStride, lid, NT );
+      SYNC();
+    }
+    if( fusionCccm )
+    {
+      cccmPrediction( tc, false, lid, NT );
+    }
+    if( hist )
+    {
+      ccpMergePrediction( tc, predStride, lid, NT );
+      for( int k = lid; k < inner; k += NT )
+      {
+        const int   x = 1 + k % iw, y = 1 + k / iw;
+        const ivec2 g = sobel3x3( ccpMergeFinalSample( tc, x - 1, y - 1, maxPel ),
+                                  ccpMergeFinalSample( tc, x, y - 1, maxPel ),
+                                  ccpMergeFinalSample( tc, x + 1, y - 1, maxPel ),
+                                  ccpMergeFinalSample( tc, x - 1, y, maxPel ),
+                                  ccpMergeFinalSample( tc, x + 1, y, maxPel ),
+                                  ccpMergeFinalSample( tc, x - 1, y + 1, maxPel ),
+                                  ccpMergeFinalSample( tc, x, y + 1, maxPel ),
+                                  ccpMergeFinalSample( tc, x + 1, y + 1, maxPel ) );
+        if( g.x != 0 || g.y != 0 )
+        {
+          atomicAdd( s_dimdHist[CCP_DIMD_HIST + dimdAngle( g )], abs( g.x ) + abs( g.y ) );
+        }
+      }
+      SYNC();   // (the next pass's predictions overwrite these)
+    }
+  }
+  g_ccpOther = false;
+  if( lid == 0 )   // the first of equal amplitudes
+  {
+    int firstAmp = 0, first = 0;
+    for( int i = 0; i < NUM_LUMA_MODE; i++ )
+    {
+      if( s_dimdHist[CCP_DIMD_HIST + i] > firstAmp )
+      {
+        firstAmp = s_dimdHist[CCP_DIMD_HIST + i];
+        first    = i;
+      }
+    }
+    s_predDimdMode = first;
+  }
+  SYNC();
+}
+
+#endif
 
 #endif

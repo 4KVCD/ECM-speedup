@@ -22,26 +22,38 @@ set( GLSLANG_OPT -O )
 set( SPV_DIR "${CMAKE_CURRENT_BINARY_DIR}/spv" )
 file( MAKE_DIRECTORY "${SPV_DIR}" )
 set( SPV_HEADERS )
-foreach( SHADER ${SHADER_FILES} )
-  get_filename_component( NAME ${SHADER} NAME_WE )
+# spv_header( <name> <shader> [macros...] ): the header spv/<name>.spv.h of <shader> compiled with the macros defined
+# (const uint32_t spv_<name>[]), appended to SPV_HEADERS
+function( spv_header NAME SHADER )
   set( OUT "${SPV_DIR}/${NAME}.spv.h" )
+  set( DEFINES )
+  foreach( MACRO ${ARGN} )
+    list( APPEND DEFINES "-D${MACRO}" )
+  endforeach()
   if( CMAKE_VERSION VERSION_GREATER_EQUAL 3.21 )
     add_custom_command( OUTPUT "${OUT}"
-                        COMMAND "${ECM_GLSLANG}" -V --target-env vulkan1.3 ${GLSLANG_OPT}
+                        COMMAND "${ECM_GLSLANG}" -V --target-env vulkan1.3 ${GLSLANG_OPT} ${DEFINES}
                                 -I${CMAKE_CURRENT_SOURCE_DIR}/shaders --vn spv_${NAME} --depfile "${OUT}.d" -o "${OUT}"
                                 "${SHADER}"
                         DEPENDS "${SHADER}"
                         DEPFILE "${OUT}.d"
-                        COMMENT "glslang ${NAME}.comp" VERBATIM )
+                        COMMENT "glslang ${NAME}" VERBATIM )
   else()
     add_custom_command( OUTPUT "${OUT}"
-                        COMMAND "${ECM_GLSLANG}" -V --target-env vulkan1.3 ${GLSLANG_OPT}
+                        COMMAND "${ECM_GLSLANG}" -V --target-env vulkan1.3 ${GLSLANG_OPT} ${DEFINES}
                                 -I${CMAKE_CURRENT_SOURCE_DIR}/shaders --vn spv_${NAME} -o "${OUT}" "${SHADER}"
                         DEPENDS "${SHADER}" ${SHADER_INCLUDES}
-                        COMMENT "glslang ${NAME}.comp" VERBATIM )
+                        COMMENT "glslang ${NAME}" VERBATIM )
   endif()
-  list( APPEND SPV_HEADERS "${OUT}" )
+  set( SPV_HEADERS ${SPV_HEADERS} "${OUT}" PARENT_SCOPE )
+endfunction()
+foreach( SHADER ${SHADER_FILES} )
+  get_filename_component( NAME ${SHADER} NAME_WE )
+  spv_header( ${NAME} "${SHADER}" )
 endforeach()
+# intra_rec's second module: the pipelines of the pictures with CCP merge or decoder-derived CCP fusion blocks with
+# LFNST / NSPT, whose second merge prediction adds ~1M IDs that the other pipelines' module does without
+spv_header( intra_rec_lfnst "${CMAKE_CURRENT_SOURCE_DIR}/shaders/intra_rec.comp" CCP_LFNST_MODULE )
 
 add_library( ${LIB_NAME} STATIC ${SRC_FILES} ${INC_FILES} ${SPV_HEADERS} ${SHADER_FILES} ${SHADER_INCLUDES} )
 target_include_directories( ${LIB_NAME} PUBLIC . "${ECM_VULKAN_HEADERS}" PRIVATE "${SPV_DIR}" )

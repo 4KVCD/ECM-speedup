@@ -45,6 +45,9 @@ layout( constant_id = 8 ) const bool WITH_CCCM = false;                // CCCM b
 layout( constant_id = 9 ) const bool WITH_CFLM = false;                // CFLM blocks (with CCCM: ~2 % for CCCM's)
 layout( constant_id = 10 ) const bool WITH_CCP_MERGE = false;          // CCP merge blocks (with CFLM)
 layout( constant_id = 11 ) const bool WITH_CCP_DERIVED = false;        // decoder-derived CCP fusion (with CCP merge)
+// CCP merge / decoder-derived CCP fusion blocks with LFNST / NSPT (with decoder-derived CCP fusion) are the pipelines
+// of intra_rec's second module (GpuLib's CMakeLists.txt compiles it with CCP_LFNST_MODULE defined), whose second merge
+// prediction adds ~1M SPIR-V IDs (of the 4.19M a module may have) that the first module's pipelines do without
 // the template costs of arms one sample thick (TIMD merge's and TMRL's templates: their SATD kernels)
 const bool WITH_THIN_TEMPLATES = WITH_TIMD_MERGE || WITH_TMRL;
 
@@ -1791,11 +1794,21 @@ void main()
       }
     }
 
-    // ----- a CCLM block with LFNST / NSPT: their mode from a DIMD of the CU's chroma predictions (intra_cclm.glsl)
+    // ----- a CCLM block with LFNST / NSPT: their mode from a DIMD of the CU's chroma predictions (intra_cclm.glsl; a
+    // CCP merge block's and a decoder-derived CCP fusion block's: intra_ccp.glsl)
     const bool cclmDimd = WITH_CCLM && WITH_DIMD && WITH_DERIVED_TRANSFORMS && ( t.derive & DERIVE_CCLM_DIMD ) != 0;
     if( cclmDimd )
     {
-      cclmTransformMode( t, predStride, maxPel, lid, NT );
+#ifdef CCP_LFNST_MODULE   // (a call the optimizer removes still takes the IDs of the inlined function)
+      if( t.ccpMerge >= 0 )
+      {
+        ccpMergeTransformMode( t, predStride, maxPel, lid, NT );
+      }
+      else
+#endif
+      {
+        cclmTransformMode( t, predStride, maxPel, lid, NT );
+      }
     }
 
     // ----- the transforms, where they depend on a derived mode or a MIP / CCLM block's prediction: the matrices of the

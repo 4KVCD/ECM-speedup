@@ -435,7 +435,9 @@ the reconstruction buffer; works in every frame-thread context):
   fitted to their template predictions (a linear model of the position) or averages, whichever fits the template
   better. M52 is CCP merge fusion with CCCM by a blend model: with the SPS's CCP fusion mode (which ECM's encoder sets
   outside all-intra streams) the merge prediction and the two-model CCCM one are blended by such fitted weights
-  instead of averaged.
+  instead of averaged. M53 is CCP merge and decoder-derived CCP fusion with LFNST / NSPT, whose mode is a DIMD of the
+  CU's final chroma predictions: each block predicts the other component too, in pipelines of a second SPIR-V module
+  that only pictures with such blocks take.
   GpuIntraRec::supported()
   rejects every tool whose mode derivation or prediction reads reconstructed samples or that the kernels lack, before
   anything is skipped. All 19 regular streams now fall back to the CPU at chroma reordering / DBV, the next
