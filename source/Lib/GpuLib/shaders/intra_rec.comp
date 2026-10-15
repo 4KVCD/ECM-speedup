@@ -942,6 +942,7 @@ ivec2 angularArrays( bool isVer, int W, int H, int angle, int absInvAngle, int t
 #include "intra_nn.glsl"
 #include "intra_mpm.glsl"
 #include "intra_eip.glsl"
+#include "intra_tmp.glsl"
 
 // the EipOut of EIP CU n (intra_eip.glsl)
 int eipOutBase( int n )
@@ -1479,7 +1480,7 @@ void main()
       break;
     }
     Tu t = BufTu( P.tus ).v[g_ti];
-    g_deferRecon = WITH_DERIVED_TRANSFORMS && ( t.derive & ( DERIVE_PNN_DIMD | DERIVE_EIP ) ) != 0;
+    g_deferRecon = WITH_DERIVED_TRANSFORMS && ( t.derive & ( DERIVE_PNN_DIMD | DERIVE_EIP | DERIVE_TMP ) ) != 0;
     g_secMode    = -1;
     g_bvSubs     = 0;
     g_bvTransform = false;
@@ -1586,6 +1587,11 @@ void main()
         }
         cuMode = PLANAR_IDX;
       }
+      else if( WITH_MPM && c.kind == CU_TMP )   // intra_tmp.glsl: its list of vectors (the MPM lists read planar)
+      {
+        tmpNode( c, t.cu, t.bitDepth, lid, NT );
+        cuMode = PLANAR_IDX;
+      }
       else if( lid == 0 && c.kind != CU_KNOWN )
       {
         int modes[MPM_NEIGHBOURS];
@@ -1613,14 +1619,15 @@ void main()
           CBufI32( P.dimdOut ).v[t.cu * DIMD_OUT + DIMD_OUT_BV]      = 0;
         }
       }
-      // MTSS (a DIMD, OBIC, intra merge, TIMD or MIP CU with mdirIdx): its mode list from histograms of its own
-      // (deriveDimdModeList), once dimdSelect and obicSelect have read theirs, then the LFNST / NSPT mode and bucket of its
-      // luma block (a MIP block chooses them itself, from its prediction: mipTransformMode)
+      // MTSS (a DIMD, OBIC, intra merge, TIMD, MIP, EIP or IntraTMP CU with mdirIdx): its mode list from histograms of
+      // its own (deriveDimdModeList), once dimdSelect and obicSelect have read theirs, then the LFNST / NSPT mode and
+      // bucket of its luma block (a MIP, EIP or IntraTMP block chooses them itself, from its prediction:
+      // mipTransformMode)
       if( WITH_DIMD && WITH_DERIVED_TRANSFORMS && c.mtss >= 0 )
       {
         SYNC();
         dimdHistogramsOf( c.mtss, MTSS_CALLS, c.w, c.h, lid, NT );
-        if( lid == 0 && ( c.kind == CU_KNOWN || c.kind == CU_EIP ) )   // (a MIP or EIP CU's block chooses itself)
+        if( lid == 0 && ( c.kind == CU_KNOWN || c.kind == CU_EIP || c.kind == CU_TMP ) )   // (its block chooses itself)
         {
           const ivec3 list = mtssList();
           for( int k = 0; k < 3; k++ )
@@ -2053,6 +2060,10 @@ void main()
       else if( WITH_MPM && ( t.derive & DERIVE_EIP ) != 0 )   // EIP (intra_eip.glsl): its prediction in s_spPred
       {
         eipPredict( t, eipOutBase( t.cu ), lid, NT );
+      }
+      else if( WITH_MPM && ( t.derive & DERIVE_TMP ) != 0 )   // IntraTMP (intra_tmp.glsl): its copy in s_spPred
+      {
+        tmpPredict( t, lid, NT );
       }
       else if( t.pnn >= 0 )   // NN intra prediction (intra_nn.glsl), then the bilateral filter as for DC
       {

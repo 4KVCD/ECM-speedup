@@ -165,6 +165,8 @@ constexpr int DERIVE_EIP          = 8388608; // an EIP CU's luma block: predicte
                                              // its transforms' mode a DIMD of the prediction
 constexpr int DERIVE_PREFIX       = 16777216; // a node that starts once all before it have finished (it reads at block
                                               // vectors, which may point anywhere decoded before)
+constexpr int DERIVE_TMP          = 33554432; // an IntraTMP CU's luma block: the copy at its node's vector
+                                              // (intra_tmp.glsl), its transforms' mode a DIMD of the prediction
 
 // Tu::lm (intra_common.glsl's LM_*): whether the block is a CCLM block (the modes from 67 on are also those of TIMD /
 // TMRL luma blocks), its slope adjustments (+ 8, in 4 bits each) and LBCCP's inside filter; with DERIVE_CCLM_DIMD the
@@ -302,8 +304,9 @@ struct Cu
   int32_t eip;       // an EIP CU's record in Params::timdData (EIP_HEAD_*; -1: not EIP)
   int32_t bvList;    // where its node takes block vectors from the CUs around, which may have some: its list's record
                      // in Params::timdData (BV_LIST_*, set at the picture's end; -1: none)
+  int32_t tmp;       // an IntraTMP CU's record in Params::timdData (intra_tmp.glsl's TMP_HEAD_*; -1: not IntraTMP)
 };
-static_assert( sizeof( Cu ) == 50 * 4, "Cu layout" );
+static_assert( sizeof( Cu ) == 51 * 4, "Cu layout" );
 
 // Cu::kind
 constexpr int CU_KNOWN       = 0;   // the host knows the mode
@@ -323,14 +326,17 @@ constexpr int CU_EIP         = 11;  // luma: an EIP CU (intra_eip.glsl): its nod
                                     // and the mode chroma DM reads (eipDimdMode; the MPM lists read planar: mpmModeCu)
 constexpr int CU_KNOWN_EXT   = 12;  // luma: the host knows the mode, of the 131-mode set: what a TMRL CU's list reads
                                     // of a TIMD or TMRL neighbour taken from the CPU (mpmModeCu)
+constexpr int CU_TMP         = 13;  // luma: an IntraTMP CU (intra_tmp.glsl): its node its list of block vectors, its
+                                    // block the copy at the one its index selects (the MPM lists read planar:
+                                    // mpmModeCu)
 
 // a CU kind's name, for the verification's reports
 static const char* cuKindName( int kind )
 {
   static const char* const NAMES[] = { "known mode", "MPM", "chroma DM", "chroma candidate", "DIMD", "DIMD chroma",
                                        "OBIC", "intra merge", "TIMD", "TMRL", "chroma TMRL", "EIP",
-                                       "known mode (131)" };
-  return kind >= 0 && kind <= CU_KNOWN_EXT ? NAMES[kind] : "?";
+                                       "known mode (131)", "IntraTMP" };
+  return kind >= 0 && kind <= CU_TMP ? NAMES[kind] : "?";
 }
 
 // an EIP CU's record in Params::timdData (intra_common.glsl's EIP_HEAD_*; layout shared): its index (Params::eipOut),
@@ -408,6 +414,8 @@ constexpr int DIMD_OUT_MTSS_MODE   = 28;
 constexpr int DIMD_OUT_MTSS_BUCKET = 29;
 constexpr int DIMD_OUT_BV_FLAG     = 30;
 constexpr int DIMD_OUT_BV          = 31;
+constexpr int DIMD_OUT_TMP_NUM     = 1;    // an IntraTMP CU's number of vectors found, then its list's MTMP_NUM
+constexpr int DIMD_OUT_TMP_BV      = 2;
 constexpr int DIMD_OUT             = 32;
 constexpr int MTSS_CALLS           = 3;      // the histograms of deriveDimdModeList (left, above, above-left)
 // the transforms of DIMD CUs the kernels have: getFinalIntraModeForTransform's DIMD branch (JVET-AM0138; without
@@ -525,6 +533,21 @@ static_assert( EIP_FILTER_TAP == 15 && EIP_FILTER_SIZE == 7 && MAX_MERGE_EIP == 
                "intra_eip.glsl's constants" );
 #else
 #define GPU_EIP 0
+#endif
+// the IntraTMP the kernels have (intra_tmp.glsl): JVET-AM0229's template types and indices with JVET-AM0138's lists of
+// block vectors (intra_bv.glsl), the DIMD of the prediction for the transforms (as a MIP block's), in the pipelines of
+// the MPM lists; no LIC, fusion, FLM or sub-sample vectors (addTmpRecord)
+#if JVET_AM0229_INTRATMP_SUBMODES_DEPENDING && JVET_AM0138_ENHANCED_TMP_MERGE_LIST_TIMD_BV \
+  && JVET_AH0200_INTRA_TMP_BV_REORDER && JVET_AC0115_INTRA_TMP_DIMD_MTS_LFNST \
+  && JVET_AI0129_INTRA_TMP_OVERLAPPING_REFINEMENT && GPU_TIMD && GPU_MIP_DIMD && GPU_MPM
+#define GPU_TMP 1
+static_assert( MTMP_NUM == 19 && MTMP_NUM_SPARSE == 30 && TL_NUM == 3 && TL_NUM_SPARSE == 6 && MERGE_RANGE == 5
+                 && ARBVP_RANGE == 2 && ARBVPS_RANGE == 2 && TMP_MRG_REG_ID == 6 && LOG2MINCOST == 5
+                 && NUM_TMP_ARBVP_S == 5 && MAX_TO_KEEP_MERGE == 36 && TMP_TEMPLATE_SIZE == 4
+                 && TMP_TEMPLATE_COST_SHIFT == 3,
+               "intra_tmp.glsl's constants" );
+#else
+#define GPU_TMP 0
 #endif
 constexpr int CFLM_TEMPLATE = 2;   // CFLM's template: lines above / columns left of the block (xCflmGetRefBuf)
 // the capacity of intra_cccm.glsl's luma buffer (the four angular arrays): (areaW + 2) x (areaH + 2) samples (without
@@ -2025,7 +2048,7 @@ static int32_t knownCuRecord( GpuIntraRec::Impl& m, const CompArea& a, int32_t m
 {
   Cu c{};
   c.kind = CU_KNOWN;
-  c.node = c.lumaCu = c.dimd = c.obic = c.merge = c.mtss = c.timd = c.tmrl = c.mpm = c.eip = c.bvList = -1;
+  c.node = c.lumaCu = c.dimd = c.obic = c.merge = c.mtss = c.timd = c.tmrl = c.mpm = c.eip = c.bvList = c.tmp = -1;
   std::fill_n( c.nbr, MPM_NEIGHBOURS, -1 );
   c.modes[0] = c.modes[1] = -1;
   c.x = a.x;
@@ -2257,7 +2280,7 @@ static void cpuFillCu( GpuIntraRec::Impl& m, const CodingUnit& cu, const char* w
     }
     Cu& c = m.cus[rec->second];
     c.kind = CU_KNOWN;
-    c.node = c.dimd = c.obic = c.merge = c.mtss = c.timd = c.tmrl = c.mpm = c.eip = c.bvList = -1;
+    c.node = c.dimd = c.obic = c.merge = c.mtss = c.timd = c.tmrl = c.mpm = c.eip = c.bvList = c.tmp = -1;
     m.cuMode[rec->second] = mode;
   }
 }
@@ -2740,9 +2763,10 @@ static bool addMpmNeighbours( GpuIntraRec::Impl& m, const CodingUnit& cu, Cu& c,
       why = "an MPM neighbour that is not a recorded intra CU";
       return false;
     }
-    // an EIP CU's mode is planar to the MPM lists (PU::getIntraDirLuma), its record's the one chroma DM reads
+    // an EIP CU's mode is planar to the MPM lists (PU::getIntraDirLuma), its record's the one chroma DM reads; an
+    // IntraTMP CU's planar too (a record of its own, which spares the lists the wait for the CU's search)
     const CodingUnit& n = *nb->cu;
-    if( n.eipFlag )
+    if( n.eipFlag || n.tmpFlag )
     {
       c.nbr[k] = mpmModeCu( m, PLANAR_IDX );
       continue;
@@ -2787,8 +2811,9 @@ static bool addChromaTmrlNeighbours( GpuIntraRec::Impl& m, const PredictionUnit&
       why = "a chroma TMRL luma CU that is not recorded";
       return false;
     }
-    // (getIntraDirLuma: an EIP CU's mode planar, not the one chroma DM reads)
-    c.nbr[CHROMA_TMRL_NBR_LUMA + k] = lumaPU->cu->eipFlag ? mpmModeCu( m, PLANAR_IDX ) : rec->second;
+    // (getIntraDirLuma: an EIP CU's mode planar, not the one chroma DM reads; an IntraTMP CU's planar)
+    c.nbr[CHROMA_TMRL_NBR_LUMA + k] = lumaPU->cu->eipFlag || lumaPU->cu->tmpFlag ? mpmModeCu( m, PLANAR_IDX )
+                                                                                 : rec->second;
   }
   const Position chromaPos[5] = { pu.chromaPos().offset( -1, cb.height - 1 ), pu.chromaPos().offset( cb.width - 1, -1 ),
                                   pu.chromaPos().offset( -1, cb.height ), pu.chromaPos().offset( cb.width, -1 ),
@@ -3420,6 +3445,84 @@ static int32_t eipIndexOf( GpuIntraRec::Impl& m, const CodingUnit& cu )
 }
 #endif
 
+// an IntraTMP CU's record in Params::timdData (Cu::tmp; intra_tmp.glsl's TMP_HEAD_*, layout shared)
+constexpr int TMP_HEAD_REGIONS = 7;
+constexpr int TMP_HEAD         = TMP_HEAD_REGIONS + 24;
+
+#if GPU_TMP
+// an IntraTMP CU's record (Cu::tmp): its template, its index, the SPS's sampling and LIC mode, needTopLeft and the
+// length of the refined list (searchCandidateFromOnePicIntra), whether the CTU is above 128, then per region the
+// bounds of its vectors (clipMvIntraConstraint, which sortInOut repeats; relative to the CU). False with why set where
+// the GPU lacks what the CU needs: LIC, fusion, FLM, a sub-sample vector (tmpFracIdx), no template (DC instead), more
+// samples than intra_rec's prediction buffer, no DIMD (the transforms' mode of its prediction), OBMC
+static bool addTmpRecord( GpuIntraRec::Impl& m, const CodingUnit& cu, Cu& c, const char*& why )
+{
+  const SPS& sps = *cu.cs->sps;
+  why = cu.tmpLicFlag ? ( cu.tmpFusionFlag ? "IntraTMP (LIC, fusion)" : "IntraTMP (LIC)" )
+        : cu.tmpFusionFlag ? "IntraTMP (fusion)" : cu.tmpFlmFlag ? "IntraTMP (FLM)"
+        : cu.tmpFracIdx != 0 ? "IntraTMP (sub-sample)" : cu.tempType == NO_TEMPLATE ? "IntraTMP without a template"
+        : cu.lwidth() * cu.lheight() > 32 * 32 ? "IntraTMP above 1024 samples"
+        : !sps.getUseDimd() ? "IntraTMP without DIMD" : nullptr;
+#if JVET_AK0076_EXTENDED_OBMC_IBC
+  why = why ? why : cu.obmcFlag ? "IntraTMP with OBMC" : nullptr;
+#endif
+  if( why )
+  {
+    return false;
+  }
+  const int  W = cu.lwidth(), H = cu.lheight(), x = cu.lx(), y = cu.ly(), ctu = sps.getCTUSize();
+  const int  sizeUsed    = cu.tmpIdx + 1;
+  const bool needTopLeft = sizeUsed > MTMP_NUM - ( TL_NUM << 1 );
+  int32_t    h[TMP_HEAD];
+  h[0] = cu.tempType;
+  h[1] = cu.tmpIdx;
+  h[2] = sps.getItmpLicMode() ? TMP_SAMPLING_LIC_MODE_1 : TMP_SAMPLING_LIC_MODE_0;
+  h[3] = sps.getItmpLicMode() ? 1 : 0;
+  h[4] = needTopLeft ? 1 : 0;
+  h[5] = needTopLeft ? MTMP_NUM : sizeUsed;
+  h[6] = ctu > 128 ? 1 : 0;
+  // clipMvIntraConstraint: 0 above the CTU, 1 left of the CU (to its CTU's top), 2 below-left outside the CTU, 3 above
+  // the CU in the CTU, 4 below-left in the CTU, 5 above-right in the CTU; within the picture where the template fits,
+  // within the search range
+  const Position ctuPos = CU::getCtuXYAddr( cu );
+  const int      offY   = y - ctuPos.y, offX = x - ctuPos.x;
+  const int      factor = TMP_SEARCH_RANGE_MULT_FACTOR;
+  const int      rangeW = std::max( ( W == 64 ? factor - 1 : factor ) * W, TMP_MINSR );
+  const int      rangeH = std::max( ( H == 64 ? factor - 1 : factor ) * H, TMP_MINSR );
+  const int      picW   = (int) cu.cs->pps->getPicWidthInLumaSamples();
+  const int      picH   = (int) cu.cs->pps->getPicHeightInLumaSamples();
+  for( int r = 0; r < 6; r++ )
+  {
+    int horMin = 0, verMin = 0, horMax = INT_MAX, verMax = INT_MAX;
+    switch( r )
+    {
+    case 0: verMax = y - offY - H; break;
+    case 1: horMax = x - W; verMin = y - offY - H + 1; verMax = y; break;
+    case 2: horMax = x - offX - W; verMin = y + 1; verMax = y - offY + ctu - H; break;
+    case 3: verMin = y - offY - H + 1; verMax = y - H; horMin = x - W + 1; horMax = x; break;
+    case 4: horMin = x - offX - W + 1; horMax = x - W; verMin = y + 1; verMax = y - offY + ctu - H; break;
+    default: horMin = x + 1; horMax = x - offX + ctu - W; verMin = y - offY - H + 1; verMax = y - H; break;
+    }
+    verMin = std::max( verMin, cu.tempType != LEFT_TEMPLATE ? TMP_TEMPLATE_SIZE : 0 );
+    verMax = std::min( verMax, picH - H );
+    horMin = std::max( horMin, cu.tempType != ABOVE_TEMPLATE ? TMP_TEMPLATE_SIZE : 0 );
+    horMax = std::min( horMax, picW - W );
+    verMin = std::max( verMin, y - rangeH );
+    verMax = std::min( verMax, y + rangeH );
+    horMin = std::max( horMin, x - rangeW );
+    horMax = std::min( horMax, x + rangeW );
+    h[TMP_HEAD_REGIONS + 4 * r]     = horMin - x;
+    h[TMP_HEAD_REGIONS + 4 * r + 1] = horMax - x;
+    h[TMP_HEAD_REGIONS + 4 * r + 2] = verMin - y;
+    h[TMP_HEAD_REGIONS + 4 * r + 3] = verMax - y;
+  }
+  c.tmp = (int32_t) m.timdData.size();
+  m.timdData.insert( m.timdData.end(), h, h + TMP_HEAD );
+  m.blendBlocks = true;   // (its node's lists take the workgroup's scratch)
+  return true;
+}
+#endif
+
 // an EIP CU's record (Cu::eip, EIP_HEAD_*) and EIP index: how its node finds its model - fitted (its mode's shape,
 // regions of recoType and models: getAllowedCurEip's list) or a merge candidate (the EIP CUs at eipMergeNeighbours'
 // positions, then its CTU row's before it, each as its CU record and EIP index) - and its reference area
@@ -3543,6 +3646,7 @@ static int32_t cuRecord( GpuIntraRec::Impl& m, const TransformUnit& tu, const Co
   c.mpm      = -1;
   c.eip      = -1;
   c.bvList   = -1;
+  c.tmp      = -1;
   std::fill_n( c.nbr, MPM_NEIGHBOURS, -1 );
   c.modes[0] = c.modes[1] = -1;
   const CompArea& a = cu.blocks[chType == CHANNEL_TYPE_LUMA ? COMPONENT_Y : COMPONENT_Cb];
@@ -3610,6 +3714,19 @@ static int32_t cuRecord( GpuIntraRec::Impl& m, const TransformUnit& tu, const Co
       m.cpuTmrl.push_back( pu.intraDir[CHANNEL_TYPE_LUMA] );
       m.cpuTmrl.push_back( pu.multiRefIdx );
     }
+#if GPU_TMP
+    // an IntraTMP CU: its node its list of block vectors (from the CUs around it, which its list's record names, and
+    // the search), its luma block the copy at the one its index selects (intra_tmp.glsl)
+    else if( m.deriveModes && cu.tmpFlag )
+    {
+      if( !addTmpRecord( m, cu, c, why ) )
+      {
+        return -1;
+      }
+      c.kind = CU_TMP;
+      bvList = true;
+    }
+#endif
     // an EIP CU: its node its model, its luma block the prediction and the mode chroma DM reads (intra_eip.glsl)
     else if( m.deriveModes && cu.eipFlag )
     {
@@ -3673,10 +3790,10 @@ static int32_t cuRecord( GpuIntraRec::Impl& m, const TransformUnit& tu, const Co
         c.dimdNum = 0;
       }
     }
-    // MTSS's mode list, in the CU's node: of a DIMD, OBIC, intra merge or TIMD CU, and of a MIP CU (CU_KNOWN) or an EIP
-    // CU, whose node derives only that list of MTSS (its block the rest, from its prediction)
+    // MTSS's mode list, in the CU's node: of a DIMD, OBIC, intra merge or TIMD CU, and of a MIP CU (CU_KNOWN), an EIP
+    // or an IntraTMP CU, whose node derives only that list of MTSS (its block the rest, from its prediction)
     if( ( c.kind == CU_DIMD || c.kind == CU_OBIC || c.kind == CU_MERGE || c.kind == CU_TIMD || c.kind == CU_EIP
-          || ( GPU_MIP_DIMD && cu.mipFlag ) )
+          || c.kind == CU_TMP || ( GPU_MIP_DIMD && cu.mipFlag ) )
         && usesMtss( *cu.firstTU ) )
     {
       addMtssCalls( m, cu, c );
@@ -3795,6 +3912,18 @@ static int32_t cuRecord( GpuIntraRec::Impl& m, const TransformUnit& tu, const Co
     std::copy_n( cu.dimdRelWeightMerge, 8, d + 9 );
     std::copy_n( cu.dimdLocDepMerge, 7, d + 17 );
   }
+#if GPU_TMP
+  else if( c.kind == CU_TMP )   // its list (the number its search found, tmpXYdisp), the DIMD of its prediction
+  {
+    d[0]                  = cu.intraTmpDimdMode;
+    d[DIMD_OUT_TMP_NUM]   = m.intraPred ? m.intraPred->getTmpNumCand() : 0;
+    for( int i = 0; i < MTMP_NUM; i++ )
+    {
+      d[DIMD_OUT_TMP_BV + i] = bvPack( cu.tmpXYdisp[i] );
+    }
+    d[DIMD_OUT_TR_SECOND] = cu.dimdDerivedIntraDir2nd;
+  }
+#endif
   else
   {
     d[0] = cu.dimdMode;
@@ -4072,10 +4201,11 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
   // transform skip with the regular residual coding is dequantized like a transform block (DepQuant::dequant)
   else if( ( tu.mtsIdx[compID] == MTS_SKIP || ( tu.jointCbCr && tu.mtsIdx[COMPONENT_Cr] == MTS_SKIP ) )
            && slice.getTSResidualCodingDisabledFlag() )             why = "transform skip with regular residual coding";
-  else if( cu.tmpFlag )
+  // IntraTMP: a luma block that is its CU, whose node searches its vectors (the rest of what it needs in addTmpRecord)
+  else if( cu.tmpFlag && ( !GPU_TMP || !isLuma( compID ) || !m.deriveModes || area != cu.blocks[COMPONENT_Y] ) )
   {
-    why = cu.tmpLicFlag ? ( cu.tmpFusionFlag ? "IntraTMP (LIC, fusion)" : "IntraTMP (LIC)" )
-          : cu.tmpFusionFlag ? "IntraTMP (fusion)" : cu.tmpFlmFlag ? "IntraTMP (FLM)" : "IntraTMP";
+    why = !GPU_TMP ? "IntraTMP" : !isLuma( compID ) ? "IntraTMP's chroma (single tree)"
+          : !m.deriveModes ? "IntraTMP without the GPU's derivation" : "IntraTMP CU with several transform blocks";
   }
 #if JVET_AC0071_DBV
   else if( !isLuma( compID ) && PU::isDbvMode( dirMode ) )           why = "DBV";
@@ -4098,9 +4228,9 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
   else if( cu.dimd && isLuma( compID ) && area != cu.blocks[COMPONENT_Y] ) why = "DIMD CU with several transform blocks";
   else if( !GPU_DIMD_TRANSFORMS && cu.dimd && isLuma( compID ) && ( tu.mtsIdx[COMPONENT_Y] > MTS_SKIP || cu.lfnstIdx ) )
     why = "the transforms of a DIMD CU";
-  // MTSS of other CUs than DIMD's, MIP's, TIMD's and EIP's (IntraTMP, SGPM: rejected themselves)
+  // MTSS of other CUs than DIMD's, MIP's, TIMD's, EIP's and IntraTMP's (SGPM: rejected itself)
   else if( isLuma( compID ) && usesMtss( tu )
-           && ( !( cu.dimd || cu.mipFlag || ( GPU_TIMD && cu.timd ) || ( GPU_EIP && cu.eipFlag ) )
+           && ( !( cu.dimd || cu.mipFlag || ( GPU_TIMD && cu.timd ) || ( GPU_EIP && cu.eipFlag ) || cu.tmpFlag )
                 || !GPU_DIMD_TRANSFORMS ) )
     why = "MTSS";
   // TIMD (luma; plain TIMD, TIMD-SAD and TIMD merge): its CU is one block, which predicts the CU's modes. TIMD with MRL
@@ -4221,9 +4351,11 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
       return;
     }
   }
-  // (an EIP CU's block takes no mode: its prediction is its node's model's)
-  const bool derived = cuIdx >= 0 && m.cus[cuIdx].kind != CU_KNOWN && m.cus[cuIdx].kind != CU_EIP;
+  // (an EIP or IntraTMP CU's block takes no mode: its prediction is its node's model's, a copy at its node's vector)
+  const bool derived  = cuIdx >= 0 && m.cus[cuIdx].kind != CU_KNOWN && m.cus[cuIdx].kind != CU_EIP
+                        && m.cus[cuIdx].kind != CU_TMP;
   const bool eipBlock = cuIdx >= 0 && m.cus[cuIdx].kind == CU_EIP && isLuma( compID );
+  const bool tmpBlock = cuIdx >= 0 && m.cus[cuIdx].kind == CU_TMP && isLuma( compID );
 
   Tu t{};
   t.comp           = compID;
@@ -4284,9 +4416,9 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
     t.refFilter = t.fusion = 0;
   }
 #endif
-  // EIP (intra_eip.glsl, DERIVE_EIP): the block predicted by its node's model, without a mode's parameters (the CPU's
-  // snapshot is a previous block's)
-  if( eipBlock )
+  // EIP (intra_eip.glsl, DERIVE_EIP): the block predicted by its node's model, IntraTMP (intra_tmp.glsl, DERIVE_TMP) by
+  // the copy at its node's vector, without a mode's parameters (the CPU's snapshot is a previous block's)
+  if( eipBlock || tmpBlock )
   {
     t.dirMode   = PLANAR_IDX;
     t.mrl       = 0;
@@ -4530,7 +4662,8 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
     const bool modeOff = ( ( t.mrl || t.isp ) && md > DC_IDX )
                          || ( md > DC_IDX && ( ( md >= 2 && md <= 3 ) || ( md >= 17 && md <= 19 ) || ( md >= 33 && md <= 35 )
                                                || ( md >= 49 && md <= 51 ) || ( md >= 65 && md <= 66 ) ) );
-    t.bf = bfBase && !modeOff && !eipBlock ? ( md <= DC_IDX ? 1 : 2 ) : 0;   // (EIP's prediction is not filtered)
+    // (EIP's and IntraTMP's predictions are not filtered)
+    t.bf = bfBase && !modeOff && !eipBlock && !tmpBlock ? ( md <= DC_IDX ? 1 : 2 ) : 0;
   }
   // bilateralFilterPredDiamond5x5Clip pads at the CU, which ISP sub-partitions reproduce (Tu::isp); other blocks smaller
   // than their CU are not supported (with a derived mode: wherever the filter may apply)
@@ -4573,7 +4706,7 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
   // a derived mode: what its parameters depend on besides the mode (initIntraPatternChType's fetchRef2nd, the
   // filter's conditions, the SPS's switches)
   t.cu     = cuIdx;
-  t.derive = eipBlock ? DERIVE_EIP : 0;
+  t.derive = eipBlock ? DERIVE_EIP : tmpBlock ? DERIVE_TMP : 0;
   if( derived )
   {
     // a DIMD CU's fetchRef2nd without its DIMD term (the CPU's depends on the blending the GPU derives): DIMD has no
@@ -4799,13 +4932,14 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
     const bool pnnSec    = false;
 #endif
     // an EIP block's alike: a DIMD of its prediction (eipDimdMode), which its block derives in any case (chroma DM
-    // reads it)
-    const bool eipDimd   = eipBlock;
+    // reads it); an IntraTMP block's (intraTmpDimdMode, which its block derives in any case too)
+    const bool eipDimd   = eipBlock || tmpBlock;
     if( ( derived || mipDimd || cclmDimd || pnnDimd || eipDimd ) && ( mtsByMode || sec.kind != SEC_NONE ) )
     {
       CHECK( mipDimd && cuIdx < 0, "a MIP block's LFNST mode without its CU's record (DIMD has the GPU derive modes)" );
       CHECK( pnnDimd && cuIdx < 0, "an NN block's transforms' mode without its CU's record" );
       m.numCcpLfnst += cclmDimd && t.ccpMerge >= 0;
+      m.blendBlocks = m.blendBlocks || ( cclmDimd && t.ccpMerge >= 0 );   // (ccpMergeTransformMode's final samples)
       t.derive   |= DERIVE_TRANSFORM | ( mipDimd ? DERIVE_MIP_DIMD : 0 ) | ( cclmDimd ? DERIVE_CCLM_DIMD : 0 )
                     | ( pnnDimd || eipDimd ? DERIVE_PNN_DIMD : 0 ) | ( pnnSec ? DERIVE_PNN_LFNST_SEC : 0 )
                     | ( isLuma( resiComp ) && usesMtss( tu ) ? DERIVE_MTSS : 0 );
@@ -5700,8 +5834,10 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
       {
         addBlock( cuRec->node );
       }
-      else if( t.derive & ( DERIVE_MTSS | DERIVE_EIP ) )   // a MIP block: MTSS's mode list; an EIP block: its model
-      {                                                     // (from the CU's node)
+      // a MIP block: MTSS's mode list; an EIP block: its model; an IntraTMP block: its list of vectors (from the CU's
+      // node, after which every block before it is reconstructed: the node waits for them all)
+      else if( t.derive & ( DERIVE_MTSS | DERIVE_EIP | DERIVE_TMP ) )
+      {
         addBlock( m.cus[t.cu].node );
       }
       if( t.spCoded >= 0 )   // sign prediction's border (TU::predBorderResi): the two columns left of / rows above the block
@@ -5819,7 +5955,8 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
       }
       const CodingUnit* nb[BV_NBRS];
       bvNeighbourCus( cu, nb );
-      bool potential = false;
+      Cu&  c         = m.cus[list.first];
+      bool potential = c.kind == CU_TMP;   // (an IntraTMP CU searches in any case, and records its vectors)
       for( int k = 0; k < BV_NBRS; k++ )
       {
         potential = potential || ( nb[k] && may[nb[k]->idx] );
@@ -5828,18 +5965,18 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
       {
         continue;
       }
-      // TIMD's list cascades; DIMD's (getBestNonAnglularMode, also of OBIC and intra merge CUs) keeps its first 30 / 15
-      // and costs its vectors on TIMD's template of both arms, whose units follow
-      Cu&        c    = m.cus[list.first];
-      const bool timd = c.kind == CU_TIMD;
+      // TIMD's and IntraTMP's lists cascade (IntraTMP's node sorts its neighbours' first); DIMD's
+      // (getBestNonAnglularMode, also of OBIC and intra merge CUs) keeps its first 30 / 15 and costs its vectors on
+      // TIMD's template of both arms, whose units follow
+      const bool dimd = c.kind != CU_TIMD && c.kind != CU_TMP;
       c.bvList = (int32_t) m.timdData.size();
       m.timdData.push_back( (int32_t) cu.idx );   // BV_LIST_INDEX
-      m.timdData.push_back( timd ? 0 : cs.sps->getItmpLicMode() ? MAX_TO_KEEP : MAX_TO_KEEP >> 1 );   // BV_LIST_KEEP
+      m.timdData.push_back( !dimd ? 0 : cs.sps->getItmpLicMode() ? MAX_TO_KEEP : MAX_TO_KEEP >> 1 );   // BV_LIST_KEEP
       for( int k = 0; k < BV_NBRS; k++ )
       {
         m.timdData.push_back( nb[k] ? (int32_t) nb[k]->idx : -1 );
       }
-      if( !timd )
+      if( dimd )
       {
         std::vector<int32_t> bits;
         const TemplateUnits  t     = templateUnits( cu, cu.Y(), cu.lwidth() <= 8 ? 2 : 4, cu.lheight() <= 8 ? 2 : 4,
@@ -5964,11 +6101,11 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
   // predictions are part of DIMD: their code, mipTransformMode's and cclmTransformMode's too, is in the pipelines with
   // WITH_DIMD only)
   bool dimd = false, derivedTransforms = false, cclm = false, cccm = false, cflm = false, ccpMerge = false;
-  bool eip = false;   // (EIP CUs take the pipelines of the MPM lists)
+  bool eip = false;   // (EIP and IntraTMP CUs take the pipelines of the MPM lists, with DIMD: their blocks' DIMD)
   for( const Cu& c: m.cus )
   {
     dimd = dimd || c.dimd >= 0 || c.obic >= 0 || c.merge >= 0 || c.mtss >= 0;
-    eip  = eip || c.eip >= 0;
+    eip  = eip || c.eip >= 0 || c.tmp >= 0;
   }
   for( const Tu& t: m.rec )
   {
@@ -6324,7 +6461,8 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
     const bool mipDimd = m.cuMipDimd[u] != 0;   // a MIP CU: its block's modes of its prediction (DERIVE_MIP_DIMD)
     const bool params  = c.dimd >= 0 || c.merge >= 0;   // DIMD_OUT_PARAMS (a TIMD merge CU has MTSS's fields only)
     const bool chroma  = c.kind == CU_CHROMA_DIMD || c.kind == CU_CHROMA_TMRL;   // its DIMD chroma's two modes
-    if( !params && c.mtss < 0 && !mipDimd )
+    const bool tmp     = c.kind == CU_TMP;   // its node's list, its block's modes of its prediction
+    if( !params && c.mtss < 0 && !mipDimd && !tmp )
     {
       continue;
     }
@@ -6335,16 +6473,51 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
       // (the choice of planar or a block vector, which every such node makes)
       const bool vector   = c.kind == CU_DIMD || c.kind == CU_OBIC || c.kind == CU_MERGE;
       const bool compared = k >= DIMD_OUT_BV_FLAG ? vector
+                            : tmp ? k < DIMD_OUT_TMP_BV + MTMP_NUM || k == DIMD_OUT_TR_SECOND
+                                    || ( k >= DIMD_OUT_MTSS_LIST && c.mtss >= 0 )
                             : mipDimd ? k == 0 || k == DIMD_OUT_TR_SECOND || ( k >= DIMD_OUT_MTSS_LIST && c.mtss >= 0 )
                             : k < DIMD_OUT_PARAMS ? params
                             : GPU_DIMD_TRANSFORMS && ( k == DIMD_OUT_TR_SECOND ? c.dimd >= 0 && !chroma : c.mtss >= 0 );
       if( compared && g[k] != h[k] )
       {
         const bool  pnnDimd = m.cuMipDimd[u] == 2, eipDimd = m.cuMipDimd[u] == 3;
+        if( tmp && k > 0 && k < DIMD_OUT_TMP_BV + MTMP_NUM )   // its list (a vector packed: hor in the low 16 bits)
+        {
+          const int idx = m.timdData[c.tmp + 1];   // (TMP_HEAD_IDX)
+          char      buf[200];
+          if( k == DIMD_OUT_TMP_NUM )
+          {
+            snprintf( buf, sizeof( buf ),
+                      "IntraTMP's number of candidates of CU %d (at %d,%d %dx%d, index %d): CPU %d GPU %d", (int) u,
+                      c.x, c.y, c.w, c.h, idx, h[k], g[k] );
+          }
+          else
+          {
+            snprintf( buf, sizeof( buf ),
+                      "tmpXYdisp[%d] of CU %d (IntraTMP at %d,%d %dx%d, index %d): CPU %d,%d GPU %d,%d",
+                      k - DIMD_OUT_TMP_BV, (int) u, c.x, c.y, c.w, c.h, idx, int16_t( h[k] ), h[k] >> 16,
+                      int16_t( g[k] ), g[k] >> 16 );
+          }
+          first = buf;
+          for( int s = 0; s < 2; s++ )   // (both lists in full)
+          {
+            const int32_t* l = s == 0 ? h : g;
+            first += std::string( s == 0 ? "; CPU list (" : "; GPU list (" ) + std::to_string( l[DIMD_OUT_TMP_NUM] )
+                     + ")";
+            for( int i = 0; i < MTMP_NUM; i++ )
+            {
+              first += " " + std::to_string( int16_t( l[DIMD_OUT_TMP_BV + i] ) ) + ","
+                       + std::to_string( l[DIMD_OUT_TMP_BV + i] >> 16 );
+            }
+          }
+          firstCu = u;
+          break;
+        }
         const char* field = pnnDimd && k == 0 ? "indicesRepresentationPnn" : pnnDimd ? "indicesRepresentationPnn[1]"
                             : eipDimd && k == 0 ? "eipDimdMode" : eipDimd && k == DIMD_OUT_TR_SECOND ? "eipDimdMode2nd"
+                            : tmp && k == 0 ? "intraTmpDimdMode"
                             : mipDimd && k == 0 ? "mipDimdMode"
-                            : mipDimd && k == DIMD_OUT_TR_SECOND ? "dimdDerivedIntraDir2nd"
+                            : ( mipDimd || tmp ) && k == DIMD_OUT_TR_SECOND ? "dimdDerivedIntraDir2nd"
                             : chroma ? ( k == 0 ? "dimdChromaMode" : "dimdChromaModeSecond" )
                             : k == 0 ? "dimdMode" : k == 1 ? "dimdBlending" : k < 9 ? "dimdBlendMode" : k < 17 ? "dimdRelWeight"
                             : k < DIMD_OUT_TR_SECOND ? "dimdLocDep" : k == DIMD_OUT_TR_SECOND ? "candModeListForTransform"
@@ -6842,7 +7015,7 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
     numMipDimd += ( t.derive & DERIVE_MIP_DIMD ) != 0;
     numInherited += ( t.derive & ( DERIVE_INHERIT_HOR | DERIVE_INHERIT_VER ) ) != 0;
   }
-  int numTmrl = 0, numChromaTmrl = 0, numEipGpu = 0;
+  int numTmrl = 0, numChromaTmrl = 0, numEipGpu = 0, numTmpGpu = 0;
   for( const Cu& c: m.cus )
   {
     numDimd += c.dimd >= 0;
@@ -6851,6 +7024,7 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
     numTmrl += c.kind == CU_TMRL;
     numChromaTmrl += c.kind == CU_CHROMA_TMRL;
     numEipGpu += c.kind == CU_EIP;
+    numTmpGpu += c.kind == CU_TMP;
   }
   int numTimdBlended = 0, numTimdSad = 0;
   for( const Cu& c: m.cus )
@@ -6862,8 +7036,8 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
       numTimdBlended += m.cpuTimd[size_t( th.index ) * TIMD_OUT + ( th.sad ? TIMD_OUT_SAD : 0 ) + TIMD_OUT_BLENDED] != 0;
     }
   }
-  printf( "\n[gpu-intra] POC %d: %d blocks, chain %d (ref filter %d, PDPC %d, gradient PDPC %d, fusion %d, bilateral filter candidates %d, CU nodes %d, DIMD %d, DIMD CUs %d, OBIC CUs %d, intra merge CUs %d, TIMD CUs %d (blended %d, TIMD-SAD %d, TIMD merge %d, inheriting transforms %d), TMRL CUs %d, chroma TMRL CUs %d, MPM records %d (sorted %d, MDIP %d), EIP CUs %d (merge %d, two models %d), their MTS / LFNST / NSPT blocks %d, MTSS %d, MIP LFNST / NSPT %d, LM blocks %d (MMLM %d, MDLM %d, LBCCP %d, LFNST / NSPT %d, GLM %d (with luma %d), CCCM %d: above %d, left %d, GL %d, several filters %d, without subsampling %d), LM chroma fusion %d (CFLM %d), CCP merge %d (fusion with CCCM %d (by a blend model %d), with DIMD chroma %d, adjusted %d, decoder-derived fusion %d, LFNST / NSPT %d (with DIMD chroma %d)), decoder-derived CCP fusion %d), GPU %.2f ms: %s%s%s", m.poc,
-          (int) m.rec.size() - numNodes, maxDepth, numFilter, numPdpc, numGrad, numFusion, numBf, numNodes, numDimd, numDimdCus, numObic, m.numMerge, m.numTimd, numTimdBlended, numTimdSad, m.numTimdMerge, numInherited, numTmrl, numChromaTmrl, m.numMpm, m.numMpmSorted, m.numMdip, numEipGpu, m.numEipMerge, m.numEipMm, numDimdTransforms, numMtss, numMipDimd, numCclm, numMmlm, numMdlm, numLbccp, numCclmDimd, numGlm, numGlmLuma, numCccm, numCccmAbove, numCccmLeft, numGlCccm, numMdfCccm, numNoSubCccm, numLmFusion, numCflm, numCcpMerge, numCcpMergeFusion, m.numFusionBlend, numCcpMergeDimd, m.numCcpAdjust, m.numDdMergeFusion, numCcpMergeLfnst, numCcpMergeDimdLfnst, m.numDerivedCcp, ms, bad ? "MISMATCH, " : "identical",
+  printf( "\n[gpu-intra] POC %d: %d blocks, chain %d (ref filter %d, PDPC %d, gradient PDPC %d, fusion %d, bilateral filter candidates %d, CU nodes %d, DIMD %d, DIMD CUs %d, OBIC CUs %d, intra merge CUs %d, TIMD CUs %d (blended %d, TIMD-SAD %d, TIMD merge %d, inheriting transforms %d), TMRL CUs %d, chroma TMRL CUs %d, MPM records %d (sorted %d, MDIP %d), EIP CUs %d (merge %d, two models %d), IntraTMP CUs %d, their MTS / LFNST / NSPT blocks %d, MTSS %d, MIP LFNST / NSPT %d, LM blocks %d (MMLM %d, MDLM %d, LBCCP %d, LFNST / NSPT %d, GLM %d (with luma %d), CCCM %d: above %d, left %d, GL %d, several filters %d, without subsampling %d), LM chroma fusion %d (CFLM %d), CCP merge %d (fusion with CCCM %d (by a blend model %d), with DIMD chroma %d, adjusted %d, decoder-derived fusion %d, LFNST / NSPT %d (with DIMD chroma %d)), decoder-derived CCP fusion %d), GPU %.2f ms: %s%s%s", m.poc,
+          (int) m.rec.size() - numNodes, maxDepth, numFilter, numPdpc, numGrad, numFusion, numBf, numNodes, numDimd, numDimdCus, numObic, m.numMerge, m.numTimd, numTimdBlended, numTimdSad, m.numTimdMerge, numInherited, numTmrl, numChromaTmrl, m.numMpm, m.numMpmSorted, m.numMdip, numEipGpu, m.numEipMerge, m.numEipMm, numTmpGpu, numDimdTransforms, numMtss, numMipDimd, numCclm, numMmlm, numMdlm, numLbccp, numCclmDimd, numGlm, numGlmLuma, numCccm, numCccmAbove, numCccmLeft, numGlCccm, numMdfCccm, numNoSubCccm, numLmFusion, numCflm, numCcpMerge, numCcpMergeFusion, m.numFusionBlend, numCcpMergeDimd, m.numCcpAdjust, m.numDdMergeFusion, numCcpMergeLfnst, numCcpMergeDimdLfnst, m.numDerivedCcp, ms, bad ? "MISMATCH, " : "identical",
           bad ? first.c_str() : "", numBad ? ( ", " + std::to_string( numBad ) + " picture samples differ" ).c_str() : "" );
   if( m.partial )
   {

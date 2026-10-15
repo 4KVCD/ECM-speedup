@@ -1500,17 +1500,23 @@ void ccpMergeTransformMode( Tu t, int predStride, int maxPel, int lid, int NT )
         ccpDimdChromaPrediction( tc, predStride, maxPel, lid, NT );
       }
       ccpMergePrediction( tc, predStride, lid, NT );
+      // the final prediction once per sample, into the workgroup's blending sums (free before the prediction section,
+      // whose first blended prediction sets them anew; the host makes the scratch have them), the gradients from
+      // there: one inlined copy of the prediction instead of one per tap of the gradient (the module's SPIR-V IDs
+      // ~350k fewer)
+      CBufI32   fin  = CBufI32( P.scratch );
+      const int base = int( gl_WorkGroupID.x ) * BLEND_ACC, W = tc.w;
+      for( int i = lid; i < W * tc.h; i += NT )
+      {
+        fin.v[base + i] = ccpMergeFinalSample( tc, i % W, i / W, maxPel );
+      }
+      controlBarrier( gl_ScopeWorkgroup, gl_ScopeWorkgroup, gl_StorageSemanticsBuffer | gl_StorageSemanticsShared,
+                      gl_SemanticsAcquireRelease );
       for( int k = lid; k < inner; k += NT )
       {
-        const int   x = 1 + k % iw, y = 1 + k / iw;
-        const ivec2 g = sobel3x3( ccpMergeFinalSample( tc, x - 1, y - 1, maxPel ),
-                                  ccpMergeFinalSample( tc, x, y - 1, maxPel ),
-                                  ccpMergeFinalSample( tc, x + 1, y - 1, maxPel ),
-                                  ccpMergeFinalSample( tc, x - 1, y, maxPel ),
-                                  ccpMergeFinalSample( tc, x + 1, y, maxPel ),
-                                  ccpMergeFinalSample( tc, x - 1, y + 1, maxPel ),
-                                  ccpMergeFinalSample( tc, x, y + 1, maxPel ),
-                                  ccpMergeFinalSample( tc, x + 1, y + 1, maxPel ) );
+        const int   o = base + ( 1 + k / iw ) * W + 1 + k % iw;
+        const ivec2 g = sobel3x3( fin.v[o - W - 1], fin.v[o - W], fin.v[o - W + 1], fin.v[o - 1], fin.v[o + 1],
+                                  fin.v[o + W - 1], fin.v[o + W], fin.v[o + W + 1] );
         if( g.x != 0 || g.y != 0 )
         {
           atomicAdd( s_dimdHist[CCP_DIMD_HIST + dimdAngle( g )], abs( g.x ) + abs( g.y ) );

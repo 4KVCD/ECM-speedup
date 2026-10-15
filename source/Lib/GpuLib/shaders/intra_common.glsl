@@ -246,6 +246,9 @@ const int DERIVE_EIP = 8388608;
 // its derivation reads samples or records at block vectors, which may point anywhere decoded before (a TIMD CU's
 // candidates from block vectors)
 const int DERIVE_PREFIX = 16777216;
+// an IntraTMP CU's luma block (intra_tmp.glsl): the copy of the reconstruction at the vector of its node's list its
+// index selects; then the DIMD of its prediction (intraTmpDimdMode, which its transforms take, as an EIP block's)
+const int DERIVE_TMP = 33554432;
 
 // a CU's block vectors as the lists of later CUs take them (Params::bvOut per luma CU, by its index in the
 // CodingStructure: getNeighBv's vectors of the CU in its order, which getArBvMergeCandidate cascades), written by the
@@ -295,6 +298,7 @@ struct Cu
   // where its node's derivation takes block vectors from the CUs around it (a TIMD CU's candidates, JVET-AM0138) and
   // they may have some: the offset in Params::timdData of its list's record (intra_bv.glsl's BV_LIST_*), else -1
   int bvList;
+  int tmp;               // an IntraTMP CU's record in Params::timdData (intra_tmp.glsl's TMP_HEAD_*; -1: not IntraTMP)
 };
 layout( buffer_reference, std430, buffer_reference_align = 4 ) buffer BufCu { Cu v[]; };
 
@@ -317,6 +321,8 @@ const int CU_EIP         = 11;  // luma: an EIP CU (intra_eip.glsl): its node it
                                 // the mode chroma DM reads (eipDimdMode; the MPM lists read planar instead)
 const int CU_KNOWN_EXT   = 12;  // luma: the host knows the mode, of the 131-mode set (Params::cuMode): what a TMRL CU's
                                 // list reads of a TIMD or TMRL neighbour taken from the CPU
+const int CU_TMP         = 13;  // luma: an IntraTMP CU (intra_tmp.glsl): its node its list of vectors (the MPM lists
+                                // read planar), its block the copy at the one its index selects
 
 // a TMRL CU's choice as its node derives it (TMRL_OUT int32 per TMRL CU in Params::tmrlOut): the mode (131-mode set)
 // and the reference line (multiRefIdx) of m_tmrlList[tmrlListIdx], which its blocks predict with
@@ -380,7 +386,9 @@ layout( buffer_reference, std430, buffer_reference_align = 4 ) buffer BufDimdCal
 // (candModeListForTransformMtss) and getFinalIntraModeForTransform's result: the LFNST / NSPT mode in NSPT's numbering
 // and secondBucket; DIMD chroma's the final mode and the second one (dimdChromaMode, dimdChromaModeSecond). A MIP block
 // with LFNST / NSPT writes its CU's: mipDimdMode as the mode, dimdDerivedIntraDir2nd as the second, with MTSS the result
-// (its node the list)
+// (its node the list). An IntraTMP CU's: its node's list in place of the DIMD fields (the number of vectors it found,
+// then MTMP_NUM, repeated cyclically past that number: tmpXYdisp) and in DIMD_OUT_BV the vector its block copies, its
+// block's DIMD as a MIP block's (intraTmpDimdMode)
 const int DIMD_OUT             = 32;
 const int DIMD_OUT_PARAMS      = 24;
 const int DIMD_OUT_MODE        = 0;
@@ -395,6 +403,8 @@ const int DIMD_OUT_MTSS_MODE   = 28;
 const int DIMD_OUT_MTSS_BUCKET = 29;
 const int DIMD_OUT_BV_FLAG     = 30;   // a DIMD, OBIC or intra merge CU's isBvDimd (getBestNonAnglularMode)
 const int DIMD_OUT_BV          = 31;   // and its bvDimd (bvPack)
+const int DIMD_OUT_TMP_NUM     = 1;    // an IntraTMP CU's number of vectors found,
+const int DIMD_OUT_TMP_BV      = 2;    // then its list's MTMP_NUM vectors (bvPack)
 const int MTSS_CALLS           = 3;    // the histograms of MTSS's mode list (deriveDimdModeList: left, above, above-left)
 
 // a neighbour of an OBIC CU whose mode its histogram counts (layout shared with GpuIntraRec.cpp, OBIC_NBRS per OBIC CU

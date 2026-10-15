@@ -640,8 +640,9 @@ void dependencies( int comp )
   {
     addDep( c.node );
   }
-  else if( ( t.derive & ( DERIVE_MTSS | DERIVE_EIP ) ) != 0 )   // a MIP block: MTSS's mode list; an EIP block: its
-  {                                                             // model (from the CU's node)
+  // a MIP block: MTSS's mode list; an EIP block: its model; an IntraTMP block: its list of vectors (from the CU's node)
+  else if( ( t.derive & ( DERIVE_MTSS | DERIVE_EIP | DERIVE_TMP ) ) != 0 )
+  {
     addDep( BufCu( P.cus ).v[t.cu].node );
   }
   if( t.spCoded >= 0 )   // sign prediction's border (TU::predBorderResi): the two columns left of / rows above the block

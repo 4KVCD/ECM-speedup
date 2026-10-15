@@ -449,7 +449,7 @@ wall-clock gains with threads are "the easy baseline". Decoder status: single-th
 (`--GpuLoopFilter=1`: ALF, SAO, BIF, CCSAO, LF-CCCM, offset refinement on Vulkan). The user then asked for **a full
 GPU decoder in Vulkan, optimized until nothing is left** ("The GPU decoder needs to fully decode the frame on the
 GPU"; "Your first Vulkan version is going to be slow. That's OK"). That work is branch `dec-gpurecon`: intra
-reconstruction on the GPU (`--GpuRecon`), tool levels M1-M61 done and verified bit-exact (M19: DIMD, M20: OBIC, M21:
+reconstruction on the GPU (`--GpuRecon`), tool levels M1-M62 done and verified bit-exact (M19: DIMD, M20: OBIC, M21:
 intra merge, M22: the transforms of DIMD CUs, M23: LFNST of MIP, M24: TIMD, M25: OBIC and intra merge with TIMD
 neighbours, M26: TIMD-SAD, M27: OBIC and intra merge with TIMD-SAD neighbours, M28: TIMD merge, M29: TMRL of luma,
 M30: chroma TMRL, M31: CCLM, M32: LFNST / NSPT of CCLM, M33: GLM's gradient patterns, M34: CCCM, M35: GL-CCCM, M36:
@@ -458,7 +458,8 @@ luma, M40: LM chroma fusion of CCCM, M41: CFLM, M42: GLM with luma with LFNST / 
 CCP tools, M44 / M45: the CCP models, M46: CCP merge, M47 / M48: CCP merge fusion with CCCM / DIMD chroma, M49: CCP
 merge adjustment, M50 / M51: decoder-derived CCP fusion, its merge fusion, M52: CCP merge fusion with CCCM by a blend
 model, M53 / M54: CCP merge and decoder-derived fusion with LFNST / NSPT, M55: PDP, M56: NN intra prediction, M57: the
-MPM lists of MPM sorting, MDIP and PDP, M58: EIP, M59-M61: block vectors - TIMD, DIMD and OBIC with vectors); it is
+MPM lists of MPM sorting, MDIP and PDP, M58: EIP, M59-M61: block vectors - TIMD, DIMD and OBIC with vectors, M62:
+IntraTMP's search, without LIC / fusion / FLM / sub-sample vectors / OBMC); it is
 **not yet faster than the CPU
 decoder** (see section 8) and supports only a restricted tool set (all real CTC streams fall back to the CPU, first
 reason: chroma reordering / DBV; BVG-CCCM CUs are rejected per block).
@@ -1622,6 +1623,31 @@ candidates take vectors (reorderIntraMergeCand's dimdBv), intra merge with an In
 CUs had all been on the CPU for other reasons). Results (grB6): every regular stream identical but the known CCP merge
 blocks; the intra CUs from the CPU over the 21 streams 40621 (M58) -> 29378 (M59 / M60) -> 24816. Partial
 verification now reports the CU first in decoding order among the per-CU checks' mismatches.
+M62: IntraTMP (intra_tmp.glsl; searchCandidateFromOnePicIntra with JVET-AM0138's lists), stage 1: no LIC, fusion,
+FLM or sub-sample vector (tmpFracIdx 0), a template (else DC), up to 1024 samples (s_spPred), no OBMC. The CU's node
+(Cu::tmp: TmpHead, TMP_HEAD_*: template type, index, sampling, LIC mode, needTopLeft, the refined list's length, the
+CTU above 128, the six regions' bounds from clipMvIntraConstraint, which sortInOut repeats) waits for every block
+before it (DERIVE_PREFIX; its list record is made even without vectors around, as it records its own), builds its
+neighbours' list (bvNeighbourList, tmpSortInOut, bvCascade), runs the sparse search (regions 3, 4, 5, 0, 1, 2; rows by
+TMP_SAMPLING from the bottom, each row's start staggered; regions 4 / 5 from the first decoded block of a row; a small
+block skips a region inside a neighbour vector's window), cascades from the sparse candidates (bvCascadeStep with the
+sparse records), clusters the list's vectors into the sparse lists (adaptive windows by cost for the neighbours'
+vectors; the >128 CTU and the other window rules), refines every candidate's window, merges the top / left lists into
+the L-shape's from INIT_TL_POS. Costs (calcTemplateDiff's exact sums: weighted cost, top part, left part) are computed
+by all invocations, chunk by chunk of TMP_CHUNK positions in the CPU's order (the workgroup's scratch, TS_*), and
+invocation 0 replays updateCandList and the thresholds from them: every test is "cost < threshold", which the CPU's
+early ends cannot change. The list goes into the CU's DimdOut (DIMD_OUT_TMP_NUM, DIMD_OUT_TMP_BV: tmpXYdisp, padded
+cyclically), the vector of tmpIdx and the list's first into its record of vectors (getNeighBv). The luma block
+(DERIVE_TMP, waiting for the node) copies the reconstruction at its vector (DIMD_OUT_BV) into s_spPred and, as an EIP
+block, takes the DIMD of the prediction (mipTransformMode: intraTmpDimdMode, dimdDerivedIntraDir2nd, MTSS's choice)
+for its transforms.
+The MPM lists and chroma TMRL read an IntraTMP neighbour as planar from a record of their own (mpmModeCu), so they do
+not wait for its search. SPIR-V: ccpMergeTransformMode's gradients read the final chroma samples computed once into
+the workgroup's blending sums (the CCP-LFNST module was at 4.09M of the 4.19M IDs; now ~350k fewer); IntraTMP adds
+~141k: the modules are at 3.06M / 3.88M. Results (grT9): every regular stream identical but the known CCP merge
+blocks; 208 IntraTMP CUs on the GPU, the intra CUs from the CPU 24816 -> 24608; the rest of IntraTMP: LIC 4159 (with
+fusion 813), sub-sample vectors 1900, OBMC 919, fusion 731, FLM 589. The MPM variant's pipelines compile in 244 / 271 /
+~290 / 351 s.
 
 ## 8. Numbers (i7-10700 8C/16T, Win11, GCC 16.2, RTX 3070 driver 616.92)
 
@@ -1667,7 +1693,8 @@ Profile of a GPU-on decode (non-LTO, m2_park16, share of all samples): parsing ~
    NSPT (the m53 set; intra_rec's second module), M54 its merge fusion with DIMD chroma, M55 PDP, M56 NN intra
    prediction, M57 the MPM lists of MPM sorting, MDIP and PDP, TIMD / TMRL on the regular streams, M58 EIP, M59-M61
    block vectors: TIMD, DIMD and OBIC with vectors, the scheduler's prefix waits (partial verification of the regular
-   streams).
+   streams), M62 IntraTMP's search (its plain CUs; LIC, sub-sample vectors and OBMC need inter's LIC, interpolation
+   and OBMC, fusion and FLM their models).
    All 19 regular streams now stop at "chroma reordering / DBV" (the next sequence-level check; the block-level tools
    of step 4 follow; BVG-CCCM needs IntraTMP / IBC first).
 3. Make the GPU path win on CPU time per picture: the derive-only pass (record during parsing or a leaner pass;
