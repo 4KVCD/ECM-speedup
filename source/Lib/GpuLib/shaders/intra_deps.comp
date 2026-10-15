@@ -734,7 +734,14 @@ void main()
       const int d = BufI32( P.depTmp ).v[k];
       BufI32( P.depList ).v[BufI32( P.depOffset ).v[d] + atomicAdd( BufI32( P.numDep ).v[d], 1 )] = g_i;
     }
-    if( e == b )
+    // a node waiting for all before it (DERIVE_PREFIX, but the first) has that wait as one more dependency, which
+    // intra_rec's prefix of finished blocks releases
+    const bool prefix = ( BufTu( P.tus ).v[g_i].derive & DERIVE_PREFIX ) != 0 && g_i > 0;
+    if( prefix )
+    {
+      BufI32( P.depCount ).v[g_i] += 1;
+    }
+    if( e == b && !prefix )
     {
       BufI32( P.queue ).v[atomicAdd( BufI32( P.counter ).v[1], 1 )] = g_i;
     }

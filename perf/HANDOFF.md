@@ -449,7 +449,7 @@ wall-clock gains with threads are "the easy baseline". Decoder status: single-th
 (`--GpuLoopFilter=1`: ALF, SAO, BIF, CCSAO, LF-CCCM, offset refinement on Vulkan). The user then asked for **a full
 GPU decoder in Vulkan, optimized until nothing is left** ("The GPU decoder needs to fully decode the frame on the
 GPU"; "Your first Vulkan version is going to be slow. That's OK"). That work is branch `dec-gpurecon`: intra
-reconstruction on the GPU (`--GpuRecon`), tool levels M1-M58 done and verified bit-exact (M19: DIMD, M20: OBIC, M21:
+reconstruction on the GPU (`--GpuRecon`), tool levels M1-M61 done and verified bit-exact (M19: DIMD, M20: OBIC, M21:
 intra merge, M22: the transforms of DIMD CUs, M23: LFNST of MIP, M24: TIMD, M25: OBIC and intra merge with TIMD
 neighbours, M26: TIMD-SAD, M27: OBIC and intra merge with TIMD-SAD neighbours, M28: TIMD merge, M29: TMRL of luma,
 M30: chroma TMRL, M31: CCLM, M32: LFNST / NSPT of CCLM, M33: GLM's gradient patterns, M34: CCCM, M35: GL-CCCM, M36:
@@ -458,7 +458,7 @@ luma, M40: LM chroma fusion of CCCM, M41: CFLM, M42: GLM with luma with LFNST / 
 CCP tools, M44 / M45: the CCP models, M46: CCP merge, M47 / M48: CCP merge fusion with CCCM / DIMD chroma, M49: CCP
 merge adjustment, M50 / M51: decoder-derived CCP fusion, its merge fusion, M52: CCP merge fusion with CCCM by a blend
 model, M53 / M54: CCP merge and decoder-derived fusion with LFNST / NSPT, M55: PDP, M56: NN intra prediction, M57: the
-MPM lists of MPM sorting, MDIP and PDP, M58: EIP); it is
+MPM lists of MPM sorting, MDIP and PDP, M58: EIP, M59-M61: block vectors - TIMD, DIMD and OBIC with vectors); it is
 **not yet faster than the CPU
 decoder** (see section 8) and supports only a restricted tool set (all real CTC streams fall back to the CPU, first
 reason: chroma reordering / DBV; BVG-CCCM CUs are rejected per block).
@@ -1591,6 +1591,37 @@ counts an NN neighbour's indicesRepresentationPnn, which the GPU's NN blocks do 
 EIP neighbour sent those OBIC CUs to the CPU before) - such OBIC CUs stay on the CPU now. Not yet: EIP with a block
 vector (IntraTMP's search), EIP in inter slices (temporal candidates). Results (grE4): every regular stream identical
 but the known CCP merge blocks; per 720p intra picture ~196 EIP CUs on the GPU (~63 merge, ~88 with two models).
+M59-M61: block vectors (JVET-AM0138 and the tools before it; intra_bv.glsl). Every luma CU has a record of its block
+vectors as later CUs' lists take them (Params::bvOut, BV_OUT per CU by its CodingStructure index, getNeighBv's order:
+IBC, IntraTMP / BVG-DIMD / EIP with a vector, a DIMD CU's bvDimd, a TIMD CU's timdBv, SGPM's), written by the GPU's
+nodes or uploaded for the CPU's CUs (cpuBlockVectors), and a map of the luma units to CUs (Params::bvMap). A node
+whose CU takes vectors from the CUs around it (Cu::bvList: its list record, BV_LIST_*) builds getItmpMergeCandidate's
+list (the CUs at its 13 neighbour and 18 non-adjacent positions, bvNeighbourCus) and, for TIMD, getArBvMergeCandidate's
+cascade (per vector the CUs at the CU's centre and corners moved by it) - only where those CUs may have vectors
+(bvPotentials: from the syntax, cascaded through DIMD / TIMD / SGPM CUs), else the list is empty and there is no
+record. Such a node reads at vectors that may point anywhere decoded before, so it waits for the scheduler's prefix of
+finished blocks (DERIVE_PREFIX: intra_rec.comp keeps a done flag per block in depTmp, which intra_deps no longer needs,
+and a counter of the finished prefix moved on by compare-and-swap; whoever moves it to a waiting node releases it;
+intra_deps counts the wait as one more dependency). TIMD (intra_timd.glsl): planar, DC and the list's vectors (modes
+from TIMD_BV_IDX, their templates copied from the reconstruction) costed and scanned in batches as the CPU's first loop
+(a vector best zeroes the location dependences; deriveTimdModeSad passes over one whose template leaves the picture),
+into TimdOut (isBvTimd, timdBv; the fields' modes planar) and the CU's record; its luma block predicts those parts as
+copies (g_bvSubs, bvOfSub). DIMD, OBIC and intra merge CUs (dimdVectorChoice: getBestNonAnglularMode, both arms of
+TIMD's template, the list kept to 30 / 15, no cascade): planar's SATD against each vector's, the first of the least cost
+replaces planar's predictions (a DIMD or merge blend's planar, an OBIC blend's planar blend modes). With a vector the
+transforms of a TIMD, DIMD or OBIC block take the DIMD of its prediction (getTimdVimp / getDimdVimp: MTS and LFNST /
+NSPT; g_bvTransform defers the reconstruction as EIP's does; a TIMD CU's block writes its timdmTrType). M59: the MPM
+lists read an SGPM CU (all on the CPU) as getSpatialIpm does, its partition's angle or with regression SGPM the DIMD
+of its prediction (mpmModeCu records of one mode each), an IBC / inter neighbour as its motion field's mode, a TIMD /
+TMRL neighbour from the CPU of a TMRL CU's list in the 131-mode set (CU_KNOWN_EXT). Every DIMD / OBIC / merge node
+writes its choice, planar where it has no list: its blocks read the CU's DimdOut, which otherwise holds an earlier
+picture's (the first run mispredicted from the second picture on). Stay on the CPU: TIMD merge CUs with a neighbour
+predicting from a vector, TIMD / DIMD with a vector and MTSS, lists beyond the GPU's room (80), intra merge whose
+candidates take vectors (reorderIntraMergeCand's dimdBv), intra merge with an IntraTMP neighbour
+(getItmpBasedIntraMergeCand: the parameters at its vector - found on the way: the GPU's record had left it out; such
+CUs had all been on the CPU for other reasons). Results (grB6): every regular stream identical but the known CCP merge
+blocks; the intra CUs from the CPU over the 21 streams 40621 (M58) -> 29378 (M59 / M60) -> 24816. Partial
+verification now reports the CU first in decoding order among the per-CU checks' mismatches.
 
 ## 8. Numbers (i7-10700 8C/16T, Win11, GCC 16.2, RTX 3070 driver 616.92)
 
@@ -1634,8 +1665,9 @@ Profile of a GPU-on decode (non-LTO, m2_park16, share of all samples): parsing ~
    M50 decoder-derived CCP fusion (the m50 set), M51 decoder-derived CCP merge fusion (the m51 set), M52 CCP merge
    fusion with CCCM by a blend model (the m52 set). 2026-10-15: M53 CCP merge and decoder-derived fusion with LFNST /
    NSPT (the m53 set; intra_rec's second module), M54 its merge fusion with DIMD chroma, M55 PDP, M56 NN intra
-   prediction, M57 the MPM lists of MPM sorting, MDIP and PDP, TIMD / TMRL on the regular streams, M58 EIP (partial
-   verification of the regular streams).
+   prediction, M57 the MPM lists of MPM sorting, MDIP and PDP, TIMD / TMRL on the regular streams, M58 EIP, M59-M61
+   block vectors: TIMD, DIMD and OBIC with vectors, the scheduler's prefix waits (partial verification of the regular
+   streams).
    All 19 regular streams now stop at "chroma reordering / DBV" (the next sequence-level check; the block-level tools
    of step 4 follow; BVG-CCCM needs IntraTMP / IBC first).
 3. Make the GPU path win on CPU time per picture: the derive-only pass (record during parsing or a leaner pass;

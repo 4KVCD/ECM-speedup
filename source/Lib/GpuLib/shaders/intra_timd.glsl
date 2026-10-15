@@ -583,13 +583,15 @@ ivec2 timdKernel( int w, int h )
 // ----- the costs of a list of candidates
 
 // a candidate (a word of s_spCost): the mode predicted, the mode of its parameters and whether they take
-// getWideAngleExt's wide angles (timdParams), and the slot its costs are added to
+// getWideAngleExt's wide angles (timdParams), and the slot its costs are added to. A mode from a block vector (from
+// TIMD_BV_IDX) takes the field's top quarter
 uint timdCand( int mode, int dirMode, bool checkWA, int slot )
 {
-  return uint( mode + 256 ) | uint( dirMode ) << 10 | ( checkWA ? 1u : 0u ) << 18 | uint( slot ) << 19;
+  const int field = mode >= TIMD_BV_IDX ? mode - TIMD_BV_IDX + 768 : mode + 256;
+  return uint( field ) | uint( dirMode ) << 10 | ( checkWA ? 1u : 0u ) << 18 | uint( slot ) << 19;
 }
 
-int  timdCandMode( uint w ) { return int( w & 1023u ) - 256; }
+int  timdCandMode( uint w ) { const int f = int( w & 1023u ); return f >= 768 ? f - 768 + TIMD_BV_IDX : f - 256; }
 int  timdCandDir( uint w )  { return int( ( w >> 10 ) & 255u ); }
 bool timdCandWA( uint w )   { return ( w & ( 1u << 18 ) ) != 0u; }
 int  timdCandSlot( uint w ) { return int( w >> 19 ); }
@@ -634,7 +636,17 @@ void timdTemplateCosts( Cu c, TemplateUnits t, int candBase, int numCands, int c
       const TimdParams p    = timdParams( timdCandDir( cand ), c.w, c.h, noPdpc, timdCandWA( cand ) );
       const int x = s < nA ? t.tw + s % c.w : ( s - nA ) % t.tw;
       const int y = s < nA ? s / c.w : t.th + ( s - nA ) / t.tw;
-      s_tmp[i] = int16_t( timdPredict( timdCandMode( cand ), p, x, y, c.w, c.h, t.tw, t.th, dc, maxPel ) );
+      const int mode = timdCandMode( cand );
+      if( mode >= TIMD_BV_IDX )   // a block vector's: the reconstruction there (predTimdIbcItmp; clamped to the picture
+      {                           // for a vector that TIMD-SAD's thicker template passes over)
+        const ivec2 bv = bvListAt( mode - TIMD_BV_IDX );
+        s_tmp[i] = int16_t( recoAt( 0, clamp( c.x - t.tw + x + bv.x, 0, P.width[0] - 1 ),
+                                    clamp( c.y - t.th + y + bv.y, 0, P.height[0] - 1 ) ) );
+      }
+      else
+      {
+        s_tmp[i] = int16_t( timdPredict( mode, p, x, y, c.w, c.h, t.tw, t.th, dc, maxPel ) );
+      }
     }
     for( int i = lid; mrsad && i < 2 * n; i += NT )
     {
@@ -691,6 +703,7 @@ const int TC_COST_L   = TC_COST_A + TIMD_CANDS;    // the left arm's (tmpCost1)
 const int TC_NUM      = TC_COST_L + TIMD_CANDS;    // the first batch's candidates
 const int TC_NUM_B    = TC_NUM + 1;                // the second batch's candidates
 const int TC_END_LIST = TC_NUM + 2;                // the end of the list's modes in the first batch
+const int TC_NUM_BV   = TC_NUM + 3;                // the length of the CU's list of block vectors
 
 const int TIMD_COST_LIST     = NUM_MPM + 2;   // m_timdModeCostList: the MPM list's angular modes, HOR and VER
 const int TIMD_SAD_LIST      = 25;            // deriveTimdModeSad's list (TIMD_NUM_MODES_SORTED + 10)
@@ -915,8 +928,9 @@ void timdSadListAdd( int m, int timdMode, int timdSecondary, bool blended, inout
 // 2 to lastList, by cost, then mode: std::stable_sort of the pairs), the CU's DIMD modes (its DimdOut slot cuIndex),
 // HOR, VER and the modes around those deriveTimdMode found (timdFields) and around DIMD's (timdSadRefinedMode); each
 // mode once, none of the modes TIMD found (its secondary only where they blend) - then the wide angles beyond the
-// regular ones as deriveTimdMode's (TIMD-SAD's code runs in a pipeline of its own: VARIANT_TIMD_SAD)
-void timdSadCandidates( int timdFields[TIMD_OUT_FIELDS], int cuIndex, int lastList, int W, int H, TimdAngleRange range )
+// regular ones as deriveTimdMode's (TIMD-SAD's code runs in a pipeline of its own: VARIANT_TIMD_SAD). The list into
+// list (n modes) first, the candidates from it by timdSadSlots (with block vectors their batches in between)
+void timdSadList( int timdFields[TIMD_OUT_FIELDS], int cuIndex, int lastList, out int list[TIMD_SAD_LIST], out int n )
 {
   uint64_t costs[TIMD_COST_LIST];
   int      modes[TIMD_COST_LIST];
@@ -937,8 +951,7 @@ void timdSadCandidates( int timdFields[TIMD_OUT_FIELDS], int cuIndex, int lastLi
   const int  timdMode = timdFields[TIMD_OUT_MODE], timdSecondary = timdFields[TIMD_OUT_SECONDARY];
   const bool blended  = timdFields[TIMD_OUT_BLENDED] != 0;
   uint used[3] = uint[3]( 0u, 0u, 0u );
-  int  list[TIMD_SAD_LIST];
-  int  n = 0;
+  n = 0;
   // the sorted modes until min(15, the list's size) of them are taken (those skipped not counted)
   for( int i = 0; i < numCosts && n < min( numCosts, TIMD_SAD_SORTED ); i++ )
   {
@@ -967,6 +980,11 @@ void timdSadCandidates( int timdFields[TIMD_OUT_FIELDS], int cuIndex, int lastLi
     timdSadListAdd( timdSadRefinedMode( i, timd67, second67, dimdMode, dimdBlend, dimdBlending ), timdMode, timdSecondary,
                     blended, used, list, n );
   }
+}
+
+// deriveTimdModeSad's first batch from its list (n modes, timdSadList): planar, DC, the list, the wide angles
+void timdSadSlots( int list[TIMD_SAD_LIST], int n, int W, int H, TimdAngleRange range )
+{
   int slot = 0;
   s_spCost[TC_CAND + slot] = timdCand( PLANAR_IDX, PLANAR_IDX, true, slot );
   slot++;
@@ -985,15 +1003,20 @@ void timdSadCandidates( int timdFields[TIMD_OUT_FIELDS], int cuIndex, int lastLi
 // planar and DC set the non-angular mode; the list's modes (to endList), then the wide angles (where the scan gets that
 // far) end once the secondary cost is at most maxCost, the wide angles after one at least. With skipAbove
 // (deriveTimdModeSad with both arms, JVET-AN0093) the scan passes over a list mode whose above arm alone costs the
-// secondary cost or more, before that test. Returns the slot of the last list mode the scan took (its early end)
-int timdScanFirst( inout TimdScan s, int numCands, int endList, int type, int log2A, int log2L, uint64_t maxCost, bool skipAbove )
+// secondary cost or more, before that test. Returns the slot of the last list mode the scan took (its early end).
+// continued: planar, DC and the block vectors were scanned before (timdScanVectors), the scan starts with the list
+int timdScanFirst( inout TimdScan s, int numCands, int endList, int type, int log2A, int log2L, uint64_t maxCost,
+                   bool skipAbove, bool continued )
 {
-  s.best = s.secondary = s.nonAng = ~0ul;
-  s.bestMode = s.secMode = s.nonAngMode = PLANAR_IDX;
-  s.bestWA = s.secWA = true;
-  s.locDep = int[3]( 0, 0, 0 );
+  if( !continued )
+  {
+    s.best = s.secondary = s.nonAng = ~0ul;
+    s.bestMode = s.secMode = s.nonAngMode = PLANAR_IDX;
+    s.bestWA = s.secWA = true;
+    s.locDep = int[3]( 0, 0, 0 );
+  }
   int lastList = endList - 1;
-  for( int k = 0; k < numCands; k++ )
+  for( int k = continued ? 2 : 0; k < numCands; k++ )
   {
     if( skipAbove && k >= 2 && k < endList && uint64_t( s_spCost[TC_COST_A + k] ) >= s.secondary )
     {
@@ -1038,6 +1061,79 @@ int timdScanFirst( inout TimdScan s, int numCands, int endList, int type, int lo
     }
   }
   return lastList;
+}
+
+// the CPU's first loop with block vectors (deriveTimdMode's bFull loop, deriveTimdModeSad's alike): planar, DC, then
+// the list's vectors (modes from TIMD_BV_IDX), num of them at slots 0 .. num - 1 (first: the loop's start, planar at
+// slot 0), strictly less replacing, each one becoming the best also the non-angular mode. A vector's mode counts as
+// angular for the location dependences, which it zeroes (deriveTimdModeSad's stay 0). deriveTimdModeSad's loop (sad)
+// passes over a vector whose template block would start left of or above the picture (template t of CU c)
+void timdScanVectors( inout TimdScan s, int num, bool first, int type, int log2A, int log2L, bool sad, Cu c,
+                      TemplateUnits t )
+{
+  if( first )
+  {
+    s.best = s.secondary = s.nonAng = ~0ul;
+    s.bestMode = s.secMode = s.nonAngMode = PLANAR_IDX;
+    s.bestWA = s.secWA = true;
+    s.locDep = int[3]( 0, 0, 0 );
+  }
+  for( int k = 0; k < num; k++ )
+  {
+    const uint64_t cost = timdCost( k );
+    const int      mode = timdCandMode( s_spCost[TC_CAND + k] );
+    if( sad && mode >= TIMD_BV_IDX )
+    {
+      const ivec2 bv = bvListAt( mode - TIMD_BV_IDX );
+      if( c.x - t.tw + bv.x < 0 || c.y - t.th + bv.y < 0 )
+      {
+        continue;
+      }
+    }
+    const int      ld   = timdLocDep( type, s_spCost[TC_COST_A + k], s_spCost[TC_COST_L + k], log2A, log2L );
+    if( cost < s.best )
+    {
+      s.secondary  = s.best;
+      s.secMode    = s.bestMode;
+      s.best       = cost;
+      s.bestMode   = mode;
+      s.nonAng     = cost;
+      s.nonAngMode = mode;
+      s.locDep     = mode > DC_IDX ? int[3]( 0, 0, 0 ) : int[3]( ld, s.locDep[0], ld );
+    }
+    else if( cost < s.secondary )
+    {
+      s.secondary = cost;
+      s.secMode   = mode;
+      s.locDep[1] = mode > DC_IDX ? 0 : ld;
+    }
+  }
+}
+
+// the CPU's first loop with numBv block vectors of the CU's list (all invocations, uniform control flow): planar, DC
+// and the vectors as candidates in batches of TIMD_CANDS, their costs (mrsad: deriveTimdModeSad's), each batch scanned
+// by invocation 0 (timdScanVectors)
+void timdVectorBatches( Cu c, TemplateUnits t, int numBv, int dc, int maxPel, bool noPdpc, bool mrsad, inout TimdScan s,
+                        int type, int log2A, int log2L, int lid, int NT )
+{
+  for( int base = 0; base < 2 + numBv; base += TIMD_CANDS )
+  {
+    const int n = min( TIMD_CANDS, 2 + numBv - base );
+    for( int k = lid; k < n; k += NT )
+    {
+      const int e = base + k;   // planar, DC, then the vectors
+      s_spCost[TC_CAND + k]   = timdCand( e < 2 ? e : TIMD_BV_IDX + e - 2, e < 2 ? e : PLANAR_IDX, true, k );
+      s_spCost[TC_COST_A + k] = 0u;
+      s_spCost[TC_COST_L + k] = 0u;
+    }
+    SYNC();
+    timdTemplateCosts( c, t, TC_CAND, n, TC_COST_A, TC_COST_L, dc, maxPel, noPdpc, mrsad, lid, NT );
+    if( lid == 0 )
+    {
+      timdScanVectors( s, n, base == 0, type, log2A, log2L, mrsad, c, t );   // (mrsad: deriveTimdModeSad's loop)
+    }
+    SYNC();
+  }
 }
 
 // the second batch: of the best and the secondary mode's neighbours those the CPU tries (angular ones; of a wide angle
@@ -1150,18 +1246,35 @@ void timdFinal( TimdScan s, int W, int H, bool sad, out int fields[TIMD_OUT_FIEL
   {
     s.locDep = int[3]( 0, 0, 0 );
   }
-  fields = int[TIMD_OUT_FIELDS]( s.bestMode, -1, -1, blended ? 1 : 0, -1, -1, -1, s.locDep[0], s.locDep[1], s.locDep[2],
-                                 s.bestWA ? 1 : 0, 1 );
+  // a mode from a block vector is planar in the fields, its vector beside them (isBvTimd, timdBv)
+  const bool bvBest = s.bestMode >= TIMD_BV_IDX, bvSec = blended && s.secMode >= TIMD_BV_IDX;
+  fields = int[TIMD_OUT_FIELDS]( bvBest ? PLANAR_IDX : s.bestMode, -1, -1, blended ? 1 : 0, -1, -1, -1, s.locDep[0],
+                                 s.locDep[1], s.locDep[2], s.bestWA ? 1 : 0, 1, 0, 0, 0, 0 );
+  if( bvBest )
+  {
+    fields[TIMD_OUT_BV_FLAGS] = 1;
+    fields[TIMD_OUT_BV]       = bvPack( bvListAt( s.bestMode - TIMD_BV_IDX ) );
+  }
   if( blended )
   {
-    fields[TIMD_OUT_SECONDARY]    = s.secMode;
+    fields[TIMD_OUT_SECONDARY]    = bvSec ? PLANAR_IDX : s.secMode;
     fields[TIMD_OUT_SEC_CHECK_WA] = s.secWA ? 1 : 0;
+    if( bvSec )
+    {
+      fields[TIMD_OUT_BV_FLAGS] |= 2;
+      fields[TIMD_OUT_BV + 1]    = bvPack( bvListAt( s.secMode - TIMD_BV_IDX ) );
+    }
     const bool nonAngFusion = ( s.nonAng < s.best || s.nonAng - s.best < ( s.best >> 1 ) ) && s.bestMode != s.nonAngMode
-                              && s.secMode != s.nonAngMode;
+                              && s.secMode != s.nonAngMode && ( s.nonAngMode < TIMD_BV_IDX || ( !bvBest && !bvSec ) );
     if( nonAngFusion )   // each weight (sum - cost) / (2 sum) in 1/64 rounded, as the CPU's doubles give it
     {
       const uint64_t sum = s.best + s.secondary + s.nonAng;
-      fields[TIMD_OUT_NON_ANG]    = s.nonAngMode;
+      fields[TIMD_OUT_NON_ANG]    = s.nonAngMode >= TIMD_BV_IDX ? PLANAR_IDX : s.nonAngMode;
+      if( s.nonAngMode >= TIMD_BV_IDX )
+      {
+        fields[TIMD_OUT_BV_FLAGS] |= 4;
+        fields[TIMD_OUT_BV + 2]    = bvPack( bvListAt( s.nonAngMode - TIMD_BV_IDX ) );
+      }
       fields[TIMD_OUT_WEIGHT]     = int( ( 64ul * ( sum - s.best ) + sum ) / ( 2ul * sum ) );
       fields[TIMD_OUT_WEIGHT + 1] = int( ( 64ul * ( sum - s.secondary ) + sum ) / ( 2ul * sum ) );
       fields[TIMD_OUT_WEIGHT + 2] = 64 - fields[TIMD_OUT_WEIGHT] - fields[TIMD_OUT_WEIGHT + 1];
@@ -1219,7 +1332,7 @@ int timdNode( Cu c, int cuIndex, int nbrMode[MPM_NEIGHBOURS], int dimdModes[3], 
   mtssSecond = -1;
   if( head.type == TIMD_NONE )   // the picture's top-left CU: planar, the other fields at their initial values
   {
-    fields = int[TIMD_OUT_FIELDS]( PLANAR_IDX, -1, -1, 0, -1, -1, -1, 0, 0, 0, 1, 1 );
+    fields = int[TIMD_OUT_FIELDS]( PLANAR_IDX, -1, -1, 0, -1, -1, -1, 0, 0, 0, 1, 1, 0, 0, 0, 0 );
     if( lid == 0 )
     {
       timdStore( outBase, fields );
@@ -1240,23 +1353,35 @@ int timdNode( Cu c, int cuIndex, int nbrMode[MPM_NEIGHBOURS], int dimdModes[3], 
   int            neighbourMode[TIMD_SECOND_BATCH];
   bool           neighbourValid[TIMD_SECOND_BATCH];
 
-  // deriveTimdMode: its first batch, the template's references, DC's value and costs, the CPU's scan, the second
-  // batch's costs, the refinement and the final choice
+  // deriveTimdMode: with block vectors their list, then planar, DC and the vectors in batches, scanned in turn; its
+  // first batch, the template's references, DC's value and costs, the CPU's scan, the second batch's costs, the
+  // refinement and the final choice
   SYNC();   // (dimdSelect has read its histograms)
+  if( c.bvList >= 0 && lid == 0 )
+  {
+    s_spCost[TC_NUM_BV] = uint( bvMergeList( c, g_ti ) );
+  }
+  timdFillReference( head.t, BufI32( P.timdData ), c.timd + TIMD_HEAD, 0, c.x, c.y, c.w, c.h, TIMD_REF_SHIFT,
+                     bitDepth, lid, NT );
+  const int dc    = timdDc( head.t, c.w, c.h, lid, NT );   // (a barrier: the list's length visible)
+  const int numBv = c.bvList >= 0 ? int( s_spCost[TC_NUM_BV] ) : 0;
+  if( numBv > 0 )
+  {
+    timdVectorBatches( c, head.t, numBv, dc, maxPel, noPdpc, false, scan, head.type, log2A, log2L, lid, NT );
+  }
   if( lid == 0 )
   {
     timdMpmCandidates( c, nbrMode, dimdModes, range );
   }
-  timdFillReference( head.t, BufI32( P.timdData ), c.timd + TIMD_HEAD, 0, c.x, c.y, c.w, c.h, TIMD_REF_SHIFT,
-                     bitDepth, lid, NT );
-  const int dc       = timdDc( head.t, c.w, c.h, lid, NT );
+  SYNC();
   const int numCands = int( s_spCost[TC_NUM] );
   timdTemplateCosts( c, head.t, TC_CAND, numCands, TC_COST_A, TC_COST_L, dc, maxPel, noPdpc, false, lid, NT );
   const uint64_t maxCost  = uint64_t( tw * c.h + th * c.w );
   int            lastList = 0;
   if( lid == 0 )
   {
-    lastList = timdScanFirst( scan, numCands, int( s_spCost[TC_END_LIST] ), head.type, log2A, log2L, maxCost, false );
+    lastList = timdScanFirst( scan, numCands, int( s_spCost[TC_END_LIST] ), head.type, log2A, log2L, maxCost, false,
+                              numBv > 0 );
     timdSecondBatch( scan, numCands, c.w, c.h, range, neighbourMode, neighbourValid );
   }
   SYNC();
@@ -1274,22 +1399,34 @@ int timdNode( Cu c, int cuIndex, int nbrMode[MPM_NEIGHBOURS], int dimdModes[3], 
   // CPU clips it), the mean-removed SAD, JVET-AN0093's pass with both arms, no location dependence
   if( sad )
   {
+    int sadList[TIMD_SAD_LIST];   // (invocation 0's)
+    int sadNum = 0;
     if( lid == 0 )
     {
-      timdSadCandidates( fields, cuIndex, lastList, c.w, c.h, range );
+      timdSadList( fields, cuIndex, lastList, sadList, sadNum );
     }
     SYNC();
     const int unitsAt = c.timd + TIMD_HEAD + ( ( head.t.totalUnits + 31 ) >> 5 );
     timdFillReference( head.ts, BufI32( P.timdData ), unitsAt, 0, c.x, c.y, c.w, c.h, TIMD_REF_SHIFT, bitDepth, lid,
                        NT );
-    const int dcSad   = timdDc( head.ts, c.w, c.h, lid, NT );
-    const int numSad  = int( s_spCost[TC_NUM] );
+    const int dcSad = timdDc( head.ts, c.w, c.h, lid, NT );
+    if( numBv > 0 )
+    {
+      timdVectorBatches( c, head.ts, numBv, dcSad, maxPel, noPdpc, true, scan, head.type, log2A, log2L, lid, NT );
+    }
+    if( lid == 0 )
+    {
+      timdSadSlots( sadList, sadNum, c.w, c.h, range );
+    }
+    SYNC();
+    const int numSad = int( s_spCost[TC_NUM] );
     timdTemplateCosts( c, head.ts, TC_CAND, numSad, TC_COST_A, TC_COST_L, dcSad, maxPel, noPdpc, true, lid, NT );
     const uint64_t maxCostSad = uint64_t( ( head.type == TIMD_ABOVE ? 2 : head.ts.tw ) * c.h
                                           + ( head.type == TIMD_LEFT ? 2 : head.ts.th ) * c.w );
     if( lid == 0 )
     {
-      timdScanFirst( scan, numSad, int( s_spCost[TC_END_LIST] ), head.type, log2A, log2L, maxCostSad, head.type == TIMD_BOTH );
+      timdScanFirst( scan, numSad, int( s_spCost[TC_END_LIST] ), head.type, log2A, log2L, maxCostSad,
+                     head.type == TIMD_BOTH, numBv > 0 );
       timdSecondBatch( scan, numSad, c.w, c.h, range, neighbourMode, neighbourValid );
     }
     SYNC();
@@ -1306,14 +1443,70 @@ int timdNode( Cu c, int cuIndex, int nbrMode[MPM_NEIGHBOURS], int dimdModes[3], 
   {
     return -1;
   }
-  // the modes the blocks predict: a TIMD-SAD CU's deriveTimdModeSad's
+  // the modes the blocks predict: a TIMD-SAD CU's deriveTimdModeSad's; its vectors for the lists of the CUs after it
+  // (getNeighBv takes a TIMD-SAD CU's of deriveTimdModeSad)
   if( fields[TIMD_OUT_BLENDED] != 0 )
   {
     mtssSecond = timdMode67( fields[TIMD_OUT_SECONDARY] );
   }
+  if( c.bvList >= 0 )
+  {
+    ivec2 bv[3];
+    int   num = 0;
+    for( int k = 0; k < 3; k++ )
+    {
+      if( ( ( fields[TIMD_OUT_BV_FLAGS] >> k ) & 1 ) != 0 )
+      {
+        bv[num++] = bvUnpack( fields[TIMD_OUT_BV + k] );
+      }
+    }
+    bvStore( c, num, bv );
+  }
   const int mode = timdMode67( fields[TIMD_OUT_MODE] );
   timdStoreTransforms( head, c, mode );
   return mode;
+}
+
+// ----- a DIMD, OBIC or intra merge CU's choice of planar or a block vector (IntraPrediction::getBestNonAnglularMode,
+// JVET-AG0146): with both arms of TIMD's template (its record after the list's, BV_LIST), the SATD of planar's template
+// prediction and of the reconstruction at each vector of its list (getItmpMergeCandidate's, kept to its first 30 / 15)
+// against the template, the first of the least cost; a vector chosen replaces planar's predictions of the CU
+// (isBvDimd, bvDimd: into its DimdOut and its record of vectors). All invocations, uniform control flow
+void dimdVectorChoice( Cu c, int cuIndex, int bitDepth, bool noPdpc, int lid, int NT )
+{
+  BufI32              data = BufI32( P.timdData );
+  const TemplateUnits t    = templateUnitsAt( data, c.bvList + BV_LIST );
+  SYNC();   // (the node's shared arrays are free)
+  if( lid == 0 )
+  {
+    s_spCost[TC_NUM_BV] = uint( bvMergeList( c, g_ti ) );
+  }
+  timdFillReference( t, data, c.bvList + BV_LIST + TEMPLATE_UNITS, 0, c.x, c.y, c.w, c.h, TIMD_REF_SHIFT, bitDepth, lid,
+                     NT );
+  SYNC();
+  const int n = 1 + int( s_spCost[TC_NUM_BV] );   // planar, then the vectors (at most 31 candidates)
+  for( int k = lid; k < n; k += NT )
+  {
+    s_spCost[TC_CAND + k]   = timdCand( k == 0 ? PLANAR_IDX : TIMD_BV_IDX + k - 1, PLANAR_IDX, true, k );
+    s_spCost[TC_COST_A + k] = 0u;
+    s_spCost[TC_COST_L + k] = 0u;
+  }
+  SYNC();
+  timdTemplateCosts( c, t, TC_CAND, n, TC_COST_A, TC_COST_L, 0, ( 1 << bitDepth ) - 1, noPdpc, false, lid, NT );
+  if( lid == 0 )
+  {
+    int best = 0;
+    for( int k = 1; k < n; k++ )
+    {
+      best = timdCost( k ) < timdCost( best ) ? k : best;
+    }
+    CBufI32     o  = CBufI32( P.dimdOut );
+    const ivec2 bv = best > 0 ? bvListAt( best - 1 ) : ivec2( 0 );
+    o.v[cuIndex * DIMD_OUT + DIMD_OUT_BV_FLAG] = best > 0 ? 1 : 0;
+    o.v[cuIndex * DIMD_OUT + DIMD_OUT_BV]      = best > 0 ? bvPack( bv ) : 0;
+    ivec2 bvs[3] = ivec2[3]( bv, bv, bv );
+    bvStore( c, best > 0 ? 1 : 0, bvs );
+  }
 }
 
 // ----- a TIMD merge CU's node (IntraPrediction::deriveTimdMergeModes, JVET-AJ0061; NUM_TIMD_MERGE_MODES 1): its
@@ -1418,7 +1611,7 @@ int timdMergeNode( Cu c, int bitDepth, bool noPdpc, out int mtssSecond, int lid,
   }
   // its fields (every mode's wide angle getWideAngleExt's: timdMrgModeCheckWA), its transform types; without a
   // candidate (the CPU cannot decode such a CU) planar
-  int fields[TIMD_OUT_FIELDS] = int[TIMD_OUT_FIELDS]( PLANAR_IDX, -1, -1, 0, -1, -1, -1, 0, 0, 0, 1, 1 );
+  int fields[TIMD_OUT_FIELDS] = int[TIMD_OUT_FIELDS]( PLANAR_IDX, -1, -1, 0, -1, -1, -1, 0, 0, 0, 1, 1, 0, 0, 0, 0 );
   int trHor = TR_DCT2, trVer = TR_DCT2;
   if( num > 0 )
   {

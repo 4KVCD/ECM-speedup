@@ -108,6 +108,13 @@ int    g_crsScale;  // its scale (Reshape::calculateChromaAdj)
 // takes (-1: the same)
 bool   g_deferRecon;
 int    g_secMode;
+// a block's predictions that are copies of the reconstruction at a block vector (not with ISP; bvOfSub): bit k for
+// its k-th prediction of a blend (a TIMD block's mode, secondary, non-angular one; a DIMD or intra merge block's
+// planar, an OBIC block's planar blend modes), the main one's alone without blending; with g_bvTransform its
+// transforms take the DIMD of its prediction (PU::isBvTimdApplied / isBvDimdApplied: getTimdVimp / getDimdVimp), which
+// its CU's records keep apart
+int    g_bvSubs;
+bool   g_bvTransform;
 // blending (a DERIVE_DIMD block whose CU's DIMD blends, a DERIVE_OBIC or DERIVE_MERGE block): the predictions of the
 // CU's modes (s_blendMode: DIMD's or the intra merge candidate's main mode, planar and blend modes, OBIC's modes) are
 // summed per location dependence class (emitPred), weighted, in the workgroup's BLEND_ACC sums at the start of the
@@ -328,7 +335,8 @@ void selectTransform( inout Tu t, int mode, int plIdx )
     }
     else
     {
-      int m = WITH_DIMD && ( t.derive & ( DERIVE_DIMD | DERIVE_OBIC ) ) != 0
+      // (with a block vector the DIMD of the prediction, mode)
+      int m = WITH_DIMD && !g_bvTransform && ( t.derive & ( DERIVE_DIMD | DERIVE_OBIC ) ) != 0
                 ? CBufI32( P.dimdOut ).v[t.cu * DIMD_OUT + DIMD_OUT_MODE] : g_secMode >= 0 ? g_secMode : mode;
       if( luma && m == PLANAR_IDX )
       {
@@ -668,8 +676,11 @@ void mipTransformMode( Tu t, int W, int H, int ps, int upH, int upV, int predStr
     s_predDimdMode = first;
     CBufI32   o    = CBufI32( P.dimdOut );
     const int base = t.cu * DIMD_OUT;
-    o.v[base + DIMD_OUT_MODE]      = first;
-    o.v[base + DIMD_OUT_TR_SECOND] = second;
+    if( !g_bvTransform )   // (the CU's DimdOut keeps its DIMD)
+    {
+      o.v[base + DIMD_OUT_MODE]      = first;
+      o.v[base + DIMD_OUT_TR_SECOND] = second;
+    }
     if( ( t.derive & DERIVE_MTSS ) != 0 )
     {
       const ivec3 list   = ivec3( o.v[base + DIMD_OUT_MTSS_LIST], o.v[base + DIMD_OUT_MTSS_LIST + 1], o.v[base + DIMD_OUT_MTSS_LIST + 2] );
@@ -695,6 +706,7 @@ ivec2 wgSum2( int a, int b, int slot )
   return ivec2( s_red[slot], s_red[slot + 1] );
 }
 
+#include "intra_bv.glsl"
 #include "intra_timd.glsl"
 #include "intra_merge.glsl"
 
@@ -745,6 +757,14 @@ void timdModeParams( inout Tu t, int mode, bool checkWA )
   t.useCubic  = 1;
   t.applyPDPC = pdpc ? 1 : 0;
   t.plIdx     = 0;
+}
+
+// the block vector of prediction sub of block t (g_bvSubs): a TIMD block's of that prediction (TimdOut), another's its
+// CU's choice instead of planar (DimdOut's bvDimd)
+ivec2 bvOfSub( Tu t, int sub )
+{
+  return bvUnpack( ( t.derive & DERIVE_TIMD ) != 0 ? CBufI32( P.timdOut ).v[timdPredBase( t.cu ) + TIMD_OUT_BV + sub]
+                                                   : CBufI32( P.dimdOut ).v[t.cu * DIMD_OUT + DIMD_OUT_BV] );
 }
 
 // a TIMD block's blend (xGetNumTapsTIMD): the filter lengths of its mode (x) and its secondary mode (y), from its modes
@@ -1340,27 +1360,55 @@ void signPrediction( Tu t, int lid, int NT )
   }
 }
 
+// a dependency of block d gone (its count decremented); its last queues it, or the workgroup continues with it
+void releaseOne( int d )
+{
+  if( atomicAdd( CBufI32( P.depCount ).v[d], -1, gl_ScopeQueueFamily, gl_StorageSemanticsBuffer,
+                 gl_SemanticsAcquireRelease ) == 1 )
+  {
+    if( atomicCompSwap( s_next, -1, d ) != -1 )
+    {
+      const int pos = atomicAdd( CBufI32( P.counter ).v[1], 1 );
+      atomicStore( CBufI32( P.queue ).v[pos], d, gl_ScopeQueueFamily, gl_StorageSemanticsBuffer, gl_SemanticsRelease );
+    }
+  }
+}
+
 // the end of a block or node: its results (device-coherent stores of all invocations: samples, a node's mode) happen
 // before its dependents (d0 .. d1 in depList, the first ones prefetched in s_deps) are released; the last dependency of
-// a block to finish takes it over (one per block, the workgroup continues with it) or queues it
+// a block to finish takes it over (one per block, the workgroup continues with it) or queues it. Then the prefix of
+// finished blocks and nodes in decoding order (counter[3]; per block a done flag in depTmp, which intra_deps no longer
+// needs): each finisher moves it on over the finished ones, by compare-and-swap, and whoever moves it to a node waiting
+// for all before it (DERIVE_PREFIX) releases that node
 void releaseDependents( int d0, int d1, int lid, int NT )
 {
   controlBarrier( gl_ScopeWorkgroup, gl_ScopeQueueFamily, gl_StorageSemanticsBuffer, gl_SemanticsAcquireRelease );
   for( int k = lid; k < d1 - d0; k += NT )
   {
-    const int d = k < 256 ? s_deps[k] : BufI32( P.depList ).v[d0 + k];
-    if( atomicAdd( CBufI32( P.depCount ).v[d], -1, gl_ScopeQueueFamily, gl_StorageSemanticsBuffer, gl_SemanticsAcquireRelease ) == 1 )
-    {
-      if( atomicCompSwap( s_next, -1, d ) != -1 )
-      {
-        const int pos = atomicAdd( CBufI32( P.counter ).v[1], 1 );
-        atomicStore( CBufI32( P.queue ).v[pos], d, gl_ScopeQueueFamily, gl_StorageSemanticsBuffer, gl_SemanticsRelease );
-      }
-    }
+    releaseOne( k < 256 ? s_deps[k] : BufI32( P.depList ).v[d0 + k] );
   }
   if( lid == 0 )
   {
-    atomicAdd( CBufI32( P.counter ).v[2], 1 );   // finished blocks and nodes
+    CBufI32 done = CBufI32( P.depTmp ), counter = CBufI32( P.counter );
+    atomicStore( done.v[g_ti], 1, gl_ScopeQueueFamily, gl_StorageSemanticsBuffer, gl_SemanticsRelease );
+    int p = atomicLoad( counter.v[3], gl_ScopeQueueFamily, gl_StorageSemanticsBuffer, gl_SemanticsAcquire );
+    while( p < pc.numTus
+           && atomicLoad( done.v[p], gl_ScopeQueueFamily, gl_StorageSemanticsBuffer, gl_SemanticsAcquire ) != 0 )
+    {
+      const int seen = atomicCompSwap( counter.v[3], p, p + 1, gl_ScopeQueueFamily, gl_StorageSemanticsBuffer,
+                                       gl_SemanticsAcquireRelease, gl_StorageSemanticsBuffer, gl_SemanticsAcquire );
+      if( seen != p )
+      {
+        p = seen;   // another finisher moved it
+        continue;
+      }
+      p++;
+      if( p < pc.numTus && ( BufTu( P.tus ).v[p].derive & DERIVE_PREFIX ) != 0 )
+      {
+        releaseOne( p );
+      }
+    }
+    atomicAdd( counter.v[2], 1 );   // finished blocks and nodes
   }
 }
 
@@ -1433,6 +1481,8 @@ void main()
     Tu t = BufTu( P.tus ).v[g_ti];
     g_deferRecon = WITH_DERIVED_TRANSFORMS && ( t.derive & ( DERIVE_PNN_DIMD | DERIVE_EIP ) ) != 0;
     g_secMode    = -1;
+    g_bvSubs     = 0;
+    g_bvTransform = false;
     // the dependents, prefetched (their release ends the block)
     const int d0 = BufI32( P.depOffset ).v[g_ti], d1 = BufI32( P.depOffset ).v[g_ti + 1];
     if( lid < d1 - d0 )
@@ -1548,6 +1598,20 @@ void main()
       if( lid == 0 && c.kind != CU_KNOWN )   // (a MIP CU's node, CU_KNOWN, keeps the host's mode)
       {
         CBufI32( P.cuMode ).v[t.cu] = cuMode;
+      }
+      // a DIMD, OBIC or intra merge CU's choice of planar or a block vector (intra_timd.glsl), where the CUs around it
+      // may have vectors; else planar (its blocks read the choice from its DimdOut, which holds an earlier picture's)
+      if( WITH_DIMD && ( c.kind == CU_DIMD || c.kind == CU_OBIC || c.kind == CU_MERGE ) )
+      {
+        if( c.bvList >= 0 )
+        {
+          dimdVectorChoice( c, t.cu, t.bitDepth, ( t.derive & DERIVE_NO_PDPC ) != 0, lid, NT );
+        }
+        else if( lid == 0 )
+        {
+          CBufI32( P.dimdOut ).v[t.cu * DIMD_OUT + DIMD_OUT_BV_FLAG] = 0;
+          CBufI32( P.dimdOut ).v[t.cu * DIMD_OUT + DIMD_OUT_BV]      = 0;
+        }
       }
       // MTSS (a DIMD, OBIC, intra merge, TIMD or MIP CU with mdirIdx): its mode list from histograms of its own
       // (deriveDimdModeList), once dimdSelect and obicSelect have read theirs, then the LFNST / NSPT mode and bucket of its
@@ -1667,6 +1731,9 @@ void main()
         t.fusion = blending ? ( blendFuses ? 1 : 0 )
                             : ( t.derive & DERIVE_FETCH2ND ) != 0 && t.dirMode > DC_IDX && ( abs( t.intraPredAngle ) & 63 ) != 0 ? 1 : 0;
         t.bf     = blending && ( t.derive & DERIVE_BF ) != 0 ? 1 : 0;   // (of the blend)
+        // predictions from block vectors (not with ISP)
+        g_bvSubs      = t.isp == 0 ? o.v[timdOut + TIMD_OUT_BV_FLAGS] & ( blending ? 7 : 1 ) : 0;
+        g_bvTransform = g_bvSubs != 0;
       }
       else if( WITH_TMRL && ( t.derive & DERIVE_TMRL ) != 0 )   // its node's mode and line (intra_tmrl.glsl)
       {
@@ -1684,7 +1751,20 @@ void main()
         const bool blending = s_blendNum != 0;
         t.fusion = blending ? 0 : t.fusion;
         t.bf     = blending && ( t.derive & DERIVE_BF ) != 0 ? 1 : 0;
+        // with a block vector its planar predictions copies at it: a DIMD or intra merge blend's planar one, an OBIC
+        // blend's planar blend modes; then a DIMD or OBIC block's transforms by the DIMD of its prediction
+        if( t.isp == 0 && CBufI32( P.dimdOut ).v[t.cu * DIMD_OUT + DIMD_OUT_BV_FLAG] != 0 )
+        {
+          for( int k = 1; blending && k < BLEND_MAX; k++ )
+          {
+            g_bvSubs |= ( obicCu ? s_blendMode[k] == PLANAR_IDX && s_blendW[k] != 0 : k == 1 ) ? 1 << k : 0;
+          }
+          g_bvTransform = !mergeCu;
+        }
       }
+      // (the block keeps its prediction until the transforms are chosen)
+      g_deferRecon = g_deferRecon
+                     || ( WITH_DERIVED_TRANSFORMS && g_bvTransform && ( t.derive & DERIVE_TRANSFORM ) != 0 );
       if( pc.verify != 0 && lid == 0 )
       {
         const int o = g_ti * DBG_PARAMS;
@@ -1948,7 +2028,16 @@ void main()
       const bool blendPdp = sub >= 2 && ( t.derive & ( DERIVE_DIMD | DERIVE_MERGE ) ) != 0;
       const bool pdpSub   = t.pdp >= 0 && ( !blend || sub == 0 || blendPdp );
       const int  pdpFilt = pdpSub && t.mipMatrix < 0 ? pdpFilters( t, t.dirMode ) : -1;
-      if( t.mipMatrix >= 0 && pdpMain >= 0 )   // MIP's PDP prediction (above)
+      const int  bvSub   = blend ? sub : 0;   // (a prediction from a block vector: predUsingBv's copy)
+      if( ( ( g_bvSubs >> bvSub ) & 1 ) != 0 )
+      {
+        const ivec2 bv = bvOfSub( t, bvSub );
+        for( int i = lid; i < N; i += NT )
+        {
+          emitPred( t, i % W, i / W, recoAt( 0, t.x + i % W + bv.x, t.y + i / W + bv.y ), bf );
+        }
+      }
+      else if( t.mipMatrix >= 0 && pdpMain >= 0 )   // MIP's PDP prediction (above)
       {
         pdpEmit( t, lid, NT );
       }
@@ -2434,11 +2523,12 @@ void main()
         }
       }
     }
-    // ----- an NN block whose transforms depend on its prediction (DERIVE_PNN_DIMD), an EIP block (DERIVE_EIP): the
-    // mode of a DIMD of the prediction kept in s_spPred, filtered (xPredIntraPnn's / DecCu's deriveIpmForTransform, as
-    // mipTransformMode derives a MIP block's) - an EIP CU's mode, which chroma DM reads -, the transforms where they
-    // depend on it (LFNST / NSPT by the lfnstSecFlag rule where it applies), then the residual and the reconstruction
-    // (sign prediction's below where the block has it)
+    // ----- an NN block whose transforms depend on its prediction (DERIVE_PNN_DIMD), an EIP block (DERIVE_EIP), a TIMD,
+    // DIMD or OBIC block with a prediction from a block vector (g_bvTransform): the mode of a DIMD of the prediction
+    // kept in s_spPred, filtered (xPredIntraPnn's / DecCu's deriveIpmForTransform, as mipTransformMode derives a MIP
+    // block's) - an EIP CU's mode, which chroma DM reads -, the transforms where they depend on it (LFNST / NSPT by the
+    // lfnstSecFlag rule where it applies), then the residual and the reconstruction (sign prediction's below where the
+    // block has it)
     if( WITH_DERIVED_TRANSFORMS && g_deferRecon )
     {
       for( int i = lid; i < NUM_LUMA_MODE; i += NT )
@@ -2455,6 +2545,11 @@ void main()
       if( WITH_MPM && ( t.derive & DERIVE_EIP ) != 0 && lid == 0 )   // (eipDimdMode: the mode chroma DM reads)
       {
         CBufI32( P.cuMode ).v[t.cu] = s_predDimdMode;
+      }
+      if( WITH_TIMD && ( t.derive & DERIVE_TIMD ) != 0 && g_bvTransform && lid == 0 )   // (its timdmTrType too)
+      {
+        const Cu cu = BufCu( P.cus ).v[t.cu];
+        timdStoreTransforms( timdHeadAt( cu.timd ), cu, s_predDimdMode );
       }
       if( ( t.derive & DERIVE_TRANSFORM ) != 0 )   // (an EIP block's may not depend on the mode)
       {

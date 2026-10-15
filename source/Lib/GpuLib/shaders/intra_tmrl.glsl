@@ -40,7 +40,7 @@ int tmrlNeighbourMode( int n )
   {
     return CBufI32( P.tmrlOut ).v[BufCu( P.cus ).v[n].tmrl * TMRL_OUT + TMRL_OUT_MODE];
   }
-  return timdMode131( cuModeOf( n ) );
+  return kind == CU_KNOWN_EXT ? cuModeOf( n ) : timdMode131( cuModeOf( n ) );
 }
 
 // getTmrlSearchRange's ten modes of CU c (131-mode set; invocation 0): getSpatialIpm's - the CU's DIMD modes first

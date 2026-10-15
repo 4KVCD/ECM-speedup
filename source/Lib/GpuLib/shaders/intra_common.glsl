@@ -242,6 +242,20 @@ const int DERIVE_PNN_LFNST_SEC = 4194304;
 // an EIP CU's luma block (intra_eip.glsl): predicted by its node's model; then the DIMD of its prediction in any case
 // (eipDimdMode, which chroma DM reads: the CU's mode its block writes)
 const int DERIVE_EIP = 8388608;
+// a node that starts only once every block and node before it has finished (the scheduler's prefix of finished ones):
+// its derivation reads samples or records at block vectors, which may point anywhere decoded before (a TIMD CU's
+// candidates from block vectors)
+const int DERIVE_PREFIX = 16777216;
+
+// a CU's block vectors as the lists of later CUs take them (Params::bvOut per luma CU, by its index in the
+// CodingStructure: getNeighBv's vectors of the CU in its order, which getArBvMergeCandidate cascades), written by the
+// CU's node or uploaded for a CU from the CPU: their number, then up to BV_MAX (bvPack); then those
+// getSparseArBvMergeCandidate cascades where they differ (an IntraTMP fusion CU's own vector, then its cheapest
+// where it has an index: their number, then 2), else -1
+const int BV_MAX        = 8;
+const int BV_OUT_SPARSE = 1 + BV_MAX;
+const int BV_OUT        = BV_OUT_SPARSE + 3;
+const int BV_NBRS = 31;    // getItmpMergeCandidate's 13 CU neighbours, then its 18 non-adjacent positions
 
 // Params::dbgParams per block: the derived dirMode, isModeVer, intraPredAngle, absInvAngle, useCubic, refFilter,
 // applyPDPC, gradPDPC, angularScale, fusion, bf, plIdx, then mtxV, mtxH, secMatrix, secTranspose, secLayout
@@ -251,7 +265,7 @@ const int DBG_PARAMS = 17;
 // the non-adjacent ones
 const int MPM_NEIGHBOURS = 23;
 
-// a coding unit of one channel type whose blocks were recorded (47 int32, layout shared with GpuIntraRec.cpp)
+// a coding unit of one channel type whose blocks were recorded (50 int32, layout shared with GpuIntraRec.cpp)
 struct Cu
 {
   int kind;              // CU_*: how its intra mode is found
@@ -278,6 +292,9 @@ struct Cu
   int mpm;               // an MPM CU's record in Params::timdData where MPM sorting, MDIP or PDP shape its lists, an
                          // MDIP CU's (MpmHead; -1: none, intra_modes.glsl's lists)
   int eip;               // an EIP CU's record in Params::timdData (intra_eip.glsl's EIP_HEAD_*; -1: not EIP)
+  // where its node's derivation takes block vectors from the CUs around it (a TIMD CU's candidates, JVET-AM0138) and
+  // they may have some: the offset in Params::timdData of its list's record (intra_bv.glsl's BV_LIST_*), else -1
+  int bvList;
 };
 layout( buffer_reference, std430, buffer_reference_align = 4 ) buffer BufCu { Cu v[]; };
 
@@ -298,6 +315,8 @@ const int CU_CHROMA_TMRL = 10;  // chroma: a chroma TMRL CU, its mode and refere
                                 // Cu::nbr: CHROMA_TMRL_NBR_*)
 const int CU_EIP         = 11;  // luma: an EIP CU (intra_eip.glsl): its node its model, its block the prediction and
                                 // the mode chroma DM reads (eipDimdMode; the MPM lists read planar instead)
+const int CU_KNOWN_EXT   = 12;  // luma: the host knows the mode, of the 131-mode set (Params::cuMode): what a TMRL CU's
+                                // list reads of a TIMD or TMRL neighbour taken from the CPU
 
 // a TMRL CU's choice as its node derives it (TMRL_OUT int32 per TMRL CU in Params::tmrlOut): the mode (131-mode set)
 // and the reference line (multiRefIdx) of m_tmrlList[tmrlListIdx], which its blocks predict with
@@ -362,7 +381,7 @@ layout( buffer_reference, std430, buffer_reference_align = 4 ) buffer BufDimdCal
 // and secondBucket; DIMD chroma's the final mode and the second one (dimdChromaMode, dimdChromaModeSecond). A MIP block
 // with LFNST / NSPT writes its CU's: mipDimdMode as the mode, dimdDerivedIntraDir2nd as the second, with MTSS the result
 // (its node the list)
-const int DIMD_OUT             = 30;
+const int DIMD_OUT             = 32;
 const int DIMD_OUT_PARAMS      = 24;
 const int DIMD_OUT_MODE        = 0;
 const int DIMD_OUT_SECOND      = 1;
@@ -374,6 +393,8 @@ const int DIMD_OUT_TR_SECOND   = 24;
 const int DIMD_OUT_MTSS_LIST   = 25;   // 3 entries
 const int DIMD_OUT_MTSS_MODE   = 28;
 const int DIMD_OUT_MTSS_BUCKET = 29;
+const int DIMD_OUT_BV_FLAG     = 30;   // a DIMD, OBIC or intra merge CU's isBvDimd (getBestNonAnglularMode)
+const int DIMD_OUT_BV          = 31;   // and its bvDimd (bvPack)
 const int MTSS_CALLS           = 3;    // the histograms of MTSS's mode list (deriveDimdModeList: left, above, above-left)
 
 // a neighbour of an OBIC CU whose mode its histogram counts (layout shared with GpuIntraRec.cpp, OBIC_NBRS per OBIC CU
@@ -466,7 +487,7 @@ const int TIMD_WAIP_MIN_FAR   = 8;   // decreaseMinFar: a PU left, a CU height f
 // fields at the same offsets), which its blocks predict; a TIMD merge CU's chosen candidate in the first fields (its
 // timdMrgList[0], ... timdMrgModeCheckWA[0]). Then, in the pipelines with TIMD merge, the CU's transform types
 // (timdmTrType: a TIMD merge CU's inherited ones, another's own)
-const int TIMD_OUT_FIELDS          = 12;   // the fields of one derivation
+const int TIMD_OUT_FIELDS          = 16;   // the fields of one derivation
 const int TIMD_OUT_SAD             = TIMD_OUT_FIELDS;       // the offset of deriveTimdModeSad's
 const int TIMD_OUT_TR_HOR          = 2 * TIMD_OUT_FIELDS;   // timdmTrType's horizontal type
 const int TIMD_OUT_TR_VER          = TIMD_OUT_TR_HOR + 1;   // and vertical one
@@ -479,6 +500,12 @@ const int TIMD_OUT_WEIGHT          = 4;    // timdFusionWeight, 3 entries: the m
 const int TIMD_OUT_LOC_DEP         = 7;    // timdLocDep, 3 entries
 const int TIMD_OUT_CHECK_WA        = 10;   // timdModeCheckWA: 0 for a wide angle beyond the regular ones
 const int TIMD_OUT_SEC_CHECK_WA    = 11;   // timdModeSecondaryCheckWA
+// the fields of the predictions from a block vector (JVET-AM0138), whose modes above are planar: bit k of isBvTimd[k]
+// (the mode's, the secondary's, the non-angular one's), then timdBv[k] (bvPack; 0 where the bit is not set)
+const int TIMD_OUT_BV_FLAGS        = 12;
+const int TIMD_OUT_BV              = 13;
+// TIMD's candidates from block vectors are modes from this one on (TIMD_BV_IDX: the vector at that index of its list)
+const int TIMD_BV_IDX              = 1000;
 // an MPM CU's record in Params::timdData (layout shared with GpuIntraRec.cpp; intra_mpm.glsl): this header, then the
 // availability bits of its template's reference units
 struct MpmHead
@@ -788,6 +815,12 @@ struct Params
   int      cccmScratchWords;    // its int32 per workgroup
   int      ccpFusionPairs;      // decoder-derived CCP merge fusion's pairs (PU::getMaxNumCcpFusionModel)
   int      pdpTable;            // in matrices: per mode and PDP size its filters' offset (intra_pdp.glsl)
+  // in timdData: the CUs' block vectors (BV_OUT per CU, by its index in the CodingStructure), and the map of the luma
+  // units of 4 x 4 to the index of the CU covering them (bvMapW per row; -1 none), where the picture's CUs read
+  // block vectors (else 0)
+  int      bvOut;
+  int      bvMap;
+  int      bvMapW;
 };
 layout( buffer_reference, std430, buffer_reference_align = 8 ) buffer BufParams { Params p; };
 
