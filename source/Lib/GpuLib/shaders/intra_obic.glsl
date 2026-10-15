@@ -67,6 +67,16 @@ void obicHistogram( Cu c, int lid, int NT )
         }
       }
     }
+    else if( WITH_MPM && kind == CU_BVG )   // its blend (DIMD's fields): its modes alike (planar never counts)
+    {
+      CBufI32   d = CBufI32( P.dimdOut );
+      const int o = nb.cu * DIMD_OUT, second = d.v[o + DIMD_OUT_BLEND_MODE];
+      atomicAdd( s_obicPlain[d.v[o + DIMD_OUT_MODE]], ns );
+      if( second > PLANAR_IDX && d.v[o + DIMD_OUT_REL_WEIGHT + 2] > 0 )
+      {
+        atomicAdd( s_obicPlain[second], ns );
+      }
+    }
     else if( WITH_MERGE && kind == CU_MERGE )   // its merge parameters (its DimdOut slot), all samples to each mode, no class
     {
       CBufI32   d        = CBufI32( P.dimdOut );

@@ -946,6 +946,7 @@ ivec2 angularArrays( bool isVer, int W, int H, int angle, int absInvAngle, int t
 #include "intra_mpm.glsl"
 #include "intra_eip.glsl"
 #include "intra_tmp.glsl"
+#include "intra_bvg.glsl"
 
 // the EipOut of EIP CU n (intra_eip.glsl)
 int eipOutBase( int n )
@@ -1534,7 +1535,7 @@ void main()
         }
       }
       int cuMode = -1;       // invocation 0's
-      int timdSecond = -1;   // a TIMD CU's second mode for MTSS (invocation 0's)
+      int mtssSecond = -1;   // a TIMD CU's second mode for MTSS, a BVG-DIMD CU's second entry (invocation 0's)
       // a DIMD, OBIC or intra merge CU's choice of planar or a block vector (intra_timd.glsl), where the CUs around it
       // may have vectors, before an intra merge CU's candidates, which take the vectors' costs (as DecCu orders them);
       // else planar (its blocks read the choice from its DimdOut, which holds an earlier picture's)
@@ -1551,6 +1552,12 @@ void main()
         }
         SYNC();
       }
+      // IntraTMP's search (intra_tmp.glsl; one call site, as it is large): an IntraTMP CU's list of vectors, an EIP
+      // CU's vector, a BVG-DIMD CU's vectors
+      if( WITH_MPM && c.tmp >= 0 )
+      {
+        tmpNode( c, t.cu, t.bitDepth, lid, NT );
+      }
       if( WITH_DIMD && c.kind == CU_OBIC )
       {
         SYNC();   // dimdSelect has read the histograms whose memory OBIC's takes
@@ -1566,7 +1573,7 @@ void main()
       }
       else if( WITH_TIMD_MERGE && c.kind == CU_TIMD && timdMergeCu( c ) )   // intra_timd.glsl, from its candidates
       {
-        cuMode = timdMergeNode( c, t.bitDepth, ( t.derive & DERIVE_NO_PDPC ) != 0, timdSecond, lid, NT );
+        cuMode = timdMergeNode( c, t.bitDepth, ( t.derive & DERIVE_NO_PDPC ) != 0, mtssSecond, lid, NT );
       }
       else if( WITH_TMRL && c.kind == CU_TMRL )   // intra_tmrl.glsl, its mode list with its DIMD
       {
@@ -1583,7 +1590,8 @@ void main()
         {
           modes[k] = s_modesRead[k];
         }
-        cuMode = timdNode( c, t.cu, modes, dimdModes, t.bitDepth, ( t.derive & DERIVE_NO_PDPC ) != 0, timdSecond, lid, NT );
+        cuMode = timdNode( c, t.cu, modes, dimdModes, t.bitDepth, ( t.derive & DERIVE_NO_PDPC ) != 0, mtssSecond, lid,
+                           NT );
       }
       else if( WITH_MPM && c.kind == CU_MPM && c.mpm >= 0 )   // intra_mpm.glsl, MPM sorting, MDIP, PDP's lists
       {
@@ -1602,18 +1610,17 @@ void main()
         }
         else
         {
-          if( c.tmp >= 0 )   // (with a vector: IntraTMP's sparse search finds it, intra_tmp.glsl)
-          {
-            tmpNode( c, t.cu, t.bitDepth, lid, NT );
-          }
-          eipNode( c, t.cu, c.eip, t.bitDepth, lid, NT );
+          eipNode( c, t.cu, c.eip, t.bitDepth, lid, NT );   // (with a vector: the search's best, above)
         }
         cuMode = PLANAR_IDX;
       }
       else if( WITH_MPM && c.kind == CU_TMP )   // intra_tmp.glsl: its list of vectors (the MPM lists read planar)
       {
-        tmpNode( c, t.cu, t.bitDepth, lid, NT );
         cuMode = PLANAR_IDX;
+      }
+      else if( WITH_MPM && c.kind == CU_BVG )   // intra_bvg.glsl, from the vectors of the search (above)
+      {
+        cuMode = bvgNode( c, t.cu, mtssSecond, lid, NT );
       }
       else if( lid == 0 && c.kind != CU_KNOWN )
       {
@@ -1646,13 +1653,14 @@ void main()
         }
         else if( lid == 0 )
         {
-          // the mode without MTSS (a DIMD or OBIC CU's DIMD main mode, intra merge's, TIMD's) and the one MTSS tries
-          // first: DIMD's second strongest, an OBIC CU's second OBIC mode (-1 only without OBIC modes, which no
-          // decodable stream has: planar keeps it in range), a blended TIMD CU's secondary, none for intra merge
-          const int   mode   = c.kind == CU_MERGE || c.kind == CU_TIMD ? cuMode : d.mode;
+          // the mode without MTSS (a DIMD or OBIC CU's DIMD main mode, intra merge's, TIMD's, BVG-DIMD's) and the one
+          // MTSS tries first: DIMD's second strongest, an OBIC CU's second OBIC mode (-1 only without OBIC modes, which
+          // no decodable stream has: planar keeps it in range), a blended TIMD CU's secondary, a BVG-DIMD CU's second
+          // entry, none for intra merge
+          const int   mode   = c.kind == CU_MERGE || c.kind == CU_TIMD || c.kind == CU_BVG ? cuMode : d.mode;
           const int   second = c.kind == CU_DIMD ? d.trSecond
                                : c.kind == CU_OBIC ? max( CBufI32( P.obicOut ).v[c.obic * OBIC_OUT + OBIC_OUT_MODE + 1], PLANAR_IDX )
-                               : c.kind == CU_TIMD ? timdSecond : -1;
+                               : c.kind == CU_TIMD || c.kind == CU_BVG ? mtssSecond : -1;
           const ivec3 list   = mtssList();
           const ivec2 choice = mtssChoice( c, mode, second, list );
           CBufI32     o      = CBufI32( P.dimdOut );
@@ -1772,7 +1780,11 @@ void main()
         // merge block whose node gave parts vectors (isBvDimdExtAvail) copies those parts instead (planar's not with
         // ISP; then never planar from bvDimd)
         const int ext = mergeCu ? CBufI32( P.dimdOut ).v[t.cu * DIMD_OUT + DIMD_OUT_EXT_FLAGS] : 0;
-        if( ext != 0 )
+        if( WITH_MPM && ( t.derive & DERIVE_BVG ) != 0 )   // (BVG-DIMD: planar is its vectors' fusion; no ISP)
+        {
+          g_bvSubs = 2;
+        }
+        else if( ext != 0 )
         {
           g_bvSubs = t.isp == 0 ? ext : ext & ~2;
         }
@@ -2012,7 +2024,7 @@ void main()
     // prediction (intra_ccp.glsl, with its inside filter), then that of the DIMD chroma mode its node derived, each
     // weighed 1, averaged with rounding
     g_blendSum  = false;
-    g_blendTaps = ( t.derive & DERIVE_DIMD ) != 0;
+    g_blendTaps = ( t.derive & ( DERIVE_DIMD | DERIVE_BVG ) ) == DERIVE_DIMD;   // (BVG-DIMD's: the longest)
     const ivec2 timdTaps = timdBlend && !timdSadCu( t.cu ) ? timdBlendTaps( timdPredBase( t.cu ) ) : ivec2( 0, 0 );
     const bool  timdMergeBlend = WITH_TIMD_MERGE && timdBlend && ( t.derive & DERIVE_TIMD_MERGE ) != 0;
     const bool  ccpDimd = WITH_CCP_MERGE && WITH_DIMD && ( t.derive & DERIVE_CCP_DIMD ) != 0;
@@ -2047,17 +2059,20 @@ void main()
       // a TIMD blend's planar with the reference filter: the filtered line (in s_tmp)
       const bool planarFiltered = timdBlend && t.refFilter != 0;
       // PDP where the mode has filters: of a blend (predIntraAng) the main mode's prediction, and of DIMD's and intra
-      // merge's the blend modes' (not planar's, nor OBIC's other modes)
-      const bool blendPdp = sub >= 2 && ( t.derive & ( DERIVE_DIMD | DERIVE_MERGE ) ) != 0;
+      // merge's the blend modes' (not planar's, nor OBIC's or BVG-DIMD's other modes)
+      const bool blendPdp = sub >= 2 && ( t.derive & ( DERIVE_DIMD | DERIVE_MERGE ) ) != 0
+                            && ( t.derive & DERIVE_BVG ) == 0;
       const bool pdpSub   = t.pdp >= 0 && ( !blend || sub == 0 || blendPdp );
       const int  pdpFilt = pdpSub && t.mipMatrix < 0 ? pdpFilters( t, t.dirMode ) : -1;
       const int  bvSub   = blend ? sub : 0;   // (a prediction from a block vector: predUsingBv's copy)
       if( ( ( g_bvSubs >> bvSub ) & 1 ) != 0 )
       {
-        const ivec2 bv = bvOfSub( t, bvSub );
+        const bool  fused = WITH_MPM && ( t.derive & DERIVE_BVG ) != 0;   // (BVG-DIMD: its vectors' fusion)
+        const ivec2 bv    = fused ? ivec2( 0 ) : bvOfSub( t, bvSub );
         for( int i = lid; i < N; i += NT )
         {
-          emitPred( t, i % W, i / W, recoAt( 0, t.x + i % W + bv.x, t.y + i / W + bv.y ), bf );
+          const int x = t.x + i % W, y = t.y + i / W;
+          emitPred( t, i % W, i / W, fused ? bvgFusionSample( t.cu, x, y ) : recoAt( 0, x + bv.x, y + bv.y ), bf );
         }
       }
       else if( t.mipMatrix >= 0 && pdpMain >= 0 )   // MIP's PDP prediction (above)

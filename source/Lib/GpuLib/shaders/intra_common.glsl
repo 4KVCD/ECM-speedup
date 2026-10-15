@@ -249,6 +249,9 @@ const int DERIVE_PREFIX = 16777216;
 // an IntraTMP CU's luma block (intra_tmp.glsl): the copy of the reconstruction at the vector of its node's list its
 // index selects; then the DIMD of its prediction (intraTmpDimdMode, which its transforms take, as an EIP block's)
 const int DERIVE_TMP = 33554432;
+// with DERIVE_DIMD, a BVG-DIMD CU's luma block (intra_bvg.glsl): its blend's planar prediction the fusion of its node's
+// vectors, its blend modes without PDP and with the longest taps (not DIMD's by weight), no bilateral filter
+const int DERIVE_BVG = 67108864;
 
 // a CU's block vectors as the lists of later CUs take them (Params::bvOut per luma CU, by its index in the
 // CodingStructure: getNeighBv's vectors of the CU in its order, which getArBvMergeCandidate cascades), written by the
@@ -323,6 +326,8 @@ const int CU_KNOWN_EXT   = 12;  // luma: the host knows the mode, of the 131-mod
                                 // list reads of a TIMD or TMRL neighbour taken from the CPU
 const int CU_TMP         = 13;  // luma: an IntraTMP CU (intra_tmp.glsl): its node its list of vectors (the MPM lists
                                 // read planar), its block the copy at the one its index selects
+const int CU_BVG         = 14;  // luma: a BVG-DIMD CU (intra_bvg.glsl): its node IntraTMP's search, the DIMD at the
+                                // vectors it finds, its blend; its block the blend with their fusion as planar
 
 // a TMRL CU's choice as its node derives it (TMRL_OUT int32 per TMRL CU in Params::tmrlOut): the mode (131-mode set)
 // and the reference line (multiRefIdx) of m_tmrlList[tmrlListIdx], which its blocks predict with
@@ -390,8 +395,10 @@ layout( buffer_reference, std430, buffer_reference_align = 4 ) buffer BufDimdCal
 // then MTMP_NUM, repeated cyclically past that number: tmpXYdisp) and in DIMD_OUT_BV the vector its block copies, its
 // block's DIMD as a MIP block's (intraTmpDimdMode). An intra merge CU's parts that its node gives vectors instead of
 // their modes (reorderIntraMergeCand: isBvDimdExt as bits by part - its candidate's main mode, planar, blend modes -,
-// bvDimdExt)
-const int DIMD_OUT             = 41;
+// bvDimdExt). A BVG-DIMD CU's blend in DIMD's fields (bvgDimdMode, bvgDimdFusionWeight: its first mode, planar's
+// weight, its second mode as the first blend mode; bvgDimdMode[1] as the second), its vectors in place of intra
+// merge's (bvDimdNum, bvDimdList, bvDimdWeight)
+const int DIMD_OUT             = 43;
 const int DIMD_OUT_PARAMS      = 24;
 const int DIMD_OUT_MODE        = 0;
 const int DIMD_OUT_SECOND      = 1;
@@ -409,6 +416,9 @@ const int DIMD_OUT_TMP_NUM     = 1;    // an IntraTMP CU's number of vectors fou
 const int DIMD_OUT_TMP_BV      = 2;    // then its list's MTMP_NUM vectors (bvPack)
 const int DIMD_OUT_EXT_FLAGS   = 32;   // an intra merge CU's parts predicted from vectors (bit by part),
 const int DIMD_OUT_EXT_BV      = 33;   // their vectors (8, bvPack)
+const int DIMD_OUT_BVG_NUM     = 32;   // a BVG-DIMD CU's number of vectors,
+const int DIMD_OUT_BVG_BV      = 33;   // its vectors (5, bvPack; 0 past the number)
+const int DIMD_OUT_BVG_WEIGHT  = 38;   // and their fusion weights (5)
 const int MTSS_CALLS           = 3;    // the histograms of MTSS's mode list (deriveDimdModeList: left, above, above-left)
 
 // a neighbour of an OBIC CU whose mode its histogram counts (layout shared with GpuIntraRec.cpp, OBIC_NBRS per OBIC CU
@@ -560,7 +570,7 @@ const int EIP_HEAD_MERGE_IDX = 5, EIP_HEAD_SIZE_X = 6, EIP_HEAD_SIZE_Y = 7, EIP_
 const int EIP_HEAD_TPL_X = 10, EIP_HEAD_TPL_Y = 11, EIP_HEAD_BLOCK = 12;
 const int EIP_HEAD = 13;
 const int EIP_DERIVED = 0, EIP_MERGE = 1, EIP_BV = 2;
-const int MERGE_NBR_MERGE = 1;   // an intra merge CU: always a candidate, its merge parameters (its DimdOut slot)
+const int MERGE_NBR_MERGE = 1;   // an intra merge or BVG-DIMD CU: always a candidate, its parameters (DimdOut slot)
 const int MERGE_NBR_OBIC  = 2;   // an OBIC CU: always, its OBIC converted
 const int MERGE_NBR_DIMD  = 3;   // a DIMD CU or an MPM CU: where its DIMD blends, its DIMD
 const int MERGE_NBR_TIMD  = 4;   // a TIMD CU: where its modes blend or its mode is angular, its TIMD converted (or its DIMD)

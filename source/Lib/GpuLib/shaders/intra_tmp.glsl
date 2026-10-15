@@ -7,8 +7,9 @@
 // (calcTemplateDiff) are computed in parallel, in chunks of positions in the CPU's order, and the CPU's lists replayed
 // from them by invocation 0: every test of a cost is "less than a threshold", which the CPU's early ends cannot
 // change. No LIC, fusion, FLM or sub-sample refinement yet (the host keeps such CUs on the CPU). An EIP CU with a
-// vector runs the sparse search alone, for its best (TMP_HEAD_ONLY_BEST). Included by intra_rec.comp after
-// intra_bv.glsl.
+// vector runs the sparse search alone, for its best (TMP_SEARCH_BEST); a BVG-DIMD CU the sparse search for its best,
+// its neighbours' vectors against it and the refinement of the best one's window (TMP_SEARCH_BVG; intra_bvg.glsl takes
+// the refined list on). Included by intra_rec.comp after intra_bv.glsl.
 
 const int TMP_COST_SHIFT    = 3;    // TMP_TEMPLATE_COST_SHIFT: the template row and column next to the block weigh 8
 const int MTMP_NUM          = 19;
@@ -32,9 +33,18 @@ const int TMP_HEAD_LIC_MODE   = 3;   // the SPS's ItmpLicMode
 const int TMP_HEAD_NEED_TL    = 4;   // needTopLeft: tmpIdx reaches the list's entries of the top / left template
 const int TMP_HEAD_NUM_REFINE = 5;   // mtmpNumRefine[0] (tmpIdx + 1 without needTopLeft)
 const int TMP_HEAD_BIG_CTU    = 6;   // the CTU is larger than 128 (the clustering's windows)
-const int TMP_HEAD_ONLY_BEST  = 7;   // an EIP CU with a vector: the sparse search's best alone (mtmpNumSparse 1)
+const int TMP_HEAD_SEARCH     = 7;   // what the search is for (TMP_SEARCH_*)
 const int TMP_HEAD_REGIONS    = 8;   // per regionId mvXMin, mvXMax, mvYMin, mvYMax (clipMvIntraConstraint), 6 x 4
 const int TMP_HEAD            = TMP_HEAD_REGIONS + 24;
+const int TMP_SEARCH_FULL = 0;   // an IntraTMP CU's list
+const int TMP_SEARCH_BEST = 1;   // an EIP CU with a vector: the sparse search's best alone (mtmpNumSparse 1)
+const int TMP_SEARCH_BVG  = 2;   // a BVG-DIMD CU's (JVET-AL0108): MAX_BVG_ROUGH_NUM 1, its own refinement
+
+// BVG-DIMD's search: the window of a neighbour's vector (5 around it), the refined list's length and its cut-off at
+// 1.2 times its cheapest (BVG_DIMD_BV_LIST_THRD; the CPU's double products are exact as 6 / 5 in integers)
+const int BVG_REFINE_RANGE = 5;
+const int BVG_NUM_REFINE   = 5;   // BVG_DIMD_BV_LIST_SIZE
+int bvgThreshold( int cost ) { return int( int64_t( cost ) * 6 / 5 ) + 1; }   // (int)( cost * 1.2 ) + 1
 
 // the node's work area in the scratch (the workgroup's blending sums, free in a node): a chunk of positions and their
 // costs, the lists (a length, then entries of TE ints), the vector list's costs, the clustering's result
@@ -288,8 +298,9 @@ void tmpNode( Cu c, int cuIndex, int bitDepth, int lid, int NT )
   const int  numTypes = needTL && tempType == TMP_L_SHAPE ? 3 : 1;   // (checkAllTmpTypes)
   const int  W = c.w, H = c.h;
   OwnerMap   om = OwnerMap( BufI32( P.owner[0] ), P.ownerW[0], P.ownerH[0], P.unitLog2X[0], P.unitLog2Y[0] );
-  const bool onlyBest = data.v[head + TMP_HEAD_ONLY_BEST] != 0;   // (an EIP CU with a vector)
-  const int  numSparse[3] = int[3]( onlyBest ? 1 : MTMP_NUM_SPARSE, TL_NUM_SPARSE, TL_NUM_SPARSE );
+  const int  search   = data.v[head + TMP_HEAD_SEARCH];
+  const bool onlyBest = search == TMP_SEARCH_BEST, bvg = search == TMP_SEARCH_BVG;
+  const int  numSparse[3] = int[3]( search != TMP_SEARCH_FULL ? 1 : MTMP_NUM_SPARSE, TL_NUM_SPARSE, TL_NUM_SPARSE );
   const int  numRefine[3] = int[3]( data.v[head + TMP_HEAD_NUM_REFINE], TL_NUM, TL_NUM );
   const int  numTL = ( W + TMP_TEMPLATE_SIZE ) * TMP_TEMPLATE_SIZE + TMP_TEMPLATE_SIZE * H;   // numPixTopLeft
   const int  numTop = W * TMP_TEMPLATE_SIZE, numLeft = TMP_TEMPLATE_SIZE * H;
@@ -433,12 +444,12 @@ void tmpNode( Cu c, int cuIndex, int bitDepth, int lid, int NT )
   }
 
   // the vectors cascaded from the L-shape's sparse candidates (getSparseArBvMergeCandidate: up to NUM_TMP_ARBVP_S
-  // more), then the costs of every vector of the list
+  // more; BVG-DIMD's search takes none), then the costs of every vector of the list
   if( lid == 0 )
   {
     numList = itmpSize1;
     const int total = numList + NUM_TMP_ARBVP_S;
-    for( int i = 0; i < tlSize( TS_SPARSE ) && numList < total; i++ )
+    for( int i = 0; i < tlSize( TS_SPARSE ) && numList < total && !bvg; i++ )
     {
       numList = bvCascadeStep( c, numList, total, ivec2( tlAt( TS_SPARSE, i, TE_X ), tlAt( TS_SPARSE, i, TE_Y ) ), true,
                                g_ti );
@@ -453,9 +464,29 @@ void tmpNode( Cu c, int cuIndex, int bitDepth, int lid, int NT )
   tsSync();
   tmpChunkCosts( c, tempType, lid, NT );   // (at most BV_LIST_MAX)
 
+  // BVG-DIMD (invocation 0): of the sparse search's best and the neighbours' vectors that cost less than it, in turn,
+  // the cheapest alone (bvgCandList of MAX_BVG_ROUGH_NUM 1), a vector's window BVG_REFINE_RANGE around it; the
+  // refinement's threshold 1.2 times its cost, plus 1, without clustering (no position is tried twice)
+  if( lid == 0 && bvg )
+  {
+    int maxCost = pDiff[0];   // (the sparse best's cost, else the initial threshold: maxSparseCost)
+    for( int m = 0; m < numList; m++ )
+    {
+      const int diff = tsGet( TS_COST + 3 * m );
+      if( diff < maxCost )
+      {
+        const ivec2 cand = bvListAt( m );
+        tlUpdate( TS_SPARSE, tlEntry( cand.x, cand.y, cand - BVG_REFINE_RANGE, cand + BVG_REFINE_RANGE, TMP_MRG_REG_ID,
+                                      diff ), 1 );
+        maxCost = diff;
+      }
+    }
+    tsSet( TS_WIN, 0 );
+    tsSet( TS_WIN + 1, bvgThreshold( maxCost ) );
+  }
   // the windows of the neighbours' vectors (adaptive: by the cost against its threshold), the cascaded ones' fixed;
   // then the clustering (invocation 0)
-  if( lid == 0 )
+  else if( lid == 0 )
   {
     for( int i = 0; i < numList; i++ )
     {
@@ -621,9 +652,18 @@ void tmpNode( Cu c, int cuIndex, int bitDepth, int lid, int NT )
           }
           found = true;
         }
-        else if( candRegion > 5 && !validWindow && !bvValid( c.x, c.y, W, H, ivec2( px, py ), g_ti ) )
+        else if( candRegion > 5 && !validWindow && !bvg && !bvValid( c.x, c.y, W, H, ivec2( px, py ), g_ti ) )
         {
           continue;
+        }
+        else if( candRegion > 5 && !validWindow && bvg )   // (validItmpBv with isAvailablePairFound: once a position
+        {                                                  // of the row has its block decoded, the template's corner)
+          if( ( !found && !decodedBefore( om, c.x + px + W - 1, c.y + py + H - 1, g_ti ) )
+              || !decodedBefore( om, c.x + px - TMP_TEMPLATE_SIZE, c.y + py - TMP_TEMPLATE_SIZE, g_ti ) )
+          {
+            continue;
+          }
+          found = true;
         }
         tmpEmit( k, px, py, type | cand << 2 );
       }
@@ -659,9 +699,10 @@ void tmpNode( Cu c, int cuIndex, int bitDepth, int lid, int NT )
           const ivec2 tl = ivec2( tlAt( sparse, ci, TE_TLX ), tlAt( sparse, ci, TE_TLY ) );
           const ivec2 br = ivec2( tlAt( sparse, ci, TE_BRX ), tlAt( sparse, ci, TE_BRY ) );
           tlUpdate( refine, tlEntry( px, py, tl, br, tlAt( sparse, ci, TE_REGION ), cost ), numRefine[t] );
-          if( tlSize( refine ) == numRefine[t] )
+          if( tlSize( refine ) == numRefine[t] )   // (BVG-DIMD's: also no more than 1.2 times the cheapest, plus 1)
           {
-            rDiff[t] = min( tlAt( refine, numRefine[t] - 1, TE_COST ), rDiff[t] );
+            const int lastCost = tlAt( refine, numRefine[t] - 1, TE_COST );
+            rDiff[t] = min( bvg ? min( bvgThreshold( tlAt( refine, 0, TE_COST ) ), lastCost ) : lastCost, rDiff[t] );
           }
         }
       }
@@ -671,6 +712,10 @@ void tmpNode( Cu c, int cuIndex, int bitDepth, int lid, int NT )
     {
       break;
     }
+  }
+  if( bvg )   // (its refined list in TS_REFINE: intra_bvg.glsl's bvgNode goes on)
+  {
+    return;
   }
 
   // the list: the L-shape's (or the only one's), with the top and the left template's merged in from INIT_TL_POS on
