@@ -114,8 +114,14 @@ struct Tu
   int32_t ccp;    // an LM / LM chroma fusion / CCP merge block's CU's CCP model record in Params::ccpOut (CCP_OUT;
                   // -1: none)
   int32_t ccpMerge;   // a CCP merge block's entry in Params::ccpData (CCP_MERGE_*; -1: not a merge block)
+  int32_t pdp;        // a block PDP may predict: its size, its references' padding (intra_common.glsl; -1: none)
 };
-static_assert( sizeof( Tu ) == 103 * 4, "Tu layout" );
+static_assert( sizeof( Tu ) == 104 * 4, "Tu layout" );
+
+// the PDP sizes with filters (g_size's first 16) and MIP's filter sets (per MIP mode, then transposed; intra_pdp.glsl's
+// PDP_SIZES, PDP_MIP_GROUPS)
+constexpr int PDP_SIZES      = 16;
+constexpr int PDP_MIP_GROUPS = 32;
 
 // Tu::derive (intra_common.glsl's DERIVE_*)
 constexpr int DERIVE_NODE         = 32;   // not a block: the derivation of the mode of CU Tu::cu, before its blocks
@@ -1052,6 +1058,7 @@ struct Params
   int32_t  cccmScratchOffset;
   int32_t  cccmScratchWords;
   int32_t  ccpFusionPairs;
+  int32_t  pdpTable;
 };
 static_assert( offsetof( Params, origin ) == 304 && offsetof( Params, edgeCap ) == 384 && sizeof( Params ) == 448,
                "Params layout" );
@@ -1123,6 +1130,7 @@ struct Shared
   int32_t                          mipOffset[3] = {};             // of the MIP matrices of each size class in matrices
   int32_t                          lfnstLayout[3][2] = {};        // of the LFNST output positions in matrices (sbSize 4, 8, 16; transposed)
   int32_t                          trTables = 0;                  // of the transform tables' directory in matrices (TR_TAB_*)
+  int32_t                          pdpTable = 0;                  // of PDP's filters' offsets in matrices
   std::vector<std::pair<const int8_t*, size_t>>      secTables;   // each table's start and bytes, in secKernels' order
   std::vector<std::pair<const ScanElement*, int32_t>> secScans;  // the scans LFNST / NSPT read, their positions' offset in matrices
   std::unique_ptr<BilateralFilter> bif;   // the intra prediction bilateral filter's tables
@@ -1299,6 +1307,50 @@ Shared* createShared( gpu::Context& ctx )
   mat.insert( mat.end(), &mipMatrix8x8[0][0][0], &mipMatrix8x8[0][0][0] + sizeof( mipMatrix8x8 ) );
   sh->mipOffset[2] = (int32_t) mat.size();
   mat.insert( mat.end(), &mipMatrix16x16[0][0][0], &mipMatrix16x16[0][0][0] + sizeof( mipMatrix16x16 ) );
+  // PDP (intra_pdp.glsl): per mode, then per MIP filter set (JVET-AI0208), and per size (g_size's first PDP_SIZES) the
+  // offset in int16 entries of its filters (-1: none, or a mode xPredIntraOpt rejects), then the filters of every mode
+  // and size (createPdpFilters' and createMipFilters' layout: per row of the block and 4 columns len4 weights; DecApp
+  // creates them before the decoder), two int16 per int32
+  sh->pdpTable = (int32_t) mat.size();
+  mat.resize( mat.size() + ( NUM_LUMA_MODE + PDP_MIP_GROUPS ) * PDP_SIZES, -1 );
+#if JVET_AH0209_PDP
+  {
+    const int32_t        weights = (int32_t) mat.size();
+    std::vector<int16_t> pdp;
+    for( int set = 0; set < NUM_LUMA_MODE + PDP_MIP_GROUPS; set++ )
+    {
+      for( int size = 0; size < PDP_SIZES; size++ )
+      {
+        const int  mode = set;   // (of a regular set)
+        const bool mip  = set >= NUM_LUMA_MODE;
+#if JVET_AI0208_PDP_MIP
+        int16_t*** f = mip ? g_pdpFiltersMip[set - NUM_LUMA_MODE][size] : g_pdpFilters[mode][size];
+#else
+        int16_t*** f = mip ? nullptr : g_pdpFilters[mode][size];
+#endif
+        if( !f || ( !mip && mode > 1 && mode % 2 ) || ( !mip && size > 12 && mode > 1 && mode % 4 != 2 ) )
+        {
+          continue;
+        }
+        const bool shortLen = !mip
+                              && ( mode < PDP_SHORT_TH[0] || ( mode >= PDP_SHORT_TH[1] && mode <= PDP_SHORT_TH[2] ) );
+        const int  len4     = ( ( shortLen ? g_sizeData[size][10] : g_sizeData[size][7] ) + 7 ) / 8 * 32;
+        mat[sh->pdpTable + set * PDP_SIZES + size] = 2 * weights + (int32_t) pdp.size();
+        for( int y = 0; y < g_sizeData[size][4]; y++ )
+        {
+          for( int q = 0; q < g_sizeData[size][3] / 4; q++ )
+          {
+            pdp.insert( pdp.end(), f[y][q], f[y][q] + len4 );
+          }
+        }
+      }
+    }
+    for( size_t i = 0; i < pdp.size(); i += 2 )   // (each mode's filters are a multiple of 32 entries)
+    {
+      mat.push_back( int32_t( uint16_t( pdp[i] ) ) | int32_t( uint32_t( uint16_t( pdp[i + 1] ) ) << 16 ) );
+    }
+  }
+#endif
   // LFNST / NSPT (invSecondary): the positions x | y << 16 of the first 64 entries of each scan they read (the grouped
   // 4x4 diagonal scans, the top-left 8x8 / 16x16 ones of LFNST; from each entry's raster index, as the 16x16 scan's x
   // and y lie within its 8x8 quarters), and the extended LFNST's output positions
@@ -1789,32 +1841,19 @@ void GpuIntraRec::unsupported( const char* why )
 }
 
 #if JVET_AH0209_PDP
-// PDP (JVET-AH0209): predIntraAng predicts a luma block of a size PDP has filters for by its mode's filter instead
-// (its conditions but the references' availability: a superset of the blocks; a DIMD CU's blend of modes counted in)
-static bool pdpCandidate( const CodingUnit& cu, const PredictionUnit& pu, const ComponentID compID )
+// PDP (JVET-AH0209): the size index (g_size) of a luma block whose prediction is PDP's where its mode has filters
+// (predIntraAng, intra_rec's pdpFilters; MIP's own filters: predIntraMip), -1 for others: a size of g_size, its
+// references available (the snapshot's), its CU without the tools that exclude PDP
+static int pdpSize( const CodingUnit& cu, const PredictionUnit& pu, const ComponentID compID,
+                    const IntraPrediction::IpaSnapshot& ipa )
 {
-  if( !isLuma( compID ) || !cu.cs->sps->getUsePDP() || cu.ispMode || cu.bdpcmMode || cu.plIdx || cu.sgpm || cu.timd
-      || cu.tmrlFlag || pu.multiRefIdx )
+  if( !isLuma( compID ) || !cu.cs->sps->getUsePDP() || !ipa.pdpRefAvailable || cu.ispMode || cu.bdpcmMode || cu.plIdx
+      || cu.sgpm || cu.timd || cu.tmrlFlag || pu.multiRefIdx || pu.intraDir[CHANNEL_TYPE_LUMA] == PNN_IDX )
   {
-    return false;
+    return -1;
   }
   const auto size = g_size.find( ( int( pu.lwidth() ) << 8 ) + int( pu.lheight() ) );
-  if( size == g_size.end() )
-  {
-    return false;
-  }
-  const int mode = pu.intraDir[CHANNEL_TYPE_LUMA];
-  if( cu.dimd || mode >= NUM_LUMA_MODE )
-  {
-    return true;
-  }
-#if JVET_AI0208_PDP_MIP
-  if( cu.mipFlag )
-  {
-    return g_pdpFiltersMip[pu.mipTransposedFlag ? mode + 16 : mode][size->second] != nullptr;
-  }
-#endif
-  return g_pdpFilters[mode][size->second] && !( mode > 1 && ( mode % 2 ) );
+  return size != g_size.end() ? size->second : -1;
 }
 #endif
 
@@ -1941,7 +1980,7 @@ static void cpuFillBlock( GpuIntraRec::Impl& m, const ComponentID comp, const Co
   t.h         = a.height;
   t.dbgOffset = (int32_t) m.numSamples;
   t.mipMatrix = -1;
-  t.ispPrev = t.spCoded = t.spOffset = t.resiFrom = t.cflm = t.ccp = t.ccpMerge = -1;
+  t.ispPrev = t.spCoded = t.spOffset = t.resiFrom = t.cflm = t.ccp = t.ccpMerge = t.pdp = -1;
   t.derive    = DERIVE_NODE | DERIVE_CPU_FILL;
   t.cu        = m.cpuDummyCu;
   m.rec.push_back( t );
@@ -1970,7 +2009,7 @@ static void cpuFillCu( GpuIntraRec::Impl& m, const CodingUnit& cu, const char* w
       t.derive    = DERIVE_NODE | DERIVE_CPU_FILL;
       t.cu        = m.cpuDummyCu;
       t.mipMatrix = -1;
-      t.ispPrev = t.spCoded = t.spOffset = t.resiFrom = t.cflm = t.ccp = t.ccpMerge = -1;
+      t.ispPrev = t.spCoded = t.spOffset = t.resiFrom = t.cflm = t.ccp = t.ccpMerge = t.pdp = -1;
     }
   }
   if( !CU::isIntra( cu ) )
@@ -2254,6 +2293,16 @@ static bool addObicNeighbours( GpuIntraRec::Impl& m, const CodingUnit& cu, Cu& c
     if( nbrs[n]->mipFlag )
     {
       continue;
+    }
+    // partial verification: a neighbour taken from the CPU counts its mode once (a known CU's), which deriveObicMode
+    // does only for a CU of no tool it counts otherwise (TIMD's, DIMD's, SGPM's, NN's modes; nothing of IntraTMP, EIP)
+    const CodingUnit& nb = *nbrs[n];
+    if( m.partial && m.cpuCus.count( &nb )
+        && ( nb.dimd || nb.timd || nb.sgpm || nb.tmrlFlag || nb.tmpFlag || nb.eipFlag || !CU::isIntra( nb )
+             || nb.firstPU->intraDir[CHANNEL_TYPE_LUMA] >= NUM_LUMA_MODE ) )
+    {
+      why = "OBIC with a neighbour from the CPU that counts otherwise";
+      return false;
     }
     const auto rec = m.cuIndex[CHANNEL_TYPE_LUMA].find( nbrs[n] );
     if( rec == m.cuIndex[CHANNEL_TYPE_LUMA].end() )
@@ -2888,7 +2937,7 @@ static int32_t cuRecord( GpuIntraRec::Impl& m, const TransformUnit& tu, const Co
     node.y         = c.y;
     node.dbgOffset = (int32_t) m.numSamples;
     node.mipMatrix = -1;
-    node.ispPrev = node.spCoded = node.spOffset = node.resiFrom = node.cflm = node.ccp = node.ccpMerge = -1;
+    node.ispPrev = node.spCoded = node.spOffset = node.resiFrom = node.cflm = node.ccp = node.ccpMerge = node.pdp = -1;
     node.cu        = index;
     // with what the template predictions of intra merge, TIMD and TMRL need (the bit depth, the SPS's PDPC switch; the
     // availability units of TMRL's reference lines, chroma's as xFillReferenceSamples has them for the CU; the SPS's
@@ -3149,6 +3198,19 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
   dirMode = !isLuma( compID ) && pu.decoderDerivedCcpMode ? LM_CHROMA_IDX : dirMode;
 #endif
 
+#if JVET_AH0209_PDP
+  // PDP's size of the block (-1: no PDP), and a MIP block's filter set where PDP predicts it (predIntraMip, -1: none)
+  const int pdp       = pdpSize( cu, pu, compID, ipa );
+  int       pdpMipSet = -1;
+#if JVET_AI0208_PDP_MIP
+  if( pdp >= 0 && cu.mipFlag && !cu.dimd )
+  {
+    const int set = pu.intraDir[CHANNEL_TYPE_LUMA] + ( pu.mipTransposedFlag ? 16 : 0 );
+    pdpMipSet     = g_pdpFiltersMip[set][pdp] ? set : -1;
+  }
+#endif
+#endif
+
   // what the GPU path does not do yet
   const char* why = nullptr;
   if( !CU::isIntra( cu ) )                                          why = "not intra";
@@ -3167,7 +3229,9 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
   else if( !isLuma( compID ) && PU::isDbvMode( dirMode ) )           why = "DBV";
 #endif
 #if JVET_AH0209_PDP
-  else if( pdpCandidate( cu, pu, compID ) )                         why = "PDP";
+  // PDP: a PDP size's CU is one block
+  else if( pdpMipSet >= 0 && pdp >= PDP_SIZES )                     why = "PDP of MIP beyond 32x32";
+  else if( pdp >= 0 && area != cu.blocks[COMPONENT_Y] )             why = "PDP of a CU with several blocks";
 #endif
   // a DIMD CU (CU_DIMD, CU_OBIC, CU_MERGE) blends planar predicted from the CU's reference line at the block's size
   // (predIntraAng: initIntraPatternChType with the CU's area), the GPU from the block's: the same only where the CU is
@@ -3322,6 +3386,14 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
   t.cflm     = -1;
   t.ccp      = -1;
   t.ccpMerge = -1;
+  // PDP (intra_pdp.glsl): a block it predicts where the mode has filters, with its references' padding and a MIP
+  // block's filter set
+#if JVET_AH0209_PDP
+  t.pdp = pdp >= 0 && pdp < PDP_SIZES && ( !mip || pdpMipSet >= 0 )
+            ? pdp | ipa.pdpPadW << 8 | ipa.pdpPadH << 16 | ( pdpMipSet + 1 ) << 24 : -1;
+#else
+  t.pdp = -1;
+#endif
 #if GPU_CCLM
   if( !isLuma( compID ) && PU::isLMCMode( dirMode ) )
   {
@@ -4587,6 +4659,11 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
           addOwner( fx - 1, fy + y );
         }
       }
+      if( t.pdp >= 0 )   // PDP (intra_pdp.glsl): two lines above with the corner and left, arms of twice the sides
+      {
+        addArea( COMPONENT_Y, t.x - 2, t.y - 2, t.x + 2 * t.w - 1, t.y - 1 );
+        addArea( COMPONENT_Y, t.x - 2, t.y, t.x - 1, t.y + 2 * t.h - 1 );
+      }
       // CCLM: the luma its downsampling reads (xGetLumaRecPixels, 4:2:0): the co-located block, the rows above it (up
       // to 3; MDLM's template 2W wide) and the columns left of it (3; 2H high)
       if( t.lm & LM_ACTIVE )
@@ -4738,6 +4815,7 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
   P.lumaClipMax = cs.slice->clpRng( COMPONENT_Y ).max;
   P.qcsOffset   = m.sh->qcsOffset;
   P.trTables    = m.sh->trTables;
+  P.pdpTable    = m.sh->pdpTable;
   P.ctuSize     = (int32_t) cs.sps->getCTUSize();
   P.lumaUnitW   = (int32_t) cs.pcv->minCUWidth;
   P.lumaUnitH   = (int32_t) cs.pcv->minCUHeight;

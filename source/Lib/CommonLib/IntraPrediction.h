@@ -456,6 +456,7 @@ public:
   Pel  m_ref[ MAX_PDP_SIZE * 6 ];
   Pel  m_refShort[ MAX_PDP_SIZE * 6 ];
   bool m_refAvailable;
+  int  m_pdpPadW = 0, m_pdpPadH = 0;   // xFillReferenceSamples2's padding of m_ref (the decoder's GPU reconstruction)
 #if JVET_AK0061_PDP_MPM
   Pel m_leftRef[256] = { 0 };
   Pel m_leftRefShort[256] = { 0 };
@@ -643,6 +644,10 @@ public:
     bool isModeVer, interpolationFlag, refFilterFlag, applyPDPC, useGradPDPC, applyFusion;
     int  multiRefIndex, intraPredAngle, absInvAngle, angularScale;
     bool fetchRef2nd;   // intra fusion may read the second reference line (initIntraPatternChType, not the mode)
+    // PDP (JVET-AH0209): its references are available (xFillReferenceSamples2's m_refAvailable), and the samples of
+    // the above-right / below-left ends that m_ref replicates from the last available one
+    bool pdpRefAvailable;
+    int  pdpPadW, pdpPadH;
   };
   /// initIntraPatternChType() sets the parameters only (no reference samples; the decoder's GPU reconstruction)
   void setParamsOnly( bool b ) { m_paramsOnly = b; }
@@ -710,9 +715,14 @@ public:
              m_ipaParam.absInvAngle,
              m_ipaParam.angularScale,
 #if JVET_AB0157_INTRA_FUSION
-             m_ipaParam.fetchRef2nd };
+             m_ipaParam.fetchRef2nd,
 #else
-             false };
+             false,
+#endif
+#if JVET_AH0209_PDP
+             m_refAvailable, m_pdpPadW, m_pdpPadH };
+#else
+             false, 0, 0 };
 #endif
   }
 private:

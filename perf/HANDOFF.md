@@ -449,7 +449,7 @@ wall-clock gains with threads are "the easy baseline". Decoder status: single-th
 (`--GpuLoopFilter=1`: ALF, SAO, BIF, CCSAO, LF-CCCM, offset refinement on Vulkan). The user then asked for **a full
 GPU decoder in Vulkan, optimized until nothing is left** ("The GPU decoder needs to fully decode the frame on the
 GPU"; "Your first Vulkan version is going to be slow. That's OK"). That work is branch `dec-gpurecon`: intra
-reconstruction on the GPU (`--GpuRecon`), tool levels M1-M54 done and verified bit-exact (M19: DIMD, M20: OBIC, M21:
+reconstruction on the GPU (`--GpuRecon`), tool levels M1-M55 done and verified bit-exact (M19: DIMD, M20: OBIC, M21:
 intra merge, M22: the transforms of DIMD CUs, M23: LFNST of MIP, M24: TIMD, M25: OBIC and intra merge with TIMD
 neighbours, M26: TIMD-SAD, M27: OBIC and intra merge with TIMD-SAD neighbours, M28: TIMD merge, M29: TMRL of luma,
 M30: chroma TMRL, M31: CCLM, M32: LFNST / NSPT of CCLM, M33: GLM's gradient patterns, M34: CCCM, M35: GL-CCCM, M36:
@@ -457,7 +457,7 @@ CCCM with several downsampling filters, M37: CCCM without subsampling, M38: CCCM
 luma, M40: LM chroma fusion of CCCM, M41: CFLM, M42: GLM with luma with LFNST / NSPT, M43: the SPS switches of the
 CCP tools, M44 / M45: the CCP models, M46: CCP merge, M47 / M48: CCP merge fusion with CCCM / DIMD chroma, M49: CCP
 merge adjustment, M50 / M51: decoder-derived CCP fusion, its merge fusion, M52: CCP merge fusion with CCCM by a blend
-model, M53 / M54: CCP merge and decoder-derived fusion with LFNST / NSPT); it is **not yet faster than the CPU
+model, M53 / M54: CCP merge and decoder-derived fusion with LFNST / NSPT, M55: PDP); it is **not yet faster than the CPU
 decoder** (see section 8) and supports only a restricted tool set (all real CTC streams fall back to the CPU, first
 reason: chroma reordering / DBV; BVG-CCCM CUs are rejected per block).
 
@@ -1512,6 +1512,19 @@ Development speed (2026-10-15, at the user's request): the regular streams in pa
 each tool family (no more test sets encoded per tool); canaries only for code no stream reaches, a full regression once
 a day or before a push, timing at the end of a phase. A cold intra_rec pipeline takes 30 s (plain) to 220 s (CCP LFNST)
 to create; VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT does not shorten it, SPIR-V without glslang's optimizer doubles it.
+M55: PDP (JVET-AH0209, intra_pdp.glsl): a luma block of a size with PDP filters whose references are available is
+predicted by its mode's filter per sample over two reference lines (one for 16x32 .. 32x32, whose filters cover every
+second sample and whose samples between are averaged in place, in the CPU's order); also a MIP block's by MIP's filter
+sets (JVET-AI0208; its LFNST / NSPT mode then a DIMD of that prediction), DIMD's, OBIC's and intra merge's main mode and
+DIMD's / intra merge's blend modes (not the blend's planar, nor OBIC's other modes). The CPU's references' availability
+and padding (xFillReferenceSamples2) now come in parameters-only mode too (initIntraPatternChType; the snapshot's
+pdpRefAvailable / pdpPadW / pdpPadH); the filters (createPdpFilters' and createMipFilters' layouts, ~6M int16) are in
+the matrices buffer, a table per mode / MIP set and size gives their offsets; intra_rec decides per mode (a derived
+mode's too). The prediction goes through s_spPred (a blend keeps its filtered references in s_tmp). Partial
+verification found an OBIC CU counting a CPU-filled neighbour as a plain CU (deriveObicMode counts TIMD, SGPM, NN ...
+neighbours otherwise): such an OBIC CU is taken from the CPU. Results (grP7): every regular stream identical but the
+known CCP merge blocks (fp720_ai's 3 pictures, ra720's first); PDP left the CPU-fill reasons entirely (ai720: 4340 ->
+~3990 CUs from the CPU; NN intra prediction 1626 is now the largest).
 
 ## 8. Numbers (i7-10700 8C/16T, Win11, GCC 16.2, RTX 3070 driver 616.92)
 
@@ -1554,7 +1567,8 @@ Profile of a GPU-on decode (non-LTO, m2_park16, share of all samples): parsing ~
    merge fusion with CCCM (the m47 set), M48 with DIMD chroma (the m48 set), M49 CCP merge adjustment (the m49 set),
    M50 decoder-derived CCP fusion (the m50 set), M51 decoder-derived CCP merge fusion (the m51 set), M52 CCP merge
    fusion with CCCM by a blend model (the m52 set). 2026-10-15: M53 CCP merge and decoder-derived fusion with LFNST /
-   NSPT (the m53 set; intra_rec's second module), M54 its merge fusion with DIMD chroma.
+   NSPT (the m53 set; intra_rec's second module), M54 its merge fusion with DIMD chroma, M55 PDP (partial verification
+   of the regular streams).
    All 19 regular streams now stop at "chroma reordering / DBV" (the next sequence-level check; the block-level tools
    of step 4 follow; BVG-CCCM needs IntraTMP / IBC first).
 3. Make the GPU path win on CPU time per picture: the derive-only pass (record during parsing or a leaner pass;

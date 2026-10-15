@@ -2,7 +2,7 @@
 #ifndef INTRA_COMMON_GLSL
 #define INTRA_COMMON_GLSL
 
-// one transform block of one component (103 int32, layout shared with GpuIntraRec.cpp)
+// one transform block of one component (104 int32, layout shared with GpuIntraRec.cpp)
 struct Tu
 {
   int comp, x, y, w, h;
@@ -74,6 +74,10 @@ struct Tu
   // a CCP merge block (JVET-AD0188, intra_ccp.glsl): its CU's sources of candidates in Params::ccpData (CCP_MERGE_*;
   // -1: not a merge block)
   int ccpMerge;
+  // a luma block PDP may predict (JVET-AH0209, intra_pdp.glsl; whether it does depends on the mode): its size's index
+  // (g_size) | the padding of its references' above-right end << 8 | of their below-left end << 16 | a MIP block's
+  // filter set + 1 << 24 (-1: no PDP)
+  int pdp;
 };
 layout( buffer_reference, std430, buffer_reference_align = 4 ) buffer BufTu { Tu v[]; };
 
@@ -718,6 +722,7 @@ struct Params
   int      cccmScratchOffset;   // its start (int32)
   int      cccmScratchWords;    // its int32 per workgroup
   int      ccpFusionPairs;      // decoder-derived CCP merge fusion's pairs (PU::getMaxNumCcpFusionModel)
+  int      pdpTable;            // in matrices: per mode and PDP size its filters' offset (intra_pdp.glsl)
 };
 layout( buffer_reference, std430, buffer_reference_align = 8 ) buffer BufParams { Params p; };
 

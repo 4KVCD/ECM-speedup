@@ -555,6 +555,11 @@ void dependencies( int comp )
   {
     bilateralFilterDeps( t, comp, availComp, fx, fy, numAbove, numLeft );
   }
+  if( t.pdp >= 0 )   // PDP (intra_pdp.glsl): up to two lines above with the corner and left, arms of twice the sides
+  {
+    addAreaDeps( 0, t.x - 2, t.y - 2, t.x + 2 * t.w - 1, t.y - 1 );
+    addAreaDeps( 0, t.x - 2, t.y, t.x - 1, t.y + 2 * t.h - 1 );
+  }
   if( ( t.lm & LM_ACTIVE ) != 0 )   // CCLM: the luma it downsamples
   {
     cclmDeps( t );

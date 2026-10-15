@@ -6,11 +6,11 @@
 // the picture) run at the same time and no workgroup waits on a block it holds.
 // Per block: reference samples of the block's reference line (MRL; for ISP sub-partitions the CU's references, shifted
 // along the split, and the previous sub-partition's samples) and their [1 2 1] filtering, prediction (planar,
-// directional planar, DC, angular with PDPC and intra fusion, MIP, the intra bilateral filter) and reconstruction with
-// the residual intra_resi computed beforehand for all blocks at once (with LMCS: scaled for chroma by the neighbouring
-// luma, the bilateral filter on inverse-mapped samples); with sign prediction the signs are decided first from the
-// prediction and the neighbours, and the residual computed again where a sign is negative. Every step follows the C++
-// of IntraPrediction / MatrixIntraPrediction / TrQuant / DecCu.
+// directional planar, DC, angular with PDPC and intra fusion, MIP, PDP, the intra bilateral filter) and reconstruction
+// with the residual intra_resi computed beforehand for all blocks at once (with LMCS: scaled for chroma by the
+// neighbouring luma, the bilateral filter on inverse-mapped samples); with sign prediction the signs are decided first
+// from the prediction and the neighbours, and the residual computed again where a sign is negative. Every step follows
+// the C++ of IntraPrediction / MatrixIntraPrediction / TrQuant / DecCu.
 // Modes the CPU cannot know without the reconstruction are derived in a node per CU before its blocks: the MPM lists
 // (intra_modes.glsl), DIMD (intra_dimd.glsl), OBIC (intra_obic.glsl), intra merge (intra_merge.glsl, with the template
 // costs of intra_timd.glsl) and TIMD (intra_timd.glsl); the blocks of DIMD, OBIC, intra merge and TIMD CUs blend the
@@ -612,19 +612,27 @@ const int MIN_MTSS_SIZE = 128;
 // before, ending with a barrier: deriveIpmForTransform over the prediction (buildHistogram's 3x3 gradients at the
 // samples inside the block, subsampled from MIN_MTSS_SIZE samples on; the strongest mode, mipDimdMode, and the second
 // strongest, dimdDerivedIntraDir2nd), into s_predDimdMode and for the comparison the CU's DimdOut; with MTSS
-// (DERIVE_MTSS) MTSS's choice among them and the mode list of the CU's node, into the DimdOut that selectTransform reads
-void mipTransformMode( Tu t, int W, int H, int ps, int upH, int upV, int predStride, int lid, int NT )
+// (DERIVE_MTSS) MTSS's choice among them and the mode list of the CU's node, into the DimdOut that selectTransform
+// reads. pdp: the prediction is PDP's (intra_pdp.glsl, in s_spPred)
+int mipPredAt( int x, int y, int W, int ps, int upH, int upV, int predStride, bool pdp )
+{
+  return pdp ? int( s_spPred[y * W + x] ) : mipSample( x, y, ps, upH, upV, predStride );
+}
+void mipTransformMode( Tu t, int W, int H, int ps, int upH, int upV, int predStride, bool pdp, int lid, int NT )
 {
   const int iw = W - 2, ih = H - 2, step = iw * ih >= MIN_MTSS_SIZE ? 2 : 1;
   const int cols = ( iw + step - 1 ) / step, rows = ( ih + step - 1 ) / step;
   for( int i = lid; i < cols * rows; i += NT )
   {
     const int   x = 1 + ( i % cols ) * step, y = 1 + ( i / cols ) * step;
-    const ivec2 g = sobel3x3( mipSample( x - 1, y - 1, ps, upH, upV, predStride ), mipSample( x, y - 1, ps, upH, upV, predStride ),
-                              mipSample( x + 1, y - 1, ps, upH, upV, predStride ),
-                              mipSample( x - 1, y, ps, upH, upV, predStride ), mipSample( x + 1, y, ps, upH, upV, predStride ),
-                              mipSample( x - 1, y + 1, ps, upH, upV, predStride ), mipSample( x, y + 1, ps, upH, upV, predStride ),
-                              mipSample( x + 1, y + 1, ps, upH, upV, predStride ) );
+    const ivec2 g = sobel3x3( mipPredAt( x - 1, y - 1, W, ps, upH, upV, predStride, pdp ),
+                              mipPredAt( x, y - 1, W, ps, upH, upV, predStride, pdp ),
+                              mipPredAt( x + 1, y - 1, W, ps, upH, upV, predStride, pdp ),
+                              mipPredAt( x - 1, y, W, ps, upH, upV, predStride, pdp ),
+                              mipPredAt( x + 1, y, W, ps, upH, upV, predStride, pdp ),
+                              mipPredAt( x - 1, y + 1, W, ps, upH, upV, predStride, pdp ),
+                              mipPredAt( x, y + 1, W, ps, upH, upV, predStride, pdp ),
+                              mipPredAt( x + 1, y + 1, W, ps, upH, upV, predStride, pdp ) );
     if( g.x != 0 || g.y != 0 )
     {
       atomicAdd( s_dimdHist[dimdAngle( g )], abs( g.x ) + abs( g.y ) );
@@ -903,6 +911,7 @@ ivec2 angularArrays( bool isVer, int W, int H, int angle, int absInvAngle, int t
 #include "intra_cclm.glsl"
 #include "intra_cccm.glsl"
 #include "intra_ccp.glsl"
+#include "intra_pdp.glsl"
 
 // the residual of block c in intra_rec (a derived mode's transforms, DERIVE_TRANSFORM, or sign prediction's
 // recomputation), as intra_resi computes it for the others: the dequantized coefficients, those at the positions in
@@ -1727,11 +1736,16 @@ void main()
       SYNC();
     }
 
+    // ----- PDP (intra_pdp.glsl): the filters of a block it may predict for the block's mode (a MIP block's for its MIP
+    // mode: its prediction then PDP's), -1 for none; of a blend those of each of its predictions (below)
+    const int pdpMain = t.pdp >= 0 && !blend ? pdpFilters( t, t.dirMode ) : -1;
+
     // ----- the intra bilateral filter (bilateralFilterPredDiamond5x5Clip, luma of intra slices; the host checked
     // the size, mode and QP): angular modes skip it for textured references (xPredIntaAng's isRefSampleMadSkipBf, the
-    // mean absolute deviation of the (filtered) top and left reference arrays)
-    bool bf = t.bf == 1;
-    if( t.bf == 2 )
+    // mean absolute deviation of the (filtered) top and left reference arrays); not after PDP, but after a blend of a
+    // PDP prediction
+    bool bf = t.bf == 1 && pdpMain < 0;
+    if( t.bf == 2 && pdpMain < 0 )
     {
       // the arms are 8x the block (never ISP), W, H <= 32: one sample per invocation
       const int a = lid < topLen ? int( s_ref[0][lid] ) : 0, b = lid < leftLen ? int( s_ref[0][predStride + lid] ) : 0;
@@ -1744,9 +1758,23 @@ void main()
     }
 
     // ----- MIP's reduced prediction (MatrixIntraPrediction::prepareInputForPred, computeReducedPred), which its
-    // upsampling reads (mipSample); a MIP block with LFNST / NSPT takes their mode from its prediction (mipTransformMode)
-    const int mipPs = t.mipSizeId < 2 ? 4 : 8, mipUpH = W / mipPs, mipUpV = H / mipPs;
-    if( t.mipMatrix >= 0 )
+    // upsampling reads (mipSample), or PDP's prediction in its place; a MIP block with LFNST / NSPT takes their mode
+    // from its prediction (mipTransformMode)
+    const int  mipPs = t.mipSizeId < 2 ? 4 : 8, mipUpH = W / mipPs, mipUpV = H / mipPs;
+    const bool mipDimd = WITH_DERIVED_TRANSFORMS && WITH_DIMD && ( t.derive & DERIVE_MIP_DIMD ) != 0;
+    if( t.mipMatrix >= 0 && pdpMain >= 0 )
+    {
+      for( int i = lid; mipDimd && i < NUM_LUMA_MODE; i += NT )   // mipTransformMode's histogram
+      {
+        s_dimdHist[i] = 0;
+      }
+      pdpPredict( t, pdpMain, maxPel, lid, NT );
+      if( mipDimd )
+      {
+        mipTransformMode( t, W, H, mipPs, mipUpH, mipUpV, predStride, true, lid, NT );
+      }
+    }
+    else if( t.mipMatrix >= 0 )
     {
       const int bs = t.mipSizeId == 0 ? 2 : 4, inSize = 2 * bs;
       // the reduced boundary: the Haar-downsampled top (entries 0 .. bs - 1) and left (bs .. 2 bs - 1) references
@@ -1758,7 +1786,6 @@ void main()
         for( int j = 0; j < f; j++ ) sum += int( s_ref[0][( top ? 1 : predStride + 1 ) + k * f + j] );
         s_mipBdry[lid] = f > 1 ? ( sum + ( 1 << ( lg - 1 ) ) ) >> lg : sum;
       }
-      const bool mipDimd = WITH_DERIVED_TRANSFORMS && WITH_DIMD && ( t.derive & DERIVE_MIP_DIMD ) != 0;
       for( int i = lid; mipDimd && i < NUM_LUMA_MODE; i += NT )   // mipTransformMode's histogram
       {
         s_dimdHist[i] = 0;
@@ -1790,7 +1817,7 @@ void main()
       SYNC();
       if( mipDimd )
       {
-        mipTransformMode( t, W, H, mipPs, mipUpH, mipUpV, predStride, lid, NT );
+        mipTransformMode( t, W, H, mipPs, mipUpH, mipUpV, predStride, false, lid, NT );
       }
     }
 
@@ -1877,9 +1904,23 @@ void main()
       }
       // a TIMD blend's planar with the reference filter: the filtered line (in s_tmp)
       const bool planarFiltered = timdBlend && t.refFilter != 0;
-      if( t.mipMatrix >= 0 )   // MIP: predictionUpsampling of the reduced prediction
+      // PDP where the mode has filters: of a blend (predIntraAng) the main mode's prediction, and of DIMD's and intra
+      // merge's the blend modes' (not planar's, nor OBIC's other modes)
+      const bool blendPdp = sub >= 2 && ( t.derive & ( DERIVE_DIMD | DERIVE_MERGE ) ) != 0;
+      const bool pdpSub   = t.pdp >= 0 && ( !blend || sub == 0 || blendPdp );
+      const int  pdpFilt = pdpSub && t.mipMatrix < 0 ? pdpFilters( t, t.dirMode ) : -1;
+      if( t.mipMatrix >= 0 && pdpMain >= 0 )   // MIP's PDP prediction (above)
+      {
+        pdpEmit( t, lid, NT );
+      }
+      else if( t.mipMatrix >= 0 )   // MIP: predictionUpsampling of the reduced prediction
       {
         for( int i = lid; i < N; i += NT ) emitPred( t, i % W, i / W, mipSample( i % W, i / W, mipPs, mipUpH, mipUpV, predStride ), bf );
+      }
+      else if( pdpFilt >= 0 )
+      {
+        pdpPredict( t, pdpFilt, maxPel, lid, NT );
+        pdpEmit( t, lid, NT );
       }
       else if( WITH_CCLM && !( ccpDimd && sub == 1 )   // (the merge's LM fields stay: its second prediction is angular)
                && ( ( t.lm & LM_ACTIVE ) != 0 || ( WITH_CCP_MERGE && t.ccpMerge >= 0 ) ) )

@@ -9244,6 +9244,18 @@ void IntraPrediction::initIntraPatternChType(const CodingUnit &cu, const CompAre
       m_ipaParam.refFilterFlag = false;
     }
 #endif
+#if JVET_AH0209_PDP && JVET_AB0155_SGPM && JVET_AJ0161_OBMC_EXT_WITH_INTRA_PRED && JVET_AJ0249_NEURAL_NETWORK_BASED \
+  && JVET_AK0076_EXTENDED_OBMC_IBC
+    // PDP's reference availability and padding, which the GPU's PDP prediction needs: xFillReferenceSamples' call of
+    // xFillReferenceSamples2 (the samples it copies are not the reconstruction's yet, and are never read)
+    m_refAvailable = false;
+    if( !partIdx && isLuma( area.compID ) && cs.sps->getUsePDP() && m_intraOBMCNeighState == INTRA_OBMC_BOTH_NEIGH_AVAIL
+        && !cu.tmpFlag && !cu.eipFlag && !cu.timd && !cu.sgpm && !cu.plIdx && !cu.firstPU->multiRefIdx && !cu.ispMode
+        && !forceDeac0 && cu.firstPU->intraDir[CHANNEL_TYPE_LUMA] != PNN_IDX && !cu.isobmcMC )
+    {
+      xFillReferenceSamples2( cs.picture->getRecoBuf( area ), area, cu );
+    }
+#endif
     return;
   }
 #if JVET_AH0209_PDP
@@ -9708,6 +9720,8 @@ void IntraPrediction::xFillReferenceSamples2(const CPelBuf &recoBuf, const CompA
         int padH = startUnit * 4;
         int sizeW = tuWidth << 1;
         int sizeH = tuHeight << 1;
+        m_pdpPadW = padW;
+        m_pdpPadH = padH;
 
         CPelBuf refBuf = CPelBuf( recoBuf.buf - numMRLTop * srcStride - numMRLLeft, recoBuf.stride, Size( sizeW + numMRLLeft, sizeH + numMRLTop ) );
         xFillReferenceSamplesL( refBuf, m_ref, numMRLTop, sizeW, sizeH, padW, padH );
