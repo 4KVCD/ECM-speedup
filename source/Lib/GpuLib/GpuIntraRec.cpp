@@ -1541,6 +1541,18 @@ Shared* createShared( gpu::Context& ctx )
     stream.submitAndWait();
   }
   upload.destroy( ctx );
+  // development (perf/gpu/precompile.py): ECM_GPU_PRECOMPILE=variant:level compiles that intra_rec pipeline, filling
+  // the driver's shader cache for the processes after it, and ends the process (its decoding would compile the
+  // pipelines its stream needs)
+  int variant = 0, level = 0;
+  const char* precompile = getenv( "ECM_GPU_PRECOMPILE" );
+  if( precompile && sscanf( precompile, "%d:%d", &variant, &level ) == 2 && variant >= 0 && variant < NUM_VARIANTS
+      && level >= 0 && level < NUM_LM_LEVELS )
+  {
+    intraRecKernel( *sh, ctx, IntraRecVariant( variant ), LmLevel( level ) );
+    fflush( stderr );
+    exit( 0 );
+  }
   return sh;
 }
 

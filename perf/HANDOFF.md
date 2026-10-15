@@ -1515,6 +1515,11 @@ Development speed (2026-10-15, at the user's request): the regular streams in pa
 each tool family (no more test sets encoded per tool); canaries only for code no stream reaches, a full regression once
 a day or before a push, timing at the end of a phase. A cold intra_rec pipeline takes 30 s (plain) to 220 s (CCP LFNST)
 to create; VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT does not shorten it, SPIR-V without glslang's optimizer doubles it.
+A decoding process creates the pipelines it needs one after the other, and parallel test processes each compile the same
+ones: after a shader change `perf/gpu/precompile.py <build>` first compiles all 63 (IntraRecVariant x LmLevel), one
+process per pipeline (ECM_GPU_PRECOMPILE=variant:level) on every CPU thread, into runs/nvcache - the cache partial.py
+uses; point the regressions there too (__GL_SHADER_DISK_CACHE_PATH, _SIZE 8000000000, _SKIP_CLEANUP 1). The M57
+regression without it spent ~25 min compiling.
 M55: PDP (JVET-AH0209, intra_pdp.glsl): a luma block of a size with PDP filters whose references are available is
 predicted by its mode's filter per sample over two reference lines (one for 16x32 .. 32x32, whose filters cover every
 second sample and whose samples between are averaged in place, in the CPU's order); also a MIP block's by MIP's filter
