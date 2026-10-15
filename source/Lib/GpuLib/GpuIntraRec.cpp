@@ -2796,10 +2796,10 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
   // template predictions where the SPS's ccpFusionMode asks for it (the encoder's outside all-intra), else averaged,
   // with DIMD chroma always averaged, its adjustment (JVET-AL0126: CCCM models only, on-the-fly ones added, the chosen
   // model's coefficients moved by template costs) and its decoder-derived fusion (JVET-AG0154: a pair of candidates
-  // blended by that regression or averaged); with LFNST / NSPT (JVET-AK0064: their mode a DIMD of the CU's final
-  // predictions, intra_ccp.glsl's ccpMergeTransformMode), but not fusion with DIMD chroma then (the other component's
-  // angular prediction); their SPS switches leave the other LM blocks as they are (BVG-CCCM: otherCccm). Merge fusion
-  // exists in I slices with DIMD only (PU::hasCCPMergeFusionFlag): the GPU derives the DIMD chroma mode there
+  // blended by that regression or averaged), also with LFNST / NSPT (JVET-AK0064: their mode a DIMD of the CU's final
+  // predictions, intra_ccp.glsl's ccpMergeTransformMode); their SPS switches leave the other LM blocks as they are
+  // (BVG-CCCM: otherCccm). Merge fusion exists in I slices with DIMD only (PU::hasCCPMergeFusionFlag): the GPU derives
+  // the DIMD chroma mode there
 #if JVET_AD0188_CCP_MERGE
   else if( !isLuma( compID ) && pu.idxNonLocalCCP && pu.ccpMergeFusionFlag && pu.ccpMergeFusionType != 0
            && !m.deriveModes )
@@ -2808,9 +2808,6 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
   else if( !isLuma( compID ) && pu.idxNonLocalCCP && pu.ddNonLocalCCPFusion )
     why = "decoder-derived CCP merge fusion without the regression blend";
 #endif
-  else if( !isLuma( compID ) && pu.idxNonLocalCCP && pu.ccpMergeFusionFlag && pu.ccpMergeFusionType != 0
-           && cu.lfnstIdx )
-    why = "CCP merge fusion with DIMD chroma with LFNST / NSPT";
   else if( !isLuma( compID ) && pu.idxNonLocalCCP && !GPU_CCCM )    why = "CCP merge of another configuration";
 #endif
 #if JVET_AG0154_DECODER_DERIVED_CCP_FUSION
@@ -2927,16 +2924,17 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
       // CCP merge (intra_ccp.glsl): the inherited model's kind, the GPU's (Tu::lm 0 until then, but merge fusion's);
       // the luma buffers of any kind in the workgroup's CCCM scratch (several filters' four, without subsampling the
       // luma itself) and the prediction, with merge fusion with CCCM also its CCCM prediction (at the scratch's end),
-      // with decoder-derived merge fusion list[1]'s there; before it with either of them by a blend model the
-      // candidates' (and the CCCM prediction's) template samples
-      const bool fusionCccm = pu.ccpMergeFusionFlag && pu.ccpMergeFusionType == 0;
+      // with decoder-derived merge fusion list[1]'s there, with fusion with DIMD chroma and LFNST / NSPT the DIMD
+      // chroma mode's prediction of each component in turn (ccpMergeTransformMode); before it with either of them by a
+      // blend model the candidates' (and the CCCM prediction's) template samples
+      const bool fusionSlot = pu.ccpMergeFusionFlag && ( pu.ccpMergeFusionType == 0 || cu.lfnstIdx );
       const int  lumaWords  = std::max( 4 * cccmLumaArea( area, false ), cccmLumaArea( area, true ) );
 #if JVET_AG0154_DECODER_DERIVED_CCP_FUSION
       const bool samples    = pu.ddNonLocalCCPFusion || ccpFusionBlend( pu );
 #else
       const bool samples    = ccpFusionBlend( pu );
 #endif
-      const int  predWords  = samples ? ccpDerivedScratch( area ) : ( fusionCccm ? 2 : 1 ) * (int) area.area();
+      const int  predWords  = samples ? ccpDerivedScratch( area ) : ( fusionSlot ? 2 : 1 ) * (int) area.area();
       m.cccmScratchWords  = std::max( m.cccmScratchWords, lumaWords + predWords );
     }
     else
@@ -5083,6 +5081,7 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
   // with luma, CCCM's not)
   int numCclm = 0, numMmlm = 0, numMdlm = 0, numLbccp = 0, numCclmDimd = 0, numGlm = 0, numGlmLuma = 0, numLmFusion = 0;
   int numCflm = 0, numCcpMerge = 0, numCcpMergeFusion = 0, numCcpMergeDimd = 0, numCcpMergeLfnst = 0;
+  int numCcpMergeDimdLfnst = 0;
   int numCccm = 0, numCccmAbove = 0, numCccmLeft = 0, numGlCccm = 0, numMdfCccm = 0, numNoSubCccm = 0;
   for( const Tu& t: m.rec )
   {
@@ -5108,8 +5107,10 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
     numCcpMerge += t.ccpMerge >= 0 && !( t.lm & LM_ACTIVE );   // (decoder-derived fusion's blocks are LM blocks)
     numCcpMergeFusion += t.ccpMerge >= 0 && lmFusionType( t ) != 0;   // (with CCCM)
     numCcpMergeDimd += ( t.derive & DERIVE_CCP_DIMD ) != 0;
-    numCcpMergeLfnst += t.ccpMerge >= 0 && !( t.lm & LM_ACTIVE ) && ( t.derive & DERIVE_CCLM_DIMD )
-                        && ( t.derive & DERIVE_TRANSFORM );
+    const bool mergeLfnst = t.ccpMerge >= 0 && !( t.lm & LM_ACTIVE ) && ( t.derive & DERIVE_CCLM_DIMD )
+                            && ( t.derive & DERIVE_TRANSFORM );
+    numCcpMergeLfnst += mergeLfnst;
+    numCcpMergeDimdLfnst += mergeLfnst && ( t.derive & DERIVE_CCP_DIMD );
     numFilter += t.refFilter;
     numPdpc += t.applyPDPC;
     numGrad += t.applyPDPC && t.gradPDPC;
@@ -5140,7 +5141,7 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
       numTimdBlended += m.cpuTimd[size_t( th.index ) * TIMD_OUT + ( th.sad ? TIMD_OUT_SAD : 0 ) + TIMD_OUT_BLENDED] != 0;
     }
   }
-  printf( "\n[gpu-intra] POC %d: %d blocks, chain %d (ref filter %d, PDPC %d, gradient PDPC %d, fusion %d, bilateral filter candidates %d, CU nodes %d, DIMD %d, DIMD CUs %d, OBIC CUs %d, intra merge CUs %d, TIMD CUs %d (blended %d, TIMD-SAD %d, TIMD merge %d, inheriting transforms %d), TMRL CUs %d, chroma TMRL CUs %d, their MTS / LFNST / NSPT blocks %d, MTSS %d, MIP LFNST / NSPT %d, LM blocks %d (MMLM %d, MDLM %d, LBCCP %d, LFNST / NSPT %d, GLM %d (with luma %d), CCCM %d: above %d, left %d, GL %d, several filters %d, without subsampling %d), LM chroma fusion %d (CFLM %d), CCP merge %d (fusion with CCCM %d (by a blend model %d), with DIMD chroma %d, adjusted %d, decoder-derived fusion %d, LFNST / NSPT %d), decoder-derived CCP fusion %d), GPU %.2f ms: %s%s%s", m.poc,
-          (int) m.rec.size() - numNodes, maxDepth, numFilter, numPdpc, numGrad, numFusion, numBf, numNodes, numDimd, numDimdCus, numObic, m.numMerge, m.numTimd, numTimdBlended, numTimdSad, m.numTimdMerge, numInherited, numTmrl, numChromaTmrl, numDimdTransforms, numMtss, numMipDimd, numCclm, numMmlm, numMdlm, numLbccp, numCclmDimd, numGlm, numGlmLuma, numCccm, numCccmAbove, numCccmLeft, numGlCccm, numMdfCccm, numNoSubCccm, numLmFusion, numCflm, numCcpMerge, numCcpMergeFusion, m.numFusionBlend, numCcpMergeDimd, m.numCcpAdjust, m.numDdMergeFusion, numCcpMergeLfnst, m.numDerivedCcp, ms, bad ? "MISMATCH, " : "identical",
+  printf( "\n[gpu-intra] POC %d: %d blocks, chain %d (ref filter %d, PDPC %d, gradient PDPC %d, fusion %d, bilateral filter candidates %d, CU nodes %d, DIMD %d, DIMD CUs %d, OBIC CUs %d, intra merge CUs %d, TIMD CUs %d (blended %d, TIMD-SAD %d, TIMD merge %d, inheriting transforms %d), TMRL CUs %d, chroma TMRL CUs %d, their MTS / LFNST / NSPT blocks %d, MTSS %d, MIP LFNST / NSPT %d, LM blocks %d (MMLM %d, MDLM %d, LBCCP %d, LFNST / NSPT %d, GLM %d (with luma %d), CCCM %d: above %d, left %d, GL %d, several filters %d, without subsampling %d), LM chroma fusion %d (CFLM %d), CCP merge %d (fusion with CCCM %d (by a blend model %d), with DIMD chroma %d, adjusted %d, decoder-derived fusion %d, LFNST / NSPT %d (with DIMD chroma %d)), decoder-derived CCP fusion %d), GPU %.2f ms: %s%s%s", m.poc,
+          (int) m.rec.size() - numNodes, maxDepth, numFilter, numPdpc, numGrad, numFusion, numBf, numNodes, numDimd, numDimdCus, numObic, m.numMerge, m.numTimd, numTimdBlended, numTimdSad, m.numTimdMerge, numInherited, numTmrl, numChromaTmrl, numDimdTransforms, numMtss, numMipDimd, numCclm, numMmlm, numMdlm, numLbccp, numCclmDimd, numGlm, numGlmLuma, numCccm, numCccmAbove, numCccmLeft, numGlCccm, numMdfCccm, numNoSubCccm, numLmFusion, numCflm, numCcpMerge, numCcpMergeFusion, m.numFusionBlend, numCcpMergeDimd, m.numCcpAdjust, m.numDdMergeFusion, numCcpMergeLfnst, numCcpMergeDimdLfnst, m.numDerivedCcp, ms, bad ? "MISMATCH, " : "identical",
           bad ? first.c_str() : "", numBad ? ( ", " + std::to_string( numBad ) + " picture samples differ" ).c_str() : "" );
 }

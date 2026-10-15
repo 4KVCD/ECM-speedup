@@ -437,7 +437,7 @@ the reconstruction buffer; works in every frame-thread context):
   outside all-intra streams) the merge prediction and the two-model CCCM one are blended by such fitted weights
   instead of averaged. M53 is CCP merge and decoder-derived CCP fusion with LFNST / NSPT, whose mode is a DIMD of the
   CU's final chroma predictions: each block predicts the other component too, in pipelines of a second SPIR-V module
-  that only pictures with such blocks take.
+  that only pictures with such blocks take. M54 adds such blocks of merge fusion with DIMD chroma.
   GpuIntraRec::supported()
   rejects every tool whose mode derivation or prediction reads reconstructed samples or that the kernels lack, before
   anything is skipped. All 19 regular streams now fall back to the CPU at chroma reordering / DBV, the next

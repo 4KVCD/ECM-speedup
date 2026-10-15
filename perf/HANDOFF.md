@@ -449,7 +449,7 @@ wall-clock gains with threads are "the easy baseline". Decoder status: single-th
 (`--GpuLoopFilter=1`: ALF, SAO, BIF, CCSAO, LF-CCCM, offset refinement on Vulkan). The user then asked for **a full
 GPU decoder in Vulkan, optimized until nothing is left** ("The GPU decoder needs to fully decode the frame on the
 GPU"; "Your first Vulkan version is going to be slow. That's OK"). That work is branch `dec-gpurecon`: intra
-reconstruction on the GPU (`--GpuRecon`), tool levels M1-M53 done and verified bit-exact (M19: DIMD, M20: OBIC, M21:
+reconstruction on the GPU (`--GpuRecon`), tool levels M1-M54 done and verified bit-exact (M19: DIMD, M20: OBIC, M21:
 intra merge, M22: the transforms of DIMD CUs, M23: LFNST of MIP, M24: TIMD, M25: OBIC and intra merge with TIMD
 neighbours, M26: TIMD-SAD, M27: OBIC and intra merge with TIMD-SAD neighbours, M28: TIMD merge, M29: TMRL of luma,
 M30: chroma TMRL, M31: CCLM, M32: LFNST / NSPT of CCLM, M33: GLM's gradient patterns, M34: CCCM, M35: GL-CCCM, M36:
@@ -457,9 +457,9 @@ CCCM with several downsampling filters, M37: CCCM without subsampling, M38: CCCM
 luma, M40: LM chroma fusion of CCCM, M41: CFLM, M42: GLM with luma with LFNST / NSPT, M43: the SPS switches of the
 CCP tools, M44 / M45: the CCP models, M46: CCP merge, M47 / M48: CCP merge fusion with CCCM / DIMD chroma, M49: CCP
 merge adjustment, M50 / M51: decoder-derived CCP fusion, its merge fusion, M52: CCP merge fusion with CCCM by a blend
-model, M53: CCP merge and decoder-derived fusion with LFNST / NSPT); it is **not yet faster than the CPU decoder** (see
-section 8) and supports only a restricted tool set (all real CTC streams fall back to the CPU, first reason: chroma
-reordering / DBV; CCP merge fusion with DIMD chroma with LFNST / NSPT and BVG-CCCM CUs are rejected per block).
+model, M53 / M54: CCP merge and decoder-derived fusion with LFNST / NSPT); it is **not yet faster than the CPU
+decoder** (see section 8) and supports only a restricted tool set (all real CTC streams fall back to the CPU, first
+reason: chroma reordering / DBV; BVG-CCCM CUs are rejected per block).
 
 ## 2. The user's rules (follow them exactly)
 
@@ -1481,6 +1481,15 @@ the block's own CCCM prediction, the block's CCCM fusion not restored, the gradi
 the later mode, both histograms for every joint CbCr mode), the tenth (merge blocks without DERIVE_CCLM_DIMD) in ON
 mode only: verification records a block after the CPU predicted it, so the host's transform choice reads the CPU's
 mode.
+M54: CCP merge fusion with DIMD chroma with LFNST / NSPT: ccpMergeTransformMode also predicts the CU's DIMD chroma
+mode for each component it reads (ccpDimdChromaPrediction: that component's reference line, intra_rec's chroma
+planar / DC / angular code with PDPC, into the fusion slot the host now sizes for these blocks) and averages it into
+the final samples ((P0 + P1 + 1) >> 1). Second module only. m53: all 12 pictures on the GPU, identical (ON mode too),
+2 to 4 such blocks in m53_fore22 / park720 / four720 pictures. Canaries: 7, 5 caught (the DIMD prediction not
+averaged in, the average unrounded, the other component from the block's line, horizontal modes untransposed, two
+taps rounded down); PDPC off changed no picture (a probe zeroing the angular predictions with PDPC did: the blocks
+have them, but PDPC never moved the histogram's maximum); no m53 block has a planar / DC DIMD chroma mode (a probe
+zeroing them changed nothing), so that branch is untested.
 
 ## 8. Numbers (i7-10700 8C/16T, Win11, GCC 16.2, RTX 3070 driver 616.92)
 
@@ -1523,9 +1532,9 @@ Profile of a GPU-on decode (non-LTO, m2_park16, share of all samples): parsing ~
    merge fusion with CCCM (the m47 set), M48 with DIMD chroma (the m48 set), M49 CCP merge adjustment (the m49 set),
    M50 decoder-derived CCP fusion (the m50 set), M51 decoder-derived CCP merge fusion (the m51 set), M52 CCP merge
    fusion with CCCM by a blend model (the m52 set). 2026-10-15: M53 CCP merge and decoder-derived fusion with LFNST /
-   NSPT (the m53 set; intra_rec's second module).
+   NSPT (the m53 set; intra_rec's second module), M54 its merge fusion with DIMD chroma.
    All 19 regular streams now stop at "chroma reordering / DBV" (the next sequence-level check; the block-level tools
-   of step 4 follow, the CCP tools' rest first: merge fusion with DIMD chroma with LFNST / NSPT, BVG-CCCM).
+   of step 4 follow; BVG-CCCM needs IntraTMP / IBC first).
 3. Make the GPU path win on CPU time per picture: the derive-only pass (record during parsing or a leaner pass;
    speed up getSpatialIpm/getPURestricted, which also helps the CPU decoder), GPU behaviour with frame threads
    (8 contexts x 32 persistent workgroups oversubscribe the GPU; spinning workgroups; try fewer groups per context,
@@ -1567,9 +1576,8 @@ Profile of a GPU-on decode (non-LTO, m2_park16, share of all samples): parsing ~
    merge fusion ones); `bin\encTest21` (m52) ECM_TEST_CCP_FUSION_MODE (the SPS's ccpFusionMode 1 in all-intra too:
    EncLib.cpp's `sps.setCcpFusionMode( getenv( "ECM_TEST_CCP_FUSION_MODE" ) ? 1 : getIntraPeriod() == 1 ? 0 : 1 )`;
    m53 without ECM_TEST_CCP_FUSION_CCCM, with LFNST / NSPT).
-   The user's order (2026-10-13): all intra first, then inter. Next the rest of the CCP tools' CUs (merge fusion with
-   DIMD chroma with LFNST / NSPT: the other component's prediction of the DIMD chroma mode; BVG-CCCM with IntraTMP /
-   IBC), chroma reordering / DBV, BVG-DIMD, MDIP / MPM sorting, IntraTMP / IBC, EIP / SGPM, PDP, NN
+   The user's order (2026-10-13): all intra first, then inter. Next chroma reordering / DBV, BVG-DIMD, MDIP / MPM
+   sorting, IntraTMP / IBC (then BVG-CCCM), EIP / SGPM, PDP, NN
    intra, implicit MTS (not in CTC; its test set, the m24 arguments with `--MTS=0 --MTSImplicit=1`, is encoded:
    `streams_gpu\pending\imts_*`), deblocking on the GPU, then inter pictures.
    Intra merge's GPU time (m19: park720 152, four720 183 ms per picture, from 347 / 392 at first) has room: the

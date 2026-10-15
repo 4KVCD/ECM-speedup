@@ -1315,11 +1315,144 @@ void ccpMergePrediction( inout Tu t, int predStride, int lid, int NT )
 
 // the CU's final prediction of component tc.comp at (x, y), after ccpMergePrediction( tc ): the chosen model's through
 // its inside filter (cclmPrediction), blended with the fusion slot's prediction as storeRegion blends it
-// (cccmFusionBlend: merge fusion with CCCM, decoder-derived fusion and its merge fusion)
+// (cccmFusionBlend: merge fusion with CCCM, decoder-derived fusion and its merge fusion), or as intra_rec's blending
+// averages it with the prediction of the DIMD chroma mode there (merge fusion with DIMD chroma: two predictions of
+// weight 1, the sum rounded)
 int ccpMergeFinalSample( Tu tc, int x, int y, int maxPel )
 {
   const int pr = cclmPrediction( tc, tc.x << 1, tc.y << 1, x, y, maxPel, 0 );
+  if( ( tc.derive & DERIVE_CCP_DIMD ) != 0 )
+  {
+    return ( pr + CBufI32( P.scratch ).v[cccmFusionPredBase( tc ) + y * tc.w + x] + 1 ) >> 1;
+  }
   return lmFusionType( tc ) == 1 ? cccmFusionBlend( tc, x, y, pr ) : pr;
+}
+
+// merge fusion with DIMD chroma's second prediction of component tc.comp (the CU's DIMD chroma mode, its node's) into
+// the fusion slot, from the component's reference line in s_ref[0], as intra_rec's prediction section predicts a
+// chroma block: planar / DC with their PDPC, angular from xPredIntraAng's arrays by two taps with PDPC, the angular
+// arrays cleared again (all invocations, ending with a barrier)
+void ccpDimdChromaPrediction( Tu tc, int predStride, int maxPel, int lid, int NT )
+{
+  Tu td = tc;
+  applyModeParams( td, cuModeOf( tc.cu ), 0 );
+  const int W = td.w, H = td.h, N = W * H, slot = cccmFusionPredBase( tc );
+  const int topLen = W << 3, leftLen = H << 3;
+  if( td.dirMode == PLANAR_IDX || td.dirMode == DC_IDX )
+  {
+    const int log2W = findMSB( W ), log2H = findMSB( H );
+    if( td.dirMode == DC_IDX && lid == 0 )   // xGetPredValDc
+    {
+      const int denom = ( W == H ) ? ( W << 1 ) : max( W, H );
+      int sum = 0;
+      if( W >= H ) for( int k = 0; k < W; k++ ) sum += int( s_ref[0][1 + k] );
+      if( W <= H ) for( int k = 0; k < H; k++ ) sum += int( s_ref[0][predStride + 1 + k] );
+      s_dc = ( sum + ( denom >> 1 ) ) >> findMSB( denom );
+    }
+    SYNC();
+    const int topRight = int( s_ref[0][1 + W] ), bottomLeft = int( s_ref[0][predStride + 1 + H] );
+    const int offset = 1 << ( log2W + log2H ), finalShift = 1 + log2W + log2H;
+    const int pdpcScale = ( log2W - 2 + log2H - 2 + 2 ) >> 2;
+    for( int i = lid; i < N; i += NT )
+    {
+      const int x = i % W, y = i / W, T = int( s_ref[0][1 + x] ), L = int( s_ref[0][predStride + 1 + y] );
+      int v;
+      if( td.dirMode == DC_IDX )
+      {
+        v = s_dc;
+      }
+      else
+      {
+        const int horPred  = ( L << log2W ) + ( x + 1 ) * ( topRight - L );
+        const int vertPred = ( T << log2H ) + ( y + 1 ) * ( bottomLeft - T );
+        if( td.plIdx == 1 )      v = ( horPred + ( 1 << ( log2W - 1 ) ) ) >> log2W;
+        else if( td.plIdx == 2 ) v = ( vertPred + ( 1 << ( log2H - 1 ) ) ) >> log2H;
+        else                     v = ( ( horPred << log2H ) + ( vertPred << log2W ) + offset ) >> finalShift;
+      }
+      v = asPel( v );
+      if( td.applyPDPC != 0 )   // xIntraPredPlanarDcPdpc
+      {
+        const int wT = 32 >> min( 31, ( y << 1 ) >> pdpcScale );
+        const int wL = 32 >> min( 31, ( x << 1 ) >> pdpcScale );
+        v = asPel( v + ( ( wL * ( L - v ) + wT * ( T - v ) + 32 ) >> 6 ) );
+      }
+      CBufI32( P.scratch ).v[slot + i] = v;
+    }
+  }
+  else
+  {
+    const bool  isVer = td.isModeVer != 0;
+    const int   angle = td.intraPredAngle, absInvAngle = td.absInvAngle;
+    const ivec2 bases = angularArrays( isVer, W, H, angle, absInvAngle, topLen, leftLen, 0, predStride,
+                                       td.disableRefFilter != 0, maxPel, lid, NT );
+    SYNC();
+    const int  mainBase = bases.x, sideBase = bases.y;
+    const int  w = isVer ? W : H, h = isVer ? H : W;   // (rows along the main direction)
+    const bool intSlope = ( abs( angle ) & 31 ) == 0;
+    const int  pdpcScale = angle == 0 ? ( ( findMSB( w ) + findMSB( h ) - 2 ) >> 2 ) : td.angularScale;
+    const int  pdpcLimit = td.applyPDPC != 0 ? min( 3 << pdpcScale, w ) : 0;
+    for( int i = lid; i < N; i += NT )
+    {
+      const int x = i % w, y = i / w;   // position in the (possibly transposed) block
+      int v;
+      if( angle == 0 )
+      {
+        v = mainR( isVer, 0, mainBase + 1 + x );
+        if( x < pdpcLimit )
+        {
+          const int scale = ( findMSB( w ) + findMSB( h ) - 2 ) >> 2;
+          const int topLeft = mainR( isVer, 0, mainBase ), left = sideR( isVer, 0, sideBase + 1 + y );
+          const int wL = 32 >> ( 2 * x >> scale );
+          v = clip3i( 0, maxPel, v + ( ( wL * ( left - topLeft ) + 32 ) >> 6 ) );
+        }
+      }
+      else
+      {
+        const int deltaPos = angle * ( y + 1 );
+        const int deltaInt = deltaPos >> 5, deltaFract = deltaPos & 31;
+        if( intSlope )
+        {
+          v = mainR( isVer, 0, mainBase + deltaInt + 1 + x );
+        }
+        else
+        {
+          const int p0 = mainR( isVer, 0, mainBase + deltaInt + x + 1 );
+          const int p1 = mainR( isVer, 0, mainBase + deltaInt + x + 2 );
+          v = asPel( p0 + ( ( deltaFract * ( p1 - p0 ) + 16 ) >> 5 ) );
+        }
+        v = asPel( v );
+        if( x < pdpcLimit )
+        {
+          const int wL = 32 >> ( 2 * x >> td.angularScale );
+          if( td.gradPDPC != 0 )
+          {
+            const int left = sideR( isVer, 0, sideBase + 1 + y );
+            const int m0 = mainR( isVer, 0, mainBase + deltaInt ), m1 = mainR( isVer, 0, mainBase + deltaInt + 1 );
+            const int topLeft = asPel( m0 + ( ( deltaFract * ( m1 - m0 ) + 16 ) >> 5 ) );
+            v = clip3i( 0, maxPel, v + ( ( wL * ( left - topLeft ) + 32 ) >> 6 ) );
+          }
+          else
+          {
+            const int invAngleSum = 256 + ( x + 1 ) * absInvAngle;
+            const int left = sideR( isVer, 0, sideBase + y + ( invAngleSum >> 9 ) + 1 );
+            v = asPel( v + ( ( wL * ( left - v ) + 32 ) >> 6 ) );
+          }
+        }
+      }
+      CBufI32( P.scratch ).v[slot + ( isVer ? y * W + x : x * W + y )] = asPel( v );
+    }
+    // (zero again for the next prediction: IntraPrediction's angRefClearEnd)
+    const int log2Ratio = findMSB( W ) - findMSB( H );
+    const int angClear  = min( ANG, 2 * ( W + H ) + max( topLen, leftLen ) + 2 * PAD + 2 + ( 1 << abs( log2Ratio ) )
+                                    + 16 );
+    SYNC();
+    for( int i = lid; i < angClear; i += NT )
+    {
+      s_angA[0][i] = int16_t( 0 );
+      s_angL[0][i] = int16_t( 0 );
+    }
+  }
+  SYNC();
 }
 
 // the LFNST / NSPT mode of CCP merge block t, also of a decoder-derived CCP fusion block (DERIVE_CCLM_DIMD): DecCu's
@@ -1332,6 +1465,7 @@ void ccpMergeTransformMode( Tu t, int predStride, int maxPel, int lid, int NT )
 {
   const bool derived    = BufI32( P.ccpData ).v[t.ccpMerge + CCP_MERGE_KIND] == CCP_KIND_DERIVED;
   const bool fusionCccm = lmFusionType( t ) == 1;   // (merge fusion with CCCM: its CCCM prediction comes first)
+  const bool fusionDimd = ( t.derive & DERIVE_CCP_DIMD ) != 0;   // (merge fusion with DIMD chroma: its prediction too)
   for( int i = lid; i < NUM_LUMA_MODE; i += NT )
   {
     s_dimdHist[CCP_DIMD_HIST + i] = 0;
@@ -1347,7 +1481,9 @@ void ccpMergeTransformMode( Tu t, int predStride, int maxPel, int lid, int NT )
       continue;
     }
     g_ccpOther = pass == 0;
-    if( derived )   // (its CCLM model's references; the merge code takes the other component's into s_ref[1])
+    // (the references: a derived block's CCLM model's, the merge code takes the other component's into s_ref[1]; those
+    // of the DIMD chroma mode's prediction)
+    if( derived || fusionDimd )
     {
       SYNC();
       fillReferencePar( tc, 0, 0, predStride, lid, NT );
@@ -1359,6 +1495,10 @@ void ccpMergeTransformMode( Tu t, int predStride, int maxPel, int lid, int NT )
     }
     if( hist )
     {
+      if( fusionDimd )
+      {
+        ccpDimdChromaPrediction( tc, predStride, maxPel, lid, NT );
+      }
       ccpMergePrediction( tc, predStride, lid, NT );
       for( int k = lid; k < inner; k += NT )
       {
