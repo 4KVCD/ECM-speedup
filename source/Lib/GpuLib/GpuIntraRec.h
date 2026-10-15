@@ -38,8 +38,8 @@
     picture from the records alone (reference samples, prediction, dequantization, inverse transform, reconstruction).
     With the reconstruction on, the CPU only derives the records; when verifying, it reconstructs the picture too
     (its prediction and residual are recorded) and the results are compared block by block. Supported so far: planar / DC / angular intra prediction with reference filtering, PDPC, intra fusion, the
-    intra bilateral filter, MRL, ISP and MIP, PDP (also MIP's, and in DIMD / OBIC / intra merge blends); DCT-II and
-    explicit MTS, LFNST (with the extended kernels) and NSPT,
+    intra bilateral filter, MRL, ISP and MIP, PDP (also MIP's, and in DIMD / OBIC / intra merge blends), NN intra
+    prediction; DCT-II and explicit MTS, LFNST (with the extended kernels) and NSPT,
     transform skip and BDPCM; scalar and dependent quantization, QCS; joint CbCr; LMCS; sign prediction; the dual tree;
     4:2:0 or 4:0:0. A picture with anything else is skipped and counted. The GPU derives the intra modes itself (the
     MPM lists, chroma DM and candidates, in a node per CU before its blocks) where they depend on reconstructed

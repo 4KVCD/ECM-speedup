@@ -16,6 +16,7 @@ if args and args[0] == '-j':
     args = args[2:]
 streams = args or sorted(f[:-4] for f in os.listdir('C:/Code/ECM/streams') if f.endswith('.bin'))
 cache = 'C:/Code/ECM/runs/nvcache'
+os.makedirs(cache, exist_ok=True)   # (the driver does not create it: without it nothing is cached)
 env = dict(os.environ, ECM_GPU_PARTIAL='1', __GL_SHADER_DISK_CACHE_PATH=cache,
            __GL_SHADER_DISK_CACHE_SIZE='8000000000', __GL_SHADER_DISK_CACHE_SKIP_CLEANUP='1')
 total = Counter()

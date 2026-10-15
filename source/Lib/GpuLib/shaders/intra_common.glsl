@@ -2,7 +2,7 @@
 #ifndef INTRA_COMMON_GLSL
 #define INTRA_COMMON_GLSL
 
-// one transform block of one component (104 int32, layout shared with GpuIntraRec.cpp)
+// one transform block of one component (105 int32, layout shared with GpuIntraRec.cpp)
 struct Tu
 {
   int comp, x, y, w, h;
@@ -78,6 +78,8 @@ struct Tu
   // (g_size) | the padding of its references' above-right end << 8 | of their below-left end << 16 | a MIP block's
   // filter set + 1 << 24 (-1: no PDP)
   int pdp;
+  // a block of NN intra prediction (intra_nn.glsl): its record in Params::timdData (PNN_REC_*; -1: none)
+  int pnn;
 };
 layout( buffer_reference, std430, buffer_reference_align = 4 ) buffer BufTu { Tu v[]; };
 
@@ -174,6 +176,16 @@ const int CCP_MERGE_HIST = 0, CCP_MERGE_HIST_NUM = 1, CCP_MERGE_INDEX = 2, CCP_M
 const int CCP_MERGE_KIND = 4, CCP_MERGE_NUM_SPATIAL = 5, CCP_MERGE_SPATIAL = 6;
 const int CCP_KIND_DERIVED = 3, CCP_KIND_DD_FUSION = 4, CCP_KIND_FUSION_BLEND = 5;
 
+// a block of NN intra prediction's record in Params::timdData (Tu::pnn, intra_nn.glsl; layout shared with
+// GpuIntraRec.cpp): its model's tables in matrices, the downsampling factors, the transposition, the input's layout
+// (lines above / left, the arms' lengths), the context available (likewise; then in samples of the block: the above
+// arm, the left arm, the lines above, the lines left), the model's target size (height, width), the upsampling's
+// boundaries (the reference column left, the row above)
+const int PNN_REC_MODEL = 0, PNN_REC_FACTOR_VER = 1, PNN_REC_FACTOR_HOR = 2, PNN_REC_TRANSPOSED = 3;
+const int PNN_REC_MAX_LINES = 4, PNN_REC_MAX_LENGTH = 6, PNN_REC_LINES = 8, PNN_REC_LENGTH = 10;
+const int PNN_REC_AVAIL = 12, PNN_REC_TARGET = 16, PNN_REC_LEFT_BOUNDARY = 18, PNN_REC_TOP_BOUNDARY = 19;
+const int PNN_REC = 20;
+
 // Tu::derive
 const int DERIVE_NODE     = 32;  // not a block: the derivation of the mode of CU Tu::cu, before the CU's blocks
 const int DERIVE_MODE     = 1;   // the mode and its parameters come from the CU's mode (intra_modes.glsl)
@@ -221,6 +233,12 @@ const int DERIVE_CCP_DIMD = 524288;
 // with DERIVE_NODE: a block partial verification takes from the CPU (its samples in the planes from the start); it
 // owns its area like a block (intra_deps' owner maps: the blocks after it read it as decoded) and does nothing
 const int DERIVE_CPU_FILL = 1048576;
+// a block of NN intra prediction with LFNST / NSPT or explicit MTS (intra_nn.glsl): their mode is a DIMD of its
+// prediction (xPredIntraPnn's indicesRepresentationPnn), which intra_rec derives after the prediction, then the
+// residual and the reconstruction (with DERIVE_TRANSFORM); with DERIVE_PNN_LFNST_SEC LFNST / NSPT take planar, or the
+// second mode where the first is planar (getFinalIntraModeForTransform's lfnstSecFlag rule)
+const int DERIVE_PNN_DIMD = 2097152;
+const int DERIVE_PNN_LFNST_SEC = 4194304;
 
 // Params::dbgParams per block: the derived dirMode, isModeVer, intraPredAngle, absInvAngle, useCubic, refFilter,
 // applyPDPC, gradPDPC, angularScale, fusion, bf, plIdx, then mtxV, mtxH, secMatrix, secTranspose, secLayout

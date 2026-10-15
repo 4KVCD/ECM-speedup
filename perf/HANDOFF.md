@@ -449,7 +449,7 @@ wall-clock gains with threads are "the easy baseline". Decoder status: single-th
 (`--GpuLoopFilter=1`: ALF, SAO, BIF, CCSAO, LF-CCCM, offset refinement on Vulkan). The user then asked for **a full
 GPU decoder in Vulkan, optimized until nothing is left** ("The GPU decoder needs to fully decode the frame on the
 GPU"; "Your first Vulkan version is going to be slow. That's OK"). That work is branch `dec-gpurecon`: intra
-reconstruction on the GPU (`--GpuRecon`), tool levels M1-M55 done and verified bit-exact (M19: DIMD, M20: OBIC, M21:
+reconstruction on the GPU (`--GpuRecon`), tool levels M1-M56 done and verified bit-exact (M19: DIMD, M20: OBIC, M21:
 intra merge, M22: the transforms of DIMD CUs, M23: LFNST of MIP, M24: TIMD, M25: OBIC and intra merge with TIMD
 neighbours, M26: TIMD-SAD, M27: OBIC and intra merge with TIMD-SAD neighbours, M28: TIMD merge, M29: TMRL of luma,
 M30: chroma TMRL, M31: CCLM, M32: LFNST / NSPT of CCLM, M33: GLM's gradient patterns, M34: CCCM, M35: GL-CCCM, M36:
@@ -457,7 +457,8 @@ CCCM with several downsampling filters, M37: CCCM without subsampling, M38: CCCM
 luma, M40: LM chroma fusion of CCCM, M41: CFLM, M42: GLM with luma with LFNST / NSPT, M43: the SPS switches of the
 CCP tools, M44 / M45: the CCP models, M46: CCP merge, M47 / M48: CCP merge fusion with CCCM / DIMD chroma, M49: CCP
 merge adjustment, M50 / M51: decoder-derived CCP fusion, its merge fusion, M52: CCP merge fusion with CCCM by a blend
-model, M53 / M54: CCP merge and decoder-derived fusion with LFNST / NSPT, M55: PDP); it is **not yet faster than the CPU
+model, M53 / M54: CCP merge and decoder-derived fusion with LFNST / NSPT, M55: PDP, M56: NN intra prediction); it is
+**not yet faster than the CPU
 decoder** (see section 8) and supports only a restricted tool set (all real CTC streams fall back to the CPU, first
 reason: chroma reordering / DBV; BVG-CCCM CUs are rejected per block).
 
@@ -1525,6 +1526,21 @@ verification found an OBIC CU counting a CPU-filled neighbour as a plain CU (der
 neighbours otherwise): such an OBIC CU is taken from the CPU. Results (grP7): every regular stream identical but the
 known CCP merge blocks (fp720_ai's 3 pictures, ra720's first); PDP left the CPU-fill reasons entirely (ai720: 4340 ->
 ~3990 CUs from the CPU; NN intra prediction 1626 is now the largest).
+M56: NN intra prediction (JVET-AJ0249, intra_nn.glsl, GpuPnn.cpp): the six SADL models (MatMul layers of int16 weights,
+int32 sums shifted and saturated to +-32767, leaky ReLUs clipping to int16) parsed from the model files into packs of 8
+weights per output column (the sparse layers' packs, the dense layers cut into packs; int32 wraps, so neither order
+nor zeros matter); per block the context (extractContextPortions: lines above with the corner and left, arms of twice
+the sides as far as available, downsampled for 32x32 and up, transposed for tall blocks, less its rounded mean, masks
+0 before the zero-mean shift), the layers, the output plus the mean, upsample2d from the reference column / row
+(closed form per sample), the bilateral filter as for DC. IntraPredictionNN::gpuBlock gives the geometry (the CPU's
+own context availability, now a static function). Transforms that depend on the mode (LFNST / NSPT, explicit MTS):
+the prediction (filtered) is kept in s_spPred as sign prediction keeps it, mipTransformMode's DIMD derives
+indicesRepresentationPnn from it, then the transforms (LFNST / NSPT by getFinalIntraModeForTransform's lfnstSecFlag
+rule), the residual and the reconstruction (DERIVE_PNN_DIMD). An NN CU's record holds planar as its mode (what the MPM
+lists and chroma TMRL read; chroma DM reads indicesRepresentationPnn, still the CPU's in partial verification). Not yet:
+NN CUs above 32 x 32 or with MTSS. Bug found on the way: a workgroup sum in a slot the bilateral filter takes zero.
+partial.py now creates the driver cache's folder (runs/nvcache did not exist: nothing was cached, every run compiled
+every pipeline). The NN's layers are slow so far (ai720: GPU 122 -> 495 ms; each column's packs read serially).
 
 ## 8. Numbers (i7-10700 8C/16T, Win11, GCC 16.2, RTX 3070 driver 616.92)
 
@@ -1567,8 +1583,8 @@ Profile of a GPU-on decode (non-LTO, m2_park16, share of all samples): parsing ~
    merge fusion with CCCM (the m47 set), M48 with DIMD chroma (the m48 set), M49 CCP merge adjustment (the m49 set),
    M50 decoder-derived CCP fusion (the m50 set), M51 decoder-derived CCP merge fusion (the m51 set), M52 CCP merge
    fusion with CCCM by a blend model (the m52 set). 2026-10-15: M53 CCP merge and decoder-derived fusion with LFNST /
-   NSPT (the m53 set; intra_rec's second module), M54 its merge fusion with DIMD chroma, M55 PDP (partial verification
-   of the regular streams).
+   NSPT (the m53 set; intra_rec's second module), M54 its merge fusion with DIMD chroma, M55 PDP, M56 NN intra
+   prediction (partial verification of the regular streams).
    All 19 regular streams now stop at "chroma reordering / DBV" (the next sequence-level check; the block-level tools
    of step 4 follow; BVG-CCCM needs IntraTMP / IBC first).
 3. Make the GPU path win on CPU time per picture: the derive-only pass (record during parsing or a leaner pass;

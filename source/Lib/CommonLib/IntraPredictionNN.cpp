@@ -750,11 +750,22 @@ int IntraPredictionNN::getNbLinesIndividualDimension(const unsigned int dimensio
 
 void IntraPredictionNN::xPredIntraPnnContext(const CompArea& area, const CodingUnit& cu, const int unitHeight, const int unitWidth)
 {
+  int availablePixelsAbove = 0, availablePixelsLeft = 0, nbLinesAbove = 0, nbLinesLeft = 0;
+  contextAvailability(area, cu, unitHeight, unitWidth, availablePixelsAbove, availablePixelsLeft, nbLinesAbove,
+                      nbLinesLeft);
+  setAvailableContext(availablePixelsAbove, availablePixelsLeft, nbLinesAbove, nbLinesLeft);
+}
+
+void IntraPredictionNN::contextAvailability(const CompArea& area, const CodingUnit& cu, const int unitHeight,
+                                            const int unitWidth, int& availablePixelsAbove, int& availablePixelsLeft,
+                                            int& nbLinesAbove, int& nbLinesLeft)
+{
   const ChannelType chType = toChannelType(area.compID);
   const Position posLT = area;
   const CodingStructure& cs = *cu.cs;
-  const WidthHeight pnnContextLength = IntraPredictionNN::getPnnCtxLength(area.width, area.height); 
-  int availablePixelsAbove = 0, availablePixelsLeft = 0;
+  const WidthHeight pnnContextLength = IntraPredictionNN::getPnnCtxLength(area.width, area.height);
+  availablePixelsAbove = 0;
+  availablePixelsLeft  = 0;
   for (int dx = area.width - unitWidth; dx < pnnContextLength.first; dx += unitWidth)
   {
     const Position refPos = posLT.offset(dx, -1);
@@ -774,7 +785,8 @@ void IntraPredictionNN::xPredIntraPnnContext(const CompArea& area, const CodingU
     availablePixelsLeft = dy + unitHeight;
   }
   const WidthHeight maxNbLines = IntraPredictionNN::getNbLines(area.width, area.height);
-  int nbLinesAbove = 0, nbLinesLeft = 0;
+  nbLinesAbove = 0;
+  nbLinesLeft  = 0;
   if (availablePixelsAbove > 0)
   {
     const int maxNbLinesAbove = maxNbLines.first;
@@ -803,7 +815,60 @@ void IntraPredictionNN::xPredIntraPnnContext(const CompArea& area, const CodingU
       }
     }
   }
-  setAvailableContext(availablePixelsAbove, availablePixelsLeft, nbLinesAbove, nbLinesLeft);
+}
+
+IntraPredictionNN::GpuBlock IntraPredictionNN::gpuBlock(const CompArea& area, const CodingUnit& cu)
+{
+  // collectContextWidthHeightMasksInPixels' units (a luma block of the sizes handled: no ISP sub-partition below 4)
+  const PreCalcValues& pcv = *cu.cs->pcv;
+  GpuBlock             b{};
+  contextAvailability(area, cu, pcv.minCUHeight, pcv.minCUWidth, b.availAbove, b.availLeft, b.nbLinesAbove,
+                      b.nbLinesLeft);
+  const TransformationsContextPrediction transfos(area.width, area.height);
+  b.model = -1;
+  for (int k = 0; k < (int) g_pnnModelParams.size(); k++)
+  {
+    if (g_pnnModelParams[k].modelTargetSize == transfos.pairHeightWidthAfterTr)
+    {
+      b.model = k;
+    }
+  }
+  b.heightTr        = transfos.pairHeightWidthAfterTr.first;
+  b.widthTr         = transfos.pairHeightWidthAfterTr.second;
+  b.factorVer       = transfos.factorDownsamplingVertical;
+  b.factorHor       = transfos.factorDownsamplingHorizontal;
+  b.transposed      = transfos.isTransposed;
+  b.maxNbLines[0]   = transfos.maxNbLines.first;
+  b.maxNbLines[1]   = transfos.maxNbLines.second;
+  b.maxCtxLength[0] = transfos.maxCtxLength.first;
+  b.maxCtxLength[1] = transfos.maxCtxLength.second;
+  // extractZeroMeanContextPortions
+  WidthHeight ctxLength(b.availAbove / b.factorHor, b.availLeft / b.factorVer);
+  WidthHeight ctxNbLines(b.nbLinesAbove / b.factorVer, b.nbLinesLeft / b.factorHor);
+  if (b.transposed)
+  {
+    std::swap(ctxLength.first, ctxLength.second);
+    std::swap(ctxNbLines.first, ctxNbLines.second);
+  }
+  b.ctxLength[0]  = ctxLength.first;
+  b.ctxLength[1]  = ctxLength.second;
+  b.ctxNbLines[0] = ctxNbLines.first;
+  b.ctxNbLines[1] = ctxNbLines.second;
+  // predictPnn
+  b.leftBoundary = (b.transposed ? b.nbLinesAbove : b.nbLinesLeft) > 0;
+  b.topBoundary  = (b.transposed ? b.nbLinesLeft : b.nbLinesAbove) > 0;
+  return b;
+}
+
+const unsigned int* IntraPredictionNN::modelData(const int model, size_t& bytes)
+{
+  bytes = g_pnnModelParams[model].modelCoeffsSizeInBytes;
+  return g_pnnModelParams[model].modelCoeffs;
+}
+
+int IntraPredictionNN::numModels()
+{
+  return (int) g_pnnModelParams.size();
 }
 
 WidthHeight IntraPredictionNN::getNbLines(const int blockWidth, const int blockHeight)

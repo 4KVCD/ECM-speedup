@@ -560,6 +560,14 @@ void dependencies( int comp )
     addAreaDeps( 0, t.x - 2, t.y - 2, t.x + 2 * t.w - 1, t.y - 1 );
     addAreaDeps( 0, t.x - 2, t.y, t.x - 1, t.y + 2 * t.h - 1 );
   }
+  if( t.pnn >= 0 )   // NN intra prediction (intra_nn.glsl): its context, the lines above with the corner and left
+  {
+    const int a = t.pnn + PNN_REC_AVAIL;   // the above arm, the left arm, the lines above, the lines left
+    const int above = BufI32( P.timdData ).v[a], left = BufI32( P.timdData ).v[a + 1];
+    const int linesAbove = BufI32( P.timdData ).v[a + 2], linesLeft = BufI32( P.timdData ).v[a + 3];
+    addAreaDeps( 0, t.x - linesLeft, t.y - linesAbove, t.x + above - 1, t.y - 1 );
+    addAreaDeps( 0, t.x - linesLeft, t.y, t.x - 1, t.y + left - 1 );
+  }
   if( ( t.lm & LM_ACTIVE ) != 0 )   // CCLM: the luma it downsamples
   {
     cclmDeps( t );

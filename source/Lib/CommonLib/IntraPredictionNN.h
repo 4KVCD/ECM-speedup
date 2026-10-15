@@ -87,8 +87,30 @@ public:
   const std::array<uint32_t, NUM_INDICES_REP>& getEquivalentIntraDir(const ComponentID compId) { return m_argmaxs[compId]; }
   void collectContextWidthHeightMasksInPixels(const CompArea &area, const int16_t* const piRoiOrigin, const int iPicStride, const int inputBitDepth, const CodingUnit& cu, const ComponentID compID);
 
+  /// the decoder's GPU reconstruction: how predictPnn predicts luma block area of CU cu - its model, the context's
+  /// transformation (downsampling, transposition), the context available (collectContextWidthHeightMasksInPixels;
+  /// the lengths and lines as extractContextPortions takes them, downsampled and transposed) and the upsampling's
+  /// boundaries
+  struct GpuBlock
+  {
+    int  model;                         // the model's index (modelData)
+    int  heightTr, widthTr;             // the model's target size (the downsampled block, transposed)
+    int  factorVer, factorHor;          // the downsampling of the context, the upsampling of the prediction
+    bool transposed;
+    int  maxNbLines[2], maxCtxLength[2];   // the input's layout: lines above / left, the above / left arm's length
+    int  ctxNbLines[2], ctxLength[2];      // the context available
+    int  availAbove, availLeft, nbLinesAbove, nbLinesLeft;   // the same in samples of the block (setAvailableContext's)
+    bool leftBoundary, topBoundary;     // the upsampling starts from the reference column left / row above
+  };
+  static GpuBlock gpuBlock(const CompArea& area, const CodingUnit& cu);
+  /// the SADL model data of model `model` of numModels()
+  static const unsigned int* modelData(const int model, size_t& bytes);
+  static int numModels();
+
 private:
   void xPredIntraPnnContext(const CompArea& area, const CodingUnit& cu, const int unitHeight, const int unitWidth);
+  static void contextAvailability(const CompArea& area, const CodingUnit& cu, const int unitHeight, const int unitWidth,
+                                  int& availAbove, int& availLeft, int& nbLinesAbove, int& nbLinesLeft);
   static int getNbLinesIndividualDimension(const unsigned int dimension);
   static bool decideShapeHandledPnn(const uint32_t height, const uint32_t width);
 };

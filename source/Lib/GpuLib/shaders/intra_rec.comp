@@ -102,6 +102,11 @@ Params P;      // the parameter block (loaded once)
 int    g_ti;   // the block being reconstructed
 bool   g_crs;       // LMCS chroma residual scaling of the block
 int    g_crsScale;  // its scale (Reshape::calculateChromaAdj)
+// a block whose transforms depend on its prediction (DERIVE_PNN_DIMD): its prediction is kept in s_spPred (as sign
+// prediction keeps it) until the transforms are chosen; then the mode LFNST / NSPT take where it is not the one MTS
+// takes (-1: the same)
+bool   g_deferRecon;
+int    g_secMode;
 // blending (a DERIVE_DIMD block whose CU's DIMD blends, a DERIVE_OBIC or DERIVE_MERGE block): the predictions of the
 // CU's modes (s_blendMode: DIMD's or the intra merge candidate's main mode, planar and blend modes, OBIC's modes) are
 // summed per location dependence class (emitPred), weighted, in the workgroup's BLEND_ACC sums at the start of the
@@ -322,7 +327,8 @@ void selectTransform( inout Tu t, int mode, int plIdx )
     }
     else
     {
-      int m = WITH_DIMD && ( t.derive & ( DERIVE_DIMD | DERIVE_OBIC ) ) != 0 ? CBufI32( P.dimdOut ).v[t.cu * DIMD_OUT + DIMD_OUT_MODE] : mode;
+      int m = WITH_DIMD && ( t.derive & ( DERIVE_DIMD | DERIVE_OBIC ) ) != 0
+                ? CBufI32( P.dimdOut ).v[t.cu * DIMD_OUT + DIMD_OUT_MODE] : g_secMode >= 0 ? g_secMode : mode;
       if( luma && m == PLANAR_IDX )
       {
         m = plIdx == 2 ? HOR_IDX : plIdx == 1 ? VER_IDX : m;
@@ -510,7 +516,7 @@ void reconstruct( Tu t, int x, int y, int pr, int re )
 // resiFrom to itself); with sign prediction kept until the signs are decided (signPrediction)
 void storeRecon( Tu t, int x, int y, int pr )
 {
-  if( t.spCoded >= 0 )
+  if( t.spCoded >= 0 || g_deferRecon )
   {
     s_spPred[y * t.w + x] = int16_t( pr );
     return;
@@ -912,6 +918,7 @@ ivec2 angularArrays( bool isVer, int W, int H, int angle, int absInvAngle, int t
 #include "intra_cccm.glsl"
 #include "intra_ccp.glsl"
 #include "intra_pdp.glsl"
+#include "intra_nn.glsl"
 
 // the residual of block c in intra_rec (a derived mode's transforms, DERIVE_TRANSFORM, or sign prediction's
 // recomputation), as intra_resi computes it for the others: the dequantized coefficients, those at the positions in
@@ -1415,6 +1422,8 @@ void main()
       break;
     }
     Tu t = BufTu( P.tus ).v[g_ti];
+    g_deferRecon = WITH_DERIVED_TRANSFORMS && ( t.derive & DERIVE_PNN_DIMD ) != 0;
+    g_secMode    = -1;
     // the dependents, prefetched (their release ends the block)
     const int d0 = BufI32( P.depOffset ).v[g_ti], d1 = BufI32( P.depOffset ).v[g_ti + 1];
     if( lid < d1 - d0 )
@@ -1841,8 +1850,8 @@ void main()
     // ----- the transforms, where they depend on a derived mode or a MIP / CCLM block's prediction: the matrices of the
     // mode, and (unless the residual comes from the other block of a joint CbCr pair) without sign prediction the
     // residual, its first stage now, its second sample by sample at the reconstruction (storeRecon); signPrediction
-    // computes all for its blocks
-    if( WITH_DERIVED_TRANSFORMS && ( t.derive & DERIVE_TRANSFORM ) != 0 )
+    // computes all for its blocks (an NN block's mode is derived after its prediction: below)
+    if( WITH_DERIVED_TRANSFORMS && ( t.derive & DERIVE_TRANSFORM ) != 0 && !g_deferRecon )
     {
       const bool predDimd = cclmDimd || ( WITH_DIMD && ( t.derive & DERIVE_MIP_DIMD ) != 0 );
       selectTransform( t, predDimd ? s_predDimdMode : s_mode, predDimd ? 0 : BufCu( P.cus ).v[t.cu].plIdx );
@@ -1921,6 +1930,11 @@ void main()
       {
         pdpPredict( t, pdpFilt, maxPel, lid, NT );
         pdpEmit( t, lid, NT );
+      }
+      else if( t.pnn >= 0 )   // NN intra prediction (intra_nn.glsl), then the bilateral filter as for DC
+      {
+        pnnPredict( t, predStride, lid, NT );
+        for( int i = lid; i < N; i += NT ) emitPred( t, i % W, i / W, int( s_spPred[i] ), bf );
       }
       else if( WITH_CCLM && !( ccpDimd && sub == 1 )   // (the merge's LM fields stay: its second prediction is angular)
                && ( ( t.lm & LM_ACTIVE ) != 0 || ( WITH_CCP_MERGE && t.ccpMerge >= 0 ) ) )
@@ -2386,6 +2400,40 @@ void main()
         }
       }
     }
+    // ----- an NN block whose transforms depend on its prediction (DERIVE_PNN_DIMD): their mode from a DIMD of the
+    // prediction kept in s_spPred, filtered (xPredIntraPnn's deriveIpmForTransform, as mipTransformMode derives a MIP
+    // block's), the transforms (LFNST / NSPT by the lfnstSecFlag rule where it applies), then the residual and the
+    // reconstruction (sign prediction's below where the block has it)
+    if( WITH_DERIVED_TRANSFORMS && g_deferRecon )
+    {
+      for( int i = lid; i < NUM_LUMA_MODE; i += NT )
+      {
+        s_dimdHist[i] = 0;
+      }
+      SYNC();
+      mipTransformMode( t, W, H, mipPs, mipUpH, mipUpV, predStride, true, lid, NT );
+      if( ( t.derive & DERIVE_PNN_LFNST_SEC ) != 0 )
+      {
+        const int second = CBufI32( P.dimdOut ).v[t.cu * DIMD_OUT + DIMD_OUT_TR_SECOND];
+        g_secMode = s_predDimdMode == PLANAR_IDX ? second : PLANAR_IDX;
+      }
+      selectTransform( t, s_predDimdMode, 0 );
+      if( pc.verify != 0 && lid == 0 )
+      {
+        storeDbgTransforms( t );
+      }
+      if( t.spCoded < 0 && t.resiFrom < 0 )
+      {
+        inChainResidual( t, lid, NT );
+        t.resiFrom = g_ti;   // storeRecon reads it device-coherent
+      }
+      g_deferRecon = false;
+      for( int i = lid; i < N && t.spCoded < 0; i += NT )
+      {
+        storeRecon( t, i % W, i / W, int( s_spPred[i] ) );
+      }
+    }
+
     // ----- CFLM (geneChromaFusionPred's types 2 and 3): the block's prediction by its models from its regular one,
     // complete in the chroma buffer, and the luma (intra_cccm.glsl; its luma buffer in the angular arrays, cleared at
     // the end, or the scratch)

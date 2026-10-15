@@ -36,6 +36,7 @@
 */
 
 #include "GpuIntraRec.h"
+#include "GpuPnn.h"
 #include "VkCompute.h"
 
 #include <algorithm>
@@ -47,6 +48,9 @@
 #include "CommonLib/BilateralFilter.h"
 #include "CommonLib/DepQuant.h"
 #include "CommonLib/InterpolationFilter.h"
+#if JVET_AJ0249_NEURAL_NETWORK_BASED
+#include "CommonLib/IntraPredictionNN.h"
+#endif
 #include "CommonLib/MipData.h"
 #include "CommonLib/Picture.h"
 #include "CommonLib/Quant.h"
@@ -115,8 +119,13 @@ struct Tu
                   // -1: none)
   int32_t ccpMerge;   // a CCP merge block's entry in Params::ccpData (CCP_MERGE_*; -1: not a merge block)
   int32_t pdp;        // a block PDP may predict: its size, its references' padding (intra_common.glsl; -1: none)
+  int32_t pnn;        // a block of NN intra prediction: its record in Params::timdData (PNN_REC_*; -1: none)
 };
-static_assert( sizeof( Tu ) == 104 * 4, "Tu layout" );
+static_assert( sizeof( Tu ) == 105 * 4, "Tu layout" );
+
+// a block of NN intra prediction's record in Params::timdData (intra_common.glsl's PNN_REC_*)
+constexpr int PNN_REC_AVAIL = 12, PNN_REC_TARGET = 16, PNN_REC_TOP_BOUNDARY = 19;
+constexpr int PNN_REC = 20;
 
 // the PDP sizes with filters (g_size's first 16) and MIP's filter sets (per MIP mode, then transposed; intra_pdp.glsl's
 // PDP_SIZES, PDP_MIP_GROUPS)
@@ -150,6 +159,8 @@ constexpr int DERIVE_CCP_DIMD     = 524288;  // a block of a CCP merge CU of fus
                                              // the merge prediction and that of its node's DIMD chroma mode
 constexpr int DERIVE_CPU_FILL     = 1048576; // with DERIVE_NODE: a block partial verification takes from the CPU, which
                                              // owns its area (the blocks after it read it as decoded) and does nothing
+constexpr int DERIVE_PNN_DIMD     = 2097152; // an NN block whose transforms' mode is a DIMD of its prediction
+constexpr int DERIVE_PNN_LFNST_SEC = 4194304; // ... whose LFNST / NSPT take the lfnstSecFlag rule's mode
 
 // Tu::lm (intra_common.glsl's LM_*): whether the block is a CCLM block (the modes from 67 on are also those of TIMD /
 // TMRL luma blocks), its slope adjustments (+ 8, in 4 bits each) and LBCCP's inside filter; with DERIVE_CCLM_DIMD the
@@ -1131,6 +1142,7 @@ struct Shared
   int32_t                          lfnstLayout[3][2] = {};        // of the LFNST output positions in matrices (sbSize 4, 8, 16; transposed)
   int32_t                          trTables = 0;                  // of the transform tables' directory in matrices (TR_TAB_*)
   int32_t                          pdpTable = 0;                  // of PDP's filters' offsets in matrices
+  std::vector<int32_t>             pnnModel;                      // of each NN intra prediction model in matrices
   std::vector<std::pair<const int8_t*, size_t>>      secTables;   // each table's start and bytes, in secKernels' order
   std::vector<std::pair<const ScanElement*, int32_t>> secScans;  // the scans LFNST / NSPT read, their positions' offset in matrices
   std::unique_ptr<BilateralFilter> bif;   // the intra prediction bilateral filter's tables
@@ -1351,6 +1363,11 @@ Shared* createShared( gpu::Context& ctx )
     }
   }
 #endif
+  // the NN intra prediction's models (intra_nn.glsl, GpuPnn.h; none where one has what the kernels lack)
+  if( !appendPnnModels( mat, sh->pnnModel ) )
+  {
+    sh->pnnModel.clear();
+  }
   // LFNST / NSPT (invSecondary): the positions x | y << 16 of the first 64 entries of each scan they read (the grouped
   // 4x4 diagonal scans, the top-left 8x8 / 16x16 ones of LFNST; from each entry's raster index, as the 16x16 scan's x
   // and y lie within its 8x8 quarters), and the extended LFNST's output positions
@@ -1980,7 +1997,7 @@ static void cpuFillBlock( GpuIntraRec::Impl& m, const ComponentID comp, const Co
   t.h         = a.height;
   t.dbgOffset = (int32_t) m.numSamples;
   t.mipMatrix = -1;
-  t.ispPrev = t.spCoded = t.spOffset = t.resiFrom = t.cflm = t.ccp = t.ccpMerge = t.pdp = -1;
+  t.ispPrev = t.spCoded = t.spOffset = t.resiFrom = t.cflm = t.ccp = t.ccpMerge = t.pdp = t.pnn = -1;
   t.derive    = DERIVE_NODE | DERIVE_CPU_FILL;
   t.cu        = m.cpuDummyCu;
   m.rec.push_back( t );
@@ -2009,7 +2026,7 @@ static void cpuFillCu( GpuIntraRec::Impl& m, const CodingUnit& cu, const char* w
       t.derive    = DERIVE_NODE | DERIVE_CPU_FILL;
       t.cu        = m.cpuDummyCu;
       t.mipMatrix = -1;
-      t.ispPrev = t.spCoded = t.spOffset = t.resiFrom = t.cflm = t.ccp = t.ccpMerge = t.pdp = -1;
+      t.ispPrev = t.spCoded = t.spOffset = t.resiFrom = t.cflm = t.ccp = t.ccpMerge = t.pdp = t.pnn = -1;
     }
   }
   if( !CU::isIntra( cu ) )
@@ -2846,6 +2863,9 @@ static int32_t cuRecord( GpuIntraRec::Impl& m, const TransformUnit& tu, const Co
     else
     {
       mode = PU::getIntraDirLuma( pu );
+#if JVET_AJ0249_NEURAL_NETWORK_BASED
+      mode = mode == PNN_IDX ? PLANAR_IDX : mode;   // (an NN CU: the mode the MPM lists and chroma TMRL read)
+#endif
     }
     // DIMD's histograms (deriveDimdMode): a DIMD CU's mode, the modes OBIC counts less, and the first entries of an
     // MPM list (also a TIMD CU's, not a TIMD merge CU's, and a TMRL CU's mode list); where the parsed syntax selects the
@@ -2937,7 +2957,8 @@ static int32_t cuRecord( GpuIntraRec::Impl& m, const TransformUnit& tu, const Co
     node.y         = c.y;
     node.dbgOffset = (int32_t) m.numSamples;
     node.mipMatrix = -1;
-    node.ispPrev = node.spCoded = node.spOffset = node.resiFrom = node.cflm = node.ccp = node.ccpMerge = node.pdp = -1;
+    node.ispPrev = node.spCoded = node.spOffset = node.resiFrom = node.cflm = node.ccp = node.ccpMerge = -1;
+    node.pdp = node.pnn = -1;
     node.cu        = index;
     // with what the template predictions of intra merge, TIMD and TMRL need (the bit depth, the SPS's PDPC switch; the
     // availability units of TMRL's reference lines, chroma's as xFillReferenceSamples has them for the CU; the SPS's
@@ -2997,6 +3018,14 @@ static int32_t cuRecord( GpuIntraRec::Impl& m, const TransformUnit& tu, const Co
   {
     d[0]                  = cu.mipDimdMode;
     d[DIMD_OUT_TR_SECOND] = cu.dimdDerivedIntraDir2nd;
+  }
+#endif
+#if JVET_AJ0249_NEURAL_NETWORK_BASED
+  // an NN CU: those of its prediction (xPredIntraPnn's indicesRepresentationPnn)
+  if( isLuma( chType ) && cu.firstPU->intraDir[CHANNEL_TYPE_LUMA] == PNN_IDX && !m.on )
+  {
+    d[0]                  = (int32_t) cu.indicesRepresentationPnn[COMPONENT_Y][0];
+    d[DIMD_OUT_TR_SECOND] = (int32_t) cu.indicesRepresentationPnn[COMPONENT_Y][1];
   }
 #endif
   // MTSS's mode list and the LFNST / NSPT mode and bucket it chose, for verification (in ON mode the CPU derives them
@@ -3191,7 +3220,14 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
   // MIP blocks (luma; IntraPrediction::predIntraMip) are recorded with the DC mode: they read the references DC reads
   // (a superset), and their bilateral filter, like DC's, has no angular texture gate; Tu::mipMatrix selects MIP
   const bool             mip     = isLuma( compID ) && cu.mipFlag;
-  int                    dirMode = mip ? DC_IDX : PU::getFinalIntraMode( pu, chType );
+  // NN intra prediction's blocks (luma; IntraPrediction::xPredIntraPnn, intra_nn.glsl) likewise: they read the
+  // references DC reads (the upsampling's boundaries) and have the bilateral filter where DC has it
+#if JVET_AJ0249_NEURAL_NETWORK_BASED
+  const bool             pnn     = isLuma( compID ) && PU::getFinalIntraMode( pu, chType ) == PNN_IDX;
+#else
+  const bool             pnn     = false;
+#endif
+  int                    dirMode = mip || pnn ? DC_IDX : PU::getFinalIntraMode( pu, chType );
 #if JVET_AG0154_DECODER_DERIVED_CCP_FUSION
   // a block of decoder-derived CCP fusion has the parsed LM_CHROMA_IDX (its CCLM model's), the GPU derives the rest; in
   // verification DecCu has left its choice (LM_CHROMA_IDX or MMLM_CHROMA_IDX) in the PU
@@ -3233,6 +3269,13 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
   else if( pdpMipSet >= 0 && pdp >= PDP_SIZES )                     why = "PDP of MIP beyond 32x32";
   else if( pdp >= 0 && area != cu.blocks[COMPONENT_Y] )             why = "PDP of a CU with several blocks";
 #endif
+  // NN intra prediction: its CU is one block up to 32 x 32 (its transforms' mode, where they depend on one, a DIMD of
+  // its prediction intra_rec derives: DERIVE_PNN_DIMD)
+  else if( pnn && m.sh->pnnModel.empty() )                          why = "NN intra prediction without its models";
+  else if( pnn && ( area != cu.blocks[COMPONENT_Y] || area.width > 32 || area.height > 32 ) )
+    why = "NN intra prediction of a split CU or above 32 x 32";
+  else if( pnn && !m.deriveModes && ( cu.lfnstIdx || tu.mtsIdx[COMPONENT_Y] > MTS_SKIP ) )
+    why = "NN intra prediction with LFNST / NSPT or MTS without the GPU's mode derivation";
   // a DIMD CU (CU_DIMD, CU_OBIC, CU_MERGE) blends planar predicted from the CU's reference line at the block's size
   // (predIntraAng: initIntraPatternChType with the CU's area), the GPU from the block's: the same only where the CU is
   // one block (the intra configuration's CTU and transform sizes leave no other)
@@ -3393,6 +3436,29 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
             ? pdp | ipa.pdpPadW << 8 | ipa.pdpPadH << 16 | ( pdpMipSet + 1 ) << 24 : -1;
 #else
   t.pdp = -1;
+#endif
+  // NN intra prediction (intra_nn.glsl): the block's record (IntraPredictionNN::gpuBlock's geometry), from the
+  // unfiltered references without fusion (initPredIntraParams' PNN_IDX; fetchRef2nd)
+  t.pnn = -1;
+#if JVET_AJ0249_NEURAL_NETWORK_BASED
+  if( pnn )
+  {
+    const IntraPredictionNN::GpuBlock b = IntraPredictionNN::gpuBlock( area, cu );
+    if( b.model < 0 || b.model >= (int) m.sh->pnnModel.size() )
+    {
+      reject( "NN intra prediction of a shape without a model" );
+      return;
+    }
+    const int32_t rec[PNN_REC] = { m.sh->pnnModel[b.model], b.factorVer, b.factorHor, b.transposed ? 1 : 0,
+                                   b.maxNbLines[0], b.maxNbLines[1], b.maxCtxLength[0], b.maxCtxLength[1],
+                                   b.ctxNbLines[0], b.ctxNbLines[1], b.ctxLength[0], b.ctxLength[1],
+                                   b.availAbove, b.availLeft, b.nbLinesAbove, b.nbLinesLeft, b.heightTr, b.widthTr,
+                                   b.leftBoundary ? 1 : 0, b.topBoundary ? 1 : 0 };
+    static_assert( PNN_REC_TOP_BOUNDARY == PNN_REC - 1 && PNN_REC_AVAIL == 12 && PNN_REC_TARGET == 16, "PNN_REC" );
+    t.pnn = (int32_t) m.timdData.size();
+    m.timdData.insert( m.timdData.end(), rec, rec + PNN_REC );
+    t.refFilter = t.fusion = 0;
+  }
 #endif
 #if GPU_CCLM
   if( !isLuma( compID ) && PU::isLMCMode( dirMode ) )
@@ -3889,15 +3955,25 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
     const bool mipDimd   = GPU_MIP_DIMD && mip && cu.lfnstIdx;
     // (a DIMD of the CU's chroma predictions: an LM block's, a CCP merge block's)
     const bool cclmDimd  = ( ( t.lm & LM_ACTIVE ) || t.ccpMerge >= 0 ) && cu.lfnstIdx;
-    if( ( derived || mipDimd || cclmDimd ) && ( mtsByMode || sec.kind != SEC_NONE ) )
+    // an NN block's (MTS too): a DIMD of its prediction (indicesRepresentationPnn), LFNST / NSPT by the lfnstSecFlag
+    // rule where it applies (getFinalIntraModeForTransform)
+    const bool pnnDimd   = pnn;
+#if JVET_AJ0249_NEURAL_NETWORK_BASED
+    const bool pnnSec    = pnn && cu.lfnstSecFlag && isAllowedMultiple( area.width, area.height );
+#else
+    const bool pnnSec    = false;
+#endif
+    if( ( derived || mipDimd || cclmDimd || pnnDimd ) && ( mtsByMode || sec.kind != SEC_NONE ) )
     {
       CHECK( mipDimd && cuIdx < 0, "a MIP block's LFNST mode without its CU's record (DIMD has the GPU derive modes)" );
+      CHECK( pnnDimd && cuIdx < 0, "an NN block's transforms' mode without its CU's record" );
       m.numCcpLfnst += cclmDimd && t.ccpMerge >= 0;
       t.derive   |= DERIVE_TRANSFORM | ( mipDimd ? DERIVE_MIP_DIMD : 0 ) | ( cclmDimd ? DERIVE_CCLM_DIMD : 0 )
+                    | ( pnnDimd ? DERIVE_PNN_DIMD : 0 ) | ( pnnSec ? DERIVE_PNN_LFNST_SEC : 0 )
                     | ( isLuma( resiComp ) && usesMtss( tu ) ? DERIVE_MTSS : 0 );
-      if( mipDimd )
+      if( mipDimd || pnnDimd )
       {
-        m.cuMipDimd[cuIdx] = 1;
+        m.cuMipDimd[cuIdx] = pnnDimd ? 2 : 1;
       }
       t.mtsSet    = mtsByMode ? tu.mtsIdx[resiComp] - MTS_DST7_DST7 + 1 : 0;
       t.secIdx    = cu.lfnstIdx - 1;
@@ -4664,6 +4740,12 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
         addArea( COMPONENT_Y, t.x - 2, t.y - 2, t.x + 2 * t.w - 1, t.y - 1 );
         addArea( COMPONENT_Y, t.x - 2, t.y, t.x - 1, t.y + 2 * t.h - 1 );
       }
+      if( t.pnn >= 0 )   // NN intra prediction (intra_nn.glsl): its context, the lines above with the corner and left
+      {
+        const int32_t* a = &m.timdData[t.pnn + PNN_REC_AVAIL];   // the above arm, the left arm, the lines above / left
+        addArea( COMPONENT_Y, t.x - a[3], t.y - a[2], t.x + a[0] - 1, t.y - 1 );
+        addArea( COMPONENT_Y, t.x - a[3], t.y, t.x - 1, t.y + a[1] - 1 );
+      }
       // CCLM: the luma its downsampling reads (xGetLumaRecPixels, 4:2:0): the co-located block, the rows above it (up
       // to 3; MDLM's template 2W wide) and the columns left of it (3; 2H high)
       if( t.lm & LM_ACTIVE )
@@ -5250,7 +5332,10 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
                             : GPU_DIMD_TRANSFORMS && ( k == DIMD_OUT_TR_SECOND ? c.dimd >= 0 && !chroma : c.mtss >= 0 );
       if( compared && g[k] != h[k] )
       {
-        const char* field = mipDimd && k == 0 ? "mipDimdMode" : mipDimd && k == DIMD_OUT_TR_SECOND ? "dimdDerivedIntraDir2nd"
+        const bool  pnnDimd = m.cuMipDimd[u] == 2;
+        const char* field = pnnDimd && k == 0 ? "indicesRepresentationPnn" : pnnDimd ? "indicesRepresentationPnn[1]"
+                            : mipDimd && k == 0 ? "mipDimdMode"
+                            : mipDimd && k == DIMD_OUT_TR_SECOND ? "dimdDerivedIntraDir2nd"
                             : chroma ? ( k == 0 ? "dimdChromaMode" : "dimdChromaModeSecond" )
                             : k == 0 ? "dimdMode" : k == 1 ? "dimdBlending" : k < 9 ? "dimdBlendMode" : k < 17 ? "dimdRelWeight"
                             : k < DIMD_OUT_TR_SECOND ? "dimdLocDep" : k == DIMD_OUT_TR_SECOND ? "candModeListForTransform"
@@ -5260,7 +5345,7 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
                             : k == DIMD_OUT_TR_SECOND ? 1 : k < DIMD_OUT_MTSS_MODE ? k - DIMD_OUT_MTSS_LIST : 0;
         char buf[200];
         snprintf( buf, sizeof( buf ), "%s[%d] of CU %d (%s at %d,%d %dx%d): CPU %d GPU %d", field, entry, (int) u,
-                  mipDimd ? "MIP" : cuKindName( c.kind ), c.x, c.y, c.w, c.h, h[k], g[k] );
+                  pnnDimd ? "NN" : mipDimd ? "MIP" : cuKindName( c.kind ), c.x, c.y, c.w, c.h, h[k], g[k] );
         first = buf;
         break;
       }
