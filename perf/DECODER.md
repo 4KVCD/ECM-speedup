@@ -430,7 +430,10 @@ the reconstruction buffer; works in every frame-thread context):
   CCP merge adjustment: CCCM candidates alone, up to six models fitted on the fly, and the chosen model's
   coefficients moved by template costs. M50 is decoder-derived CCP fusion: a chroma CU fits a CCLM model and CCCM
   models itself, ranks them (and LBCCP's inside filter on two of them) by their predictions of the lines next to the
-  block, and predicts with the best one or, where it fits those lines better, a 3 : 1 blend of the best pair.
+  block, and predicts with the best one or, where it fits those lines better, a 3 : 1 blend of the best pair. M51 is
+  decoder-derived CCP merge fusion: a merge CU signals a pair of its ranked candidates, which it blends by weights
+  fitted to their template predictions (a linear model of the position) or averages, whichever fits the template
+  better.
   GpuIntraRec::supported()
   rejects every tool whose mode derivation or prediction reads reconstructed samples or that the kernels lack, before
   anything is skipped. All 19 regular streams now fall back to the CPU at chroma reordering / DBV, the next

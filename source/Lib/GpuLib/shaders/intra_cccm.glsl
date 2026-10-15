@@ -1086,11 +1086,19 @@ int cccmBlockPrediction( Tu t, int x, int y )
 // LM chroma fusion's sample (x, y) of block t: its regular prediction pr blended with the CCCM prediction, weighted
 // w0 : 4 - w0 (geneChromaFusionPred: w0 by whether the CUs below-left and above-right are LM CUs, the host's). A CCP
 // merge fusion block's: its merge prediction after the inside filter, w0 2 (applyBlendFusion's average without a
-// blend model, (pr + cccm + 1) >> 1)
+// blend model, (pr + cccm + 1) >> 1); a decoder-derived fusion block's: list[0]'s and list[1]'s, w0 3, a
+// decoder-derived merge fusion block's: by its pair's blend model (w0 0, intra_ccp.glsl's ccpFusionBlend)
+int ccpFusionBlend( int x, int y, int p0, int p1 );
+
 int cccmFusionBlend( Tu t, int x, int y, int pr )
 {
-  const int w0 = ( t.lm >> LM_FUSION_W_SHIFT ) & 3;
-  return ( pr * w0 + CBufI32( P.scratch ).v[cccmFusionPredBase( t ) + y * t.w + x] * ( 4 - w0 ) + 2 ) >> 2;
+  const int w0    = ( t.lm >> LM_FUSION_W_SHIFT ) & 3;
+  const int other = CBufI32( P.scratch ).v[cccmFusionPredBase( t ) + y * t.w + x];
+  if( WITH_CCP_DERIVED && w0 == 0 )
+  {
+    return ccpFusionBlend( x, y, pr, other );
+  }
+  return ( pr * w0 + other * ( 4 - w0 ) + 2 ) >> 2;
 }
 
 // ----- CFLM (LM chroma fusion's types 2 and 3: xCflmCreateLumaRef, xCflmCreateChromaPred, xCflmCalcModels /

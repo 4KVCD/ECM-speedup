@@ -51,11 +51,18 @@ const int CCP_DEFAULT_A[CCP_MAX_CANDS] = int[]( 0, 1, -1, 2, -2, 3, -3, 4, -4, 5
 // their number; the history's models (most recent first) and their number; the first CCLM candidate's slopes (Cb's,
 // Cr's, 64-bit as two words) and shifts, which the defaults move, and whether there is one; which on-the-fly models are
 // valid; decoder-derived fusion's costs of the pairs of modes and its choice (the list entries of list[0] and list[1],
-// -1 without fusion)
+// -1 without fusion; decoder-derived merge fusion's alike), the sorted candidates' places before the sort (its template
+// samples' order), the chosen pair's model
 #define s_ccp s_dimdHist
 const int CCP_LIST = 0, CCP_LIST_INSIDE = 15, CCP_LIST_COST = 30, CCP_LIST_NUM = 45, CCP_LUT = 46, CCP_LUT_NUM = 52;
 const int CCP_SCALE = 53, CCP_SHIFT = 57, CCP_FOUND = 59, CCP_FLY_VALID = 60, CCP_PAIR_COST = 66;
-const int CCP_DERIVED_FIRST = 81, CCP_DERIVED_SECOND = 82;
+const int CCP_DERIVED_FIRST = 81, CCP_DERIVED_SECOND = 82, CCP_LIST_ORIG = 83, CCP_BLEND = 98;
+
+// decoder-derived CCP merge fusion (reorderCCPCandidates with ddNonLocalCCPFusion): pairs of the first 9 candidates,
+// per pair in the scratch its words (CCP_PAIR_*: its cost, whether its model blends, the model's three parameters,
+// shift and offset), the same words of the chosen pair at CCP_BLEND; a blend's weights of list[1] 1 .. 31 of 32
+const int CCP_FUSION_CANDS = 9, CCP_PAIRS_MAX = 36, CCP_PAIR_WORDS = 7, CCP_FUSION_SLOTS_MAX = 12;
+const int CCP_PAIR_COST_W = 0, CCP_PAIR_VALID = 1, CCP_PAIR_PARAMS = 2, CCP_PAIR_SHIFT = 5, CCP_PAIR_OFFSET = 6;
 
 // decoder-derived CCP fusion's modes in the CPU's order (decoderDerivedCcp): the CCLM model (LM_CHROMA_IDX), plain
 // CCCM of a single model without and with LBCCP's inside filter, of two models alike, GL-CCCM where the block has more
@@ -233,7 +240,8 @@ void ccpMergeList( Tu t )
 {
   BufI32     d = BufI32( P.ccpData );
   const int  e = t.ccpMerge, numSpatial = d.v[e + CCP_MERGE_NUM_SPATIAL], numLut = s_ccp[CCP_LUT_NUM];
-  const bool adjust = d.v[e + CCP_MERGE_KIND] != 0;
+  const int  kind = d.v[e + CCP_MERGE_KIND];
+  const bool adjust = kind != 0 && kind < CCP_KIND_DERIVED;
   const int  maxNum = adjust ? CCP_MAX_LIST : CCP_MAX_CANDS, numDefaults = adjust ? 0 : CCP_MAX_CANDS;
   int        num = 0;
   for( int s = 0; s < numSpatial + numLut + numDefaults && num < maxNum; s++ )
@@ -273,9 +281,13 @@ void ccpDerivedList( Tu t )
 }
 
 // reorderCCPCandidates' insertion sort by the costs (invocation 0): each candidate before the first one of a higher
-// cost
+// cost; in the pipelines with decoder-derived fusion each one's place before the sort too (CCP_LIST_ORIG)
 void ccpMergeSort()
 {
+  for( int i = 0; i < s_ccp[CCP_LIST_NUM] && WITH_CCP_DERIVED; i++ )
+  {
+    s_ccp[CCP_LIST_ORIG + i] = i;
+  }
   for( int i = 1; i < s_ccp[CCP_LIST_NUM]; i++ )
   {
     for( int j = 0; j < i; j++ )
@@ -283,15 +295,24 @@ void ccpMergeSort()
       if( s_ccp[CCP_LIST_COST + i] < s_ccp[CCP_LIST_COST + j] )
       {
         const int x = s_ccp[CCP_LIST + i], inside = s_ccp[CCP_LIST_INSIDE + i], cost = s_ccp[CCP_LIST_COST + i];
+        const int orig = s_ccp[CCP_LIST_ORIG + i];
         for( int k = i; k > j; k-- )
         {
           s_ccp[CCP_LIST + k]        = s_ccp[CCP_LIST + k - 1];
           s_ccp[CCP_LIST_INSIDE + k] = s_ccp[CCP_LIST_INSIDE + k - 1];
           s_ccp[CCP_LIST_COST + k]   = s_ccp[CCP_LIST_COST + k - 1];
+          if( WITH_CCP_DERIVED )
+          {
+            s_ccp[CCP_LIST_ORIG + k] = s_ccp[CCP_LIST_ORIG + k - 1];
+          }
         }
         s_ccp[CCP_LIST + j]        = x;
         s_ccp[CCP_LIST_INSIDE + j] = inside;
         s_ccp[CCP_LIST_COST + j]   = cost;
+        if( WITH_CCP_DERIVED )
+        {
+          s_ccp[CCP_LIST_ORIG + j] = orig;
+        }
         break;
       }
     }
@@ -416,9 +437,15 @@ void ccpDerivedLinear( Tu t, int predStride )
   }
 }
 
-// where block t's probe samples are (the costs' step by step, Cb's then Cr's): the workgroup's scratch after the luma
-// buffer (where it is there), where the predictions go later (the host allocates room for both)
-int ccpProbeBase() { return cccmScratchPred(); }
+// where decoder-derived fusion block t's probe samples (decoder-derived merge fusion's template samples) are, the costs'
+// step by step, Cb's then Cr's, and after them the pairs' words: in the workgroup's scratch before list[1]'s
+// prediction at its end, which the block's own prediction may overlap later (GpuIntraRec.cpp's ccpDerivedScratch)
+int ccpProbeBase( Tu t )
+{
+  return cccmFusionPredBase( t ) - CCP_MAX_CANDS * 2 * ( t.w + t.h ) - CCP_PAIRS_MAX * CCP_PAIR_WORDS;
+}
+
+int ccpPairBase( Tu t ) { return ccpProbeBase( t ) + CCP_MAX_CANDS * 2 * ( t.w + t.h ); }
 
 // the position of tap k (0 .. 8: 3 x 3, the line farthest from the block first) of decoder-derived fusion's probe
 // sample q of the row above block t (top) or of the column left of it with LBCCP's inside filter
@@ -476,8 +503,8 @@ void ccpDerivedChoice( Tu t, int lid, int NT )
     if( top ? above : left )
     {
       const ivec2 ab = ccpDerivedPair( p, num );
-      const int   pa = CBufI32( P.scratch ).v[ccpProbeBase() + ab.x * 2 * len + s];
-      const int   pb = CBufI32( P.scratch ).v[ccpProbeBase() + ab.y * 2 * len + s];
+      const int   pa = CBufI32( P.scratch ).v[ccpProbeBase( t ) + ab.x * 2 * len + s];
+      const int   pb = CBufI32( P.scratch ).v[ccpProbeBase( t ) + ab.y * 2 * len + s];
       const bool  bFirst = s_ccp[CCP_LIST_COST + ab.y] < s_ccp[CCP_LIST_COST + ab.x];
       const int   v = bFirst ? ( 3 * pb + pa + 2 ) >> 2 : ( 3 * pa + pb + 2 ) >> 2;
       const int   reco = top ? recoAt( c + 1, t.x + q, t.y - 1 ) : recoAt( c + 1, t.x - 1, t.y + q );
@@ -511,6 +538,213 @@ void ccpDerivedChoice( Tu t, int lid, int NT )
     s_ccp[CCP_DERIVED_SECOND] = second;
   }
   SYNC();
+}
+
+// ----- decoder-derived CCP merge fusion (JVET-AG0154 with JVET-AN0168's regression blend)
+
+// list[1]'s weight (1 .. 31 of 32) at (x, y) relative to the block by a blend model (AffineBlendingModel::compute: in
+// 32 bits, as the CPU's ints)
+int ccpBlendWeight( int p0, int p1, int p2, int shift, int offset, int x, int y )
+{
+  return clamp( ( p0 * x + p1 * y + p2 + offset ) >> shift, 1, 31 );
+}
+
+// the cost and blend model of the pair of candidates whose template samples are the a-th and b-th in the scratch (one
+// invocation; reorderCCPCandidates with useBlendModelDdccp, always) into the pair's words at `dst`: the SAD of the
+// average of their samples (xGetCostCCPFusion) or, where lower, of their blend by xComputeBlendFusionModelJoint's
+// model - list[1]'s weight linear in the position, fitted to both components' template samples by solve1: the
+// features (P1 - P0) x where the block has a CU above, (P1 - P0) y where it has one left (x and y one less than the
+// sample's own along its line: AML_MERGE_TEMPLATE_SIZE) and P1 - P0, the target the reconstruction minus P0, each a
+// Pel; its parameters as ints (the CPU sizes them before it sets them, so it scales them by 1), its shift DECIM_BITS
+// - 5; equal weights (16) where those at the block's corners differ by 4 at most
+void ccpBlendModel( Tu t, int a, int b, int dst )
+{
+  const bool above = s_cclm[CCLM_POS_ABOVE] != 0, left = s_cclm[CCLM_POS_LEFT] != 0;
+  const int  W = t.w, H = t.h, len = W + H, bitDepth = t.bitDepth;
+  const int  pa = ccpProbeBase( t ) + a * 2 * len, pb = ccpProbeBase( t ) + b * 2 * len;
+  CBufI32    s = CBufI32( P.scratch );
+  int64_t e[3][4];   // the normal equations' upper triangle and right-hand side, then the elimination's rows
+  for( int i = 0; i < 12; i++ )
+  {
+    e[i / 4][i % 4] = 0;
+  }
+  int n = 0, costAverage = 0;
+  for( int k = 0; k < 2 * len; k++ )   // (component k / len, template sample k % len: the row above, then the column)
+  {
+    const int  i = k % len, q = i < W ? i : i - W, c = k / len;
+    const bool top = i < W;
+    if( top ? above : left )
+    {
+      const int p0 = s.v[pa + k], p1 = s.v[pb + k], d = p1 - p0;
+      const int reco = top ? recoAt( c + 1, t.x + q, t.y - 1 ) : recoAt( c + 1, t.x - 1, t.y + q );
+      int f[4];
+      f[0] = above ? int( int16_t( d * ( top ? q - 1 : -1 ) ) ) : 0;
+      f[1] = left ? int( int16_t( d * ( top ? -1 : q - 1 ) ) ) : 0;
+      f[2] = int( int16_t( d ) );
+      f[3] = int( int16_t( reco - p0 ) );
+      for( int r = 0; r < 3; r++ )
+      {
+        for( int col = r; col < 4; col++ )
+        {
+          e[r][col] += int64_t( f[r] * f[col] );
+        }
+      }
+      n++;
+      costAverage += abs( reco - ( ( p0 + p1 + 1 ) >> 1 ) );
+    }
+  }
+  // solve1: scaled to 28 bits over the samples, regularized, eliminated with xDivide's scales, substituted back
+  const int matrixShift = 28 - 2 * bitDepth - cccmCeilLog2( max( n, 1 ) );
+  for( int i = 0; i < 12; i++ )   // (the upper triangle and the right-hand side scaled, then the lower triangle)
+  {
+    const int r = i / 4, col = i % 4;
+    if( col >= r )
+    {
+      e[r][col] = matrixShift > 0 ? e[r][col] << matrixShift : e[r][col] >> -matrixShift;
+    }
+  }
+  for( int r = 0; r < 3; r++ )
+  {
+    for( int col = 0; col < r; col++ )
+    {
+      e[r][col] = e[col][r];
+    }
+    e[r][r] += int64_t( 2 << ( bitDepth - 8 ) );
+  }
+  for( int piv = 0; piv < 3; piv++ )
+  {
+    int scale, round, shift;
+    cccmDivScale( e[piv][piv] < int64_t( 1 ) ? int64_t( 1 ) : e[piv][piv], scale, round, shift );
+    for( int j = piv + 1; j < 4; j++ )
+    {
+      e[piv][j] = ( e[piv][j] * int64_t( scale ) + int64_t( round ) ) >> shift;
+    }
+    for( int r = piv + 1; r < 3; r++ )
+    {
+      const int64_t f = e[r][piv];
+      for( int j = piv + 1; j < 4; j++ )
+      {
+        e[r][j] -= ( f * e[piv][j] + int64_t( 1 << ( CCCM_DECIM - 1 ) ) ) >> CCCM_DECIM;
+      }
+    }
+  }
+  int64_t x[3];
+  for( int r = 2; r >= 0; r-- )
+  {
+    x[r] = e[r][3];
+    for( int j = r + 1; j < 3; j++ )
+    {
+      x[r] -= ( e[r][j] * x[j] + int64_t( 1 << ( CCCM_DECIM - 1 ) ) ) >> CCCM_DECIM;
+    }
+  }
+  int p0 = int( x[0] ), p1 = int( x[1] ), p2 = int( x[2] ), shift = CCCM_DECIM - 5, offset = 1 << ( shift - 1 );
+  int lo = 31, hi = 1;
+  for( int corner = 0; corner < 4; corner++ )
+  {
+    const int wgt = ccpBlendWeight( p0, p1, p2, shift, offset, ( corner & 1 ) * ( W - 1 ), ( corner >> 1 ) * ( H - 1 ) );
+    lo = min( lo, wgt );
+    hi = max( hi, wgt );
+  }
+  if( hi - lo <= 4 )   // (AffineBlendingModel::average)
+  {
+    p0     = 0;
+    p1     = 0;
+    p2     = 16;
+    shift  = 0;
+    offset = 0;
+  }
+  int costModel = 0;
+  for( int k = 0; k < 2 * len; k++ )
+  {
+    const int  i = k % len, q = i < W ? i : i - W, c = k / len;
+    const bool top = i < W;
+    if( top ? above : left )
+    {
+      const int p0s = s.v[pa + k], p1s = s.v[pb + k];
+      const int reco = top ? recoAt( c + 1, t.x + q, t.y - 1 ) : recoAt( c + 1, t.x - 1, t.y + q );
+      const int wgt = top ? ccpBlendWeight( p0, p1, p2, shift, offset, q, -1 )
+                          : ccpBlendWeight( p0, p1, p2, shift, offset, -1, q );
+      costModel += abs( reco - int( int16_t( ( ( 32 - wgt ) * p0s + wgt * p1s + 16 ) >> 5 ) ) );
+    }
+  }
+  const bool blends = costModel < costAverage;
+  s.v[dst + CCP_PAIR_COST_W]     = blends ? costModel : costAverage;
+  s.v[dst + CCP_PAIR_VALID]      = blends ? 1 : 0;
+  s.v[dst + CCP_PAIR_PARAMS]     = p0;
+  s.v[dst + CCP_PAIR_PARAMS + 1] = p1;
+  s.v[dst + CCP_PAIR_PARAMS + 2] = p2;
+  s.v[dst + CCP_PAIR_SHIFT]      = shift;
+  s.v[dst + CCP_PAIR_OFFSET]     = offset;
+}
+
+// decoder-derived CCP merge fusion's pair (reorderCCPCandidates' fusionList; all invocations, ending with a barrier),
+// after the sort: per pair of the first 9 candidates (in the CPU's order) its cost and model (ccpBlendModel), then the
+// pairs ranked by cost into P.ccpFusionPairs slots (each before the first slot of a higher cost), the entry's slot's
+// pair as list[0] (its first candidate) and list[1] (its second), its model into CCP_BLEND. (A slot no pair reached,
+// which the encoder never signals, takes the first candidate twice, averaged.)
+void ccpDdFusionChoice( Tu t, int lid, int NT )
+{
+  const int num = min( s_ccp[CCP_LIST_NUM], CCP_FUSION_CANDS ), numPairs = num * ( num - 1 ) / 2;
+  cccmSync();   // (the template samples)
+  for( int p = lid; p < numPairs; p += NT )
+  {
+    const ivec2 ab = ccpDerivedPair( p, num );
+    ccpBlendModel( t, s_ccp[CCP_LIST_ORIG + ab.x], s_ccp[CCP_LIST_ORIG + ab.y], ccpPairBase( t ) + p * CCP_PAIR_WORDS );
+  }
+  cccmSync();
+  if( lid == 0 )
+  {
+    CBufI32   s = CBufI32( P.scratch );
+    const int slots = min( P.ccpFusionPairs, CCP_FUSION_SLOTS_MAX );
+    int slotPair[CCP_FUSION_SLOTS_MAX], slotCost[CCP_FUSION_SLOTS_MAX];
+    for( int m = 0; m < CCP_FUSION_SLOTS_MAX; m++ )
+    {
+      slotPair[m] = -1;
+      slotCost[m] = 0x7fffffff;
+    }
+    for( int p = 0; p < numPairs; p++ )
+    {
+      const int cost = s.v[ccpPairBase( t ) + p * CCP_PAIR_WORDS + CCP_PAIR_COST_W];
+      for( int m = 0; m < slots; m++ )
+      {
+        if( cost < slotCost[m] )
+        {
+          for( int k = slots - 1; k > m; k-- )
+          {
+            slotCost[k] = slotCost[k - 1];
+            slotPair[k] = slotPair[k - 1];
+          }
+          slotCost[m] = cost;
+          slotPair[m] = p;
+          break;
+        }
+      }
+    }
+    const int   p  = slotPair[clamp( BufI32( P.ccpData ).v[t.ccpMerge + CCP_MERGE_INDEX], 0, slots - 1 )];
+    const ivec2 ab = p >= 0 ? ccpDerivedPair( p, num ) : ivec2( 0 );
+    s_ccp[CCP_DERIVED_FIRST]  = ab.x;
+    s_ccp[CCP_DERIVED_SECOND] = ab.y;
+    for( int w = 0; w < CCP_PAIR_WORDS; w++ )
+    {
+      s_ccp[CCP_BLEND + w] = p >= 0 ? s.v[ccpPairBase( t ) + p * CCP_PAIR_WORDS + w] : 0;
+    }
+  }
+  SYNC();
+}
+
+// decoder-derived CCP merge fusion's prediction at (x, y) of block t (storeRegion's, cccmFusionBlend): list[0]'s p0
+// blended with list[1]'s p1 by the chosen pair's model, ( ( 32 - w ) p0 + w p1 + 16 ) >> 5, else averaged
+// (applyBlendFusion)
+int ccpFusionBlend( int x, int y, int p0, int p1 )
+{
+  if( s_ccp[CCP_BLEND + CCP_PAIR_VALID] == 0 )
+  {
+    return ( p0 + p1 + 1 ) >> 1;
+  }
+  const int wgt = ccpBlendWeight( s_ccp[CCP_BLEND + CCP_PAIR_PARAMS], s_ccp[CCP_BLEND + CCP_PAIR_PARAMS + 1],
+                                  s_ccp[CCP_BLEND + CCP_PAIR_PARAMS + 2], s_ccp[CCP_BLEND + CCP_PAIR_SHIFT],
+                                  s_ccp[CCP_BLEND + CCP_PAIR_OFFSET], x, y );
+  return int( int16_t( ( ( 32 - wgt ) * p0 + wgt * p1 + 16 ) >> 5 ) );
 }
 
 // ----- models the block fits itself; adjustment (JVET-AL0126): the chosen model's coefficients moved
@@ -771,13 +1005,24 @@ void ccpMergeAdjust( Tu t, int x, int flag, int lid, int NT )
 // CCLM model's clipped; decoderDerivedCccmCost), which the scratch keeps for the choice (ccpDerivedChoice), then
 // predicts list[1] where it blends two (predDecoderDerivedIntraCCCMFusions: through its inside filter, into the fusion
 // slot), then list[0]. The CU's record is list[0]'s model with the inside filter flags 0 (DecCu clears the PU's flag
-// before CU::saveCcInsideFilterFlagInCCP would copy it)
+// before CU::saveCcInsideFilterFlagInCCP would copy it).
+// A merge block of decoder-derived merge fusion keeps its candidates' template samples alike, chooses its pair after
+// the sort (ccpDdFusionChoice) and predicts like a decoder-derived fusion block (predDecoderDerivedCcpMergeFusion: the
+// pair's second candidate, then its first, each through its inside filter), blended by the pair's model
+// (ccpFusionBlend); the CU's record is the first candidate's, as a merge CU's
 void ccpMergePrediction( inout Tu t, int predStride, int lid, int NT )
 {
   const int  kind = BufI32( P.ccpData ).v[t.ccpMerge + CCP_MERGE_KIND];
   const bool derived = WITH_CCP_DERIVED && kind == CCP_KIND_DERIVED;
-  const int  adjust = derived ? 0 : kind;
+  const bool ddFusion = WITH_CCP_DERIVED && kind == CCP_KIND_DD_FUSION;
+  const bool twoSteps = derived || ddFusion;   // (list[1]'s prediction, then list[0]'s)
+  const int  adjust = twoSteps ? 0 : kind;
   g_ccpAngUsed = 0;
+  if( twoSteps )   // (where a prediction goes, also where no CCCM model of the block set them: list[1] a CCLM model)
+  {
+    g_cccmFusion = false;
+    g_cccmBoth   = false;
+  }
   if( derived )   // (the other component's references, for its CCLM model)
   {
     Tu o = t;
@@ -834,12 +1079,12 @@ void ccpMergePrediction( inout Tu t, int predStride, int lid, int NT )
     SYNC();
   }
   const int  W = t.w, H = t.h, len = W + H, numCost = s_ccp[CCP_LIST_NUM], maxPel = ( 1 << t.bitDepth ) - 1;
-  const int  steps = numCost + ( derived ? 2 : 1 );   // (decoder-derived fusion: list[1]'s prediction, then list[0]'s)
+  const int  steps = numCost + ( twoSteps ? 2 : 1 );
   const bool above = s_cclm[CCLM_POS_ABOVE] != 0, left = s_cclm[CCLM_POS_LEFT] != 0;
   int x = 0, inside = 0;
   for( int step = 0; step < steps; step++ )
   {
-    const bool cost = step < numCost, last = step == steps - 1, fusionStep = derived && !cost && !last;
+    const bool cost = step < numCost, last = step == steps - 1, fusionStep = twoSteps && !cost && !last;
     if( cost )
     {
       x      = s_ccp[CCP_LIST + step];
@@ -860,9 +1105,13 @@ void ccpMergePrediction( inout Tu t, int predStride, int lid, int NT )
             ccpMergeSort();
           }
           SYNC();
+          if( ddFusion )
+          {
+            ccpDdFusionChoice( t, lid, NT );
+          }
         }
       }
-      const int idx = !derived ? BufI32( P.ccpData ).v[t.ccpMerge + CCP_MERGE_INDEX]
+      const int idx = !twoSteps ? BufI32( P.ccpData ).v[t.ccpMerge + CCP_MERGE_INDEX]
                     : s_ccp[last ? CCP_DERIVED_FIRST : CCP_DERIVED_SECOND];
       if( derived && idx < 0 )   // (no list[1]: one mode alone)
       {
@@ -941,11 +1190,11 @@ void ccpMergePrediction( inout Tu t, int predStride, int lid, int NT )
           }
           v = ( sum + 8 ) >> 4;
         }
-        else if( fusionStep && linear )   // (list[1]'s CCLM prediction)
+        else if( fusionStep && linear )   // (list[1]'s CCLM / GLM prediction)
         {
-          Tu tl = t;   // (a CCLM block of slot 0's model)
-          tl.lm      = LM_ACTIVE;
-          tl.dirMode = LM_CHROMA_IDX;
+          Tu tl = t;   // (a CCLM block of slot 0's model: its pattern, two models as MMLM's)
+          tl.lm      = LM_ACTIVE | ( ccpWord( x, CCP_OUT_GLM_IDC ) << LM_GLM_SHIFT );
+          tl.dirMode = two ? MMLM_CHROMA_IDX : LM_CHROMA_IDX;
           v = cclmPredSample( tl, t.x << 1, t.y << 1, s % W, s / W, maxPel, 0 );
         }
         else
@@ -958,9 +1207,9 @@ void ccpMergePrediction( inout Tu t, int predStride, int lid, int NT )
         if( cost )
         {
           sad += abs( ( top ? recoAt( c + 1, t.x + q, t.y - 1 ) : recoAt( c + 1, t.x - 1, t.y + q ) ) - v );
-          if( derived )
+          if( twoSteps )
           {
-            CBufI32( P.scratch ).v[ccpProbeBase() + step * 2 * len + s] = v;
+            CBufI32( P.scratch ).v[ccpProbeBase( t ) + step * 2 * len + s] = v;
           }
         }
         else if( fusionStep && inside == 0 )
@@ -996,12 +1245,13 @@ void ccpMergePrediction( inout Tu t, int predStride, int lid, int NT )
     SYNC();
   }
   // the chosen model as its LM block's; a merge fusion block's fields kept: storeRegion blends its CCCM prediction in,
-  // decoder-derived fusion's list[1] with the weight 3 for list[0]
+  // decoder-derived fusion's list[1] with the weight 3 for list[0], decoder-derived merge fusion's by the pair's model
+  // (the weight 0 that stands for it)
   const int type = ccpWord( x, CCP_OUT_TYPE );
   t.lm = ( t.lm & LM_FUSION_FIELDS ) | ( inside != 0 ? LM_INSIDE : 0 );
-  if( derived && s_ccp[CCP_DERIVED_SECOND] >= 0 )
+  if( ( derived && s_ccp[CCP_DERIVED_SECOND] >= 0 ) || ddFusion )
   {
-    t.lm |= LM_FUSION | ( 1 << LM_FUSION_TYPE_SHIFT ) | ( 3 << LM_FUSION_W_SHIFT );
+    t.lm |= LM_FUSION | ( 1 << LM_FUSION_TYPE_SHIFT ) | ( ( derived ? 3 : 0 ) << LM_FUSION_W_SHIFT );
   }
   if( ccpLinear( type ) )
   {

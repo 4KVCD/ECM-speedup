@@ -160,12 +160,13 @@ const int CCP_TYPE_GLCCCM = 32, CCP_TYPE_NSCCCM = 64, CCP_TYPE_MDFCCCM = 128;
 // the Cr block's; with adjustment its on-the-fly models, for decoder-derived CCP fusion its models), its kind (the
 // adjustment, ccpMergeAdjustFlag: 0 none, 1 the coefficient of the co-located luma sample, 2 that, then those of its
 // neighbours; CCP_KIND_DERIVED a block of decoder-derived CCP fusion, which shares the merge code: no sources, no
-// history), the number of spatial sources, then those records (PU::getCCPModelCandidateList's adjacent and
-// non-adjacent positions' PUs, decoded before the CU, typed, each once)
+// history; CCP_KIND_DD_FUSION a merge block of decoder-derived merge fusion, its index the pair's,
+// ddNonLocalCCPFusion - 1), the number of spatial sources, then those records (PU::getCCPModelCandidateList's
+// adjacent and non-adjacent positions' PUs, decoded before the CU, typed, each once)
 const int CCP_WRITERS = 2;
 const int CCP_MERGE_HIST = 0, CCP_MERGE_HIST_NUM = 1, CCP_MERGE_INDEX = 2, CCP_MERGE_DEFAULTS = 3;
 const int CCP_MERGE_KIND = 4, CCP_MERGE_NUM_SPATIAL = 5, CCP_MERGE_SPATIAL = 6;
-const int CCP_KIND_DERIVED = 3;
+const int CCP_KIND_DERIVED = 3, CCP_KIND_DD_FUSION = 4;
 
 // Tu::derive
 const int DERIVE_NODE     = 32;  // not a block: the derivation of the mode of CU Tu::cu, before the CU's blocks
@@ -711,6 +712,7 @@ struct Params
   // Params was 4 % slower; a buffer of its own, its address a further field, measured 0.7 % slower on CCCM streams)
   int      cccmScratchOffset;   // its start (int32)
   int      cccmScratchWords;    // its int32 per workgroup
+  int      ccpFusionPairs;      // decoder-derived CCP merge fusion's pairs (PU::getMaxNumCcpFusionModel)
 };
 layout( buffer_reference, std430, buffer_reference_align = 8 ) buffer BufParams { Params p; };
 
