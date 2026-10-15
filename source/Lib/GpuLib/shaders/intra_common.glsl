@@ -543,7 +543,8 @@ const int MPM_I_SLICE        = 64;   // an intra slice (sorting from 6 entries o
 const int MPM_OUT = 21;
 // an EIP CU's record in Params::timdData (layout shared with GpuIntraRec.cpp; intra_eip.glsl): its index
 // (Params::eipOut), how its model is found (EIP_DERIVED: its own fit, of recoType / shape / two models from its mode;
-// EIP_MERGE: a neighbour's, the merge index), its reference area (initEipParams: the template's lines above / left of
+// EIP_MERGE: a neighbour's, the merge index; EIP_BV: fitted to the block at the vector IntraTMP's sparse search finds,
+// its Cu::tmp record's), its reference area (initEipParams: the template's lines above / left of
 // the block within it, the area's refSizeX columns left of and refSizeY rows above the block, refWidth x refHeight with
 // the available above-right / below-left units), its luma block (which writes the mode chroma DM reads); an EIP merge
 // CU's sources follow, each its CU record and EIP index: those at the neighbouring positions (their number first),
@@ -552,7 +553,7 @@ const int EIP_HEAD_INDEX = 0, EIP_HEAD_KIND = 1, EIP_HEAD_SHAPE = 2, EIP_HEAD_MM
 const int EIP_HEAD_MERGE_IDX = 5, EIP_HEAD_SIZE_X = 6, EIP_HEAD_SIZE_Y = 7, EIP_HEAD_WIDTH = 8, EIP_HEAD_HEIGHT = 9;
 const int EIP_HEAD_TPL_X = 10, EIP_HEAD_TPL_Y = 11, EIP_HEAD_BLOCK = 12;
 const int EIP_HEAD = 13;
-const int EIP_DERIVED = 0, EIP_MERGE = 1;
+const int EIP_DERIVED = 0, EIP_MERGE = 1, EIP_BV = 2;
 const int MERGE_NBR_MERGE = 1;   // an intra merge CU: always a candidate, its merge parameters (its DimdOut slot)
 const int MERGE_NBR_OBIC  = 2;   // an OBIC CU: always, its OBIC converted
 const int MERGE_NBR_DIMD  = 3;   // a DIMD CU or an MPM CU: where its DIMD blends, its DIMD

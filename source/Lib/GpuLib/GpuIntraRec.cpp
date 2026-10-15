@@ -341,14 +341,15 @@ static const char* cuKindName( int kind )
 
 // an EIP CU's record in Params::timdData (intra_common.glsl's EIP_HEAD_*; layout shared): its index (Params::eipOut),
 // how its model is found (EIP_DERIVED: fitted, of its mode's shape, regions and models; EIP_MERGE: a neighbour's, the
-// merge index), its reference area (IntraPrediction::eipReferenceArea), its luma block; an EIP merge CU's sources
+// merge index; EIP_BV: fitted to the block at the vector of IntraTMP's sparse search, Cu::tmp's), its reference area
+// (IntraPrediction::eipReferenceArea), its luma block; an EIP merge CU's sources
 // follow, each as its CU record and EIP index: their number and the eipMergeNeighbours' CUs, then the number and the
 // EIP CUs of its CTU row before it (the history), oldest first
 constexpr int EIP_HEAD_INDEX = 0, EIP_HEAD_KIND = 1, EIP_HEAD_SHAPE = 2, EIP_HEAD_MM = 3, EIP_HEAD_RECO = 4;
 constexpr int EIP_HEAD_MERGE_IDX = 5, EIP_HEAD_SIZE_X = 6, EIP_HEAD_SIZE_Y = 7, EIP_HEAD_WIDTH = 8, EIP_HEAD_HEIGHT = 9;
 constexpr int EIP_HEAD_TPL_X = 10, EIP_HEAD_TPL_Y = 11, EIP_HEAD_BLOCK = 12;
 constexpr int EIP_HEAD = 13;
-constexpr int EIP_DERIVED = 0, EIP_MERGE = 1;
+constexpr int EIP_DERIVED = 0, EIP_MERGE = 1, EIP_BV = 2;
 constexpr int EIP_REGION_AL = 1, EIP_REGION_A = 2, EIP_REGION_L = 4;   // the regions of recoType (EIP_AL, EIP_A, EIP_L)
 // int32 per EIP CU (intra_eip.glsl's EIP_OUT_*): its two models' parameters (int64 each, low word first), its shape,
 // two models, the threshold, its prediction's clipping range, eipDimdMode and eipDimdMode2nd
@@ -1719,8 +1720,9 @@ struct GpuIntraRec::Impl
   std::vector<uint8_t>        eipFromCpu;
   int                         eipRow = -1;
   std::vector<const CodingUnit*> eipRowCus;
-  int                         numEipMerge = 0;    // of the EIP CUs: merge, two models
+  int                         numEipMerge = 0;    // of the EIP CUs: merge, two models, with a vector
   int                         numEipMm = 0;
+  int                         numEipBv = 0;
   std::vector<uint8_t>        cuMipDimd;          // per CU: a MIP CU whose block derives mipDimdMode (DERIVE_MIP_DIMD)
   bool                        blendBlocks = false;   // a block of a DIMD / OBIC / merge CU was recorded (the
                                                      // workgroups' blending sums, BLEND_ACC, are needed)
@@ -1979,6 +1981,7 @@ void GpuIntraRec::beginPicture( const CodingStructure& cs )
   m.eipRowCus.clear();
   m.numEipMerge = 0;
   m.numEipMm    = 0;
+  m.numEipBv    = 0;
   m.cuMipDimd.clear();
   m.blendBlocks = false;
   m.cccmScratchWords = 0;
@@ -3445,8 +3448,9 @@ static int32_t eipIndexOf( GpuIntraRec::Impl& m, const CodingUnit& cu )
 }
 #endif
 
-// an IntraTMP CU's record in Params::timdData (Cu::tmp; intra_tmp.glsl's TMP_HEAD_*, layout shared)
-constexpr int TMP_HEAD_REGIONS = 7;
+// an IntraTMP CU's record in Params::timdData (Cu::tmp; intra_tmp.glsl's TMP_HEAD_*, layout shared), also an EIP
+// CU's with a vector (the sparse search alone)
+constexpr int TMP_HEAD_REGIONS = 8;
 constexpr int TMP_HEAD         = TMP_HEAD_REGIONS + 24;
 
 #if GPU_TMP
@@ -3455,6 +3459,7 @@ constexpr int TMP_HEAD         = TMP_HEAD_REGIONS + 24;
 // bounds of its vectors (clipMvIntraConstraint, which sortInOut repeats; relative to the CU). False with why set where
 // the GPU lacks what the CU needs: LIC, fusion, FLM, a sub-sample vector (tmpFracIdx), no template (DC instead), more
 // samples than intra_rec's prediction buffer, no DIMD (the transforms' mode of its prediction), OBMC
+static void tmpSearchRecord( GpuIntraRec::Impl& m, const CodingUnit& cu, Cu& c, bool onlyBest );
 static bool addTmpRecord( GpuIntraRec::Impl& m, const CodingUnit& cu, Cu& c, const char*& why )
 {
   const SPS& sps = *cu.cs->sps;
@@ -3470,9 +3475,18 @@ static bool addTmpRecord( GpuIntraRec::Impl& m, const CodingUnit& cu, Cu& c, con
   {
     return false;
   }
+  tmpSearchRecord( m, cu, c, false );
+  return true;
+}
+
+// the search's record of an IntraTMP CU, or with onlyBest of an EIP CU with a vector (IntraPrediction's mtmpNumSparse
+// of 1: the sparse search's best alone)
+static void tmpSearchRecord( GpuIntraRec::Impl& m, const CodingUnit& cu, Cu& c, bool onlyBest )
+{
+  const SPS& sps = *cu.cs->sps;
   const int  W = cu.lwidth(), H = cu.lheight(), x = cu.lx(), y = cu.ly(), ctu = sps.getCTUSize();
   const int  sizeUsed    = cu.tmpIdx + 1;
-  const bool needTopLeft = sizeUsed > MTMP_NUM - ( TL_NUM << 1 );
+  const bool needTopLeft = !onlyBest && sizeUsed > MTMP_NUM - ( TL_NUM << 1 );
   int32_t    h[TMP_HEAD];
   h[0] = cu.tempType;
   h[1] = cu.tmpIdx;
@@ -3481,6 +3495,7 @@ static bool addTmpRecord( GpuIntraRec::Impl& m, const CodingUnit& cu, Cu& c, con
   h[4] = needTopLeft ? 1 : 0;
   h[5] = needTopLeft ? MTMP_NUM : sizeUsed;
   h[6] = ctu > 128 ? 1 : 0;
+  h[7] = onlyBest ? 1 : 0;
   // clipMvIntraConstraint: 0 above the CTU, 1 left of the CU (to its CTU's top), 2 below-left outside the CTU, 3 above
   // the CU in the CTU, 4 below-left in the CTU, 5 above-right in the CTU; within the picture where the template fits,
   // within the search range
@@ -3519,7 +3534,6 @@ static bool addTmpRecord( GpuIntraRec::Impl& m, const CodingUnit& cu, Cu& c, con
   c.tmp = (int32_t) m.timdData.size();
   m.timdData.insert( m.timdData.end(), h, h + TMP_HEAD );
   m.blendBlocks = true;   // (its node's lists take the workgroup's scratch)
-  return true;
 }
 #endif
 
@@ -3531,7 +3545,8 @@ static bool addTmpRecord( GpuIntraRec::Impl& m, const CodingUnit& cu, Cu& c, con
 static bool addEipRecord( GpuIntraRec::Impl& m, const CodingUnit& cu, Cu& c, const char*& why )
 {
 #if GPU_EIP
-  if( cu.bvEip )
+  // with a vector: IntraTMP's sparse search (GPU_TMP's) of its template
+  if( cu.bvEip && ( !GPU_TMP || cu.tempType == NO_TEMPLATE ) )
   {
     why = "EIP with a block vector";
     return false;
@@ -3586,6 +3601,16 @@ static bool addEipRecord( GpuIntraRec::Impl& m, const CodingUnit& cu, Cu& c, con
     rec[EIP_HEAD_MERGE_IDX] = cu.firstPU->intraDir[CHANNEL_TYPE_LUMA];
     m.numEipMerge++;
   }
+#if GPU_TMP
+  else if( cu.bvEip )   // (getBvEipCands: the square shape, one model)
+  {
+    rec[EIP_HEAD_KIND]  = EIP_BV;
+    rec[EIP_HEAD_SHAPE] = EIP_FILTER_S;
+    rec[EIP_HEAD_MM]    = 0;
+    tmpSearchRecord( m, cu, c, true );
+    m.numEipBv++;
+  }
+#endif
   else
   {
     static_vector<EIPInfo, NUM_DERIVED_EIP> modes;
@@ -3735,6 +3760,7 @@ static int32_t cuRecord( GpuIntraRec::Impl& m, const TransformUnit& tu, const Co
         return -1;
       }
       c.kind = CU_EIP;
+      bvList = c.tmp >= 0;   // (with a vector: its search's list of its neighbours' vectors)
     }
     // an MDIP CU: its mode MDIP's (deriveMdipMode: from histograms of the reconstruction around it and template costs)
     else if( m.deriveModes && cu.mdip )
@@ -3966,6 +3992,7 @@ static int32_t cuRecord( GpuIntraRec::Impl& m, const TransformUnit& tu, const Co
   {
     d[0]                  = cu.eipModel.eipDimdMode;
     d[DIMD_OUT_TR_SECOND] = cu.eipModel.eipDimdMode2nd;
+    d[DIMD_OUT_BV]        = c.tmp >= 0 ? bvPack( pu.bv ) : 0;   // (with a vector: its search's best, setEipBvInfo)
     m.cuMipDimd[index]    = 3;
   }
 #endif
@@ -5956,7 +5983,7 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
       const CodingUnit* nb[BV_NBRS];
       bvNeighbourCus( cu, nb );
       Cu&  c         = m.cus[list.first];
-      bool potential = c.kind == CU_TMP;   // (an IntraTMP CU searches in any case, and records its vectors)
+      bool potential = c.tmp >= 0;   // (IntraTMP's search runs in any case, and records its vectors)
       for( int k = 0; k < BV_NBRS; k++ )
       {
         potential = potential || ( nb[k] && may[nb[k]->idx] );
@@ -5968,7 +5995,7 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
       // TIMD's and IntraTMP's lists cascade (IntraTMP's node sorts its neighbours' first); DIMD's
       // (getBestNonAnglularMode, also of OBIC and intra merge CUs) keeps its first 30 / 15 and costs its vectors on
       // TIMD's template of both arms, whose units follow
-      const bool dimd = c.kind != CU_TIMD && c.kind != CU_TMP;
+      const bool dimd = c.kind != CU_TIMD && c.tmp < 0;
       c.bvList = (int32_t) m.timdData.size();
       m.timdData.push_back( (int32_t) cu.idx );   // BV_LIST_INDEX
       m.timdData.push_back( !dimd ? 0 : cs.sps->getItmpLicMode() ? MAX_TO_KEEP : MAX_TO_KEEP >> 1 );   // BV_LIST_KEEP
@@ -6471,8 +6498,10 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
     for( int k = 0; k < DIMD_OUT; k++ )
     {
       // (the choice of planar or a block vector, which every such node makes)
+      // (an EIP CU with a vector: that of its search, pu.bv)
       const bool vector   = c.kind == CU_DIMD || c.kind == CU_OBIC || c.kind == CU_MERGE;
-      const bool compared = k >= DIMD_OUT_BV_FLAG ? vector
+      const bool eipBv    = c.kind == CU_EIP && c.tmp >= 0;
+      const bool compared = k >= DIMD_OUT_BV_FLAG ? vector || ( eipBv && k == DIMD_OUT_BV )
                             : tmp ? k < DIMD_OUT_TMP_BV + MTMP_NUM || k == DIMD_OUT_TR_SECOND
                                     || ( k >= DIMD_OUT_MTSS_LIST && c.mtss >= 0 )
                             : mipDimd ? k == 0 || k == DIMD_OUT_TR_SECOND || ( k >= DIMD_OUT_MTSS_LIST && c.mtss >= 0 )
@@ -6515,6 +6544,7 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
         }
         const char* field = pnnDimd && k == 0 ? "indicesRepresentationPnn" : pnnDimd ? "indicesRepresentationPnn[1]"
                             : eipDimd && k == 0 ? "eipDimdMode" : eipDimd && k == DIMD_OUT_TR_SECOND ? "eipDimdMode2nd"
+                            : eipBv && k == DIMD_OUT_BV ? "pu.bv of EIP (packed)"
                             : tmp && k == 0 ? "intraTmpDimdMode"
                             : mipDimd && k == 0 ? "mipDimdMode"
                             : ( mipDimd || tmp ) && k == DIMD_OUT_TR_SECOND ? "dimdDerivedIntraDir2nd"
@@ -7036,8 +7066,8 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
       numTimdBlended += m.cpuTimd[size_t( th.index ) * TIMD_OUT + ( th.sad ? TIMD_OUT_SAD : 0 ) + TIMD_OUT_BLENDED] != 0;
     }
   }
-  printf( "\n[gpu-intra] POC %d: %d blocks, chain %d (ref filter %d, PDPC %d, gradient PDPC %d, fusion %d, bilateral filter candidates %d, CU nodes %d, DIMD %d, DIMD CUs %d, OBIC CUs %d, intra merge CUs %d, TIMD CUs %d (blended %d, TIMD-SAD %d, TIMD merge %d, inheriting transforms %d), TMRL CUs %d, chroma TMRL CUs %d, MPM records %d (sorted %d, MDIP %d), EIP CUs %d (merge %d, two models %d), IntraTMP CUs %d, their MTS / LFNST / NSPT blocks %d, MTSS %d, MIP LFNST / NSPT %d, LM blocks %d (MMLM %d, MDLM %d, LBCCP %d, LFNST / NSPT %d, GLM %d (with luma %d), CCCM %d: above %d, left %d, GL %d, several filters %d, without subsampling %d), LM chroma fusion %d (CFLM %d), CCP merge %d (fusion with CCCM %d (by a blend model %d), with DIMD chroma %d, adjusted %d, decoder-derived fusion %d, LFNST / NSPT %d (with DIMD chroma %d)), decoder-derived CCP fusion %d), GPU %.2f ms: %s%s%s", m.poc,
-          (int) m.rec.size() - numNodes, maxDepth, numFilter, numPdpc, numGrad, numFusion, numBf, numNodes, numDimd, numDimdCus, numObic, m.numMerge, m.numTimd, numTimdBlended, numTimdSad, m.numTimdMerge, numInherited, numTmrl, numChromaTmrl, m.numMpm, m.numMpmSorted, m.numMdip, numEipGpu, m.numEipMerge, m.numEipMm, numTmpGpu, numDimdTransforms, numMtss, numMipDimd, numCclm, numMmlm, numMdlm, numLbccp, numCclmDimd, numGlm, numGlmLuma, numCccm, numCccmAbove, numCccmLeft, numGlCccm, numMdfCccm, numNoSubCccm, numLmFusion, numCflm, numCcpMerge, numCcpMergeFusion, m.numFusionBlend, numCcpMergeDimd, m.numCcpAdjust, m.numDdMergeFusion, numCcpMergeLfnst, numCcpMergeDimdLfnst, m.numDerivedCcp, ms, bad ? "MISMATCH, " : "identical",
+  printf( "\n[gpu-intra] POC %d: %d blocks, chain %d (ref filter %d, PDPC %d, gradient PDPC %d, fusion %d, bilateral filter candidates %d, CU nodes %d, DIMD %d, DIMD CUs %d, OBIC CUs %d, intra merge CUs %d, TIMD CUs %d (blended %d, TIMD-SAD %d, TIMD merge %d, inheriting transforms %d), TMRL CUs %d, chroma TMRL CUs %d, MPM records %d (sorted %d, MDIP %d), EIP CUs %d (merge %d, two models %d, with a vector %d), IntraTMP CUs %d, their MTS / LFNST / NSPT blocks %d, MTSS %d, MIP LFNST / NSPT %d, LM blocks %d (MMLM %d, MDLM %d, LBCCP %d, LFNST / NSPT %d, GLM %d (with luma %d), CCCM %d: above %d, left %d, GL %d, several filters %d, without subsampling %d), LM chroma fusion %d (CFLM %d), CCP merge %d (fusion with CCCM %d (by a blend model %d), with DIMD chroma %d, adjusted %d, decoder-derived fusion %d, LFNST / NSPT %d (with DIMD chroma %d)), decoder-derived CCP fusion %d), GPU %.2f ms: %s%s%s", m.poc,
+          (int) m.rec.size() - numNodes, maxDepth, numFilter, numPdpc, numGrad, numFusion, numBf, numNodes, numDimd, numDimdCus, numObic, m.numMerge, m.numTimd, numTimdBlended, numTimdSad, m.numTimdMerge, numInherited, numTmrl, numChromaTmrl, m.numMpm, m.numMpmSorted, m.numMdip, numEipGpu, m.numEipMerge, m.numEipMm, m.numEipBv, numTmpGpu, numDimdTransforms, numMtss, numMipDimd, numCclm, numMmlm, numMdlm, numLbccp, numCclmDimd, numGlm, numGlmLuma, numCccm, numCccmAbove, numCccmLeft, numGlCccm, numMdfCccm, numNoSubCccm, numLmFusion, numCflm, numCcpMerge, numCcpMergeFusion, m.numFusionBlend, numCcpMergeDimd, m.numCcpAdjust, m.numDdMergeFusion, numCcpMergeLfnst, numCcpMergeDimdLfnst, m.numDerivedCcp, ms, bad ? "MISMATCH, " : "identical",
           bad ? first.c_str() : "", numBad ? ( ", " + std::to_string( numBad ) + " picture samples differ" ).c_str() : "" );
   if( m.partial )
   {

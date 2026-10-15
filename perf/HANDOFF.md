@@ -449,7 +449,7 @@ wall-clock gains with threads are "the easy baseline". Decoder status: single-th
 (`--GpuLoopFilter=1`: ALF, SAO, BIF, CCSAO, LF-CCCM, offset refinement on Vulkan). The user then asked for **a full
 GPU decoder in Vulkan, optimized until nothing is left** ("The GPU decoder needs to fully decode the frame on the
 GPU"; "Your first Vulkan version is going to be slow. That's OK"). That work is branch `dec-gpurecon`: intra
-reconstruction on the GPU (`--GpuRecon`), tool levels M1-M62 done and verified bit-exact (M19: DIMD, M20: OBIC, M21:
+reconstruction on the GPU (`--GpuRecon`), tool levels M1-M63 done and verified bit-exact (M19: DIMD, M20: OBIC, M21:
 intra merge, M22: the transforms of DIMD CUs, M23: LFNST of MIP, M24: TIMD, M25: OBIC and intra merge with TIMD
 neighbours, M26: TIMD-SAD, M27: OBIC and intra merge with TIMD-SAD neighbours, M28: TIMD merge, M29: TMRL of luma,
 M30: chroma TMRL, M31: CCLM, M32: LFNST / NSPT of CCLM, M33: GLM's gradient patterns, M34: CCCM, M35: GL-CCCM, M36:
@@ -459,7 +459,7 @@ CCP tools, M44 / M45: the CCP models, M46: CCP merge, M47 / M48: CCP merge fusio
 merge adjustment, M50 / M51: decoder-derived CCP fusion, its merge fusion, M52: CCP merge fusion with CCCM by a blend
 model, M53 / M54: CCP merge and decoder-derived fusion with LFNST / NSPT, M55: PDP, M56: NN intra prediction, M57: the
 MPM lists of MPM sorting, MDIP and PDP, M58: EIP, M59-M61: block vectors - TIMD, DIMD and OBIC with vectors, M62:
-IntraTMP's search, without LIC / fusion / FLM / sub-sample vectors / OBMC); it is
+IntraTMP's search, without LIC / fusion / FLM / sub-sample vectors / OBMC, M63: EIP with a vector); it is
 **not yet faster than the CPU
 decoder** (see section 8) and supports only a restricted tool set (all real CTC streams fall back to the CPU, first
 reason: chroma reordering / DBV; BVG-CCCM CUs are rejected per block).
@@ -1647,7 +1647,16 @@ the workgroup's blending sums (the CCP-LFNST module was at 4.09M of the 4.19M ID
 ~141k: the modules are at 3.06M / 3.88M. Results (grT9): every regular stream identical but the known CCP merge
 blocks; 208 IntraTMP CUs on the GPU, the intra CUs from the CPU 24816 -> 24608; the rest of IntraTMP: LIC 4159 (with
 fusion 813), sub-sample vectors 1900, OBMC 919, fusion 731, FLM 589. The MPM variant's pipelines compile in 244 / 271 /
-~290 / 351 s.
+~290 / 351 s. Cu::tmp must start at -1 wherever a Cu is made (cuRecord's initializer missed it at first: every CU then
+looked like it had a search record, and every picture took the MPM pipelines).
+M63: EIP with a block vector (getBvEipCands, JVET-AL0106). Its node runs IntraTMP's sparse search alone (tmpNode with
+TMP_HEAD_ONLY_BEST, the record made by tmpSearchRecord: mtmpNumSparse 1, after the neighbours' list as an IntraTMP
+CU's; its list record and prefix wait as one's), puts the best vector (m_tmpSparseSearchXdisp) into its DimdOut's
+DIMD_OUT_BV and its record of vectors (pu.bv), then eipNode (EIP_BV) fits the square shape's single model to the block
+at the vector with the BV_EIP_TEMP_SIZE lines above / left of it where the picture has them (its samples from (3, 3)
+on; EIP_REGION_BV), with the clipping range and luma offset of the CU's own reference area. eipEntrySum reads through
+an origin, so the sums and the solver keep one call site each. Results (grU3): every regular stream identical but the
+known CCP merge blocks; all 1263 EIP CUs with a vector on the GPU, the intra CUs from the CPU 24608 -> 23345.
 
 ## 8. Numbers (i7-10700 8C/16T, Win11, GCC 16.2, RTX 3070 driver 616.92)
 
@@ -1694,7 +1703,7 @@ Profile of a GPU-on decode (non-LTO, m2_park16, share of all samples): parsing ~
    prediction, M57 the MPM lists of MPM sorting, MDIP and PDP, TIMD / TMRL on the regular streams, M58 EIP, M59-M61
    block vectors: TIMD, DIMD and OBIC with vectors, the scheduler's prefix waits (partial verification of the regular
    streams), M62 IntraTMP's search (its plain CUs; LIC, sub-sample vectors and OBMC need inter's LIC, interpolation
-   and OBMC, fusion and FLM their models).
+   and OBMC, fusion and FLM their models), M63 EIP with a vector.
    All 19 regular streams now stop at "chroma reordering / DBV" (the next sequence-level check; the block-level tools
    of step 4 follow; BVG-CCCM needs IntraTMP / IBC first).
 3. Make the GPU path win on CPU time per picture: the derive-only pass (record during parsing or a leaner pass;

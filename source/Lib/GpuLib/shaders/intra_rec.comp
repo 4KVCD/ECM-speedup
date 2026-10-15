@@ -1583,7 +1583,11 @@ void main()
         }
         else
         {
-          eipNode( c, c.eip, t.bitDepth, lid, NT );
+          if( c.tmp >= 0 )   // (with a vector: IntraTMP's sparse search finds it, intra_tmp.glsl)
+          {
+            tmpNode( c, t.cu, t.bitDepth, lid, NT );
+          }
+          eipNode( c, t.cu, c.eip, t.bitDepth, lid, NT );
         }
         cuMode = PLANAR_IDX;
       }

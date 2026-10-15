@@ -6,8 +6,9 @@
 // L-shaped one's - into its DimdOut (DIMD_OUT_TMP_*), whose entry tmpIdx its block copies. The template costs
 // (calcTemplateDiff) are computed in parallel, in chunks of positions in the CPU's order, and the CPU's lists replayed
 // from them by invocation 0: every test of a cost is "less than a threshold", which the CPU's early ends cannot
-// change. No LIC, fusion, FLM or sub-sample refinement yet (the host keeps such CUs on the CPU). Included by
-// intra_rec.comp after intra_bv.glsl.
+// change. No LIC, fusion, FLM or sub-sample refinement yet (the host keeps such CUs on the CPU). An EIP CU with a
+// vector runs the sparse search alone, for its best (TMP_HEAD_ONLY_BEST). Included by intra_rec.comp after
+// intra_bv.glsl.
 
 const int TMP_COST_SHIFT    = 3;    // TMP_TEMPLATE_COST_SHIFT: the template row and column next to the block weigh 8
 const int MTMP_NUM          = 19;
@@ -31,7 +32,8 @@ const int TMP_HEAD_LIC_MODE   = 3;   // the SPS's ItmpLicMode
 const int TMP_HEAD_NEED_TL    = 4;   // needTopLeft: tmpIdx reaches the list's entries of the top / left template
 const int TMP_HEAD_NUM_REFINE = 5;   // mtmpNumRefine[0] (tmpIdx + 1 without needTopLeft)
 const int TMP_HEAD_BIG_CTU    = 6;   // the CTU is larger than 128 (the clustering's windows)
-const int TMP_HEAD_REGIONS    = 7;   // per regionId mvXMin, mvXMax, mvYMin, mvYMax (clipMvIntraConstraint), 6 x 4
+const int TMP_HEAD_ONLY_BEST  = 7;   // an EIP CU with a vector: the sparse search's best alone (mtmpNumSparse 1)
+const int TMP_HEAD_REGIONS    = 8;   // per regionId mvXMin, mvXMax, mvYMin, mvYMax (clipMvIntraConstraint), 6 x 4
 const int TMP_HEAD            = TMP_HEAD_REGIONS + 24;
 
 // the node's work area in the scratch (the workgroup's blending sums, free in a node): a chunk of positions and their
@@ -286,7 +288,8 @@ void tmpNode( Cu c, int cuIndex, int bitDepth, int lid, int NT )
   const int  numTypes = needTL && tempType == TMP_L_SHAPE ? 3 : 1;   // (checkAllTmpTypes)
   const int  W = c.w, H = c.h;
   OwnerMap   om = OwnerMap( BufI32( P.owner[0] ), P.ownerW[0], P.ownerH[0], P.unitLog2X[0], P.unitLog2Y[0] );
-  const int  numSparse[3] = int[3]( MTMP_NUM_SPARSE, TL_NUM_SPARSE, TL_NUM_SPARSE );
+  const bool onlyBest = data.v[head + TMP_HEAD_ONLY_BEST] != 0;   // (an EIP CU with a vector)
+  const int  numSparse[3] = int[3]( onlyBest ? 1 : MTMP_NUM_SPARSE, TL_NUM_SPARSE, TL_NUM_SPARSE );
   const int  numRefine[3] = int[3]( data.v[head + TMP_HEAD_NUM_REFINE], TL_NUM, TL_NUM );
   const int  numTL = ( W + TMP_TEMPLATE_SIZE ) * TMP_TEMPLATE_SIZE + TMP_TEMPLATE_SIZE * H;   // numPixTopLeft
   const int  numTop = W * TMP_TEMPLATE_SIZE, numLeft = TMP_TEMPLATE_SIZE * H;
@@ -411,6 +414,22 @@ void tmpNode( Cu c, int cuIndex, int bitDepth, int lid, int NT )
     {
       break;
     }
+  }
+
+  // an EIP CU with a vector: the sparse search's best (m_tmpSparseSearchXdisp; the number found, 0 or 1) into its
+  // DimdOut and its record of vectors (pu.bv), which is all it searches for
+  if( onlyBest )
+  {
+    if( lid == 0 )
+    {
+      const int   n  = tlSize( TS_SPARSE ), at = cuIndex * DIMD_OUT;
+      const ivec2 bv = n > 0 ? ivec2( tlAt( TS_SPARSE, 0, TE_X ), tlAt( TS_SPARSE, 0, TE_Y ) ) : ivec2( 0 );
+      CBufI32( P.dimdOut ).v[at + DIMD_OUT_TMP_NUM] = n;
+      CBufI32( P.dimdOut ).v[at + DIMD_OUT_BV]      = bvPack( bv );
+      bvStore( c, n, ivec2[3]( bv, bv, bv ) );
+    }
+    tsSync();
+    return;
   }
 
   // the vectors cascaded from the L-shape's sparse candidates (getSparseArBvMergeCandidate: up to NUM_TMP_ARBVP_S

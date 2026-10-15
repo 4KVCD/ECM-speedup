@@ -56,8 +56,10 @@ int eipChooser( int shape, int in0, int in1, int in3 )
 // ----- the model (layout shared with GpuIntraRec.cpp; the record's: intra_common.glsl's EIP_HEAD_*)
 
 // recoType's regions (EIP_REFERENCE_TYPE): bit 0 the corner above-left (EIP_AL), bit 1 above (EIP_A), bit 2 left
-// (EIP_L) - the host gives them as such bits
-const int EIP_REGION_AL = 1, EIP_REGION_A = 2, EIP_REGION_L = 4;
+// (EIP_L) - the host gives them as such bits; bit 3 an EIP CU with a vector's: the block at the vector with the
+// BV_EIP_TEMP_SIZE lines above / left of it where the picture has them (getBvEipCands), its samples from (3, 3) on
+const int EIP_REGION_AL = 1, EIP_REGION_A = 2, EIP_REGION_L = 4, EIP_REGION_BV = 8;
+const int BV_EIP_TEMP_SIZE = 4;
 
 // an EIP CU's model as its node derives it (EIP_OUT int32 per EIP CU in Params::eipOut): the parameters of its first
 // and second models (int64 each, low word first), its shape, two models or one, the threshold, the clipping range of
@@ -144,41 +146,46 @@ ivec2 eipEntryPair( int e )   // (i, j), j = EIP_TAPS for ATY
   return ivec2( i, i + e );
 }
 
-int64_t eipEntrySum( Cu c, int e, int part, bool mm, int thrd, int shape, int regions, int sizeX, int sizeY, int width,
-                     int height, int tplX, int tplY, int bitDepth )
+// (the area's samples read at origin + (bx, by): the reference area's above-left corner, or the vector's block area's)
+int64_t eipEntrySum( ivec2 origin, int e, int part, bool mm, int thrd, int shape, int regions, int sizeX, int sizeY,
+                     int width, int height, int tplX, int tplY, int bitDepth )
 {
   const ivec2 ij = eipEntryPair( e );
   int64_t sum = 0;
-  for( int r = 0; r < 3; r++ )
+  for( int r = 0; r < 4; r++ )
   {
-    const int region = r == 0 ? EIP_REGION_AL : r == 1 ? EIP_REGION_A : EIP_REGION_L;
+    const int region = r == 0 ? EIP_REGION_AL : r == 1 ? EIP_REGION_A : r == 2 ? EIP_REGION_L : EIP_REGION_BV;
     if( ( regions & region ) == 0 )
     {
       continue;
     }
-    const int x0 = r == 1 ? sizeX : sizeX - tplX, x1 = r == 1 ? width : sizeX;
-    const int y0 = r == 2 ? sizeY : sizeY - tplY, y1 = r == 2 ? height : sizeY;
+    // (the vector's block: from (3, 3) to width x height, the area's size)
+    const int x0 = r == 3 ? 3 : r == 1 ? sizeX : sizeX - tplX, x1 = r >= 1 && r != 2 ? width : sizeX;
+    const int y0 = r == 3 ? 3 : r == 2 ? sizeY : sizeY - tplY, y1 = r >= 2 ? height : sizeY;
     for( int by = y0; by < y1; by++ )
     {
       for( int bx = x0; bx < x1; bx++ )
       {
         if( mm )
         {
-          const int in0 = eipArea( c, sizeX, sizeY, eipTapX( shape, 0, bx, x1 - 1 ), eipTapY( shape, 0, by, y1 - 1 ) );
-          const int in1 = eipArea( c, sizeX, sizeY, eipTapX( shape, 1, bx, x1 - 1 ), eipTapY( shape, 1, by, y1 - 1 ) );
-          const int in3 = eipArea( c, sizeX, sizeY, eipTapX( shape, 3, bx, x1 - 1 ), eipTapY( shape, 3, by, y1 - 1 ) );
+          const int in0 = recoAt( 0, origin.x + eipTapX( shape, 0, bx, x1 - 1 ),
+                                  origin.y + eipTapY( shape, 0, by, y1 - 1 ) );
+          const int in1 = recoAt( 0, origin.x + eipTapX( shape, 1, bx, x1 - 1 ),
+                                  origin.y + eipTapY( shape, 1, by, y1 - 1 ) );
+          const int in3 = recoAt( 0, origin.x + eipTapX( shape, 3, bx, x1 - 1 ),
+                                  origin.y + eipTapY( shape, 3, by, y1 - 1 ) );
           if( ( eipChooser( shape, in0, in1, in3 ) > thrd ) != ( part == 1 ) )
           {
             continue;
           }
         }
         const int a = ij.x == EIP_TAPS - 1 ? eipBias( bitDepth )
-                      : eipArea( c, sizeX, sizeY, eipTapX( shape, ij.x, bx, x1 - 1 ),
-                                 eipTapY( shape, ij.x, by, y1 - 1 ) );
-        const int b = ij.y == EIP_TAPS ? eipArea( c, sizeX, sizeY, bx, by )
+                      : recoAt( 0, origin.x + eipTapX( shape, ij.x, bx, x1 - 1 ),
+                                origin.y + eipTapY( shape, ij.x, by, y1 - 1 ) );
+        const int b = ij.y == EIP_TAPS ? recoAt( 0, origin.x + bx, origin.y + by )
                       : ij.y == EIP_TAPS - 1 ? eipBias( bitDepth )
-                      : eipArea( c, sizeX, sizeY, eipTapX( shape, ij.y, bx, x1 - 1 ),
-                                 eipTapY( shape, ij.y, by, y1 - 1 ) );
+                      : recoAt( 0, origin.x + eipTapX( shape, ij.y, bx, x1 - 1 ),
+                                origin.y + eipTapY( shape, ij.y, by, y1 - 1 ) );
         sum += int64_t( a * b );
       }
     }
@@ -208,19 +215,29 @@ int eipRegularization( int n, bool mm, int bitDepth )
   return ( reg * EIP_TAPS ) << ( 2 * max( 0, bitDepth - 10 ) );
 }
 
-// the node of EIP CU c with a derived model (all invocations, uniform control flow): the area's statistics, the sums of
-// each model (in s_tmp's 64-bit slots), solveEip (rows by invocations as cccmSolve's elimination, invocation 0 the back
-// substitution), the parameters and the area's statistics into its EipOut
-void eipNode( Cu c, int at, int bitDepth, int lid, int NT )
+// the node of EIP CU c (record cuIndex) with a derived model, fitted to its reference area or (EIP_BV) to the block at
+// the vector its search put in its DimdOut (all invocations, uniform control flow): the area's statistics (also with a
+// vector the CU's own: initEipParams), the sums of each model (in s_tmp's 64-bit slots), solveEip (rows by
+// invocations as cccmSolve's elimination, invocation 0 the back substitution), the parameters and the area's
+// statistics into its EipOut
+void eipNode( Cu c, int cuIndex, int at, int bitDepth, int lid, int NT )
 {
   BufI32    d       = BufI32( P.timdData );
   const int index   = d.v[at + EIP_HEAD_INDEX], shape = d.v[at + EIP_HEAD_SHAPE];
   const bool mm     = d.v[at + EIP_HEAD_MM] != 0;
-  const int regions = d.v[at + EIP_HEAD_RECO];
   const int sizeX   = d.v[at + EIP_HEAD_SIZE_X], sizeY = d.v[at + EIP_HEAD_SIZE_Y];
   const int width   = d.v[at + EIP_HEAD_WIDTH], height = d.v[at + EIP_HEAD_HEIGHT];
   const int tplX    = d.v[at + EIP_HEAD_TPL_X], tplY = d.v[at + EIP_HEAD_TPL_Y];
   const int outBase = index * EIP_OUT;
+  // the sums' area: the reference area, or the vector's block with BV_EIP_TEMP_SIZE lines above / left where the
+  // picture has them (initBvEipParams' m_bvEipTempSize)
+  const bool  bv      = d.v[at + EIP_HEAD_KIND] == EIP_BV;
+  const ivec2 bvPos   = ivec2( c.x, c.y ) + bvUnpack( CBufI32( P.dimdOut ).v[cuIndex * DIMD_OUT + DIMD_OUT_BV] );
+  const ivec2 bvTpl   = ivec2( bvPos.x >= BV_EIP_TEMP_SIZE ? BV_EIP_TEMP_SIZE : 0,
+                               bvPos.y >= BV_EIP_TEMP_SIZE ? BV_EIP_TEMP_SIZE : 0 );
+  const ivec2 origin  = bv ? bvPos - bvTpl : ivec2( c.x - sizeX, c.y - sizeY );
+  const int   regions = bv ? EIP_REGION_BV : d.v[at + EIP_HEAD_RECO];
+  const int   sumW    = bv ? c.w + bvTpl.x : width, sumH = bv ? c.h + bvTpl.y : height;
   eipAreaStats( c, sizeX, sizeY, width, height, mm, lid, NT );
   const int clipLo = s_red[2], clipHi = s_red[3];
   // m_eipAvg: the inner half's mean (a double's truncation; the samples count by the area's geometry)
@@ -231,8 +248,8 @@ void eipNode( Cu c, int at, int bitDepth, int lid, int NT )
   const int parts = mm ? 2 : 1;
   for( int e = lid; e < parts * EIP_SUMS; e += NT )
   {
-    cccmTmpStore( e, eipEntrySum( c, e % EIP_SUMS, e / EIP_SUMS, mm, thrd, shape, regions, sizeX, sizeY, width, height,
-                                  tplX, tplY, bitDepth ) );
+    cccmTmpStore( e, eipEntrySum( origin, e % EIP_SUMS, e / EIP_SUMS, mm, thrd, shape, regions, sizeX, sizeY, sumW,
+                                  sumH, tplX, tplY, bitDepth ) );
   }
   SYNC();
   for( int part = 0; part < parts; part++ )
