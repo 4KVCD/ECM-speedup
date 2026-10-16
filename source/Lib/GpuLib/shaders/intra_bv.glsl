@@ -121,20 +121,39 @@ int bvCascadeStep( Cu c, int n, int total, ivec2 cmv, bool sparse, int before )
     {
       continue;
     }
-    int at  = P.bvOut + src * BV_OUT;
-    int num = recs.v[at];
+    int       at     = P.bvOut + src * BV_OUT;
+    int       num    = recs.v[at];
+    const int fusion = sparse ? -1 : recs.v[at + BV_OUT_FUSION];
     if( sparse && recs.v[at + BV_OUT_SPARSE] >= 0 )   // (an IntraTMP fusion CU's own vector and its cheapest)
     {
       at  = at + BV_OUT_SPARSE;
       num = recs.v[at];
     }
-    for( int j = 0; j < num && n < total; j++ )
+    // each vector moved by cmv, then as it is, until the list has total; an IntraTMP fusion CU's cheapest vector after
+    // its fused ones (from j = fusion) even so: the CPU's fusion loop leaves only itself at the list's length, so the
+    // cheapest's moved, else plain, vector may still enter, and the step ends where one has entered at the list's
+    // length (one call of bvListAdd: this is inlined at every list)
+    for( int j = 0; j < num; j++ )
     {
-      const ivec2 bv = bvUnpack( recs.v[at + 1 + j] );
-      n = bvListAdd( n, cmv + bv, c, before );
-      if( n < total )
+      const bool tail = fusion >= 0 && j >= fusion;
+      if( !tail && n >= total )
       {
-        n = bvListAdd( n, bv, c, before );
+        if( fusion < 0 )
+        {
+          break;
+        }
+        j = fusion - 1;   // (on to the cheapest)
+        continue;
+      }
+      const ivec2 bv = bvUnpack( recs.v[at + 1 + j] );
+      for( int k = 0; k < 2 && ( tail || n < total ); k++ )
+      {
+        const int m = bvListAdd( n, k == 0 ? cmv + bv : bv, c, before );
+        if( tail && m > n && m >= total )
+        {
+          return m;
+        }
+        n = m;
       }
     }
   }
@@ -183,4 +202,5 @@ void bvStore( Cu c, int num, ivec2 bv[3] )
     data.v[at + 1 + j] = bvPack( bv[j] );
   }
   data.v[at + BV_OUT_SPARSE] = -1;   // (the same for getSparseArBvMergeCandidate)
+  data.v[at + BV_OUT_FUSION] = -1;   // (no IntraTMP fusion CU is the GPU's)
 }

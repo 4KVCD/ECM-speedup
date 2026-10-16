@@ -261,11 +261,14 @@ const int DERIVE_SGPM = 134217728;
 // CU's node or uploaded for a CU from the CPU: their number, then up to BV_MAX (bvPack); then those
 // getSparseArBvMergeCandidate cascades where they differ (an IntraTMP fusion CU's own vector, then its cheapest
 // where it has an index: their number, then 2), else -1; then the offset in Params::timdData of the LIC model SGPM's
-// list takes with the first vector (intra_sgpm.glsl's SGPM_LIC_*: an IBC or IntraTMP CU's from the CPU), else -1
+// list takes with the first vector (intra_sgpm.glsl's SGPM_LIC_*: an IBC or IntraTMP CU's from the CPU), else -1; then
+// an IntraTMP fusion CU's number of fused vectors before its cheapest one (getArBvMergeCandidate's fusion branch, which
+// may add the cheapest past the list's length: bvCascadeStep), else -1
 const int BV_MAX        = 8;
 const int BV_OUT_SPARSE = 1 + BV_MAX;
 const int BV_OUT_LIC    = BV_OUT_SPARSE + 3;
-const int BV_OUT        = BV_OUT_LIC + 1;
+const int BV_OUT_FUSION = BV_OUT_LIC + 1;
+const int BV_OUT        = BV_OUT_FUSION + 1;
 const int BV_NBRS = 31;    // getItmpMergeCandidate's 13 CU neighbours, then its 18 non-adjacent positions
 
 // Params::dbgParams per block: the derived dirMode, isModeVer, intraPredAngle, absInvAngle, useCubic, refFilter,

@@ -660,7 +660,10 @@ constexpr int TIMD_HEAD_BLOCK = offsetof( TimdHead, block ) / 4;
 constexpr int BV_MAX        = 8;
 constexpr int BV_OUT_SPARSE = 1 + BV_MAX;   // then those getSparseArBvMergeCandidate takes where they differ (else -1)
 constexpr int BV_OUT_LIC    = BV_OUT_SPARSE + 3;   // then the LIC model SGPM's list takes with the first (else -1)
-constexpr int BV_OUT        = BV_OUT_LIC + 1;
+// then an IntraTMP fusion CU's number of fused vectors before its cheapest one (getArBvMergeCandidate's fusion branch
+// leaves only its own loop at the list's length and may still add the cheapest; else -1)
+constexpr int BV_OUT_FUSION = BV_OUT_LIC + 1;
+constexpr int BV_OUT        = BV_OUT_FUSION + 1;
 // such a LIC model in Params::timdData (intra_sgpm.glsl's SGPM_LIC_*; a BvInfo's): whether it has two models, the
 // first's scale, shift and offset, the second's, the mean between them
 constexpr int SGPM_LIC      = 8;
@@ -2341,12 +2344,14 @@ static void cpuCcpWords( const CCPModelCandidate& h, bool merge, int32_t* o )
   const int ranges[2][2][3] = { { { h.rangeMinCb, h.rangeMaxCb, h.rangeChangeCb }, { h.rangeMinCr, h.rangeMaxCr, h.rangeChangeCr } },
                                 { { h.rangeMinCb2, h.rangeMaxCb2, h.rangeChangeCb2 },
                                   { h.rangeMinCr2, h.rangeMaxCr2, h.rangeChangeCr2 } } };
+  // (GLM with luma's model has GLM_NUM_PARAMS parameters whatever numParams says: glmModelToCcpParams sets only them)
+  const int numParams = ( h.type & CCP_TYPE_GLM4567 ) ? GLM_NUM_PARAMS : std::min( h.numParams, CCP_MAX_PARAMS );
   for( int k = 0; k < ( two ? 2 : 1 ); k++ )
   {
     for( int c = 0; c < 2; c++ )
     {
       std::copy_n( ranges[k][c], 3, o + CCP_OUT_RANGE + 3 * ( 2 * k + c ) );
-      for( int p = 0; p < std::min( h.numParams, CCP_MAX_PARAMS ); p++ )
+      for( int p = 0; p < numParams; p++ )
       {
         put( k != 0, c, p, k ? h.params2[c][p] : h.params[c][p] );
       }
@@ -2456,6 +2461,7 @@ static void cpuFillCu( GpuIntraRec::Impl& m, const CodingUnit& cu, const char* w
     c.kind = CU_KNOWN;
     c.node = c.dimd = c.obic = c.merge = c.mtss = c.timd = c.tmrl = c.mpm = c.eip = c.bvList = c.tmp = c.sgpm = -1;
     m.cuMode[rec->second] = mode;   // (and a TIMD record's CPU fields stay: an SGPM CU's TIMD pass compares none)
+    m.cuMipDimd[rec->second] = 0;   // (no block of it derives a DIMD of its prediction any more: none is verified)
   }
 }
 
@@ -4638,6 +4644,9 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
   // NN intra prediction: its CU is one block up to 32 x 32 (its transforms' mode, where they depend on one, a DIMD of
   // its prediction intra_rec derives: DERIVE_PNN_DIMD)
   else if( pnn && m.sh->pnnModel.empty() )                          why = "NN intra prediction without its models";
+  // without DIMD in the SPS the CPU's DIMD of the prediction is planar (deriveIpmForTransform returns at once), the
+  // GPU's NN blocks derive it from the prediction
+  else if( pnn && !cu.cs->sps->getUseDimd() )                    why = "NN intra prediction without DIMD";
   else if( pnn && ( area != cu.blocks[COMPONENT_Y] || area.width > 32 || area.height > 32 ) )
     why = "NN intra prediction of a split CU or above 32 x 32";
   else if( pnn && !m.deriveModes && ( cu.lfnstIdx || tu.mtsIdx[COMPONENT_Y] > MTS_SKIP ) )
@@ -4648,6 +4657,9 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
   else if( cu.dimd && isLuma( compID ) && area != cu.blocks[COMPONENT_Y] ) why = "DIMD CU with several transform blocks";
   else if( !GPU_DIMD_TRANSFORMS && cu.dimd && isLuma( compID ) && ( tu.mtsIdx[COMPONENT_Y] > MTS_SKIP || cu.lfnstIdx ) )
     why = "the transforms of a DIMD CU";
+  // MTSS without DIMD in the SPS: the CPU's mode list stays empty (deriveDimdModeList returns at once) and its transform
+  // choice skips the list (getFinalIntraModeForTransform); the kernels derive the list from DIMD's histograms
+  else if( isLuma( compID ) && usesMtss( tu ) && !cu.cs->sps->getUseDimd() ) why = "MTSS without DIMD";
   // MTSS of other CUs than DIMD's, MIP's, TIMD's, EIP's and IntraTMP's (SGPM: rejected itself)
   else if( isLuma( compID ) && usesMtss( tu )
            && ( !( cu.dimd || cu.mipFlag || ( GPU_TIMD && cu.timd ) || ( GPU_EIP && cu.eipFlag ) || cu.tmpFlag )
@@ -6462,6 +6474,7 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
       int32_t* rec = &m.timdData[P.bvOut + size_t( cu->idx ) * BV_OUT];
       rec[BV_OUT_SPARSE] = -1;
       rec[BV_OUT_LIC]    = -1;
+      rec[BV_OUT_FUSION] = -1;
       if( m.cpuCus.count( cu ) )
       {
         Mv bvs[BV_MAX];
@@ -6471,6 +6484,12 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
           rec[1 + j] = bvPack( bvs[j] );
         }
         const PredictionUnit& pu = *cu->firstPU;
+        // an IntraTMP fusion CU whose fused vectors are followed by the cheapest one's (cpuBlockVectors): their number
+        if( !CU::isIBC( *cu ) && ( cu->tmpFlag || PU::hasBvgBv( pu ) || PU::isBvEip( pu ) ) && cu->tmpFusionFlag )
+        {
+          const int first = getTmpFusionIdx( cu->tmpIdx );
+          rec[BV_OUT_FUSION] = first != 0 ? getTmpFusionNumber( first, true ) : -1;
+        }
 #if JVET_AM0157_SGPM_BV_LIC && JVET_AE0078_IBC_LIC_EXTENSION && JVET_AD0213_LIC_IMP
         // SGPM's list takes its first vector with its LIC model (getNeighBv: an IBC CU's, an IntraTMP CU's without
         // fusion; two models with IBC_LIC_IDX_M)
@@ -7029,7 +7048,7 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
                             : k > DIMD_OUT_EXT_FLAGS ? k - DIMD_OUT_EXT_BV : 0;
         char buf[200];
         snprintf( buf, sizeof( buf ), "%s[%d] of CU %d (%s at %d,%d %dx%d): CPU %d GPU %d", field, entry, (int) u,
-                  pnnDimd ? "NN" : mipDimd ? "MIP" : cuKindName( c.kind ), c.x, c.y, c.w, c.h, h[k], g[k] );
+                  pnnDimd ? "NN" : eipDimd ? "EIP" : mipDimd ? "MIP" : cuKindName( c.kind ), c.x, c.y, c.w, c.h, h[k], g[k] );
         first   = buf;
         firstCu = u;
         break;

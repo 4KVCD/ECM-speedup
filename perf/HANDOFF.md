@@ -1824,6 +1824,11 @@ Profile of a GPU-on decode (non-LTO, m2_park16, share of all samples): parsing ~
 0. Now (2026-10-15, the intra phase; the user's order: all intra first, then inter), by the CPU CUs they free:
    a. Done (2026-10-16): M67, committed on dec-gpurecon from the WIP commit's diff (the branch
       dec-gpurecon-m67-wip keeps the WIP commit as it was pushed).
+   a2. Open (found 2026-10-16 on the Intel PC's corpus; older than M67, identical at M66): the two single-tree intra
+      streams (`--DualITree=0`; CTC's intra slices are dual tree) differ in partial verification - ai_nodualtree_q27
+      (a CCP merge chroma block inherits the wrong model type, CCLM instead of CCCM, first seen as NN's
+      indicesRepresentationPnn) and ra_nodualtree_q32 (a luma MPM block's prediction, then DIMD chroma's second
+      mode). ON mode leaves both to the CPU (identical output). Fix before single tree counts as supported.
    b. M68: IBC's interpolation on the GPU (getPredIBCBlk -> InterPrediction::xPredInterBlk with isIBC: the bilinear
       filter for SGPM's templates, the regular luma filter for blocks at fractional vectors, rndRes, no LIC there):
       frees SGPM's fractional / EIP-vector neighbours (~1280 CUs) and IntraTMP's sub-sample vectors (1900); it is the
@@ -1924,6 +1929,16 @@ Profile of a GPU-on decode (non-LTO, m2_park16, share of all samples): parsing ~
    streams verify identical since M12); check on other GPU makers (AMD, Intel) before any release.
 
 ## 10. Findings worth knowing
+
+- Fixed 2026-10-16 (the Intel PC's corpus, `C:\Code\corpus`: 48 streams of the CTC tools with tool groups off):
+  getArBvMergeCandidate's IntraTMP fusion branch `break`s out of its own loop only, so a fusion CU's cheapest vector
+  can still enter a list that is full - the list then holds total + 1 (BV_OUT_FUSION; ai_foreman352_q22's TIMD
+  vector); with DIMD off the MTSS mode list is empty and NN's transform mode is planar (host rejections "MTSS without
+  DIMD", "NN intra prediction without DIMD"); a block sent to the CPU after its CU's EIP / MIP DIMD marker was set
+  left the marker (cpuFillCu clears it); GLM with luma's CCP record took numParams, which glmModelToCcpParams never
+  sets (GLM_NUM_PARAMS).
+- Copy-Item keeps the source's time stamp, so `bin\<name>\DecoderApp.exe`'s time is the link time: a build whose
+  link did not run (cut short) leaves the old exe and still prints "built". Check the exe's time after a shader change.
 
 - RTX 3070: plain loads through `coherent`/`volatile` buffer references returned stale L1 data across workgroups;
   use `#pragma use_vulkan_memory_model` + GL_KHR_memory_scope_semantics. Persistent workgroups + an atomic ready
