@@ -27,8 +27,11 @@ total = Counter()
 
 
 def run(name):
-    out = subprocess.run([f'C:/Code/ECM/bin/{build}/DecoderApp.exe', '-b', f'C:/Code/ECM/streams/{name}.bin', '-o', '',
-                          '--GpuRecon=2'], capture_output=True, text=True, env=env).stdout
+    p = subprocess.run([f'C:/Code/ECM/bin/{build}/DecoderApp.exe', '-b', f'C:/Code/ECM/streams/{name}.bin', '-o', '',
+                        '--GpuRecon=2'], capture_output=True, text=True, env=env)
+    out = p.stdout
+    if p.returncode != 0:   # (a decoder that failed: its exit code and error output, in the log and the report)
+        out += f'\n[exit code {p.returncode}] ' + ' | '.join(p.stderr.strip()[-500:].splitlines()) + '\n'
     os.makedirs('C:/Code/ECM/runs/partial', exist_ok=True)
     open(f'C:/Code/ECM/runs/partial/{name}.{build}.log', 'w').write(out)
     s = re.search(r'\[gpu-intra\] (\d+) pictures: (\d+) verified \((\d+) with differences\), (\d+) skipped([^;]*)', out)
@@ -41,13 +44,30 @@ def run(name):
             if part:
                 k, n = part.rsplit(' ', 1)
                 reasons[k] += int(n)
-    return name, s.groups() if s else None, first, reasons
+    failure = re.search(r'\[exit code [^\n]*', out)
+    return name, s.groups() if s else None, first, reasons, failure.group(0) if failure else ''
 
 
+def report(name, s, first, reasons, failure):
+    total.update(reasons)
+    print(f'{name:16s} {"pictures %s: verified %s, differ %s, skipped %s%s" % s if s else "no summary"}', flush=True)
+    if failure:
+        print(f'{"":16s} {failure[:400]}', flush=True)
+    if first:
+        print(f'{"":16s} first: {first[:400]}', flush=True)
+
+
+# a stream whose GPU device was lost (VK_ERROR_DEVICE_LOST, -4): Windows resets a GPU whose work runs past its
+# timeout (2 s), which pictures of ~1.8 s alone (pj720_ai) reach when 8 decoders share the GPU; such a stream runs again
+# alone after the others
+lost = []
 with ThreadPoolExecutor(jobs) as ex:
-    for name, s, first, reasons in ex.map(run, streams):
-        total.update(reasons)
-        print(f'{name:16s} {"pictures %s: verified %s, differ %s, skipped %s%s" % s if s else "no summary"}', flush=True)
-        if first:
-            print(f'{"":16s} first: {first[:400]}', flush=True)
+    for result in ex.map(run, streams):
+        if 'VkResult -4' in result[4]:
+            lost.append(result[0])
+            print(f'{result[0]:16s} GPU device lost under the parallel load: run again alone below', flush=True)
+            continue
+        report(*result)
+for name in lost:
+    report(*run(name))
 print('CUs from the CPU, all streams:', '; '.join(f'{k} {n}' for k, n in total.most_common()))

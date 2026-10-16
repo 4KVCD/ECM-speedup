@@ -1522,7 +1522,10 @@ ones: after a shader change `perf/gpu/precompile.py <build>` first compiles all 
 process per pipeline (ECM_GPU_PRECOMPILE=variant:level) on every CPU thread, into runs/nvcache - the cache partial.py
 uses; point the regressions there too (__GL_SHADER_DISK_CACHE_PATH, _SIZE 8000000000, _SKIP_CLEANUP 1). The M57
 regression without it spent ~25 min compiling. (Since M65 also into pipeline cache files, runs/pipecache, which keep
-them all: see the note after M65.)
+them all: see the note after M65.) partial.py reports a decoder that fails (its exit code and error output, also in its
+log); a stream whose GPU device is lost (VkResult -4) runs again alone after the others: pj720_ai's pictures take up
+to ~1.8 s of GPU time in partial verification, and with 8 decoders sharing the GPU some pass Windows' 2 s GPU timeout
+(TDR), which resets the device (seen from M66 on; the same build verifies it alone).
 M55: PDP (JVET-AH0209, intra_pdp.glsl): a luma block of a size with PDP filters whose references are available is
 predicted by its mode's filter per sample over two reference lines (one for 16x32 .. 32x32, whose filters cover every
 second sample and whose samples between are averaged in place, in the CPU's order); also a MIP block's by MIP's filter
