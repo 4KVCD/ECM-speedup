@@ -1,7 +1,7 @@
 // Block vectors (JVET-AM0138 and the tools before it): the list of block vectors a CU takes from the CUs around it
 // (PU::getItmpMergeCandidate, then getArBvMergeCandidate's cascade), from the records of those CUs' vectors
-// (Params::bvOut, BV_OUT per CU by its index in the CodingStructure). A vector is in integer samples. Included by
-// intra_rec.comp.
+// (Params::bvOut, BV_OUT per CU by its index in the CodingStructure). A vector is in integer samples (but SGPM's own
+// in a record, BV_OUT_SGPM: 1/16 samples). Included by intra_rec.comp.
 
 // getArBvMergeCandidate's lengths (NUM_BV, NUM_TMP_ARBVP): a list grows to at least NUM_BV, else NUM_TMP_ARBVP beyond
 // the vectors of the neighbours; BV_LIST_MAX the GPU's room (the host takes the lists that fit)
@@ -203,4 +203,18 @@ void bvStore( Cu c, int num, ivec2 bv[3] )
   }
   data.v[at + BV_OUT_SPARSE] = -1;   // (the same for getSparseArBvMergeCandidate)
   data.v[at + BV_OUT_FUSION] = -1;   // (no IntraTMP fusion CU is the GPU's)
+  data.v[at + BV_OUT_SGPM]   = -1;   // (SGPM's list takes them x 16)
+}
+
+// after bvStore: the vectors SGPM's list takes of CU c instead (num of mv, in 1/16 samples)
+void bvStoreSgpm( Cu c, int num, ivec2 mv[2] )
+{
+  CBufI32   data = CBufI32( P.timdData );
+  const int at   = P.bvOut + BufI32( P.timdData ).v[c.bvList + BV_LIST_INDEX] * BV_OUT + BV_OUT_SGPM;
+  data.v[at] = num;
+  for( int j = 0; j < 2; j++ )
+  {
+    data.v[at + 1 + 2 * j] = mv[j].x;
+    data.v[at + 2 + 2 * j] = mv[j].y;
+  }
 }

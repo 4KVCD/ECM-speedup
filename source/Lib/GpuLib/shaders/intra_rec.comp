@@ -108,7 +108,7 @@ int    g_crsScale;  // its scale (Reshape::calculateChromaAdj)
 // takes (-1: the same)
 bool   g_deferRecon;
 int    g_secMode;
-// a block's predictions that are copies of the reconstruction at a block vector (not with ISP; bvOfSub): bit k for
+// a block's predictions that are copies of the reconstruction at a block vector (not with ISP; mvOfSub): bit k for
 // its k-th prediction of a blend (a TIMD block's mode, secondary, non-angular one; a DIMD or intra merge block's
 // planar, an OBIC block's planar blend modes), the main one's alone without blending; with g_bvTransform its
 // transforms take the DIMD of its prediction (PU::isBvTimdApplied / isBvDimdApplied: getTimdVimp / getDimdVimp), which
@@ -719,6 +719,7 @@ ivec2 wgSum2( int a, int b, int slot )
 }
 
 #include "intra_bv.glsl"
+#include "intra_ibc.glsl"
 #include "intra_timd.glsl"
 #include "intra_merge.glsl"
 
@@ -771,17 +772,20 @@ void timdModeParams( inout Tu t, int mode, bool checkWA )
   t.plIdx     = 0;
 }
 
-// the block vector of prediction sub of block t (g_bvSubs): a TIMD block's of that prediction (TimdOut), an intra merge
-// block's of that part where its node gave it one (bvDimdExt), an SGPM block's of that mode (sgpmBv), another's its
-// CU's choice instead of planar (bvDimd)
-ivec2 bvOfSub( Tu t, int sub )
+// the block vector of prediction sub of block t (g_bvSubs) in 1/16 samples: an SGPM block's of that mode (its
+// node's, which may point between samples), else x 16 of a TIMD block's of that prediction (TimdOut), an intra merge
+// block's of that part where its node gave it one (bvDimdExt), another's its CU's choice instead of planar (bvDimd)
+ivec2 mvOfSub( Tu t, int sub )
 {
   CBufI32    d   = CBufI32( P.dimdOut );
   const int  o   = t.cu * DIMD_OUT;
   const bool ext = ( t.derive & DERIVE_MERGE ) != 0 && ( ( d.v[o + DIMD_OUT_EXT_FLAGS] >> sub ) & 1 ) != 0;
+  if( WITH_MPM && ( t.derive & DERIVE_SGPM ) != 0 )
+  {
+    return ivec2( d.v[o + DIMD_OUT_SGPM_BV + 2 * sub], d.v[o + DIMD_OUT_SGPM_BV + 2 * sub + 1] );
+  }
   return bvUnpack( ( t.derive & DERIVE_TIMD ) != 0 ? CBufI32( P.timdOut ).v[timdPredBase( t.cu ) + TIMD_OUT_BV + sub]
-                   : WITH_MPM && ( t.derive & DERIVE_SGPM ) != 0 ? d.v[o + DIMD_OUT_SGPM_BV + sub]
-                   : d.v[o + ( ext ? DIMD_OUT_EXT_BV + sub : DIMD_OUT_BV )] );
+                   : d.v[o + ( ext ? DIMD_OUT_EXT_BV + sub : DIMD_OUT_BV )] ) << 4;
 }
 
 // a TIMD block's blend (xGetNumTapsTIMD): the filter lengths of its mode (x) and its secondary mode (y), from its modes
@@ -2107,14 +2111,17 @@ void main()
       if( ( ( g_bvSubs >> bvSub ) & 1 ) != 0 )
       {
         const bool  fused = WITH_MPM && ( t.derive & DERIVE_BVG ) != 0;   // (BVG-DIMD: its vectors' fusion)
-        const ivec2 bv    = fused ? ivec2( 0 ) : bvOfSub( t, bvSub );
-        // (an SGPM mode's vector: through its LIC model)
+        const ivec2 mv    = fused ? ivec2( 0 ) : mvOfSub( t, bvSub );
+        // (an SGPM mode's vector: through its LIC model; at a fraction getPredIBCBlk's interpolation over its CU)
         const int   lic   = WITH_MPM && ( t.derive & DERIVE_SGPM ) != 0
                               ? CBufI32( P.dimdOut ).v[t.cu * DIMD_OUT + DIMD_OUT_SGPM_LIC + bvSub] : -1;
+        const Cu    c     = BufCu( P.cus ).v[t.cu];
         for( int i = lid; i < N; i += NT )
         {
           const int x = t.x + i % W, y = t.y + i / W;
-          const int v = fused ? bvgFusionSample( t.cu, x, y ) : sgpmLic( recoAt( 0, x + bv.x, y + bv.y ), lic, maxPel );
+          const int v = fused ? bvgFusionSample( t.cu, x, y )
+                              : sgpmLic( ibcPredict( c.x, c.y, c.w, c.h, mv, false, x - c.x, y - c.y, g_ti,
+                                                     t.bitDepth ), lic, maxPel );
           emitPred( t, i % W, i / W, v, bf );
         }
       }

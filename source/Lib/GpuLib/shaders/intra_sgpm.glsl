@@ -2,16 +2,16 @@
 // (DecCu's SGPM branch) has its DIMD (intra_dimd.glsl) and TIMD's best horizontal and vertical modes (intra_timd.glsl's
 // timdNode), then derives IntraPrediction::deriveSgpmModeOrdered without regression SGPM (the host leaves those CUs to
 // the CPU): its list of block vectors (getItmpMergeCandidate's for SGPM, the vectors of the CUs around it valid for its
-// one-sample template; integer ones: the host takes no CU whose list may hold another) ordered by their template costs,
-// the cheapest of them modes from SGPM_BV_START on; per partition of g_sgpmSplitDir the lists of its two parts, three
-// modes (PU::getSgpmIntraMPMs) and those vectors; the template costs of every mode they name - its prediction of the
-// template (predTimdIntraAng with SGPM's wide angles, a vector's copy of the reconstruction), its SAD against the
-// reconstruction (sadTM) and per partition that SAD weighted by the partition's template weights (sgpmSadTM) - and of
-// each partition's mode pairs (the first mode's weighted SAD plus the second's SAD less its weighted one), then the
-// entry of the list those costs rank (updateCandList: ascending, the first of equal costs first) that the CU's index
-// selects. Its block predicts the two modes (a vector's: its copy) and blends them by the partition's weights
-// (xWeightedSgpm, in intra_rec.comp's blending), and takes its transforms by a DIMD of that blend. Included by
-// intra_rec.comp after intra_tmp.glsl.
+// one-sample template, in 1/16 samples) ordered by their template costs, the cheapest of them modes from SGPM_BV_START
+// on; per partition of g_sgpmSplitDir the lists of its two parts, three modes (PU::getSgpmIntraMPMs) and those vectors;
+// the template costs of every mode they name - its prediction of the template (predTimdIntraAng with SGPM's wide
+// angles, a vector's copy of the reconstruction: getPredIBCBlk's bilinear interpolation at a fraction, intra_ibc.glsl),
+// its SAD against the reconstruction (sadTM) and per partition that SAD weighted by the partition's template weights
+// (sgpmSadTM) - and of each partition's mode pairs (the first mode's weighted SAD plus the second's SAD less its
+// weighted one), then the entry of the list those costs rank (updateCandList: ascending, the first of equal costs
+// first) that the CU's index selects. Its block predicts the two modes (a vector's: its copy, at a fraction the luma
+// filter's interpolation) and blends them by the partition's weights (xWeightedSgpm, in intra_rec.comp's blending), and
+// takes its transforms by a DIMD of that blend. Included by intra_rec.comp after intra_tmp.glsl.
 #ifndef INTRA_SGPM_GLSL
 #define INTRA_SGPM_GLSL
 
@@ -31,9 +31,10 @@ const int SGPM_VIPM_SIZE  = 256;   // MAX_SGPM_VIPM_SIZE: the CUs below it whose
 // vectors (s_bvList, intra_bv.glsl) and from SG_LIST_AT the parts' entries as int16 (partition, part, entry); in
 // s_dimdHist per mode of SGPM_BV_START + SGPM_NUM_BVS its slot among the modes the lists name (-1: none), per slot its
 // mode, their number, the CU's DIMD mode, TIMD's two modes, the chosen pair, the number of vectors that are modes; in
-// s_spCost the list's vectors' template costs, then the order of the cheapest; in s_tmp each slot's template
+// s_spCost the list's vectors' template costs, then the order of the cheapest, the vectors' LIC models, their
+// fractions (x & 15 | ( y & 15 ) << 4: s_bvList holds their integer parts); in s_tmp each slot's template
 // differences. In the workgroup's scratch (its blending sums, free in a node): per list entry its weighted SAD, per
-// slot its SAD, per mode pair its cost
+// slot its SAD, per mode pair its cost, the list's vectors' template copies
 const int SG_LIST_AT   = 2 * BV_LIST_MAX;
 const int SG_SLOTS     = SGPM_BV_START + SGPM_NUM_BVS;
 const int SG_MODES     = SG_SLOTS;
@@ -44,9 +45,12 @@ const int SG_CHOICE    = SG_TIMD + 2;
 const int SG_NUM_BVS   = SG_CHOICE + 1;
 const int SG_BV_ORDER  = BV_LIST_MAX;                    // (in s_spCost)
 const int SG_LIC       = SG_BV_ORDER + SGPM_NUM_BVS;     // (in s_spCost: the list's LIC models' offsets, -1 none)
+const int SG_FRAC      = SG_LIC + BV_LIST_MAX;           // (in s_spCost: the list's vectors' fractions)
 const int SC_UNIT      = 0;
 const int SC_SAD       = SC_UNIT + SGPM_PARTITIONS * 2 * SGPM_LIST_MAX;
 const int SC_PAIR      = SC_SAD + SG_SLOTS;
+// (per vector its template's W + H)
+const int SC_COPY      = SC_PAIR + SGPM_PARTITIONS * SGPM_LIST_MAX * SGPM_LIST_MAX;
 
 int  scGet( int o )        { return CBufI32( P.scratch ).v[int( gl_WorkGroupID.x ) * BLEND_ACC + o]; }
 void scSet( int o, int v ) { CBufI32( P.scratch ).v[int( gl_WorkGroupID.x ) * BLEND_ACC + o] = v; }
@@ -140,11 +144,19 @@ bool sgpmLicSame( int a, int b )
   return same;
 }
 
+// the list's vector k in 1/16 samples
+ivec2 sgpmMvAt( int k )
+{
+  const int f = int( s_spCost[SG_FRAC + k] );
+  return ( bvListAt( k ) << 4 ) + ivec2( f & 15, f >> 4 );
+}
+
 // getItmpMergeCandidate's list for SGPM of CU c (invocation 0; the node of task `before`; c.bvList's record): the
-// vectors of the CUs at its neighbour positions each in its order (their records', which are SGPM's in integer
-// samples; a CU's first with its LIC model), each once (with its model) where the block at it and its template's
-// corner are decoded (validIBCItmpMv with SGPM's one-sample template), the first BV_LIST_KEEP of them (DecCu's
-// maxToKeep): the vectors into s_bvList, their models' offsets into s_spCost. Returns the length
+// vectors of the CUs at its neighbour positions each in its order (getNeighBv's for SGPM, in 1/16 samples: their
+// records' x 16, else those the records give SGPM's list; a CU's first with its LIC model), each once (with its model)
+// where the block at it and its template's corner are decoded (validIBCItmpMv with SGPM's one-sample template, at the
+// vector's integer part), the first BV_LIST_KEEP of them (DecCu's maxToKeep): the vectors' integer parts into
+// s_bvList, their fractions and their models' offsets into s_spCost. Returns the length
 int sgpmVectorList( Cu c, int before )
 {
   BufI32    data = BufI32( P.timdData );
@@ -156,21 +168,25 @@ int sgpmVectorList( Cu c, int before )
   {
     const int src = data.v[c.bvList + BV_LIST_NBRS + k];
     const int at  = P.bvOut + src * BV_OUT;
-    for( int j = 0; src >= 0 && j < recs.v[at] && n < keep; j++ )
+    const int own = src >= 0 ? recs.v[at + BV_OUT_SGPM] : -1;   // (SGPM's own vectors, else -1)
+    for( int j = 0; src >= 0 && j < ( own >= 0 ? own : recs.v[at] ) && n < keep; j++ )
     {
-      const ivec2 bv  = bvUnpack( recs.v[at + 1 + j] );
+      const ivec2 mv  = own >= 0 ? ivec2( recs.v[at + BV_OUT_SGPM + 1 + 2 * j], recs.v[at + BV_OUT_SGPM + 2 + 2 * j] )
+                                 : bvUnpack( recs.v[at + 1 + j] ) << 4;
+      const ivec2 bv  = mv >> 4;
       const int   lic = j == 0 ? data.v[at + BV_OUT_LIC] : -1;
       bool        listed = false;
       for( int e = 0; e < n && !listed; e++ )
       {
-        listed = bvListAt( e ) == bv && sgpmLicSame( int( s_spCost[SG_LIC + e] ), lic );
+        listed = sgpmMvAt( e ) == mv && sgpmLicSame( int( s_spCost[SG_LIC + e] ), lic );
       }
       if( !listed && decodedBefore( om, c.x + bv.x + c.w - 1, c.y + bv.y + c.h - 1, before )
           && decodedBefore( om, c.x + bv.x - 1, c.y + bv.y - 1, before ) )
       {
-        s_bvList[2 * n]     = int16_t( bv.x );
-        s_bvList[2 * n + 1] = int16_t( bv.y );
-        s_spCost[SG_LIC + n] = uint( lic );
+        s_bvList[2 * n]       = int16_t( bv.x );
+        s_bvList[2 * n + 1]   = int16_t( bv.y );
+        s_spCost[SG_FRAC + n] = uint( ( mv.x & 15 ) | ( ( mv.y & 15 ) << 4 ) );
+        s_spCost[SG_LIC + n]  = uint( lic );
         n++;
       }
     }
@@ -178,14 +194,16 @@ int sgpmVectorList( Cu c, int before )
   return n;
 }
 
-// the template sample s (the above row's W, then the left column's H) of CU c copied from the block at the list's
-// vector k (getPredIBCBlk at the vector moved by the template's offset), through its LIC model
-int sgpmCopyAt( Cu c, int k, int s, int maxPel )
+// the template sample s (the above row's W, then the left column's H) of CU c predicted from the block at the list's
+// vector k (getPredIBCBlk with the bilinear filter at the vector moved by the template's offset, the template's
+// region at the CU's position), through its LIC model; for the node of block `before`
+int sgpmCopyAt( Cu c, int k, int s, int bitDepth, int before )
 {
-  const ivec2 bv = bvListAt( k );
-  const int   v  = s < c.w ? recoAt( 0, c.x + s + bv.x, c.y - 1 + bv.y )
-                           : recoAt( 0, c.x - 1 + bv.x, c.y + s - c.w + bv.y );
-  return sgpmLic( v, int( s_spCost[SG_LIC + k] ), maxPel );
+  const bool top = s < c.w;
+  const int  v   = ibcPredict( c.x, c.y, top ? c.w : 1, top ? 1 : c.h,
+                               sgpmMvAt( k ) + ( top ? ivec2( 0, -16 ) : ivec2( -16, 0 ) ), true, top ? s : 0,
+                               top ? 0 : s - c.w, before, bitDepth );
+  return sgpmLic( v, int( s_spCost[SG_LIC + k] ), ( 1 << bitDepth ) - 1 );
 }
 
 // the node of SGPM CU c (all invocations, uniform control flow; after timdNode's pass, which wrote TIMD's two modes
@@ -217,16 +235,18 @@ int sgpmNode( Cu c, int cuIndex, int dimdMode, int bitDepth, bool noPdpc, int li
     s_spCost[k] = 0u;
   }
   SYNC();
-  // the vectors' template costs (sadTM of their copies), then the cheapest SGPM_NUM_BVS in order (stableSortSmall),
-  // which become the modes from SGPM_BV_START on
+  // the vectors' template costs (sadTM of their copies, which the scratch keeps for the modes' costs below), then the
+  // cheapest SGPM_NUM_BVS in order (stableSortSmall), which become the modes from SGPM_BV_START on
   const int numVectors = s_dimdHist[SG_NUM_BVS];
   for( int i = lid; i < numVectors * T; i += NT )
   {
-    const int s = i % T;
+    const int s    = i % T;
     const int reco = s < W ? recoAt( 0, c.x + s, c.y - 1 ) : recoAt( 0, c.x - 1, c.y + s - W );
-    atomicAdd( s_spCost[i / T], uint( abs( reco - sgpmCopyAt( c, i / T, s, maxPel ) ) ) );
+    const int copy = sgpmCopyAt( c, i / T, s, bitDepth, g_ti );
+    scSet( SC_COPY + i, copy );
+    atomicAdd( s_spCost[i / T], uint( abs( reco - copy ) ) );
   }
-  SYNC();
+  tsSync();
   if( lid == 0 )
   {
     uint used = 0u;
@@ -296,7 +316,7 @@ int sgpmNode( Cu c, int cuIndex, int dimdMode, int bitDepth, bool noPdpc, int li
       int       pred;
       if( mode >= SGPM_BV_START )
       {
-        pred = sgpmCopyAt( c, int( s_spCost[SG_BV_ORDER + mode - SGPM_BV_START] ), s, maxPel );
+        pred = scGet( SC_COPY + int( s_spCost[SG_BV_ORDER + mode - SGPM_BV_START] ) * T + s );
       }
       else
       {
@@ -385,24 +405,30 @@ int sgpmNode( Cu c, int cuIndex, int dimdMode, int bitDepth, bool noPdpc, int li
   o.v[base + DIMD_OUT_SGPM_MODE]     = mode0;
   o.v[base + DIMD_OUT_SGPM_MODE + 1] = mode1;
   CBufI32( P.cuMode ).v[td.v[rec + SGPM_HEAD_VIEW]] = sgpmTable( SGPM_TAB_ANGLE + s );
-  // the vectors of its modes from vectors with their LIC models for its block, the vectors in its record for the
-  // lists after it (getNeighBv's SGPM branch: the first mode's, then the second's; without their models)
-  ivec2 bvs[3];
+  // the vectors of its modes from vectors (1/16 samples) with their LIC models for its block, the vectors in its record
+  // for the lists after it (getNeighBv's SGPM branch: the first mode's, then the second's; without their models;
+  // rounded to integers, changePrecision's rounding, and as they are for SGPM's lists)
+  ivec2 bvs[3] = ivec2[3]( ivec2( 0 ), ivec2( 0 ), ivec2( 0 ) ), mvs[2] = ivec2[2]( ivec2( 0 ), ivec2( 0 ) );
   int   num = 0;
   for( int k = 0; k < 2; k++ )
   {
-    const int m     = k == 0 ? mode0 : mode1;
-    const int entry = m >= SGPM_BV_START ? int( s_spCost[SG_BV_ORDER + m - SGPM_BV_START] ) : -1;
-    o.v[base + DIMD_OUT_SGPM_BV + k]  = entry >= 0 ? bvPack( bvListAt( entry ) ) : 0;
-    o.v[base + DIMD_OUT_SGPM_LIC + k] = entry >= 0 ? int( s_spCost[SG_LIC + entry] ) : -1;
+    const int   m     = k == 0 ? mode0 : mode1;
+    const int   entry = m >= SGPM_BV_START ? int( s_spCost[SG_BV_ORDER + m - SGPM_BV_START] ) : -1;
+    const ivec2 mv    = entry >= 0 ? sgpmMvAt( entry ) : ivec2( 0 );
+    o.v[base + DIMD_OUT_SGPM_BV + 2 * k]     = mv.x;
+    o.v[base + DIMD_OUT_SGPM_BV + 2 * k + 1] = mv.y;
+    o.v[base + DIMD_OUT_SGPM_LIC + k]        = entry >= 0 ? int( s_spCost[SG_LIC + entry] ) : -1;
     if( entry >= 0 )
     {
-      bvs[num++] = bvListAt( entry );
+      mvs[num] = mv;
+      bvs[num] = ( mv + mix( ivec2( 8 ), ivec2( 7 ), greaterThanEqual( mv, ivec2( 0 ) ) ) ) >> 4;
+      num++;
     }
   }
   if( c.bvList >= 0 )
   {
     bvStore( c, num, bvs );
+    bvStoreSgpm( c, num, mvs );
   }
   return mode0 >= SGPM_BV_START ? PLANAR_IDX : mode0;
 }

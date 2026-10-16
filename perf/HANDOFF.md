@@ -449,7 +449,7 @@ wall-clock gains with threads are "the easy baseline". Decoder status: single-th
 (`--GpuLoopFilter=1`: ALF, SAO, BIF, CCSAO, LF-CCCM, offset refinement on Vulkan). The user then asked for **a full
 GPU decoder in Vulkan, optimized until nothing is left** ("The GPU decoder needs to fully decode the frame on the
 GPU"; "Your first Vulkan version is going to be slow. That's OK"). That work is branch `dec-gpurecon`: intra
-reconstruction on the GPU (`--GpuRecon`), tool levels M1-M67 done and verified bit-exact (M19: DIMD, M20: OBIC, M21:
+reconstruction on the GPU (`--GpuRecon`), tool levels M1-M68 done and verified bit-exact (M19: DIMD, M20: OBIC, M21:
 intra merge, M22: the transforms of DIMD CUs, M23: LFNST of MIP, M24: TIMD, M25: OBIC and intra merge with TIMD
 neighbours, M26: TIMD-SAD, M27: OBIC and intra merge with TIMD-SAD neighbours, M28: TIMD merge, M29: TMRL of luma,
 M30: chroma TMRL, M31: CCLM, M32: LFNST / NSPT of CCLM, M33: GLM's gradient patterns, M34: CCCM, M35: GL-CCCM, M36:
@@ -461,7 +461,7 @@ model, M53 / M54: CCP merge and decoder-derived fusion with LFNST / NSPT, M55: P
 MPM lists of MPM sorting, MDIP and PDP, M58: EIP, M59-M61: block vectors - TIMD, DIMD and OBIC with vectors, M62:
 IntraTMP's search, without LIC / fusion / FLM / sub-sample vectors / OBMC, M63: EIP with a vector, M64: intra
 merge with vectors, M65: BVG-DIMD, M66: SGPM without vectors or regression, M67: SGPM's integer vectors with
-their LIC models); it is
+their LIC models, M68: IBC's interpolation, SGPM's fractional vectors); it is
 **not yet faster than the CPU
 decoder** (see section 8) and supports only a restricted tool set (in ON mode the real CTC streams still fall back to
 the CPU, first reason: chroma reordering / DBV). Partial verification (`perf/gpu/partial.py`, section 7's "Partial
@@ -469,8 +469,8 @@ verification") runs the 19 regular CTC streams with the CUs of missing tools tak
 picture is identical but the known CCP merge blocks (fp720_ai's 3 pictures, ra720's first), and 17265 intra CUs
 still come from the CPU (IntraTMP LIC 4159, intra merge with a neighbour of a missing kind 2586, IntraTMP
 sub-sample vectors 1900, SGPM with vectors 3152 and regression 795, IntraTMP OBMC / fusion / FLM ~2200, ...; plus
-32777 inter / IBC / palette CUs of inter pictures). M67 (2026-10-16) took SGPM's integer vectors; next is M68,
-IBC's interpolation (section 9).
+32777 inter / IBC / palette CUs of inter pictures). M67 / M68 (2026-10-16) took SGPM's vectors; next is M69,
+IntraTMP's sub-sample vectors (section 9).
 
 ## 1a. Working fast (development time)
 
@@ -1785,7 +1785,7 @@ with LIC on an Intel iGPU with a corpus of 48 streams of the CTC tools (C:\Code\
 C:\Code\ECM\streams), where every stream gave M66's results (the differences it showed were older bugs, fixed after
 M67). Remaining: "SGPM with a fractional vector neighbour" (~830) and "SGPM with an EIP neighbour with a vector"
 (~450) need IBC's interpolation (getPredIBCBlk: bilinear for the template, the regular luma filter for a block at a
-fractional vector), which IntraTMP's sub-sample CUs (1900) need too (M68, M69).
+fractional vector), which IntraTMP's sub-sample CUs (1900) need too (M68, M69). (The EIP rule was not needed: M68.)
 Of the 3152 SGPM CUs with vectors in their lists, 1693 had a fractional one (EIP with a vector gives its integer
 vector as 1/16 samples to SGPM's list, IntraTMP's sub-sample CUs their fractional mv), 178 one with LIC (after
 DecCu's cap; ~1000 lists hold a LIC neighbour's valid vector before it), none a flipped one.
@@ -1800,6 +1800,31 @@ up to 9 x 9 per partition (the costs and pairs in the workgroup's scratch). It w
 is a vector's. Its block copies the reconstruction at a vector for that part (g_bvSubs). TIMD's pass of an SGPM CU
 takes no vectors (deriveTimdMode's useBv), OBIC counts no vector's mode. SPIR-V: 3.21M / 4.04M IDs (~155k left in
 the CCP-LFNST module).
+M68 (2026-10-16): IBC's interpolation (intra_ibc.glsl: getPredIBCBlk -> InterPrediction::xPredInterBlk with isIBC,
+luma, rndRes, no LIC) and SGPM's fractional vectors. ibcPredict gives a sample of a region (w x h at a CU's position,
+which checkValidBv takes even for a template) at a vector in 1/16 samples: a copy at an integer vector or without
+the SPS's IBCFracFlag (Params::ibcFrac; the integer part then), else m_lumaFilter's 8 taps (IF_12TAP's x 4 table,
+filterIdx -1) or the bilinear filter (filterIdx 1: SGPM's templates), one pass rounded to the sample or two through
+the 14-bit intermediate (headroom max(2, 14 - bitDepth)). ibcAreaValid is PU::searchBv with the filter's reach
+(JVET-AJ0172's area); where it fails (IBC_INT_BV_VALID) ibcRef pads as xPredIBCBlkPadding does, per sample: rows of
+the region left / right of it from the first unit not decoded on take the sample next to that unit, then rows above /
+below take the one nearer the region where their unit is not decoded. One ibcRef call site per module (it inlines).
+SGPM: a record's vectors for SGPM's lists are its vectors x 16 unless BV_OUT_SGPM gives its own (count, 2 x / y in
+1/16: a CPU IBC CU's mv, an IntraTMP CU's mv[0] - sub-sample ones point between samples -, an SGPM CU's own, written
+by the host for CPU CUs (cpuSgpmVectors) and by a GPU SGPM node; a flipped IBC CU gives none, as it keeps the SGPM CU
+on the CPU where its flipped vector is valid). The SGPM list holds integer parts in s_bvList and fractions in
+s_spCost (SG_FRAC); its template copies are computed once (bilinear at a fraction) into the scratch (SC_COPY) for the
+vectors' costs and the modes' template costs; DimdOut's SGPM_BV holds x / y in 1/16 (DIMD_OUT 45); the block's copy
+interpolates over the CU with the 8-tap filter (mvOfSub). An SGPM node's record: the vectors rounded as
+Mv::changePrecision rounds (for the other lists) and in 1/16 (BV_OUT_SGPM). Finding: an EIP CU with a vector gives
+SGPM's list its vector x 16 (setEipBvInfo; checked with a debug print in CPU and verify mode), so the M67 rejection
+"SGPM with an EIP neighbour with a vector" was never needed. Results on the Intel PC's 48-stream corpus (build gpu2):
+every stream as before (the 2 single-tree streams differ as at M66), SGPM CUs on the GPU 700 -> 884, intra CUs from
+the CPU 2966 -> 2767 (both rejections gone; "an intra merge neighbour of a kind the GPU lacks" 339 -> 308).
+The padding ran: a debug print in xPredIBCBlkPadding found 4 padded SGPM predictions in the corpus (ai_foreman352_q22:
+two blocks with the 8-tap filter, CUs at 88,128 and 136,24; ld_fourpeople_q37: the two bilinear templates of the CU
+at 232,240); all three CUs were the GPU's in verification (debug print in addSgpmRecord). SPIR-V 3.22M / 4.04M IDs (152k
+left in the CCP-LFNST module). Run verify_all.py on the RTX PC (its 444 streams are not on the Intel PC).
 
 
 ## 8. Numbers (i7-10700 8C/16T, Win11, GCC 16.2, RTX 3070 driver 616.92)
@@ -1829,10 +1854,15 @@ Profile of a GPU-on decode (non-LTO, m2_park16, share of all samples): parsing ~
       (a CCP merge chroma block inherits the wrong model type, CCLM instead of CCCM, first seen as NN's
       indicesRepresentationPnn) and ra_nodualtree_q32 (a luma MPM block's prediction, then DIMD chroma's second
       mode). ON mode leaves both to the CPU (identical output). Fix before single tree counts as supported.
-   b. M68: IBC's interpolation on the GPU (getPredIBCBlk -> InterPrediction::xPredInterBlk with isIBC: the bilinear
-      filter for SGPM's templates, the regular luma filter for blocks at fractional vectors, rndRes, no LIC there):
-      frees SGPM's fractional / EIP-vector neighbours (~1280 CUs) and IntraTMP's sub-sample vectors (1900); it is the
-      first piece of inter prediction too.
+   b. Done (2026-10-16): M68, IBC's interpolation (intra_ibc.glsl) and SGPM's fractional vectors.
+   b2. M69: IntraTMP's sub-sample vectors (1900 CUs on the CTC streams): searchFracCandidate (JVET-AM0229: the
+      template around the chosen vector padded by xPadForFracSearchInterpolation, the 4-tap cubic filters of
+      defineFilterTmpSubpel0 / 1 per fracPrecX / fracPrecY and direction, calcTemplateDiff with requiredTemplate,
+      updateCandList; tmpFracIdx 1 takes the cheapest), then the block from ibcPredict at mv = (pX << 4) + distance.
+      Careful: xPredIBCBlkPadding moves its offset by deltaX / deltaY (1 where the vector's integer part is below
+      pu.bv: a negative fraction) for such CUs; read how refBuf then lines up before porting (a poison test of
+      m_cRefSamplesDMVRL0 changed no output, so nothing stale is read). The CU's record gets mv[0] for SGPM
+      (bvStoreSgpm).
    c. IntraTMP's LIC (4159 + 813 with fusion): the LIC model of its template (InterPrediction's LicItmp /
       xLocalIlluComp), then IntraTMP fusion (731), FLM (589), OBMC (919); with them the intra merge CUs held back by
       an IntraTMP neighbour (~950) and most of "an intra merge neighbour of a kind the GPU lacks".
@@ -1867,7 +1897,7 @@ Profile of a GPU-on decode (non-LTO, m2_park16, share of all samples): parsing ~
    streams), M62 IntraTMP's search (its plain CUs; LIC, sub-sample vectors and OBMC need inter's LIC, interpolation
    and OBMC, fusion and FLM their models), M63 EIP with a vector, M64 intra merge with vectors, M65 BVG-DIMD, M66
    SGPM (its CUs without vector candidates or regression, up to 1024 samples). 2026-10-16: M67 SGPM's block vectors
-   and their LIC models.
+   and their LIC models, M68 IBC's interpolation and SGPM's fractional vectors.
    All 19 regular streams now stop at "chroma reordering / DBV" (the next sequence-level check; the block-level tools
    of step 4 follow; BVG-CCCM needs IntraTMP / IBC first).
 3. Make the GPU path win on CPU time per picture: the derive-only pass (record during parsing or a leaner pass;
