@@ -260,12 +260,28 @@ int timdRegularAngle( int W, int H, int angle )
   return angle > EXT_VER_IDX ? angle - ( EXT_VDIA_IDX - 2 ) : angle < EXT_HOR_IDX ? angle + ( EXT_VDIA_IDX - 2 ) : angle;
 }
 
-// the parameters of mode dirMode, its wide angle getWideAngleExt's (checkWA, every mode but TIMD's beyond the regular
-// angles) or getTimdWideAngleExt's
-TimdParams timdParams( int dirMode, int W, int H, bool noPdpc, bool checkWA )
+// getWideAngleExt with bSgpm (SGPM's template predictions): the wide angles one step further than timdWideAngle's
+int sgpmWideAngle( int W, int H, int mode )
+{
+  if( mode > 1 && mode <= EXT_VDIA_IDX )
+  {
+    const int deltaSize = abs( findMSB( W ) - findMSB( H ) );
+    if( W > H && mode < 2 + TIMD_MODE_SHIFT[deltaSize] )
+    {
+      mode += EXT_VDIA_IDX;
+    }
+    else if( H > W && mode > EXT_VDIA_IDX - TIMD_MODE_SHIFT[deltaSize] )
+    {
+      mode -= EXT_VDIA_IDX;
+    }
+  }
+  return mode;
+}
+
+// the parameters of mode dirMode whose wide angle is predMode
+TimdParams timdParamsOf( int dirMode, int predMode, int W, int H, bool noPdpc )
 {
   TimdParams p;
-  const int predMode  = checkWA ? timdWideAngle( W, H, dirMode ) : timdWaipAngle( W, H, dirMode );
   p.isModeVer         = predMode >= EXT_DIA_IDX;
   const int angleMode = p.isModeVer ? predMode - EXT_VER_IDX : -( predMode - EXT_HOR_IDX );
   const int absMode   = abs( angleMode );
@@ -290,6 +306,14 @@ TimdParams timdParams( int dirMode, int W, int H, bool noPdpc, bool checkWA )
   p.pdpc   = p.pdpc && !noPdpc;
   p.chroma = false;
   return p;
+}
+
+// the parameters of mode dirMode, its wide angle getWideAngleExt's (checkWA, every mode but TIMD's beyond the regular
+// angles) or getTimdWideAngleExt's
+TimdParams timdParams( int dirMode, int W, int H, bool noPdpc, bool checkWA )
+{
+  const int predMode = checkWA ? timdWideAngle( W, H, dirMode ) : timdWaipAngle( W, H, dirMode );
+  return timdParamsOf( dirMode, predMode, W, H, noPdpc );
 }
 
 // the reference row (top) or column at index k
@@ -1315,10 +1339,39 @@ void timdStoreTransforms( TimdHead head, Cu c, int mode )
   }
 }
 
+// an SGPM CU's TIMD pass (deriveTimdMode with bHorVer alone, one invocation): of the first batch's list modes (their
+// costs computed) the cheapest by the left arm's cost among those up to the diagonal, the cheapest by the above arm's
+// among the others (by the only arm of a template of one), each the first of equal costs, planar where none (the CPU
+// skips planar and DC), into the CU's DimdOut (timdHor, timdVer: its partitions' mode lists read them)
+void sgpmTimdModes( int cuIndex, int type, int endList )
+{
+  uint costHor = ~0u, costVer = ~0u;
+  int  modeHor = PLANAR_IDX, modeVer = PLANAR_IDX;
+  for( int k = 2; k < endList; k++ )
+  {
+    const int  mode = timdCandMode( s_spCost[TC_CAND + k] );
+    const bool ver  = type == TIMD_ABOVE || ( type == TIMD_BOTH && mode > EXT_DIA_IDX );
+    const uint cost = s_spCost[( ver ? TC_COST_A : TC_COST_L ) + k];
+    if( ver && cost < costVer )
+    {
+      costVer = cost;
+      modeVer = mode;
+    }
+    else if( !ver && cost < costHor )
+    {
+      costHor = cost;
+      modeHor = mode;
+    }
+  }
+  CBufI32( P.dimdOut ).v[cuIndex * DIMD_OUT + DIMD_OUT_SGPM_TIMD]     = modeHor;
+  CBufI32( P.dimdOut ).v[cuIndex * DIMD_OUT + DIMD_OUT_SGPM_TIMD + 1] = modeVer;
+}
+
 // the node of TIMD CU c (all invocations, uniform control flow): its TIMD (a TIMD-SAD CU's also its TIMD-SAD) into its
 // TimdOut; returns (invocation 0) the mode its blocks predict as the neighbours read it (MAP131TO67) and in mtssSecond
 // the second mode MTSS tries first (the secondary where those modes blend, else -1: none). nbrMode, dimdModes:
 // deriveLumaMode's (invocation 0's); cuIndex: the CU's record, whose DimdOut slot holds its DIMD.
+// An SGPM CU's node takes the first batch's costs alone (sgpmTimdModes).
 // Each derivation is written out at its own call sites, with its kind (SATD / mean-removed SAD) a constant there: one
 // function for both, its kind a parameter, made the TIMD-SAD pictures ~8 % slower
 int timdNode( Cu c, int cuIndex, int nbrMode[MPM_NEIGHBOURS], int dimdModes[3], int bitDepth, bool noPdpc,
@@ -1341,6 +1394,10 @@ int timdNode( Cu c, int cuIndex, int nbrMode[MPM_NEIGHBOURS], int dimdModes[3], 
         timdStore( outBase + TIMD_OUT_SAD, fields );
       }
       timdStoreTransforms( head, c, PLANAR_IDX );
+      if( WITH_MPM && c.kind == CU_SGPM )
+      {
+        sgpmTimdModes( cuIndex, TIMD_NONE, 0 );
+      }
     }
     return PLANAR_IDX;
   }
@@ -1372,10 +1429,23 @@ int timdNode( Cu c, int cuIndex, int nbrMode[MPM_NEIGHBOURS], int dimdModes[3], 
   if( lid == 0 )
   {
     timdMpmCandidates( c, nbrMode, dimdModes, range );
+    if( WITH_MPM && c.kind == CU_SGPM )   // (SGPM's pass tries no wide angles beyond the regular ones)
+    {
+      s_spCost[TC_NUM] = s_spCost[TC_END_LIST];
+    }
   }
   SYNC();
   const int numCands = int( s_spCost[TC_NUM] );
   timdTemplateCosts( c, head.t, TC_CAND, numCands, TC_COST_A, TC_COST_L, dc, maxPel, noPdpc, false, lid, NT );
+  if( WITH_MPM && c.kind == CU_SGPM )
+  {
+    if( lid == 0 )
+    {
+      sgpmTimdModes( cuIndex, head.type, int( s_spCost[TC_END_LIST] ) );
+    }
+    SYNC();   // (the SGPM node takes s_spCost next)
+    return -1;
+  }
   const uint64_t maxCost  = uint64_t( tw * c.h + th * c.w );
   int            lastList = 0;
   if( lid == 0 )

@@ -23,9 +23,9 @@ void obicCount( int mode, int cls, int amount )
 
 // deriveObicMode's step 4 over the neighbours of OBIC CU c, one invocation each, all invocations (ends with a barrier).
 // A DIMD CU counts its main mode, planar and its blend modes, those but the main one by their weights relative to the
-// main one's; a TIMD CU alike its modes; an OBIC CU its modes, each with all the samples; an intra merge CU its modes,
-// each with all the samples, without a class (s_obicPlain); another intra CU its mode (MIP CUs, which count nothing in
-// intra slices, are not in the list)
+// main one's; a TIMD CU alike its modes; an OBIC CU its modes and an SGPM CU its two, each with all the samples; an
+// intra merge CU its modes, each with all the samples, without a class (s_obicPlain); another intra CU its mode (MIP
+// CUs, which count nothing in intra slices, are not in the list)
 void obicHistogram( Cu c, int lid, int NT )
 {
   for( int i = lid; i < 3 * NUM_LUMA_MODE; i += NT )
@@ -76,6 +76,13 @@ void obicHistogram( Cu c, int lid, int NT )
       {
         atomicAdd( s_obicPlain[second], ns );
       }
+    }
+    else if( WITH_MPM && kind == CU_SGPM )   // its two modes (its node's), each with all the samples, class 0
+    {
+      CBufI32   d = CBufI32( P.dimdOut );
+      const int o = nb.cu * DIMD_OUT;
+      obicCount( d.v[o + DIMD_OUT_SGPM_MODE], 0, ns );
+      obicCount( d.v[o + DIMD_OUT_SGPM_MODE + 1], 0, ns );
     }
     else if( WITH_MERGE && kind == CU_MERGE )   // its merge parameters (its DimdOut slot), all samples to each mode, no class
     {

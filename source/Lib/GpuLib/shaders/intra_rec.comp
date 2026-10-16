@@ -132,6 +132,10 @@ bool   g_blendFirst;   // the first prediction (the main mode) sets them, the ot
 int    g_blendW;       // the prediction's weight
 int    g_blendClass;   // its class
 bool   g_blendTaps;    // DIMD: the prediction's filter length by its weight (JVET-AN0158)
+// an SGPM block's blend (DERIVE_SGPM, its two predictions of weight 1): the offset in matrices of its partition's
+// weight of the first prediction per sample (of 32; the second's the rest), which emitPred applies; -1 for any other
+// block
+int    g_sgpmWeights;
 
 #include "intra_modes.glsl"
 
@@ -210,7 +214,7 @@ bool timdMergeCu( Cu c )
 // positions (-1: none), chroma the co-located luma CU's in entry 0
 int modeRead( Cu c, int k )
 {
-  const int n = c.kind == CU_MPM || c.kind == CU_TIMD ? c.nbr[k] : k == 0 ? c.lumaCu : -1;
+  const int n = c.kind == CU_MPM || c.kind == CU_TIMD || c.kind == CU_SGPM ? c.nbr[k] : k == 0 ? c.lumaCu : -1;
   return n >= 0 ? cuModeOf( n ) : -1;
 }
 
@@ -568,9 +572,12 @@ void emitPred( Tu t, int x, int y, int pr, bool bf )
     CBufI32   acc = CBufI32( P.scratch );
     const int o   = int( gl_WorkGroupID.x ) * BLEND_ACC + y * t.regW + x;
     const int N   = t.regW * t.h;
+    // (an SGPM block's first prediction weighs its partition's weight, the second the rest)
+    const int sgpmW = WITH_MPM && g_sgpmWeights >= 0 ? BufI32( P.matrices ).v[g_sgpmWeights + y * t.regW + x] : 0;
+    const int w     = WITH_MPM && g_sgpmWeights >= 0 ? ( g_blendFirst ? sgpmW : 32 - sgpmW ) : g_blendW;
     for( int c = 0; c < 3; c++ )
     {
-      const int add = c == g_blendClass ? pr * g_blendW : 0;
+      const int add = c == g_blendClass ? pr * w : 0;
       if( g_blendFirst )
       {
         acc.v[o + c * N] = add;
@@ -676,7 +683,12 @@ void mipTransformMode( Tu t, int W, int H, int ps, int upH, int upV, int predStr
     s_predDimdMode = first;
     CBufI32   o    = CBufI32( P.dimdOut );
     const int base = t.cu * DIMD_OUT;
-    if( !g_bvTransform )   // (the CU's DimdOut keeps its DIMD)
+    if( WITH_MPM && ( t.derive & DERIVE_SGPM ) != 0 )   // (an SGPM CU's DimdOut keeps its DIMD)
+    {
+      o.v[base + DIMD_OUT_SGPM_PRED]     = first;
+      o.v[base + DIMD_OUT_SGPM_PRED + 1] = second;
+    }
+    else if( !g_bvTransform )   // (the CU's DimdOut keeps its DIMD)
     {
       o.v[base + DIMD_OUT_MODE]      = first;
       o.v[base + DIMD_OUT_TR_SECOND] = second;
@@ -947,6 +959,7 @@ ivec2 angularArrays( bool isVer, int W, int H, int angle, int absInvAngle, int t
 #include "intra_eip.glsl"
 #include "intra_tmp.glsl"
 #include "intra_bvg.glsl"
+#include "intra_sgpm.glsl"
 
 // the EipOut of EIP CU n (intra_eip.glsl)
 int eipOutBase( int n )
@@ -1484,10 +1497,12 @@ void main()
       break;
     }
     Tu t = BufTu( P.tus ).v[g_ti];
-    g_deferRecon = WITH_DERIVED_TRANSFORMS && ( t.derive & ( DERIVE_PNN_DIMD | DERIVE_EIP | DERIVE_TMP ) ) != 0;
+    g_deferRecon = WITH_DERIVED_TRANSFORMS
+                   && ( t.derive & ( DERIVE_PNN_DIMD | DERIVE_EIP | DERIVE_TMP | DERIVE_SGPM ) ) != 0;
     g_secMode    = -1;
     g_bvSubs     = 0;
     g_bvTransform = false;
+    g_sgpmWeights = -1;
     // the dependents, prefetched (their release ends the block)
     const int d0 = BufI32( P.depOffset ).v[g_ti], d1 = BufI32( P.depOffset ).v[g_ti + 1];
     if( lid < d1 - d0 )
@@ -1583,8 +1598,8 @@ void main()
       {
         cuMode = chromaTmrlNode( t, c, s_modesRead[0], dimdModes, lid, NT );
       }
-      else if( WITH_TIMD && c.kind == CU_TIMD )   // intra_timd.glsl, its MPM list with its DIMD
-      {
+      else if( WITH_TIMD && ( c.kind == CU_TIMD || ( WITH_MPM && c.kind == CU_SGPM ) ) )   // intra_timd.glsl, its MPM
+      {                                                                                      // list with its DIMD
         int modes[MPM_NEIGHBOURS];
         for( int k = 0; k < MPM_NEIGHBOURS; k++ )
         {
@@ -1592,6 +1607,10 @@ void main()
         }
         cuMode = timdNode( c, t.cu, modes, dimdModes, t.bitDepth, ( t.derive & DERIVE_NO_PDPC ) != 0, mtssSecond, lid,
                            NT );
+        if( WITH_MPM && c.kind == CU_SGPM )   // intra_sgpm.glsl, after its TIMD pass
+        {
+          cuMode = sgpmNode( c, t.cu, dimdModes[0], t.bitDepth, ( t.derive & DERIVE_NO_PDPC ) != 0, lid, NT );
+        }
       }
       else if( WITH_MPM && c.kind == CU_MPM && c.mpm >= 0 )   // intra_mpm.glsl, MPM sorting, MDIP, PDP's lists
       {
@@ -1686,18 +1705,25 @@ void main()
       // a DIMD CU's predictions where its DIMD blends (dimdPrediction), an intra merge CU's alike from its chosen
       // candidate (always), an OBIC CU's: its modes but those not set; a TIMD CU's where its modes blend: its mode, its
       // secondary mode and its non-angular one (TimdOut; the weight of one not blended 0); a CCP merge block's of
-      // fusion with DIMD chroma: the merge prediction (no mode), then the DIMD chroma mode's, each weighed 1
+      // fusion with DIMD chroma: the merge prediction (no mode), then the DIMD chroma mode's, each weighed 1; an SGPM
+      // CU's: its two modes, weighed per sample by its partition (g_sgpmWeights)
       const bool dimdCu  = WITH_DIMD && ( t.derive & DERIVE_DIMD ) != 0, obicCu = WITH_DIMD && ( t.derive & DERIVE_OBIC ) != 0;
       const bool mergeCu = WITH_DIMD && WITH_MERGE && ( t.derive & DERIVE_MERGE ) != 0;
       const bool timdCu  = WITH_TIMD && ( t.derive & DERIVE_TIMD ) != 0;
       const bool ccpCu   = WITH_CCP_MERGE && WITH_DIMD && ( t.derive & DERIVE_CCP_DIMD ) != 0;
+      const bool sgpmCu  = WITH_MPM && ( t.derive & DERIVE_SGPM ) != 0;
       const int  timdOut = timdCu ? timdPredBase( t.cu ) : 0;
-      if( ( dimdCu || obicCu || mergeCu || timdCu || ccpCu ) && lid < BLEND_MAX )
+      if( ( dimdCu || obicCu || mergeCu || timdCu || ccpCu || sgpmCu ) && lid < BLEND_MAX )
       {
         int mode = -1, w = 0, cls = 0;
         if( ccpCu )
         {
           mode = lid == 1 ? cuModeOf( t.cu ) : -1;
+          w    = lid < 2 ? 1 : 0;
+        }
+        else if( sgpmCu )
+        {
+          mode = lid < 2 ? CBufI32( P.dimdOut ).v[t.cu * DIMD_OUT + DIMD_OUT_SGPM_MODE + lid] : -1;
           w    = lid < 2 ? 1 : 0;
         }
         else if( timdCu )
@@ -1727,18 +1753,25 @@ void main()
         s_blendClass[lid] = cls;
         if( lid == 0 )
         {
-          s_blendNum = ccpCu ? 2 : obicCu ? OBIC_MODES
+          s_blendNum = ccpCu || sgpmCu ? 2 : obicCu ? OBIC_MODES
                        : timdCu ? ( CBufI32( P.timdOut ).v[timdOut + TIMD_OUT_BLENDED] != 0 ? 3 : 0 )
                        : mergeCu || CBufI32( P.dimdOut ).v[t.cu * DIMD_OUT + DIMD_OUT_BLENDING] != 0 ? DIMD_FUSION_NUM : 0;
         }
       }
       SYNC();
-      if( dimdCu || obicCu || mergeCu || timdCu || ccpCu )   // (the block's: the same for the whole workgroup)
+      if( dimdCu || obicCu || mergeCu || timdCu || ccpCu || sgpmCu )   // (the block's: the same for all invocations)
       {
-        if( lid == 0 )
+        if( lid == 0 && sgpmCu )   // (SGPM: the weights per sample sum to 32, xWeightedSgpm's shift)
+        {
+          s_blendTot[0] = 32;
+          s_blendTot[1] = 0;
+          s_blendTot[2] = 0;
+        }
+        else if( lid == 0 )
         {
           blendTotals( mergeCu );
         }
+        g_sgpmWeights = sgpmCu ? sgpmBlockWeights( t ) : -1;
         SYNC();
       }
       if( timdCu )
@@ -1863,7 +1896,7 @@ void main()
     // the filtered in s_tmp. A TIMD blend, which can fuse, keeps the unfiltered ones in s_ref[0], its planar
     // predictions read the filtered ones in s_tmp (planarRef)
     const bool timdBlend = WITH_TIMD && ( t.derive & DERIVE_TIMD ) != 0 && s_blendNum != 0;
-    const int  blendCus  = DERIVE_DIMD | DERIVE_OBIC | DERIVE_MERGE | DERIVE_CCP_DIMD;
+    const int  blendCus  = DERIVE_DIMD | DERIVE_OBIC | DERIVE_MERGE | DERIVE_CCP_DIMD | ( WITH_MPM ? DERIVE_SGPM : 0 );
     const bool blend     = ( WITH_DIMD && ( t.derive & blendCus ) != 0 && s_blendNum != 0 ) || timdBlend;
     if( t.refFilter != 0 || blend )   // xFilterReferenceSamples (multiRefIdx 0): in place, or for blending beside them
     {
@@ -2417,7 +2450,8 @@ void main()
       const bool needClipVer = wVer + rangeVer > clipVer || wVer - rangeVer < 0;
       const bool needClipHor = wHor + rangeHor > clipHor || wHor - rangeHor < 0;
       CBufI32 acc = CBufI32( P.scratch );
-      const int rounding = ccpDimd ? 1 : 0;   // (CCP merge fusion with DIMD chroma: (2 P0 + 2 P1 + 2) >> 2)
+      // (CCP merge fusion with DIMD chroma: (2 P0 + 2 P1 + 2) >> 2; SGPM: ( w P0 + ( 32 - w ) P1 + 16 ) >> 5)
+      const int rounding = ccpDimd ? 1 : WITH_MPM && ( t.derive & DERIVE_SGPM ) != 0 ? 16 : 0;
       for( int i = lid; i < N; i += NT )
       {
         const int x = i % W, y = i / W, o = int( gl_WorkGroupID.x ) * BLEND_ACC + i;
@@ -2565,8 +2599,9 @@ void main()
         }
       }
     }
-    // ----- an NN block whose transforms depend on its prediction (DERIVE_PNN_DIMD), an EIP block (DERIVE_EIP), a TIMD,
-    // DIMD or OBIC block with a prediction from a block vector (g_bvTransform): the mode of a DIMD of the prediction
+    // ----- an NN block whose transforms depend on its prediction (DERIVE_PNN_DIMD), an EIP block (DERIVE_EIP), an SGPM
+    // block (DERIVE_SGPM, whose CU keeps the DIMD in any case), a TIMD, DIMD or OBIC block with a prediction from a
+    // block vector (g_bvTransform): the mode of a DIMD of the prediction
     // kept in s_spPred, filtered (xPredIntraPnn's / DecCu's deriveIpmForTransform, as mipTransformMode derives a MIP
     // block's) - an EIP CU's mode, which chroma DM reads -, the transforms where they depend on it (LFNST / NSPT by the
     // lfnstSecFlag rule where it applies), then the residual and the reconstruction (sign prediction's below where the
@@ -2595,7 +2630,11 @@ void main()
       }
       if( ( t.derive & DERIVE_TRANSFORM ) != 0 )   // (an EIP block's may not depend on the mode)
       {
-        selectTransform( t, s_predDimdMode, 0 );
+        // (an SGPM block's: explicit MTS by its partition's angle, LFNST / NSPT by sgpmTransformModes' rule)
+        const bool  sgpm      = WITH_MPM && ( t.derive & DERIVE_SGPM ) != 0;
+        const ivec2 sgpmModes = sgpm ? sgpmTransformModes( t ) : ivec2( 0 );
+        g_secMode = sgpm ? sgpmModes.y : g_secMode;
+        selectTransform( t, sgpm ? sgpmModes.x : s_predDimdMode, 0 );
         if( pc.verify != 0 && lid == 0 )
         {
           storeDbgTransforms( t );

@@ -368,7 +368,7 @@ void dependencies( int comp )
   if( ( t.derive & DERIVE_NODE ) != 0 )   // a CU's mode: the derived modes it reads, from those CUs' nodes
   {
     const Cu c = BufCu( P.cus ).v[t.cu];
-    if( c.kind == CU_MPM || c.kind == CU_TIMD || c.kind == CU_TMRL )
+    if( c.kind == CU_MPM || c.kind == CU_TIMD || c.kind == CU_TMRL || c.kind == CU_SGPM )
     {
       for( int k = 0; k < MPM_NEIGHBOURS; k++ )
       {
@@ -381,6 +381,15 @@ void dependencies( int comp )
     else if( c.lumaCu >= 0 )
     {
       addModeDep( c.lumaCu );
+    }
+    // SGPM: the CUs its partitions' lists read (its template: below)
+    for( int k = 0; c.sgpm >= 0 && k < 5; k++ )
+    {
+      const int n = BufI32( P.timdData ).v[c.sgpm + SGPM_HEAD_NBR + k];
+      if( n >= 0 )
+      {
+        addModeDep( n );
+      }
     }
     for( int k = 0; c.obic >= 0 && k < OBIC_NBRS; k++ )   // OBIC: the modes of its neighbours
     {
@@ -431,6 +440,11 @@ void dependencies( int comp )
           addDep( td.v[BufCu( P.cus ).v[n].timd + TIMD_HEAD_BLOCK] );
         }
       }
+    }
+    if( c.sgpm >= 0 )   // SGPM: its one-sample template (whose reference line TIMD's thicker one does not cover)
+    {
+      BufI32 td = BufI32( P.timdData );
+      addTemplateDeps( c, td.v[c.sgpm + SGPM_HEAD_T], td.v[c.sgpm + SGPM_HEAD_T + 1] );
     }
     // EIP (intra_eip.glsl): its reference area (its model's samples, the clipping range), an EIP merge CU's sources'
     // models (their nodes)

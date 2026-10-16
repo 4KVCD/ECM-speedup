@@ -449,7 +449,7 @@ wall-clock gains with threads are "the easy baseline". Decoder status: single-th
 (`--GpuLoopFilter=1`: ALF, SAO, BIF, CCSAO, LF-CCCM, offset refinement on Vulkan). The user then asked for **a full
 GPU decoder in Vulkan, optimized until nothing is left** ("The GPU decoder needs to fully decode the frame on the
 GPU"; "Your first Vulkan version is going to be slow. That's OK"). That work is branch `dec-gpurecon`: intra
-reconstruction on the GPU (`--GpuRecon`), tool levels M1-M65 done and verified bit-exact (M19: DIMD, M20: OBIC, M21:
+reconstruction on the GPU (`--GpuRecon`), tool levels M1-M66 done and verified bit-exact (M19: DIMD, M20: OBIC, M21:
 intra merge, M22: the transforms of DIMD CUs, M23: LFNST of MIP, M24: TIMD, M25: OBIC and intra merge with TIMD
 neighbours, M26: TIMD-SAD, M27: OBIC and intra merge with TIMD-SAD neighbours, M28: TIMD merge, M29: TMRL of luma,
 M30: chroma TMRL, M31: CCLM, M32: LFNST / NSPT of CCLM, M33: GLM's gradient patterns, M34: CCCM, M35: GL-CCCM, M36:
@@ -460,7 +460,7 @@ merge adjustment, M50 / M51: decoder-derived CCP fusion, its merge fusion, M52: 
 model, M53 / M54: CCP merge and decoder-derived fusion with LFNST / NSPT, M55: PDP, M56: NN intra prediction, M57: the
 MPM lists of MPM sorting, MDIP and PDP, M58: EIP, M59-M61: block vectors - TIMD, DIMD and OBIC with vectors, M62:
 IntraTMP's search, without LIC / fusion / FLM / sub-sample vectors / OBMC, M63: EIP with a vector, M64: intra
-merge with vectors, M65: BVG-DIMD); it is
+merge with vectors, M65: BVG-DIMD, M66: SGPM without vectors or regression); it is
 **not yet faster than the CPU
 decoder** (see section 8) and supports only a restricted tool set (all real CTC streams fall back to the CPU, first
 reason: chroma reordering / DBV; BVG-CCCM CUs are rejected per block).
@@ -1708,6 +1708,28 @@ ECM_GPU_PIPELINE_CACHE=<dir>: each pipeline's VkPipelineCache data in a file of 
 of its SPIR-V, specialization and the device's pipelineCacheUUID), written where it was compiled, loaded later (the
 MPM pipeline: 122 s cold, 0.0 s from its file of ~4 MB). precompile.py and partial.py set it to runs/pipecache;
 precompile.py trims that to 30 GB, oldest first. Point the regressions there too.
+M66: SGPM (spatial GPM, JVET-AB0155 with JVET-AJ0107's 26 partitions), its CUs without vector candidates or regression
+SGPM, up to 1024 samples. An SGPM CU (CU_SGPM) records its DIMD, its MPM neighbours and a TIMD record (deriveTimdMode
+with bHorVer alone reads the MPM list), the five CUs getSgpmIntraMPMs reads with their kinds (an intra CU's mode as
+getIntraDirLuma gives it, an inter or IBC CU's motion-field mode), its list index (less the 4 regression entries where
+the CU allows them), its size's partition weights and its one-sample template (addSgpmRecord; sgpmTables in the
+transform tables, TR_TAB_SGPM). Its node runs timdNode's first batch only (the MPM list's angular modes, HOR, VER; no
+wide angles beyond) and takes timdHor / timdVer from the arm costs (sgpmTimdModes), then intra_sgpm.glsl's sgpmNode:
+the 52 parts' lists, every named mode's template differences (predTimdIntraAng with SGPM's wide angles: getWideAngleExt
+with bSgpm, one step further), each mode's SAD and each list entry's SAD weighted by its partition (sgpmSadTM), the 234
+pairs' costs in integers (the CPU's doubles are exact) and the pair of the CU's rank (ascending, the CPU's order among
+equal costs). It writes the partition and modes into DimdOut (DIMD_OUT_SGPM_*), the first mode as the CU's and the
+partition's angle into a record of its own for the MPM lists after it (CU_SGPM_MPM: getSpatialIpm reads the angle).
+Its luma block (DERIVE_SGPM) blends both modes' predictions in intra_rec's blending, weighted per sample by the
+partition (emitPred, g_sgpmWeights; (sum + 16) >> 5), keeps the blend for a DIMD of it (DIMD_OUT_SGPM_PRED) and takes
+explicit MTS by the partition's angle, LFNST / NSPT by getFinalIntraModeForTransform's SGPM rule (JVET-AK0222). OBIC
+counts an SGPM neighbour's two modes, intra merge reads one's DIMD. The dependencies add the CUs its lists read and
+its template, whose reference line TIMD's thicker template does not cover. SPIR-V: 3.19M / 4.01M IDs (the CCP-LFNST
+module ~180k under the limit). Results (grW1): every regular stream identical but the known CCP merge blocks; 1643 SGPM
+CUs on the GPU, the intra CUs from the CPU 19093 -> 17265; the full regression (444 streams, 1565 pictures verified,
+8 skipped) clean with M64-M66. Remaining SGPM: with vector candidates 2056 (the list's
+m_sgpmMvBasedMergeCandidates), with a block vector 1096, regression 795. A full precompile of the 63 pipelines takes
+~26 min after a shader change (14 at a time, 225-480 s each).
 
 ## 8. Numbers (i7-10700 8C/16T, Win11, GCC 16.2, RTX 3070 driver 616.92)
 
@@ -1754,7 +1776,8 @@ Profile of a GPU-on decode (non-LTO, m2_park16, share of all samples): parsing ~
    prediction, M57 the MPM lists of MPM sorting, MDIP and PDP, TIMD / TMRL on the regular streams, M58 EIP, M59-M61
    block vectors: TIMD, DIMD and OBIC with vectors, the scheduler's prefix waits (partial verification of the regular
    streams), M62 IntraTMP's search (its plain CUs; LIC, sub-sample vectors and OBMC need inter's LIC, interpolation
-   and OBMC, fusion and FLM their models), M63 EIP with a vector, M64 intra merge with vectors, M65 BVG-DIMD.
+   and OBMC, fusion and FLM their models), M63 EIP with a vector, M64 intra merge with vectors, M65 BVG-DIMD, M66
+   SGPM (its CUs without vector candidates or regression, up to 1024 samples).
    All 19 regular streams now stop at "chroma reordering / DBV" (the next sequence-level check; the block-level tools
    of step 4 follow; BVG-CCCM needs IntraTMP / IBC first).
 3. Make the GPU path win on CPU time per picture: the derive-only pass (record during parsing or a leaner pass;

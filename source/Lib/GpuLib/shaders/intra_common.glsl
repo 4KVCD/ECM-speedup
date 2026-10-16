@@ -252,6 +252,9 @@ const int DERIVE_TMP = 33554432;
 // with DERIVE_DIMD, a BVG-DIMD CU's luma block (intra_bvg.glsl): its blend's planar prediction the fusion of its node's
 // vectors, its blend modes without PDP and with the longest taps (not DIMD's by weight), no bilateral filter
 const int DERIVE_BVG = 67108864;
+// an SGPM CU's luma block (intra_sgpm.glsl): the predictions of its node's two modes blended by the weights of the
+// partition its node chose; its transforms by a DIMD of that blend (with the partition's angle and the two modes)
+const int DERIVE_SGPM = 134217728;
 
 // a CU's block vectors as the lists of later CUs take them (Params::bvOut per luma CU, by its index in the
 // CodingStructure: getNeighBv's vectors of the CU in its order, which getArBvMergeCandidate cascades), written by the
@@ -271,7 +274,7 @@ const int DBG_PARAMS = 17;
 // the non-adjacent ones
 const int MPM_NEIGHBOURS = 23;
 
-// a coding unit of one channel type whose blocks were recorded (50 int32, layout shared with GpuIntraRec.cpp)
+// a coding unit of one channel type whose blocks were recorded (52 int32, layout shared with GpuIntraRec.cpp)
 struct Cu
 {
   int kind;              // CU_*: how its intra mode is found
@@ -302,6 +305,7 @@ struct Cu
   // they may have some: the offset in Params::timdData of its list's record (intra_bv.glsl's BV_LIST_*), else -1
   int bvList;
   int tmp;               // an IntraTMP CU's record in Params::timdData (intra_tmp.glsl's TMP_HEAD_*; -1: not IntraTMP)
+  int sgpm;              // an SGPM CU's record in Params::timdData (SGPM_HEAD_*; -1: not SGPM)
 };
 layout( buffer_reference, std430, buffer_reference_align = 4 ) buffer BufCu { Cu v[]; };
 
@@ -328,6 +332,12 @@ const int CU_TMP         = 13;  // luma: an IntraTMP CU (intra_tmp.glsl): its no
                                 // read planar), its block the copy at the one its index selects
 const int CU_BVG         = 14;  // luma: a BVG-DIMD CU (intra_bvg.glsl): its node IntraTMP's search, the DIMD at the
                                 // vectors it finds, its blend; its block the blend with their fusion as planar
+const int CU_SGPM        = 15;  // luma: an SGPM CU (intra_sgpm.glsl): its node its DIMD, TIMD's best horizontal and
+                                // vertical modes, its list of partitions and mode pairs by template costs; its block
+                                // the two modes' predictions blended by the partition's weights (chroma DM reads its
+                                // first mode)
+const int CU_SGPM_MPM    = 16;  // luma: what the MPM lists read of an SGPM CU (getSpatialIpm: its partition's angle),
+                                // which that CU's node writes; derives nothing itself
 
 // a TMRL CU's choice as its node derives it (TMRL_OUT int32 per TMRL CU in Params::tmrlOut): the mode (131-mode set)
 // and the reference line (multiRefIdx) of m_tmrlList[tmrlListIdx], which its blocks predict with
@@ -397,7 +407,9 @@ layout( buffer_reference, std430, buffer_reference_align = 4 ) buffer BufDimdCal
 // their modes (reorderIntraMergeCand: isBvDimdExt as bits by part - its candidate's main mode, planar, blend modes -,
 // bvDimdExt). A BVG-DIMD CU's blend in DIMD's fields (bvgDimdMode, bvgDimdFusionWeight: its first mode, planar's
 // weight, its second mode as the first blend mode; bvgDimdMode[1] as the second), its vectors in place of intra
-// merge's (bvDimdNum, bvDimdList, bvDimdWeight)
+// merge's (bvDimdNum, bvDimdList, bvDimdWeight). An SGPM CU's DIMD in the DIMD fields, then its node's choice
+// (sgpmSplitDir, sgpmMode0, sgpmMode1), TIMD's best horizontal and vertical modes (timdHor, timdVer: 131-mode set) and
+// its block's DIMD of its prediction (dimdDerivedIntraDir, dimdDerivedIntraDir2nd)
 const int DIMD_OUT             = 43;
 const int DIMD_OUT_PARAMS      = 24;
 const int DIMD_OUT_MODE        = 0;
@@ -419,7 +431,20 @@ const int DIMD_OUT_EXT_BV      = 33;   // their vectors (8, bvPack)
 const int DIMD_OUT_BVG_NUM     = 32;   // a BVG-DIMD CU's number of vectors,
 const int DIMD_OUT_BVG_BV      = 33;   // its vectors (5, bvPack; 0 past the number)
 const int DIMD_OUT_BVG_WEIGHT  = 38;   // and their fusion weights (5)
+const int DIMD_OUT_SGPM_SPLIT  = 32;   // an SGPM CU's partition (its index in g_sgpmSplitDir),
+const int DIMD_OUT_SGPM_MODE   = 33;   // its two modes,
+const int DIMD_OUT_SGPM_TIMD   = 35;   // TIMD's two modes,
+const int DIMD_OUT_SGPM_PRED   = 37;   // its block's two DIMD modes
 const int MTSS_CALLS           = 3;    // the histograms of MTSS's mode list (deriveDimdModeList: left, above, above-left)
+
+// an SGPM CU's record in Params::timdData (Cu::sgpm; layout shared with GpuIntraRec.cpp's addSgpmRecord): the index of
+// its list's entry (sgpmIdx, less the regression entries where the CU allows them) and its length, the CUs its
+// partitions' mode lists read at getSgpmIntraMPMs' five positions (left, above, above-left, above-right, below-left:
+// records of the mode getIntraDirLuma gives, -1 for none) with each one's kind as 2 bits (1 intra, 2 inter or IBC), the
+// record the MPM lists read of it (CU_SGPM_MPM), the offsets in matrices of its size's partition weights (the
+// template's, the block's), then its template (one sample thick) as TemplateUnits with its units' availability bits
+const int SGPM_HEAD_IDX = 0, SGPM_HEAD_NUM = 1, SGPM_HEAD_NBR = 2, SGPM_HEAD_NBR_KIND = 7, SGPM_HEAD_VIEW = 8;
+const int SGPM_HEAD_WEIGHTS = 9, SGPM_HEAD_T = 11;
 
 // a neighbour of an OBIC CU whose mode its histogram counts (layout shared with GpuIntraRec.cpp, OBIC_NBRS per OBIC CU
 // in Params::obicNbrs; IntraPrediction::obicNeighbours): its record (-1: none) and the samples it counts
@@ -592,7 +617,8 @@ const int TR_TAB_LFNST_LAYOUT = 9;    // [3 region sizes][2 transposed]: the off
 const int TR_TAB_EXT_MODES    = 10;   // value: NUM_EXT_LUMA_MODE
 const int TR_TAB_SET_ROW      = 11;   // value: the length of g_aucTrSet's rows
 const int TR_TAB_IDTR         = 12;   // value: the identity transform's type (IDTR)
-const int TR_TAB_NUM          = 13;
+const int TR_TAB_SGPM         = 13;   // SGPM's tables (intra_sgpm.glsl's SGPM_TAB_*; not a transform's, but read alike)
+const int TR_TAB_NUM          = 14;
 const int TR_DCT2             = 0;    // DCT-II's transform type (TransType)
 
 // the NSPT shapes (w x h) of TR_TAB_NSPT_MATRIX
