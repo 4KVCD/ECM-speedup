@@ -435,6 +435,7 @@ const int DIMD_OUT_BV_FLAG     = 30;   // a DIMD, OBIC or intra merge CU's isBvD
 const int DIMD_OUT_BV          = 31;   // and its bvDimd (bvPack)
 const int DIMD_OUT_TMP_NUM     = 1;    // an IntraTMP CU's number of vectors found,
 const int DIMD_OUT_TMP_BV      = 2;    // then its list's MTMP_NUM vectors (bvPack)
+const int DIMD_OUT_TMP_MV      = 32;   // and its block's vector in 1/16 samples (pu.mv[0]: a sub-sample one's), x, y
 const int DIMD_OUT_EXT_FLAGS   = 32;   // an intra merge CU's parts predicted from vectors (bit by part),
 const int DIMD_OUT_EXT_BV      = 33;   // their vectors (8, bvPack)
 const int DIMD_OUT_BVG_NUM     = 32;   // a BVG-DIMD CU's number of vectors,

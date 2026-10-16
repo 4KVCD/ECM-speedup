@@ -202,7 +202,7 @@ int sgpmCopyAt( Cu c, int k, int s, int bitDepth, int before )
   const bool top = s < c.w;
   const int  v   = ibcPredict( c.x, c.y, top ? c.w : 1, top ? 1 : c.h,
                                sgpmMvAt( k ) + ( top ? ivec2( 0, -16 ) : ivec2( -16, 0 ) ), true, top ? s : 0,
-                               top ? 0 : s - c.w, before, bitDepth );
+                               top ? 0 : s - c.w, before, bitDepth, ivec2( 0 ) );
   return sgpmLic( v, int( s_spCost[SG_LIC + k] ), ( 1 << bitDepth ) - 1 );
 }
 

@@ -431,6 +431,7 @@ constexpr int DIMD_OUT_BV_FLAG     = 30;
 constexpr int DIMD_OUT_BV          = 31;
 constexpr int DIMD_OUT_TMP_NUM     = 1;    // an IntraTMP CU's number of vectors found, then its list's MTMP_NUM
 constexpr int DIMD_OUT_TMP_BV      = 2;
+constexpr int DIMD_OUT_TMP_MV      = 32;   // and its block's vector in 1/16 samples (pu.mv[0]), x, y
 constexpr int DIMD_OUT_EXT_FLAGS   = 32;   // an intra merge CU's parts predicted from vectors (isBvDimdExt by bit),
 constexpr int DIMD_OUT_EXT_BV      = 33;   // their vectors (bvDimdExt, 8)
 constexpr int DIMD_OUT_BVG_NUM     = 32;   // a BVG-DIMD CU's (its blend in the DIMD fields) bvDimdNum,
@@ -3785,14 +3786,16 @@ static int32_t eipIndexOf( GpuIntraRec::Impl& m, const CodingUnit& cu )
 // an IntraTMP CU's record in Params::timdData (Cu::tmp; intra_tmp.glsl's TMP_HEAD_*, layout shared), also an EIP
 // CU's with a vector (the sparse search alone), a BVG-DIMD CU's (TMP_HEAD_SEARCH: what the search is for)
 constexpr int TMP_HEAD_REGIONS = 8;
-constexpr int TMP_HEAD         = TMP_HEAD_REGIONS + 24;
+constexpr int TMP_HEAD_FRAC    = TMP_HEAD_REGIONS + 24;   // tmpFracIdx (its block's vector from the sub-sample search)
+constexpr int TMP_HEAD         = TMP_HEAD_FRAC + 1;
 constexpr int TMP_SEARCH_FULL = 0, TMP_SEARCH_BEST = 1, TMP_SEARCH_BVG = 2;
 
 #if GPU_TMP
 // an IntraTMP CU's record (Cu::tmp): its template, its index, the SPS's sampling and LIC mode, needTopLeft and the
 // length of the refined list (searchCandidateFromOnePicIntra), whether the CTU is above 128, then per region the
-// bounds of its vectors (clipMvIntraConstraint, which sortInOut repeats; relative to the CU). False with why set where
-// the GPU lacks what the CU needs: LIC, fusion, FLM, a sub-sample vector (tmpFracIdx), no template (DC instead), more
+// bounds of its vectors (clipMvIntraConstraint, which sortInOut repeats; relative to the CU), tmpFracIdx (its block at
+// the sub-sample search's vector). False with why set where the GPU lacks what the CU needs: LIC, fusion, FLM, no
+// template (DC instead), more
 // samples than intra_rec's prediction buffer, no DIMD (the transforms' mode of its prediction), OBMC
 static void tmpSearchRecord( GpuIntraRec::Impl& m, const CodingUnit& cu, Cu& c, int search );
 static bool addTmpRecord( GpuIntraRec::Impl& m, const CodingUnit& cu, Cu& c, const char*& why )
@@ -3800,7 +3803,7 @@ static bool addTmpRecord( GpuIntraRec::Impl& m, const CodingUnit& cu, Cu& c, con
   const SPS& sps = *cu.cs->sps;
   why = cu.tmpLicFlag ? ( cu.tmpFusionFlag ? "IntraTMP (LIC, fusion)" : "IntraTMP (LIC)" )
         : cu.tmpFusionFlag ? "IntraTMP (fusion)" : cu.tmpFlmFlag ? "IntraTMP (FLM)"
-        : cu.tmpFracIdx != 0 ? "IntraTMP (sub-sample)" : cu.tempType == NO_TEMPLATE ? "IntraTMP without a template"
+        : cu.tempType == NO_TEMPLATE ? "IntraTMP without a template"
         : cu.lwidth() * cu.lheight() > 32 * 32 ? "IntraTMP above 1024 samples"
         : !sps.getUseDimd() ? "IntraTMP without DIMD" : nullptr;
 #if JVET_AK0076_EXTENDED_OBMC_IBC
@@ -3867,6 +3870,7 @@ static void tmpSearchRecord( GpuIntraRec::Impl& m, const CodingUnit& cu, Cu& c, 
     h[TMP_HEAD_REGIONS + 4 * r + 2] = verMin - y;
     h[TMP_HEAD_REGIONS + 4 * r + 3] = verMax - y;
   }
+  h[TMP_HEAD_FRAC] = search == TMP_SEARCH_FULL && cu.tmpFracIdx != 0 ? 1 : 0;
   c.tmp = (int32_t) m.timdData.size();
   m.timdData.insert( m.timdData.end(), h, h + TMP_HEAD );
   m.blendBlocks = true;   // (its node's lists take the workgroup's scratch)
@@ -4321,7 +4325,9 @@ static int32_t cuRecord( GpuIntraRec::Impl& m, const TransformUnit& tu, const Co
     {
       d[DIMD_OUT_TMP_BV + i] = bvPack( cu.tmpXYdisp[i] );
     }
-    d[DIMD_OUT_TR_SECOND] = cu.dimdDerivedIntraDir2nd;
+    d[DIMD_OUT_TMP_MV]     = cu.firstPU->mv[0].hor;   // (a sub-sample vector's: generateTMPrediction)
+    d[DIMD_OUT_TMP_MV + 1] = cu.firstPU->mv[0].ver;
+    d[DIMD_OUT_TR_SECOND]  = cu.dimdDerivedIntraDir2nd;
   }
   else if( c.kind == CU_BVG )   // its blend in DIMD's layout as its node writes it (deriveIntraMergeCand's conversion:
   {                             // planar's weight, the second mode as the first blend mode), its vectors, their weights
@@ -7017,6 +7023,7 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
                                   || ( k >= DIMD_OUT_MTSS_LIST && k < DIMD_OUT_BV_FLAG && c.mtss >= 0 )
                             : k >= DIMD_OUT_EXT_FLAGS ? ( c.kind == CU_MERGE && k < DIMD_OUT_EXT_BV + 8 )
                                                         || ( c.kind == CU_SGPM && k < DIMD_OUT_SGPM_END )
+                                                        || ( tmp && k < DIMD_OUT_TMP_MV + 2 )
                             : k >= DIMD_OUT_BV_FLAG ? vector || ( eipBv && k == DIMD_OUT_BV )
                             : tmp ? k < DIMD_OUT_TMP_BV + MTMP_NUM || k == DIMD_OUT_TR_SECOND
                                     || ( k >= DIMD_OUT_MTSS_LIST && c.mtss >= 0 )
@@ -7062,6 +7069,8 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
                             : eipDimd && k == 0 ? "eipDimdMode" : eipDimd && k == DIMD_OUT_TR_SECOND ? "eipDimdMode2nd"
                             : eipBv && k == DIMD_OUT_BV ? "pu.bv of EIP (packed)"
                             : tmp && k == 0 ? "intraTmpDimdMode"
+                            : tmp && k == DIMD_OUT_TMP_MV ? "IntraTMP's mv hor"
+                            : tmp && k > DIMD_OUT_TMP_MV ? "IntraTMP's mv ver"
                             : mipDimd && k == 0 ? "mipDimdMode"
                             : ( mipDimd || tmp ) && k == DIMD_OUT_TR_SECOND ? "dimdDerivedIntraDir2nd"
                             : chroma ? ( k == 0 ? "dimdChromaMode" : "dimdChromaModeSecond" )

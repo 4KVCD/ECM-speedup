@@ -2121,7 +2121,7 @@ void main()
           const int x = t.x + i % W, y = t.y + i / W;
           const int v = fused ? bvgFusionSample( t.cu, x, y )
                               : sgpmLic( ibcPredict( c.x, c.y, c.w, c.h, mv, false, x - c.x, y - c.y, g_ti,
-                                                     t.bitDepth ), lic, maxPel );
+                                                     t.bitDepth, ivec2( 0 ) ), lic, maxPel );
           emitPred( t, i % W, i / W, v, bf );
         }
       }

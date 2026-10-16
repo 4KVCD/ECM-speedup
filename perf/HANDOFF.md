@@ -449,7 +449,7 @@ wall-clock gains with threads are "the easy baseline". Decoder status: single-th
 (`--GpuLoopFilter=1`: ALF, SAO, BIF, CCSAO, LF-CCCM, offset refinement on Vulkan). The user then asked for **a full
 GPU decoder in Vulkan, optimized until nothing is left** ("The GPU decoder needs to fully decode the frame on the
 GPU"; "Your first Vulkan version is going to be slow. That's OK"). That work is branch `dec-gpurecon`: intra
-reconstruction on the GPU (`--GpuRecon`), tool levels M1-M68 done and verified bit-exact (M19: DIMD, M20: OBIC, M21:
+reconstruction on the GPU (`--GpuRecon`), tool levels M1-M69 done and verified bit-exact (M19: DIMD, M20: OBIC, M21:
 intra merge, M22: the transforms of DIMD CUs, M23: LFNST of MIP, M24: TIMD, M25: OBIC and intra merge with TIMD
 neighbours, M26: TIMD-SAD, M27: OBIC and intra merge with TIMD-SAD neighbours, M28: TIMD merge, M29: TMRL of luma,
 M30: chroma TMRL, M31: CCLM, M32: LFNST / NSPT of CCLM, M33: GLM's gradient patterns, M34: CCCM, M35: GL-CCCM, M36:
@@ -461,7 +461,7 @@ model, M53 / M54: CCP merge and decoder-derived fusion with LFNST / NSPT, M55: P
 MPM lists of MPM sorting, MDIP and PDP, M58: EIP, M59-M61: block vectors - TIMD, DIMD and OBIC with vectors, M62:
 IntraTMP's search, without LIC / fusion / FLM / sub-sample vectors / OBMC, M63: EIP with a vector, M64: intra
 merge with vectors, M65: BVG-DIMD, M66: SGPM without vectors or regression, M67: SGPM's integer vectors with
-their LIC models, M68: IBC's interpolation, SGPM's fractional vectors); it is
+their LIC models, M68: IBC's interpolation, SGPM's fractional vectors, M69: IntraTMP's sub-sample vectors); it is
 **not yet faster than the CPU
 decoder** (see section 8) and supports only a restricted tool set (in ON mode the real CTC streams still fall back to
 the CPU, first reason: chroma reordering / DBV). Partial verification (`perf/gpu/partial.py`, section 7's "Partial
@@ -469,8 +469,8 @@ verification") runs the 19 regular CTC streams with the CUs of missing tools tak
 picture is identical but the known CCP merge blocks (fp720_ai's 3 pictures, ra720's first), and 17265 intra CUs
 still come from the CPU (IntraTMP LIC 4159, intra merge with a neighbour of a missing kind 2586, IntraTMP
 sub-sample vectors 1900, SGPM with vectors 3152 and regression 795, IntraTMP OBMC / fusion / FLM ~2200, ...; plus
-32777 inter / IBC / palette CUs of inter pictures). M67 / M68 (2026-10-16) took SGPM's vectors; next is M69,
-IntraTMP's sub-sample vectors (section 9).
+32777 inter / IBC / palette CUs of inter pictures). M67-M69 (2026-10-16) took SGPM's vectors and IntraTMP's
+sub-sample ones; next is IntraTMP's OBMC (section 9).
 
 ## 1a. Working fast (development time)
 
@@ -1825,6 +1825,26 @@ The padding ran: a debug print in xPredIBCBlkPadding found 4 padded SGPM predict
 two blocks with the 8-tap filter, CUs at 88,128 and 136,24; ld_fourpeople_q37: the two bilinear templates of the CU
 at 232,240); all three CUs were the GPU's in verification (debug print in addSgpmRecord). SPIR-V 3.22M / 4.04M IDs (152k
 left in the CCP-LFNST module). Run verify_all.py on the RTX PC (its 444 streams are not on the Intel PC).
+M69 (2026-10-16): IntraTMP's sub-sample vectors (tmpFracIdx 1, JVET-AM0229's searchFracCandidate). The host's record
+flag TMP_HEAD_FRAC; the node, after its list, runs tmpFracSearch: xPadForFracSearchInterpolation's region around the
+template at the block's vector copied into the workgroup's scratch (TS_FBUF; reads clamped into the picture - the GPU's
+planes have no margin, and an unclamped read 2 rows above the picture lost the device on ai_foreman352_q22 - every
+such sample is replaced by the padding anyway), its five padding steps ported literally (invocation 0), the cost of
+each of the 128 (fracPrecX, fracPrecY, direction) combinations searchFracCandidate's loop takes (one invocation each:
+xTmpFracSearchIF's 4-tap cubic filters of defineFilterTmpSubpel0 / 1, each pass rounded and clipped; calcTemplateDiff's
+cost of the entry's required template - m_mtmpRequiredTemplate, which the merged list now carries in TE_REGION's bits
+8+), the first cheapest (updateCandList keeps the first of equal costs). The block's vector in 1/16 samples goes to
+DimdOut (DIMD_OUT_TMP_MV, compared with pu.mv[0]) and to the record for SGPM's lists (bvStoreSgpm); tmpPredict
+interpolates with ibcPredict over the CU (8 taps) with xPredIBCBlkPadding's deltaX / deltaY: for such a CU the
+padding's region moves by 1 where the vector's integer part is left of / above pu.bv, while the filter still reads
+from the integer part (the function's last line points refBuf back; found with debug prints of the padding's geometry
+- a poison test of the local buffer had changed nothing). Results (Intel PC, 48 streams, build gpu4): every stream
+as before (45 identical, the 2 single-tree ones as at M66, ra_wpp_q32 without an intra picture to verify); over the
+46 streams both runs report, intra CUs from the CPU 2546 -> 2520: "IntraTMP (sub-sample)" 127 -> 0, but most of those
+CUs also have OBMC ("IntraTMP with OBMC" 323 -> 423), so IntraTMP's OBMC is next. ai_crowdrun832_q27 (~3.0 s of GPU
+time per picture on this iGPU, M68 2.96 s) lost the device once in partial.py's lone rerun and verified identical in
+3 of 3 lone runs: Windows' GPU timeout on the heaviest picture, not a fault of the code.
+SPIR-V 3.26M / 4.08M IDs (113k left in the CCP-LFNST module).
 
 
 ## 8. Numbers (i7-10700 8C/16T, Win11, GCC 16.2, RTX 3070 driver 616.92)
@@ -1855,14 +1875,8 @@ Profile of a GPU-on decode (non-LTO, m2_park16, share of all samples): parsing ~
       indicesRepresentationPnn) and ra_nodualtree_q32 (a luma MPM block's prediction, then DIMD chroma's second
       mode). ON mode leaves both to the CPU (identical output). Fix before single tree counts as supported.
    b. Done (2026-10-16): M68, IBC's interpolation (intra_ibc.glsl) and SGPM's fractional vectors.
-   b2. M69: IntraTMP's sub-sample vectors (1900 CUs on the CTC streams): searchFracCandidate (JVET-AM0229: the
-      template around the chosen vector padded by xPadForFracSearchInterpolation, the 4-tap cubic filters of
-      defineFilterTmpSubpel0 / 1 per fracPrecX / fracPrecY and direction, calcTemplateDiff with requiredTemplate,
-      updateCandList; tmpFracIdx 1 takes the cheapest), then the block from ibcPredict at mv = (pX << 4) + distance.
-      Careful: xPredIBCBlkPadding moves its offset by deltaX / deltaY (1 where the vector's integer part is below
-      pu.bv: a negative fraction) for such CUs; read how refBuf then lines up before porting (a poison test of
-      m_cRefSamplesDMVRL0 changed no output, so nothing stale is read). The CU's record gets mv[0] for SGPM
-      (bvStoreSgpm).
+   b2. Done (2026-10-16): M69, IntraTMP's sub-sample vectors.
+   b3. Next: IntraTMP's OBMC (JVET-AK0076: most sub-sample CUs have it too), then c.
    c. IntraTMP's LIC (4159 + 813 with fusion): the LIC model of its template (InterPrediction's LicItmp /
       xLocalIlluComp), then IntraTMP fusion (731), FLM (589), OBMC (919); with them the intra merge CUs held back by
       an IntraTMP neighbour (~950) and most of "an intra merge neighbour of a kind the GPU lacks".
@@ -1897,7 +1911,7 @@ Profile of a GPU-on decode (non-LTO, m2_park16, share of all samples): parsing ~
    streams), M62 IntraTMP's search (its plain CUs; LIC, sub-sample vectors and OBMC need inter's LIC, interpolation
    and OBMC, fusion and FLM their models), M63 EIP with a vector, M64 intra merge with vectors, M65 BVG-DIMD, M66
    SGPM (its CUs without vector candidates or regression, up to 1024 samples). 2026-10-16: M67 SGPM's block vectors
-   and their LIC models, M68 IBC's interpolation and SGPM's fractional vectors.
+   and their LIC models, M68 IBC's interpolation and SGPM's fractional vectors, M69 IntraTMP's sub-sample vectors.
    All 19 regular streams now stop at "chroma reordering / DBV" (the next sequence-level check; the block-level tools
    of step 4 follow; BVG-CCCM needs IntraTMP / IBC first).
 3. Make the GPU path win on CPU time per picture: the derive-only pass (record during parsing or a leaner pass;

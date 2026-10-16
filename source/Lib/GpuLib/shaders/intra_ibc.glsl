@@ -50,12 +50,15 @@ bool ibcAreaValid( int px, int py, int w, int h, ivec2 b, int xTap, int yTap, in
 }
 
 // the reference samples of a region's interpolation: their top-left (the region at the vector's integer part), the
-// region's size, the filter's taps across and down (0: that fraction is 0), whether they are padded
+// region's size, the filter's taps across and down (0: that fraction is 0), whether they are padded, and how far the
+// padding's region lies right of / below that top-left (xPredIBCBlkPadding's deltaX / deltaY: 1 for an IntraTMP CU's
+// sub-sample vector whose integer part is left of / above its integer vector; the filter reads from the top-left
+// still, but the padding takes the region there)
 struct IbcRef
 {
   int  ox, oy, w, h, xTap, yTap;
   bool pad;
-  int  before;
+  int  before, dx, dy;
 };
 
 // reference sample (x, y) of g (relative to its top-left), padded as xPredIBCBlkPadding pads: first per row of the
@@ -67,19 +70,22 @@ int ibcRef( IbcRef g, int x, int y )
   {
     OwnerMap  om = OwnerMap( BufI32( P.owner[0] ), P.ownerW[0], P.ownerH[0], P.unitLog2X[0], P.unitLog2Y[0] );
     const int L  = om.log2X, U = 1 << L;
+    const int rx = g.ox + g.dx, ry = g.oy + g.dy;   // (the padding's region; x, y relative to it from here)
+    x -= g.dx;
+    y -= g.dy;
     // (rows outside the region exist only with yTap: the nearest decoded row towards it, else its edge row)
     const int dir = y < 0 ? 1 : -1;
-    for( ; ( y < 0 || y >= g.h ) && !decodedBefore( om, g.ox + x, g.oy + y, g.before ); y += dir ) {}
+    for( ; ( y < 0 || y >= g.h ) && !decodedBefore( om, rx + x, ry + y, g.before ); y += dir ) {}
     if( y >= 0 && y < g.h )
     {
       // (columns outside it exist only with xTap)
       if( x < 0 )
       {
-        for( int u = ( g.ox >> L ) - 1; ( u << L ) + U - 1 - g.ox >= 1 - ( g.xTap >> 1 ); u-- )
+        for( int u = ( rx >> L ) - 1; ( u << L ) + U - 1 - rx >= 1 - g.dx - ( g.xTap >> 1 ); u-- )
         {
-          if( !decodedBefore( om, u << L, g.oy + y, g.before ) )
+          if( !decodedBefore( om, u << L, ry + y, g.before ) )
           {
-            const int c = ( u << L ) + U - 1 - g.ox;   // (the unit's last column)
+            const int c = ( u << L ) + U - 1 - rx;   // (the unit's last column)
             x = x <= c ? c + 1 : x;
             break;
           }
@@ -87,24 +93,27 @@ int ibcRef( IbcRef g, int x, int y )
       }
       else if( x >= g.w )
       {
-        for( int u = ( ( g.ox + g.w - 1 ) >> L ) + 1; ( u << L ) - ( g.ox + g.w - 1 ) <= ( g.xTap >> 1 ); u++ )
+        for( int u = ( ( rx + g.w - 1 ) >> L ) + 1; ( u << L ) - ( rx + g.w - 1 ) <= ( g.xTap >> 1 ) - g.dx; u++ )
         {
-          if( !decodedBefore( om, u << L, g.oy + y, g.before ) )
+          if( !decodedBefore( om, u << L, ry + y, g.before ) )
           {
-            const int c = ( u << L ) - g.ox;   // (the unit's first column)
+            const int c = ( u << L ) - rx;   // (the unit's first column)
             x = x >= c ? c - 1 : x;
             break;
           }
         }
       }
     }
+    return recoAt( 0, rx + x, ry + y );
   }
   return recoAt( 0, g.ox + x, g.oy + y );
 }
 
 // sample (i, j) of the prediction of the region of w x h at (px, py) at vector mv (1/16 samples) with the luma filter
-// or the bilinear one, for block `before` (one call site per module: ibcRef inlines)
-int ibcPredict( int px, int py, int w, int h, ivec2 mv, bool bilinear, int i, int j, int before, int bitDepth )
+// or the bilinear one, for block `before`; delta: the padding's deltaX / deltaY (IbcRef). (Few call sites: ibcRef
+// inlines.)
+int ibcPredict( int px, int py, int w, int h, ivec2 mv, bool bilinear, int i, int j, int before, int bitDepth,
+                ivec2 delta )
 {
   IbcRef    g;
   const int fx = P.ibcFrac != 0 ? mv.x & 15 : 0, fy = P.ibcFrac != 0 ? mv.y & 15 : 0;
@@ -116,6 +125,8 @@ int ibcPredict( int px, int py, int w, int h, ivec2 mv, bool bilinear, int i, in
   g.xTap   = fx != 0 ? taps : 0;
   g.yTap   = fy != 0 ? taps : 0;
   g.before = before;
+  g.dx     = delta.x;
+  g.dy     = delta.y;
   g.pad    = ( fx != 0 || fy != 0 )
            && !ibcAreaValid( px, py, w, h, ivec2( g.ox - px, g.oy - py ), g.xTap, g.yTap, before );
   // per row of the filter's reach down (one without yTap) the horizontal pass (the sample without xTap), then the

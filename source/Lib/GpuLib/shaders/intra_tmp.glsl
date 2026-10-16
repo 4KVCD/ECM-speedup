@@ -1,15 +1,15 @@
-// IntraTMP's search (IntraPrediction::searchCandidateFromOnePicIntra, JVET-V0130 and the proposals after it): the
-// node of an IntraTMP CU finds the block vectors of its list (MTMP_NUM) as the decoder does - a sparse search of the
-// regions around the CU, the vectors of its neighbours (getItmpMergeCandidate, sortInOut, getArBvMergeCandidate) and
-// those cascaded from the sparse search's best (getSparseArBvMergeCandidate) with windows clustered into the sparse
-// lists, a refinement of each candidate's window, the lists of the top and the left template merged into the
-// L-shaped one's - into its DimdOut (DIMD_OUT_TMP_*), whose entry tmpIdx its block copies. The template costs
-// (calcTemplateDiff) are computed in parallel, in chunks of positions in the CPU's order, and the CPU's lists replayed
-// from them by invocation 0: every test of a cost is "less than a threshold", which the CPU's early ends cannot
-// change. No LIC, fusion, FLM or sub-sample refinement yet (the host keeps such CUs on the CPU). An EIP CU with a
-// vector runs the sparse search alone, for its best (TMP_SEARCH_BEST); a BVG-DIMD CU the sparse search for its best,
-// its neighbours' vectors against it and the refinement of the best one's window (TMP_SEARCH_BVG; intra_bvg.glsl takes
-// the refined list on). Included by intra_rec.comp after intra_bv.glsl.
+// IntraTMP's search (IntraPrediction::searchCandidateFromOnePicIntra, JVET-V0130 and the proposals after it): the node
+// of an IntraTMP CU finds the block vectors of its list (MTMP_NUM) as the decoder does - a sparse search of the regions
+// around the CU, the vectors of its neighbours (getItmpMergeCandidate, sortInOut, getArBvMergeCandidate) and those
+// cascaded from the sparse search's best (getSparseArBvMergeCandidate) with windows clustered into the sparse lists, a
+// refinement of each candidate's window, the lists of the top and the left template merged into the L-shaped one's -
+// into its DimdOut (DIMD_OUT_TMP_*), whose entry tmpIdx its block copies. The template costs (calcTemplateDiff) are
+// computed in parallel, in chunks of positions in the CPU's order, and the CPU's lists replayed from them by invocation
+// 0: every test of a cost is "less than a threshold", which the CPU's early ends cannot change; for tmpFracIdx 1 the
+// sub-sample search (tmpFracSearch). No LIC, fusion, FLM or OBMC yet (the host keeps such CUs on the CPU). An EIP CU
+// with a vector runs the sparse search alone, for its best (TMP_SEARCH_BEST); a BVG-DIMD CU the sparse search for its
+// best, its neighbours' vectors against it and the refinement of the best one's window (TMP_SEARCH_BVG; intra_bvg.glsl
+// takes the refined list on). Included by intra_rec.comp after intra_bv.glsl.
 
 const int TMP_COST_SHIFT    = 3;    // TMP_TEMPLATE_COST_SHIFT: the template row and column next to the block weigh 8
 const int MTMP_NUM          = 19;
@@ -35,7 +35,8 @@ const int TMP_HEAD_NUM_REFINE = 5;   // mtmpNumRefine[0] (tmpIdx + 1 without nee
 const int TMP_HEAD_BIG_CTU    = 6;   // the CTU is larger than 128 (the clustering's windows)
 const int TMP_HEAD_SEARCH     = 7;   // what the search is for (TMP_SEARCH_*)
 const int TMP_HEAD_REGIONS    = 8;   // per regionId mvXMin, mvXMax, mvYMin, mvYMax (clipMvIntraConstraint), 6 x 4
-const int TMP_HEAD            = TMP_HEAD_REGIONS + 24;
+const int TMP_HEAD_FRAC       = TMP_HEAD_REGIONS + 24;   // tmpFracIdx: its block's vector is the sub-sample search's
+const int TMP_HEAD            = TMP_HEAD_FRAC + 1;
 const int TMP_SEARCH_FULL = 0;   // an IntraTMP CU's list
 const int TMP_SEARCH_BEST = 1;   // an EIP CU with a vector: the sparse search's best alone (mtmpNumSparse 1)
 const int TMP_SEARCH_BVG  = 2;   // a BVG-DIMD CU's (JVET-AL0108): MAX_BVG_ROUGH_NUM 1, its own refinement
@@ -207,6 +208,230 @@ ivec4 tmpRegion( int head, int r )
   BufI32    data = BufI32( P.timdData );
   const int at   = head + TMP_HEAD_REGIONS + 4 * r;
   return ivec4( data.v[at], data.v[at + 1], data.v[at + 2], data.v[at + 3] );
+}
+
+// ----- the sub-sample search (JVET-AM0229's searchFracCandidate, for tmpFracIdx 1)
+
+const int TMP_PAD        = 2;                     // TMP_SUBPEL_PAD_NUM
+const int TS_FRAC_REQ    = TS_WIN + 4;            // the block vector's required template (m_mtmpRequiredTemplate)
+const int TS_FBUF        = 4096;                  // the padded template region at that vector (row-major)
+const int TS_FCOST       = TS_FBUF + 72 * 72;     // per candidate its cost, -1 where the search skips it
+const int TMP_FRAC_CANDS = 4 * 4 * 8;             // fracPrecX 1..4, fracPrecY 1..4, the 8 directions (TmpSubPelDirType)
+
+// defineFilterTmpSubpel0 / 1's 4-tap cubic filters (getExtIntraCubicFilter) per fracPrec 1..4; the distances in 1/16
+// samples generateTMPrediction moves the vector by per fracPrec
+const ivec4 TMP_SUBPEL0[4] = ivec4[4]( ivec4( -16, 144, 144, -16 ), ivec4( -10, 70, 210, -14 ),
+                                       ivec4( -5, 34, 236, -9 ), ivec4( -14, 107, 179, -16 ) );
+const ivec4 TMP_SUBPEL1[4] = ivec4[4]( ivec4( -16, 144, 144, -16 ), ivec4( -14, 210, 70, -10 ),
+                                       ivec4( -9, 236, 34, -5 ), ivec4( -16, 179, 107, -14 ) );
+const int   TMP_FRAC_DIST[4] = int[4]( 8, 4, 2, 6 );
+
+// the padded region's sample (bx, by) (relative to the template's top-left at the vector; rows of `stride`)
+int  tfGet( int stride, int bx, int by )        { return tsGet( TS_FBUF + ( by + TMP_PAD ) * stride + bx + TMP_PAD ); }
+void tfSet( int stride, int bx, int by, int v ) { tsSet( TS_FBUF + ( by + TMP_PAD ) * stride + bx + TMP_PAD, v ); }
+
+// whether searchFracCandidate's loop takes (fracPrecX fx, fracPrecY fy, direction dir): 3 / 4 in both only the
+// diagonal directions; 1 / 2 in both the straight ones only where equal, without some combinations of 1; others none
+bool tmpFracAllowed( int fx, int fy, int dir )
+{
+  if( fx >= 3 && fy >= 3 )
+  {
+    return dir >= 4;
+  }
+  if( fx > 2 || fy > 2 )
+  {
+    return false;
+  }
+  const bool skip = ( fx == 1 && fy == 1 && ( dir == 1 || dir == 3 ) ) || ( fy == 1 && dir == 6 )
+                    || ( ( fx == 1 || fy == 1 ) && dir == 7 ) || ( fx == 1 && dir == 5 );
+  return !skip && ( fx == fy || dir >= 4 );
+}
+
+// sample (bx, by) of the template predicted at candidate (fx, fy, dir) (xTmpFracSearchIF): the 4-tap filter across
+// (left / right: the taps from 2 / 1 samples before), down (above / below), or across then down for a diagonal
+// direction, each pass rounded to the sample and clipped (m_filterHor / m_filterVer with isFirst and isLast)
+int tmpFracSample( int stride, int fx, int fy, int dir, int bx, int by, int maxPel )
+{
+  if( dir < 4 )   // (left, right, above, below: fracPrecX's filter)
+  {
+    const bool  first = dir == 0 || dir == 2, hor = dir < 2;
+    const ivec4 p     = first ? TMP_SUBPEL0[fx - 1] : TMP_SUBPEL1[fx - 1];
+    int         sum   = 0;
+    for( int k = 0; k < 4; k++ )
+    {
+      const int o = ( first ? -2 : -1 ) + k;
+      sum += p[k] * tfGet( stride, hor ? bx + o : bx, hor ? by : by + o );
+    }
+    return clamp( ( sum + 128 ) >> 8, 0, maxPel );
+  }
+  const bool  left = dir == 4 || dir == 6, above = dir == 4 || dir == 5;
+  const ivec4 ph   = left ? TMP_SUBPEL0[fx - 1] : TMP_SUBPEL1[fx - 1];
+  const ivec4 pv   = above ? TMP_SUBPEL0[fy - 1] : TMP_SUBPEL1[fy - 1];
+  int         sum  = 0;
+  for( int k = 0; k < 4; k++ )
+  {
+    int row = 0;
+    for( int m = 0; m < 4; m++ )
+    {
+      row += ph[m] * tfGet( stride, bx + ( left ? -2 : -1 ) + m, by + ( above ? -2 : -1 ) + k );
+    }
+    sum += pv[k] * clamp( ( row + 128 ) >> 8, 0, maxPel );
+  }
+  return clamp( ( sum + 128 ) >> 8, 0, maxPel );
+}
+
+// calcTemplateDiff's cost of candidate n that required template req takes (tmpCosts' weighted one, the L-shape's top
+// part or its left part) of the template predicted there against CU c's
+int tmpFracCost( Cu c, int tempType, int req, int stride, int n, int maxPel )
+{
+  const int fx = 1 + n / 32, fy = 1 + ( n / 8 ) % 4, dir = n % 8;
+  const int extW = tempType != TMP_ABOVE ? TMP_TEMPLATE_SIZE : 0, extH = tempType != TMP_LEFT ? TMP_TEMPLATE_SIZE : 0;
+  int       sum = 0, top = 0, left = 0;
+  if( tempType != TMP_LEFT && req != 2 )   // the rows above (with the corner for the L-shape's whole)
+  {
+    const int x0 = tempType == TMP_L_SHAPE && req == 0 ? -TMP_TEMPLATE_SIZE : 0;
+    for( int y = -TMP_TEMPLATE_SIZE; y < 0; y++ )
+    {
+      int corner = 0, row = 0;
+      for( int x = x0; x < c.w; x++ )
+      {
+        const int p = tmpFracSample( stride, fx, fy, dir, x + extW, y + extH, maxPel );
+        const int d = abs( p - recoAt( 0, c.x + x, c.y + y ) );
+        corner += x < 0 ? d : 0;
+        row    += x < 0 ? 0 : d;
+      }
+      top += row;
+      sum += corner + ( y == -1 ? row << TMP_COST_SHIFT : row );
+    }
+  }
+  if( tempType != TMP_ABOVE && req != 1 )   // the columns left
+  {
+    for( int y = 0; y < c.h; y++ )
+    {
+      int row = 0, next = 0;
+      for( int x = -TMP_TEMPLATE_SIZE; x < 0; x++ )
+      {
+        const int p = tmpFracSample( stride, fx, fy, dir, x + extW, y + extH, maxPel );
+        next = abs( p - recoAt( 0, c.x + x, c.y + y ) );   // (x -1 last)
+        row += next;
+      }
+      left += row;
+      sum += row + next * ( ( 1 << TMP_COST_SHIFT ) - 1 );
+    }
+  }
+  return req == 1 ? top : req == 2 ? left : sum;
+}
+
+// the sub-sample search of IntraTMP CU c (all invocations; after its list, with its block's vector in its DimdOut and
+// its required template at TS_FRAC_REQ): xPadForFracSearchInterpolation's region around the template at the vector
+// (the copy, then its padding where units are not decoded, step by step as the CPU pads it), each candidate's cost (one
+// invocation each), the first cheapest (updateCandList keeps the first of equal costs; tmpFracIdx 1 takes the list's
+// first) as the block's vector moved by its distances (DIMD_OUT_TMP_MV), which SGPM's lists take too
+void tmpFracSearch( Cu c, int cuIndex, int tempType, int bitDepth, int lid, int NT )
+{
+  OwnerMap    om   = OwnerMap( BufI32( P.owner[0] ), P.ownerW[0], P.ownerH[0], P.unitLog2X[0], P.unitLog2Y[0] );
+  CBufI32     o    = CBufI32( P.dimdOut );
+  const int   at   = cuIndex * DIMD_OUT, T = TMP_TEMPLATE_SIZE, D = TMP_PAD;
+  const int   extW = tempType != TMP_ABOVE ? T : 0, extH = tempType != TMP_LEFT ? T : 0;
+  const int   eW = c.w + extW, eH = c.h + extH, stride = eW + 2 * D, maxPel = ( 1 << bitDepth ) - 1;
+  const ivec2 bv   = bvUnpack( o.v[at + DIMD_OUT_BV] );
+  const ivec2 pos  = ivec2( c.x + bv.x - extW, c.y + bv.y - extH );
+  const int   req  = tsGet( TS_FRAC_REQ );
+  // the copy: the above template's rows and the left one's columns, D more on each side (clamped into the picture,
+  // which the GPU's planes do not pad: the padding below replaces every sample outside it, as none is decoded)
+  for( int i = lid; i < stride * ( eH + 2 * D ); i += NT )
+  {
+    const int bx = i % stride - D, by = i / stride - D;
+    if( ( tempType != TMP_LEFT && by < T + D ) || ( tempType != TMP_ABOVE && bx < T + D ) )
+    {
+      const int x = clamp( pos.x + bx, 0, P.width[0] - 1 ), y = clamp( pos.y + by, 0, P.height[0] - 1 );
+      tfSet( stride, bx, by, recoAt( 0, x, y ) );
+    }
+  }
+  tsSync();
+  if( lid == 0 )
+  {
+    // the rows above where their first column is not decoded: the row below
+    const int padW = tempType != TMP_LEFT ? eW : T + D;
+    for( int j = -1; j >= -D; j-- )
+    {
+      for( int i = 0; i < padW && !decodedBefore( om, pos.x, pos.y + j, g_ti ); i++ )
+      {
+        tfSet( stride, i, j, tfGet( stride, i, j + 1 ) );
+      }
+    }
+    // the rows below the left template from their first column not decoded: the row above
+    for( int j = eH; j < eH + D && tempType != TMP_ABOVE; j++ )
+    {
+      int i = 0;
+      for( ; i < T + D && decodedBefore( om, pos.x + i, pos.y + j, g_ti ); i++ ) {}
+      for( int k = i; k < T + D; k++ )
+      {
+        tfSet( stride, k, j, tfGet( stride, k, j - 1 ) );
+      }
+    }
+    // the columns left where row 0's is not decoded: from there on the column right, in the template's rows
+    const int padH = tempType == TMP_ABOVE ? T + D : eH;
+    int       i0   = -1;
+    for( ; i0 >= -D && decodedBefore( om, pos.x + i0, pos.y, g_ti ); i0-- ) {}
+    for( int j = 0; j < padH && i0 >= -D; j++ )
+    {
+      for( int k = i0; k >= -D; k-- )
+      {
+        tfSet( stride, k, j, tfGet( stride, k + 1, j ) );
+      }
+    }
+    // the rows above and below the template left of it, from their first column not decoded: the column right
+    for( int j = -D; j < ( tempType == TMP_ABOVE ? 0 : eH + D ); j++ )
+    {
+      if( j >= 0 && j < eH )
+      {
+        continue;
+      }
+      int i = -1;
+      for( ; i >= -D && decodedBefore( om, pos.x + i, pos.y + j, g_ti ); i-- ) {}
+      for( int k = i; k >= -D; k-- )
+      {
+        tfSet( stride, k, j, tfGet( stride, k + 1, j ) );
+      }
+    }
+    // the columns right of the above template from the first not decoded: the column left
+    for( int j = -D; j < T + D && tempType != TMP_LEFT; j++ )
+    {
+      int i = eW;
+      for( ; i < eW + D && decodedBefore( om, pos.x + i, pos.y + j, g_ti ); i++ ) {}
+      for( int k = i; k < eW + D; k++ )
+      {
+        tfSet( stride, k, j, tfGet( stride, k - 1, j ) );
+      }
+    }
+  }
+  tsSync();
+  for( int n = lid; n < TMP_FRAC_CANDS; n += NT )
+  {
+    const bool allowed = tmpFracAllowed( 1 + n / 32, 1 + ( n / 8 ) % 4, n % 8 );
+    tsSet( TS_FCOST + n, allowed ? tmpFracCost( c, tempType, req, stride, n, maxPel ) : -1 );
+  }
+  tsSync();
+  if( lid == 0 )
+  {
+    int best = -1;
+    for( int n = 0; n < TMP_FRAC_CANDS; n++ )
+    {
+      const int cost = tsGet( TS_FCOST + n );
+      best = cost >= 0 && ( best < 0 || cost < tsGet( TS_FCOST + best ) ) ? n : best;
+    }
+    const int   fx = 1 + best / 32, fy = 1 + ( best / 8 ) % 4, dir = best % 8;
+    const int   dx = TMP_FRAC_DIST[fx - 1], dy = TMP_FRAC_DIST[fy - 1];
+    const bool  l  = dir == 0 || dir == 4 || dir == 6, r = dir == 1 || dir == 5 || dir == 7;
+    const bool  a  = dir == 2 || dir == 4 || dir == 5, b = dir == 3 || dir == 6 || dir == 7;
+    const ivec2 mv = ( bv << 4 ) + ivec2( l ? -dx : r ? dx : 0, a ? -dy : b ? dy : 0 );
+    o.v[at + DIMD_OUT_TMP_MV]     = mv.x;
+    o.v[at + DIMD_OUT_TMP_MV + 1] = mv.y;
+    // (SGPM's lists take mv[0], then the list's first x 16 where the CU has an index: getNeighBv)
+    const int tmpIdx = BufI32( P.timdData ).v[c.tmp + TMP_HEAD_IDX];
+    bvStoreSgpm( c, tmpIdx > 0 ? 2 : 1, ivec2[2]( mv, bvUnpack( o.v[at + DIMD_OUT_TMP_BV] ) << 4 ) );
+  }
 }
 
 // PU::sortInOut (more than MAX_TO_KEEP_MERGE vectors): those outside every region first, then those inside, 24 and 12
@@ -757,6 +982,7 @@ void tmpNode( Cu c, int cuIndex, int bitDepth, int lid, int NT )
           {
             tlSetAt( main, at, f, tlAt( list, i, f ) );
           }
+          tlSetAt( main, at, TE_REGION, tlAt( list, i, TE_REGION ) | t << 8 );   // (m_mtmpRequiredTemplate: t)
         }
       }
     }
@@ -776,21 +1002,37 @@ void tmpNode( Cu c, int cuIndex, int bitDepth, int lid, int NT )
       const ivec2 bv[3] = ivec2[3]( bvUnpack( o.v[at + DIMD_OUT_TMP_BV + tmpIdx] ),
                                     bvUnpack( o.v[at + DIMD_OUT_TMP_BV] ), ivec2( 0 ) );
       bvStore( c, tmpIdx > 0 ? 2 : 1, bv );
-      o.v[at + DIMD_OUT_BV] = bvPack( bv[0] );   // (the one its block copies)
+      o.v[at + DIMD_OUT_BV]         = bvPack( bv[0] );   // (the one its block copies)
+      o.v[at + DIMD_OUT_TMP_MV]     = bv[0].x << 4;      // (pu.mv[0], but a sub-sample search's below)
+      o.v[at + DIMD_OUT_TMP_MV + 1] = bv[0].y << 4;
+      tsSet( TS_FRAC_REQ, tlAt( main, tmpIdx % n, TE_REGION ) >> 8 );
     }
+  }
+  if( data.v[head + TMP_HEAD_FRAC] != 0 )
+  {
+    tsSync();
+    tmpFracSearch( c, cuIndex, tempType, bitDepth, lid, NT );
   }
 }
 
 // ----- the block
 
 // IntraTMP block t's prediction into s_spPred (all invocations): the reconstruction at the vector of its CU's list that
-// tmpIdx selects (generateTMPrediction), which its CU's node has put in its DimdOut's DIMD_OUT_BV
+// tmpIdx selects (generateTMPrediction), which its CU's node has put in its DimdOut's DIMD_OUT_BV; at a sub-sample
+// vector (DIMD_OUT_TMP_MV) getPredIBCBlk's interpolation over its CU, xPredIBCBlkPadding's region moved by 1 where
+// the vector's integer part lies left of / above that vector (deltaX / deltaY)
 void tmpPredict( Tu t, int lid, int NT )
 {
-  const ivec2 bv = bvUnpack( CBufI32( P.dimdOut ).v[t.cu * DIMD_OUT + DIMD_OUT_BV] );
+  CBufI32     o     = CBufI32( P.dimdOut );
+  const int   at    = t.cu * DIMD_OUT;
+  const ivec2 bv    = bvUnpack( o.v[at + DIMD_OUT_BV] );
+  const ivec2 mv    = ivec2( o.v[at + DIMD_OUT_TMP_MV], o.v[at + DIMD_OUT_TMP_MV + 1] );
+  const ivec2 delta = ivec2( ( mv.x >> 4 ) < bv.x ? 1 : 0, ( mv.y >> 4 ) < bv.y ? 1 : 0 );
+  const Cu    c     = BufCu( P.cus ).v[t.cu];
   for( int i = lid; i < t.w * t.h; i += NT )
   {
-    s_spPred[i] = int16_t( recoAt( 0, t.x + bv.x + i % t.w, t.y + bv.y + i / t.w ) );
+    s_spPred[i] = int16_t( ibcPredict( c.x, c.y, c.w, c.h, mv, false, t.x - c.x + i % t.w, t.y - c.y + i / t.w, g_ti,
+                                       t.bitDepth, delta ) );
   }
   SYNC();
 }
