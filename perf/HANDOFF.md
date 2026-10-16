@@ -1776,6 +1776,30 @@ CUs on the GPU, the intra CUs from the CPU 19093 -> 17265; the full regression (
 8 skipped) clean with M64-M66. Remaining SGPM: with vector candidates 2056 (the list's
 m_sgpmMvBasedMergeCandidates), with a block vector 1096, regression 795. A full precompile of the 63 pipelines takes
 ~26 min after a shader change (14 at a time, 225-480 s each).
+M67 (WORK IN PROGRESS, branch dec-gpurecon-m67-wip, not on dec-gpurecon / perf): SGPM's block vectors (JVET-AG0152
+with AH0200's reordering). Status: the integer-vector part was verified (build grW4: every regular stream identical
+but the known CCP merge blocks; SGPM CUs on the GPU 1643 -> 2494, intra CUs from the CPU 17265 -> 16349); then LIC
+was added (BV_OUT_LIC models of the CPU's IBC / IntraTMP CUs, sgpmLic on the template copies and the block's copy,
+DIMD_OUT_SGPM_LIC) and the shaders compile (3.20M / 4.02M IDs), but that version was neither built nor run: build it,
+precompile 8:0-8:6, run partial.py, then commit M67 (the WIP commit's message has the details). Remaining after the
+LIC part: "SGPM with a fractional vector neighbour" (~830) and "SGPM with an EIP neighbour with a vector" (~450) need
+IBC's interpolation (getPredIBCBlk: bilinear for the template, the regular luma filter for a block at a fractional
+vector), which IntraTMP's sub-sample CUs (1900) need too: port that next (InterPrediction::xPredInterBlk with isIBC).
+Of the 3152 SGPM CUs with vectors in their lists, 1693 had a fractional one (EIP with a vector gives its integer
+vector as 1/16 samples to SGPM's list, IntraTMP's sub-sample CUs their fractional mv), 178 one with LIC (after
+DecCu's cap; ~1000 lists hold a LIC neighbour's valid vector before it), none a flipped one.
+The GPU takes the others: an SGPM CU has a list record (Cu::bvList, keeping DecCu's 30 / 15, a prefix wait) and its
+node builds getItmpMergeCandidate's list for SGPM from the records of the CUs around it (Params::bvOut: getNeighBv's
+SGPM vectors are those in 1/16 samples for every CU kind but the ones the host rejects - an EIP neighbour with a
+vector, an IBC / IntraTMP neighbour with LIC, flips or a fractional vector, an inter IBC neighbour; verification
+checks the CPU's list against that), valid for its one-sample template (validIBCItmpMv), costs each vector's template
+copy (sadTM), takes the cheapest 6 (stableSortSmall) as modes 67..72 behind each part's three, and ranks the pairs over
+up to 9 x 9 per partition (the costs and pairs in the workgroup's scratch). It writes the chosen modes' vectors
+(DIMD_OUT_SGPM_BV) and into its vector record (for the lists after it); its CU's mode is planar where its first mode
+is a vector's. Its block copies the reconstruction at a vector for that part (g_bvSubs). TIMD's pass of an SGPM CU
+takes no vectors (deriveTimdMode's useBv), OBIC counts no vector's mode. SPIR-V: 3.21M / 4.04M IDs (~155k left in
+the CCP-LFNST module).
+
 
 ## 8. Numbers (i7-10700 8C/16T, Win11, GCC 16.2, RTX 3070 driver 616.92)
 

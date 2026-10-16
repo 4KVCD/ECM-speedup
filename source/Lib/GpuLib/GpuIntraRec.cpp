@@ -439,8 +439,9 @@ constexpr int DIMD_OUT_BVG_WEIGHT  = 38;   // bvDimdWeight (5)
 constexpr int DIMD_OUT_SGPM_SPLIT  = 32;   // an SGPM CU's (its DIMD in the DIMD fields) sgpmSplitDir,
 constexpr int DIMD_OUT_SGPM_MODE   = 33;   // sgpmMode0, sgpmMode1,
 constexpr int DIMD_OUT_SGPM_TIMD   = 35;   // timdHor, timdVer (131-mode set),
-constexpr int DIMD_OUT_SGPM_PRED   = 37;   // and its block's dimdDerivedIntraDir, dimdDerivedIntraDir2nd
-constexpr int DIMD_OUT_SGPM_END    = 39;
+constexpr int DIMD_OUT_SGPM_PRED   = 37;   // its block's dimdDerivedIntraDir, dimdDerivedIntraDir2nd,
+constexpr int DIMD_OUT_SGPM_BV     = 39;   // its modes' vectors (sgpmBv0, sgpmBv1; bvPack, 0: none)
+constexpr int DIMD_OUT_SGPM_END    = 41;   // (then their LIC models' offsets, which no CPU field mirrors)
 constexpr int DIMD_OUT             = 43;
 // an SGPM CU's record in Params::timdData (Cu::sgpm; intra_sgpm.glsl's SGPM_HEAD_*, layout shared): the index of its
 // list's entry (sgpmIdx, less the regression entries where the CU allows them) and its length, the CUs its partitions'
@@ -658,7 +659,11 @@ constexpr int TIMD_HEAD_BLOCK = offsetof( TimdHead, block ) / 4;
 // list keeps (0: the cascade's), the CUs at those positions
 constexpr int BV_MAX        = 8;
 constexpr int BV_OUT_SPARSE = 1 + BV_MAX;   // then those getSparseArBvMergeCandidate takes where they differ (else -1)
-constexpr int BV_OUT        = BV_OUT_SPARSE + 3;
+constexpr int BV_OUT_LIC    = BV_OUT_SPARSE + 3;   // then the LIC model SGPM's list takes with the first (else -1)
+constexpr int BV_OUT        = BV_OUT_LIC + 1;
+// such a LIC model in Params::timdData (intra_sgpm.glsl's SGPM_LIC_*; a BvInfo's): whether it has two models, the
+// first's scale, shift and offset, the second's, the mean between them
+constexpr int SGPM_LIC      = 8;
 constexpr int BV_NBRS       = 31;
 constexpr int BV_LIST_MAX   = 80;
 constexpr int BV_LIST_INDEX = 0, BV_LIST_KEEP = 1, BV_LIST_NBRS = 2;
@@ -3468,19 +3473,78 @@ static bool addTimdRecord( GpuIntraRec::Impl& m, const CodingUnit& cu, Cu& c, co
 // an SGPM CU's record (Cu::sgpm, SGPM_HEAD_*; DecCu: deriveDimdMode, deriveTimdMode for timdHor / timdVer,
 // deriveSgpmModeOrdered): with its DIMD's histograms, its MPM neighbours and a TIMD record (deriveTimdMode reads its
 // MPM list, whose neighbours getSpatialIpm reads), the five CUs getSgpmIntraMPMs reads, its list's entry and length,
-// its size's weights, its template. False with why set where the GPU lacks what the CU needs: regression SGPM, a
-// vector (chosen, or among its list's candidates: m_sgpmMvBasedMergeCandidates), more samples than intra_rec's
-// prediction buffer, MTSS, SGPM without blending, no TIMD or DIMD (then the CPU reads a TIMD the CU never derived)
+// its size's weights, its template (its list of vectors: endPicture's list record, Cu::bvList). False with why set
+// where the GPU lacks what the CU needs: regression SGPM, a list vector that is fractional, flipped or with LIC, more
+// samples than intra_rec's prediction buffer, MTSS, SGPM without blending, no TIMD or DIMD (then the CPU reads a TIMD
+// the CU never derived)
 static bool addSgpmRecord( GpuIntraRec::Impl& m, const CodingUnit& cu, Cu& c, const char*& why )
 {
 #if GPU_TIMD && JVET_AB0155_SGPM && JVET_AJ0107_GPM_SHAPE_ADAPT && JVET_AJ0112_REGRESSION_SGPM \
-  && JVET_AG0152_SGPM_ITMP_IBC && JVET_AL0188_SGPM_FLIPAWARE_BV
-  const PredictionUnit& pu      = *cu.firstPU;
-  const SPS&            sps     = *cu.cs->sps;
-  const bool            vectors = m.intraPred && !m.intraPred->m_sgpmMvBasedMergeCandidates.empty();
-  why = PU::isRegressionSgpm( pu ) ? "SGPM (regression)"
-        : cu.sgpmMode0 >= SGPM_BV_START_IDX || cu.sgpmMode1 >= SGPM_BV_START_IDX ? "SGPM (block vector)"
-        : vectors ? "SGPM (with vector candidates)"
+  && JVET_AG0152_SGPM_ITMP_IBC && JVET_AL0188_SGPM_FLIPAWARE_BV && JVET_AM0138_ENHANCED_TMP_MERGE_LIST_TIMD_BV \
+  && JVET_AA0070_RRIBC && JVET_AI0082_GPM_WITH_INTER_IBC
+  const PredictionUnit& pu  = *cu.firstPU;
+  const SPS&            sps = *cu.cs->sps;
+  // its list's vectors (m_sgpmMvBasedMergeCandidates, getNeighBv's for SGPM from the CUs getItmpMergeCandidate
+  // visits) as the GPU takes them: each such CU's vectors of its record (Params::bvOut) in 1/16 samples, valid for a
+  // one-sample template, not flipped, the first with the CU's LIC model (BV_OUT_LIC). That holds but for the CUs whose
+  // vectors for SGPM are fractional (an EIP CU with a vector gives its integer vector as 1/16 samples; IntraTMP's
+  // sub-sample vectors; an IBC or SGPM CU's own) or flipped (an IBC CU's RRIBC); of those the CPU's CUs (all but
+  // EIP's, whose vector the GPU finds) count only with a vector valid for this CU
+  const char*       source = nullptr;
+  const CodingUnit* nb[BV_NBRS];
+  bvNeighbourCus( cu, nb );
+  auto fractional = []( const Mv& v ) { return ( v.hor & 15 ) != 0 || ( v.ver & 15 ) != 0; };
+  auto entersList = [&]( const PredictionUnit& np, const Mv& mv )   // (getNeighBv: moved by its flip)
+  {
+    return PU::validIBCItmpMv( pu, PU::adjustLumaBv( np, pu.Y(), mv ), SGPM_TEMPLATE_SIZE, np.cu->rribcFlipType );
+  };
+  for( int k = 0; k < BV_NBRS && !source; k++ )
+  {
+    const CodingUnit* n = nb[k];
+    if( !n )
+    {
+      continue;
+    }
+    const PredictionUnit& np = *n->firstPU;
+    if( PU::isBvEip( np ) )
+    {
+      source = "SGPM with an EIP neighbour with a vector";
+    }
+    else if( CU::isIBC( *n ) )
+    {
+      const bool flipped = n->rribcFlipType != 0;
+      for( int l = 0; l < ( np.interDir == 3 ? 2 : 1 ) && !source; l++ )
+      {
+        source = ( flipped || fractional( np.mv[l] ) ) && entersList( np, np.mv[l] )
+                   ? ( flipped ? "SGPM with a flipped vector neighbour" : "SGPM with a fractional vector neighbour" )
+                   : nullptr;
+      }
+    }
+    else if( n->tmpFlag && !PU::hasBvgBv( np ) && !n->tmpFusionFlag )   // (sub-sample CUs: the CPU's)
+    {
+      source = n->tmpIsSubPel > 0 && entersList( np, np.mv[0] ) ? "SGPM with a fractional vector neighbour" : nullptr;
+    }
+    else if( n->sgpm && m.cpuCus.count( n ) )   // (one of the GPU's has integer vectors only)
+    {
+      const bool frac0 = n->sgpmMode0 >= SGPM_BV_START_IDX && fractional( n->sgpmBv0.mv );
+      const bool frac1 = n->sgpmMode1 >= SGPM_BV_START_IDX && fractional( n->sgpmBv1.mv );
+      source = ( frac0 && entersList( np, n->sgpmBv0.mv ) ) || ( frac1 && entersList( np, n->sgpmBv1.mv ) )
+                 ? "SGPM with a fractional vector neighbour" : nullptr;
+    }
+    else if( CU::isInter( *n ) && n->geoFlag && np.gpmInterIbcFlag )
+    {
+      source = "SGPM with an inter IBC neighbour";
+    }
+  }
+  // (verification: the CPU's list holds no vector those rules let pass)
+  bool missed = false;
+  for( size_t k = 0; !source && m.intraPred && k < m.intraPred->m_sgpmMvBasedMergeCandidates.size(); k++ )
+  {
+    const BvInfo& b = m.intraPred->m_sgpmMvBasedMergeCandidates[k];
+    missed = missed || ( b.mv.hor & 15 ) != 0 || ( b.mv.ver & 15 ) != 0 || b.flipType != 0;
+  }
+  why = PU::isRegressionSgpm( pu ) ? "SGPM (regression)" : source ? source
+        : missed ? "SGPM with a vector its neighbours' checks missed"
         : cu.lwidth() * cu.lheight() > 32 * 32 ? "SGPM above 1024 samples"
         : usesMtss( *cu.firstTU ) ? "SGPM with MTSS"
         : cu.cs->pps->getUseSgpmNoBlend() ? "SGPM without blending"
@@ -4032,6 +4096,7 @@ static int32_t cuRecord( GpuIntraRec::Impl& m, const TransformUnit& tu, const Co
         return -1;
       }
       c.kind = CU_SGPM;
+      bvList = true;   // (its list of vectors: getItmpMergeCandidate's for SGPM)
     }
     // an MDIP CU: its mode MDIP's (deriveMdipMode: from histograms of the reconstruction around it and template costs)
     else if( m.deriveModes && cu.mdip )
@@ -4270,6 +4335,10 @@ static int32_t cuRecord( GpuIntraRec::Impl& m, const TransformUnit& tu, const Co
     d[DIMD_OUT_SGPM_TIMD + 1] = cu.timdVer;
     d[DIMD_OUT_SGPM_PRED]     = cu.dimdDerivedIntraDir;
     d[DIMD_OUT_SGPM_PRED + 1] = cu.dimdDerivedIntraDir2nd;
+    // (integer vectors: the host takes no CU with another)
+    auto sampleBv = []( const Mv& mv ) { return bvPack( Mv( mv.hor >> 4, mv.ver >> 4 ) ); };
+    d[DIMD_OUT_SGPM_BV]     = cu.sgpmMode0 >= SGPM_BV_START_IDX ? sampleBv( cu.sgpmBv0.mv ) : 0;
+    d[DIMD_OUT_SGPM_BV + 1] = cu.sgpmMode1 >= SGPM_BV_START_IDX ? sampleBv( cu.sgpmBv1.mv ) : 0;
   }
 #endif
 #if JVET_AG0146_DIMD_ITMP_IBC && JVET_AM0138_ENHANCED_TMP_MERGE_LIST_TIMD_BV
@@ -6349,11 +6418,13 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
       }
       // TIMD's and IntraTMP's lists cascade (IntraTMP's node sorts its neighbours' first); DIMD's
       // (getBestNonAnglularMode, also of OBIC and intra merge CUs) keeps its first 30 / 15 and costs its vectors on
-      // TIMD's template of both arms, whose units follow
-      const bool dimd = c.kind != CU_TIMD && c.tmp < 0;
+      // TIMD's template of both arms, whose units follow; SGPM's keeps as many (DecCu), its node checks its vectors
+      // for its own template (intra_sgpm.glsl)
+      const bool sgpm = c.kind == CU_SGPM, dimd = c.kind != CU_TIMD && c.tmp < 0 && !sgpm;
       c.bvList = (int32_t) m.timdData.size();
       m.timdData.push_back( (int32_t) cu.idx );   // BV_LIST_INDEX
-      m.timdData.push_back( !dimd ? 0 : cs.sps->getItmpLicMode() ? MAX_TO_KEEP : MAX_TO_KEEP >> 1 );   // BV_LIST_KEEP
+      const int keep = !dimd && !sgpm ? 0 : cs.sps->getItmpLicMode() ? MAX_TO_KEEP : MAX_TO_KEEP >> 1;
+      m.timdData.push_back( keep );   // BV_LIST_KEEP
       for( int k = 0; k < BV_NBRS; k++ )
       {
         m.timdData.push_back( nb[k] ? (int32_t) nb[k]->idx : -1 );
@@ -6378,6 +6449,9 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
     P.bvMapW = ( P.width[0] + 3 ) >> 2;
     P.bvMap  = (int32_t) m.timdData.size();
     m.timdData.resize( m.timdData.size() + size_t( P.bvMapW ) * ( ( P.height[0] + 3 ) >> 2 ), -1 );
+    // (the LIC models after the map)
+    const size_t         licBase = m.timdData.size();
+    std::vector<int32_t> licModels;
     for( const CodingUnit* cu: cs.cus )
     {
       const CompArea& a = cu->blocks[COMPONENT_Y];
@@ -6387,6 +6461,7 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
       }
       int32_t* rec = &m.timdData[P.bvOut + size_t( cu->idx ) * BV_OUT];
       rec[BV_OUT_SPARSE] = -1;
+      rec[BV_OUT_LIC]    = -1;
       if( m.cpuCus.count( cu ) )
       {
         Mv bvs[BV_MAX];
@@ -6395,8 +6470,27 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
         {
           rec[1 + j] = bvPack( bvs[j] );
         }
-        // getSparseArBvMergeCandidate takes an IntraTMP fusion CU's own vector and its cheapest, not the fused ones
         const PredictionUnit& pu = *cu->firstPU;
+#if JVET_AM0157_SGPM_BV_LIC && JVET_AE0078_IBC_LIC_EXTENSION && JVET_AD0213_LIC_IMP
+        // SGPM's list takes its first vector with its LIC model (getNeighBv: an IBC CU's, an IntraTMP CU's without
+        // fusion; two models with IBC_LIC_IDX_M)
+        const bool lic = CU::isIBC( *cu ) ? cu->ibcLicFlag && !cu->ibcFilterFlag : cu->tmpLicFlag && !cu->tmpFusionFlag;
+        if( lic )
+        {
+          rec[BV_OUT_LIC] = (int32_t) ( licBase + licModels.size() );
+          const bool    mm               = cu->ibcLicIdx == IBC_LIC_IDX_M;
+          const int32_t model[SGPM_LIC] = { mm ? 1 : 0,
+                                             mm ? cu->ibcLicScale[0][0][0] : cu->licScale[0][0],
+                                             mm ? cu->ibcLicShift[0][0][0] : 5,
+                                             mm ? cu->ibcLicOffset[0][0][0] : cu->licOffset[0][0],
+                                             mm ? cu->ibcLicScale[0][1][0] : 0,
+                                             mm ? cu->ibcLicShift[0][1][0] : 0,
+                                             mm ? cu->ibcLicOffset[0][1][0] : 0,
+                                             mm ? cu->ibcLicMean[0][0] : 0 };
+          licModels.insert( licModels.end(), model, model + SGPM_LIC );
+        }
+#endif
+        // getSparseArBvMergeCandidate takes an IntraTMP fusion CU's own vector and its cheapest, not the fused ones
         if( cu->tmpFlag && cu->tmpFusionFlag )
         {
           const Mv* disp = cu->tmpLicFlag ? cu->tmpXYdispUseMR : cu->tmpXYdisp;
@@ -6415,6 +6509,7 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
         std::fill_n( row + ( a.x >> 2 ), ( a.width + 3 ) >> 2, (int32_t) cu->idx );
       }
     }
+    m.timdData.insert( m.timdData.end(), licModels.begin(), licModels.end() );
   }
 #endif
   // the CU records, then their modes (the derived ones -1 until the CU's node writes them), their DIMD histograms, the
@@ -6914,6 +7009,7 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
                             : bvg && k >= DIMD_OUT_BVG_WEIGHT ? "bvDimdWeight"
                             : bvg && k >= DIMD_OUT_BVG_BV ? "bvDimdList (packed)"
                             : bvg && k == DIMD_OUT_TR_SECOND ? "bvgDimdMode[1]"
+                            : c.kind == CU_SGPM && k >= DIMD_OUT_SGPM_BV ? "sgpmBv (packed)"
                             : c.kind == CU_SGPM && k >= DIMD_OUT_SGPM_PRED ? "dimdDerivedIntraDir (SGPM's prediction)"
                             : c.kind == CU_SGPM && k >= DIMD_OUT_SGPM_TIMD ? "timdHor / timdVer"
                             : c.kind == CU_SGPM && k >= DIMD_OUT_SGPM_MODE ? "sgpmMode"
@@ -6927,6 +7023,7 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
         const int   entry = k < 2 ? 0 : k < 9 ? k - 2 : k < 17 ? k - 9 : k < DIMD_OUT_TR_SECOND ? k - 17
                             : k == DIMD_OUT_TR_SECOND ? 1 : k < DIMD_OUT_MTSS_MODE ? k - DIMD_OUT_MTSS_LIST
                             : bvg && k >= DIMD_OUT_BVG_WEIGHT ? k - DIMD_OUT_BVG_WEIGHT
+                            : c.kind == CU_SGPM && k >= DIMD_OUT_SGPM_BV ? k - DIMD_OUT_SGPM_BV
                             : c.kind == CU_SGPM && k >= DIMD_OUT_SGPM_PRED ? k - DIMD_OUT_SGPM_PRED
                             : c.kind == CU_SGPM && k >= DIMD_OUT_SGPM_TIMD ? k - DIMD_OUT_SGPM_TIMD
                             : k > DIMD_OUT_EXT_FLAGS ? k - DIMD_OUT_EXT_BV : 0;

@@ -1414,14 +1414,15 @@ int timdNode( Cu c, int cuIndex, int nbrMode[MPM_NEIGHBOURS], int dimdModes[3], 
   // first batch, the template's references, DC's value and costs, the CPU's scan, the second batch's costs, the
   // refinement and the final choice
   SYNC();   // (dimdSelect has read its histograms)
-  if( c.bvList >= 0 && lid == 0 )
+  const bool vectors = c.bvList >= 0 && !( WITH_MPM && c.kind == CU_SGPM );   // (an SGPM CU's list is SGPM's own)
+  if( vectors && lid == 0 )
   {
     s_spCost[TC_NUM_BV] = uint( bvMergeList( c, g_ti ) );
   }
   timdFillReference( head.t, BufI32( P.timdData ), c.timd + TIMD_HEAD, 0, c.x, c.y, c.w, c.h, TIMD_REF_SHIFT,
                      bitDepth, lid, NT );
   const int dc    = timdDc( head.t, c.w, c.h, lid, NT );   // (a barrier: the list's length visible)
-  const int numBv = c.bvList >= 0 ? int( s_spCost[TC_NUM_BV] ) : 0;
+  const int numBv = vectors ? int( s_spCost[TC_NUM_BV] ) : 0;
   if( numBv > 0 )
   {
     timdVectorBatches( c, head.t, numBv, dc, maxPel, noPdpc, false, scan, head.type, log2A, log2L, lid, NT );

@@ -77,12 +77,12 @@ void obicHistogram( Cu c, int lid, int NT )
         atomicAdd( s_obicPlain[second], ns );
       }
     }
-    else if( WITH_MPM && kind == CU_SGPM )   // its two modes (its node's), each with all the samples, class 0
-    {
+    else if( WITH_MPM && kind == CU_SGPM )   // its two modes (its node's), each with all the samples, class 0, but
+    {                                        // those from vectors
       CBufI32   d = CBufI32( P.dimdOut );
-      const int o = nb.cu * DIMD_OUT;
-      obicCount( d.v[o + DIMD_OUT_SGPM_MODE], 0, ns );
-      obicCount( d.v[o + DIMD_OUT_SGPM_MODE + 1], 0, ns );
+      const int o = nb.cu * DIMD_OUT, mode0 = d.v[o + DIMD_OUT_SGPM_MODE], mode1 = d.v[o + DIMD_OUT_SGPM_MODE + 1];
+      obicCount( mode0, 0, mode0 < NUM_LUMA_MODE ? ns : 0 );
+      obicCount( mode1, 0, mode1 < NUM_LUMA_MODE ? ns : 0 );
     }
     else if( WITH_MERGE && kind == CU_MERGE )   // its merge parameters (its DimdOut slot), all samples to each mode, no class
     {

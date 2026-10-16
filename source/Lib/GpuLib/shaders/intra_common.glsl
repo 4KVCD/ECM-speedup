@@ -260,10 +260,12 @@ const int DERIVE_SGPM = 134217728;
 // CodingStructure: getNeighBv's vectors of the CU in its order, which getArBvMergeCandidate cascades), written by the
 // CU's node or uploaded for a CU from the CPU: their number, then up to BV_MAX (bvPack); then those
 // getSparseArBvMergeCandidate cascades where they differ (an IntraTMP fusion CU's own vector, then its cheapest
-// where it has an index: their number, then 2), else -1
+// where it has an index: their number, then 2), else -1; then the offset in Params::timdData of the LIC model SGPM's
+// list takes with the first vector (intra_sgpm.glsl's SGPM_LIC_*: an IBC or IntraTMP CU's from the CPU), else -1
 const int BV_MAX        = 8;
 const int BV_OUT_SPARSE = 1 + BV_MAX;
-const int BV_OUT        = BV_OUT_SPARSE + 3;
+const int BV_OUT_LIC    = BV_OUT_SPARSE + 3;
+const int BV_OUT        = BV_OUT_LIC + 1;
 const int BV_NBRS = 31;    // getItmpMergeCandidate's 13 CU neighbours, then its 18 non-adjacent positions
 
 // Params::dbgParams per block: the derived dirMode, isModeVer, intraPredAngle, absInvAngle, useCubic, refFilter,
@@ -408,8 +410,9 @@ layout( buffer_reference, std430, buffer_reference_align = 4 ) buffer BufDimdCal
 // bvDimdExt). A BVG-DIMD CU's blend in DIMD's fields (bvgDimdMode, bvgDimdFusionWeight: its first mode, planar's
 // weight, its second mode as the first blend mode; bvgDimdMode[1] as the second), its vectors in place of intra
 // merge's (bvDimdNum, bvDimdList, bvDimdWeight). An SGPM CU's DIMD in the DIMD fields, then its node's choice
-// (sgpmSplitDir, sgpmMode0, sgpmMode1), TIMD's best horizontal and vertical modes (timdHor, timdVer: 131-mode set) and
-// its block's DIMD of its prediction (dimdDerivedIntraDir, dimdDerivedIntraDir2nd)
+// (sgpmSplitDir, sgpmMode0, sgpmMode1: a mode from SGPM_BV_START on is a vector of its list), TIMD's best horizontal
+// and vertical modes (timdHor, timdVer: 131-mode set), its block's DIMD of its prediction (dimdDerivedIntraDir,
+// dimdDerivedIntraDir2nd) and the vectors of its modes from vectors
 const int DIMD_OUT             = 43;
 const int DIMD_OUT_PARAMS      = 24;
 const int DIMD_OUT_MODE        = 0;
@@ -434,7 +437,9 @@ const int DIMD_OUT_BVG_WEIGHT  = 38;   // and their fusion weights (5)
 const int DIMD_OUT_SGPM_SPLIT  = 32;   // an SGPM CU's partition (its index in g_sgpmSplitDir),
 const int DIMD_OUT_SGPM_MODE   = 33;   // its two modes,
 const int DIMD_OUT_SGPM_TIMD   = 35;   // TIMD's two modes,
-const int DIMD_OUT_SGPM_PRED   = 37;   // its block's two DIMD modes
+const int DIMD_OUT_SGPM_PRED   = 37;   // its block's two DIMD modes,
+const int DIMD_OUT_SGPM_BV     = 39;   // the vectors of its modes from vectors (2, bvPack; 0 for another mode)
+const int DIMD_OUT_SGPM_LIC    = 41;   // and their LIC models (2, offsets in Params::timdData; -1: none)
 const int MTSS_CALLS           = 3;    // the histograms of MTSS's mode list (deriveDimdModeList: left, above, above-left)
 
 // an SGPM CU's record in Params::timdData (Cu::sgpm; layout shared with GpuIntraRec.cpp's addSgpmRecord): the index of
