@@ -436,9 +436,9 @@ crops, so its md5 differ.
 
 # Handoff: ECM-20.0 decoder speed-up and the Vulkan GPU decoder
 
-Written 2026-10-10 on the i7-10700 PC so that another computer (and its Claude session) can continue. Read this
-first, then `perf/DECODER.md` (the decoder speed-up log, incl. the section "GPU reconstruction") and
-`perf/OPTIMIZATIONS.md` (the encoder log).
+Written 2026-10-10 on the i7-10700 PC so that another computer (and its Claude session) can continue; last updated
+2026-10-15 at M66, when the work moved to another computer. Read sections 1, 1a, 2, 9 first, then the M-level notes in
+section 7 that touch your next step, then `perf/DECODER.md` (the decoder speed-up log, incl. "GPU reconstruction").
 
 ## 1. Goal and status in one paragraph
 
@@ -462,8 +462,41 @@ MPM lists of MPM sorting, MDIP and PDP, M58: EIP, M59-M61: block vectors - TIMD,
 IntraTMP's search, without LIC / fusion / FLM / sub-sample vectors / OBMC, M63: EIP with a vector, M64: intra
 merge with vectors, M65: BVG-DIMD, M66: SGPM without vectors or regression); it is
 **not yet faster than the CPU
-decoder** (see section 8) and supports only a restricted tool set (all real CTC streams fall back to the CPU, first
-reason: chroma reordering / DBV; BVG-CCCM CUs are rejected per block).
+decoder** (see section 8) and supports only a restricted tool set (in ON mode the real CTC streams still fall back to
+the CPU, first reason: chroma reordering / DBV). Partial verification (`perf/gpu/partial.py`, section 7's "Partial
+verification") runs the 19 regular CTC streams with the CUs of missing tools taken from the CPU: at M66 every intra
+picture is identical but the known CCP merge blocks (fp720_ai's 3 pictures, ra720's first), and 17265 intra CUs
+still come from the CPU (IntraTMP LIC 4159, intra merge with a neighbour of a missing kind 2586, IntraTMP
+sub-sample vectors 1900, SGPM with vectors 3152 and regression 795, IntraTMP OBMC / fusion / FLM ~2200, ...; plus
+32777 inter / IBC / palette CUs of inter pictures). M67 (SGPM's vectors) is half done on branch
+`dec-gpurecon-m67-wip` (section 9).
+
+## 1a. Working fast (development time)
+
+The user found the first week far too slow (M1-M54 in ~a week: a milestone was ~30-60 min of coding and 4-5 h of
+waiting for encodes, canaries, regressions and timing). After the changes below (2026-10-15) a milestone took ~70
+min instead of ~2 h, each covering a whole tool family on real streams. Keep it that way:
+- Test set = the 19 regular CTC streams in partial verification (`partial.py <build> -j 8`, ~3 min with warm
+  pipelines). A step = a tool family; its gate = every stream identical (GPU vs CPU, block by block) plus ON mode
+  where it applies. No dedicated encodes per tool unless no stream exercises the code; canaries only for code no
+  stream reaches; the full regression (`verify_all.py <build> -j 4`, 444 streams, ~10 min warm) once a day and
+  before every push; timing only when a phase ends.
+- Measure before designing: a host-only build that splits a rejection reason finer (e.g. by what a CU's list
+  holds) costs ~3 min (no shader change, so no pipeline compile) and shows where the CUs are (`cpu_cus.py <build>`).
+  The SGPM split showed fractional vectors dominate, which set the order M67 (integer vectors) -> M68 (IBC
+  interpolation).
+- Shader changes cost pipeline compiles: an intra_rec pipeline takes 225-480 s cold. After a shader change run
+  `precompile.py <build> -j 7 8:0 8:1 8:2 8:3 8:4 8:5 8:6` (~7 min: the MPM variant, which every regular stream's
+  pictures take since EIP / IntraTMP / SGPM CUs force it), not all 63 (~26 min with 14 at a time; only needed before
+  the 444-stream regression). Pipelines then load from runs/pipecache in 0.0 s. Check a shader edit with glslang
+  first (`spirv_ids.py`: compile errors in a few minutes and the SPIR-V ID budget, 4.19M per module; the CCP-LFNST
+  module is the tight one, ~180k left at M66). Host-only edits need no compile at all.
+- Never wait idle: builds, precompiles and test runs go to the background while you read the CPU code for the next
+  step or write the next part. Use at most one agent (the user's rule); parallelize with background processes.
+- Debug with the verification's first differing field / block (the report names the CU, the field, CPU vs GPU
+  values) and fix the cause; most bugs were a missed CPU branch (read the whole CPU function and its SIMD version).
+- pj720_ai's pictures take ~1.8 s of GPU time in partial verification; under 8 parallel decoders some pass Windows'
+  2 s GPU timeout (VK_ERROR_DEVICE_LOST); partial.py runs such a stream again alone.
 
 ## 2. The user's rules (follow them exactly)
 
@@ -509,7 +542,11 @@ Machine
 
 - GitHub: https://github.com/4KVCD/ECM-speedup (public; remote `github`). Upstream: vcgit.hhi.fraunhofer.de ECM
   (remote `origin`, read-only). gh CLI logged in as 4KVCD on the old PC.
-- `perf` (default branch on GitHub): the encoder work (done mainly on the other computer).
+- `perf` (default branch on GitHub, the main line; there is no master / main): the encoder work, with `dec` and
+  `dec-gpurecon` merged in (2026-10-14). 2026-10-15 it was fast-forwarded to `dec-gpurecon` at M66 (+ the tooling
+  and this handoff).
+- `dec-gpurecon-m67-wip` (pushed 2026-10-15): one WIP commit on top of `dec-gpurecon` with M67 (SGPM's block
+  vectors) half done - its integer-vector part verified, its LIC part compiling but never run (section 9, step 0).
 - `dec`: the decoder work (single-thread steps, frame threads, segment-parallel, GPU loop filters). Pushed
   2026-10-10 at 447ecde1 = 3e43989f (frame-thread drain fix: all-intra streams resend SPS/PPS each picture, which
   drained the threads; fp720_ai FT8 3.00 s -> 0.88 s) + 447ecde1 (merge of github/perf b8e5f2ba: 25 encoder
@@ -650,6 +687,12 @@ commands that combine `Remove-Item` with `//` text. `perf\gpu\crlf.ps1 <worktree
 
 | script | use |
 |---|---|
+| `partial.py <build> [-j N] [streams]` | partial verification of the 19 regular streams (C:\Code\ECM\streams): per stream the pictures verified / differing and the first difference, then the CUs taken from the CPU by reason; logs in runs/partial. The test gate of every step since M57 |
+| `precompile.py <build> [-j N] [variant:level ...]` | compiles intra_rec's pipelines into runs/nvcache and runs/pipecache (see 1a: after a shader change `8:0` .. `8:6`) |
+| `verify_all.py [-j N] <build> [streams]` | the full regression: `--GpuRecon=2` over the 444 GPU test streams (C:\Code\ECM\streams_gpu); M66 baseline 1565 verified, 8 skipped, 0 differences |
+| `cpu_cus.py <build> ...` | sums partial.py's "CUs taken from the CPU" per reason over the logs: what to port next |
+| `long_lines.py <worktree> <files>` | added lines over 120 columns (the style rule) |
+| `spirv_ids.py [worktree]` | compiles intra_rec's two modules with glslang, prints their SPIR-V ID bounds (limit 4194303) |
 | `gpucheck.py [-j N] <build> [streams] -- <decoder args>` | decodes every GPU stream with the build and with the stock decoder (cached), compares all frames, prints the `[gpu-intra]` lines. Use `--GpuRecon=2` (verify) and `--GpuRecon=3`, also with `--FrameThreads=8`. `-j N` decodes N streams at a time (6 for verification, 3 with 8 frame threads; 1, the default, for timings): a full regression then takes minutes instead of most of an hour. |
 | `stress.py <build> <reps> [args]` | repeats verify decodes, saves the output of any run that is not "all verified, 0 differences, 0 skipped" (caught the m_timdMrg bug, 1 in ~650 runs) |
 | `gpuload.py <build> <seconds>` | keeps the GPU busy (decodes with `--GpuRecon=3 --FrameThreads=8`); run it beside stress.py, GPU synchronization bugs needed the load to show (intra_resi scratch, 2026-10-11) |
@@ -1753,6 +1796,21 @@ Profile of a GPU-on decode (non-LTO, m2_park16, share of all samples): parsing ~
 
 ## 9. Next steps (in the order I would take them)
 
+0. Now (2026-10-15, the intra phase; the user's order: all intra first, then inter), by the CPU CUs they free:
+   a. Finish M67: `git checkout dec-gpurecon-m67-wip` (one WIP commit on dec-gpurecon; its message and its HANDOFF
+      paragraph "M67" say what is verified), build, `precompile.py <build> -j 7 8:0 .. 8:6`, `partial.py`; if
+      identical, turn the WIP commit into the M67 commit (amend: it is pushed only on its own branch, so rewriting it
+      needs the user's OK for a force push - or simply commit M67 on dec-gpurecon from its diff) and drop the branch.
+   b. M68: IBC's interpolation on the GPU (getPredIBCBlk -> InterPrediction::xPredInterBlk with isIBC: the bilinear
+      filter for SGPM's templates, the regular luma filter for blocks at fractional vectors, rndRes, no LIC there):
+      frees SGPM's fractional / EIP-vector neighbours (~1280 CUs) and IntraTMP's sub-sample vectors (1900); it is the
+      first piece of inter prediction too.
+   c. IntraTMP's LIC (4159 + 813 with fusion): the LIC model of its template (InterPrediction's LicItmp /
+      xLocalIlluComp), then IntraTMP fusion (731), FLM (589), OBMC (919); with them the intra merge CUs held back by
+      an IntraTMP neighbour (~950) and most of "an intra merge neighbour of a kind the GPU lacks".
+   d. Regression SGPM (795: deriveSgpmBlending's least-squares blend model), MTSS of the remaining kinds (~200), DBV
+      (~200), NN of split CUs (~150), BVG-CCCM (~70).
+   e. ON mode on the CTC streams: chroma reordering / DBV (the sequence-level checks in supported()), then inter.
 1. Time 180ccabc (paired grL builds, `walls.py` with `--GpuRecon=3`, CPU vs GPU, FT8; use m3_park60).
 2. Done (2026-10-11): M4 dual tree, M5 LMCS, M6 dependent quantization and QCS, M7 joint CbCr, M8 explicit MTS,
    M9 transform skip and BDPCM, M10 MIP, M11 LFNST / NSPT (computed by the host until M15), M12 MRL, M13 ISP, M14 sign
