@@ -449,7 +449,7 @@ wall-clock gains with threads are "the easy baseline". Decoder status: single-th
 (`--GpuLoopFilter=1`: ALF, SAO, BIF, CCSAO, LF-CCCM, offset refinement on Vulkan). The user then asked for **a full
 GPU decoder in Vulkan, optimized until nothing is left** ("The GPU decoder needs to fully decode the frame on the
 GPU"; "Your first Vulkan version is going to be slow. That's OK"). That work is branch `dec-gpurecon`: intra
-reconstruction on the GPU (`--GpuRecon`), tool levels M1-M69 done and verified bit-exact (M19: DIMD, M20: OBIC, M21:
+reconstruction on the GPU (`--GpuRecon`), tool levels M1-M70 done and verified bit-exact (M19: DIMD, M20: OBIC, M21:
 intra merge, M22: the transforms of DIMD CUs, M23: LFNST of MIP, M24: TIMD, M25: OBIC and intra merge with TIMD
 neighbours, M26: TIMD-SAD, M27: OBIC and intra merge with TIMD-SAD neighbours, M28: TIMD merge, M29: TMRL of luma,
 M30: chroma TMRL, M31: CCLM, M32: LFNST / NSPT of CCLM, M33: GLM's gradient patterns, M34: CCCM, M35: GL-CCCM, M36:
@@ -461,7 +461,8 @@ model, M53 / M54: CCP merge and decoder-derived fusion with LFNST / NSPT, M55: P
 MPM lists of MPM sorting, MDIP and PDP, M58: EIP, M59-M61: block vectors - TIMD, DIMD and OBIC with vectors, M62:
 IntraTMP's search, without LIC / fusion / FLM / sub-sample vectors / OBMC, M63: EIP with a vector, M64: intra
 merge with vectors, M65: BVG-DIMD, M66: SGPM without vectors or regression, M67: SGPM's integer vectors with
-their LIC models, M68: IBC's interpolation, SGPM's fractional vectors, M69: IntraTMP's sub-sample vectors); it is
+their LIC models, M68: IBC's interpolation, SGPM's fractional vectors, M69: IntraTMP's sub-sample vectors, M70:
+IntraTMP's OBMC); it is
 **not yet faster than the CPU
 decoder** (see section 8) and supports only a restricted tool set (in ON mode the real CTC streams still fall back to
 the CPU, first reason: chroma reordering / DBV). Partial verification (`perf/gpu/partial.py`, section 7's "Partial
@@ -469,8 +470,8 @@ verification") runs the 19 regular CTC streams with the CUs of missing tools tak
 picture is identical but the known CCP merge blocks (fp720_ai's 3 pictures, ra720's first), and 17265 intra CUs
 still come from the CPU (IntraTMP LIC 4159, intra merge with a neighbour of a missing kind 2586, IntraTMP
 sub-sample vectors 1900, SGPM with vectors 3152 and regression 795, IntraTMP OBMC / fusion / FLM ~2200, ...; plus
-32777 inter / IBC / palette CUs of inter pictures). M67-M69 (2026-10-16) took SGPM's vectors and IntraTMP's
-sub-sample ones; next is IntraTMP's OBMC (section 9).
+32777 inter / IBC / palette CUs of inter pictures). M67-M70 (2026-10-16 / 21) took SGPM's vectors, IntraTMP's
+sub-sample ones and its OBMC; next is IntraTMP's LIC (section 9).
 
 ## 1a. Working fast (development time)
 
@@ -1844,6 +1845,37 @@ as before (45 identical, the 2 single-tree ones as at M66, ra_wpp_q32 without an
 CUs also have OBMC ("IntraTMP with OBMC" 323 -> 423), so IntraTMP's OBMC is next. ai_crowdrun832_q27 (~3.0 s of GPU
 time per picture on this iGPU, M68 2.96 s) lost the device once in partial.py's lone rerun and verified identical in
 3 of 3 lone runs: Windows' GPU timeout on the heaviest picture, not a fault of the code.
+M70 (2026-10-21): IntraTMP's OBMC (InterPrediction::subBlockOBMC for an IntraTMP CU, JVET-AK0076 with JVET-AJ0161's
+intra predictions; intra_obmc.glsl). The CPU's flow, read from the preprocessed sources (g++ -E -P with the build's
+flags: the #if forest of subBlockOBMC resolves to ~500 lines): where the SPS's OBMC, the CU's obmcFlag, no flip, 32
+samples and no SCC CU around it (isSCC: palette / BDPCM CUs, MotionInfo::isSCC) hold, per side (top, then left) runs
+of 4-sample units (getSameNeigMotion): a run of one valid IBC-like vector (IBC, IntraTMP, EIP with a vector; not
+flipped, FLM, fusion, filtered, two-model LIC, BVG-DIMD; checkIsIBCCandidateValidBi for the strip so far) that is not
+the CU's own gets the copy at that vector (getPredIBCBlk: ibcPredict) blended by weightObmcBoundary mode 2 (rows 0-3:
+26/6, 28/4, 30/2, 31/1 of 32) unless skipObmcConditionByPixel (the copy at the vector clipped and rounded to samples,
+where valid, is 96 << (bitDepth - 8) or more off the prediction before OBMC anywhere); runs of other units, where
+getGradForOBMC gave the side modes (DIMD on; calcGradForOBMC: per run of intra units of one mode, a histogram of
+dimdAngle over the 2x2 gradients of the two rows / columns next to the CU, with the 2 samples either side carried
+over), get per run of one mode within the side's angles (above 34..66, left 3..34) an angular prediction of the strip
+(subBlockIntraForOBMC: predIntraAng with isobmcMC - no reference filter, cubic taps, no fusion or PDP, PDPC only for a
+side's first unit; the references the regular fill for the first unit, else xFillReferenceSamplesOBMC with that side
+alone, and with prepareRef the samples beyond the strip's corner along the side replacing the projected main-array
+entries) blended by mode -1 (the same weights). Host: addTmpObmcRecord (TMP_HEAD_OBMC: flags and per unit the kind,
+the record whose Params::cuMode is its intra mode - what the MPM lists read, planar for EIP / NN / MIP -, the vector or
+its GPU source); rejections "IntraTMP OBMC with a neighbour with LIC", "... of two vectors or inter", "... with an SGPM
+neighbour" (an SGPM CU's mode per position) - 35 CUs on the corpus. GPU: tmpPredict (moved to intra_obmc.glsl) plans
+the runs (obmcPlan, invocation 0) and predicts the block and the motion runs in one loop (one ibcPredict call site);
+tmpObmc after the DIMD of the prediction (the CPU derives intraTmpDimdMode before OBMC) skips / predicts the intra
+strips (obmcIntraStrip: applyModeParams on a strip Tu, obmcFillReferences - the CPU's regular line-0 fill or its
+OBMC variant -, angularArrays, the overrides, the long-tap cubic loop) and blends. The CPU's reference fill for a
+strip after the first unit leaves top entry 1 stale (only left), which a filtered corner would read: it cannot happen
+as isobmcMC turns the reference filter off (no strip of the corpus had it). Results (Intel PC, 48 streams, build
+gpu5): every stream as before (the 2 single-tree ones differ as at M66); over the 46 streams both runs report, intra
+CUs from the CPU 2520 -> 2267 ("IntraTMP with OBMC" 423 -> 0; 35 CUs rejected by the narrower rules), IntraTMP CUs on
+the GPU 65 -> 318; the first three streams verified alone had 128 intra strips (15 after a side's first unit, 5 with
+prepareRef) and 41 motion runs on the CPU (its debug counts). SPIR-V: 3.34M / 4.17M IDs - only 26k left in
+the CCP-LFNST module: the next milestone must make room first (the strip's angular code is a second copy of the main
+path's; a shared call site would save ~60k).
 SPIR-V 3.26M / 4.08M IDs (113k left in the CCP-LFNST module).
 
 
@@ -1876,7 +1908,7 @@ Profile of a GPU-on decode (non-LTO, m2_park16, share of all samples): parsing ~
       mode). ON mode leaves both to the CPU (identical output). Fix before single tree counts as supported.
    b. Done (2026-10-16): M68, IBC's interpolation (intra_ibc.glsl) and SGPM's fractional vectors.
    b2. Done (2026-10-16): M69, IntraTMP's sub-sample vectors.
-   b3. Next: IntraTMP's OBMC (JVET-AK0076: most sub-sample CUs have it too), then c.
+   b3. Done (2026-10-21): M70, IntraTMP's OBMC. Before the next milestone: room in the CCP-LFNST module (26k IDs).
    c. IntraTMP's LIC (4159 + 813 with fusion): the LIC model of its template (InterPrediction's LicItmp /
       xLocalIlluComp), then IntraTMP fusion (731), FLM (589), OBMC (919); with them the intra merge CUs held back by
       an IntraTMP neighbour (~950) and most of "an intra merge neighbour of a kind the GPU lacks".
@@ -1912,6 +1944,7 @@ Profile of a GPU-on decode (non-LTO, m2_park16, share of all samples): parsing ~
    and OBMC, fusion and FLM their models), M63 EIP with a vector, M64 intra merge with vectors, M65 BVG-DIMD, M66
    SGPM (its CUs without vector candidates or regression, up to 1024 samples). 2026-10-16: M67 SGPM's block vectors
    and their LIC models, M68 IBC's interpolation and SGPM's fractional vectors, M69 IntraTMP's sub-sample vectors.
+   2026-10-21: M70 IntraTMP's OBMC.
    All 19 regular streams now stop at "chroma reordering / DBV" (the next sequence-level check; the block-level tools
    of step 4 follow; BVG-CCCM needs IntraTMP / IBC first).
 3. Make the GPU path win on CPU time per picture: the derive-only pass (record during parsing or a leaner pass;

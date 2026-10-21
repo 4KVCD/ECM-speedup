@@ -3787,7 +3787,18 @@ static int32_t eipIndexOf( GpuIntraRec::Impl& m, const CodingUnit& cu )
 // CU's with a vector (the sparse search alone), a BVG-DIMD CU's (TMP_HEAD_SEARCH: what the search is for)
 constexpr int TMP_HEAD_REGIONS = 8;
 constexpr int TMP_HEAD_FRAC    = TMP_HEAD_REGIONS + 24;   // tmpFracIdx (its block's vector from the sub-sample search)
-constexpr int TMP_HEAD         = TMP_HEAD_FRAC + 1;
+constexpr int TMP_HEAD_OBMC    = TMP_HEAD_FRAC + 1;       // its OBMC record (OBMC_*) in Params::timdData, else -1
+constexpr int TMP_HEAD         = TMP_HEAD_OBMC + 1;
+// an IntraTMP CU's OBMC record (InterPrediction::subBlockOBMC, JVET-AK0076 with JVET-AJ0161's intra predictions;
+// intra_obmc.glsl's OBMC_*, layout shared): flags (getGradForOBMC above / left possible, getCURestricted at the corners
+// its gradients read: above's first and last, left's first and last), then per 4-sample unit of the row above the CU
+// (W / 4), then of the column left of it (H / 4), OBMC_UNIT words: the kind of the CU there, the record whose mode
+// (Params::cuMode) is its intra mode there (getIpmInfo) or the source of its vector (-1: the vector follows; else the
+// record of a GPU CU << 1 | 1 for an EIP CU's search, 0 for an IntraTMP CU's), how many units calcGradForOBMC skips
+// for a CU with motion (to its end + 1), the vector (1/16 samples)
+constexpr int OBMC_FLAGS = 0, OBMC_UNITS = 1;
+constexpr int OBMC_U_KIND = 0, OBMC_U_MODE = 1, OBMC_U_SKIP = 2, OBMC_U_MV = 3, OBMC_UNIT = 5;
+constexpr int OBMC_NONE = 0, OBMC_INTRA = 1, OBMC_PLT = 2, OBMC_MOTION = 3, OBMC_MOTION_INVALID = 4;
 constexpr int TMP_SEARCH_FULL = 0, TMP_SEARCH_BEST = 1, TMP_SEARCH_BVG = 2;
 
 #if GPU_TMP
@@ -3798,6 +3809,7 @@ constexpr int TMP_SEARCH_FULL = 0, TMP_SEARCH_BEST = 1, TMP_SEARCH_BVG = 2;
 // template (DC instead), more
 // samples than intra_rec's prediction buffer, no DIMD (the transforms' mode of its prediction), OBMC
 static void tmpSearchRecord( GpuIntraRec::Impl& m, const CodingUnit& cu, Cu& c, int search );
+static bool addTmpObmcRecord( GpuIntraRec::Impl& m, const CodingUnit& cu, Cu& c, const char*& why );
 static bool addTmpRecord( GpuIntraRec::Impl& m, const CodingUnit& cu, Cu& c, const char*& why )
 {
   const SPS& sps = *cu.cs->sps;
@@ -3806,16 +3818,166 @@ static bool addTmpRecord( GpuIntraRec::Impl& m, const CodingUnit& cu, Cu& c, con
         : cu.tempType == NO_TEMPLATE ? "IntraTMP without a template"
         : cu.lwidth() * cu.lheight() > 32 * 32 ? "IntraTMP above 1024 samples"
         : !sps.getUseDimd() ? "IntraTMP without DIMD" : nullptr;
-#if JVET_AK0076_EXTENDED_OBMC_IBC
-  why = why ? why : cu.obmcFlag ? "IntraTMP with OBMC" : nullptr;
-#endif
   if( why )
   {
     return false;
   }
   tmpSearchRecord( m, cu, c, TMP_SEARCH_FULL );
+#if JVET_AK0076_EXTENDED_OBMC_IBC && JVET_AJ0161_OBMC_EXT_WITH_INTRA_PRED
+  return addTmpObmcRecord( m, cu, c, why );
+#else
+  why = cu.obmcFlag ? "IntraTMP with OBMC" : nullptr;
+  return !why;
+#endif
+}
+
+#if JVET_AK0076_EXTENDED_OBMC_IBC && JVET_AJ0161_OBMC_EXT_WITH_INTRA_PRED
+// InterPrediction::isSCC: with palette or BDPCM in the SPS, a CU around it (the units above and left of it until one
+// has no CU, then the non-adjacent positions of getSpatialIpm) of an SCC kind (MotionInfo::isSCC, isRefSCC: palette,
+// BDPCM): then subBlockOBMC does nothing
+static bool obmcIsScc( const PredictionUnit& pu )
+{
+  if( !pu.cs->sps->getPLTMode() && !pu.cs->sps->getBDPCMEnabledFlag() )
+  {
+    return false;
+  }
+  const int unit = pu.cs->pcv->minCUWidth;
+  for( int b = 0; b < 2; b++ )
+  {
+    const int len = ( b == 0 ? pu.lwidth() : pu.lheight() ) / unit;
+    for( int i = 0; i < len; i++ )
+    {
+      const Position        pos = pu.lumaPos().offset( b == 0 ? i * unit : -1, b == 0 ? -1 : i * unit );
+      const PredictionUnit* nb  = pu.cs->getPU( pos, pu.chType );
+      if( !nb )
+      {
+        break;
+      }
+      const MotionInfo mi = nb->getMotionInfo( pos );
+      if( mi.isSCC || mi.isRefSCC || mi.isRefRefSCC )
+      {
+        return true;
+      }
+    }
+  }
+  const unsigned pLevel = pu.cs->sps->getLog2ParallelMergeLevelMinus2() + 2;
+  const int      numNA[4] = { 3, 5, 5, 5 };
+  const int      idxMap[4][5] = { { 0, 1, 4 }, { 0, 1, 2, 3, 4 }, { 0, 1, 2, 3, 4 }, { 0, 1, 2, 3, 4 } };
+  const int      w = pu.Y().width, h = pu.Y().height;
+  for( int d = 0; d < NADISTANCE_LEVEL; d++ )
+  {
+    const int dh = w * ( d + 1 ), dv = h * ( d + 1 );
+    for( int k = 0; k < numNA[d]; k++ )
+    {
+      const int      i  = idxMap[d][k];
+      const int      ox = i == 0 || i == 3 || i == 4 ? -dh - 1 : i == 1 ? w + dh - 1 : w >> 1;
+      const int      oy = i == 0 ? h + dv - 1 : i == 3 ? h >> 1 : -dv - 1;
+      const Position pos = pu.Y().topLeft().offset( ox, oy );
+      const PredictionUnit* nb = pu.cs->getPURestricted( pos, pu, pu.chType );
+      if( nb && PU::isDiffMER( pu.lumaPos(), pos, pLevel ) )
+      {
+        const MotionInfo mi = nb->getMotionInfo( pos );
+        if( mi.isSCC || mi.isRefSCC )
+        {
+          return true;
+        }
+      }
+    }
+  }
+  return false;
+}
+
+// an IntraTMP CU's OBMC (subBlockOBMC: lumaOnly in an intra slice) where it does something: the SPS's OBMC, the CU's
+// obmcFlag, not flipped, 32 samples at least, no SCC CU around it; its record (OBMC_*) of the units above and left of
+// it into Params::timdData. False with why set where the GPU lacks what a unit needs: a CU of both lists' vectors, LIC
+// or alternative LM there (its motion compensation, getSameNeigMotion's comparisons), an SGPM CU on the GPU (its mode
+// per position)
+static bool addTmpObmcRecord( GpuIntraRec::Impl& m, const CodingUnit& cu, Cu& c, const char*& why )
+{
+  const PredictionUnit& pu  = *cu.firstPU;
+  const SPS&            sps = *cu.cs->sps;
+  if( !sps.getUseOBMC() || !cu.obmcFlag || cu.rribcFlipType != 0 || cu.lwidth() * cu.lheight() < 32 || obmcIsScc( pu ) )
+  {
+    return true;
+  }
+  why = cu.ibcLicFlag || cu.licFlag || cu.altLMFlag ? "IntraTMP OBMC of a CU with LIC" : nullptr;
+  const int unit = cu.cs->pcv->minCUWidth, numTop = cu.lwidth() / unit, numLeft = cu.lheight() / unit;
+  std::vector<int32_t> r( OBMC_UNITS + ( numTop + numLeft ) * OBMC_UNIT, 0 );
+  const Position lt = cu.Y().topLeft();
+  auto restricted = [&]( const Position& p ) { return cu.cs->getCURestricted( p, cu, CHANNEL_TYPE_LUMA ) != nullptr; };
+  const bool dimd = sps.getUseDimd();
+  r[OBMC_FLAGS] = ( dimd && cu.cs->getPU( lt.offset( 1, -1 ), CHANNEL_TYPE_LUMA ) ? 1 : 0 )
+                  | ( dimd && cu.cs->getPU( lt.offset( -1, 1 ), CHANNEL_TYPE_LUMA ) ? 2 : 0 )
+                  | ( restricted( lt.offset( -1, -1 ) ) ? 4 : 0 )
+                  | ( restricted( cu.Y().topRight().offset( 1, -1 ) ) ? 8 : 0 )
+                  | ( restricted( lt.offset( -1, -1 ) ) ? 16 : 0 )
+                  | ( restricted( cu.Y().bottomLeft().offset( -1, 1 ) ) ? 32 : 0 );
+  for( int k = 0; k < numTop + numLeft && !why; k++ )
+  {
+    const bool            above = k < numTop;
+    const int             i     = above ? k : k - numTop;
+    const Position        pos   = lt.offset( above ? i * unit : -1, above ? -1 : i * unit );
+    const PredictionUnit* nb    = cu.cs->getPU( pos, CHANNEL_TYPE_LUMA );
+    int32_t*              u     = &r[OBMC_UNITS + k * OBMC_UNIT];
+    u[OBMC_U_MODE] = -1;
+    if( !nb )
+    {
+      u[OBMC_U_KIND] = OBMC_NONE;
+      continue;
+    }
+    const CodingUnit& n  = *nb->cu;
+    const MotionInfo  mi = nb->getMotionInfo( pos );
+    if( mi.isInter )   // (an IBC, IntraTMP, BVG-DIMD or EIP CU with a vector in an intra slice)
+    {
+      u[OBMC_U_SKIP] = ( above ? nb->Y().bottomRight().x - pos.x : nb->Y().bottomRight().y - pos.y ) / unit + 1;
+      const bool invalid = mi.rribcFlipType != 0 || n.tmpFlmFlag || n.tmpFusionFlag || n.ibcFilterFlag
+                           || ( n.ibcLicFlag && n.ibcLicIdx == IBC_LIC_IDX_M ) || n.bvgDimdFlag;
+      u[OBMC_U_KIND] = invalid ? OBMC_MOTION_INVALID : OBMC_MOTION;
+      why = !mi.isIBCmot || mi.interDir != 1 ? "IntraTMP OBMC with a neighbour of two vectors or inter"
+            : !invalid && ( n.ibcLicFlag || n.licFlag || n.altLMFlag ) ? "IntraTMP OBMC with a neighbour with LIC"
+            : nullptr;
+      const auto rec = m.cuIndex[CHANNEL_TYPE_LUMA].find( &n );
+      const bool gpu = rec != m.cuIndex[CHANNEL_TYPE_LUMA].end() && !m.cpuCus.count( &n )
+                       && ( m.cus[rec->second].kind == CU_TMP || ( m.cus[rec->second].kind == CU_EIP && n.eipFlag ) );
+      if( !invalid && gpu )   // (its vector its node's: an IntraTMP CU's DIMD_OUT_TMP_MV, an EIP CU's DIMD_OUT_BV)
+      {
+        u[OBMC_U_MODE] = rec->second << 1 | ( m.cus[rec->second].kind == CU_EIP ? 1 : 0 );
+      }
+      u[OBMC_U_MV]     = mi.mv[0].hor;
+      u[OBMC_U_MV + 1] = mi.mv[0].ver;
+      continue;
+    }
+    u[OBMC_U_KIND] = CU::isPLT( n ) ? OBMC_PLT : OBMC_INTRA;
+    if( u[OBMC_U_KIND] == OBMC_PLT )
+    {
+      continue;
+    }
+    // its mode there (spanIpmInfoIntra): what its record holds for the MPM lists (getIntraDirLuma, a TIMD / TMRL CU's
+    // in the 67-mode set, planar for NN, MIP and EIP), an SGPM CU's of its part there (a CPU one's from its motion
+    // field); a CU from the CPU: its mode there
+    const auto rec = m.cuIndex[CHANNEL_TYPE_LUMA].find( &n );
+    if( m.cpuCus.count( &n ) || rec == m.cuIndex[CHANNEL_TYPE_LUMA].end() )
+    {
+      u[OBMC_U_MODE] = mpmModeCu( m, nb->getIpmInfo( pos ) );
+    }
+    else if( n.sgpm )
+    {
+      why = "IntraTMP OBMC with an SGPM neighbour";
+    }
+    else
+    {
+      u[OBMC_U_MODE] = n.eipFlag ? mpmModeCu( m, PLANAR_IDX ) : rec->second;
+    }
+  }
+  if( why )
+  {
+    return false;
+  }
+  m.timdData[c.tmp + TMP_HEAD_OBMC] = (int32_t) m.timdData.size();
+  m.timdData.insert( m.timdData.end(), r.begin(), r.end() );
   return true;
 }
+#endif
 
 // the search's record (TMP_SEARCH_*) of an IntraTMP CU, of an EIP CU with a vector (IntraPrediction's mtmpNumSparse
 // of 1: the sparse search's best alone) or of a BVG-DIMD CU (mtmpNumSparse 1 too, no top-left lists, its refined list
@@ -3871,6 +4033,7 @@ static void tmpSearchRecord( GpuIntraRec::Impl& m, const CodingUnit& cu, Cu& c, 
     h[TMP_HEAD_REGIONS + 4 * r + 3] = verMax - y;
   }
   h[TMP_HEAD_FRAC] = search == TMP_SEARCH_FULL && cu.tmpFracIdx != 0 ? 1 : 0;
+  h[TMP_HEAD_OBMC] = -1;
   c.tmp = (int32_t) m.timdData.size();
   m.timdData.insert( m.timdData.end(), h, h + TMP_HEAD );
   m.blendBlocks = true;   // (its node's lists take the workgroup's scratch)

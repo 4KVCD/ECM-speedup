@@ -36,7 +36,8 @@ const int TMP_HEAD_BIG_CTU    = 6;   // the CTU is larger than 128 (the clusteri
 const int TMP_HEAD_SEARCH     = 7;   // what the search is for (TMP_SEARCH_*)
 const int TMP_HEAD_REGIONS    = 8;   // per regionId mvXMin, mvXMax, mvYMin, mvYMax (clipMvIntraConstraint), 6 x 4
 const int TMP_HEAD_FRAC       = TMP_HEAD_REGIONS + 24;   // tmpFracIdx: its block's vector is the sub-sample search's
-const int TMP_HEAD            = TMP_HEAD_FRAC + 1;
+const int TMP_HEAD_OBMC       = TMP_HEAD_FRAC + 1;       // its OBMC record (intra_obmc.glsl's OBMC_*), else -1
+const int TMP_HEAD            = TMP_HEAD_OBMC + 1;
 const int TMP_SEARCH_FULL = 0;   // an IntraTMP CU's list
 const int TMP_SEARCH_BEST = 1;   // an EIP CU with a vector: the sparse search's best alone (mtmpNumSparse 1)
 const int TMP_SEARCH_BVG  = 2;   // a BVG-DIMD CU's (JVET-AL0108): MAX_BVG_ROUGH_NUM 1, its own refinement
@@ -1017,22 +1018,4 @@ void tmpNode( Cu c, int cuIndex, int bitDepth, int lid, int NT )
 
 // ----- the block
 
-// IntraTMP block t's prediction into s_spPred (all invocations): the reconstruction at the vector of its CU's list that
-// tmpIdx selects (generateTMPrediction), which its CU's node has put in its DimdOut's DIMD_OUT_BV; at a sub-sample
-// vector (DIMD_OUT_TMP_MV) getPredIBCBlk's interpolation over its CU, xPredIBCBlkPadding's region moved by 1 where
-// the vector's integer part lies left of / above that vector (deltaX / deltaY)
-void tmpPredict( Tu t, int lid, int NT )
-{
-  CBufI32     o     = CBufI32( P.dimdOut );
-  const int   at    = t.cu * DIMD_OUT;
-  const ivec2 bv    = bvUnpack( o.v[at + DIMD_OUT_BV] );
-  const ivec2 mv    = ivec2( o.v[at + DIMD_OUT_TMP_MV], o.v[at + DIMD_OUT_TMP_MV + 1] );
-  const ivec2 delta = ivec2( ( mv.x >> 4 ) < bv.x ? 1 : 0, ( mv.y >> 4 ) < bv.y ? 1 : 0 );
-  const Cu    c     = BufCu( P.cus ).v[t.cu];
-  for( int i = lid; i < t.w * t.h; i += NT )
-  {
-    s_spPred[i] = int16_t( ibcPredict( c.x, c.y, c.w, c.h, mv, false, t.x - c.x + i % t.w, t.y - c.y + i / t.w, g_ti,
-                                       t.bitDepth, delta ) );
-  }
-  SYNC();
-}
+// (IntraTMP block t's prediction, tmpPredict: intra_obmc.glsl, which predicts its OBMC's motion runs with it)
