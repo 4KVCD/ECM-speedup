@@ -362,6 +362,20 @@ constexpr int CU_SGPM_MPM    = 16;  // luma: what the MPM lists read of an SGPM 
 constexpr int CU_CHROMA_DBV  = 17;  // chroma: DBV of a single tree: its node DBV_MODE where the CU's luma (IntraTMP,
                                     // BVG-DIMD, EIP with a vector) has a vector, else planar; its blocks the copy at it
 constexpr int DBV_MODE       = 74;  // intra_common.glsl's (DBV_CHROMA_IDX)
+constexpr int CU_CHROMA_REORDER = 18;   // chroma: chroma reordering (JVET-AH0136, intra_reorder.glsl): its node the
+                                        // list of deriveNonCcpChromaModes ranked by template costs, the entry of the
+                                        // parsed index; Cu::nbr: CHROMA_TMRL_NBR_LUMA / _CHROMA's CUs, then at
+                                        // CR_NBR_TEMPLATE its chroma template's record (-1: none)
+constexpr int CR_NBR_TEMPLATE = 10;
+constexpr int CR_NBR_DBV      = 12;     // its DBV sources' record (-1: no DBV entries): their number, then per source a
+                                        // luma CU record (-1: none), the CPU's adjusted vector (x, y) and flip
+constexpr int CR_NBR_SIDES    = 13;     // its template's sides predChromaTM / refineChromaBv read: 1 above, 2 left
+constexpr int CR_NBR_DM       = 11;     // its DM mode's source: -1 the co-located luma CU's mode, -2 its DimdOut's (an
+                                        // NN CU's block), else that mode
+constexpr int CR_LIST_MAX     = 7;      // the list's entries a CU's index selects from (existNum)
+// its DimdOut: its DIMD chroma's modes (0, 1), the strongest five (dimdBlendModeChroma, 2..6), the list's length (9)
+// and entries (10..)
+constexpr int DIMD_OUT_CR_NUM = 9, DIMD_OUT_CR_LIST = 10, DIMD_OUT_CR_DBV = 17;   // (then the DBV vector, flip)
 #if JVET_AC0071_DBV
 static_assert( DBV_MODE == DBV_CHROMA_IDX, "intra_common.glsl's DBV_MODE" );
 #endif
@@ -372,8 +386,8 @@ static const char* cuKindName( int kind )
   static const char* const NAMES[] = { "known mode", "MPM", "chroma DM", "chroma candidate", "DIMD", "DIMD chroma",
                                        "OBIC", "intra merge", "TIMD", "TMRL", "chroma TMRL", "EIP",
                                        "known mode (131)", "IntraTMP", "BVG-DIMD", "SGPM", "SGPM's MPM mode",
-                                       "DBV chroma" };
-  return kind >= 0 && kind <= CU_CHROMA_DBV ? NAMES[kind] : "?";
+                                       "DBV chroma", "chroma reordering" };
+  return kind >= 0 && kind <= CU_CHROMA_REORDER ? NAMES[kind] : "?";
 }
 
 // an EIP CU's record in Params::timdData (intra_common.glsl's EIP_HEAD_*; layout shared): its index (Params::eipOut),
@@ -529,6 +543,13 @@ static_assert( MTSS_LIST_SIZE == 3, "MTSS's mode list" );
 #define GPU_CHROMA_TMRL 1
 #else
 #define GPU_CHROMA_TMRL 0
+#endif
+// chroma reordering (JVET-AH0136's deriveNonCcpChromaModes; intra_reorder.glsl): the co-located luma block's
+// prediction and SATD of chroma TMRL, the chroma templates of CFLM's kind (predTimdIntraAng)
+#if GPU_CHROMA_TMRL && JVET_AC0071_DBV && JVET_Z0050_DIMD_CHROMA_FUSION && ENABLE_DIMD
+#define GPU_CHROMA_REORDER 1
+#else
+#define GPU_CHROMA_REORDER 0
 #endif
 // the MPM lists the kernels have (intra_mpm.glsl): MPM sorting (JVET-AD0085) by TMRL's SATD of a template one sample
 // thick, MDIP (JVET-AK0059) and PDP's list (JVET-AK0061) with JVET-AL0125's improvements, PDP's template predictions
@@ -2100,6 +2121,8 @@ struct GpuIntraRec::Impl
   int                                                  numCcp = 0;
   std::unordered_map<const PredictionUnit*, int32_t>  ccpIndex;
   std::unordered_set<const CodingUnit*>                cpuChromaPending;   // CPU CUs whose chroma waits (cpuFillCu)
+  std::unordered_map<const PredictionUnit*, int32_t>  reorderIdx;   // chroma reordering's parsed indices (DecCu)
+  int                                                  numReorderCpu = 0;   // its CUs left the CPU's mode
   std::vector<const PredictionUnit*>                   ccpPu;
   std::vector<const PredictionUnit*>                   untypedCcpPu;   // the chroma PUs without a record
   // CCP merge (Params::ccpData, assembled at endPicture): per record its blocks (CCP_WRITERS), the records
@@ -2181,6 +2204,7 @@ struct GpuIntraRec::Impl
   std::unordered_set<int32_t>                                  ccpInterCccm;   // the records of inter CCCM models
   std::map<std::pair<const Picture*, int>, int32_t>            ccpTemporal;
   std::map<std::string, int>  cpuReasons;        // totals: why CUs were taken from the CPU
+  std::map<std::string, int>  reorderCpu;        // totals: why chroma reordering CUs kept the CPU's mode
 
   // totals
   int                         numPictures = 0, numVerified = 0, numMismatch = 0, numSkipped = 0;
@@ -2287,6 +2311,15 @@ GpuIntraRec::~GpuIntraRec()
         }
         printf( "\n" );
       }
+      if( !m.reorderCpu.empty() )
+      {
+        printf( "[gpu-intra] chroma reordering CUs with the CPU's mode:" );
+        for( const auto& r: m.reorderCpu )
+        {
+          printf( " %s %d;", r.first.c_str(), r.second );
+        }
+        printf( "\n" );
+      }
     }
   }
 }
@@ -2353,7 +2386,8 @@ bool GpuIntraRec::supported( const Slice& slice, std::string& why, bool partial 
   else if( sps.getUseDimd() && !GPU_DIMD )                                                why = "DIMD of another configuration";
   else if( sps.getUseTimd() && !GPU_TIMD )                                                why = "TIMD of another configuration";
   else if( partial )                                                                      return true;
-  else if( sps.getUseChromaReordering() || sps.getUseIntraDBV() )                         why = "chroma reordering / DBV";
+  // chroma reordering and DBV: the GPU's per CU (CU_CHROMA_REORDER, CU_CHROMA_DBV), what it lacks rejected by record()
+  else if( ( sps.getUseChromaReordering() || sps.getUseIntraDBV() ) && !GPU_CHROMA_REORDER ) why = "chroma reordering / DBV";
   else if( sps.getUseBvgDimd() )                                                          why = "BVG-DIMD";
   else if( sps.getUseMdip() || sps.getUseMpmSorting() )                                   why = "MDIP / MPM sorting";
   // (also what leaves TIMD's block vector candidates empty, JVET-AM0138's: they come from IntraTMP / IBC CUs and the
@@ -2413,6 +2447,8 @@ void GpuIntraRec::beginPicture( const CodingStructure& cs )
   m.numCcp = 0;
   m.ccpIndex.clear();
   m.cpuChromaPending.clear();
+  m.reorderIdx.clear();
+  m.numReorderCpu = 0;
   m.ccpPu.clear();
   m.untypedCcpPu.clear();
   m.ccpWriters.clear();
@@ -3378,6 +3414,192 @@ static bool addMpmNeighbours( GpuIntraRec::Impl& m, const CodingUnit& cu, Cu& c,
   }
   return true;
 }
+
+#if GPU_CHROMA_REORDER
+// whether chroma PU pu of CU cu takes chroma reordering on the GPU (record c: its parsed index, the CUs its list reads,
+// its DM mode's source, its DBV sources, its template's record): DecCu's conditions (a non-LM, non-TMRL, non-BDPCM
+// chroma CU of a separate tree in an intra slice with the SPS's switch) and those of the GPU's derivation - a dual
+// tree (not an adaptive dual tree's separate tree), its parsed index known, with DBV candidates no LM chroma fusion
+// (xCflmCreateChromaPred's DBV branch) and one chroma block, luma and chroma of the same bit depth up to 10 bits (the
+// SATD's 16-bit lanes), 4:2:0, the picture the SPS's size (the co-located luma availability), its neighbours recorded,
+// with DBV both sides of its template where its template type has them; else fallback says why: the CU keeps the
+// CPU's mode (partial verification) or the picture is rejected (ON)
+static bool chromaReorderCu( GpuIntraRec::Impl& m, const CodingUnit& cu, const PredictionUnit& pu, Cu& c,
+                             const char*& fallback )
+{
+  fallback = nullptr;
+  const CodingStructure& cs  = *cu.cs;
+  const SPS&             sps = *cs.sps;
+  if( !sps.getUseChromaReordering() || !cu.slice->isIntra() || pu.chromaTmrlFlag || cu.bdpcmModeChroma
+      || PU::isLMCMode( pu.intraDir[CHANNEL_TYPE_CHROMA] ) || ( !CS::isDualITree( cs ) && !( cu.isSST && cu.separateTree ) ) )
+  {
+    return false;
+  }
+  if( !CS::isDualITree( cs ) )   // (an adaptive dual tree's separate tree: getLumaPU's co-located luma)
+  {
+    m.numReorderCpu++;
+    m.reorderCpu["a separate tree"]++;
+    fallback = "chroma reordering of a separate tree";
+    return false;
+  }
+  m.numReorderCpu++;   // (until it is the GPU's)
+  const auto      idx = m.reorderIdx.find( &pu );
+  const CompArea& cb  = pu.Cb();
+  const char*     why = idx == m.reorderIdx.end() ? "no parsed index"
+                        : PU::hasChromaBvFlag( pu ) && pu.isChromaFusion ? "DBV with LM chroma fusion"
+                        : PU::hasChromaBvFlag( pu ) && cu.firstTU != cu.lastTU ? "DBV in a CU of several blocks"
+                        : c.lumaCu < 0 ? "no luma record"
+                        : cu.chromaFormat != CHROMA_420 || sps.getBitDepth( CHANNEL_TYPE_LUMA ) > 10
+                              || sps.getBitDepth( CHANNEL_TYPE_CHROMA ) != sps.getBitDepth( CHANNEL_TYPE_LUMA )
+                            ? "format or bit depth"
+                        : (int) sps.getMaxPicWidthInLumaSamples() != cs.pps->getPicWidthInLumaSamples()
+                              || (int) sps.getMaxPicHeightInLumaSamples() != cs.pps->getPicHeightInLumaSamples()
+                            ? "a picture smaller than the SPS's"
+                            : nullptr;
+  if( why )
+  {
+    m.reorderCpu[why]++;
+    fallback = why;
+    return false;
+  }
+  // buildChromaModeList's sources: the luma CUs at five positions of the co-located area (getIntraDirLuma's modes: a
+  // CU without a record - IBC's - a record of its parsed mode) and the chroma CUs at five positions (intra, not LM;
+  // the node skips those of a DBV mode), as chroma TMRL's
+  CompArea lumaArea( COMPONENT_Y, pu.chromaFormat, cb.lumaPos(), recalcSize( pu.chromaFormat, CHANNEL_TYPE_CHROMA, CHANNEL_TYPE_LUMA, cb.size() ) );
+  lumaArea = clipArea( lumaArea, cs.picture->block( COMPONENT_Y ) );
+  const Position lumaPos[5] = { lumaArea.center(), lumaArea.topLeft(), lumaArea.topRight(), lumaArea.bottomLeft(), lumaArea.bottomRight() };
+  int32_t nbr[2 * 5];
+  for( int k = 0; k < 5; k++ )
+  {
+    const PredictionUnit* lumaPU = cs.getLumaPU( lumaPos[k], CHANNEL_TYPE_LUMA );
+    if( !lumaPU )
+    {
+      m.reorderCpu["no luma PU"]++;
+      fallback = "chroma reordering without a luma PU";
+      return false;
+    }
+    const auto rec = m.cuIndex[CHANNEL_TYPE_LUMA].find( lumaPU->cu );
+    const CodingUnit& n = *lumaPU->cu;
+    if( rec == m.cuIndex[CHANNEL_TYPE_LUMA].end() || n.eipFlag || n.tmpFlag )
+    {
+      int mode = (int) PU::getIntraDirLuma( *lumaPU, 0 );
+      mode = n.timd || n.tmrlFlag ? ( mode < 2 ? mode : ( mode >> 1 ) + 1 ) : mode == PNN_IDX ? PLANAR_IDX : mode;
+      nbr[k] = mpmModeCu( m, mode );
+    }
+    else
+    {
+      nbr[k] = rec->second;
+    }
+  }
+  const Position chromaPos[5] = { pu.chromaPos().offset( -1, cb.height - 1 ), pu.chromaPos().offset( cb.width - 1, -1 ),
+                                  pu.chromaPos().offset( -1, cb.height ), pu.chromaPos().offset( cb.width, -1 ),
+                                  pu.chromaPos().offset( -1, -1 ) };
+  for( int k = 0; k < 5; k++ )
+  {
+    const PredictionUnit* nb = PU::getPUFromPos( pu, CHANNEL_TYPE_CHROMA, chromaPos[k] );
+    nbr[5 + k] = -1;
+    if( !nb || !CU::isIntra( *nb->cu ) || PU::isLMCMode( nb->intraDir[1] ) )
+    {
+      continue;
+    }
+    const auto rec = m.cuIndex[CHANNEL_TYPE_CHROMA].find( nb->cu );
+    if( rec == m.cuIndex[CHANNEL_TYPE_CHROMA].end() )
+    {
+      m.reorderCpu["a chroma neighbour not recorded"]++;
+      fallback = "chroma reordering with a chroma neighbour not recorded";
+      return false;
+    }
+    nbr[5 + k] = rec->second;
+  }
+  std::copy_n( nbr, 10, c.nbr );
+  c.ipredIdx = idx->second;
+  // the DM mode (getCoLocatedIntraLumaMode): the co-located luma CU's mode as its record has it, of an NN CU the DIMD
+  // of its prediction its block derives (getCoLocatedIdxRepresentationPnn; of one from the CPU the CPU's)
+  c.nbr[CR_NBR_DM] = -1;
+  if( PU::getCoLocatedIntraLumaMode( pu ) == PNN_IDX )
+  {
+    const CodingUnit& lumaCu = *PU::getCoLocatedLumaPU( pu ).cu;
+    c.nbr[CR_NBR_DM] = m.cpuCus.count( &lumaCu ) ? (int32_t) lumaCu.indicesRepresentationPnn[COMPONENT_Y][0] : -2;
+  }
+  // DBV (hasChromaBvFlag): deriveChromaBv's sources, the luma CUs at the five positions with a block vector (IBC,
+  // IntraTMP, BVG-DIMD, EIP with a vector) in its order, each as the GPU reads its vector - a GPU CU's record (its
+  // node's mv[0]; no flip: only IBC has one), else the CPU's vector moved by adjustChromaBv and its flip, an IBC CU of
+  // two vectors also its second -, and the template's sides predChromaTM and refineChromaBv read (the GPU requires
+  // those of the CU's template type: one it lacks leaves stale samples the CPU's cost reads)
+  c.nbr[CR_NBR_DBV]   = -1;
+  c.nbr[CR_NBR_SIDES] = 0;
+  if( PU::hasChromaBvFlag( pu ) )
+  {
+    const PredictionUnit* above = cs.getPURestricted( cb.topRight().offset( 0, -1 ), pu, CHANNEL_TYPE_CHROMA );
+    const PredictionUnit* left  = cs.getPURestricted( cb.bottomLeft().offset( -1, 0 ), pu, CHANNEL_TYPE_CHROMA );
+    const bool            top = above && above->cu != &cu, lft = left && left->cu != &cu;
+    if( ( cb.x > 0 && cb.y > 0 && !( top && lft ) ) || ( cb.x > 0 && cb.y == 0 && !lft )
+        || ( cb.x == 0 && cb.y > 0 && !top ) )
+    {
+      m.reorderCpu["DBV with a template side unavailable"]++;
+      fallback = "chroma reordering's DBV with a template side unavailable";
+      return false;
+    }
+    c.nbr[CR_NBR_SIDES] = ( top ? 1 : 0 ) | ( lft ? 2 : 0 );
+    std::vector<int32_t> src( 1, 0 );
+    for( int k = 0; k < 5; k++ )
+    {
+      const PredictionUnit& lp = *cs.getLumaPU( lumaPos[k], CHANNEL_TYPE_LUMA );
+      const CodingUnit&     n  = *lp.cu;
+      if( !( CU::isIBC( n ) || PU::isTmp( lp ) || PU::hasBvgBv( lp ) || PU::isBvEip( lp ) ) )
+      {
+        continue;
+      }
+      const auto rec  = m.cuIndex[CHANNEL_TYPE_LUMA].find( &n );
+      const int  kind = rec != m.cuIndex[CHANNEL_TYPE_LUMA].end() ? m.cus[rec->second].kind : -1;
+      const bool gpu  = !CU::isIBC( n ) && !m.cpuCus.count( &n )
+                       && ( kind == CU_TMP || kind == CU_BVG || ( kind == CU_EIP && m.cus[rec->second].tmp >= 0 ) );
+      if( gpu )
+      {
+        CHECK( n.rribcFlipType != 0, "a flipped IntraTMP / BVG-DIMD / EIP CU" );
+        src.insert( src.end(), { rec->second, 0, 0, 0 } );
+      }
+      else
+      {
+        const Mv bv = PU::adjustChromaBv( lp, lumaArea );
+        src.insert( src.end(), { -1, bv.hor, bv.ver, n.rribcFlipType } );
+      }
+      src[0]++;
+      if( CU::isIBC( n ) && lp.interDir == 3 )
+      {
+        const Mv bv = PU::adjustChromaBv( lp, lumaArea, REF_PIC_LIST_1 );
+        src.insert( src.end(), { -1, bv.hor, bv.ver, n.rribcFlipType } );
+        src[0]++;
+      }
+    }
+    c.nbr[CR_NBR_DBV] = (int32_t) m.timdData.size();
+    m.timdData.insert( m.timdData.end(), src.begin(), src.end() );
+  }
+  m.numReorderCpu--;
+  // the chroma templates (predChromaTM: xFillTimdReferenceSamples with templates of one sample on both sides, also at
+  // the picture's top or left edge, its arms 2 x the template block's sides, CFLM's), none for a CU at the picture's
+  // top-left corner (NO_NEIGHBOR)
+  c.nbr[CR_NBR_TEMPLATE] = -1;
+  if( cb.x > 0 || cb.y > 0 )
+  {
+    std::vector<int32_t> bits;
+    const TemplateUnits  u  = templateUnits( cu, cb, 1, 1, CFLM_REF_SHIFT, bits );
+    const int32_t*       up = reinterpret_cast<const int32_t*>( &u );
+    CHECK( u.totalUnits > TIMD_UNITS_MAX, "chroma reordering's reference units" );
+    c.nbr[CR_NBR_TEMPLATE] = (int32_t) m.timdData.size();
+    m.timdData.insert( m.timdData.end(), up, up + sizeof( u ) / 4 );
+    m.timdData.insert( m.timdData.end(), bits.begin(), bits.end() );
+  }
+  return true;
+}
+
+void GpuIntraRec::chromaReorderIndex( const PredictionUnit& pu, int idx )
+{
+  m_impl->reorderIdx[&pu] = idx;
+}
+#else
+void GpuIntraRec::chromaReorderIndex( const PredictionUnit&, int ) {}
+#endif
 
 // the CUs whose modes chroma TMRL PU pu's list reads (getChromaTmrlSearchRange; Cu::nbr from CHROMA_TMRL_NBR_LUMA): the
 // luma CUs at the centre and the four corners of the co-located luma area (clipped to the picture), then the chroma CUs
@@ -4810,6 +5032,7 @@ static int32_t cuRecord( GpuIntraRec::Impl& m, const TransformUnit& tu, const Co
     // (partial verification: the CPU's DM or candidate mode where chroma reordering reorders them, which the GPU lacks)
     const bool lumaDerived = c.lumaCu >= 0 && m.cus[c.lumaCu].kind != CU_KNOWN && !cu.bdpcmModeChroma
                              && !( m.partial && cu.cs->sps->getUseChromaReordering() );
+    const char* crFallback = nullptr;   // (chroma reordering the GPU lacks for the CU: the CPU's mode, or ON's rejection)
     if( m.deriveModes && pu.chromaTmrlFlag )
     {
       // chroma TMRL (DecCu at the Cb block: deriveDimdChromaMode, then getChromaTmrlList): from its DIMD chroma, the
@@ -4827,8 +5050,26 @@ static int32_t cuRecord( GpuIntraRec::Impl& m, const TransformUnit& tu, const Co
       m.cpuTmrl.push_back( pu.chromaMrlIdx );
       addDimdCalls( m, cu, chType, c );
     }
+#if GPU_CHROMA_REORDER
+    else if( m.deriveModes && chromaReorderCu( m, cu, pu, c, crFallback ) )
+    {
+      // chroma reordering (DecCu at the Cb block: deriveDimdChromaMode, deriveNonCcpChromaModes): its node ranks the
+      // list by template costs (with DIMD its DIMD chroma's modes), waiting for all before it (it reads the co-located
+      // luma block and its neighbourhood); a reference filter by the SPS's smoothing switch
+      c.kind = CU_CHROMA_REORDER;
+      if( cu.cs->sps->getUseDimd() )
+      {
+        addDimdCalls( m, cu, chType, c );
+      }
+    }
+    else if( crFallback && !m.partial )
+    {
+      why = crFallback;
+      return -1;
+    }
+#endif
 #if JVET_AC0071_DBV
-    else if( m.deriveModes && PU::isDbvMode( pu.intraDir[CHANNEL_TYPE_CHROMA] ) )
+    else if( m.deriveModes && PU::isDbvMode( pu.intraDir[CHANNEL_TYPE_CHROMA] ) && !CS::isDualITree( *cu.cs ) )
     {
       // DBV of a single tree (record() takes no other): its node DBV_MODE where the CU's own luma, of a kind whose
       // node publishes its vector, has one, else planar (getFinalIntraMode); it waits for all before it (the copy may
@@ -4902,6 +5143,10 @@ static int32_t cuRecord( GpuIntraRec::Impl& m, const TransformUnit& tu, const Co
     node.unitH     = cu.cs->pcv->minCUHeight >> ( noShift ? 0 : getComponentScaleY( ComponentID( node.comp ), cu.cs->sps->getChromaFormatIdc() ) );
     node.disableRefFilter = cu.cs->sps->getDisableRefFilter();
     node.derive   |= c.kind == CU_CHROMA_DBV ? DERIVE_PREFIX : 0;
+    node.derive   |= c.kind == CU_CHROMA_REORDER
+                     ? DERIVE_PREFIX
+                       | ( cu.cs->sps->getSpsRangeExtension().getIntraSmoothingDisabledFlag() ? DERIVE_NO_SMOOTHING : 0 )
+                     : 0;
     c.node         = (int32_t) m.rec.size();
     if( m.partial )
     {
@@ -4923,6 +5168,25 @@ static int32_t cuRecord( GpuIntraRec::Impl& m, const TransformUnit& tu, const Co
     d[0] = cu.dimdChromaMode;
     d[1] = cu.dimdChromaModeSecond;
   }
+#if GPU_CHROMA_REORDER
+  else if( c.kind == CU_CHROMA_REORDER )
+  {
+    d[0] = cu.dimdChromaMode;
+    d[1] = cu.dimdChromaModeSecond;
+    std::copy_n( cu.dimdBlendModeChroma, 5, d + 2 );
+    d[DIMD_OUT_CR_NUM] = ( cu.cs->sps->getUseDimd() ? 6 : 5 ) + ( PU::hasChromaBvFlag( pu ) ? 1 : 0 );
+    for( int k = 0; k < d[DIMD_OUT_CR_NUM]; k++ )
+    {
+      d[DIMD_OUT_CR_LIST + k] = cu.chromaList[k];
+    }
+    if( PU::isDbvMode( pu.intraDir[CHANNEL_TYPE_CHROMA] ) )   // (the chosen DBV entry's vector and flip)
+    {
+      d[DIMD_OUT_CR_DBV]     = pu.mv[0].hor;
+      d[DIMD_OUT_CR_DBV + 1] = pu.mv[0].ver;
+      d[DIMD_OUT_CR_DBV + 2] = cu.rribcFlipType;
+    }
+  }
+#endif
   else if( c.kind == CU_MERGE )
   {
     d[0] = cu.dimdModeMerge;
@@ -5735,13 +5999,14 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
   // DBV (JVET-AC0071, the parsed DBV_CHROMA_IDX): of a single tree (predIntraDbv's first branch) the copy at the vector
   // of the CU's own luma (an IntraTMP, BVG-DIMD or EIP-with-vector CU, its node's: CU_CHROMA_DBV), planar where it has
   // none; its CU one chroma block (predIntraDbv copies at the PU's position), 4:2:0, without LM chroma fusion
-  // (geneChromaFusionPred after it), IBC's LIC or an RR-IBC flip. A dual tree's (chroma reordering's list,
-  // deriveChromaBv's luma CUs, refineChromaBv's template matching, the flipped reconstruction) is not on the GPU yet
-  else if( dbv && ( CS::isDualITree( cs ) || ( cu.isSST && cu.separateTree ) ) ) why = "DBV (dual tree)";
-  else if( dbv && ( !GPU_TMP || !m.deriveModes ) )                  why = "DBV";
+  // (geneChromaFusionPred after it), IBC's LIC or an RR-IBC flip. A dual tree's: chroma reordering's (CU_CHROMA_REORDER:
+  // its node takes deriveChromaBv's vectors, refineChromaBv's template matching, the flip), without LM chroma fusion;
+  // an adaptive dual tree's separate tree's is not on the GPU
+  else if( dbv && cu.isSST && cu.separateTree && !CS::isDualITree( cs ) ) why = "DBV (separate tree)";
+  else if( dbv && !CS::isDualITree( cs ) && ( !GPU_TMP || !m.deriveModes ) ) why = "DBV";
   else if( dbv && ( cu.chromaFormat != CHROMA_420 || area != cu.blocks[compID] ) )
     why = "DBV of a CU with several chroma blocks or not 4:2:0";
-  else if( dbv && ( pu.isChromaFusion || cu.rribcFlipType || cu.ibcLicFlag ) )
+  else if( dbv && ( pu.isChromaFusion || ( !CS::isDualITree( cs ) && ( cu.rribcFlipType || cu.ibcLicFlag ) ) ) )
     why = "DBV with LM chroma fusion, LIC or a flip";
 #endif
 #if JVET_AH0209_PDP
@@ -5895,6 +6160,12 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
     if( cuIdx < 0 )
     {
       reject( why );
+      return;
+    }
+    // a dual tree's DBV: chroma reordering's (its node derives the vector) only
+    if( dbv && CS::isDualITree( cs ) && m.cus[cuIdx].kind != CU_CHROMA_REORDER )
+    {
+      reject( "DBV (dual tree)" );
       return;
     }
   }
@@ -6481,6 +6752,15 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
       }
     }
   }
+#if GPU_CHROMA_REORDER
+  // an NN block's DIMD of its prediction (indicesRepresentationPnn) also where its transforms do not read it (no
+  // coefficients, transform skip): the DM mode of chroma reordering's list (getCoLocatedIdxRepresentationPnn)
+  if( pnn && cuIdx >= 0 && !( t.derive & DERIVE_PNN_DIMD ) && sps.getUseChromaReordering() && CS::isDualITree( cs ) )
+  {
+    t.derive |= DERIVE_PNN_DIMD;
+    m.cuMipDimd[cuIdx] = 2;
+  }
+#endif
   if( signPred && ( !t.cbf || ts || area.width < 4 || area.height < 4 || area.width > 32 || area.height > 32 ) )
   {
     reject( "sign prediction of a block outside TU::getUseSignPred's conditions" );
@@ -8281,7 +8561,7 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
   for( const Tu& t: m.rec )
   {
     dimd              = dimd || ( t.derive & ( DERIVE_DIMD | DERIVE_OBIC | DERIVE_MERGE | DERIVE_MIP_DIMD | DERIVE_CCLM_DIMD ) );
-    derivedTransforms = derivedTransforms || ( t.derive & DERIVE_TRANSFORM );
+    derivedTransforms = derivedTransforms || ( t.derive & ( DERIVE_TRANSFORM | DERIVE_PNN_DIMD ) );
     cclm              = cclm || ( t.lm & LM_ACTIVE );
     cccm              = cccm || ( ( t.lm >> LM_CCCM_SHIFT ) & 3 );   // (LM chroma fusion's first type too)
     cflm              = cflm || lmFusionType( t ) > 1;
@@ -8682,11 +8962,12 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
     const bool mipDimd = m.cuMipDimd[u] != 0;   // a MIP CU: its block's modes of its prediction (DERIVE_MIP_DIMD)
     const bool params  = c.dimd >= 0 || c.merge >= 0;   // DIMD_OUT_PARAMS (a TIMD merge CU has MTSS's fields only)
     const bool chroma  = c.kind == CU_CHROMA_DIMD || c.kind == CU_CHROMA_TMRL;   // its DIMD chroma's two modes
+    const bool reorder = c.kind == CU_CHROMA_REORDER;   // its DIMD chroma's, the strongest five, its list
     const bool tmp     = c.kind == CU_TMP;   // its node's list, its block's modes of its prediction
     const bool bvg     = c.kind == CU_BVG;   // its blend (in DIMD's fields), its vectors and their weights
     const bool sgpm    = c.kind == CU_SGPM;  // its choice (also without a DIMD: the SPS's DIMD off), regression's model
     const bool rsgpm   = sgpm && ( m.timdData[c.sgpm + SGPM_HEAD_FLAGS] & SGPM_REGRESSION ) != 0;
-    if( !params && c.mtss < 0 && !mipDimd && !tmp && !bvg && !sgpm )
+    if( !params && c.mtss < 0 && !mipDimd && !tmp && !bvg && !sgpm && !reorder )
     {
       continue;
     }
@@ -8698,7 +8979,12 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
       // (an EIP CU with a vector: that of its search, pu.bv)
       const bool vector   = c.kind == CU_DIMD || c.kind == CU_OBIC || c.kind == CU_MERGE;
       const bool eipBv    = c.kind == CU_EIP && c.tmp >= 0;
-      const bool compared = bvg ? k < DIMD_OUT_PARAMS || k == DIMD_OUT_TR_SECOND
+      const int  crNum    = reorder ? m.cpuDimd[u * DIMD_OUT + DIMD_OUT_CR_NUM] : 0;
+      const bool crDbv    = reorder && m.cpuDimd[u * DIMD_OUT + DIMD_OUT_CR_DBV + 2] >= 0
+                            && ( m.cpuDimd[u * DIMD_OUT + DIMD_OUT_CR_DBV] != 0 || m.cpuDimd[u * DIMD_OUT + DIMD_OUT_CR_DBV + 1] != 0 );
+      const bool compared = reorder ? ( k < 7 && c.dimd >= 0 ) || ( k >= DIMD_OUT_CR_NUM && k < DIMD_OUT_CR_LIST + crNum )
+                                        || ( crDbv && k >= DIMD_OUT_CR_DBV && k < DIMD_OUT_CR_DBV + 3 )
+                            : bvg ? k < DIMD_OUT_PARAMS || k == DIMD_OUT_TR_SECOND
                                   || ( k >= DIMD_OUT_BVG_NUM && k < DIMD_OUT_BVG_WEIGHT + BVG_DIMD_BV_LIST_SIZE )
                                   || ( k >= DIMD_OUT_MTSS_LIST && k < DIMD_OUT_BV_FLAG && c.mtss >= 0 )
                             : k >= DIMD_OUT_EXT_FLAGS ? ( c.kind == CU_MERGE && k < DIMD_OUT_EXT_BV + 8 )
@@ -8745,6 +9031,25 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
             {
               first += " " + std::to_string( int16_t( l[DIMD_OUT_TMP_BV + i] ) ) + ","
                        + std::to_string( l[DIMD_OUT_TMP_BV + i] >> 16 );
+            }
+          }
+          firstCu = u;
+          break;
+        }
+        if( reorder && k >= DIMD_OUT_CR_NUM )   // (chroma reordering's list: both in full)
+        {
+          char buf[200];
+          snprintf( buf, sizeof( buf ), "%s of CU %d (chroma reordering at %d,%d %dx%d): CPU %d GPU %d",
+                    k == DIMD_OUT_CR_NUM ? "existNum" : k < DIMD_OUT_CR_DBV ? "chromaList" : "the DBV vector / flip",
+                    (int) u, c.x, c.y, c.w, c.h, h[k], g[k] );
+          first = buf;
+          for( int s = 0; s < 2; s++ )
+          {
+            const int32_t* l = s == 0 ? h : g;
+            first += s == 0 ? "; CPU list" : "; GPU list";
+            for( int i = 0; i < crNum; i++ )
+            {
+              first += " " + std::to_string( l[DIMD_OUT_CR_LIST + i] );
             }
           }
           firstCu = u;
@@ -9275,6 +9580,7 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
     numMipDimd += ( t.derive & DERIVE_MIP_DIMD ) != 0;
     numInherited += ( t.derive & ( DERIVE_INHERIT_HOR | DERIVE_INHERIT_VER ) ) != 0;
   }
+  int numReorder = 0;
   int numTmrl = 0, numChromaTmrl = 0, numEipGpu = 0, numTmpGpu = 0, numBvgGpu = 0, numSgpmGpu = 0;
   for( const Cu& c: m.cus )
   {
@@ -9283,6 +9589,7 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
     numObic += c.kind == CU_OBIC;
     numTmrl += c.kind == CU_TMRL;
     numChromaTmrl += c.kind == CU_CHROMA_TMRL;
+    numReorder    += c.kind == CU_CHROMA_REORDER;
     numEipGpu += c.kind == CU_EIP;
     numTmpGpu += c.kind == CU_TMP;
     numBvgGpu += c.kind == CU_BVG;
@@ -9298,8 +9605,8 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
       numTimdBlended += m.cpuTimd[size_t( th.index ) * TIMD_OUT + ( th.sad ? TIMD_OUT_SAD : 0 ) + TIMD_OUT_BLENDED] != 0;
     }
   }
-  printf( "\n[gpu-intra] POC %d: %d blocks, chain %d (ref filter %d, PDPC %d, gradient PDPC %d, fusion %d, bilateral filter candidates %d, CU nodes %d, DIMD %d, DIMD CUs %d, OBIC CUs %d, intra merge CUs %d, TIMD CUs %d (blended %d, TIMD-SAD %d, TIMD merge %d, inheriting transforms %d), TMRL CUs %d, chroma TMRL CUs %d, MPM records %d (sorted %d, MDIP %d), EIP CUs %d (merge %d, two models %d, with a vector %d), IntraTMP CUs %d, BVG-DIMD CUs %d, SGPM CUs %d, their MTS / LFNST / NSPT blocks %d, MTSS %d, MIP LFNST / NSPT %d, LM blocks %d (MMLM %d, MDLM %d, LBCCP %d, LFNST / NSPT %d, GLM %d (with luma %d), CCCM %d: above %d, left %d, GL %d, several filters %d, without subsampling %d), LM chroma fusion %d (CFLM %d), CCP merge %d (fusion with CCCM %d (by a blend model %d), with DIMD chroma %d, adjusted %d, decoder-derived fusion %d, LFNST / NSPT %d (with DIMD chroma %d)), decoder-derived CCP fusion %d), GPU %.2f ms: %s%s%s", m.poc,
-          (int) m.rec.size() - numNodes, maxDepth, numFilter, numPdpc, numGrad, numFusion, numBf, numNodes, numDimd, numDimdCus, numObic, m.numMerge, m.numTimd, numTimdBlended, numTimdSad, m.numTimdMerge, numInherited, numTmrl, numChromaTmrl, m.numMpm, m.numMpmSorted, m.numMdip, numEipGpu, m.numEipMerge, m.numEipMm, m.numEipBv, numTmpGpu, numBvgGpu, numSgpmGpu, numDimdTransforms, numMtss, numMipDimd, numCclm, numMmlm, numMdlm, numLbccp, numCclmDimd, numGlm, numGlmLuma, numCccm, numCccmAbove, numCccmLeft, numGlCccm, numMdfCccm, numNoSubCccm, numLmFusion, numCflm, numCcpMerge, numCcpMergeFusion, m.numFusionBlend, numCcpMergeDimd, m.numCcpAdjust, m.numDdMergeFusion, numCcpMergeLfnst, numCcpMergeDimdLfnst, m.numDerivedCcp, ms, bad ? "MISMATCH, " : "identical",
+  printf( "\n[gpu-intra] POC %d: %d blocks, chain %d (ref filter %d, PDPC %d, gradient PDPC %d, fusion %d, bilateral filter candidates %d, CU nodes %d, DIMD %d, DIMD CUs %d, OBIC CUs %d, intra merge CUs %d, TIMD CUs %d (blended %d, TIMD-SAD %d, TIMD merge %d, inheriting transforms %d), TMRL CUs %d, chroma TMRL CUs %d, chroma reordering CUs %d (the CPU's modes %d), MPM records %d (sorted %d, MDIP %d), EIP CUs %d (merge %d, two models %d, with a vector %d), IntraTMP CUs %d, BVG-DIMD CUs %d, SGPM CUs %d, their MTS / LFNST / NSPT blocks %d, MTSS %d, MIP LFNST / NSPT %d, LM blocks %d (MMLM %d, MDLM %d, LBCCP %d, LFNST / NSPT %d, GLM %d (with luma %d), CCCM %d: above %d, left %d, GL %d, several filters %d, without subsampling %d), LM chroma fusion %d (CFLM %d), CCP merge %d (fusion with CCCM %d (by a blend model %d), with DIMD chroma %d, adjusted %d, decoder-derived fusion %d, LFNST / NSPT %d (with DIMD chroma %d)), decoder-derived CCP fusion %d), GPU %.2f ms: %s%s%s", m.poc,
+          (int) m.rec.size() - numNodes, maxDepth, numFilter, numPdpc, numGrad, numFusion, numBf, numNodes, numDimd, numDimdCus, numObic, m.numMerge, m.numTimd, numTimdBlended, numTimdSad, m.numTimdMerge, numInherited, numTmrl, numChromaTmrl, numReorder, m.numReorderCpu, m.numMpm, m.numMpmSorted, m.numMdip, numEipGpu, m.numEipMerge, m.numEipMm, m.numEipBv, numTmpGpu, numBvgGpu, numSgpmGpu, numDimdTransforms, numMtss, numMipDimd, numCclm, numMmlm, numMdlm, numLbccp, numCclmDimd, numGlm, numGlmLuma, numCccm, numCccmAbove, numCccmLeft, numGlCccm, numMdfCccm, numNoSubCccm, numLmFusion, numCflm, numCcpMerge, numCcpMergeFusion, m.numFusionBlend, numCcpMergeDimd, m.numCcpAdjust, m.numDdMergeFusion, numCcpMergeLfnst, numCcpMergeDimdLfnst, m.numDerivedCcp, ms, bad ? "MISMATCH, " : "identical",
           bad ? first.c_str() : "", numBad ? ( ", " + std::to_string( numBad ) + " picture samples differ" ).c_str() : "" );
   if( m.partial )
   {

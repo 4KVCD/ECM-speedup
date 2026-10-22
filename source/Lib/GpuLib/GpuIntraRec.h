@@ -119,6 +119,9 @@ public:
   void recordInterCu( const CodingUnit& cu );
   /// IBC GPM CU cu, which the CPU has predicted: its parts' final vectors (recordInterCu's)
   void ibcGpmVectors( const CodingUnit& cu, const Mv& mv0, const Mv& mv1 );
+  /// chroma reordering (JVET-AH0136): the index of PU pu's chroma mode in its reordered list as DecCu parsed it
+  /// (chromaIdx), which the GPU's derivation of the list takes
+  void chromaReorderIndex( const PredictionUnit& pu, int idx );
   /// reconstructs the recorded picture on the GPU; on: into the picture's reconstruction buffer, off: compared with
   /// the CPU's reconstruction
   void endPicture( const CodingStructure& cs );

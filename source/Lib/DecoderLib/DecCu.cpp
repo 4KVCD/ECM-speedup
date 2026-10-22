@@ -1288,6 +1288,9 @@ void DecCu::xIntraRecBlk( TransformUnit& tu, const ComponentID compID )
     CompArea areaCb = pu.Cb();
     CompArea areaCr = pu.Cr();
     CompArea lumaArea = CompArea(COMPONENT_Y, pu.chromaFormat, areaCb.lumaPos(), recalcSize(pu.chromaFormat, CHANNEL_TYPE_CHROMA, CHANNEL_TYPE_LUMA, areaCb.size()));
+#if ECM_VULKAN
+    if( !m_gpuDeriveOnly )   // (the GPU derives the list, from its reconstruction)
+#endif
     m_pcIntraPred->deriveNonCcpChromaModes(cs.picture->getRecoBuf(lumaArea), cs.picture->getRecoBuf(areaCb), cs.picture->getRecoBuf(areaCr), lumaArea, areaCb, areaCr, *pu.cu, pu, m_pcInterPred);
     int chromaIdx = -1;
 #if JVET_AC0071_DBV
@@ -1320,6 +1323,16 @@ void DecCu::xIntraRecBlk( TransformUnit& tu, const ComponentID compID )
 #else
     chromaIdx = pu.intraDir[1] == DM_CHROMA_IDX ? 0 : pu.candId + 1;
 #endif
+#endif
+#if ECM_VULKAN
+    if( m_gpuIntraRec )   // (the GPU derives the list itself: the parsed index)
+    {
+      m_gpuIntraRec->chromaReorderIndex( pu, chromaIdx );
+    }
+    if( m_gpuDeriveOnly )   // (no list: a placeholder mode, which nothing the host decides reads)
+    {
+      std::fill_n( pu.cu->chromaList, NUM_CHROMA_LIST_MODE, uint8_t( PLANAR_IDX ) );
+    }
 #endif
     pu.intraDir[1] = pu.cu->chromaList[chromaIdx];
 #if JVET_AC0071_DBV

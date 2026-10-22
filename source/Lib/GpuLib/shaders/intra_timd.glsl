@@ -74,7 +74,8 @@ void timdFillReference( TemplateUnits t, BufI32 flags, int flagsBase, int comp, 
   const bool partial = t.numIntraNeighbor != 0 && t.numIntraNeighbor != t.totalUnits;
   const int  rest = ( predSize - t.tw ) % t.unitW;   // the last unit's samples (lastSample): rest, or a whole unit
   // the last entry of the row the units write: from 1 + tw - aboveTempUnitNum x unitW on (luma's end with the row)
-  const int  topEnd = !WITH_CFLM ? predSize
+  const bool chroma = WITH_CFLM || comp != 0;   // (CFLM's and chroma reordering's chroma templates)
+  const int  topEnd = !chroma ? predSize
                       : t.tw + ( t.totalAboveUnits - 1 ) * t.unitW + ( rest != 0 ? rest : t.unitW );
   if( lid < ( t.totalUnits + 31 ) >> 5 )
   {
@@ -96,7 +97,7 @@ void timdFillReference( TemplateUnits t, BufI32 flags, int flagsBase, int comp, 
   {
     const int c = t.totalLeftUnits + t.leftTempUnitNum, uw = t.unitW, uh = t.unitH;
     const int cornerCol = t.tw - t.aboveTempUnitNum * uw, cornerRow = t.th - t.leftTempUnitNum * uh;
-    if( WITH_CFLM && timdUnitAvailable( t.totalUnits - 1 ) )   // (the fill's samples past the row)
+    if( chroma && timdUnitAvailable( t.totalUnits - 1 ) )   // (the fill's samples past the row)
     {
       for( int j = predSize + 1; j <= topEnd; j++ )
       {
@@ -173,7 +174,7 @@ void timdFillReference( TemplateUnits t, BufI32 flags, int flagsBase, int comp, 
           for( int j = lastAvailCol + 1; j <= lastAvailCol + num; j++ )
           {
             s_ref[0][j] = v;
-            if( WITH_CFLM && j > predSize )   // (past the row: the column's first entries)
+            if( chroma && j > predSize )   // (past the row: the column's first entries)
             {
               s_ref[1][j - predSize - 1] = v;
             }
@@ -342,7 +343,7 @@ int timdMain( TimdParams p, int k, int wT, int hT )
     const int sizeSide = p.isModeVer ? hT : wT;
     return timdSide( p, min( ( -k * p.invAngle + 256 ) >> 9, sizeSide ) );
   }
-  const int refLength = ( p.isModeVer ? wT : hT ) << ( WITH_CFLM && p.chroma ? 1 : 3 );
+  const int refLength = ( p.isModeVer ? wT : hT ) << ( p.chroma ? 1 : 3 );
   const int idx = p.angle >= 0 ? min( k, refLength ) : k;
   return p.isModeVer ? timdTop( idx ) : timdLeft( idx );
 }
@@ -426,14 +427,14 @@ int timdPredict( int mode, TimdParams p, int x, int y, int W, int H, int tw, int
     }
     return v;
   }
-  const int fracBits = WITH_CFLM && p.chroma ? 5 : 6, fracMask = ( 1 << fracBits ) - 1;
+  const int fracBits = p.chroma ? 5 : 6, fracMask = ( 1 << fracBits ) - 1;
   const int deltaPos = p.angle * ( yt + 1 ), deltaInt = deltaPos >> fracBits, frac = deltaPos & fracMask;
   const int idx      = deltaInt + 1 + xt;
   if( ( abs( p.angle ) & fracMask ) == 0 )
   {
     v = timdMain( p, idx, wT, hT );
   }
-  else if( WITH_CFLM && p.chroma )   // xIntraPredTimdAngChroma
+  else if( p.chroma )   // xIntraPredTimdAngChroma
   {
     const int m0 = timdMain( p, idx, wT, hT );
     v = m0 + ( ( frac * ( timdMain( p, idx + 1, wT, hT ) - m0 ) + 16 ) >> 5 );

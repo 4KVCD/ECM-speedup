@@ -118,8 +118,11 @@ int    g_pnnLarge;
 // its CU's records keep apart
 int    g_bvSubs;
 bool   g_bvTransform;
-// a DBV block (a CU_CHROMA_DBV CU's of DBV_MODE): its prediction the copy at the co-located luma CU's vector
+// a DBV block (a CU_CHROMA_DBV CU's of DBV_MODE, a chroma reordering CU's of a DBV entry): its prediction the copy at
+// the co-located luma CU's vector, or at its CU's refined DBV vector; then its reconstruction flipped by g_recFlip
+// (DecCu: pReco.flipSignal of the CU's rribcFlipType: 1 horizontally, 2 vertically)
 bool   g_dbv;
+int    g_recFlip;
 // blending (a DERIVE_DIMD block whose CU's DIMD blends, a DERIVE_OBIC or DERIVE_MERGE block): the predictions of the
 // CU's modes (s_blendMode: DIMD's or the intra merge candidate's main mode, planar and blend modes, OBIC's modes) are
 // summed per location dependence class (emitPred), weighted, in the workgroup's BLEND_ACC sums at the start of the
@@ -311,6 +314,8 @@ int trMatrix( int type, int size )
 // DimdOut. plIdx: the CU's directional planar index
 void selectTransform( inout Tu t, int mode, int plIdx )
 {
+  // (a chroma block of a DBV mode: getFinalIntraModeForTransform's planar)
+  mode = t.comp != 0 && mode >= DBV_MODE && mode < DBV_MODE + 10 ? PLANAR_IDX : mode;   // (CR_DBV_MAX)
   BufI32     mt      = BufI32( P.matrices );
   const bool luma    = t.comp == 0;
   const int  W = t.w, H = t.h;
@@ -525,7 +530,8 @@ void reconstruct( Tu t, int x, int y, int pr, int re )
       BufI16( P.dbgResi ).v[t.dbgOffset + i] = int16_t( re );
     }
   }
-  CBufI16( P.plane[t.comp] ).v[P.origin[t.comp] + ( t.y + y ) * P.stride[t.comp] + t.x + x] = int16_t( clip3i( t.recMin, t.recMax, pr + re ) );
+  const int px = g_recFlip == 1 ? t.w - 1 - x : x, py = g_recFlip == 2 ? t.h - 1 - y : y;
+  CBufI16( P.plane[t.comp] ).v[P.origin[t.comp] + ( t.y + py ) * P.stride[t.comp] + t.x + px] = int16_t( clip3i( t.recMin, t.recMax, pr + re ) );
   if( pc.verify != 0 )
   {
     BufI16( P.dbgPred ).v[t.dbgOffset + i] = int16_t( pr );
@@ -1052,6 +1058,7 @@ ivec2 angularArrays( bool isVer, int W, int H, int angle, int absInvAngle, int t
 }
 
 #include "intra_tmrl.glsl"
+#include "intra_reorder.glsl"
 #include "intra_cclm.glsl"
 #include "intra_cccm.glsl"
 #include "intra_ccp.glsl"
@@ -1630,6 +1637,7 @@ void main()
     g_bvTransform = false;
     g_sgpmBlend   = false;
     g_dbv        = false;
+    g_recFlip    = 0;
     // the dependents, prefetched (their release ends the block)
     const int d0 = BufI32( P.depOffset ).v[g_ti], d1 = BufI32( P.depOffset ).v[g_ti + 1];
     if( lid < d1 - d0 )
@@ -1663,9 +1671,12 @@ void main()
       int dimdModes[3] = int[3]( -1, -1, -1 );
       if( lid == 0 )
       {
-        if( dimd && ( c.kind == CU_CHROMA_DIMD || c.kind == CU_CHROMA_TMRL ) )   // after the co-located luma mode's
-        {                                                                        // (s_modesRead[0])
-          dimdModes[0] = dimdChromaSelect( s_modesRead[0], dimdModes[1] );
+        // (after the co-located luma mode's: s_modesRead[0])
+        if( dimd && ( c.kind == CU_CHROMA_DIMD || c.kind == CU_CHROMA_TMRL || c.kind == CU_CHROMA_REORDER ) )
+        {
+          // (DecCu's exchange with getCoLocatedIntraLumaMode, an NN CU's PNN_IDX for chroma reordering: no mode)
+          const bool nnLuma = c.kind == CU_CHROMA_REORDER && c.nbr[CR_NBR_DM] != -1;
+          dimdModes[0] = dimdChromaSelect( nnLuma ? -1 : s_modesRead[0], dimdModes[1] );
           CBufI32( P.dimdOut ).v[t.cu * DIMD_OUT + DIMD_OUT_MODE]   = dimdModes[0];
           CBufI32( P.dimdOut ).v[t.cu * DIMD_OUT + DIMD_OUT_SECOND] = dimdModes[1];
         }
@@ -1724,6 +1735,10 @@ void main()
       else if( WITH_TMRL && c.kind == CU_CHROMA_TMRL )   // intra_tmrl.glsl, its mode list with its DIMD chroma
       {
         cuMode = chromaTmrlNode( t, c, s_modesRead[0], dimdModes, lid, NT );
+      }
+      else if( c.kind == CU_CHROMA_REORDER )   // intra_reorder.glsl, its list ranked by template costs
+      {
+        cuMode = chromaReorderNode( t, c, t.cu, s_modesRead[0], dimdModes, lid, NT );
       }
       else if( WITH_TIMD && ( c.kind == CU_TIMD || ( WITH_MPM && c.kind == CU_SGPM ) ) )   // intra_timd.glsl, its MPM
       {                                                                                      // list with its DIMD
@@ -1991,9 +2006,9 @@ void main()
       {
         tmrlBlockParams( t );
       }
-      else if( WITH_MPM && s_mode == DBV_MODE )   // DBV: none of a mode's parameters (verification: 0)
+      else if( s_mode >= DBV_MODE && s_mode < DBV_MODE + CR_DBV_MAX )   // DBV: no mode's parameters (verification: 0)
       {
-        t.dirMode   = DBV_MODE;
+        t.dirMode   = s_mode;
         t.isModeVer = t.intraPredAngle = t.absInvAngle = t.angularScale = t.useCubic = 0;
         t.refFilter = t.applyPDPC = t.gradPDPC = t.fusion = t.bf = t.plIdx = t.mrl = 0;
         t.pdp       = -1;
@@ -2287,13 +2302,33 @@ void main()
       const bool pdpSub   = t.pdp >= 0 && ( !blend || sub == 0 || blendPdp );
       const int  pdpFilt = pdpSub && t.mipMatrix < 0 ? pdpFilters( t, t.dirMode ) : -1;
       const int  bvSub   = blend ? sub : 0;   // (a prediction from a block vector: predUsingBv's copy)
-      if( WITH_MPM && g_dbv )
+      if( g_dbv )
       {
         // DBV of a single tree (predIntraDbv, refineChromaBv): the luma CU's mv[0] where its integer chroma part is a
-        // valid vector for the CU's Cb block (checkIsChromaBvCandidateValid), else its bv, the CU's chroma at it
-        const Cu    c   = BufCu( P.cus ).v[t.cu];
-        const ivec4 v   = dbvLumaVector( c.lumaCu );
-        const ivec2 mv  = ibcChromaValid( t.comp, c.x, c.y, c.w, c.h, v.xy, 0, 0, g_ti ) ? v.xy : v.zw << 4;
+        // valid vector for the CU's Cb block (checkIsChromaBvCandidateValid), else its bv, the CU's chroma at it; of
+        // chroma reordering (a dual tree) its node's vector refined (crDbvRefine), its reconstruction flipped
+        const Cu c = BufCu( P.cus ).v[t.cu];
+        ivec2    mv;
+        if( c.kind == CU_CHROMA_REORDER )
+        {
+          if( lid == 0 )
+          {
+            CBufI32     o  = CBufI32( P.dimdOut );
+            const int   at = t.cu * DIMD_OUT + DIMD_OUT_CR_DBV;
+            const ivec2 r  = crDbvRefine( t, c, ivec2( o.v[at], o.v[at + 1] ), o.v[at + 2], predStride );
+            s_mipBdry[0] = r.x;
+            s_mipBdry[1] = r.y;
+            s_mipBdry[2] = o.v[at + 2];
+          }
+          SYNC();
+          mv        = ivec2( s_mipBdry[0], s_mipBdry[1] );
+          g_recFlip = s_mipBdry[2];
+        }
+        else
+        {
+          const ivec4 v = dbvLumaVector( c.lumaCu );
+          mv = ibcChromaValid( t.comp, c.x, c.y, c.w, c.h, v.xy, 0, 0, g_ti ) ? v.xy : v.zw << 4;
+        }
         for( int i = lid; i < N; i += NT )
         {
           emitPred( t, i % W, i / W,

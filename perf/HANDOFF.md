@@ -449,7 +449,7 @@ wall-clock gains with threads are "the easy baseline". Decoder status: single-th
 (`--GpuLoopFilter=1`: ALF, SAO, BIF, CCSAO, LF-CCCM, offset refinement on Vulkan). The user then asked for **a full
 GPU decoder in Vulkan, optimized until nothing is left** ("The GPU decoder needs to fully decode the frame on the
 GPU"; "Your first Vulkan version is going to be slow. That's OK"). That work is branch `dec-gpurecon`: intra
-reconstruction on the GPU (`--GpuRecon`), tool levels M1-M94 done and verified bit-exact (M19: DIMD, M20: OBIC, M21:
+reconstruction on the GPU (`--GpuRecon`), tool levels M1-M95 done and verified bit-exact (M19: DIMD, M20: OBIC, M21:
 intra merge, M22: the transforms of DIMD CUs, M23: LFNST of MIP, M24: TIMD, M25: OBIC and intra merge with TIMD
 neighbours, M26: TIMD-SAD, M27: OBIC and intra merge with TIMD-SAD neighbours, M28: TIMD merge, M29: TMRL of luma,
 M30: chroma TMRL, M31: CCLM, M32: LFNST / NSPT of CCLM, M33: GLM's gradient patterns, M34: CCCM, M35: GL-CCCM, M36:
@@ -2242,6 +2242,45 @@ GPU); every other reason unchanged. Limit: each IBC block waits for every block 
 the area its vector reads would let more run at once (the four SCC streams' GPU time in partial verification, on a
 shared GPU: ai_scc_q27 339.5 -> 341.0, ai_scc2_q32 1410.1 -> 1423.3, ld_scc_q32 147.4 -> 154.8, ra_scc_q32 113.6 ->
 120.0 ms).
+M95 (2026-10-22, agent st): chroma reordering and the dual tree's DBV (JVET-AH0136's deriveNonCcpChromaModes, JVET-AC0071's
+DBV in a dual tree): until now partial verification took every reordered chroma CU's mode from the CPU and ON mode
+rejected each sequence with chroma reordering or DBV in its SPS ("chroma reordering / DBV"). GPU: a chroma CU kind
+CU_CHROMA_REORDER (18, intra_reorder.glsl) whose node (DERIVE_PREFIX: its costs read the co-located luma block and the
+chroma around it) builds buildChromaModeList - DM (the co-located luma CU's mode; of an NN CU the DIMD of its
+prediction, which its block now derives in every dual tree with reordering, also without coefficients or with transform
+skip), DIMD chroma with its strongest five modes (dimdBlendModeChroma), planar, DC, HOR, VER, VDIA for a duplicate of
+DM, the luma modes at the five co-located positions, the chroma neighbours' modes (not LM, not DBV) and with DBV
+candidates (hasChromaBvFlag) the DBV entries 16, 17.. of deriveChromaBv's sources: a GPU luma CU's vector (IntraTMP,
+BVG-DIMD, EIP with a vector: its node's) or the CPU's adjustChromaBv vector and flip (IBC: both vectors of a bi-vector
+CU) -, then costs each entry as the CPU: 8 x the SATD of predCoLuma (coLumaReference's line, the mode's reference
+filter, planar / DC / angular with PDPC, coLumaFullSample; a DBV entry the luma copy or IBC interpolation at its vector
+by searchBv's luma rules, the edge fixes, the flip, coLumaDbvSample) plus predChromaTM's template SADs (templates of one
+sample, CFLM's chroma TIMD path; the LEFT_NEIGHBOR / ABOVE_NEIGHBOR template types with their one-sample offsets,
+crEdgePredict; DBV arms at their checkIsChromaBvCandidateValidChromaTm vectors) shifted by log2(H) + 2 / log2(W) + 2,
+the early exit of the first two (entry 16 against DM with DBV), else updateCandList's stable order. DecCu passes the
+parsed index (chromaReorderIndex); in ON mode it skips deriveNonCcpChromaModes and leaves planar placeholders. A DBV
+entry's block: refineChromaBv (crDbvRefine: the vector and its one-luma-sample steps right / down valid for the Cb
+block, the arms' costs against the block's reference line - the 1-row Hadamard of timdHadLine from 4 x 4 on, else SAD -,
+the first minimum), predIntraDbv's copy or chroma interpolation (ibcChromaPredict), the reconstruction written flipped
+(g_recFlip), the transforms' mode planar (getFinalIntraModeForTransform). Host: supported()'s gate is gone where
+GPU_CHROMA_REORDER; what the GPU lacks is rejected per CU (ON) or keeps the CPU's mode (partial: "[gpu-intra] chroma
+reordering CUs with the CPU's mode"): DBV candidates with LM chroma fusion (xCflmCreateChromaPred's DBV branch, its
+2-line DBV templates and pre-flip), DBV candidates in a CU of several chroma blocks, no luma record, 12 bits, an
+adaptive dual tree's separate tree, unrecorded chroma neighbours, a DBV template side unavailable. Found on the way
+(ra_parkjoy_q37): an NN block derived the DIMD of its prediction only where its transforms read it, so the DM of a
+chroma CU over an NN CU without coefficients read 0. Results (Intel PC, builds agst20 / agst21, non-inlined SPIR-V,
+partial.py -j 1, the 50 streams): every stream identical; of 1029 reordered chroma CUs 994 now take the GPU's list
+(before: all the CPU's), 35 the CPU's (DBV with LM chroma fusion 22 in 16 streams - one of them has a DBV mode, the
+others only DBV candidates -, no luma record 7, 12 bits 6); intra CUs from the CPU 2317 -> 2292 ("DBV (dual tree)" 28 ->
+2, both over a co-located luma CU without a record; "DBV with LM chroma fusion, LIC or a flip" 0 -> 1). ON mode
+(--GpuRecon=3, all 50 streams identical to the CPU): no stream reaches the GPU yet; the first reason is now BVG-DIMD
+(45), IntraTMP / IBC (3), MDIP / MPM sorting (1), wavefronts (1), each the gate after chroma reordering. Test streams
+encoded here (runs/agents/st/enc: AI cfg without BVG-DIMD, MDIP, MPM sorting, IntraTMP, IBC, EIP, SGPM, PDP, NN; foreman
+352x288 and ParkJoy 416x240, 2 pictures): partial verification identical (crowd32, fore22, fore32, park27, park37: 141
+reordered CUs, all the GPU's); ON mode identical without in-loop filters (crf_fore32 32, crf_park27 15 reordered CUs),
+but different with them - also without chroma reordering (nocr_fore32) -, and bisected to ALF (bis_alf: ALF, CCALF,
+ALFCCCM on, other filters off; deblocking, SAO / CCSAO and BIF alone identical): an ON-mode ALF issue outside chroma
+reordering, open.
 
 
 ## 8. Numbers (i7-10700 8C/16T, Win11, GCC 16.2, RTX 3070 driver 616.92)

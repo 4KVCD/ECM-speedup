@@ -367,6 +367,9 @@ const int CU_CHROMA_DBV  = 17;  // chroma: DBV of a single tree (DBV_CHROMA_IDX 
                                 // co-located luma CU (IntraTMP, BVG-DIMD, EIP with a vector) has a block vector, else
                                 // planar (getFinalIntraMode); its blocks copy at the vector (ibcChromaPredict)
 const int DBV_MODE       = 74;  // DBV_CHROMA_IDX (NUM_INTRA_MODE + 1)
+const int CU_CHROMA_REORDER = 18;   // chroma: chroma reordering (intra_reorder.glsl): its node ranks its list of modes by
+                                    // template costs, takes the entry of its parsed index (Cu::ipredIdx; Cu::nbr: the
+                                    // CUs its list reads, CR_NBR_TEMPLATE its template's record)
 
 // a TMRL CU's choice as its node derives it (TMRL_OUT int32 per TMRL CU in Params::tmrlOut): the mode (131-mode set)
 // and the reference line (multiRefIdx) of m_tmrlList[tmrlListIdx], which its blocks predict with

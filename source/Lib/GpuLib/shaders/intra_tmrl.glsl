@@ -349,7 +349,7 @@ void chromaTmrlModeList( Cu c, int lumaMode, int dimdMode, int dimdSecond, out i
   for( int k = CHROMA_TMRL_NBR_LUMA; k < CHROMA_TMRL_NBR_CHROMA + 5 && num < CHROMA_TMRL_MODES; k++ )
   {
     const int mode = c.nbr[k] >= 0 ? cuModeOf( c.nbr[k] ) : -1;
-    if( mode >= 0 && !modeIn( included, mode ) )
+    if( mode >= 0 && mode < NUM_LUMA_MODE && !modeIn( included, mode ) )   // (not a reordered DBV mode)
     {
       modes[num++] = mode;
       modeAdd( included, mode );
@@ -637,6 +637,146 @@ int coLumaSample( Tu p, int x, int y, int mainBase, int dc, int maxPel )
   return clip3i( 0, maxPel, ( lumaConv( isVer, 0, mainBase + deltaInt + xt - numExtra, taps, true, false, frac, false ) + 128 ) >> 8 );
 }
 
+// sample (x, y) of the co-located luma block's prediction with parameters p from line 0 (chroma reordering's
+// predCoLuma: initPredIntraParams of a plain luma PU, no fusion, PDP or bilateral filter): planar / DC with their PDPC
+// from s_ref[0] (filtered in place where p.refFilter; dc: DC's value), angular as xPredIntraAng (intra_rec's main
+// path: the cubic or Gaussian filter of 16, 10 or 6 taps, PDPC and gradient PDPC) from the arrays angularArrays made
+// (mainBase / sideBase: their line's corners)
+int coLumaFullSample( Tu p, int x, int y, int mainBase, int sideBase, int predStride, int dc, int maxPel )
+{
+  const int W = p.regW, H = p.h;
+  if( p.dirMode <= DC_IDX )
+  {
+    const int log2W = findMSB( W ), log2H = findMSB( H );
+    const int T = int( s_ref[0][1 + x] ), L = int( s_ref[0][predStride + 1 + y] );
+    int v = dc;
+    if( p.dirMode == PLANAR_IDX )
+    {
+      const int topRight = int( s_ref[0][1 + W] ), bottomLeft = int( s_ref[0][predStride + 1 + H] );
+      const int horPred  = ( L << log2W ) + ( x + 1 ) * ( topRight - L );
+      const int vertPred = ( T << log2H ) + ( y + 1 ) * ( bottomLeft - T );
+      v = ( ( horPred << log2H ) + ( vertPred << log2W ) + ( 1 << ( log2W + log2H ) ) ) >> ( 1 + log2W + log2H );
+    }
+    v = asPel( v );
+    if( p.applyPDPC != 0 )   // xIntraPredPlanarDcPdpc
+    {
+      const int scale = ( log2W - 2 + log2H - 2 + 2 ) >> 2;
+      const int wT = 32 >> min( 31, ( y << 1 ) >> scale ), wL = 32 >> min( 31, ( x << 1 ) >> scale );
+      v = asPel( v + ( ( wL * ( L - v ) + wT * ( T - v ) + 32 ) >> 6 ) );
+    }
+    return v;
+  }
+  const bool isVer = p.isModeVer != 0;
+  const int  angle = p.intraPredAngle;
+  const int  w = isVer ? W : H, h = isVer ? H : W;
+  const int  xt = isVer ? x : y, yt = isVer ? y : x;   // in the (for horizontal modes transposed) block
+  const int  pdpcLimit = p.applyPDPC != 0
+                         ? min( 3 << ( angle == 0 ? ( ( findMSB( w ) + findMSB( h ) - 2 ) >> 2 ) : p.angularScale ), w ) : 0;
+  int v;
+  if( angle == 0 )
+  {
+    v = mainR( isVer, 0, mainBase + 1 + xt );
+    if( xt < pdpcLimit )
+    {
+      const int scale   = ( findMSB( w ) + findMSB( h ) - 2 ) >> 2;
+      const int topLeft = mainR( isVer, 0, mainBase ), left = sideR( isVer, 0, sideBase + 1 + yt );
+      v = clip3i( 0, maxPel, v + ( ( ( 32 >> ( 2 * xt >> scale ) ) * ( left - topLeft ) + 32 ) >> 6 ) );
+    }
+    return v;
+  }
+  const int deltaPos = angle * ( yt + 1 ), deltaInt = deltaPos >> 5, deltaFract = deltaPos & 31;
+  if( ( abs( angle ) & 31 ) == 0 )
+  {
+    v = mainR( isVer, 0, mainBase + deltaInt + 1 + xt );
+  }
+  else
+  {
+    int taps = p.useCubic != 0 ? 16 : 6;
+    if( w < 8 && taps > 10 )
+    {
+      taps = 10;
+    }
+    const bool big = W >= 32 && H >= 32;
+    v = clip3i( 0, maxPel, ( lumaConv( isVer, 0, mainBase + deltaInt + xt - ( taps / 2 - 2 ), taps, p.useCubic != 0, big,
+                                       deltaFract, false ) + 128 ) >> 8 );
+  }
+  v = asPel( v );
+  if( xt < pdpcLimit )
+  {
+    const int wL = 32 >> ( 2 * xt >> p.angularScale );
+    if( p.gradPDPC != 0 )
+    {
+      const int left    = sideR( isVer, 0, sideBase + 1 + yt );
+      const int m0      = mainR( isVer, 0, mainBase + deltaInt ), m1 = mainR( isVer, 0, mainBase + deltaInt + 1 );
+      const int topLeft = asPel( m0 + ( ( deltaFract * ( m1 - m0 ) + 16 ) >> 5 ) );
+      v = clip3i( 0, maxPel, v + ( ( wL * ( left - topLeft ) + 32 ) >> 6 ) );
+    }
+    else
+    {
+      const int left = sideR( isVer, 0, sideBase + yt + ( ( 256 + ( xt + 1 ) * p.absInvAngle ) >> 9 ) + 1 );
+      v = asPel( v + ( ( wL * ( left - v ) + 32 ) >> 6 ) );
+    }
+  }
+  return v;
+}
+
+// chroma reordering's DBV candidate's co-located luma prediction (predCoLuma with a DBV mode): its vector mv (1/16 luma
+// samples) and flip (g_coLumaDbv), the luma block (lx, ly, lw x lh). With the SPS's fractional IBC and a fraction the
+// IBC interpolation (getPredIBCBlk: m_lumaFilter's 8 taps, unpadded) where PU::searchBv's luma DBV rules allow the
+// filter's reach (inside the picture, not below the CTU row, not right of the CTU in its row; none of its other rules
+// or decoded checks), else the copy at the integer vector with predCoLuma's fixes - a column / row before the picture
+// takes the next one's, the last row / column the one before where the region crosses the picture's or the CTU's
+// bottom / right -, then the prediction flipped (flipSignal)
+ivec3 g_coLumaDbv;
+int coLumaDbvSample( int lx, int ly, int lw, int lh, int x, int y, int bitDepth )
+{
+  const ivec2 mv = g_coLumaDbv.xy;
+  const int   flip = g_coLumaDbv.z, s = findLSB( P.ctuSize );
+  const int   px = flip == 1 ? lw - 1 - x : x, py = flip == 2 ? lh - 1 - y : y;
+  const int   xb = mv.x >> 4, yb = mv.y >> 4, ax = mv.x & 15, ay = mv.y & 15;
+  bool frac = P.ibcFrac != 0 && ( ax != 0 || ay != 0 );
+  if( frac )
+  {
+    const int l = lx + xb - ( ax != 0 ? 3 : 0 ), r = lx + xb + lw - 1 + ( ax != 0 ? 4 : 0 );
+    const int t = ly + yb - ( ay != 0 ? 3 : 0 ), d = ly + yb + lh - 1 + ( ay != 0 ? 4 : 0 );
+    frac = l >= 0 && r < P.width[0] && t >= 0 && d < P.height[0] && ( d >> s ) <= ( ly >> s )
+           && !( ( r >> s ) > ( lx >> s ) && ( d >> s ) == ( ly >> s ) );
+  }
+  if( frac )   // (as ibcPredict without padding)
+  {
+    const bool both     = ax != 0 && ay != 0;
+    const int  headRoom = max( 2, 14 - bitDepth ), sh1 = 8 - headRoom, sh2 = 8 + headRoom;
+    const int  nx = ax != 0 ? 8 : 1, ny = ay != 0 ? 8 : 1;
+    int        sum = 0, row = 0;
+    for( int n = 0; n < nx * ny; n++ )
+    {
+      const int k = n / nx, m = n % nx;
+      const int v = recoAt( 0, lx + xb + ( ax != 0 ? px - 3 + m : px ), ly + yb + ( ay != 0 ? py - 3 + k : py ) )
+                    * ( ax != 0 ? IBC_LUMA_FILTER[ax * 8 + m] : 1 );
+      if( !both )
+      {
+        sum += v * ( ay != 0 ? IBC_LUMA_FILTER[ay * 8 + k] : 1 );
+        continue;
+      }
+      row = m == 0 ? v : row + v;
+      if( m == nx - 1 )
+      {
+        sum += IBC_LUMA_FILTER[ay * 8 + k] * ( ( row - ( 8192 << sh1 ) ) >> sh1 );
+      }
+    }
+    return clamp( both ? ( sum + ( 1 << ( sh2 - 1 ) ) + ( 8192 << 8 ) ) >> sh2 : ( sum + 128 ) >> 8, 0,
+                  ( 1 << bitDepth ) - 1 );
+  }
+  const int  rx = lx + xb, ry = ly + yb;
+  const bool cross  = ( ( rx + lw - 1 ) >> s ) > ( lx >> s ) && ( ( ry + lh - 1 ) >> s ) == ( ly >> s );
+  const bool bottom = !( ry + lh - 1 >= P.height[0] || ( ( ry + lh - 1 ) >> s ) > ( ly >> s ) || cross );
+  const bool right  = !( rx + lw - 1 >= P.width[0] || cross );
+  int x1 = !right && px == lw - 1 ? lw - 2 : px, y1 = !bottom && py == lh - 1 ? lh - 2 : py;
+  y1 = ry < 0 && y1 < -ry ? y1 - ry : y1;
+  x1 = rx < 0 && x1 < -rx ? x1 - rx : x1;
+  return recoAt( 0, clamp( rx + x1, 0, P.width[0] - 1 ), clamp( ry + y1, 0, P.height[0] - 1 ) );
+}
+
 // the Walsh-Hadamard transform of the first n (8 or 16) values, in place (the order of the butterflies and of the
 // outputs does not change their absolute values: each is a signed sum of all inputs)
 void hadamardInPlace( inout int v[16], int n )
@@ -687,13 +827,15 @@ int hadTileScale( ivec2 tile, int sad )
          : tile.x * tile.y == 128 ? hadScaleSqrt32( sad ) : timdScaleSqrt8( sad );
 }
 
-// the SATD of the co-located luma block (lx, ly, p.regW x p.h) predicted with parameters p (coLumaSample) against its
+// the SATD of the co-located luma block (lx, ly, p.regW x p.h) predicted with parameters p (kind 0: coLumaSample, 1:
+// coLumaFullSample - sideBase and predStride its -, 2: coLumaDbvSample) against its
 // reconstruction, added to cost slot `slot` (all invocations, ending with a barrier): band by band of up to 16 rows the
 // differences into s_tmp (10-bit differences stay in int16 through a tile column's butterflies), the vertical
 // butterflies of each tile column in place, per row of each tile the horizontal ones and the sum of the absolute values
 // (into s_dimdHist: the tiles' sums, then the absolute values of their DC terms; at most 32 tiles a band), then per tile
 // the DC term weighed a quarter (JVET-R0164) and the kernel's scale (hadTileScale)
-void coLumaSatd( Tu p, int lx, int ly, int mainBase, int dc, int maxPel, int slot, int lid, int NT )
+void coLumaSatd( Tu p, int lx, int ly, int mainBase, int sideBase, int predStride, int kind, int dc, int maxPel,
+                 int slot, int lid, int NT )
 {
   const int   W = p.regW, H = p.h;
   const ivec2 tile = coLumaTile( W, H );
@@ -703,7 +845,10 @@ void coLumaSatd( Tu p, int lx, int ly, int mainBase, int dc, int maxPel, int slo
     for( int i = lid; i < W * bandH; i += NT )
     {
       const int x = i % W, y = y0 + i / W;
-      s_tmp[i] = int16_t( recoAt( 0, lx + x, ly + y ) - coLumaSample( p, x, y, mainBase, dc, maxPel ) );
+      const int pred = kind == 2 ? coLumaDbvSample( lx, ly, W, H, x, y, p.bitDepth )
+                       : kind == 1 ? coLumaFullSample( p, x, y, mainBase, sideBase, predStride, dc, maxPel )
+                                   : coLumaSample( p, x, y, mainBase, dc, maxPel );
+      s_tmp[i] = int16_t( recoAt( 0, lx + x, ly + y ) - pred );
     }
     for( int i = lid; i < 2 * numTiles; i += NT )
     {
@@ -802,7 +947,7 @@ int chromaTmrlNode( Tu t, Cu c, int lumaMode, int dimdModes[3], int lid, int NT 
                                   predStride, p.disableRefFilter != 0, maxPel, lid, NT ).x + mrl;
         SYNC();
       }
-      coLumaSatd( p, lx, ly, mainBase, dc, maxPel, CT_LUMA + li * CHROMA_TMRL_MODES + m, lid, NT );
+      coLumaSatd( p, lx, ly, mainBase, 0, 0, 0, dc, maxPel, CT_LUMA + li * CHROMA_TMRL_MODES + m, lid, NT );
       // the arrays zero again for the next prediction (as main() leaves them after a block)
       const int clear = min( ANG, 2 * ( lw + lh ) + 2 * max( lw, lh ) + 2 * PAD + 2 * ( mrl + 1 ) + ( ( mrl + 1 ) << abs( findMSB( lw ) - findMSB( lh ) ) ) + 16 );
       for( int i = lid; p.dirMode > DC_IDX && i < clear; i += NT )
