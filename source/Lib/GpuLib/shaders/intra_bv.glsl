@@ -202,7 +202,7 @@ void bvStore( Cu c, int num, ivec2 bv[3] )
     data.v[at + 1 + j] = bvPack( bv[j] );
   }
   data.v[at + BV_OUT_SPARSE] = -1;   // (the same for getSparseArBvMergeCandidate)
-  data.v[at + BV_OUT_FUSION] = -1;   // (no IntraTMP fusion CU is the GPU's)
+  data.v[at + BV_OUT_FUSION] = -1;   // (an IntraTMP fusion CU's: tmpFusionSetup)
   data.v[at + BV_OUT_SGPM]   = -1;   // (SGPM's list takes them x 16)
 }
 

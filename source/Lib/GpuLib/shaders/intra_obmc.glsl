@@ -562,7 +562,14 @@ void obmcPlan( Tu t, Cu c, int rec )
 {
   const int   flags = BufI32( P.timdData ).v[rec + OBMC_FLAGS];
   CBufI32     o     = CBufI32( P.dimdOut );
-  const ivec2 ownMv = ivec2( o.v[t.cu * DIMD_OUT + DIMD_OUT_TMP_MV], o.v[t.cu * DIMD_OUT + DIMD_OUT_TMP_MV + 1] );
+  // (its own vector, whose runs have no OBMC: getSameNeigMotion's identicalMvOBMC - but for a fusion, FLM or two-model
+  // LIC CU, which compares none, and a LIC CU, whose neighbour (without LIC: the host keeps the others on the CPU)
+  // differs in its LIC flag)
+  BufI32      data  = BufI32( P.timdData );
+  const bool  noOwn = data.v[c.tmp + TMP_HEAD_FUSION] != 0 || data.v[c.tmp + TMP_HEAD_FLM] != 0
+                      || data.v[c.tmp + TMP_HEAD_LIC] != 0;
+  const int   at    = t.cu * DIMD_OUT + DIMD_OUT_TMP_MV;
+  const ivec2 ownMv = noOwn ? ivec2( 0x7FFFFFFF ) : ivec2( o.v[at], o.v[at + 1] );
   tsSet( TO_OPS, 0 );
   tsSet( TO_MC_TOTAL, 0 );
   for( int b = 0; b < 2; b++ )
@@ -590,6 +597,8 @@ void tmpPredict( Tu t, int lid, int NT )
   const ivec2 delta = ivec2( ( mv.x >> 4 ) < bv.x ? 1 : 0, ( mv.y >> 4 ) < bv.y ? 1 : 0 );
   const Cu    c     = BufCu( P.cus ).v[t.cu];
   const int   rec   = BufI32( P.timdData ).v[c.tmp + TMP_HEAD_OBMC];
+  const bool  fusion = BufI32( P.timdData ).v[c.tmp + TMP_HEAD_FUSION] != 0     // (its blend or FLM's filter:
+                       || BufI32( P.timdData ).v[c.tmp + TMP_HEAD_FLM] != 0;      // tmpFusionSample)
   int         extra = 0;
   if( rec >= 0 )
   {
@@ -621,7 +630,8 @@ void tmpPredict( Tu t, int lid, int NT )
       d = ivec2( 0 );
       p = ivec2( k % r.z, k / r.z );
     }
-    const int s = ibcPredict( r.x, r.y, r.z, r.w, v, false, p.x, p.y, g_ti, t.bitDepth, d );
+    const int s = i < N && fusion ? tmpFusionSample( c, at, p.x, p.y, t.bitDepth )
+                                  : ibcPredict( r.x, r.y, r.z, r.w, v, false, p.x, p.y, g_ti, t.bitDepth, d );
     if( i < N )
     {
       s_spPred[i] = int16_t( s );

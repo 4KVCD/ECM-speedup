@@ -6,7 +6,12 @@
 // into its DimdOut (DIMD_OUT_TMP_*), whose entry tmpIdx its block copies. The template costs (calcTemplateDiff) are
 // computed in parallel, in chunks of positions in the CPU's order, and the CPU's lists replayed from them by invocation
 // 0: every test of a cost is "less than a threshold", which the CPU's early ends cannot change; for tmpFracIdx 1 the
-// sub-sample search (tmpFracSearch). No LIC, fusion, FLM or OBMC yet (the host keeps such CUs on the CPU). An EIP CU
+// sub-sample search (tmpFracSearch). With LIC (tmpLicFlag, JVET-AE0078) its costs are mean-removed SADs
+// (each template part's mean difference taken out) and the sparse search's positions move half a step towards its
+// region's middle (iXOffsetMetric: "transferred" back at the region's edge), whose flags its refinement window
+// keeps; its block's LIC model then comes from the one-sample templates at its vector (tmpLicModel). A fusion CU's
+// block blends the vectors of its index's group (tmpFusionSetup, tmpFusionSample); an FLM CU's filters the area at its
+// vector with a model of 5 taps fitted on the template (tmpFlmSetup). An EIP CU
 // with a vector runs the sparse search alone, for its best (TMP_SEARCH_BEST); a BVG-DIMD CU the sparse search for its
 // best, its neighbours' vectors against it and the refinement of the best one's window (TMP_SEARCH_BVG; intra_bvg.glsl
 // takes the refined list on). Included by intra_rec.comp after intra_bv.glsl.
@@ -14,6 +19,8 @@
 const int TMP_COST_SHIFT    = 3;    // TMP_TEMPLATE_COST_SHIFT: the template row and column next to the block weigh 8
 const int MTMP_NUM          = 19;
 const int MTMP_NUM_SPARSE   = 30;
+// the sparse lists with LIC without the SPS's LIC mode (TL_NUM_SPARSE_FOR_LIC: TL_NUM)
+const int MTMP_NUM_SPARSE_FOR_LIC = 15;
 const int TL_NUM            = 3;
 const int TL_NUM_SPARSE     = 6;
 const int TMP_MERGE_RANGE   = 5;
@@ -37,7 +44,12 @@ const int TMP_HEAD_SEARCH     = 7;   // what the search is for (TMP_SEARCH_*)
 const int TMP_HEAD_REGIONS    = 8;   // per regionId mvXMin, mvXMax, mvYMin, mvYMax (clipMvIntraConstraint), 6 x 4
 const int TMP_HEAD_FRAC       = TMP_HEAD_REGIONS + 24;   // tmpFracIdx: its block's vector is the sub-sample search's
 const int TMP_HEAD_OBMC       = TMP_HEAD_FRAC + 1;       // its OBMC record (intra_obmc.glsl's OBMC_*), else -1
-const int TMP_HEAD            = TMP_HEAD_OBMC + 1;
+const int TMP_HEAD_LIC        = TMP_HEAD_OBMC + 1;       // with LIC (tmpLicFlag) its ibcLicIdx + 1, else 0
+const int TMP_HEAD_LIC_EXT    = TMP_HEAD_LIC + 1;        // the SPS's ItmpLicExtension (LIC on the L-shape always)
+const int TMP_HEAD_LIC_SLOT   = TMP_HEAD_LIC_EXT + 1;    // where SGPM's lists read its LIC model (SGPM_LIC), else -1
+const int TMP_HEAD_FUSION     = TMP_HEAD_LIC_SLOT + 1;   // tmpFusionFlag
+const int TMP_HEAD_FLM        = TMP_HEAD_FUSION + 1;     // tmpFlmFlag
+const int TMP_HEAD            = TMP_HEAD_FLM + 1;
 const int TMP_SEARCH_FULL = 0;   // an IntraTMP CU's list
 const int TMP_SEARCH_BEST = 1;   // an EIP CU with a vector: the sparse search's best alone (mtmpNumSparse 1)
 const int TMP_SEARCH_BVG  = 2;   // a BVG-DIMD CU's (JVET-AL0108): MAX_BVG_ROUGH_NUM 1, its own refinement
@@ -76,12 +88,40 @@ void tsSync()
 
 // ----- the template costs
 
+// the search's mean-removed costs (useMR: an IntraTMP CU with LIC) and its template's means (calcTargetMean): the
+// top part's (the rows above the block, without the L-shape's corner) and the left part's (the columns left of it),
+// each sum floored by its size's log2 (both parts are powers of two)
+bool  g_tmpMr   = false;
+ivec2 g_tmpMean = ivec2( 0 );
+
+ivec2 tmpMeans( Cu c, int tempType, int bx, int by )
+{
+  int top = 0, left = 0;
+  for( int y = -TMP_TEMPLATE_SIZE; y < 0 && tempType != TMP_LEFT; y++ )
+  {
+    for( int x = 0; x < c.w; x++ )
+    {
+      top += recoAt( 0, c.x + bx + x, c.y + by + y );
+    }
+  }
+  for( int y = 0; y < c.h && tempType != TMP_ABOVE; y++ )
+  {
+    for( int x = -TMP_TEMPLATE_SIZE; x < 0; x++ )
+    {
+      left += recoAt( 0, c.x + bx + x, c.y + by + y );
+    }
+  }
+  return ivec2( top >> findMSB( TMP_TEMPLATE_SIZE * c.w ), left >> findMSB( TMP_TEMPLATE_SIZE * c.h ) );
+}
+
 // calcTemplateDiff's three costs of vector (bx, by) for CU c with template type tempType (exact; the CPU's early ends
 // only stop where a cost is no longer below its threshold): x the weighted one (the row and the column next to the
 // block weigh 2^TMP_COST_SHIFT; the L-shape's with its corner, else the above or left template's), y the L-shape's
-// top part, z its left part
+// top part, z its left part. With g_tmpMr each part's samples less the difference of its means (the top part's for the
+// corner too)
 ivec3 tmpCosts( Cu c, int tempType, int bx, int by )
 {
+  const ivec2 dm = g_tmpMr ? tmpMeans( c, tempType, bx, by ) - g_tmpMean : ivec2( 0 );
   int sum = 0, top = 0, left = 0;
   if( tempType != TMP_LEFT )   // the rows above (with the corner of the L-shape)
   {
@@ -91,7 +131,7 @@ ivec3 tmpCosts( Cu c, int tempType, int bx, int by )
       int corner = 0, row = 0;
       for( int x = x0; x < c.w; x++ )
       {
-        const int d = abs( recoAt( 0, c.x + bx + x, c.y + by + y ) - recoAt( 0, c.x + x, c.y + y ) );
+        const int d = abs( recoAt( 0, c.x + bx + x, c.y + by + y ) - recoAt( 0, c.x + x, c.y + y ) - dm.x );
         corner += x < 0 ? d : 0;
         row    += x < 0 ? 0 : d;
       }
@@ -106,7 +146,7 @@ ivec3 tmpCosts( Cu c, int tempType, int bx, int by )
       int row = 0, next = 0;
       for( int x = -TMP_TEMPLATE_SIZE; x < 0; x++ )
       {
-        next = abs( recoAt( 0, c.x + bx + x, c.y + by + y ) - recoAt( 0, c.x + x, c.y + y ) );   // (x -1 last)
+        next = abs( recoAt( 0, c.x + bx + x, c.y + by + y ) - recoAt( 0, c.x + x, c.y + y ) - dm.y );   // (x -1 last)
         row += next;
       }
       left += row;
@@ -209,6 +249,183 @@ ivec4 tmpRegion( int head, int r )
   BufI32    data = BufI32( P.timdData );
   const int at   = head + TMP_HEAD_REGIONS + 4 * r;
   return ivec4( data.v[at], data.v[at + 1], data.v[at + 2], data.v[at + 3] );
+}
+
+// ----- LIC (JVET-AE0078: InterPrediction::LicItmp -> xLocalIlluComp with ibcLicFlag)
+
+const int IBC_LIC_IDX_T = 1, IBC_LIC_IDX_L = 2, IBC_LIC_IDX_M = 3;   // ibcLicIdx (0: both templates, one model)
+// a LIC model as SGPM's lists keep one (intra_sgpm.glsl's SGPM_LIC_*: a BvInfo's): whether it has two, the first's
+// scale, shift and offset, the second's, the mean between them (the first up to it)
+const int TMP_LIC = 8;
+
+// getMSB (CommonDef.h, INTER_LIC): floorLog2 + 1, 1 for 0
+int licMsb( uint v )
+{
+  return v == 0u ? 1 : findMSB( v ) + 1;
+}
+
+// the LIC model of IntraTMP CU c at vector mv (1/16 samples; invocation 0; the scratch from TS_POS its work area):
+// xGetSublkTemplate's one-sample templates - the row above the CU (but for IBC_LIC_IDX_L or required template 2) and
+// the column left of it (but for IBC_LIC_IDX_T or required template 1) where the CU has a neighbour there and the row /
+// column at the vector is valid (checkIsIBCCandidateValid of the vector moved by a sample, its integer part), at a
+// sub-sample vector predicted with the bilinear filter (xGetIbcLicPredBlkTpl -> getPredIBCBlk; delta: the padding's
+// region offset of the CU's vector, as tmpPredict's) -, sampled as
+// xGetLICParamGeneral steps (numSteps per side, by the smaller side but for one side's own index), fitted as inter
+// LIC's one model (m_licShift 5, the sums cropped, m_licMultApprox's division) or with IBC_LIC_IDX_M as MMLM's two
+// split at the reference samples' mean (xLMSampleClassifiedTraining over 2^cntShift samples, the means without
+// division; cclmFit)
+int[TMP_LIC] tmpLicModel( Cu c, ivec2 mv, ivec2 delta, int licIdx, int req, int bitDepth )
+{
+  const int   W = c.w, H = c.h, precShift = max( 0, bitDepth - 12 );
+  const ivec2 mvTop = mv + ivec2( 0, -16 ), mvLeft = mv + ivec2( -16, 0 );
+  const bool  above = c.y > 0 && licIdx != IBC_LIC_IDX_L && req != 2
+                      && ibcAreaValid( c.x, c.y, W, 1, mvTop >> 4, 0, 0, g_ti );
+  const bool  left  = c.x > 0 && licIdx != IBC_LIC_IDX_T && req != 1
+                      && ibcAreaValid( c.x, c.y, 1, H, mvLeft >> 4, 0, 0, g_ti );
+  const int  minDimBit = licIdx == IBC_LIC_IDX_T ? findMSB( W ) : licIdx == IBC_LIC_IDX_L ? findMSB( H )
+                                                                                          : findMSB( min( W, H ) );
+  const int  maxNumMinus1 = 30 - 2 * min( bitDepth, 12 ) - 1;
+  int        minStepBit   = ( 1 << minDimBit ) > 8 ? 1 : 0;
+  while( minDimBit > minStepBit + maxNumMinus1 )
+  {
+    minStepBit++;
+  }
+  const int numSteps = ( 1 << minDimBit ) >> minStepBit, dimShift = minDimBit - minStepBit;
+  const int REF = TS_POS, REC = TS_POS + 128;   // the samples (refSamples, recSamples)
+  int x = 0, y = 0, xx = 0, xy = 0, cntShift = 0, n = 0;
+  tsSet( REF, 0 );   // (none: the mean of 2^0 zero samples)
+  tsSet( REC, 0 );
+  for( int side = 0; side < 2; side++ )
+  {
+    if( side == 0 ? !above : !left )
+    {
+      continue;
+    }
+    for( int k = 0; k < numSteps; k++ )
+    {
+      const int idx = ( k * ( side == 0 ? W : H ) ) >> dimShift;
+      const int rf  = ibcPredict( c.x, c.y, side == 0 ? W : 1, side == 0 ? 1 : H, side == 0 ? mvTop : mvLeft, true,
+                                  side == 0 ? idx : 0, side == 0 ? 0 : idx, g_ti, bitDepth, delta ) >> precShift;
+      const int rc  = ( side == 0 ? recoAt( 0, c.x + idx, c.y - 1 ) : recoAt( 0, c.x - 1, c.y + idx ) ) >> precShift;
+      tsSet( REF + n, rf );
+      tsSet( REC + n, rc );
+      n++;
+      x  += rf;
+      y  += rc;
+      xx += rf * rf;
+      xy += rf * rc;
+    }
+    cntShift += side == 0 ? dimShift : cntShift != 0 ? 1 : dimShift;
+  }
+  int r[TMP_LIC] = int[TMP_LIC]( 0, 32, 5, 0, 0, 0, 0, 0 );
+  if( licIdx == IBC_LIC_IDX_M )
+  {
+    const int count = 1 << cntShift;   // (avgCnt)
+    int       mean = 0, meanC = 0;
+    for( int i = 0; i < count; i++ )
+    {
+      mean  += tsGet( REF + i );
+      meanC += tsGet( REC + i );
+    }
+    const int divSigTable[16] = int[16]( 0, 7, 6, 5, 5, 4, 4, 3, 3, 2, 2, 1, 1, 1, 1, 0 );
+    int       lx = findMSB( count );
+    const int normDiff = ( count << 4 >> lx ) & 15, v = divSigTable[normDiff] | 8;
+    lx += normDiff != 0 ? 1 : 0;
+    mean  = ( mean * v ) >> ( lx + 3 );
+    meanC = ( meanC * v ) >> ( lx + 3 );
+    ivec3 m[2] = ivec3[2]( ivec3( 0, 1 << ( bitDepth - 1 ), 0 ), ivec3( 0, 1 << ( bitDepth - 1 ), 0 ) );
+    if( count >= 4 )   // xLMSampleClassifiedTraining: the groups from TS_COST (reference, then current), 128 each
+    {
+      const int split = max( 1, mean );
+      int       groupCount[2] = int[2]( 0, 0 );
+      for( int i = 0; i < count; i++ )
+      {
+        const int g = tsGet( REF + i ) <= split ? 0 : 1;
+        tsSet( TS_COST + g * 128 + groupCount[g], tsGet( REF + i ) );
+        tsSet( TS_COST + 256 + g * 128 + groupCount[g], tsGet( REC + i ) );
+        groupCount[g]++;
+      }
+      for( int g = 0; g < 2; g++ )
+      {
+        const int exist = groupCount[g];
+        if( exist < 2 )
+        {
+          m[g] = ivec3( 0, meanC - mean, 0 );
+          continue;
+        }
+        const int upper = 1 << ( findMSB( exist - 1 ) + 1 ), lower = 1 << findMSB( exist );
+        if( upper != lower )   // padded to a power of two
+        {
+          const int numPadded = min( exist, upper - exist ), step = exist / numPadded;
+          for( int i = 0; i < numPadded; i++ )
+          {
+            tsSet( TS_COST + g * 128 + exist + i, tsGet( TS_COST + g * 128 + i * step ) );
+            tsSet( TS_COST + 256 + g * 128 + exist + i, tsGet( TS_COST + 256 + g * 128 + i * step ) );
+          }
+          groupCount[g] = upper;
+        }
+        int64_t sx = 0, sy = 0, sxx = 0, sxy = 0;
+        for( int i = 0; i < groupCount[g]; i++ )
+        {
+          const int64_t l = tsGet( TS_COST + g * 128 + i ), cc = tsGet( TS_COST + 256 + g * 128 + i );
+          sx  += l;
+          sy  += cc;
+          sxx += l * l;
+          sxy += l * cc;
+        }
+        m[g] = cclmFit( sx, sy, sxx, sxy, findMSB( groupCount[g] ), bitDepth );
+      }
+    }
+    r = int[TMP_LIC]( 1, m[0].x, m[0].z, m[0].y, m[1].x, m[1].z, m[1].y, mean );
+  }
+  else if( cntShift != 0 )
+  {
+    const int shift = 5, licRegShift = 7, licShiftDiff = 12;   // (m_licShift, m_licRegShift, m_licShiftDiff)
+    const int cropShift = max( 0, bitDepth - precShift + cntShift - 15 );
+    const int xzOffset  = xx >> licRegShift;
+    const int sumX = x << precShift, sumY = y << precShift;
+    const int sumXX = ( ( xx + xzOffset ) >> ( cropShift << 1 ) ) << cntShift;
+    const int sumXY = ( ( xy + xzOffset ) >> ( cropShift << 1 ) ) << cntShift;
+    const int sumXsumX = ( x >> cropShift ) * ( x >> cropShift ), sumXsumY = ( x >> cropShift ) * ( y >> cropShift );
+    int       a1 = sumXY - sumXsumY, a2 = sumXX - sumXsumX;
+    int       scaleShiftA2 = licMsb( uint( abs( a2 ) ) ) - 6, scaleShiftA1 = scaleShiftA2 - licShiftDiff;
+    scaleShiftA2 = max( 0, scaleShiftA2 );
+    scaleShiftA1 = max( 0, scaleShiftA1 );
+    const int scaleShiftA = scaleShiftA2 + 15 - shift - scaleShiftA1;
+    a1 >>= scaleShiftA1;
+    a2 = clamp( a2 >> scaleShiftA2, 0, 63 );
+    const int approx = a2 == 0 ? 0 : ( ( 1 << 15 ) + ( a2 >> 1 ) ) / a2;   // (m_licMultApprox)
+    const int scale  = clamp( int( ( int64_t( a1 ) * int64_t( approx ) ) >> scaleShiftA ), 0, 1 << ( shift + 2 ) );
+    const int maxOffset = ( 1 << ( bitDepth - 1 ) ) - 1;
+    const int offset = ( sumY - ( ( scale * sumX ) >> shift ) + ( ( 1 << cntShift ) >> 1 ) ) >> cntShift;
+    r = int[TMP_LIC]( 0, scale, shift, clamp( offset, -1 - maxOffset, maxOffset ), 0, 0, 0, 0 );
+  }
+  return r;
+}
+
+// sample v through LIC model m (linearTransform; with two models linearTransforms, the second above the mean),
+// clipped
+int tmpLicSample( int v, int m[TMP_LIC], int maxPel )
+{
+  const int k = m[0] != 0 && v > m[7] ? 4 : 1, scaled = m[k] * v, shift = m[k + 1];
+  return clamp( ( shift >= 0 ? scaled >> shift : scaled << -shift ) + m[k + 2], 0, maxPel );
+}
+
+// IntraTMP block t's LIC (all invocations; after the DIMD of its prediction in s_spPred, as DecCu applies it after
+// generateTMPrediction): its CU's model from its DimdOut through every sample
+void tmpLicApply( Tu t, int lid, int NT )
+{
+  CBufI32   o  = CBufI32( P.dimdOut );
+  const int at = t.cu * DIMD_OUT + DIMD_OUT_TMP_LIC, maxPel = ( 1 << t.bitDepth ) - 1;
+  int       m[TMP_LIC];
+  for( int k = 0; k < TMP_LIC; k++ )
+  {
+    m[k] = o.v[at + k];
+  }
+  for( int i = lid; i < t.w * t.h; i += NT )
+  {
+    s_spPred[i] = int16_t( tmpLicSample( int( s_spPred[i] ), m, maxPel ) );
+  }
 }
 
 // ----- the sub-sample search (JVET-AM0229's searchFracCandidate, for tmpFracIdx 1)
@@ -408,6 +625,34 @@ void tmpFracSearch( Cu c, int cuIndex, int tempType, int bitDepth, int lid, int 
     }
   }
   tsSync();
+  // with LIC its model of the vector (the node's, in its DimdOut) through the padded region's parts the search reads:
+  // an L-shape's rows above (from the left template's columns on for the top template alone) and below them its left
+  // columns (the left template alone: all from the rows above's last D), else all
+  const int licIdc = BufI32( P.timdData ).v[c.tmp + TMP_HEAD_LIC];
+  if( licIdc != 0 )
+  {
+    int m[TMP_LIC];
+    for( int k = 0; k < TMP_LIC; k++ )
+    {
+      m[k] = o.v[at + DIMD_OUT_TMP_LIC + k];
+    }
+    for( int i = lid; i < stride * ( eH + 2 * D ); i += NT )
+    {
+      const int bx = i % stride - D, by = i / stride - D;
+      bool      part = true;
+      if( tempType == TMP_L_SHAPE )
+      {
+        part = req == 0 ? by < T + D || bx < T + D
+           : req == 1 ? by < T + D && bx >= T - D
+                      : by >= T - D && bx < T + D;
+      }
+      if( part && ( ( tempType != TMP_LEFT && by < T + D ) || ( tempType != TMP_ABOVE && bx < T + D ) ) )
+      {
+        tfSet( stride, bx, by, tmpLicSample( tfGet( stride, bx, by ), m, maxPel ) );
+      }
+    }
+    tsSync();
+  }
   for( int n = lid; n < TMP_FRAC_CANDS; n += NT )
   {
     const bool allowed = tmpFracAllowed( 1 + n / 32, 1 + ( n / 8 ) % 4, n % 8 );
@@ -432,6 +677,23 @@ void tmpFracSearch( Cu c, int cuIndex, int tempType, int bitDepth, int lid, int 
     // (SGPM's lists take mv[0], then the list's first x 16 where the CU has an index: getNeighBv)
     const int tmpIdx = BufI32( P.timdData ).v[c.tmp + TMP_HEAD_IDX];
     bvStoreSgpm( c, tmpIdx > 0 ? 2 : 1, ivec2[2]( mv, bvUnpack( o.v[at + DIMD_OUT_TMP_BV] ) << 4 ) );
+    // with LIC the model again, at this vector (DecCu's LicItmp after generateTMPrediction with tmpIsSubPel)
+    if( licIdc != 0 )
+    {
+      BufI32      data   = BufI32( P.timdData );
+      const ivec2 delta  = ivec2( ( mv.x >> 4 ) < bv.x ? 1 : 0, ( mv.y >> 4 ) < bv.y ? 1 : 0 );
+      const int   reqLic = data.v[c.tmp + TMP_HEAD_LIC_EXT] != 0 ? 0 : req;
+      const int   model[TMP_LIC] = tmpLicModel( c, mv, delta, licIdc - 1, reqLic, bitDepth );
+      const int   slot = data.v[c.tmp + TMP_HEAD_LIC_SLOT];
+      for( int k = 0; k < TMP_LIC; k++ )
+      {
+        o.v[at + DIMD_OUT_TMP_LIC + k] = model[k];
+        if( slot >= 0 )
+        {
+          data.v[slot + k] = model[k];
+        }
+      }
+    }
   }
 }
 
@@ -495,17 +757,500 @@ int tmpSortInOut( int head, int n )
   return m;
 }
 
-// clipMvIntraConstraintRefine for a candidate at (px, py) of region r (bounds g) not transferred: its window around it
-// of S / 2 (one less to the right / below for even S), within the region but where the exception allows (region 3 /
-// 5 left, 4 up past its edge where the picture lets the template fit; 3 right, 1 down)
-ivec4 tmpRefineWindow( ivec4 g, int px, int py, int r, int S, bool extLeft, bool extTop, bool exception )
+// clipMvIntraConstraintRefine for a candidate at (px, py) of region r (bounds g): its window around it of S / 2 (one
+// less to the right / below for even S) - where transferred (tl, tt: LIC's sparse search) from it to S - 1 beyond -,
+// within the region but where the exception allows (region 3 / 5 left, 4 up past its edge where the picture lets the
+// template fit; 3 right, 1 down)
+ivec4 tmpRefineWindow( ivec4 g, int px, int py, int r, int S, bool extLeft, bool extTop, bool exception, bool tl,
+                       bool tt )
 {
   const int rr = S >> 1, odd = S % 2 != 0 ? 0 : 1;
-  const int xMin = exception && ( r == 3 || r == 5 ) && extLeft ? px - rr : max( g.x, px - rr );
-  const int xMax = exception && r == 3 ? px + rr - odd : min( g.y, px + rr - odd );
-  const int yMin = exception && r == 4 && extTop ? py - rr : max( g.z, py - rr );
-  const int yMax = exception && r == 1 ? py + rr - odd : min( g.w, py + rr - odd );
+  const int x0 = tl ? px : px - rr, x1 = tl ? px + S - 1 : px + rr - odd;
+  const int y0 = tt ? py : py - rr, y1 = tt ? py + S - 1 : py + rr - odd;
+  const int xMin = exception && ( r == 3 || r == 5 ) && extLeft ? x0 : max( g.x, x0 );
+  const int xMax = exception && r == 3 ? x1 : min( g.y, x1 );
+  const int yMin = exception && r == 4 && extTop ? y0 : max( g.z, y0 );
+  const int yMax = exception && r == 1 ? y1 : min( g.w, y1 );
   return ivec4( xMin, xMax, yMin, yMax );
+}
+
+// ----- fusion (xTMPBuildFusionCandidate, generateTMPrediction's fusion, xTMPFusionCalcModels / xTMPFusionApplyModel)
+
+const int TMP_FUSION_NUM = 5, TMP_GROUP_IDX = 4, TMP_BV_FUS_CAND_MRG = 5, MAX_NON_LOC_DEP_NUM = 3;
+
+// a fusion index's group of the list: its first entry and its number (getTmpFusionIdx, getTmpFusionNumber)
+ivec2 tmpFusionGroup( int tmpIdx )
+{
+  const int first = ( tmpIdx % TMP_GROUP_IDX ) * TMP_FUSION_NUM;
+  return ivec2( first, min( TMP_FUSION_NUM, MTMP_NUM - first ) );
+}
+
+// fusion candidate j's sample at (x, y) relative to the CU c of DimdOut at (its group from `first`): the sample at the
+// candidate's vector, with LIC through the candidate's model (getMemLicParams( 0, j ): the fusion CU's index 0, one
+// model)
+int tmpFusionRef( Cu c, int at, int first, int j, int x, int y, bool lic, int maxPel )
+{
+  CBufI32     o  = CBufI32( P.dimdOut );
+  const ivec2 bv = bvUnpack( o.v[at + DIMD_OUT_TMP_BV + first + j] );
+  const int   v  = recoAt( 0, c.x + bv.x + x, c.y + bv.y + y );
+  if( !lic )
+  {
+    return v;
+  }
+  const int k = at + DIMD_OUT_TMP_FUS_LIC + 3 * j, scaled = o.v[k] * v, shift = o.v[k + 1];
+  return clamp( ( shift >= 0 ? scaled >> shift : scaled << -shift ) + o.v[k + 2], 0, maxPel );
+}
+
+// the filter model's reference point relative to the CU (refPosX / refPosY of the template: its corner sample next to
+// the block; the above template's column 0, the left one's row 0)
+ivec2 tmpFusionRefPoint( int tempType )
+{
+  return ivec2( tempType == TMP_ABOVE ? 0 : -1, tempType == TMP_LEFT ? 0 : -1 );
+}
+
+// fusion candidate j's input to the filter model at (x, y): its sample less its sample at the reference point (with
+// LIC both through its model: m_memOffsetsFusionUseMR)
+int tmpFusionInput( Cu c, int at, int first, int j, int x, int y, int tempType, bool lic, int maxPel )
+{
+  const ivec2 rp = tmpFusionRefPoint( tempType );
+  return tmpFusionRef( c, at, first, j, x, y, lic, maxPel ) - tmpFusionRef( c, at, first, j, rp.x, rp.y, lic, maxPel );
+}
+
+// convertDiff2Weight: n template costs into weights summing to 64, each against the others' total (a zero cost as 1),
+// normalized by the divSig table, then rounded to the sum from the last (down) or the first (up)
+void tmpFusionWeights( int cost[TMP_FUSION_NUM], int n, out int w[TMP_FUSION_NUM] )
+{
+  for( int i = 0; i < TMP_FUSION_NUM; i++ )
+  {
+    w[i] = 0;
+  }
+  if( n <= 1 )
+  {
+    w[0] = 64;
+    return;
+  }
+  int sumW = 0;
+  for( int i = 0; i < n; i++ )
+  {
+    cost[i] = cost[i] == 0 ? 1 : cost[i];
+    sumW += cost[i];
+  }
+  for( int i = 0; i < n; i++ )
+  {
+    cost[i] = sumW - cost[i];
+  }
+  const int divSigTable[16] = int[16]( 0, 7, 6, 5, 5, 4, 4, 3, 3, 2, 2, 1, 1, 1, 1, 0 );
+  const int sumDiff = ( n - 1 ) * sumW;
+  int       x = findMSB( sumDiff );
+  const int norm = ( sumDiff << 4 >> x ) & 15, v = divSigTable[norm] | 8;
+  x += norm != 0 ? 1 : 0;
+  const int shift = x + 3, add = 1 << ( shift - 1 );
+  sumW = 0;
+  for( int j = 0; j < n; j++ )
+  {
+    w[j] = ( cost[j] * v * 64 + add ) >> shift;
+    sumW += w[j];
+  }
+  while( sumW > 64 )
+  {
+    for( int j = n - 1; j >= 0 && sumW > 64; j-- )
+    {
+      if( w[j] != 0 )
+      {
+        w[j]--;
+        sumW--;
+      }
+    }
+  }
+  while( sumW < 64 )
+  {
+    for( int j = 0; j < n && sumW < 64; j++ )
+    {
+      w[j]++;
+      sumW++;
+    }
+  }
+}
+
+// CccmCovariance::solve1 of M (<= 6) parameters from the products' sums over `samples` samples (ata's upper triangle,
+// atb): the offset taken out of the cross-correlations, both scaled to 28 bits less the samples' and the bit depth's
+// (GLM_MATRIX: bit depths up to 10), gaussElimination with the regularization 2 << (bitDepth - 8) and xDivide's
+// division, the back substitution, the offset added to the bias; without samples clearModel's (a bias of 1)
+int64_t[6] tmpSolve1( int64_t ata[6][6], int64_t atb[6], int M, int samples, int offset, int bitDepth )
+{
+  int64_t p[6] = int64_t[6]( 0, 0, 0, 0, 0, 0 );
+  if( samples == 0 )   // (clearModel)
+  {
+    for( int i = 0; i < 6; i++ )
+    {
+      p[i] = i == M - 1 ? int64_t( 1 ) << CCCM_DECIM : int64_t( 0 );
+    }
+  }
+  else
+  {
+    for( int i = 0; i < M; i++ )
+    {
+      atb[i] -= ( ata[i][M - 1] * int64_t( offset ) ) >> ( bitDepth - 1 );
+    }
+    const int shift = GLM_MATRIX - 2 * bitDepth - cccmCeilLog2( samples );
+    int64_t   cm[6][7];
+    for( int i = 0; i < M; i++ )
+    {
+      for( int j = 0; j < M; j++ )
+      {
+        const int64_t v = j >= i ? ata[i][j] : ata[j][i];
+        cm[i][j] = shift > 0 ? v << shift : v >> -shift;
+      }
+      cm[i][M] = shift > 0 ? atb[i] << shift : atb[i] >> -shift;
+      cm[i][i] += int64_t( 2 << ( bitDepth - 8 ) );
+    }
+    for( int i = 0; i < M; i++ )   // gaussElimination
+    {
+      int sc, rd, sh;
+      cccmDivScale( cm[i][i] < int64_t( 1 ) ? int64_t( 1 ) : cm[i][i], sc, rd, sh );
+      for( int j = i + 1; j <= M; j++ )
+      {
+        cm[i][j] = ( cm[i][j] * int64_t( sc ) + int64_t( rd ) ) >> sh;
+      }
+      for( int r = i + 1; r < M; r++ )
+      {
+        const int64_t f = cm[r][i];
+        for( int k = i + 1; k <= M; k++ )
+        {
+          cm[r][k] -= ( f * cm[i][k] + int64_t( 1 << ( CCCM_DECIM - 1 ) ) ) >> CCCM_DECIM;
+        }
+      }
+    }
+    for( int i = M - 1; i >= 0; i-- )   // gaussBacksubstitution
+    {
+      int64_t v = cm[i][M];
+      for( int j = i + 1; j < M; j++ )
+      {
+        v -= ( cm[i][j] * p[j] + int64_t( 1 << ( CCCM_DECIM - 1 ) ) ) >> CCCM_DECIM;
+      }
+      p[i] = v;
+    }
+    p[M - 1] += int64_t( offset ) << ( CCCM_DECIM - ( bitDepth - 1 ) );
+  }
+  return p;
+}
+
+// the node's part of fusion CU c (invocation 0, with its list of n entries in TS_REFINE, `main`): its group's vectors
+// as later CUs' lists take them (cpuBlockVectors' fusion branch: the group's TMP_BV_FUS_CAND_MRG, then the list's first
+// where the group is not the first; getSparseArBvMergeCandidate's: the group's first and the list's first where its
+// index is not 0), with LIC each candidate's model (LicItmp at its vector with its required template), then by its
+// index a filter model (from TMP_GROUP_IDX on: xTMPFusionCalcParams' samples of the template - each candidate's less
+// its reference point's, a bias -, solve1) or the blend's (a candidate of the top or the left template alone: the
+// first of each and up to 3 others for the location-dependent blend; else weights of the costs)
+void tmpFusionSetup( Cu c, int cuIndex, int head, int tempType, int n, int bitDepth )
+{
+  BufI32    data = BufI32( P.timdData );
+  CBufI32   o    = CBufI32( P.dimdOut );
+  const int at = cuIndex * DIMD_OUT, tmpIdx = data.v[head + TMP_HEAD_IDX], maxPel = ( 1 << bitDepth ) - 1;
+  const ivec2 grp = tmpFusionGroup( tmpIdx );
+  const int first = grp.x, num = grp.y;
+  const bool lic = data.v[head + TMP_HEAD_LIC] != 0, ext = data.v[head + TMP_HEAD_LIC_EXT] != 0;
+  // its vectors for later CUs, its own (pu.bv, mv: the group's first)
+  const int bvAt = P.bvOut + data.v[c.bvList + BV_LIST_INDEX] * BV_OUT;
+  const int numBv = min( TMP_BV_FUS_CAND_MRG, MTMP_NUM - first );
+  data.v[bvAt] = numBv + ( first != 0 ? 1 : 0 );
+  for( int j = 0; j < numBv; j++ )
+  {
+    data.v[bvAt + 1 + j] = o.v[at + DIMD_OUT_TMP_BV + first + j];
+  }
+  if( first != 0 )
+  {
+    data.v[bvAt + 1 + numBv] = o.v[at + DIMD_OUT_TMP_BV];
+  }
+  data.v[bvAt + BV_OUT_SPARSE]     = tmpIdx > 0 ? 2 : 1;
+  data.v[bvAt + BV_OUT_SPARSE + 1] = o.v[at + DIMD_OUT_TMP_BV + first];
+  data.v[bvAt + BV_OUT_SPARSE + 2] = o.v[at + DIMD_OUT_TMP_BV];
+  data.v[bvAt + BV_OUT_FUSION]     = first != 0 ? numBv : -1;
+  data.v[bvAt + BV_OUT_SGPM]       = -1;
+  const ivec2 own = bvUnpack( o.v[at + DIMD_OUT_TMP_BV + first] );
+  o.v[at + DIMD_OUT_BV]         = o.v[at + DIMD_OUT_TMP_BV + first];
+  o.v[at + DIMD_OUT_TMP_MV]     = own.x << 4;
+  o.v[at + DIMD_OUT_TMP_MV + 1] = own.y << 4;
+  // the candidates' required templates (cyclic as the list) and LIC models
+  int req[TMP_FUSION_NUM];
+  for( int j = 0; j < num; j++ )
+  {
+    req[j] = tlAt( TS_REFINE, ( first + j ) % n, TE_REGION ) >> 8;
+    if( lic )
+    {
+      const ivec2 bv = bvUnpack( o.v[at + DIMD_OUT_TMP_BV + first + j] );
+      const int   m[TMP_LIC] = tmpLicModel( c, bv << 4, ivec2( 0 ), 0, ext ? 0 : req[j], bitDepth );
+      o.v[at + DIMD_OUT_TMP_FUS_LIC + 3 * j]     = m[1];
+      o.v[at + DIMD_OUT_TMP_FUS_LIC + 3 * j + 1] = m[2];
+      o.v[at + DIMD_OUT_TMP_FUS_LIC + 3 * j + 2] = m[3];
+    }
+  }
+  if( tmpIdx < TMP_GROUP_IDX )   // the blend's
+  {
+    int  topFirst = -1, leftFirst = -1, nonLoc[3] = int[3]( -1, -1, -1 ), nb = 0;
+    bool conversion = true;
+    for( int j = first; j < first + num; j++ )
+    {
+      const int r = req[j - first];
+      if( r == 1 || r == 2 )
+      {
+        topFirst  = r == 1 && topFirst < 0 ? j : topFirst;
+        leftFirst = r == 2 && leftFirst < 0 ? j : leftFirst;
+        conversion = false;
+      }
+      else if( nb < MAX_NON_LOC_DEP_NUM )
+      {
+        nonLoc[nb++] = j;
+      }
+    }
+    if( nb == 0 )   // (the group's last 3 but the top and left ones)
+    {
+      for( int k = MAX_NON_LOC_DEP_NUM; k > 0; k-- )
+      {
+        const int idx = first + num - k;
+        if( idx != topFirst && idx != leftFirst )
+        {
+          nonLoc[nb++] = idx;
+        }
+      }
+    }
+    int cost[TMP_FUSION_NUM], w[TMP_FUSION_NUM];
+    for( int j = 0; j < TMP_FUSION_NUM; j++ )
+    {
+      cost[j] = j < num ? tlAt( TS_REFINE, ( first + j ) % n, TE_COST ) : 0;
+    }
+    tmpFusionWeights( cost, conversion ? num : 1, w );
+    o.v[at + DIMD_OUT_TMP_FUS]     = topFirst;
+    o.v[at + DIMD_OUT_TMP_FUS + 1] = leftFirst;
+    for( int k = 0; k < 3; k++ )
+    {
+      o.v[at + DIMD_OUT_TMP_FUS + 2 + k] = nonLoc[k];
+    }
+    for( int j = 0; j < TMP_FUSION_NUM; j++ )
+    {
+      o.v[at + DIMD_OUT_TMP_FUS + 5 + j] = w[j];
+    }
+    return;
+  }
+  // the filter model: num + 1 parameters over the template's samples (the rows above the block, then the columns left
+  // of it; the L-shape without its corner), solve1 with the current template's reference point as the offset
+  const int   M = num + 1, T = TMP_TEMPLATE_SIZE;
+  const ivec2 rp = tmpFusionRefPoint( tempType );
+  const int   offset = recoAt( 0, c.x + rp.x, c.y + rp.y ), bias = 1 << ( bitDepth - 1 );
+  int64_t ata[6][6], atb[6];
+  for( int i = 0; i < 6; i++ )
+  {
+    atb[i] = 0;
+    for( int j = 0; j < 6; j++ )
+    {
+      ata[i][j] = 0;
+    }
+  }
+  const int numTop = tempType != TMP_LEFT ? T * c.w : 0, numLeft = tempType != TMP_ABOVE ? T * c.h : 0;
+  const int samples = numTop + numLeft;
+  for( int s = 0; s < samples; s++ )
+  {
+    const int x = s < numTop ? s % c.w : s % T - T, y = s < numTop ? s / c.w - T : ( s - numTop ) / T;
+    int a[6];
+    for( int j = 0; j < 6; j++ )
+    {
+      a[j] = j < num ? tmpFusionInput( c, at, first, j, x, y, tempType, lic, maxPel ) : j == num ? bias : 0;
+    }
+    const int cb = recoAt( 0, c.x + x, c.y + y );
+    for( int i = 0; i < M; i++ )
+    {
+      for( int j = i; j < M; j++ )
+      {
+        ata[i][j] += int64_t( a[i] * a[j] );
+      }
+      atb[i] += int64_t( a[i] * cb );
+    }
+  }
+  const int64_t p[6] = tmpSolve1( ata, atb, M, samples, offset, bitDepth );
+  for( int i = 0; i < 6; i++ )
+  {
+    o.v[at + DIMD_OUT_TMP_FUS_PAR + 2 * i]     = int( uint64_t( p[i] ) );
+    o.v[at + DIMD_OUT_TMP_FUS_PAR + 2 * i + 1] = int( uint64_t( p[i] ) >> 32 );
+  }
+}
+
+// ----- FLM (xGetTmpFlmRefBuf / xCalcTmpFlmRefArea, xCalTmpFlmParam, xGenerateTmpFlmPred)
+
+// the FLM area's sample (ax, ay) - relative to its top-left, the template's at the CU's vector bv: the block with the
+// template's rows above / columns left -, less the area's offset, padded where pads says (bits 1 left, 2 right, 4 top,
+// 8 bottom: the area's edge sample for the one beyond it)
+int tmpFlmRef( Cu c, ivec2 bv, int tempType, int pads, int ax, int ay, int offset )
+{
+  const int rx = tempType != TMP_ABOVE ? TMP_TEMPLATE_SIZE : 0, ry = tempType != TMP_LEFT ? TMP_TEMPLATE_SIZE : 0;
+  const int aw = c.w + rx, ah = c.h + ry;
+  ax = ( pads & 1 ) != 0 && ax < 0 ? 0 : ( pads & 2 ) != 0 && ax >= aw ? aw - 1 : ax;
+  ay = ( pads & 4 ) != 0 && ay < 0 ? 0 : ( pads & 8 ) != 0 && ay >= ah ? ah - 1 : ay;
+  const int x = clamp( c.x + bv.x - rx + ax, 0, P.width[0] - 1 ), y = clamp( c.y + bv.y - ry + ay, 0, P.height[0] - 1 );
+  return recoAt( 0, x, y ) - offset;
+}
+
+// FLM's feature j at area sample (ax, ay): the sample, the ones above, below, left and right of it, the bias
+int tmpFlmFeature( Cu c, ivec2 bv, int tempType, int pads, int offset, int j, int ax, int ay, int bitDepth )
+{
+  const ivec2 d = j == 1 ? ivec2( 0, -1 ) : j == 2 ? ivec2( 0, 1 ) : j == 3 ? ivec2( -1, 0 ) : j == 4 ? ivec2( 1, 0 )
+                                                                                                     : ivec2( 0 );
+  return j == 5 ? 1 << ( bitDepth - 1 ) : tmpFlmRef( c, bv, tempType, pads, ax + d.x, ay + d.y, offset );
+}
+
+// the node's part of FLM CU c (invocation 0, with its list of n entries in TS_REFINE): its area's padding (an entry of
+// a neighbour's vector or the cascade all sides; else the sides where the vector is at its region's bound, and for the
+// regions 1, 3, 4 and 5 right / below where the samples there are not decoded), its offset (the template's corner
+// sample at the vector), the model's 6 parameters (solve1 over the template parts its required template takes: the
+// rows above the block, else the columns left; with the whole L-shape both; the current template's corner as the
+// offset) into its DimdOut
+void tmpFlmSetup( Cu c, int cuIndex, int head, int tempType, int n, int bitDepth )
+{
+  BufI32      data = BufI32( P.timdData );
+  CBufI32     o    = CBufI32( P.dimdOut );
+  OwnerMap    om   = OwnerMap( BufI32( P.owner[0] ), P.ownerW[0], P.ownerH[0], P.unitLog2X[0], P.unitLog2Y[0] );
+  const int   at = cuIndex * DIMD_OUT, tmpIdx = data.v[head + TMP_HEAD_IDX], T = TMP_TEMPLATE_SIZE;
+  const ivec2 bv = bvUnpack( o.v[at + DIMD_OUT_TMP_BV + tmpIdx] );
+  const int   tag = tlAt( TS_REFINE, tmpIdx % n, TE_REGION ), region = tag & 15, req = tag >> 8;
+  int pads = 15;
+  if( region <= 5 )
+  {
+    const ivec4 g = tmpRegion( head, region );
+    pads = ( bv.x > g.x ? 0 : 1 ) | ( bv.x < g.y ? 0 : 2 ) | ( bv.y > g.z ? 0 : 4 ) | ( bv.y < g.w ? 0 : 8 );
+    if( region != 0 && region != 2 )
+    {
+      pads |= decodedBefore( om, c.x + bv.x + c.w - 1, c.y + bv.y + c.h, g_ti ) ? 0 : 8;
+      pads |= decodedBefore( om, c.x + bv.x + c.w, c.y + bv.y + c.h - 1, g_ti ) ? 0 : 2;
+    }
+  }
+  const int   rx = tempType != TMP_ABOVE ? T : 0, ry = tempType != TMP_LEFT ? T : 0;
+  const ivec2 rp = tmpFusionRefPoint( tempType );
+  const int   offset = tmpFlmRef( c, bv, tempType, 0, rx + rp.x, ry + rp.y, 0 );   // (the area's corner)
+  const int   curOffset = recoAt( 0, c.x + rp.x, c.y + rp.y );
+  const bool  aboveDone = ( tempType == TMP_L_SHAPE && req != 2 ) || tempType == TMP_ABOVE;
+  const int   numFirst = aboveDone ? T * c.w : T * c.h;
+  const int   samples = numFirst + ( tempType == TMP_L_SHAPE && req == 0 ? T * c.h : 0 );
+  int64_t ata[6][6], atb[6];
+  for( int i = 0; i < 6; i++ )
+  {
+    atb[i] = 0;
+    for( int j = 0; j < 6; j++ )
+    {
+      ata[i][j] = 0;
+    }
+  }
+  for( int s = 0; s < samples; s++ )
+  {
+    // (x, y) relative to the CU: the rows above it, else / then the columns left of it
+    const bool top = aboveDone && s < numFirst;
+    const int  k = s < numFirst ? s : s - numFirst;
+    const int  x = top ? k % c.w : k % T - T, y = top ? k / c.w - T : k / T;
+    int a[6];
+    for( int j = 0; j < 6; j++ )
+    {
+      a[j] = tmpFlmFeature( c, bv, tempType, pads, offset, j, x + rx, y + ry, bitDepth );
+    }
+    const int cb = recoAt( 0, c.x + x, c.y + y );
+    for( int i = 0; i < 6; i++ )
+    {
+      for( int j = i; j < 6; j++ )
+      {
+        ata[i][j] += int64_t( a[i] * a[j] );
+      }
+      atb[i] += int64_t( a[i] * cb );
+    }
+  }
+  const int64_t p[6] = tmpSolve1( ata, atb, 6, samples, curOffset, bitDepth );
+  for( int i = 0; i < 6; i++ )
+  {
+    o.v[at + DIMD_OUT_TMP_FUS_PAR + 2 * i]     = int( uint64_t( p[i] ) );
+    o.v[at + DIMD_OUT_TMP_FUS_PAR + 2 * i + 1] = int( uint64_t( p[i] ) >> 32 );
+  }
+  o.v[at + DIMD_OUT_TMP_FUS]     = pads;
+  o.v[at + DIMD_OUT_TMP_FUS + 1] = offset;
+}
+
+// the fusion CU c's prediction at (x, y) relative to it (its node's DimdOut at `at`): the filter model's convolution
+// (as a Pel, clipped), the location-dependent blend (xLocationdepBlending with range 16 of the top / left candidates
+// over the others' blend: one alone, two 32 : 32, three 22 : 21 : 21), else the weighted blend (tmpFusionBlending)
+int tmpFusionSample( Cu c, int at, int x, int y, int bitDepth )
+{
+  CBufI32     o      = CBufI32( P.dimdOut );
+  BufI32      data   = BufI32( P.timdData );
+  const int   tmpIdx = data.v[c.tmp + TMP_HEAD_IDX], tempType = data.v[c.tmp + TMP_HEAD_TEMP_TYPE];
+  const bool  lic    = data.v[c.tmp + TMP_HEAD_LIC] != 0;
+  const ivec2 grp    = tmpFusionGroup( tmpIdx );
+  const int   first = grp.x, num = grp.y, maxPel = ( 1 << bitDepth ) - 1;
+  const bool  flm   = data.v[c.tmp + TMP_HEAD_FLM] != 0;
+  if( flm || tmpIdx >= TMP_GROUP_IDX )   // (a model's convolution: FLM's or fusion's filter)
+  {
+    int64_t sum = 0;
+    for( int j = 0; j <= ( flm ? 5 : num ); j++ )
+    {
+      const int64_t pj = int64_t( uint( o.v[at + DIMD_OUT_TMP_FUS_PAR + 2 * j] ) )
+                         | ( int64_t( o.v[at + DIMD_OUT_TMP_FUS_PAR + 2 * j + 1] ) << 32 );
+      if( flm )
+      {
+        const int rx = tempType != TMP_ABOVE ? TMP_TEMPLATE_SIZE : 0, ry = tempType != TMP_LEFT ? TMP_TEMPLATE_SIZE : 0;
+        sum += pj * int64_t( tmpFlmFeature( c, bvUnpack( o.v[at + DIMD_OUT_BV] ), tempType, o.v[at + DIMD_OUT_TMP_FUS],
+                                            o.v[at + DIMD_OUT_TMP_FUS + 1], j, x + rx, y + ry, bitDepth ) );
+        continue;
+      }
+      sum += pj * int64_t( j < num ? tmpFusionInput( c, at, first, j, x, y, tempType, lic, maxPel )
+                                   : 1 << ( bitDepth - 1 ) );
+    }
+    return clamp( int( int16_t( ( sum + int64_t( 1 << ( CCCM_DECIM - 1 ) ) ) >> CCCM_DECIM ) ), 0, maxPel );
+  }
+  const int topFirst = o.v[at + DIMD_OUT_TMP_FUS], leftFirst = o.v[at + DIMD_OUT_TMP_FUS + 1];
+  if( topFirst < 0 && leftFirst < 0 )
+  {
+    int blend = 32;
+    for( int j = 0; j < num; j++ )
+    {
+      blend += o.v[at + DIMD_OUT_TMP_FUS + 5 + j] * tmpFusionRef( c, at, first, j, x, y, lic, maxPel );
+    }
+    return int( int16_t( blend >> 6 ) );
+  }
+  int nb = 0, non = 32;
+  const int wn[3] = int[3]( 22, 21, 21 );
+  for( int k = 0; k < 3; k++ )
+  {
+    nb += o.v[at + DIMD_OUT_TMP_FUS + 2 + k] >= 0 ? 1 : 0;
+  }
+  for( int k = 0; k < nb; k++ )
+  {
+    const int v = tmpFusionRef( c, at, first, o.v[at + DIMD_OUT_TMP_FUS + 2 + k] - first, x, y, lic, maxPel );
+    non += ( nb == 1 ? 64 : nb == 2 ? 32 : wn[k] ) * v;
+  }
+  const int pNon = int( int16_t( non >> 6 ) );
+  const int mode = topFirst >= 0 ? ( leftFirst >= 0 ? 0 : 1 ) : 2;
+  const int wDir = mode == 0 ? ( nb == 1 ? 16 : 8 ) : 16, wNon = 64 - ( mode == 0 ? 2 * wDir : wDir );
+  const int range = 16, W1 = c.w - 1, H1 = c.h - 1;
+  const int pVer = topFirst >= 0 ? tmpFusionRef( c, at, first, topFirst - first, x, y, lic, maxPel ) : 0;
+  const int pHor = leftFirst >= 0 ? tmpFusionRef( c, at, first, leftFirst - first, x, y, lic, maxPel ) : 0;
+  const int rangeVer = c.h > 64 ? 2 * range : range, rangeHor = c.w > 64 ? 2 * range : range;
+  int wv = 64, wh = 64;
+  if( mode == 0 )   // (the clip ranges: each direction's weight plus its half of the rest, exact here)
+  {
+    const int clipVer = wDir + dimdScaledWeight( wDir, 2 * wDir, wNon ), clipHor = clipVer;
+    const bool needVer = wDir + rangeVer > clipVer || wDir - rangeVer < 0;
+    const bool needHor = wDir + rangeHor > clipHor || wDir - rangeHor < 0;
+    wv = H1 != 0 ? divTrunc( ( wDir + rangeVer ) * H1 - ( ( rangeVer * y ) << 1 ), H1 ) : 64;
+    wv = H1 != 0 && needVer ? clamp( wv, 0, clipVer ) : wv;
+    wh = W1 != 0 ? divTrunc( ( wDir + rangeHor ) * W1 - ( ( rangeHor * x ) << 1 ), W1 ) : 64 - wv;
+    wh = W1 != 0 && needHor ? clamp( wh, 0, clipHor ) : wh;
+    return int( int16_t( ( pVer * wv + pHor * wh + pNon * ( 64 - wv - wh ) + 32 ) >> 6 ) );
+  }
+  if( mode == 1 )
+  {
+    const bool need = wDir + rangeVer > 64 || wDir - rangeVer < 0;
+    wv = H1 != 0 ? divTrunc( ( wDir + rangeVer ) * H1 - ( ( rangeVer * y ) << 1 ), H1 ) : 64;
+    wv = H1 != 0 && need ? clamp( wv, 0, 64 ) : wv;
+    return int( int16_t( ( pVer * wv + pNon * ( 64 - wv ) + 32 ) >> 6 ) );
+  }
+  const bool need = wDir + rangeHor > 64 || wDir - rangeHor < 0;
+  wh = W1 != 0 ? divTrunc( ( wDir + rangeHor ) * W1 - ( ( rangeHor * x ) << 1 ), W1 ) : 64;
+  wh = W1 != 0 && need ? clamp( wh, 0, 64 ) : wh;
+  return int( int16_t( ( pHor * wh + pNon * ( 64 - wh ) + 32 ) >> 6 ) );
 }
 
 // ----- the node
@@ -526,10 +1271,18 @@ void tmpNode( Cu c, int cuIndex, int bitDepth, int lid, int NT )
   OwnerMap   om = OwnerMap( BufI32( P.owner[0] ), P.ownerW[0], P.ownerH[0], P.unitLog2X[0], P.unitLog2Y[0] );
   const int  search   = data.v[head + TMP_HEAD_SEARCH];
   const bool onlyBest = search == TMP_SEARCH_BEST, bvg = search == TMP_SEARCH_BVG;
-  const int  numSparse[3] = int[3]( search != TMP_SEARCH_FULL ? 1 : MTMP_NUM_SPARSE, TL_NUM_SPARSE, TL_NUM_SPARSE );
+  const bool mr       = data.v[head + TMP_HEAD_LIC] != 0;   // (useMR: LIC's mean-removed costs)
+  const int  tlSparse = mr && !licMode ? TL_NUM : TL_NUM_SPARSE;
+  const int  numSparse[3] = int[3]( search != TMP_SEARCH_FULL ? 1
+                                    : mr && !licMode       ? MTMP_NUM_SPARSE_FOR_LIC
+                                                           : MTMP_NUM_SPARSE,
+                                    tlSparse, tlSparse );
   const int  numRefine[3] = int[3]( data.v[head + TMP_HEAD_NUM_REFINE], TL_NUM, TL_NUM );
   const int  numTL = ( W + TMP_TEMPLATE_SIZE ) * TMP_TEMPLATE_SIZE + TMP_TEMPLATE_SIZE * H;   // numPixTopLeft
   const int  numTop = W * TMP_TEMPLATE_SIZE, numLeft = TMP_TEMPLATE_SIZE * H;
+
+  g_tmpMr   = mr;
+  g_tmpMean = mr ? tmpMeans( c, tempType, 0, 0 ) : ivec2( 0 );
 
   // invocation 0's state: the vector list's parts (itmpSize, itmpSize1), the thresholds, the enumeration
   int itmpSize = 0, itmpSize1 = 0, numList = 0;
@@ -548,7 +1301,10 @@ void tmpNode( Cu c, int cuIndex, int bitDepth, int lid, int NT )
   // the sparse search: the regions 3, 4, 5, 0, 1, 2 (but for a small block a region inside a neighbour vector's
   // window), rows from the bottom up by S, row r's first position S - 1 - (r - 1) % S left of the right edge, then
   // to the left by S; in regions 4 and 5 (beyond the CU in its CTU) the positions whose block is decoded, until a
-  // row's first such. Each chunk costed in parallel, then put into the sparse lists by invocation 0
+  // row's first such. With LIC a position's cost and entry are those S / 2 right and below it (iXOffsetMetric), but
+  // where that leaves the region (transferred: the window then extends from it by S - 1) or, in regions 4 and 5 before
+  // the row's first such, its block is not decoded (both transferred). Each chunk costed in parallel, then put into the
+  // sparse lists by invocation 0 (a region's tag with the transferred flags as bits 4 and 5)
   int   checkIdx = 0, region = 0, y = 0, x = 0, shiftX = 0;
   bool  inRegion = false, newRow = false, rowFound = false, checkR4R5 = true;
   ivec4 g = ivec4( 0 );
@@ -608,15 +1364,42 @@ void tmpNode( Cu c, int cuIndex, int bitDepth, int lid, int NT )
         }
         const int px = x;
         x -= S;
+        int mx = px + ( S >> 1 ), my = y + ( S >> 1 ), flags = 0;
+        if( mx > g.y )
+        {
+          mx = px;
+          flags |= 16;
+        }
+        if( my > g.w )
+        {
+          my = y;
+          flags |= 32;
+        }
         if( ( region == 4 || region == 5 ) && !rowFound && checkR4R5 )
         {
           if( !decodedBefore( om, c.x + px + W - 1, c.y + y + H - 1, g_ti ) )
           {
             continue;
           }
-          rowFound = true;
+          if( mr && !decodedBefore( om, c.x + mx + W - 1, c.y + my + H - 1, g_ti ) )
+          {
+            mx    = px;
+            my    = y;
+            flags = 48;
+          }
+          else
+          {
+            rowFound = true;
+          }
         }
-        tmpEmit( k, px, y, region );
+        if( mr )
+        {
+          tmpEmit( k, mx, my, region | flags );
+        }
+        else
+        {
+          tmpEmit( k, px, y, region );
+        }
       }
       s_tmpCount = k;
       s_tmpDone  = checkIdx >= 6 ? 1 : 0;
@@ -834,7 +1617,8 @@ void tmpNode( Cu c, int cuIndex, int bitDepth, int lid, int NT )
             cand = 0;
             continue;
           }
-          candRegion = tlAt( list, cand, TE_REGION );
+          const int tag = tlAt( list, cand, TE_REGION );   // (a sparse entry's transferred flags: bits 4, 5)
+          candRegion = tag & 15;
           const int cx = tlAt( list, cand, TE_X ), cy = tlAt( list, cand, TE_Y );
           if( candRegion > 5 )
           {
@@ -846,7 +1630,8 @@ void tmpNode( Cu c, int cuIndex, int bitDepth, int lid, int NT )
           {
             const ivec4 rg = tmpRegion( head, candRegion );
             win = tmpRefineWindow( rg, cx, cy, candRegion, S, c.x + rg.x >= TMP_TEMPLATE_SIZE + ( S >> 1 ),
-                                   c.y + rg.z >= TMP_TEMPLATE_SIZE + ( S >> 1 ), !licMode );
+                                   c.y + rg.z >= TMP_TEMPLATE_SIZE + ( S >> 1 ), !licMode, ( tag & 16 ) != 0,
+                                   ( tag & 32 ) != 0 );
           }
           open  = true;
           wy    = win.w;
@@ -983,7 +1768,8 @@ void tmpNode( Cu c, int cuIndex, int bitDepth, int lid, int NT )
           {
             tlSetAt( main, at, f, tlAt( list, i, f ) );
           }
-          tlSetAt( main, at, TE_REGION, tlAt( list, i, TE_REGION ) | t << 8 );   // (m_mtmpRequiredTemplate: t)
+          // (m_mtmpRequiredTemplate: t)
+          tlSetAt( main, at, TE_REGION, ( tlAt( list, i, TE_REGION ) & 255 ) | t << 8 );
         }
       }
     }
@@ -1007,6 +1793,31 @@ void tmpNode( Cu c, int cuIndex, int bitDepth, int lid, int NT )
       o.v[at + DIMD_OUT_TMP_MV]     = bv[0].x << 4;      // (pu.mv[0], but a sub-sample search's below)
       o.v[at + DIMD_OUT_TMP_MV + 1] = bv[0].y << 4;
       tsSet( TS_FRAC_REQ, tlAt( main, tmpIdx % n, TE_REGION ) >> 8 );
+      // with LIC its model (LicItmp at the vector with getRequiredTemplate: with the SPS's ItmpLicExtension the
+      // L-shape's) into its DimdOut, and where SGPM's lists may take it, into its slot there (the host's BV_OUT_LIC)
+      const int licIdc = data.v[head + TMP_HEAD_LIC];
+      if( data.v[head + TMP_HEAD_FUSION] != 0 )
+      {
+        tmpFusionSetup( c, cuIndex, head, tempType, n, bitDepth );
+      }
+      else if( data.v[head + TMP_HEAD_FLM] != 0 )
+      {
+        tmpFlmSetup( c, cuIndex, head, tempType, n, bitDepth );
+      }
+      else if( licIdc != 0 )
+      {
+        const int req = data.v[head + TMP_HEAD_LIC_EXT] != 0 ? 0 : tsGet( TS_FRAC_REQ );
+        const int model[TMP_LIC] = tmpLicModel( c, bv[0] << 4, ivec2( 0 ), licIdc - 1, req, bitDepth );
+        const int slot = data.v[head + TMP_HEAD_LIC_SLOT];
+        for( int k = 0; k < TMP_LIC; k++ )
+        {
+          o.v[at + DIMD_OUT_TMP_LIC + k] = model[k];
+          if( slot >= 0 )
+          {
+            data.v[slot + k] = model[k];
+          }
+        }
+      }
     }
   }
   if( data.v[head + TMP_HEAD_FRAC] != 0 )

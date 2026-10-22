@@ -2,7 +2,10 @@
 // neighbours (the host's list in the CPU's order, MergeHead: an intra merge or OBIC CU is always valid, a DIMD or MPM CU
 // where its DIMD blends, a TIMD CU where its modes blend or its mode is angular), each at a position not taken yet and of
 // new parameters, at most five; reorderIntraMergeCand's ranking of two or more by the template costs of their modes
-// (intra_timd.glsl); the choice into the CU's DimdOut slot (dimdModeMerge, dimdBlendModeMerge, dimdRelWeightMerge,
+// (intra_timd.glsl); an IntraTMP neighbour is the CU its vector points at (getItmpBasedIntraMergeCand: of the CUs at
+// the 4 x 4 positions of its area moved by its vector, the first of the largest overlap; its position must be new as
+// well as the IntraTMP CU's, whose position the candidate takes); the choice into the CU's DimdOut slot (dimdModeMerge,
+// dimdBlendModeMerge, dimdRelWeightMerge,
 // dimdLocDepMerge in DimdOut's layout, which the CU's blocks blend like DIMD's), the CU's mode its first. Included by
 // intra_rec.comp after intra_timd.glsl.
 #ifndef INTRA_MERGE_GLSL
@@ -35,15 +38,63 @@ void mcSet( int cand, int field, int v )
 }
 
 // in s_tmp (free before the template costs), while the candidates are found: per list entry its class where it is
-// valid (0: not a candidate) and its position (MT_ENTRY int16 each, at most MT_ENTRIES entries), then the indices of the
-// first MT_PREFETCH valid entries and their parameters' sources (their DimdOut / ObicOut, MT_WORDS each), fetched at once
-const int MT_ENTRY    = 3;
+// valid (0: not a candidate), its position, its record (low, high 16 bits), the position of the CU an IntraTMP
+// neighbour's vector points at, whether it is one (MT_ENTRY int16 each, at most MT_ENTRIES entries), then the indices
+// of the first MT_PREFETCH valid entries and their parameters' sources (their DimdOut / ObicOut, MT_WORDS each),
+// fetched at once
+const int MT_ENTRY    = 8;
 const int MT_ENTRIES  = 192;   // deriveIntraMergeCand's positions of a CU up to 128 x 128 (the host's limit): at most
                                // 2 x 33 + 5 + 61 + 28
 const int MT_PREFETCH = 16;
 const int MT_WORDS    = DIMD_OUT_PARAMS;
 const int MT_LIST     = MT_ENTRY * MT_ENTRIES;
 const int MT_DATA     = MT_LIST + MT_PREFETCH + 1;
+
+// the intra merge table (GpuIntraRec.cpp's MERGE_INFO per CodingStructure index, after the map of the CUs' block
+// vectors): position, size, record, class
+ivec4 mergeInfo( int idx )
+{
+  BufI32    d = BufI32( P.timdData );
+  const int a = P.bvMap + P.bvMapW * ( ( P.height[0] + 3 ) >> 2 ) + 4 * idx;
+  return ivec4( d.v[a], d.v[a + 1], d.v[a + 2], d.v[a + 3] );
+}
+
+// getItmpBasedIntraMergeCand's CU (CodingStructure index, -1 none) for IntraTMP CU idx: of the CUs at the 4 x 4
+// positions of its area moved by its vector (its block vectors' first, pu.bv), the first of the largest overlap
+int mergeTmpRef( int idx )
+{
+  BufI32      d   = BufI32( P.timdData );
+  const ivec4 inf = mergeInfo( idx );
+  const ivec2 bv  = bvUnpack( d.v[P.bvOut + idx * BV_OUT + 1] );
+  const int   rx = ( inf.x & 0xFFFF ) + bv.x, ry = ( inf.x >> 16 ) + bv.y, w = inf.y & 0xFFFF, h = inf.y >> 16;
+  int best = -1, bestArea = 0;
+  for( int j = 0; j < h; j += 4 )
+  {
+    for( int i = 0; i < w; i += 4 )
+    {
+      const int px = rx + i, py = ry + j;
+      if( px < 0 || py < 0 || px >= P.width[0] || py >= P.height[0] )
+      {
+        continue;
+      }
+      const int c = d.v[P.bvMap + ( py >> 2 ) * P.bvMapW + ( px >> 2 )];
+      if( c < 0 )
+      {
+        continue;
+      }
+      const ivec4 ci = mergeInfo( c );
+      const int   cx = ci.x & 0xFFFF, cy = ci.x >> 16;
+      const int   ow = min( rx + w, cx + ( ci.y & 0xFFFF ) ) - max( rx, cx );
+      const int   oh = min( ry + h, cy + ( ci.y >> 16 ) ) - max( ry, cy );
+      if( ow * oh > bestArea )
+      {
+        bestArea = ow * oh;
+        best     = c;
+      }
+    }
+  }
+  return best;
+}
 
 // word w of the parameters' source of neighbour n of class cls: its prefetched copy (slot pf), else its OBIC / DimdOut
 // (a TIMD CU's: its DIMD)
@@ -203,14 +254,17 @@ void mergeWalk( int base, int nbrNum, int numFetch )
     {
       continue;   // its DIMD does not blend: not a candidate
     }
-    const int n  = md.v[base + MERGE_HEAD + 2 * k];
-    const int pf = numValid < numFetch ? numValid : -1;
+    const int  n  = ( int( s_tmp[MT_ENTRY * k + 3] ) & 0xFFFF ) | ( int( s_tmp[MT_ENTRY * k + 4] ) << 16 );
+    const int  pf = numValid < numFetch ? numValid : -1;
     numValid++;
-    const int x = int( s_tmp[MT_ENTRY * k + 1] ), y = int( s_tmp[MT_ENTRY * k + 2] );
+    const int  x = int( s_tmp[MT_ENTRY * k + 1] ), y = int( s_tmp[MT_ENTRY * k + 2] );
+    const int  bx = int( s_tmp[MT_ENTRY * k + 5] ), by = int( s_tmp[MT_ENTRY * k + 6] );
+    const bool tmp = s_tmp[MT_ENTRY * k + 7] != int16_t( 0 );
     bool taken = false;
-    for( int i = 0; i < cnt; i++ )
+    for( int i = 0; i < cnt; i++ )   // (an IntraTMP neighbour's position, then its CU's: isDifferentIntraBlk twice)
     {
-      taken = taken || ( mcGet( i, MC_X ) == x && mcGet( i, MC_Y ) == y );
+      taken = taken || ( mcGet( i, MC_X ) == x && mcGet( i, MC_Y ) == y )
+              || ( tmp && mcGet( i, MC_X ) == bx && mcGet( i, MC_Y ) == by );
     }
     if( taken )
     {
@@ -227,21 +281,40 @@ void mergeWalk( int base, int nbrNum, int numFetch )
   s_spCost[MC_NUM] = uint( cnt );
 }
 
-// deriveIntraMergeCand over the CU's list (all invocations): the entries' validity (a DIMD or MPM neighbour where its
-// DIMD blends, a TIMD or TIMD merge neighbour by mergeTimdValid) and positions, the first valid ones' parameters
-// fetched at once (a TIMD neighbour's DIMD, its TIMD read where converted; of a TIMD merge neighbour unused), then the walk
+// deriveIntraMergeCand over the CU's list (all invocations): the entries' records and classes (an IntraTMP neighbour's
+// the CU's its vector points at), validity (a DIMD or MPM CU where its DIMD blends, a TIMD or TIMD merge CU by
+// mergeTimdValid) and positions, the first valid ones' parameters fetched at once (a TIMD CU's DIMD, its TIMD read
+// where converted; of a TIMD merge CU unused), then the walk
 void mergeCandidates( int base, int nbrNum, int lid, int NT )
 {
   BufI32 md = BufI32( P.mergeData );
   for( int k = lid; k < nbrNum; k += NT )
   {
-    const int  n = md.v[base + MERGE_HEAD + 2 * k], cls = md.v[base + MERGE_HEAD + 2 * k + 1];
+    int        n = md.v[base + MERGE_HEAD + 2 * k], cls = md.v[base + MERGE_HEAD + 2 * k + 1];
+    const bool tmp = cls == MERGE_NBR_TMP;
+    int        x = 0, y = 0;
+    if( tmp )
+    {
+      const ivec4 own = mergeInfo( n );
+      x = own.x & 0xFFFF;
+      y = own.x >> 16;
+      const int   ref = mergeTmpRef( n );
+      const ivec4 inf = ref >= 0 ? mergeInfo( ref ) : ivec4( 0, 0, -1, 0 );
+      n   = inf.z;
+      cls = n >= 0 ? max( inf.w, 0 ) : 0;
+    }
     const bool timd  = cls == MERGE_NBR_TIMD || cls == MERGE_NBR_TIMD_MERGE;
-    const bool valid = WITH_TIMD && timd ? mergeTimdValid( n )
-                     : cls != MERGE_NBR_DIMD || CBufI32( P.dimdOut ).v[n * DIMD_OUT + DIMD_OUT_BLENDING] != 0;
+    const bool valid = cls != 0 && ( WITH_TIMD && timd ? mergeTimdValid( n )
+                       : cls != MERGE_NBR_DIMD || CBufI32( P.dimdOut ).v[n * DIMD_OUT + DIMD_OUT_BLENDING] != 0 );
+    const int  bx = valid ? BufCu( P.cus ).v[n].x : 0, by = valid ? BufCu( P.cus ).v[n].y : 0;
     s_tmp[MT_ENTRY * k]     = int16_t( valid ? cls : 0 );
-    s_tmp[MT_ENTRY * k + 1] = int16_t( BufCu( P.cus ).v[n].x );
-    s_tmp[MT_ENTRY * k + 2] = int16_t( BufCu( P.cus ).v[n].y );
+    s_tmp[MT_ENTRY * k + 1] = int16_t( tmp ? x : bx );
+    s_tmp[MT_ENTRY * k + 2] = int16_t( tmp ? y : by );
+    s_tmp[MT_ENTRY * k + 3] = int16_t( n & 0xFFFF );
+    s_tmp[MT_ENTRY * k + 4] = int16_t( n >> 16 );
+    s_tmp[MT_ENTRY * k + 5] = int16_t( bx );
+    s_tmp[MT_ENTRY * k + 6] = int16_t( by );
+    s_tmp[MT_ENTRY * k + 7] = int16_t( tmp ? 1 : 0 );
   }
   SYNC();
   if( lid == 0 )   // the first valid entries, to fetch
@@ -261,7 +334,8 @@ void mergeCandidates( int base, int nbrNum, int lid, int NT )
   for( int i = lid; i < numFetch * MT_WORDS; i += NT )
   {
     const int pf = i / MT_WORDS, w = i % MT_WORDS, k = int( s_tmp[MT_LIST + pf] );
-    const int n = md.v[base + MERGE_HEAD + 2 * k], cls = md.v[base + MERGE_HEAD + 2 * k + 1];
+    const int n = ( int( s_tmp[MT_ENTRY * k + 3] ) & 0xFFFF ) | ( int( s_tmp[MT_ENTRY * k + 4] ) << 16 );
+    const int cls = int( s_tmp[MT_ENTRY * k] );
     if( cls != MERGE_NBR_OBIC || w < OBIC_OUT )
     {
       s_tmp[MT_DATA + i] = int16_t( mergeSource( n, cls, -1, w ) );

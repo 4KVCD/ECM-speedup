@@ -2632,10 +2632,16 @@ void main()
       }
       SYNC();
       mipTransformMode( t, W, H, mipPs, mipUpH, mipUpV, predStride, true, lid, NT );
-      // (an IntraTMP block's OBMC after the DIMD of its prediction: intra_obmc.glsl)
+      // (an IntraTMP block's LIC and OBMC after the DIMD of its prediction: intra_tmp.glsl, intra_obmc.glsl)
       if( WITH_MPM && ( t.derive & DERIVE_TMP ) != 0 )
       {
         const Cu  tc = BufCu( P.cus ).v[t.cu];
+        BufI32 td = BufI32( P.timdData );
+        if( td.v[tc.tmp + TMP_HEAD_LIC] != 0 && td.v[tc.tmp + TMP_HEAD_FUSION] == 0 )
+        {
+          SYNC();
+          tmpLicApply( t, lid, NT );   // (a fusion CU's candidates have theirs in its blend)
+        }
         const int ob = BufI32( P.timdData ).v[tc.tmp + TMP_HEAD_OBMC];
         if( ob >= 0 )
         {

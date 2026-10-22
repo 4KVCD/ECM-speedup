@@ -449,7 +449,7 @@ wall-clock gains with threads are "the easy baseline". Decoder status: single-th
 (`--GpuLoopFilter=1`: ALF, SAO, BIF, CCSAO, LF-CCCM, offset refinement on Vulkan). The user then asked for **a full
 GPU decoder in Vulkan, optimized until nothing is left** ("The GPU decoder needs to fully decode the frame on the
 GPU"; "Your first Vulkan version is going to be slow. That's OK"). That work is branch `dec-gpurecon`: intra
-reconstruction on the GPU (`--GpuRecon`), tool levels M1-M70 done and verified bit-exact (M19: DIMD, M20: OBIC, M21:
+reconstruction on the GPU (`--GpuRecon`), tool levels M1-M74 done and verified bit-exact (M19: DIMD, M20: OBIC, M21:
 intra merge, M22: the transforms of DIMD CUs, M23: LFNST of MIP, M24: TIMD, M25: OBIC and intra merge with TIMD
 neighbours, M26: TIMD-SAD, M27: OBIC and intra merge with TIMD-SAD neighbours, M28: TIMD merge, M29: TMRL of luma,
 M30: chroma TMRL, M31: CCLM, M32: LFNST / NSPT of CCLM, M33: GLM's gradient patterns, M34: CCCM, M35: GL-CCCM, M36:
@@ -462,7 +462,7 @@ MPM lists of MPM sorting, MDIP and PDP, M58: EIP, M59-M61: block vectors - TIMD,
 IntraTMP's search, without LIC / fusion / FLM / sub-sample vectors / OBMC, M63: EIP with a vector, M64: intra
 merge with vectors, M65: BVG-DIMD, M66: SGPM without vectors or regression, M67: SGPM's integer vectors with
 their LIC models, M68: IBC's interpolation, SGPM's fractional vectors, M69: IntraTMP's sub-sample vectors, M70:
-IntraTMP's OBMC); it is
+IntraTMP's OBMC, M71-M73: IntraTMP's LIC, fusion and FLM, M74: intra merge's IntraTMP neighbours); it is
 **not yet faster than the CPU
 decoder** (see section 8) and supports only a restricted tool set (in ON mode the real CTC streams still fall back to
 the CPU, first reason: chroma reordering / DBV). Partial verification (`perf/gpu/partial.py`, section 7's "Partial
@@ -471,7 +471,8 @@ picture is identical but the known CCP merge blocks (fp720_ai's 3 pictures, ra72
 still come from the CPU (IntraTMP LIC 4159, intra merge with a neighbour of a missing kind 2586, IntraTMP
 sub-sample vectors 1900, SGPM with vectors 3152 and regression 795, IntraTMP OBMC / fusion / FLM ~2200, ...; plus
 32777 inter / IBC / palette CUs of inter pictures). M67-M70 (2026-10-16 / 21) took SGPM's vectors, IntraTMP's
-sub-sample ones and its OBMC; next is IntraTMP's LIC (section 9).
+sub-sample ones and its OBMC, M71-M74 (2026-10-22) the rest of IntraTMP and intra merge's IntraTMP neighbours; the
+agents' branches (12-bit, SGPM regression, single tree, VVC LFNST) follow; then section 9's d and e.
 
 ## 1a. Working fast (development time)
 
@@ -1880,6 +1881,56 @@ prepareRef) and 41 motion runs on the CPU (its debug counts). SPIR-V: 3.34M / 4.
 the CCP-LFNST module: the next milestone must make room first (the strip's angular code is a second copy of the main
 path's; a shared call site would save ~60k).
 SPIR-V 3.26M / 4.08M IDs (113k left in the CCP-LFNST module).
+M71 (2026-10-22): IntraTMP's LIC (tmpLicFlag, JVET-AE0078), with or without the sub-sample search. The
+search (useMR) costs mean-removed SADs - each template part's sample less the difference of the part's means, each
+mean the part's sum floored by its size's log2 (calcTemplateDiff / calcTargetMean, the SIMD versions; the top part's
+mean also for the L-shape's corner) - keeps the sparse lists at MTMP_NUM_SPARSE_FOR_LIC 15 / TL_NUM 3 without the
+SPS's LIC mode, and moves each sparse position half a step towards its region's middle (iXOffsetMetric; "transferred"
+back where that leaves the region, or in regions 4 / 5 where its block is not decoded before the row's first such),
+whose flags its refinement window keeps (clipMvIntraConstraintRefine: from the position to S - 1 beyond). The node then
+fits the LIC model of the block's vector (LicItmp -> xLocalIlluComp with ibcLicFlag: the row above / column left of
+the CU at the vector where checkIsIBCCandidateValid allows, sampled as xGetLICParamGeneral steps by getLicDimBit; one
+model of m_licShift 5 with m_licMultApprox's division, or with IBC_LIC_IDX_M MMLM's two by cclmFit; required
+template from the list unless ItmpLicExtension) into its DimdOut (DIMD_OUT_TMP_LIC) and the slot SGPM's lists read
+(BV_OUT_LIC, which the host reserves for a GPU CU); with the sub-sample search that model goes through the padded
+template region before the costs, and the model is fitted again at the sub-sample vector (bilinear template
+predictions, the padding region moved as the block's). The block applies it after the DIMD of its prediction (the CPU
+derives intraTmpDimdMode in generateTMPrediction, before LIC). OBMC of a LIC CU: its own vector's runs are not skipped
+(getSameNeigMotion: the neighbour's LIC flag differs).
+M72 (2026-10-22): IntraTMP fusion (tmpFusionFlag): the search for the group's last entry
+(sizeUsed), then by tmpIdx the group of 5 (getTmpFusionIdx / Number): below TMP_GROUP_IDX a blend - where the group
+has entries of the top / left template alone the location-dependent blend (xLocationdepBlending, range 16) of the
+first of each over the blend of up to 3 others (32 : 32, 22 : 21 : 21), else convertDiff2Weight's weights of the
+costs -, from TMP_GROUP_IDX on a filter model of the 5 candidates and a bias fitted by solve1 on the template (each
+candidate less its reference point; with LIC through its own model, fitted per candidate at the node). The node writes
+the group's vectors as cpuBlockVectors' fusion branch takes them (BV_OUT, BV_OUT_SPARSE, BV_OUT_FUSION) and the fusion
+data into DimdOut (DIMD_OUT_TMP_FUS*, DIMD_OUT 45 -> 82); the block computes each sample (tmpFusionSample). Found on
+verification: getSameNeigMotion compares no motion for a fusion / FLM / two-model LIC CU, so OBMC runs at its own
+vector are not skipped (the first build's OBMC differed at those runs; the CPU's subBlockOBMC / xSubblockTMOBMC printed
+the runs to find it).
+M73 (2026-10-22): IntraTMP FLM (tmpFlmFlag): the area at the vector (block and template) less its corner sample, padded
+by xCalcTmpFlmRefArea's rule (a vector at its region's bound, or for regions 1 / 3 / 4 / 5 samples right / below not
+decoded), a 5-tap model (the sample and its 4 neighbours, a bias) fitted by solve1 on the template parts its required
+template takes; the node fits it (tmpSolve1, shared with fusion's filter), the block convolves.
+Results M71-M73 (Intel PC, 48 streams, build gpu11: ECM_SPIRV_OPT with ECM_SPIRV_INLINE=OFF): every stream identical
+but the 2 single-tree ones (as at M66; ra_wpp_q32 unverifiable); intra CUs from the CPU 2453 -> 1697 ("IntraTMP
+(LIC)" 378, "(LIC, fusion)" 223, "(fusion)" 217, "(FLM)" 83 -> 0; "IntraTMP OBMC with a neighbour with LIC" 25 ->
+102 and "... with an SGPM neighbour" 11 -> 42 as more CUs reach those checks). These were the first milestones on the
+spirv-opt build (868f31d26) and the non-inlined SPIR-V (f84f0f418): its pipelines compile in 144 s / 4.1 GB instead of
+760 s / 16.9 GB (MPM + CCLM), which the PC's 60 GB budget needs.
+M74 (2026-10-22): intra merge's IntraTMP neighbours (CU::setIntraMergeCandParam with itmpIbcMode ->
+getItmpBasedIntraMergeCand): such a neighbour is the CU its vector points at - of the CUs at the 4 x 4 positions of
+its area moved by its pu.bv (getCURestricted), the first of the largest overlap - as that CU's class makes it a
+candidate, with two position checks (isDifferentIntraBlk of the IntraTMP CU, then of that CU) and the IntraTMP CU's
+position for the candidate (the outer call overwrites the inner one's). The host lists the neighbour as MERGE_NBR_TMP
+by its CodingStructure index and, after the map of block vectors' CUs, a table per CodingStructure index (MERGE_INFO:
+position, size, record, class - mergeClass, the neighbour rules of addMergeRecord, -1 for a kind the GPU lacks); the
+node finds the CU from the vector the neighbour's block-vector record holds first (BV_OUT: pu.bv, a GPU CU's from its
+node) and the map (mergeTmpRef). The host still checks the CU the CPU found ("... whose reference CU the GPU lacks";
+it puts an MPM CU's DIMD kept aside to use) and makes such merge nodes prefix nodes. Results (48 streams, build
+gpu12): every stream identical but the 2 single-tree ones; intra CUs from the CPU 1697 -> 1477 ("an IntraTMP
+neighbour of intra merge" 200 -> 0, 9 for the new reason; "an intra merge neighbour of a kind the GPU lacks" 308 ->
+279).
 
 
 ## 8. Numbers (i7-10700 8C/16T, Win11, GCC 16.2, RTX 3070 driver 616.92)
@@ -1912,9 +1963,9 @@ Profile of a GPU-on decode (non-LTO, m2_park16, share of all samples): parsing ~
    b. Done (2026-10-16): M68, IBC's interpolation (intra_ibc.glsl) and SGPM's fractional vectors.
    b2. Done (2026-10-16): M69, IntraTMP's sub-sample vectors.
    b3. Done (2026-10-21): M70, IntraTMP's OBMC. Before the next milestone: room in the CCP-LFNST module (26k IDs).
-   c. IntraTMP's LIC (4159 + 813 with fusion): the LIC model of its template (InterPrediction's LicItmp /
-      xLocalIlluComp), then IntraTMP fusion (731), FLM (589), OBMC (919); with them the intra merge CUs held back by
-      an IntraTMP neighbour (~950) and most of "an intra merge neighbour of a kind the GPU lacks".
+   c. Done (2026-10-22): M71-M73 IntraTMP's LIC, fusion and FLM (and OBMC of LIC CUs), M74 intra merge's IntraTMP
+      neighbours. Left: "an intra merge neighbour of a kind the GPU lacks" (279),
+      "IntraTMP OBMC with a neighbour with LIC" (102: the neighbour's IBC LIC of the strip).
    d. Regression SGPM (795: deriveSgpmBlending's least-squares blend model), MTSS of the remaining kinds (~200), DBV
       (~200), NN of split CUs (~150), BVG-CCCM (~70).
    e. ON mode on the CTC streams: chroma reordering / DBV (the sequence-level checks in supported()), then inter.

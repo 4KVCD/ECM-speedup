@@ -419,7 +419,7 @@ layout( buffer_reference, std430, buffer_reference_align = 4 ) buffer BufDimdCal
 // (sgpmSplitDir, sgpmMode0, sgpmMode1: a mode from SGPM_BV_START on is a vector of its list), TIMD's best horizontal
 // and vertical modes (timdHor, timdVer: 131-mode set), its block's DIMD of its prediction (dimdDerivedIntraDir,
 // dimdDerivedIntraDir2nd) and the vectors of its modes from vectors
-const int DIMD_OUT             = 45;
+const int DIMD_OUT             = 82;
 const int DIMD_OUT_PARAMS      = 24;
 const int DIMD_OUT_MODE        = 0;
 const int DIMD_OUT_SECOND      = 1;
@@ -436,6 +436,12 @@ const int DIMD_OUT_BV          = 31;   // and its bvDimd (bvPack)
 const int DIMD_OUT_TMP_NUM     = 1;    // an IntraTMP CU's number of vectors found,
 const int DIMD_OUT_TMP_BV      = 2;    // then its list's MTMP_NUM vectors (bvPack)
 const int DIMD_OUT_TMP_MV      = 32;   // and its block's vector in 1/16 samples (pu.mv[0]: a sub-sample one's), x, y
+const int DIMD_OUT_TMP_LIC     = 34;   // and with LIC its model (intra_tmp.glsl's TMP_LIC: 8)
+const int DIMD_OUT_TMP_FUS_LIC = 45;   // an IntraTMP fusion CU's: with LIC its candidates' models (5 x scale, shift,
+                                       // offset),
+const int DIMD_OUT_TMP_FUS     = 60;   // the location-dependent blend's top and left candidates, its candidates of no
+                                       // location dependence (3) and the blend's weights (5; list indices, -1: none),
+const int DIMD_OUT_TMP_FUS_PAR = 70;   // the filter model's parameters (6 x int64: low, high word)
 const int DIMD_OUT_EXT_FLAGS   = 32;   // an intra merge CU's parts predicted from vectors (bit by part),
 const int DIMD_OUT_EXT_BV      = 33;   // their vectors (8, bvPack)
 const int DIMD_OUT_BVG_NUM     = 32;   // a BVG-DIMD CU's number of vectors,
@@ -612,6 +618,8 @@ const int MERGE_NBR_OBIC  = 2;   // an OBIC CU: always, its OBIC converted
 const int MERGE_NBR_DIMD  = 3;   // a DIMD CU or an MPM CU: where its DIMD blends, its DIMD
 const int MERGE_NBR_TIMD  = 4;   // a TIMD CU: where its modes blend or its mode is angular, its TIMD converted (or its DIMD)
 const int MERGE_NBR_TIMD_MERGE = 5;   // a TIMD merge CU: as a TIMD CU, but no candidate where its TIMD does not convert
+const int MERGE_NBR_TMP   = 6;   // an IntraTMP CU (its CodingStructure index): the CU its vector points at, by its
+                                 // class
 layout( buffer_reference, std430, buffer_reference_align = 8 ) buffer BufU64 { uint64_t v[]; };
 
 // the directory of the transform tables (in matrices at Params::trTables, GpuIntraRec.cpp's createShared): the
