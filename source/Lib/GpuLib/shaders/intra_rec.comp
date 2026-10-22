@@ -132,10 +132,11 @@ bool   g_blendFirst;   // the first prediction (the main mode) sets them, the ot
 int    g_blendW;       // the prediction's weight
 int    g_blendClass;   // its class
 bool   g_blendTaps;    // DIMD: the prediction's filter length by its weight (JVET-AN0158)
-// an SGPM block's blend (DERIVE_SGPM, its two predictions of weight 1): the offset in matrices of its partition's
-// weight of the first prediction per sample (of 32; the second's the rest), which emitPred applies; -1 for any other
-// block
-int    g_sgpmWeights;
+// an SGPM block's blend (DERIVE_SGPM, its two predictions of weight 1): the weight of the first prediction per sample
+// (of 32; the second's the rest), which emitPred applies, in the workgroup's scratch from SGPM_BLOCK_W (after the
+// blending sums of a block of 32 x 32 samples at most; sgpmBlockWeights)
+bool   g_sgpmBlend;
+const int SGPM_BLOCK_W = 3 * 32 * 32;
 
 #include "intra_modes.glsl"
 
@@ -540,6 +541,7 @@ void storeRecon( Tu t, int x, int y, int pr )
 }
 
 int  cccmFusionBlend( Tu t, int x, int y, int pr );   // (intra_cccm.glsl)
+bool sgpmNoDimd( Tu t );   // (intra_sgpm.glsl)
 void cflmStore( Tu t, int x, int y, int pr );
 
 // sample (x, y) of the predicted region: reconstructed if it lies in the block (the region of an ISP sub-partition 1
@@ -572,9 +574,9 @@ void emitPred( Tu t, int x, int y, int pr, bool bf )
     CBufI32   acc = CBufI32( P.scratch );
     const int o   = int( gl_WorkGroupID.x ) * BLEND_ACC + y * t.regW + x;
     const int N   = t.regW * t.h;
-    // (an SGPM block's first prediction weighs its partition's weight, the second the rest)
-    const int sgpmW = WITH_MPM && g_sgpmWeights >= 0 ? BufI32( P.matrices ).v[g_sgpmWeights + y * t.regW + x] : 0;
-    const int w     = WITH_MPM && g_sgpmWeights >= 0 ? ( g_blendFirst ? sgpmW : 32 - sgpmW ) : g_blendW;
+    // (an SGPM block's first prediction weighs its weight, the second the rest)
+    const int sgpmW = WITH_MPM && g_sgpmBlend ? acc.v[o + SGPM_BLOCK_W] : 0;
+    const int w     = WITH_MPM && g_sgpmBlend ? ( g_blendFirst ? sgpmW : 32 - sgpmW ) : g_blendW;
     for( int c = 0; c < 3; c++ )
     {
       const int add = c == g_blendClass ? pr * w : 0;
@@ -644,7 +646,9 @@ void mipTransformMode( Tu t, int W, int H, int ps, int upH, int upV, int predStr
 {
   const int iw = W - 2, ih = H - 2, step = iw * ih >= MIN_MTSS_SIZE ? 2 : 1;
   const int cols = ( iw + step - 1 ) / step, rows = ( ih + step - 1 ) / step;
-  for( int i = lid; i < cols * rows; i += NT )
+  // (an SGPM block without the SPS's DIMD: none, deriveIpmForTransform's planar and the second mode's 0)
+  const int num = WITH_MPM && ( t.derive & DERIVE_SGPM ) != 0 && sgpmNoDimd( t ) ? 0 : cols * rows;
+  for( int i = lid; i < num; i += NT )
   {
     const int   x = 1 + ( i % cols ) * step, y = 1 + ( i / cols ) * step;
     const ivec2 g = sobel3x3( mipPredAt( x - 1, y - 1, W, ps, upH, upV, predStride, pdp ),
@@ -1509,7 +1513,7 @@ void main()
     g_secMode    = -1;
     g_bvSubs     = 0;
     g_bvTransform = false;
-    g_sgpmWeights = -1;
+    g_sgpmBlend   = false;
     // the dependents, prefetched (their release ends the block)
     const int d0 = BufI32( P.depOffset ).v[g_ti], d1 = BufI32( P.depOffset ).v[g_ti + 1];
     if( lid < d1 - d0 )
@@ -1612,11 +1616,18 @@ void main()
         {
           modes[k] = s_modesRead[k];
         }
-        cuMode = timdNode( c, t.cu, modes, dimdModes, t.bitDepth, ( t.derive & DERIVE_NO_PDPC ) != 0, mtssSecond, lid,
-                           NT );
+        if( c.timd >= 0 )   // (an SGPM CU whose TIMD DecCu does not derive has no TIMD record)
+        {
+          cuMode = timdNode( c, t.cu, modes, dimdModes, t.bitDepth, ( t.derive & DERIVE_NO_PDPC ) != 0, mtssSecond, lid,
+                             NT );
+        }
+        else
+        {
+          SYNC();   // (dimdSelect has read its histograms)
+        }
         if( WITH_MPM && c.kind == CU_SGPM )   // intra_sgpm.glsl, after its TIMD pass
         {
-          cuMode = sgpmNode( c, t.cu, dimdModes[0], t.bitDepth, ( t.derive & DERIVE_NO_PDPC ) != 0, lid, NT );
+          cuMode = sgpmNode( c, t.cu, modes, dimdModes, t.bitDepth, ( t.derive & DERIVE_NO_PDPC ) != 0, lid, NT );
         }
       }
       else if( WITH_MPM && c.kind == CU_MPM && c.mpm >= 0 )   // intra_mpm.glsl, MPM sorting, MDIP, PDP's lists
@@ -1713,7 +1724,7 @@ void main()
       // candidate (always), an OBIC CU's: its modes but those not set; a TIMD CU's where its modes blend: its mode, its
       // secondary mode and its non-angular one (TimdOut; the weight of one not blended 0); a CCP merge block's of
       // fusion with DIMD chroma: the merge prediction (no mode), then the DIMD chroma mode's, each weighed 1; an SGPM
-      // CU's: its two modes, weighed per sample by its partition (g_sgpmWeights)
+      // CU's: its two modes, weighed per sample by its partition or regression SGPM's model (g_sgpmBlend)
       const bool dimdCu  = WITH_DIMD && ( t.derive & DERIVE_DIMD ) != 0, obicCu = WITH_DIMD && ( t.derive & DERIVE_OBIC ) != 0;
       const bool mergeCu = WITH_DIMD && WITH_MERGE && ( t.derive & DERIVE_MERGE ) != 0;
       const bool timdCu  = WITH_TIMD && ( t.derive & DERIVE_TIMD ) != 0;
@@ -1778,7 +1789,11 @@ void main()
         {
           blendTotals( mergeCu );
         }
-        g_sgpmWeights = sgpmCu ? sgpmBlockWeights( t ) : -1;
+        g_sgpmBlend = sgpmCu;
+        if( sgpmCu )
+        {
+          sgpmBlockWeights( t, lid, NT );
+        }
         for( int k = 0; sgpmCu && k < 2; k++ )   // (an SGPM mode from a vector: the copy at it)
         {
           g_bvSubs |= s_blendMode[k] >= SGPM_BV_START ? 1 << k : 0;

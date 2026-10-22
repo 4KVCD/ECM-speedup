@@ -418,7 +418,7 @@ layout( buffer_reference, std430, buffer_reference_align = 4 ) buffer BufDimdCal
 // merge's (bvDimdNum, bvDimdList, bvDimdWeight). An SGPM CU's DIMD in the DIMD fields, then its node's choice
 // (sgpmSplitDir, sgpmMode0, sgpmMode1: a mode from SGPM_BV_START on is a vector of its list), TIMD's best horizontal
 // and vertical modes (timdHor, timdVer: 131-mode set), its block's DIMD of its prediction (dimdDerivedIntraDir,
-// dimdDerivedIntraDir2nd) and the vectors of its modes from vectors
+// dimdDerivedIntraDir2nd) and the vectors of its modes from vectors, regression SGPM's blend model
 const int DIMD_OUT             = 82;
 const int DIMD_OUT_PARAMS      = 24;
 const int DIMD_OUT_MODE        = 0;
@@ -452,17 +452,22 @@ const int DIMD_OUT_SGPM_MODE   = 33;   // its two modes,
 const int DIMD_OUT_SGPM_TIMD   = 35;   // TIMD's two modes,
 const int DIMD_OUT_SGPM_PRED   = 37;   // its block's two DIMD modes,
 const int DIMD_OUT_SGPM_BV     = 39;   // its modes' vectors (2 x, y in 1/16 samples; 0 for another mode)
-const int DIMD_OUT_SGPM_LIC    = 43;   // and their LIC models (2, offsets in Params::timdData; -1: none)
+const int DIMD_OUT_SGPM_LIC    = 43;   // and their LIC models (2, offsets in Params::timdData; -1: none),
+const int DIMD_OUT_SGPM_MODEL  = 45;   // regression SGPM's blendModel (params[0..2], shift; offset from shift)
 const int MTSS_CALLS           = 3;    // the histograms of MTSS's mode list (deriveDimdModeList: left, above, above-left)
 
 // an SGPM CU's record in Params::timdData (Cu::sgpm; layout shared with GpuIntraRec.cpp's addSgpmRecord): the index of
-// its list's entry (sgpmIdx, less the regression entries where the CU allows them) and its length, the CUs its
-// partitions' mode lists read at getSgpmIntraMPMs' five positions (left, above, above-left, above-right, below-left:
-// records of the mode getIntraDirLuma gives, -1 for none) with each one's kind as 2 bits (1 intra, 2 inter or IBC), the
-// record the MPM lists read of it (CU_SGPM_MPM), the offsets in matrices of its size's partition weights (the
-// template's, the block's), then its template (one sample thick) as TemplateUnits with its units' availability bits
-const int SGPM_HEAD_IDX = 0, SGPM_HEAD_NUM = 1, SGPM_HEAD_NBR = 2, SGPM_HEAD_NBR_KIND = 7, SGPM_HEAD_VIEW = 8;
+// its list's entry (sgpmIdx, less the regression entries where the CU allows them but is not regression SGPM) and its
+// flags (SGPM_REGRESSION: regression SGPM; SGPM_NO_TIMD: DecCu derives no timdHor / timdVer; SGPM_NO_DIMD: the SPS's
+// DIMD is off: deriveDimdMode and deriveIpmForTransform derive nothing), the CUs its partitions' mode lists read at
+// getSgpmIntraMPMs' five positions (left, above, above-left, above-right, below-left: records of the mode
+// getIntraDirLuma gives, -1 for none) with each one's kind as 2 bits (1 intra, 2 inter or IBC), the record the MPM
+// lists read of it (CU_SGPM_MPM), the offsets in matrices of its size's partition weights (the template's, the
+// block's: without blending where the PPS has sgpmNoBlend), then its template (one sample thick) as TemplateUnits with
+// its units' availability bits
+const int SGPM_HEAD_IDX = 0, SGPM_HEAD_FLAGS = 1, SGPM_HEAD_NBR = 2, SGPM_HEAD_NBR_KIND = 7, SGPM_HEAD_VIEW = 8;
 const int SGPM_HEAD_WEIGHTS = 9, SGPM_HEAD_T = 11;
+const int SGPM_REGRESSION = 1, SGPM_NO_TIMD = 2, SGPM_NO_DIMD = 4;   // SGPM_HEAD_FLAGS
 
 // a neighbour of an OBIC CU whose mode its histogram counts (layout shared with GpuIntraRec.cpp, OBIC_NBRS per OBIC CU
 // in Params::obicNbrs; IntraPrediction::obicNeighbours): its record (-1: none) and the samples it counts

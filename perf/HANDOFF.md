@@ -1880,6 +1880,43 @@ the GPU 65 -> 318; the first three streams verified alone had 128 intra strips (
 prepareRef) and 41 motion runs on the CPU (its debug counts). SPIR-V: 3.34M / 4.17M IDs - only 26k left in
 the CCP-LFNST module: the next milestone must make room first (the strip's angular code is a second copy of the main
 path's; a shared call site would save ~60k).
+Regression SGPM and the rest of SGPM (2026-10-22, agent sg; milestone number for the lead to assign): JVET-AJ0112's
+regression SGPM, SGPM without blending and without TIMD / DIMD. A regression SGPM CU (PU::isRegressionSgpm: sgpmIdx
+below RSGPM_CAND_NUM in a CU above 4 x 4) skips deriveSgpmModeOrdered's partitions: its list is the MPM list's first
+six (planar, getSpatialIpm forced valid without MDIP's exclusions - DecCu clears isModeExcluded around it -,
+fillMPMList: mpmSpatial + mpmFill on the CU's MPM neighbours and DIMD) and then the cheapest SGPM_NUM_BVS vectors; per
+pair of entries (the first ascending, then the second after it) deriveSgpmBlending fits the second mode's weight as
+p0 x + p1 y + p2 to the one-sample template (row above at y = -1, column left at x = -1) by CccmCovariance::solve1
+with 3 parameters - features (P1 - P0) x, (P1 - P0) y, P1 - P0, target reco - P0, each truncated to a Pel; the dot
+products as the CPU's SSE cccmDotProduct sums them (madd: in each full group of 8 samples two products added in 32
+bits); matrix bits 28 (32 above 10 bits), decimation 16 (22), regularization 2 << (bitDepth - 8) - and the model's
+params as ints with shift decim - 5 (the CPU's shiftA is always 0: it sizes the freshly constructed model it was
+given, {16, 16, 0}); equal weights {0, 0, 16}, shift 0 where the clipped weights at the CU's corners differ by 4 at
+most; cost the SAD of ((32 - w) P0 + w P1 + 16) >> 5 against the template; the CU's sgpmIdx picks among the four
+cheapest (updateCandList: the first of equal costs first). intra_sgpm.glsl: the node builds that list (invocation
+0), keeps each slot's template prediction in the scratch (SC_RPRED) instead of its differences, one invocation per
+pair runs sgpmRegression (int64 elimination as ccpBlendModel's, with the decimation bits as a parameter), the rank
+loop is the partitions'; DimdOut gets DIMD_OUT_SGPM_MODEL (p0, p1, p2, shift; DIMD_OUT 45 -> 49; verification
+compares it with cu.blendModel), sgpmSplitDir 0, and the record the MPM lists read planar (sgpmDimdMode, which the
+decoder never sets: initData's 0; sgpmMpmMode did so already for CPU CUs). Its block blends with the model's weights
+(weightAffineBlk / weightedBlendBlk: 32 - w for the first mode, w for the second): sgpmBlockWeights now writes every
+SGPM block's first-mode weights into the workgroup's scratch after the blending sums (SGPM_BLOCK_W) and emitPred
+reads them there (computing the model's weight in emitPred's 8 call sites had cost ~19k SPIR-V IDs); its transforms
+take sgpmDimdMode (planar) for MTS and, where TrQuant / getFinalIntraModeForTransform take the angle, the DIMD of the
+blend. DecCu derives timdHor / timdVer only for non-regression CUs of 1024 samples at most with the SPS's TIMD, else
+they stay initData's -1 (getSgpmIntraMPMs skips them): such a CU has no TIMD record and its node skips the TIMD pass
+(SGPM_NO_TIMD, DimdOut's TIMD fields -1). Without the SPS's DIMD the CU has no DIMD (c.dimd -1: getSgpmIntraMPMs and
+getSpatialIpm take none) and deriveIpmForTransform returns planar with a second mode of 0: mipTransformMode adds no
+gradients for such an SGPM block (SGPM_NO_DIMD); verification now compares an SGPM CU's fields without a DIMD too.
+The record's SGPM_HEAD_NUM (unread) became SGPM_HEAD_FLAGS. Without blending (the PPS's sgpmNoBlend) the block takes
+g_geoWeights' first blending width (a third weight table per size in sgpmTables; the template weights are the same).
+Results (Intel Core Ultra 7 265K iGPU, build agsg3 with ECM_SPIRV_OPT and ECM_SPIRV_INLINE=OFF): the 43 corpus
+streams with these CUs (incl. ai_foreman352_q37, ra_foreman_q32) as before - 41 identical, the 2 single-tree ones
+with the same first difference as at M66 (more samples differ after it); over them "SGPM (regression)" 137 -> 0,
+"SGPM without blending" 14 -> 0, "SGPM without TIMD / DIMD" 9 -> 0, SGPM CUs on the GPU 860 -> 1019, intra CUs from
+the CPU 2206 -> 2001 ("IntraTMP OBMC with an SGPM neighbour" 11 -> 16: more SGPM neighbours are the GPU's).
+Remaining: "SGPM above 1024 samples" (1 CU, ra_parkjoy_q37): the block's deferred prediction lives in s_spPred (32 x
+32), as IntraTMP's; a larger SGPM block needs it elsewhere (and its blend weights beyond SGPM_BLOCK_W's 1024).
 SPIR-V 3.26M / 4.08M IDs (113k left in the CCP-LFNST module).
 M71 (2026-10-22): IntraTMP's LIC (tmpLicFlag, JVET-AE0078), with or without the sub-sample search. The
 search (useMR) costs mean-removed SADs - each template part's sample less the difference of the part's means, each

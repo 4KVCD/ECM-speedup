@@ -9,9 +9,12 @@
 // its SAD against the reconstruction (sadTM) and per partition that SAD weighted by the partition's template weights
 // (sgpmSadTM) - and of each partition's mode pairs (the first mode's weighted SAD plus the second's SAD less its
 // weighted one), then the entry of the list those costs rank (updateCandList: ascending, the first of equal costs
-// first) that the CU's index selects. Its block predicts the two modes (a vector's: its copy, at a fraction the luma
-// filter's interpolation) and blends them by the partition's weights (xWeightedSgpm, in intra_rec.comp's blending), and
-// takes its transforms by a DIMD of that blend. Included by intra_rec.comp after intra_tmp.glsl.
+// first) that the CU's index selects. Regression SGPM (JVET-AJ0112) instead pairs the entries of a list of the MPM
+// list's first six modes and those vectors, fits each pair's blend to the template by least squares
+// (deriveSgpmBlending: a weight linear in the position) and ranks the pairs by the SAD of that blend. Its block
+// predicts the two modes (a vector's: its copy, at a fraction the luma filter's interpolation) and blends them by the
+// partition's weights (xWeightedSgpm) or the regression's (weightAffineBlk, weightedBlendBlk), in intra_rec.comp's
+// blending, and takes its transforms by a DIMD of that blend. Included by intra_rec.comp after intra_tmp.glsl.
 #ifndef INTRA_SGPM_GLSL
 #define INTRA_SGPM_GLSL
 
@@ -26,6 +29,7 @@ const int SGPM_NUM_BVS    = 6;                           // the list's cheapest 
 const int SGPM_BV_START   = NUM_LUMA_MODE;               // SGPM_BV_START_IDX: mode SGPM_BV_START + j their j-th
 const int SGPM_LIST_MAX   = SGPM_LIST + SGPM_NUM_BVS;    // a part's entries with them
 const int SGPM_VIPM_SIZE  = 256;   // MAX_SGPM_VIPM_SIZE: the CUs below it whose transforms check the DIMD's modes
+const int RSGPM_MPMS      = 6;     // NUM_PRIMARY_MOST_PROBABLE_MODES: regression SGPM's modes before its vectors
 
 // the node's shared memory: in s_spCoef (free in a node: TIMD's pass of an SGPM CU takes no vectors) the list of
 // vectors (s_bvList, intra_bv.glsl) and from SG_LIST_AT the parts' entries as int16 (partition, part, entry); in
@@ -34,7 +38,8 @@ const int SGPM_VIPM_SIZE  = 256;   // MAX_SGPM_VIPM_SIZE: the CUs below it whose
 // s_spCost the list's vectors' template costs, then the order of the cheapest, the vectors' LIC models, their
 // fractions (x & 15 | ( y & 15 ) << 4: s_bvList holds their integer parts); in s_tmp each slot's template
 // differences. In the workgroup's scratch (its blending sums, free in a node): per list entry its weighted SAD, per
-// slot its SAD, per mode pair its cost, the list's vectors' template copies
+// slot its SAD, per mode pair its cost, the list's vectors' template copies; with regression SGPM (its list's entries
+// from SG_LIST_AT) per pair its cost and model, per slot its template prediction
 const int SG_LIST_AT   = 2 * BV_LIST_MAX;
 const int SG_SLOTS     = SGPM_BV_START + SGPM_NUM_BVS;
 const int SG_MODES     = SG_SLOTS;
@@ -51,6 +56,8 @@ const int SC_SAD       = SC_UNIT + SGPM_PARTITIONS * 2 * SGPM_LIST_MAX;
 const int SC_PAIR      = SC_SAD + SG_SLOTS;
 // (per vector its template's W + H)
 const int SC_COPY      = SC_PAIR + SGPM_PARTITIONS * SGPM_LIST_MAX * SGPM_LIST_MAX;
+const int SC_RMODEL    = SC_PAIR + 66;                     // (regression: per pair of 12 entries 4 words; in SC_PAIR's)
+const int SC_RPRED     = SC_COPY + BV_LIST_MAX * 128;      // (regression: per slot its template's W + H)
 
 int  scGet( int o )        { return CBufI32( P.scratch ).v[int( gl_WorkGroupID.x ) * BLEND_ACC + o]; }
 void scSet( int o, int v ) { CBufI32( P.scratch ).v[int( gl_WorkGroupID.x ) * BLEND_ACC + o] = v; }
@@ -206,21 +213,157 @@ int sgpmCopyAt( Cu c, int k, int s, int bitDepth, int before )
   return sgpmLic( v, int( s_spCost[SG_LIC + k] ), ( 1 << bitDepth ) - 1 );
 }
 
-// the node of SGPM CU c (all invocations, uniform control flow; after timdNode's pass, which wrote TIMD's two modes
-// into its DimdOut): its list's entry into its DimdOut (sgpmSplitDir, sgpmMode0, sgpmMode1, the vectors of the modes
-// from vectors), its partition's angle into the record the MPM lists read of it, its vectors into its record for the
-// lists of the CUs after it; returns (invocation 0) its first mode as the CU's (planar for a vector's: chroma DM and
-// the lists read that). cuIndex: the CU's record; dimdMode: its DIMD's mode (invocation 0's)
-int sgpmNode( Cu c, int cuIndex, int dimdMode, int bitDepth, bool noPdpc, int lid, int NT )
+// regression SGPM's blend weight (of 32) of its second prediction at (x, y) relative to the CU by a model (p0, p1, p2,
+// shift: AffineBlendingModel::compute, clipped to 1 .. 31, in 32 bits as the CPU's ints; its offset follows from shift)
+int sgpmModelWeight( ivec4 model, int x, int y )
 {
-  BufI32    td   = BufI32( P.timdData );
-  CBufI32   o    = CBufI32( P.dimdOut );
-  const int rec  = c.sgpm, base = cuIndex * DIMD_OUT;
-  const int W    = c.w, H = c.h, T = W + H, maxPel = ( 1 << bitDepth ) - 1;
+  const int offset = model.w != 0 ? 1 << ( model.w - 1 ) : 0;
+  return clamp( ( model.x * x + model.y * y + model.z + offset ) >> model.w, 1, 31 );
+}
+
+// deriveSgpmBlending of regression SGPM CU c's template predictions in the scratch from pa (the pair's first mode, P0)
+// and pb (its second, P1), one invocation: the second's weight linear in the position, fitted to the template (the row
+// above at y = -1, the column left at x = -1) by solve1 with a CccmModel of 3 parameters - the features (P1 - P0) x,
+// (P1 - P0) y and P1 - P0, the target the reconstruction minus P0, each a Pel; the dot products as cccmDotProduct sums
+// them (in each full group of 8 samples a pair's two products added in 32 bits: madd), the matrix scaled to 28 bits
+// (32 above 10 bits), regularized, eliminated with xGetDivScaleRoundShift's scales and the decimation bits (16, 22
+// above 10 bits), substituted back -, its parameters as ints (the CPU's shiftA is 0: it sizes the model it was given,
+// the initial one), its shift the decimation bits less 5; equal weights (16) where those at the CU's corners differ by
+// 4 at most. Returns the SAD of the blend ( ( 32 - w ) P0 + w P1 + 16 ) >> 5 against the template's reconstruction
+int sgpmRegression( Cu c, int pa, int pb, int bitDepth, out ivec4 model )
+{
+  const int W = c.w, T = c.w + c.h, full = T & ~7, decim = bitDepth > 10 ? 22 : 16;
+  int64_t e[3][4];   // the normal equations' upper triangle and right-hand side, then the elimination's rows
+  for( int i = 0; i < 12; i++ )
+  {
+    e[i / 4][i % 4] = 0;
+  }
+  int f[4], g[4] = int[4]( 0, 0, 0, 0 );   // (a sample's features and target, the previous sample's)
+  for( int i = 0; i < T; i++ )
+  {
+    const bool top  = i < W;
+    const int  p0   = scGet( SC_RPRED + pa + i ), d = scGet( SC_RPRED + pb + i ) - p0;
+    const int  reco = top ? recoAt( 0, c.x + i, c.y - 1 ) : recoAt( 0, c.x - 1, c.y + i - W );
+    f[0] = int( int16_t( d * ( top ? i : -1 ) ) );
+    f[1] = int( int16_t( d * ( top ? -1 : i - W ) ) );
+    f[2] = int( int16_t( d ) );
+    f[3] = int( int16_t( reco - p0 ) );
+    for( int r = 0; r < 3; r++ )
+    {
+      for( int col = r; col < 4; col++ )
+      {
+        if( i >= full || ( i & 1 ) != 0 )
+        {
+          e[r][col] += int64_t( ( i < full ? g[r] * g[col] : 0 ) + f[r] * f[col] );
+        }
+      }
+    }
+    g = f;
+  }
+  const int matrixShift = ( bitDepth > 10 ? 32 : 28 ) - 2 * bitDepth - cccmCeilLog2( T );
+  for( int i = 0; i < 12; i++ )   // (the upper triangle and the right-hand side scaled, then the lower triangle)
+  {
+    const int r = i / 4, col = i % 4;
+    if( col >= r )
+    {
+      e[r][col] = matrixShift > 0 ? e[r][col] << matrixShift : e[r][col] >> -matrixShift;
+    }
+  }
+  for( int r = 0; r < 3; r++ )
+  {
+    for( int col = 0; col < r; col++ )
+    {
+      e[r][col] = e[col][r];
+    }
+    e[r][r] += int64_t( 2 << ( bitDepth - 8 ) );
+  }
+  const int64_t rnd = int64_t( 1 << ( decim - 1 ) );
+  for( int piv = 0; piv < 3; piv++ )
+  {
+    int scale, round, shift;
+    cccmDivScale( e[piv][piv] < int64_t( 1 ) ? int64_t( 1 ) : e[piv][piv], scale, round, shift );
+    scale <<= decim - CCCM_DECIM;
+    for( int j = piv + 1; j < 4; j++ )
+    {
+      e[piv][j] = ( e[piv][j] * int64_t( scale ) + int64_t( round ) ) >> shift;
+    }
+    for( int r = piv + 1; r < 3; r++ )
+    {
+      const int64_t q = e[r][piv];
+      for( int j = piv + 1; j < 4; j++ )
+      {
+        e[r][j] -= ( q * e[piv][j] + rnd ) >> decim;
+      }
+    }
+  }
+  int64_t x[3];
+  for( int r = 2; r >= 0; r-- )
+  {
+    x[r] = e[r][3];
+    for( int j = r + 1; j < 3; j++ )
+    {
+      x[r] -= ( e[r][j] * x[j] + rnd ) >> decim;
+    }
+  }
+  model = ivec4( int( x[0] ), int( x[1] ), int( x[2] ), decim - 5 );
+  int lo = 31, hi = 1;
+  for( int corner = 0; corner < 4; corner++ )
+  {
+    const int w = sgpmModelWeight( model, ( corner & 1 ) * ( W - 1 ), ( corner >> 1 ) * ( c.h - 1 ) );
+    lo = min( lo, w );
+    hi = max( hi, w );
+  }
+  model = hi - lo <= 4 ? ivec4( 0, 0, 16, 0 ) : model;
+  int sad = 0;
+  for( int i = 0; i < T; i++ )
+  {
+    const bool top  = i < W;
+    const int  w    = sgpmModelWeight( model, top ? i : -1, top ? -1 : i - W );
+    const int  reco = top ? recoAt( 0, c.x + i, c.y - 1 ) : recoAt( 0, c.x - 1, c.y + i - W );
+    const int  pr   = ( ( 32 - w ) * scGet( SC_RPRED + pa + i ) + w * scGet( SC_RPRED + pb + i ) + 16 ) >> 5;
+    sad += abs( int( int16_t( pr ) ) - reco );
+  }
+  return sad;
+}
+
+// regression SGPM's pair p (the CPU's order: the first entry ascending, then the second after it) of a list of L
+// entries
+ivec2 sgpmRegressionPair( int p, int L )
+{
+  int a = 0;
+  while( p >= L - 1 - a )
+  {
+    p -= L - 1 - a;
+    a++;
+  }
+  return ivec2( a, a + 1 + p );
+}
+
+// the node of SGPM CU c (all invocations, uniform control flow; after timdNode's pass, which wrote TIMD's two modes
+// into its DimdOut, where DecCu derives them - else they are -1, initData's): its list's entry into its DimdOut
+// (sgpmSplitDir, sgpmMode0, sgpmMode1, the vectors of the modes from vectors, regression SGPM's blend model), its
+// partition's angle (regression SGPM: sgpmDimdMode, which DecCu leaves at initData's planar) into the record the MPM
+// lists read of it, its vectors into its record for the lists of the CUs after it; returns (invocation 0) its first
+// mode as the CU's (planar for a vector's: chroma DM and the lists read that). cuIndex: the CU's record; nbrMode,
+// dimdModes: its MPM list's neighbours' modes and its DIMD's modes (deriveLumaMode's, invocation 0's)
+int sgpmNode( Cu c, int cuIndex, int nbrMode[MPM_NEIGHBOURS], int dimdModes[3], int bitDepth, bool noPdpc, int lid,
+              int NT )
+{
+  BufI32     td    = BufI32( P.timdData );
+  CBufI32    o     = CBufI32( P.dimdOut );
+  const int  rec   = c.sgpm, base = cuIndex * DIMD_OUT;
+  const int  W     = c.w, H = c.h, T = W + H, maxPel = ( 1 << bitDepth ) - 1;
+  const int  flags = td.v[rec + SGPM_HEAD_FLAGS];
+  const bool regression = ( flags & SGPM_REGRESSION ) != 0;
   // its list of vectors (none without a list record: no CU around it has one)
   if( lid == 0 )
   {
-    s_dimdHist[SG_DIMD]     = dimdMode;
+    if( ( flags & SGPM_NO_TIMD ) != 0 )
+    {
+      o.v[base + DIMD_OUT_SGPM_TIMD]     = -1;
+      o.v[base + DIMD_OUT_SGPM_TIMD + 1] = -1;
+    }
+    s_dimdHist[SG_DIMD]     = dimdModes[0];
     s_dimdHist[SG_TIMD]     = o.v[base + DIMD_OUT_SGPM_TIMD];
     s_dimdHist[SG_TIMD + 1] = o.v[base + DIMD_OUT_SGPM_TIMD + 1];
     s_dimdHist[SG_CHOICE]   = 0;
@@ -265,9 +408,23 @@ int sgpmNode( Cu c, int cuIndex, int dimdMode, int bitDepth, bool noPdpc, int li
   }
   SYNC();
   // the parts' lists, one invocation each (three modes, then the vectors' modes), the modes they name marked; then
-  // each named mode's slot
-  const int numBvs = s_dimdHist[SG_NUM_BVS], L = SGPM_LIST + numBvs;
-  for( int u = lid; u < 2 * SGPM_PARTITIONS; u += NT )
+  // each named mode's slot. Regression SGPM's list instead (invocation 0): deriveSgpmModeOrdered's mpmList - planar,
+  // getSpatialIpm (forced valid, without MDIP's exclusions: isModeExcluded false; the CU's DIMD modes, the
+  // neighbours'), fillMPMList, RSGPM_MPMS entries - then the vectors' modes
+  const int numBvs = s_dimdHist[SG_NUM_BVS], L = ( regression ? RSGPM_MPMS : SGPM_LIST ) + numBvs;
+  if( regression && lid == 0 )
+  {
+    int  mpm[NUM_MPM];
+    uint included[3] = uint[3]( 0u, 0u, 0u );
+    mpmFill( min( mpmSpatial( c, nbrMode, dimdModes, true, mpm, included ), RSGPM_MPMS ), RSGPM_MPMS, mpm, included );
+    for( int k = 0; k < L; k++ )
+    {
+      const int m = k < RSGPM_MPMS ? mpm[k] : SGPM_BV_START + k - RSGPM_MPMS;
+      s_spCoef[SG_LIST_AT + k] = int16_t( m );
+      s_dimdHist[m]            = 1;
+    }
+  }
+  for( int u = lid; !regression && u < 2 * SGPM_PARTITIONS; u += NT )
   {
     int list[SGPM_LIST];
     sgpmList( rec, u >> 1, u & 1, s_dimdHist[SG_TIMD], s_dimdHist[SG_TIMD + 1], s_dimdHist[SG_DIMD], list );
@@ -303,7 +460,7 @@ int sgpmNode( Cu c, int cuIndex, int dimdMode, int bitDepth, bool noPdpc, int li
 
   // the named modes' template differences, as many modes at once as s_tmp holds (the above row's W samples, then the
   // left column's H; a vector's mode its copy), then each mode's SAD and each list entry's SAD weighted by its
-  // partition (one invocation each), into the scratch
+  // partition (one invocation each), into the scratch; with regression SGPM the predictions themselves
   const int numModes = s_dimdHist[SG_NUM], perPass = MAX_REF / T, tplWeights = td.v[rec + SGPM_HEAD_WEIGHTS];
   const int numUnits = 2 * SGPM_PARTITIONS * L;
   for( int first = 0; first < numModes; first += perPass )
@@ -324,10 +481,17 @@ int sgpmNode( Cu c, int cuIndex, int dimdMode, int bitDepth, bool noPdpc, int li
         const TimdParams p    = timdParamsOf( m131, sgpmWideAngle( W, H, m131 ), W, H, noPdpc );
         pred = timdPredict( m131, p, s < W ? 1 + s : 0, s < W ? 0 : 1 + s - W, W, H, 1, 1, dc, maxPel );
       }
-      s_tmp[i] = int16_t( abs( reco - pred ) );
+      if( regression )
+      {
+        scSet( SC_RPRED + first * T + i, pred );
+      }
+      else
+      {
+        s_tmp[i] = int16_t( abs( reco - pred ) );
+      }
     }
     SYNC();
-    for( int k = lid; k < n + numUnits; k += NT )
+    for( int k = lid; !regression && k < n + numUnits; k += NT )
     {
       if( k < n )
       {
@@ -357,8 +521,21 @@ int sgpmNode( Cu c, int cuIndex, int dimdMode, int bitDepth, bool noPdpc, int li
   }
 
   // a pair's cost: its first mode's weighted SAD plus its second's SAD less its weighted one (a second part's entry
-  // turned into the latter); a pair of one mode twice takes none (the largest cost)
-  for( int u = lid; u < numUnits; u += NT )
+  // turned into the latter); a pair of one mode twice takes none (the largest cost). Regression SGPM: per pair of its
+  // list's entries the SAD of their regression's blend and the model (sgpmRegression, one invocation each)
+  for( int p = lid; regression && p < L * ( L - 1 ) / 2; p += NT )
+  {
+    const ivec2 ab = sgpmRegressionPair( p, L );
+    ivec4       model;
+    const int   cost = sgpmRegression( c, s_dimdHist[int( s_spCoef[SG_LIST_AT + ab.x] )] * T,
+                                       s_dimdHist[int( s_spCoef[SG_LIST_AT + ab.y] )] * T, bitDepth, model );
+    scSet( SC_PAIR + p, cost );
+    for( int k = 0; k < 4; k++ )
+    {
+      scSet( SC_RMODEL + 4 * p + k, model[k] );
+    }
+  }
+  for( int u = lid; !regression && u < numUnits; u += NT )
   {
     if( ( ( u / L ) & 1 ) != 0 )
     {
@@ -366,8 +543,8 @@ int sgpmNode( Cu c, int cuIndex, int dimdMode, int bitDepth, bool noPdpc, int li
     }
   }
   tsSync();
-  const int numPairs = SGPM_PARTITIONS * L * L;
-  for( int i = lid; i < numPairs; i += NT )
+  const int numPairs = regression ? L * ( L - 1 ) / 2 : SGPM_PARTITIONS * L * L;
+  for( int i = lid; !regression && i < numPairs; i += NT )
   {
     const int s  = i / ( L * L );
     const int u0 = s * 2 * L + ( i / L ) % L;   // (the first part's entry)
@@ -398,13 +575,17 @@ int sgpmNode( Cu c, int cuIndex, int dimdMode, int bitDepth, bool noPdpc, int li
   {
     return -1;
   }
-  const int i = s_dimdHist[SG_CHOICE], s = i / ( L * L );
-  const int mode0 = int( s_spCoef[SG_LIST_AT + s * 2 * L + ( i / L ) % L] );
-  const int mode1 = int( s_spCoef[SG_LIST_AT + s * 2 * L + L + i % L] );
+  const int   i  = s_dimdHist[SG_CHOICE], s = regression ? 0 : i / ( L * L );
+  const ivec2 ab = regression ? sgpmRegressionPair( i, L ) : ivec2( s * 2 * L + ( i / L ) % L, s * 2 * L + L + i % L );
+  const int   mode0 = int( s_spCoef[SG_LIST_AT + ab.x] ), mode1 = int( s_spCoef[SG_LIST_AT + ab.y] );
   o.v[base + DIMD_OUT_SGPM_SPLIT]    = s;
   o.v[base + DIMD_OUT_SGPM_MODE]     = mode0;
   o.v[base + DIMD_OUT_SGPM_MODE + 1] = mode1;
-  CBufI32( P.cuMode ).v[td.v[rec + SGPM_HEAD_VIEW]] = sgpmTable( SGPM_TAB_ANGLE + s );
+  for( int k = 0; k < 4; k++ )
+  {
+    o.v[base + DIMD_OUT_SGPM_MODEL + k] = regression ? scGet( SC_RMODEL + 4 * i + k ) : 0;
+  }
+  CBufI32( P.cuMode ).v[td.v[rec + SGPM_HEAD_VIEW]] = regression ? PLANAR_IDX : sgpmTable( SGPM_TAB_ANGLE + s );
   // the vectors of its modes from vectors (1/16 samples) with their LIC models for its block, the vectors in its record
   // for the lists after it (getNeighBv's SGPM branch: the first mode's, then the second's; without their models;
   // rounded to integers, changePrecision's rounding, and as they are for SGPM's lists)
@@ -435,33 +616,55 @@ int sgpmNode( Cu c, int cuIndex, int dimdMode, int bitDepth, bool noPdpc, int li
 
 // ----- an SGPM CU's luma block
 
-// the offset in matrices of the weights of the partition SGPM block t's node chose: the first mode's weight (of 32) per
-// sample, row-major (xWeightedSgpm's walk of g_geoWeights with the size's blending width)
-int sgpmBlockWeights( Tu t )
+// the first mode's weight (of 32) per sample of SGPM block t (all invocations, uniform control flow, ending with a
+// barrier), row-major into the workgroup's scratch from SGPM_BLOCK_W: its node's partition's (xWeightedSgpm's walk of
+// g_geoWeights with the size's blending width, without blending its first: in matrices), regression SGPM's 32 less the
+// second's by the model its node chose (weightAffineBlk)
+void sgpmBlockWeights( Tu t, int lid, int NT )
 {
-  const int split = CBufI32( P.dimdOut ).v[t.cu * DIMD_OUT + DIMD_OUT_SGPM_SPLIT];
-  return BufI32( P.timdData ).v[BufCu( P.cus ).v[t.cu].sgpm + SGPM_HEAD_WEIGHTS + 1] + split * t.w * t.h;
+  CBufI32     o       = CBufI32( P.dimdOut );
+  const int   base    = t.cu * DIMD_OUT, rec = BufCu( P.cus ).v[t.cu].sgpm;
+  const bool  rsgpm   = ( BufI32( P.timdData ).v[rec + SGPM_HEAD_FLAGS] & SGPM_REGRESSION ) != 0;
+  const int   weights = BufI32( P.timdData ).v[rec + SGPM_HEAD_WEIGHTS + 1]
+                        + o.v[base + DIMD_OUT_SGPM_SPLIT] * t.w * t.h;
+  const ivec4 model   = ivec4( o.v[base + DIMD_OUT_SGPM_MODEL], o.v[base + DIMD_OUT_SGPM_MODEL + 1],
+                               o.v[base + DIMD_OUT_SGPM_MODEL + 2], o.v[base + DIMD_OUT_SGPM_MODEL + 3] );
+  for( int i = lid; i < t.w * t.h; i += NT )
+  {
+    scSet( SGPM_BLOCK_W + i,
+           rsgpm ? 32 - sgpmModelWeight( model, i % t.w, i / t.w ) : BufI32( P.matrices ).v[weights + i] );
+  }
+  tsSync();
+}
+
+// whether SGPM block t's SPS has no DIMD (its block's deriveIpmForTransform then derives nothing)
+bool sgpmNoDimd( Tu t )
+{
+  return ( BufI32( P.timdData ).v[BufCu( P.cus ).v[t.cu].sgpm + SGPM_HEAD_FLAGS] & SGPM_NO_DIMD ) != 0;
 }
 
 // the modes of SGPM block t's transforms (after mipTransformMode's barrier, which has the DIMD of its prediction in its
 // CU's DimdOut): x the partition's angle, which explicit MTS takes (TrQuant::getTrTypes); y the LFNST / NSPT mode
 // (getFinalIntraModeForTransform's SGPM branch, JVET-AK0222): the DIMD's main mode (dimdDerivedIntraDir), in a CU below
 // SGPM_VIPM_SIZE samples where it is within 2 of either of the CU's two modes, else its second mode where that is,
-// else the angle
+// else the angle. Regression SGPM: sgpmDimdMode (initData's planar: DecCu never sets it) for MTS, the DIMD's main mode
+// for the angle
 ivec2 sgpmTransformModes( Tu t )
 {
-  CBufI32   o      = CBufI32( P.dimdOut );
-  const int base   = t.cu * DIMD_OUT;
-  const int angle  = sgpmTable( SGPM_TAB_ANGLE + o.v[base + DIMD_OUT_SGPM_SPLIT] );
-  const int first  = o.v[base + DIMD_OUT_SGPM_PRED], second = o.v[base + DIMD_OUT_SGPM_PRED + 1];
-  const int mode0  = o.v[base + DIMD_OUT_SGPM_MODE], mode1 = o.v[base + DIMD_OUT_SGPM_MODE + 1];
+  CBufI32    o      = CBufI32( P.dimdOut );
+  const int  base   = t.cu * DIMD_OUT;
+  const bool rsgpm  = ( BufI32( P.timdData ).v[BufCu( P.cus ).v[t.cu].sgpm + SGPM_HEAD_FLAGS] & SGPM_REGRESSION ) != 0;
+  const int  first  = o.v[base + DIMD_OUT_SGPM_PRED], second = o.v[base + DIMD_OUT_SGPM_PRED + 1];
+  const int  angle  = rsgpm ? first : sgpmTable( SGPM_TAB_ANGLE + o.v[base + DIMD_OUT_SGPM_SPLIT] );
+  const int  mts    = rsgpm ? PLANAR_IDX : angle;
+  const int  mode0  = o.v[base + DIMD_OUT_SGPM_MODE], mode1 = o.v[base + DIMD_OUT_SGPM_MODE + 1];
   if( t.w * t.h >= SGPM_VIPM_SIZE )
   {
-    return ivec2( angle, first );
+    return ivec2( mts, first );
   }
   const bool firstFar  = abs( first - mode0 ) > 2 && abs( first - mode1 ) > 2;     // SGPM_VIPM_TH
   const bool secondFar = abs( second - mode0 ) > 2 && abs( second - mode1 ) > 2;
-  return ivec2( angle, firstFar && secondFar ? angle : firstFar ? second : first );
+  return ivec2( mts, firstFar && secondFar ? angle : firstFar ? second : first );
 }
 
 #endif

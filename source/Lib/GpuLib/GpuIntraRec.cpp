@@ -445,15 +445,19 @@ constexpr int DIMD_OUT_SGPM_TIMD   = 35;   // timdHor, timdVer (131-mode set),
 constexpr int DIMD_OUT_SGPM_PRED   = 37;   // its block's dimdDerivedIntraDir, dimdDerivedIntraDir2nd,
 constexpr int DIMD_OUT_SGPM_BV     = 39;   // its modes' vectors (sgpmBv0, sgpmBv1; x, y in 1/16 samples, 0: none)
 constexpr int DIMD_OUT_SGPM_END    = 43;   // (then their LIC models' offsets, which no CPU field mirrors)
+constexpr int DIMD_OUT_SGPM_MODEL  = 45;   // regression SGPM's blendModel: params[0..2], shift
 constexpr int DIMD_OUT             = 82;
 // an SGPM CU's record in Params::timdData (Cu::sgpm; intra_sgpm.glsl's SGPM_HEAD_*, layout shared): the index of its
-// list's entry (sgpmIdx, less the regression entries where the CU allows them) and its length, the CUs its partitions'
+// list's entry (sgpmIdx, less the regression entries where the CU allows them but is not regression SGPM) and its
+// flags (SGPM_REGRESSION: regression SGPM; SGPM_NO_TIMD: DecCu derives no timdHor / timdVer; SGPM_NO_DIMD: the SPS's
+// DIMD is off: deriveDimdMode and deriveIpmForTransform derive nothing), the CUs its partitions'
 // mode lists read at getSgpmIntraMPMs' five positions (left, above, above-left, above-right, below-left: records of
 // the mode getIntraDirLuma gives, -1 for none) with each one's kind as 2 bits (1 intra, 2 inter or IBC), the record the
 // MPM lists read of it (CU_SGPM_MPM), the offsets in the matrices of its size's partition weights (the template's,
 // the block's), then its template (one sample thick) as TemplateUnits with its units' availability bits
-constexpr int SGPM_HEAD_IDX = 0, SGPM_HEAD_NUM = 1, SGPM_HEAD_NBR = 2, SGPM_HEAD_NBR_KIND = 7, SGPM_HEAD_VIEW = 8;
+constexpr int SGPM_HEAD_IDX = 0, SGPM_HEAD_FLAGS = 1, SGPM_HEAD_NBR = 2, SGPM_HEAD_NBR_KIND = 7, SGPM_HEAD_VIEW = 8;
 constexpr int SGPM_HEAD_WEIGHTS = 9, SGPM_HEAD_T = 11;
+constexpr int SGPM_REGRESSION = 1, SGPM_NO_TIMD = 2, SGPM_NO_DIMD = 4;   // SGPM_HEAD_FLAGS
 constexpr int MTSS_CALLS           = 3;      // the histograms of deriveDimdModeList (left, above, above-left)
 // the transforms of DIMD CUs the kernels have: getFinalIntraModeForTransform's DIMD branch (JVET-AM0138; without
 // BVG-DIMD and intra merge it would take intra merge CUs too), MTSS (JVET-AK0217) with JVET-AK0187's mode pairs
@@ -1320,8 +1324,9 @@ struct Shared
   int32_t                          lfnstLayout[3][2] = {};        // of the LFNST output positions in matrices (sbSize 4, 8, 16; transposed)
   int32_t                          trTables = 0;                  // of the transform tables' directory in matrices (TR_TAB_*)
   int32_t                          pdpTable = 0;                  // of PDP's filters' offsets in matrices
-  int32_t                          sgpmWeights[5][5][2] = {};     // per SGPM CU size (log2 - 2) the offsets of its
-                                                                  // template's and block's weights in matrices
+  int32_t                          sgpmWeights[5][5][3] = {};     // per SGPM CU size (log2 - 2) the offsets of its
+                                                                  // template's and block's weights in matrices (the
+                                                                  // block's also without blending)
   std::vector<int32_t>             pnnModel;                      // of each NN intra prediction model in matrices
   std::vector<std::pair<const int8_t*, size_t>>      secTables;   // each table's start and bytes, in secKernels' order
   std::vector<std::pair<const ScanElement*, int32_t>> secScans;  // the scans LFNST / NSPT read, their positions' offset in matrices
@@ -1428,11 +1433,12 @@ gpu::Kernel& intraRecKernel( const Shared& sh, gpu::Context& ctx, IntraRecVarian
 // bit 0 the first part's left arm, bit 1 its above arm, bits 2 and 3 the second part's); per CU size (log2 width - 2,
 // log2 height - 2; -1 where SGPM takes no such CU) the offsets of its weights: the template's per partition
 // (xSgpmSadTM's g_geoWeightsTpl walk, one sample thick: the above row's width samples, then the left column's height)
-// and the block's (xWeightedSgpm's g_geoWeights walk with the size's blending width, GET_SGPM_BLD_IDX)
+// and the block's (xWeightedSgpm's g_geoWeights walk with the size's blending width, GET_SGPM_BLD_IDX), then the
+// block's without blending (the PPS's sgpmNoBlend: g_geoWeights' first blending width)
 static std::vector<int32_t> sgpmTables()
 {
   constexpr int NUM_SIZES = GEO_NUM_CU_SIZE_EX;
-  std::vector<int32_t> v( 2 * SGPM_TOTAL_NUM_PARTITIONS + 2 * NUM_SIZES * NUM_SIZES, -1 );
+  std::vector<int32_t> v( 2 * SGPM_TOTAL_NUM_PARTITIONS + 3 * NUM_SIZES * NUM_SIZES, -1 );
   for( int s = 0; s < SGPM_TOTAL_NUM_PARTITIONS; s++ )
   {
     const int angle = g_geoParams[g_sgpmSplitDir[s]][0];
@@ -1455,7 +1461,7 @@ static std::vector<int32_t> sgpmTables()
       {
         continue;
       }
-      const int dir = 2 * SGPM_TOTAL_NUM_PARTITIONS + 2 * ( wIdx * NUM_SIZES + hIdx );
+      const int dir = 2 * SGPM_TOTAL_NUM_PARTITIONS + 3 * ( wIdx * NUM_SIZES + hIdx );
       v[dir]        = (int32_t) v.size();
       for( int s = 0; s < SGPM_TOTAL_NUM_PARTITIONS; s++ )
       {
@@ -1488,36 +1494,39 @@ static std::vector<int32_t> sgpmTables()
           v.push_back( w[y * stride - stepX] );
         }
       }
-      v[dir + 1] = (int32_t) v.size();
-      for( int s = 0; s < SGPM_TOTAL_NUM_PARTITIONS; s++ )
+      for( int noBlend = 0; noBlend < 2; noBlend++ )
       {
-        const int      splitDir = g_sgpmSplitDir[s], angle = g_geoParams[splitDir][0];
-        const int16_t* offset   = g_weightOffsetEx[splitDir][hIdx][wIdx];
-        const int16_t* mask     = g_geoWeights[GET_SGPM_BLD_IDX( W, H )][g_angle2mask[angle]];
-        const int      size     = GEO_WEIGHT_MASK_SIZE;
-        int            stepX = 1, stepY;
-        const int16_t* w;
-        if( g_angle2mirror[angle] == 2 )
+        v[dir + 1 + noBlend] = (int32_t) v.size();
+        for( int s = 0; s < SGPM_TOTAL_NUM_PARTITIONS; s++ )
         {
-          stepY = -( size + W );
-          w     = &mask[( size - 1 - offset[1] ) * size + offset[0]];
-        }
-        else if( g_angle2mirror[angle] == 1 )
-        {
-          stepX = -1;
-          stepY = size + W;
-          w     = &mask[offset[1] * size + ( size - 1 - offset[0] )];
-        }
-        else
-        {
-          stepY = size - W;
-          w     = &mask[offset[1] * size + offset[0]];
-        }
-        for( int y = 0; y < H; y++, w += stepY )
-        {
-          for( int x = 0; x < W; x++, w += stepX )
+          const int      splitDir = g_sgpmSplitDir[s], angle = g_geoParams[splitDir][0];
+          const int16_t* offset   = g_weightOffsetEx[splitDir][hIdx][wIdx];
+          const int16_t* mask     = g_geoWeights[noBlend ? 0 : GET_SGPM_BLD_IDX( W, H )][g_angle2mask[angle]];
+          const int      size     = GEO_WEIGHT_MASK_SIZE;
+          int            stepX = 1, stepY;
+          const int16_t* w;
+          if( g_angle2mirror[angle] == 2 )
           {
-            v.push_back( *w );
+            stepY = -( size + W );
+            w     = &mask[( size - 1 - offset[1] ) * size + offset[0]];
+          }
+          else if( g_angle2mirror[angle] == 1 )
+          {
+            stepX = -1;
+            stepY = size + W;
+            w     = &mask[offset[1] * size + ( size - 1 - offset[0] )];
+          }
+          else
+          {
+            stepY = size - W;
+            w     = &mask[offset[1] * size + offset[0]];
+          }
+          for( int y = 0; y < H; y++, w += stepY )
+          {
+            for( int x = 0; x < W; x++, w += stepX )
+            {
+              v.push_back( *w );
+            }
           }
         }
       }
@@ -1774,7 +1783,7 @@ Shared* createShared( gpu::Context& ctx )
 #if JVET_AB0155_SGPM && JVET_AJ0107_GPM_SHAPE_ADAPT
     v = sgpmTables();   // (its directory's offsets made absolute)
     const int32_t sgpmBase = (int32_t) ( mat.size() + tab.size() );
-    const int     dirEnd   = 2 * SGPM_TOTAL_NUM_PARTITIONS + 2 * GEO_NUM_CU_SIZE_EX * GEO_NUM_CU_SIZE_EX;
+    const int     dirEnd   = 2 * SGPM_TOTAL_NUM_PARTITIONS + 3 * GEO_NUM_CU_SIZE_EX * GEO_NUM_CU_SIZE_EX;
     for( int i = 2 * SGPM_TOTAL_NUM_PARTITIONS; i < dirEnd; i++ )
     {
       v[i] += v[i] >= 0 ? sgpmBase : 0;
@@ -3635,12 +3644,12 @@ static bool addTimdRecord( GpuIntraRec::Impl& m, const CodingUnit& cu, Cu& c, co
 }
 
 // an SGPM CU's record (Cu::sgpm, SGPM_HEAD_*; DecCu: deriveDimdMode, deriveTimdMode for timdHor / timdVer,
-// deriveSgpmModeOrdered): with its DIMD's histograms, its MPM neighbours and a TIMD record (deriveTimdMode reads its
-// MPM list, whose neighbours getSpatialIpm reads), the five CUs getSgpmIntraMPMs reads, its list's entry and length,
-// its size's weights, its template (its list of vectors: endPicture's list record, Cu::bvList). False with why set
-// where the GPU lacks what the CU needs: regression SGPM, a flipped list vector or an inter IBC neighbour, more
-// samples than intra_rec's prediction buffer, MTSS, SGPM without blending, no TIMD or DIMD (then the CPU reads a TIMD
-// the CU never derived), a luma CU with a DBV chroma mode (searchBv's other reference area)
+// deriveSgpmModeOrdered): with its DIMD's histograms, its MPM neighbours (regression SGPM's list is the MPM list's
+// first six: getSpatialIpm, fillMPMList) and where DecCu derives TIMD's two modes a TIMD record (deriveTimdMode reads
+// its MPM list), the five CUs getSgpmIntraMPMs reads, its list's entry and flags, its size's weights, its template
+// (its list of vectors: endPicture's list record, Cu::bvList). False with why set where the GPU lacks what the CU
+// needs: a flipped list vector or an inter IBC neighbour, more samples than intra_rec's prediction buffer, MTSS, a luma
+// CU with a DBV chroma mode (searchBv's other reference area)
 static bool addSgpmRecord( GpuIntraRec::Impl& m, const CodingUnit& cu, Cu& c, const char*& why )
 {
 #if GPU_TIMD && JVET_AB0155_SGPM && JVET_AJ0107_GPM_SHAPE_ADAPT && JVET_AJ0112_REGRESSION_SGPM \
@@ -3687,21 +3696,24 @@ static bool addSgpmRecord( GpuIntraRec::Impl& m, const CodingUnit& cu, Cu& c, co
     const BvInfo& b = m.intraPred->m_sgpmMvBasedMergeCandidates[k];
     missed = missed || b.flipType != 0;
   }
-  why = PU::isRegressionSgpm( pu ) ? "SGPM (regression)" : source ? source
+  why = source ? source
         : missed ? "SGPM with a vector its neighbours' checks missed"
         : cu.lwidth() * cu.lheight() > 32 * 32 ? "SGPM above 1024 samples"
         : usesMtss( *cu.firstTU ) ? "SGPM with MTSS"
-        : cu.cs->pps->getUseSgpmNoBlend() ? "SGPM without blending"
-        : PU::isDbvMode( pu.intraDir[CHANNEL_TYPE_CHROMA] ) ? "SGPM with a DBV chroma mode"
-        : !sps.getUseTimd() || !sps.getUseDimd() ? "SGPM without TIMD / DIMD" : nullptr;
-  if( why || !addMpmNeighbours( m, cu, c, why ) || !addTimdRecord( m, cu, c, why ) )
+        : PU::isDbvMode( pu.intraDir[CHANNEL_TYPE_CHROMA] ) ? "SGPM with a DBV chroma mode" : nullptr;
+  // DecCu derives timdHor / timdVer for a CU of 1024 samples at most with the SPS's TIMD, not for regression SGPM; else
+  // they keep initData's -1, which getSgpmIntraMPMs skips
+  const bool regression = PU::isRegressionSgpm( pu );
+  const bool timd       = !regression && cu.lwidth() * cu.lheight() <= 1024 && sps.getUseTimd();
+  if( why || !addMpmNeighbours( m, cu, c, why ) || ( timd && !addTimdRecord( m, cu, c, why ) ) )
   {
     return false;
   }
   std::vector<int32_t> h( SGPM_HEAD_T, -1 );
-  const bool regression = PU::isRegressionSgpmAllow( pu );   // (its list then follows RSGPM_CAND_NUM entries)
-  h[SGPM_HEAD_IDX] = regression ? cu.sgpmIdx - RSGPM_CAND_NUM : cu.sgpmIdx;
-  h[SGPM_HEAD_NUM] = regression ? SGPM_CAND_NUM : SGPM_NUM;
+  // its entry: of regression SGPM's RSGPM_CAND_NUM, else of the partitions' list (after those where the CU allows them)
+  h[SGPM_HEAD_IDX]   = PU::isRegressionSgpmAllow( pu ) && !regression ? cu.sgpmIdx - RSGPM_CAND_NUM : cu.sgpmIdx;
+  h[SGPM_HEAD_FLAGS] = ( regression ? SGPM_REGRESSION : 0 ) | ( timd ? 0 : SGPM_NO_TIMD )
+                       | ( sps.getUseDimd() ? 0 : SGPM_NO_DIMD );
   // getSgpmIntraMPMs' positions (addMpmNeighbours' first five): an intra CU's mode as getIntraDirLuma gives it (an
   // SGPM CU's its first mode, not the angle getSpatialIpm reads: the SGPM CU's record or the CPU's mode), an inter or
   // IBC CU's motion field's (no GPM angle, unlike getSpatialIpm)
@@ -3728,7 +3740,7 @@ static bool addSgpmRecord( GpuIntraRec::Impl& m, const CodingUnit& cu, Cu& c, co
   }
   const int wIdx = floorLog2( cu.lwidth() ) - GEO_MIN_CU_LOG2_EX, hIdx = floorLog2( cu.lheight() ) - GEO_MIN_CU_LOG2_EX;
   h[SGPM_HEAD_WEIGHTS]     = m.sh->sgpmWeights[wIdx][hIdx][0];
-  h[SGPM_HEAD_WEIGHTS + 1] = m.sh->sgpmWeights[wIdx][hIdx][1];
+  h[SGPM_HEAD_WEIGHTS + 1] = m.sh->sgpmWeights[wIdx][hIdx][cu.cs->pps->getUseSgpmNoBlend() ? 2 : 1];
   CHECK( h[SGPM_HEAD_WEIGHTS] < 0, "an SGPM CU of a size without weights" );
   // deriveSgpmModeOrdered's template (SGPM_TEMPLATE_SIZE; the CU has both neighbours: sgpm_flag)
   std::vector<int32_t> bits;
@@ -4690,6 +4702,13 @@ static int32_t cuRecord( GpuIntraRec::Impl& m, const TransformUnit& tu, const Co
       d[DIMD_OUT_SGPM_BV + 2 * k]     = bv ? mv.hor : 0;
       d[DIMD_OUT_SGPM_BV + 2 * k + 1] = bv ? mv.ver : 0;
     }
+#if JVET_AJ0112_REGRESSION_SGPM
+    if( PU::isRegressionSgpm( pu ) )   // (its blend model; offset follows from shift)
+    {
+      std::copy_n( cu.blendModel.params, 3, d + DIMD_OUT_SGPM_MODEL );
+      d[DIMD_OUT_SGPM_MODEL + 3] = cu.blendModel.shift;
+    }
+#endif
   }
 #endif
 #if JVET_AG0146_DIMD_ITMP_IBC && JVET_AM0138_ENHANCED_TMP_MERGE_LIST_TIMD_BV
@@ -7358,7 +7377,9 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
     const bool chroma  = c.kind == CU_CHROMA_DIMD || c.kind == CU_CHROMA_TMRL;   // its DIMD chroma's two modes
     const bool tmp     = c.kind == CU_TMP;   // its node's list, its block's modes of its prediction
     const bool bvg     = c.kind == CU_BVG;   // its blend (in DIMD's fields), its vectors and their weights
-    if( !params && c.mtss < 0 && !mipDimd && !tmp && !bvg )
+    const bool sgpm    = c.kind == CU_SGPM;  // its choice (also without a DIMD: the SPS's DIMD off), regression's model
+    const bool rsgpm   = sgpm && ( m.timdData[c.sgpm + SGPM_HEAD_FLAGS] & SGPM_REGRESSION ) != 0;
+    if( !params && c.mtss < 0 && !mipDimd && !tmp && !bvg && !sgpm )
     {
       continue;
     }
@@ -7374,7 +7395,8 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
                                   || ( k >= DIMD_OUT_BVG_NUM && k < DIMD_OUT_BVG_WEIGHT + BVG_DIMD_BV_LIST_SIZE )
                                   || ( k >= DIMD_OUT_MTSS_LIST && k < DIMD_OUT_BV_FLAG && c.mtss >= 0 )
                             : k >= DIMD_OUT_EXT_FLAGS ? ( c.kind == CU_MERGE && k < DIMD_OUT_EXT_BV + 8 )
-                                                        || ( c.kind == CU_SGPM && k < DIMD_OUT_SGPM_END )
+                                                        || ( sgpm && k < DIMD_OUT_SGPM_END )
+                                                        || ( rsgpm && k >= DIMD_OUT_SGPM_MODEL && k < DIMD_OUT_SGPM_MODEL + 4 )
                                                         || ( tmp && k < DIMD_OUT_TMP_MV + 2 )
                                                         || ( tmp && k >= DIMD_OUT_TMP_LIC
                                                              && k < DIMD_OUT_TMP_LIC + SGPM_LIC
@@ -7434,6 +7456,8 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
                             : bvg && k >= DIMD_OUT_BVG_WEIGHT ? "bvDimdWeight"
                             : bvg && k >= DIMD_OUT_BVG_BV ? "bvDimdList (packed)"
                             : bvg && k == DIMD_OUT_TR_SECOND ? "bvgDimdMode[1]"
+                            : sgpm && k >= DIMD_OUT_SGPM_MODEL + 3 ? "blendModel.shift"
+                            : sgpm && k >= DIMD_OUT_SGPM_MODEL ? "blendModel.params"
                             : c.kind == CU_SGPM && k >= DIMD_OUT_SGPM_BV ? ( k & 1 ? "sgpmBv's hor" : "sgpmBv's ver" )
                             : c.kind == CU_SGPM && k >= DIMD_OUT_SGPM_PRED ? "dimdDerivedIntraDir (SGPM's prediction)"
                             : c.kind == CU_SGPM && k >= DIMD_OUT_SGPM_TIMD ? "timdHor / timdVer"
@@ -7448,6 +7472,7 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
         const int   entry = k < 2 ? 0 : k < 9 ? k - 2 : k < 17 ? k - 9 : k < DIMD_OUT_TR_SECOND ? k - 17
                             : k == DIMD_OUT_TR_SECOND ? 1 : k < DIMD_OUT_MTSS_MODE ? k - DIMD_OUT_MTSS_LIST
                             : bvg && k >= DIMD_OUT_BVG_WEIGHT ? k - DIMD_OUT_BVG_WEIGHT
+                            : sgpm && k >= DIMD_OUT_SGPM_MODEL ? k - DIMD_OUT_SGPM_MODEL
                             : c.kind == CU_SGPM && k >= DIMD_OUT_SGPM_BV ? ( k - DIMD_OUT_SGPM_BV ) >> 1
                             : c.kind == CU_SGPM && k >= DIMD_OUT_SGPM_PRED ? k - DIMD_OUT_SGPM_PRED
                             : c.kind == CU_SGPM && k >= DIMD_OUT_SGPM_TIMD ? k - DIMD_OUT_SGPM_TIMD
