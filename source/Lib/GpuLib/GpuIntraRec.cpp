@@ -1449,7 +1449,56 @@ gpu::Kernel& intraRecKernel( const Shared& sh, gpu::Context& ctx, IntraRecVarian
 // log2 height - 2; -1 where SGPM takes no such CU) the offsets of its weights: the template's per partition
 // (xSgpmSadTM's g_geoWeightsTpl walk, one sample thick: the above row's width samples, then the left column's height)
 // and the block's (xWeightedSgpm's g_geoWeights walk with the size's blending width, GET_SGPM_BLD_IDX), then the
-// block's without blending (the PPS's sgpmNoBlend: g_geoWeights' first blending width)
+// block's without blending (the PPS's sgpmNoBlend: g_geoWeights' first blending width); after those, per CU size and
+// partition the part of each 4 x 4 unit (spanIpmInfoSgpm's tpmMask: bit u of 2 words, u = x + y * W / 4), from
+// sgpmUnitMaskBase
+static int sgpmUnitMaskBase = 0;
+
+// spanIpmInfoSgpm's part (0, 1) of unit (x, y) of a W x H CU of partition s (an index into g_sgpmSplitDir)
+static int sgpmUnitPart( int W, int H, int s, int x, int y )
+{
+  const int splitDir = g_sgpmSplitDir[s], angle = g_geoParams[splitDir][0], distanceIdx = g_geoParams[splitDir][1];
+  const bool isFlip = angle >= 13 && angle <= 27;
+  const int  distanceX = angle, distanceY = ( distanceX + ( GEO_NUM_ANGLES >> 2 ) ) % GEO_NUM_ANGLES;
+  int        offsetX = ( -W ) >> 1, offsetY = ( -H ) >> 1;
+  if( distanceIdx > 0 )
+  {
+#if JVET_AP0086_GPM_REFINED_OFFSET_DIRECTION
+    const int mask     = g_angle2mask[angle];
+    int       shiftHor = 0;
+    if( mask <= 2 )
+    {
+      shiftHor = 1;
+    }
+    else if( mask >= 6 && mask <= 8 )
+    {
+      shiftHor = 0;
+    }
+    else
+    {
+      const int blockratio = floorLog2( W ) - floorLog2( H );
+      const int gpmratio   = g_dis[distanceX] == 0 ? 8 : g_dis[distanceY] == 0 ? -8
+                             : floorLog2( abs( g_dis[distanceY] ) ) - floorLog2( abs( g_dis[distanceX] ) );
+      shiftHor = ( gpmratio < blockratio ) || ( gpmratio == blockratio && H < W );
+    }
+    const int delta = ( angle < 16 ? 1 : -1 ) * (int) ( ( distanceIdx * ( shiftHor ? W : H ) ) >> 3 );
+    ( shiftHor ? offsetX : offsetY ) += delta;
+#else
+    if( angle % 16 == 8 || ( angle % 16 != 0 && H >= W ) )
+    {
+      offsetY += angle < 16 ? ( ( distanceIdx * H ) >> 3 ) : -(int) ( ( distanceIdx * H ) >> 3 );
+    }
+    else
+    {
+      offsetX += angle < 16 ? ( ( distanceIdx * W ) >> 3 ) : -(int) ( ( distanceIdx * W ) >> 3 );
+    }
+#endif
+  }
+  const int lookUpY   = ( ( ( 4 * y + offsetY ) << 1 ) + 5 ) * g_dis[distanceY];
+  const int motionIdx = ( ( ( 4 * x + offsetX ) << 1 ) + 5 ) * g_dis[distanceX] + lookUpY;
+  return motionIdx <= 0 ? 1 - isFlip : isFlip;
+}
+
 static std::vector<int32_t> sgpmTables()
 {
   constexpr int NUM_SIZES = GEO_NUM_CU_SIZE_EX;
@@ -1544,6 +1593,24 @@ static std::vector<int32_t> sgpmTables()
             }
           }
         }
+      }
+    }
+  }
+  sgpmUnitMaskBase = (int) v.size();
+  for( int wIdx = 0; wIdx < NUM_SIZES; wIdx++ )
+  {
+    for( int hIdx = 0; hIdx < NUM_SIZES; hIdx++ )
+    {
+      const int W = 1 << ( wIdx + GEO_MIN_CU_LOG2_EX ), H = 1 << ( hIdx + GEO_MIN_CU_LOG2_EX );
+      for( int s = 0; s < SGPM_TOTAL_NUM_PARTITIONS; s++ )
+      {
+        uint32_t bits[2] = { 0, 0 };
+        for( int u = 0; u < ( W >> 2 ) * ( H >> 2 ) && u < 64; u++ )
+        {
+          bits[u >> 5] |= uint32_t( sgpmUnitPart( W, H, s, u % ( W >> 2 ), u / ( W >> 2 ) ) ) << ( u & 31 );
+        }
+        v.push_back( (int32_t) bits[0] );
+        v.push_back( (int32_t) bits[1] );
       }
     }
   }
@@ -4008,7 +4075,9 @@ constexpr int TMP_HEAD         = TMP_HEAD_FLM + 1;
 // record of a GPU CU << 1 | 1 for an EIP CU's search, 0 for an IntraTMP CU's), how many units calcGradForOBMC skips
 // for a CU with motion (to its end + 1), the vector (1/16 samples)
 constexpr int OBMC_FLAGS = 0, OBMC_UNITS = 1;
-constexpr int OBMC_U_KIND = 0, OBMC_U_MODE = 1, OBMC_U_SKIP = 2, OBMC_U_MV = 3, OBMC_UNIT = 5;
+constexpr int OBMC_U_KIND = 0, OBMC_U_MODE = 1, OBMC_U_SKIP = 2, OBMC_U_MV = 3, OBMC_U_LIC = 5, OBMC_UNIT = 8;
+// (OBMC_U_LIC: a motion unit's IBC LIC - 0 none, 1 the scale and offset that follow, 2 its GPU IntraTMP CU's model -,
+// which xPredInterBlk applies to the strip's copy with isobmcMC: linearTransform by licScale / licOffset, shift 5)
 constexpr int OBMC_NONE = 0, OBMC_INTRA = 1, OBMC_PLT = 2, OBMC_MOTION = 3, OBMC_MOTION_INVALID = 4;
 constexpr int TMP_SEARCH_FULL = 0, TMP_SEARCH_BEST = 1, TMP_SEARCH_BVG = 2;
 
@@ -4149,7 +4218,7 @@ static bool addTmpObmcRecord( GpuIntraRec::Impl& m, const CodingUnit& cu, Cu& c,
                            || ( n.ibcLicFlag && n.ibcLicIdx == IBC_LIC_IDX_M ) || n.bvgDimdFlag;
       u[OBMC_U_KIND] = invalid ? OBMC_MOTION_INVALID : OBMC_MOTION;
       why = !mi.isIBCmot || mi.interDir != 1 ? "IntraTMP OBMC with a neighbour of two vectors or inter"
-            : !invalid && ( n.ibcLicFlag || n.licFlag || n.altLMFlag ) ? "IntraTMP OBMC with a neighbour with LIC"
+            : !invalid && ( n.licFlag || n.altLMFlag ) ? "IntraTMP OBMC with a neighbour with inter LIC"
             : nullptr;
       const auto rec = m.cuIndex[CHANNEL_TYPE_LUMA].find( &n );
       const bool gpu = rec != m.cuIndex[CHANNEL_TYPE_LUMA].end() && !m.cpuCus.count( &n )
@@ -4157,6 +4226,13 @@ static bool addTmpObmcRecord( GpuIntraRec::Impl& m, const CodingUnit& cu, Cu& c,
       if( !invalid && gpu )   // (its vector its node's: an IntraTMP CU's DIMD_OUT_TMP_MV, an EIP CU's DIMD_OUT_BV)
       {
         u[OBMC_U_MODE] = rec->second << 1 | ( m.cus[rec->second].kind == CU_EIP ? 1 : 0 );
+      }
+      // its IBC LIC (an IntraTMP CU's of one model; its node's where the GPU's, else the CU's fields)
+      if( !invalid && n.ibcLicFlag )
+      {
+        u[OBMC_U_LIC]     = gpu && m.cus[rec->second].kind == CU_TMP ? 2 : 1;
+        u[OBMC_U_LIC + 1] = n.licScale[0][COMPONENT_Y];
+        u[OBMC_U_LIC + 2] = n.licOffset[0][COMPONENT_Y];
       }
       u[OBMC_U_MV]     = mi.mv[0].hor;
       u[OBMC_U_MV + 1] = mi.mv[0].ver;
@@ -4175,9 +4251,17 @@ static bool addTmpObmcRecord( GpuIntraRec::Impl& m, const CodingUnit& cu, Cu& c,
     {
       u[OBMC_U_MODE] = mpmModeCu( m, nb->getIpmInfo( pos ) );
     }
-    else if( n.sgpm )
+    else if( n.sgpm )   // (its mode by its part there: its node's partition and modes, sgpmUnitPart's table)
     {
-      why = "IntraTMP OBMC with an SGPM neighbour";
+      const int wIdx = floorLog2( n.lwidth() ) - GEO_MIN_CU_LOG2_EX, hIdx = floorLog2( n.lheight() ) - GEO_MIN_CU_LOG2_EX;
+      if( n.lwidth() * n.lheight() > 64 * 16 || m.cus[rec->second].kind != CU_SGPM )
+      {
+        why = "IntraTMP OBMC with an SGPM neighbour";
+      }
+      u[OBMC_U_MODE]   = rec->second;
+      u[OBMC_U_MV]     = 1;
+      u[OBMC_U_MV + 1] = ( ( pos.x - n.lx() ) >> 2 ) + ( ( pos.y - n.ly() ) >> 2 ) * ( n.lwidth() >> 2 );
+      u[OBMC_U_LIC]    = sgpmUnitMaskBase + ( wIdx * GEO_NUM_CU_SIZE_EX + hIdx ) * SGPM_TOTAL_NUM_PARTITIONS * 2;
     }
     else
     {

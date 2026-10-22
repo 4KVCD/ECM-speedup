@@ -449,7 +449,7 @@ wall-clock gains with threads are "the easy baseline". Decoder status: single-th
 (`--GpuLoopFilter=1`: ALF, SAO, BIF, CCSAO, LF-CCCM, offset refinement on Vulkan). The user then asked for **a full
 GPU decoder in Vulkan, optimized until nothing is left** ("The GPU decoder needs to fully decode the frame on the
 GPU"; "Your first Vulkan version is going to be slow. That's OK"). That work is branch `dec-gpurecon`: intra
-reconstruction on the GPU (`--GpuRecon`), tool levels M1-M80 done and verified bit-exact (M19: DIMD, M20: OBIC, M21:
+reconstruction on the GPU (`--GpuRecon`), tool levels M1-M82 done and verified bit-exact (M19: DIMD, M20: OBIC, M21:
 intra merge, M22: the transforms of DIMD CUs, M23: LFNST of MIP, M24: TIMD, M25: OBIC and intra merge with TIMD
 neighbours, M26: TIMD-SAD, M27: OBIC and intra merge with TIMD-SAD neighbours, M28: TIMD merge, M29: TMRL of luma,
 M30: chroma TMRL, M31: CCLM, M32: LFNST / NSPT of CCLM, M33: GLM's gradient patterns, M34: CCCM, M35: GL-CCCM, M36:
@@ -1969,6 +1969,14 @@ it puts an MPM CU's DIMD kept aside to use) and makes such merge nodes prefix no
 gpu12): every stream identical but the 2 single-tree ones; intra CUs from the CPU 1697 -> 1477 ("an IntraTMP
 neighbour of intra merge" 200 -> 0, 9 for the new reason; "an intra merge neighbour of a kind the GPU lacks" 308 ->
 279).
+M81 (2026-10-22): IntraTMP OBMC with a neighbour with IBC LIC: the run's copy goes through the neighbour's model (its
+licScale / licOffset, shift 5: xPredInterBlk's linearTransform with isobmcMC), also for skipObmcConditionByPixel's
+copy; the record's unit carries it (OBMC_U_LIC: the CU's fields, or a GPU IntraTMP CU's node model); the CU's own
+vector counts as a neighbour's only with equal LIC flags and, with LIC, scale and offset (getSameNeigMotion).
+M82 (2026-10-22): IntraTMP OBMC with an SGPM neighbour: the unit's mode is the SGPM CU's mode of its part there
+(spanIpmInfoSgpm's tpmMask per 4 x 4 unit, tabled per CU size and partition after sgpmTables' weights; a vector's
+mode planar), from the SGPM node's partition and modes. Results (9 streams with these CUs, build gpu16): all
+identical; "IntraTMP OBMC with a neighbour with LIC" 102 and "... with an SGPM neighbour" 49 -> 0.
 M75 (2026-10-22, agent hb): 12-bit internal bit depth for the tools rejected above 10 bits (JVET-AJ0237 is compiled
 in; the SPS has one bit depth for luma and chroma, sps_bitdepth_minus8, so "unequal bit depths" cannot occur in a
 decoded stream and those checks stay). The template costs: xGetHADs_SIMD's kernels keep 16-bit lanes up to 12 bits -
