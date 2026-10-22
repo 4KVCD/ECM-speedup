@@ -2117,6 +2117,9 @@ struct GpuIntraRec::Impl
   std::unordered_set<const CodingUnit*>                        interPending;
   std::map<std::string, int>                                   interKinds;
   std::vector<int16_t>                                         interPred;
+  // the predicted signs of their blocks (prepareInterSignPred: the CPU decodes the CU before recordInterCu), per TU and
+  // component
+  std::map<std::pair<const TransformUnit*, int>, PendingSignPred> interSign;
   // partial verification: the temporal CCP merge candidates (JVET-AE0043) of inter slices, the collocated picture's
   // models (the CPU's, as its decoding kept them: m_ccpModelLUT) as records of their own, per picture and model index
   std::deque<CCPModelCandidate>                                ccpTemporalModels;
@@ -2367,6 +2370,7 @@ void GpuIntraRec::beginPicture( const CodingStructure& cs )
   m.ccpTuIndex.clear();
   m.interPending.clear();
   m.interPred.clear();
+  m.interSign.clear();
   m.ccpTemporalModels.clear();
   m.ccpTemporal.clear();
   m.ccpInterCccm.clear();
@@ -6562,7 +6566,7 @@ static const char* interKind( const CodingUnit& cu )
 
 // why non-intra CU cu is taken from the CPU, nullptr for an inter CU whose blocks the GPU reconstructs: what the GPU
 // lacks of its residual (inter LFNST / NSPT, whose mode is a DIMD of the prediction; inter CCCM and CCP merge, which
-// replace its chroma prediction; ASBT; sign prediction, whose templates read the prediction's border)
+// replace its chroma prediction; ASBT)
 static const char* interWhy( const GpuIntraRec::Impl& m, const CodingUnit& cu )
 {
   if( !m.partial )
@@ -6619,15 +6623,24 @@ static const char* interWhy( const GpuIntraRec::Impl& m, const CodingUnit& cu )
         return "ASBT";
       }
 #endif
-      const ComponentID comp = ComponentID( c );
-      if( tu.blocks[comp].valid() && cu.rootCbf && ( TU::getCbf( tu, comp ) || ( isChroma( comp ) && tu.jointCbCr ) )
-          && TU::getUseSignPred( tu, comp ) )
-      {
-        return "inter sign prediction";
-      }
     }
   }
   return nullptr;
+}
+
+void GpuIntraRec::prepareInterSignPred( TransformUnit& tu, const ComponentID compID )
+{
+  Impl& m = *m_impl;
+  if( !m.interPending.count( tu.cu ) )
+  {
+    return;
+  }
+  prepareSignPred( tu, compID );
+  if( m.pendingSign.num > 0 )
+  {
+    m.interSign[std::make_pair( (const TransformUnit*) &tu, (int) compID )] = m.pendingSign;
+    m.pendingSign.num = 0;
+  }
 }
 
 void GpuIntraRec::interCu( const CodingUnit& cu )
@@ -6644,7 +6657,7 @@ void GpuIntraRec::interCu( const CodingUnit& cu )
 
 // the record of block compID of TU tu of an inter CU (recordInterCu): the CPU's prediction (Params::interPred at the
 // block's samples; luma forward-mapped by LMCS on the GPU where DecCu::xDecodeInterTU maps it) and the GPU's residual
-// as an intra block's (joint CbCr, transforms, dequantization, levels), reconstructed as xDecodeInterTU does: clipped to
+// as an intra block's (joint CbCr, sign prediction, transforms, dequantization, levels), reconstructed as xDecodeInterTU does: clipped to
 // the slice's range (luma's adaptive, mapped with LMCS), the chroma residual scaled by the CU's neighbouring luma (also
 // where the CTU has no LMCS). False with why set where the GPU lacks something
 static bool recordInterBlock( GpuIntraRec::Impl& m, const TransformUnit& tu, const ComponentID compID, const char*& why )
@@ -6694,11 +6707,40 @@ static bool recordInterBlock( GpuIntraRec::Impl& m, const TransformUnit& tu, con
       return false;
     }
     t.jccr = JCCR_DERIVED;
+    const int32_t cbIndex = (int32_t) m.rec.size() - 1;
+    if( cb->spOffset >= 0 )   // sign prediction of the pair, decided by the coded component's block
+    {
+      if( std::abs( cb->jccr ) == 3 )   // Cr coded: this block decides and writes the Cb block's residual
+      {
+        t.spCoded               = cbIndex;
+        m.rec[cbIndex].resiFrom = cbIndex + 1;
+      }
+      else
+      {
+        t.resiFrom = cbIndex;
+      }
+    }
   }
   // (a CU without residual has none in any block: xDecodeInterTexture's rootCbf)
   const QpParam resiQp( tu, resiComp );
   t.cbf           = cu.rootCbf && t.jccr != JCCR_DERIVED && TU::getCbf( tu, resiComp ) ? 1 : 0;
   t.transformSkip = tu.mtsIdx[resiComp] == MTS_SKIP ? 1 : 0;
+  // sign prediction (TrQuant::predCoeffSigns in xDecodeInterTU): prepareInterSignPred took the predicted levels of the
+  // coded component (at the Cb block with joint CbCr)
+  const auto sp       = m.interSign.find( std::make_pair( &tu, (int) compID ) );
+  const bool signPred = sp != m.interSign.end() && t.jccr != JCCR_DERIVED;
+  if( signPred && ( sp->second.comp != resiComp || sp->second.pos != tu.blocks[resiComp].pos() || !t.cbf
+                    || t.transformSkip || area.width < 4 || area.height < 4 ) )
+  {
+    why = "inter sign prediction outside TU::getUseSignPred's conditions";
+    return false;
+  }
+  // (an inter block's up to SIGN_PRED_MAX_BS_INTER, 128; intra_rec's signPrediction keeps 32 x 32)
+  if( signPred && ( area.width > 32 || area.height > 32 ) )
+  {
+    why = "inter sign prediction above 32 x 32";
+    return false;
+  }
   Secondary sec;
   if( !transformFields( m, tu, resiComp, area, t, sec, why ) || !dequantFields( tu, resiComp, resiQp, area, t, why ) )
   {
@@ -6739,9 +6781,19 @@ static bool recordInterBlock( GpuIntraRec::Impl& m, const TransformUnit& tu, con
     }
     m.lmcsUsed |= t.lmcs != 0;
   }
-  if( !coefficientFields( m, tu, resiComp, area, t, nullptr, why ) )
+  if( !coefficientFields( m, tu, resiComp, area, t, signPred ? sp->second.coef.data() : nullptr, why ) )
   {
     return false;
+  }
+  if( signPred )   // the signPred data; the block decides itself unless its pair's Cr is coded
+  {
+    const GpuIntraRec::Impl::PendingSignPred& sign = sp->second;
+    t.spOffset = (int32_t) m.signPred.size();
+    t.spCoded  = std::abs( t.jccr ) == 3 ? -1 : (int32_t) m.rec.size();
+    m.signPred.push_back( sign.num );
+    m.signPred.push_back( sign.codedSigns );
+    m.signPred.insert( m.signPred.end(), sign.xy, sign.xy + SIGN_PRED_MAX_NUM );
+    m.signPred.resize( m.signPred.size() + size_t( sign.num ) * ( area.width + area.height ), 0 );
   }
   // the CPU's prediction (its buffer keeps the unmapped luma: xDecodeInterTU maps a copy) and, for the comparison, the
   // prediction and the residual the CPU reconstructs with
@@ -7145,10 +7197,24 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
       memset( t.readMax, 0, sizeof( t.readMax ) );
       memset( t.bfAvail, 0, sizeof( t.bfAvail ) );
       t.ispSide = 0;
-      // what the residual reads: with joint CbCr and sign prediction the decision in the other block of the pair, before
-      // or after this one; with LMCS chroma residual scaling the luma column left of and the row above the CU, clipped
+      // what the residual reads: sign prediction's border; with joint CbCr and sign prediction the decision in the other
+      // block of the pair, before or after this one; with LMCS chroma residual scaling the luma column left of and the
+      // row above the CU, clipped
       auto residualDeps = [&]()
       {
+        if( t.spCoded >= 0 )   // sign prediction's border (TU::predBorderResi): the two columns left of / rows above the block
+        {
+          for( int k = 0; k < t.h && t.x > 0; k++ )
+          {
+            addOwner( t.x - 1, t.y + k );
+            addOwner( t.x - 2, t.y + k );
+          }
+          for( int k = 0; k < t.w && t.y > 0; k++ )
+          {
+            addOwner( t.x + k, t.y - 1 );
+            addOwner( t.x + k, t.y - 2 );
+          }
+        }
         if( t.resiFrom >= 0 && mark[t.resiFrom] != i )
         {
           mark[t.resiFrom] = i;
@@ -7492,19 +7558,6 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
       else if( t.derive & ( DERIVE_MTSS | DERIVE_EIP | DERIVE_TMP ) )
       {
         addBlock( m.cus[t.cu].node );
-      }
-      if( t.spCoded >= 0 )   // sign prediction's border (TU::predBorderResi): the two columns left of / rows above the block
-      {
-        for( int k = 0; k < t.h && t.x > 0; k++ )
-        {
-          addOwner( t.x - 1, t.y + k );
-          addOwner( t.x - 2, t.y + k );
-        }
-        for( int k = 0; k < t.w && t.y > 0; k++ )
-        {
-          addOwner( t.x + k, t.y - 1 );
-          addOwner( t.x + k, t.y - 2 );
-        }
       }
       residualDeps();
     }

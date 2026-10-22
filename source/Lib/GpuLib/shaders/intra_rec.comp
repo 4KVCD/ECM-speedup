@@ -1772,7 +1772,8 @@ void main()
     }
     // ----- an inter CU's block (partial verification: its prediction the CPU's, Params::interPred at the block's
     // samples): the prediction - luma forward-mapped by LMCS where DecCu::xDecodeInterTU maps it (LMCS_INTER_FWD) -
-    // reconstructed with intra_resi's residual, the chroma residual scaled as an intra block's
+    // reconstructed with intra_resi's residual, the chroma residual scaled as an intra block's; with sign prediction
+    // after the signs are decided on it
     if( ( t.derive & DERIVE_INTER ) != 0 )
     {
       crsSetup( t, lid, NT );
@@ -1781,6 +1782,11 @@ void main()
       {
         const int p = int( ip.v[t.dbgOffset + i] );
         storeRecon( t, i % t.w, i / t.w, ( t.lmcs & LMCS_INTER_FWD ) != 0 ? fwdLut( p ) : p );
+      }
+      if( t.spCoded >= 0 )   // sign prediction (kept in s_spPred): decide the signs, reconstruct
+      {
+        SYNC();
+        signPrediction( t, lid, NT );
       }
       releaseDependents( d0, d1, lid, NT );
       continue;

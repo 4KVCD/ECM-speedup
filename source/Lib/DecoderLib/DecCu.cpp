@@ -3547,6 +3547,12 @@ void DecCu::xDecodeInterTU( TransformUnit & currTU, const ComponentID compID )
 #endif
     cs.getPredBuf(currTU.blocks[COMPONENT_Y]).rspSignal(m_pcReshape->getFwdLUT());
   }
+#if ECM_VULKAN
+  if( m_gpuIntraRec )   // (an inter CU the GPU reconstructs: its predicted signs, taken before they are decided here)
+  {
+    m_gpuIntraRec->prepareInterSignPred( currTU, compID );
+  }
+#endif
 #if JVET_AL0181_ASBT
   if ((currTU.asbtDecimW[compID] || currTU.asbtDecimH[compID]) && TU::getCbf(currTU, compID))
   {

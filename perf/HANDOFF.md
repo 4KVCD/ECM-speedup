@@ -449,7 +449,7 @@ wall-clock gains with threads are "the easy baseline". Decoder status: single-th
 (`--GpuLoopFilter=1`: ALF, SAO, BIF, CCSAO, LF-CCCM, offset refinement on Vulkan). The user then asked for **a full
 GPU decoder in Vulkan, optimized until nothing is left** ("The GPU decoder needs to fully decode the frame on the
 GPU"; "Your first Vulkan version is going to be slow. That's OK"). That work is branch `dec-gpurecon`: intra
-reconstruction on the GPU (`--GpuRecon`), tool levels M1-M89 done and verified bit-exact (M19: DIMD, M20: OBIC, M21:
+reconstruction on the GPU (`--GpuRecon`), tool levels M1-M90 done and verified bit-exact (M19: DIMD, M20: OBIC, M21:
 intra merge, M22: the transforms of DIMD CUs, M23: LFNST of MIP, M24: TIMD, M25: OBIC and intra merge with TIMD
 neighbours, M26: TIMD-SAD, M27: OBIC and intra merge with TIMD-SAD neighbours, M28: TIMD merge, M29: TMRL of luma,
 M30: chroma TMRL, M31: CCLM, M32: LFNST / NSPT of CCLM, M33: GLM's gradient patterns, M34: CCCM, M35: GL-CCCM, M36:
@@ -2151,6 +2151,15 @@ Results (50 streams, build gpu26): every verified picture identical; inter CUs r
 10912 (OBMC flag 5836, affine 2359, GPM 1423, LIC 557, uni-prediction 481, bi-prediction 119, non-local LIC 113, CIIP
 14, multi-hypothesis 10); still taken from the CPU: inter sign prediction 3157, IBC CU 2472, inter LFNST / NSPT 1255,
 inter CCP merge 128, palette CU 123, ASBT 101, inter CCCM 16.
+M90 (2026-10-22): sign prediction of inter blocks on the GPU: DecCu::xDecodeInterTU calls prepareInterSignPred before
+TrQuant::predCoeffSigns (the CPU decodes the CU before recordInterCu, so the pending signs are kept per TU and
+component, interSign); recordInterBlock takes them as record() does (the levels with the predicted signs positive, the
+signPred data, joint CbCr's pairing) and intra_rec's DERIVE_INTER branch runs signPrediction after its prediction (in
+s_spPred; luma forward-mapped by LMCS as xDecodeInterTU predicts the signs on). The border's reads (signDeps / the host's
+residualDeps) are shared with intra blocks. Inter blocks may predict signs up to SIGN_PRED_MAX_BS_INTER (128); the
+GPU's signPrediction keeps 32 x 32: "inter sign prediction above 32 x 32". Results (50 streams, build gpu28): every
+picture identical; "inter sign prediction" 3157 -> 127 (above 32 x 32); inter CUs from the CPU's prediction 10912 ->
+13873.
 
 
 ## 8. Numbers (i7-10700 8C/16T, Win11, GCC 16.2, RTX 3070 driver 616.92)

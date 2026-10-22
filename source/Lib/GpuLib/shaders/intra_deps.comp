@@ -360,6 +360,24 @@ void bilateralFilterDeps( inout Tu t, int comp, int availComp, int fx, int fy, i
   }
 }
 
+// sign prediction's border (TU::predBorderResi): the two columns left of / rows above the block
+void signDeps( Tu t, int comp )
+{
+  if( t.spCoded >= 0 )
+  {
+    for( int k = 0; k < t.h && t.x > 0; k++ )
+    {
+      addDep( ownerAt( comp, t.x - 1, t.y + k ) );
+      addDep( ownerAt( comp, t.x - 2, t.y + k ) );
+    }
+    for( int k = 0; k < t.w && t.y > 0; k++ )
+    {
+      addDep( ownerAt( comp, t.x + k, t.y - 1 ) );
+      addDep( ownerAt( comp, t.x + k, t.y - 2 ) );
+    }
+  }
+}
+
 // LMCS chroma residual scaling's reads (Tu::lmcs 2): the luma column left of and the row above the CU, clipped
 void crsDeps( Tu t )
 {
@@ -522,6 +540,7 @@ void dependencies( int comp )
   }
   if( ( t.derive & DERIVE_INTER ) != 0 )   // an inter CU's block: its prediction given, it reads what its residual needs
   {
+    signDeps( t, comp );
     addEdge( t.resiFrom );
     crsDeps( t );
     return;
@@ -688,19 +707,7 @@ void dependencies( int comp )
   {
     addDep( BufCu( P.cus ).v[t.cu].node );
   }
-  if( t.spCoded >= 0 )   // sign prediction's border (TU::predBorderResi): the two columns left of / rows above the block
-  {
-    for( int k = 0; k < t.h && t.x > 0; k++ )
-    {
-      addDep( ownerAt( comp, t.x - 1, t.y + k ) );
-      addDep( ownerAt( comp, t.x - 2, t.y + k ) );
-    }
-    for( int k = 0; k < t.w && t.y > 0; k++ )
-    {
-      addDep( ownerAt( comp, t.x + k, t.y - 1 ) );
-      addDep( ownerAt( comp, t.x + k, t.y - 2 ) );
-    }
-  }
+  signDeps( t, comp );
   // joint CbCr with sign prediction: the residual comes from the decision in the other block of the pair, before or
   // after this one
   addEdge( t.resiFrom );

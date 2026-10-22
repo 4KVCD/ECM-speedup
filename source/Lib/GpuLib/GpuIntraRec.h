@@ -113,6 +113,8 @@ public:
   /// non-intra CU cu, before the CPU decodes it: with partial verification an inter CU the GPU reconstructs from the
   /// CPU's prediction (recordInterCu records its blocks), else one taken from the CPU (cpuCu: the reason)
   void interCu( const CodingUnit& cu );
+  /// with an inter CU interCu took: block compID's predicted signs, before the CPU decides them (prepareSignPred)
+  void prepareInterSignPred( TransformUnit& tu, const ComponentID compID );
   /// inter CU cu, which the CPU has reconstructed: the records of its blocks (interCu's CUs)
   void recordInterCu( const CodingUnit& cu );
   /// reconstructs the recorded picture on the GPU; on: into the picture's reconstruction buffer, off: compared with
