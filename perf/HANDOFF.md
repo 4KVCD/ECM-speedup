@@ -449,7 +449,7 @@ wall-clock gains with threads are "the easy baseline". Decoder status: single-th
 (`--GpuLoopFilter=1`: ALF, SAO, BIF, CCSAO, LF-CCCM, offset refinement on Vulkan). The user then asked for **a full
 GPU decoder in Vulkan, optimized until nothing is left** ("The GPU decoder needs to fully decode the frame on the
 GPU"; "Your first Vulkan version is going to be slow. That's OK"). That work is branch `dec-gpurecon`: intra
-reconstruction on the GPU (`--GpuRecon`), tool levels M1-M93 done and verified bit-exact (M19: DIMD, M20: OBIC, M21:
+reconstruction on the GPU (`--GpuRecon`), tool levels M1-M94 done and verified bit-exact (M19: DIMD, M20: OBIC, M21:
 intra merge, M22: the transforms of DIMD CUs, M23: LFNST of MIP, M24: TIMD, M25: OBIC and intra merge with TIMD
 neighbours, M26: TIMD-SAD, M27: OBIC and intra merge with TIMD-SAD neighbours, M28: TIMD merge, M29: TMRL of luma,
 M30: chroma TMRL, M31: CCLM, M32: LFNST / NSPT of CCLM, M33: GLM's gradient patterns, M34: CCCM, M35: GL-CCCM, M36:
@@ -2215,6 +2215,33 @@ verification unchanged; ON mode (3) output identical with the CPU's on all 50, 3
 the CPU (no SAO on the GPU). GPU time per picture (copy and both passes): 0.02 ms (deblocking off) to 1.4 ms on these
 small pictures (ai_crowdrun832_q27 0.9 ms, ra_parkjoy832_q32 1.4 ms); there is no 1080p stream on this PC. Not known to be exercised by any stream:
 asymmetric deblocking (GDR), LADF, virtual boundaries, 4:2:2 / 4:4:4 (palette only as far as the SCC streams use it).
+M94 (2026-10-22, agent lf): IBC and palette CUs on the GPU (partial verification; DERIVE_IBC bit 30 when merged, 29 is M92's): interCu / recordInterCu take them as inter
+CUs (DERIVE_INTER blocks: the residual intra_resi's, the reconstruction xDecodeInterTU's) whose prediction the GPU
+makes. An IBC CU's block (DERIVE_IBC; Tu::ibc, its record in timdData: the CU's region of the component, its vector,
+RR-IBC's flip, IBC GPM's second vector and weights, IBC LIC's index) waits for every block before it (DERIVE_PREFIX, as
+IntraTMP's nodes) and is predicted in intra_rec (intra_ibccu.glsl's ibcBlock) at the CPU's final vector: the copy or
+IBCFrac's interpolation with xPredIBCBlkPadding's padding (intra_ibc.glsl's ibcPredict / ibcChromaPredict; the CPU's IBC
+buffer is a whole-picture copy of the reconstruction, so the GPU reads the picture), luma and 4:2:0 chroma; RR-IBC of a
+one-TU CU reconstructed into the mirrored positions (xDecodeInterTU's flipSignal; prediction and residual unflipped);
+IBC LIC of luma-only (dual-tree) CUs by intra_tmp.glsl's tmpLicModel (xLocalIlluComp's templates and fit, as IntraTMP
+LIC's); IBC GPM of two IBC parts: DecCu hands over the parts' final vectors (ibcGpmVectors, after
+motionCompensationIbcGpm), the host walks xWeightedGeoBlkRounded's weights, the GPU blends (w p0 + (32 - w) p1 + 16) >>
+5. A merge CU's LIC, filter, flip, bi-prediction and OBMC flags come from its candidate while it is predicted, so ibcWhy
+runs again in recordInterCu (ld_scc_q32 differed at an IBC LIC merge CU interCu had passed). The host's block-vector
+table (Params::bvOut) now gives every non-intra CU's vectors, which no node derives (with IBC CUs on the GPU and none
+there, their neighbours' IntraTMP / TIMD lists differed). Palette CUs: DecCu calls recordInterCu after xReconIntraQT;
+the host computes xReconPLT's samples (palette entries, escape values dequantized; checked equal to xReconPLT's in
+verification) into the block's prediction (cbf 0, no LMCS, clipped to the bit depth), the GPU writes them. Still from
+the CPU, by reason: IBC with OBMC (subBlockOBMC: the neighbours' inter / intra predictions), IBC GPM with an intra part,
+IBC bi-prediction (xPredInterBi's average), IBC filter (xCalIbcFilterParam's fit), IBC LIC with chroma (chroma templates
+not ported), IBC CIIP, IBC CU in a GDR interval, RR-IBC flip of a CU of several TUs, IBC / palette CUs of other layouts
+or with ACT. Results (50 streams, build aglfi9): every verified picture identical; "IBC CU" 2472 -> 0 (2389 IBC CUs on
+the GPU, 41 of them IBC GPM; from the CPU: IBC with OBMC 38, IBC GPM with an intra part 17, IBC bi-prediction 16, IBC
+filter 6, IBC LIC with chroma 1, and 5 now under inter sign prediction, 3157 -> 3162), "palette CU" 123 -> 0 (all on the
+GPU); every other reason unchanged. Limit: each IBC block waits for every block before it; dependencies on the owners of
+the area its vector reads would let more run at once (the four SCC streams' GPU time in partial verification, on a
+shared GPU: ai_scc_q27 339.5 -> 341.0, ai_scc2_q32 1410.1 -> 1423.3, ld_scc_q32 147.4 -> 154.8, ra_scc_q32 113.6 ->
+120.0 ms).
 
 
 ## 8. Numbers (i7-10700 8C/16T, Win11, GCC 16.2, RTX 3070 driver 616.92)

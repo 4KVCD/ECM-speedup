@@ -75,7 +75,7 @@
 
 namespace
 {
-// layout shared with intra_rec.comp (struct Tu): 103 int32
+// layout shared with intra_rec.comp (struct Tu): 106 int32
 struct Tu
 {
   int32_t comp, x, y, w, h;
@@ -123,8 +123,9 @@ struct Tu
   int32_t ccpMerge;   // a CCP merge block's entry in Params::ccpData (CCP_MERGE_*; -1: not a merge block)
   int32_t pdp;        // a block PDP may predict: its size, its references' padding (intra_common.glsl; -1: none)
   int32_t pnn;        // a block of NN intra prediction: its record in Params::timdData (PNN_REC_*; -1: none)
+  int32_t ibc;        // an IBC CU's block (DERIVE_IBC): its record in Params::timdData (IBC_REC_*; read with it only)
 };
-static_assert( sizeof( Tu ) == 105 * 4, "Tu layout" );
+static_assert( sizeof( Tu ) == 106 * 4, "Tu layout" );
 
 // a block of NN intra prediction's record in Params::timdData (intra_common.glsl's PNN_REC_*)
 constexpr int PNN_REC_AVAIL = 12, PNN_REC_TARGET = 16, PNN_REC_TOP_BOUNDARY = 19;
@@ -178,6 +179,14 @@ constexpr int DERIVE_INTER        = 268435456; // an inter CU's block: its predi
                                                // its residual the GPU's (recordInterBlock)
 constexpr int DERIVE_INTER_SECOND = 536870912; // with DERIVE_TRANSFORM, an inter block whose LFNST / NSPT take
                                                // the second mode of the DIMD of its prediction (lfnstIntra)
+constexpr int DERIVE_IBC          = 1073741824; // with DERIVE_INTER an IBC CU's block: its prediction the GPU's, at its
+                                               // record's block vectors (intra_ibccu.glsl's ibcBlock)
+// an IBC CU's block's record in Params::timdData (Tu::ibc): its CU's region of the component (x, y, w, h: the one
+// checkValidBv and the padding take), its vector (1/16 luma samples; x, y), its RR-IBC flip (rribcFlipType: 1 horizontal, 2 vertical); IBC GPM's second part's vector and the
+// first part's weights (of 32) per sample of the region, row-major in Params::timdData (else -1); with IBC LIC its
+// ibcLicIdx + 1 (else 0)
+constexpr int IBC_REC_X = 0, IBC_REC_Y = 1, IBC_REC_W = 2, IBC_REC_H = 3, IBC_REC_MV = 4, IBC_REC_FLIP = 6;
+constexpr int IBC_REC_MV2 = 7, IBC_REC_WEIGHTS = 9, IBC_REC_LIC = 10, IBC_REC = 11;
 
 // Tu::lm (intra_common.glsl's LM_*): whether the block is a CCLM block (the modes from 67 on are also those of TIMD /
 // TMRL luma blocks), its slope adjustments (+ 8, in 4 bits each) and LBCCP's inside filter; with DERIVE_CCLM_DIMD the
@@ -2151,6 +2160,10 @@ struct GpuIntraRec::Impl
   // prediction of those (interKind, totals) and the CPU's prediction of their blocks (Params::interPred, per sample)
   std::unordered_set<const CodingUnit*>                        interPending;
   std::map<std::string, int>                                   interKinds;
+  int                                                          ibcCus = 0;   // IBC CUs the GPU predicts
+  int                                                          ibcGpmCus = 0;   // ... of them IBC GPM CUs
+  std::unordered_map<const CodingUnit*, std::pair<Mv, Mv>>     ibcGpmMvs;   // IBC GPM CUs' parts' vectors (DecCu)
+  int                                                          pltCus = 0;   // palette CUs the GPU writes
   std::vector<int16_t>                                         interPred;
   // motion compensation on the GPU (inter_mc.comp): the inter CUs whose prediction it makes, their blocks' jobs
   // (MC_JOB each), the reference pictures they read (their slots), the CUs by kind (interKind, totals)
@@ -2241,6 +2254,14 @@ GpuIntraRec::~GpuIntraRec()
           printf( " %s %d;", r.second.c_str(), r.first );
         }
         printf( "\n" );
+      }
+      if( m.pltCus )
+      {
+        printf( "[gpu-intra] palette CUs written by the GPU: %d\n", m.pltCus );
+      }
+      if( m.ibcCus )
+      {
+        printf( "[gpu-intra] IBC CUs predicted by the GPU: %d (IBC GPM %d)\n", m.ibcCus, m.ibcGpmCus );
       }
       if( !m.interKinds.empty() )   // (the inter CUs whose prediction is the CPU's, by its kind)
       {
@@ -2413,6 +2434,7 @@ void GpuIntraRec::beginPicture( const CodingStructure& cs )
   m.partial = !m.on && getenv( "ECM_GPU_PARTIAL" );
   m.cuTus.clear();
   m.cpuCus.clear();
+  m.ibcGpmMvs.clear();
   m.cpuDummyCu = -1;
   m.mpmModeCus.clear();
   m.bvLists.clear();
@@ -6628,6 +6650,206 @@ static const char* interKind( const CodingUnit& cu )
   return pu.interDir == 3 ? "bi-prediction" : "uni-prediction";
 }
 
+// ----- IBC CUs (partial verification): their blocks on the GPU at the CPU's block vector, the residual as an inter
+// CU's
+
+// why IBC CU cu is taken from the CPU (what ibcBlock lacks), nullptr where the GPU predicts it: the copy or IBCFrac's
+// interpolation at the CU's one vector (InterPrediction::xIntraBlockCopy), or IBC GPM's two parts at theirs blended
+// (motionCompensationIbcGpm of two IBC parts: no LIC, IBC filter or OBMC), luma and chroma, with RR-IBC's flip.
+// (Called before the CU's motion is derived, and again after it: a merge CU's flags come from its candidate.)
+static const char* ibcWhy( const GpuIntraRec::Impl& m, const CodingUnit& cu )
+{
+  const PredictionUnit& pu = *cu.firstPU;
+  if( cu.cs->isInGdrIntervalOrRecoveryPoc() )   // (xIntraBlockCopy's clean IBC buffer)
+  {
+    return "IBC CU in a GDR interval";
+  }
+  if( !cu.Y().valid() || ( isChromaEnabled( cu.chromaFormat ) && cu.Cb().valid() && cu.chromaFormat != CHROMA_420 ) )
+  {
+    return "IBC CU of another layout";
+  }
+  if( cu.rribcFlipType && cu.firstTU != cu.lastTU )   // (xDecodeInterTU flips each TU, xDecodeInterTexture the CU)
+  {
+    return "RR-IBC flip of a CU of several TUs";
+  }
+  if( pu.ibcGpmFlag )
+  {
+#if JVET_AC0112_IBC_GPM && JVET_AA0058_GPM_ADAPTIVE_BLENDING
+    if( pu.ibcGpmMergeIdx0 >= IBC_GPM_MAX_NUM_UNI_CANDS || pu.ibcGpmMergeIdx1 >= IBC_GPM_MAX_NUM_UNI_CANDS )
+    {
+      return "IBC GPM with an intra part";
+    }
+    return nullptr;
+#else
+    return "IBC GPM";
+#endif
+  }
+  if( pu.ibcCiipFlag )
+  {
+    return "IBC CIIP";
+  }
+  if( pu.interDir != 1 )
+  {
+    return "IBC bi-prediction";
+  }
+  if( cu.ibcFilterFlag )
+  {
+    return "IBC filter";
+  }
+  if( cu.ibcLicFlag && isChromaEnabled( cu.chromaFormat ) && cu.Cb().valid() )   // (luma's alone: a dual tree's)
+  {
+    return "IBC LIC with chroma";
+  }
+  if( cu.cs->sps->getUseOBMC() && cu.obmcFlag && pu.lwidth() * pu.lheight() >= 32 )   // (subBlockOBMC's own gates)
+  {
+    return "IBC with OBMC";
+  }
+  return nullptr;
+}
+
+// block compID of IBC CU cu, recorded by recordInterBlock (the last record): predicted at the CPU's vector (pu.mv[0], in
+// 1/16 luma samples; the GPU derives it later) in the CU's region of the component, with IBC LIC by its model (the GPU
+// fits it), IBC GPM's parts at their vectors blended, with RR-IBC its reconstruction flipped; it waits for every block
+// before it (DERIVE_PREFIX: a vector, and LIC's templates, may read anything decoded before)
+static void ibcRecord( GpuIntraRec::Impl& m, const CodingUnit& cu, const ComponentID compID )
+{
+  Tu&                   t    = m.rec.back();
+  const PredictionUnit& pu   = *cu.firstPU;
+  const CompArea&       area = cu.blocks[compID];
+  t.derive |= DERIVE_IBC | DERIVE_PREFIX;
+  t.ibc = (int32_t) m.timdData.size();
+  int32_t rec[IBC_REC] = { area.x, area.y, (int32_t) area.width, (int32_t) area.height, pu.mv[0].hor, pu.mv[0].ver,
+                           cu.rribcFlipType, 0, 0, -1, cu.ibcLicFlag ? cu.ibcLicIdx + 1 : 0 };
+  m.blendBlocks = m.blendBlocks || cu.ibcLicFlag;   // (its model's templates take the workgroup's scratch)
+#if JVET_AC0112_IBC_GPM && JVET_AA0058_GPM_ADAPTIVE_BLENDING
+  if( pu.ibcGpmFlag )   // the parts' vectors (DecCu's), the first one's weights (xWeightedGeoBlkRounded's walk)
+  {
+    const auto mvs = m.ibcGpmMvs.find( &cu );
+    CHECK( mvs == m.ibcGpmMvs.end(), "an IBC GPM CU without its vectors" );
+    rec[IBC_REC_MV]          = mvs->second.first.hor;
+    rec[IBC_REC_MV + 1]      = mvs->second.first.ver;
+    rec[IBC_REC_MV2]         = mvs->second.second.hor;
+    rec[IBC_REC_MV2 + 1]     = mvs->second.second.ver;
+    rec[IBC_REC_WEIGHTS]     = (int32_t) m.timdData.size() + IBC_REC;
+#if JVET_AJ0107_GPM_SHAPE_ADAPT
+    const int splitDir = g_ibcGpmSplitDir[pu.ibcGpmSplitDir];
+#else
+    const int splitDir = pu.ibcGpmSplitDir;
+#endif
+    const int      scaleX = getComponentScaleX( compID, cu.chromaFormat ), scaleY = getComponentScaleY( compID, cu.chromaFormat );
+    const int      angle = g_geoParams[splitDir][0];
+    const int      wIdx = floorLog2( pu.lwidth() ) - GEO_MIN_CU_LOG2, hIdx = floorLog2( pu.lheight() ) - GEO_MIN_CU_LOG2;
+    const int16_t* off   = g_weightOffset[splitDir][hIdx][wIdx];
+    const int16_t* mask  = g_geoWeights[pu.ibcGpmBldIdx][g_angle2mask[angle]];
+    int            stepX = 1 << scaleX, stepY;
+    const int16_t* weight;
+    if( g_angle2mirror[angle] == 2 )
+    {
+      stepY  = -(int) ( ( GEO_WEIGHT_MASK_SIZE << scaleY ) + pu.lwidth() );
+      weight = &mask[( GEO_WEIGHT_MASK_SIZE - 1 - off[1] ) * GEO_WEIGHT_MASK_SIZE + off[0]];
+    }
+    else if( g_angle2mirror[angle] == 1 )
+    {
+      stepX  = -1 << scaleX;
+      stepY  = ( GEO_WEIGHT_MASK_SIZE << scaleY ) + pu.lwidth();
+      weight = &mask[off[1] * GEO_WEIGHT_MASK_SIZE + ( GEO_WEIGHT_MASK_SIZE - 1 - off[0] )];
+    }
+    else
+    {
+      stepY  = ( GEO_WEIGHT_MASK_SIZE << scaleY ) - pu.lwidth();
+      weight = &mask[off[1] * GEO_WEIGHT_MASK_SIZE + off[0]];
+    }
+    m.timdData.insert( m.timdData.end(), rec, rec + IBC_REC );
+    for( int y = 0; y < (int) area.height; y++ )
+    {
+      for( int x = 0; x < (int) area.width; x++ )
+      {
+        m.timdData.push_back( *weight );
+        weight += stepX;
+      }
+      weight += stepY;
+    }
+    return;
+  }
+#endif
+  m.timdData.insert( m.timdData.end(), rec, rec + IBC_REC );
+}
+
+// ----- palette CUs (partial verification): their samples from the syntax - the palette, the indices, the escape
+// values (DecCu::xReconPLT) -, written by the GPU as an inter block's prediction without residual
+
+// why palette CU cu is taken from the CPU, nullptr where the GPU writes it
+static const char* pltWhy( const GpuIntraRec::Impl& m, const CodingUnit& cu )
+{
+  if( cu.colorTransform )
+  {
+    return "palette CU with ACT";
+  }
+  if( cu.chromaFormat != CHROMA_420 && cu.chromaFormat != CHROMA_400 )
+  {
+    return "palette CU of another chroma format";
+  }
+  return nullptr;
+}
+
+// palette CU cu's sample (x, y) of component compID (xReconPLT, the CU's single TU): the palette entry its index gives,
+// or its escape value dequantized; in a single tree the chroma of the luma indices at even positions
+static int pltSample( const CodingUnit& cu, const ComponentID compID, int x, int y )
+{
+  const SPS&            sps       = *cu.cs->sps;
+  const TransformUnit&  tu        = *cu.firstTU;
+#if INTRA_RM_SMALL_BLOCK_SIZE_CONSTRAINTS   // (xReconIntraQT's choice)
+  const bool            separate  = CS::isDualITree( *cu.cs );
+#else
+  const bool            separate  = cu.isSepTree();
+#endif
+  const ComponentID     compBegin = separate && isChroma( compID ) ? COMPONENT_Cb : COMPONENT_Y;
+  const int             scaleX    = compBegin == COMPONENT_Y && isChroma( compID ) ? getComponentScaleX( COMPONENT_Cb, sps.getChromaFormatIdc() ) : 0;
+  const int             scaleY    = compBegin == COMPONENT_Y && isChroma( compID ) ? getComponentScaleY( COMPONENT_Cb, sps.getChromaFormatIdc() ) : 0;
+  const CPelBuf         idx       = const_cast<TransformUnit&>( tu ).getcurPLTIdx( compBegin );
+  const uint32_t        curIdx    = idx.at( x << scaleX, y << scaleY );
+  if( curIdx == cu.curPLTSize[compBegin] )   // an escape value
+  {
+    const PLTescapeBuf esc = const_cast<TransformUnit&>( tu ).getescapeValue( compID );
+    const QpParam      cQP( tu, compID );
+    const int          qp = cQP.Qp( true ), qpRem = qp % 6, qpPer = qp / 6;
+    const int          add = 1 << ( IQUANT_SHIFT - 1 );
+    const TCoeff value = ( ( ( esc.at( x, y ) * g_invQuantScales[0][qpRem] ) << qpPer ) + add ) >> IQUANT_SHIFT;
+    return ClipBD<TCoeff>( value, sps.getBitDepth( toChannelType( compID ) ) );
+  }
+  return cu.curPLT[compID][curIdx];
+}
+
+// palette CU cu's block of compID, recorded by recordInterBlock (the last record): its samples instead of a prediction,
+// no residual, clipped to the bit depth alone (xReconPLT writes its values, which lie in it, as they are)
+static void pltRecord( GpuIntraRec::Impl& m, const CodingUnit& cu, const ComponentID compID )
+{
+  Tu&             t    = m.rec.back();
+  const CompArea& area = cu.blocks[compID];
+  CHECK( t.x != area.x || t.y != area.y || t.w != (int) area.width || t.h != (int) area.height,
+         "a palette CU of several TUs" );
+  t.cbf    = 0;
+  t.lmcs   = 0;
+  t.recMin = 0;
+  t.recMax = ( 1 << t.bitDepth ) - 1;
+  const size_t n   = size_t( area.width ) * area.height;
+  const CPelBuf reco = cu.cs->getRecoBuf( area );
+  for( int y = 0; y < (int) area.height; y++ )
+  {
+    for( int x = 0; x < (int) area.width; x++ )
+    {
+      const int v = pltSample( cu, compID, x, y );
+      m.interPred[t.dbgOffset + y * area.width + x] = (int16_t) v;
+      if( !m.on )   // (verification: xReconPLT's own result, the residual none)
+      {
+        CHECK( v != reco.at( x, y ), "a palette sample other than xReconPLT's" );
+        m.cpuPred[m.cpuPred.size() - n + y * area.width + x] = (Pel) v;
+        m.cpuResi[m.cpuResi.size() - n + y * area.width + x] = 0;
+      }
+    }
+  }
+}
+
 // why non-intra CU cu is taken from the CPU, nullptr for an inter CU whose blocks the GPU reconstructs: what the GPU
 // lacks of its residual (inter CCCM and CCP merge, which replace its chroma prediction; ASBT; LFNST / NSPT where
 // their mode's DIMD is not of one block's prediction)
@@ -6637,13 +6859,13 @@ static const char* interWhy( const GpuIntraRec::Impl& m, const CodingUnit& cu )
   {
     return "inter / IBC / palette CU";
   }
-  if( CU::isIBC( cu ) )
+  if( CU::isIBC( cu ) && ibcWhy( m, cu ) )
   {
-    return "IBC CU";
+    return ibcWhy( m, cu );
   }
   if( CU::isPLT( cu ) )
   {
-    return "palette CU";
+    return pltWhy( m, cu );
   }
   if( getenv( "ECM_GPU_NO_INTER" ) )   // (all inter CUs from the CPU)
   {
@@ -6977,6 +7199,8 @@ void GpuIntraRec::recordInterCu( const CodingUnit& cu )
     m.mcCus.insert( &cu );
   }
   const int numComp = cu.chromaFormat == CHROMA_400 ? 1 : MAX_NUM_COMPONENT;
+  // (an IBC merge CU's motion and flags, which its merge candidate gives, are known only now)
+  const char* const ibcLate = CU::isIBC( cu ) ? ibcWhy( m, cu ) : nullptr;
   for( const TransformUnit& tu: CU::traverseTUs( cu ) )
   {
     for( int c = 0; c < numComp; c++ )
@@ -6986,22 +7210,43 @@ void GpuIntraRec::recordInterCu( const CodingUnit& cu )
       {
         continue;
       }
-      const char* why = nullptr;
+      const char* why = ibcLate;
       if( m.cpuCus.count( &cu ) )   // (a block after one the GPU lacks something for: its CU is the CPU's)
       {
         cpuFillBlock( m, comp, tu.blocks[comp] );
       }
-      else if( !recordInterBlock( m, tu, comp, why ) )
+      else if( why || !recordInterBlock( m, tu, comp, why ) )
       {
         cpuFillCu( m, cu, why );
         cpuFillBlock( m, comp, tu.blocks[comp] );
+      }
+      else if( CU::isIBC( cu ) )
+      {
+        ibcRecord( m, cu, comp );
+      }
+      else if( CU::isPLT( cu ) )
+      {
+        pltRecord( m, cu, comp );
       }
     }
   }
   if( !m.cpuCus.count( &cu ) )
   {
-    ( m.mcCus.count( &cu ) ? m.mcKinds : m.interKinds )[interKind( cu )]++;
+    if( CU::isIBC( cu ) || CU::isPLT( cu ) )
+    {
+      ( CU::isIBC( cu ) ? m.ibcCus : m.pltCus )++;
+    }
+    else
+    {
+      ( m.mcCus.count( &cu ) ? m.mcKinds : m.interKinds )[interKind( cu )]++;
+    }
+    m.ibcGpmCus += CU::isIBC( cu ) && cu.firstPU->ibcGpmFlag ? 1 : 0;
   }
+}
+
+void GpuIntraRec::ibcGpmVectors( const CodingUnit& cu, const Mv& mv0, const Mv& mv1 )
+{
+  m_impl->ibcGpmMvs[&cu] = std::make_pair( mv0, mv1 );
 }
 
 void GpuIntraRec::endPicture( const CodingStructure& cs )
@@ -7890,7 +8135,8 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
         rec = &m.timdData[P.bvOut + size_t( cu->idx ) * BV_OUT];
       }
 #endif
-      if( m.cpuCus.count( cu ) )
+      // (from the host also a non-intra CU's of the GPU, which no node derives: an IBC CU's, inter GPM's IBC part)
+      if( m.cpuCus.count( cu ) || !CU::isIntra( *cu ) )
       {
         Mv bvs[BV_MAX];
         rec[0] = cpuBlockVectors( *cu, bvs );

@@ -1085,6 +1085,12 @@ void DecCu::decompressCtu( CodingStructure& cs, const UnitArea& ctuArea )
         }
 #endif 
         xReconIntraQT( currCU );
+#if ECM_VULKAN
+        if( m_gpuIntraRec && CU::isPLT( currCU ) )   // (partial verification: a palette CU's blocks)
+        {
+          m_gpuIntraRec->recordInterCu( currCU );
+        }
+#endif
 #if JVET_AM0138_ENHANCED_TMP_MERGE_LIST_TIMD_BV
         if (!currCU.timdMrg && !currCU.lfnstIdx)
         {
@@ -2979,6 +2985,14 @@ void DecCu::xReconInter(CodingUnit &cu)
   else if (cu.firstPU->ibcGpmFlag)
   {
     m_pcInterPred->motionCompensationIbcGpm(cu, m_ibcMrgCtx, m_pcIntraPred);
+#if ECM_VULKAN
+    if( m_gpuIntraRec && cu.firstPU->ibcGpmMergeIdx0 < IBC_GPM_MAX_NUM_UNI_CANDS
+        && cu.firstPU->ibcGpmMergeIdx1 < IBC_GPM_MAX_NUM_UNI_CANDS )   // (partial verification: two IBC parts)
+    {
+      m_gpuIntraRec->ibcGpmVectors( cu, m_ibcMrgCtx.mvFieldNeighbours[cu.firstPU->ibcGpmMergeIdx0 << 1].mv,
+                                    m_ibcMrgCtx.mvFieldNeighbours[cu.firstPU->ibcGpmMergeIdx1 << 1].mv );
+    }
+#endif
   }
 #endif
   else

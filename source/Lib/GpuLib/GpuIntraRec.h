@@ -117,6 +117,8 @@ public:
   void prepareInterSignPred( TransformUnit& tu, const ComponentID compID );
   /// inter CU cu, which the CPU has reconstructed: the records of its blocks (interCu's CUs)
   void recordInterCu( const CodingUnit& cu );
+  /// IBC GPM CU cu, which the CPU has predicted: its parts' final vectors (recordInterCu's)
+  void ibcGpmVectors( const CodingUnit& cu, const Mv& mv0, const Mv& mv1 );
   /// reconstructs the recorded picture on the GPU; on: into the picture's reconstruction buffer, off: compared with
   /// the CPU's reconstruction
   void endPicture( const CodingStructure& cs );

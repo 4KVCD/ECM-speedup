@@ -2,7 +2,7 @@
 #ifndef INTRA_COMMON_GLSL
 #define INTRA_COMMON_GLSL
 
-// one transform block of one component (105 int32, layout shared with GpuIntraRec.cpp)
+// one transform block of one component (106 int32, layout shared with GpuIntraRec.cpp)
 struct Tu
 {
   int comp, x, y, w, h;
@@ -80,6 +80,8 @@ struct Tu
   int pdp;
   // a block of NN intra prediction (intra_nn.glsl): its record in Params::timdData (PNN_REC_*; -1: none)
   int pnn;
+  // an IBC CU's block (DERIVE_IBC): its record in Params::timdData (IBC_REC_*; read with DERIVE_IBC only)
+  int ibc;
 };
 layout( buffer_reference, std430, buffer_reference_align = 4 ) buffer BufTu { Tu v[]; };
 
@@ -261,6 +263,12 @@ const int DERIVE_INTER = 268435456;
 // with DERIVE_TRANSFORM, an inter block whose LFNST / NSPT take the second mode of the DIMD of its prediction
 // (lfnstIntra, JVET-AI0050)
 const int DERIVE_INTER_SECOND = 536870912;
+const int DERIVE_IBC   = 1073741824;   // with DERIVE_INTER: an IBC CU's block, predicted at its block vector (ibcBlock)
+// an IBC CU's block's record in Params::timdData (Tu::ibc; GpuIntraRec.cpp's IBC_REC_*): the CU's region in the
+// component's samples, its block vector in 1/16 luma samples, its RR-IBC flip, IBC GPM's second vector and the first
+// part's weights (their offset, else -1), with IBC LIC its ibcLicIdx + 1 (else 0)
+const int IBC_REC_X = 0, IBC_REC_Y = 1, IBC_REC_W = 2, IBC_REC_H = 3, IBC_REC_MV = 4, IBC_REC_FLIP = 6;
+const int IBC_REC_MV2 = 7, IBC_REC_WEIGHTS = 9, IBC_REC_LIC = 10;
 // Tu::lmcs (1: the bilateral filter on inverse-mapped samples, 2: chroma residual scaling): an inter block's
 // prediction forward-mapped (luma)
 const int LMCS_INTER_FWD = 4;
