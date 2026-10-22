@@ -173,6 +173,8 @@ constexpr int DERIVE_BVG          = 67108864; // with DERIVE_DIMD a BVG-DIMD CU'
                                               // fusion (intra_bvg.glsl), the blend modes without PDP, the longest taps
 constexpr int DERIVE_SGPM         = 134217728; // an SGPM CU's luma block: its node's two modes blended by the
                                                // partition's weights, its transforms' modes from a DIMD of that
+constexpr int DERIVE_INTER        = 268435456; // an inter CU's block: its prediction given (Params::interPred),
+                                               // its residual the GPU's (recordInterBlock)
 
 // Tu::lm (intra_common.glsl's LM_*): whether the block is a CCLM block (the modes from 67 on are also those of TIMD /
 // TMRL luma blocks), its slope adjustments (+ 8, in 4 bits each) and LBCCP's inside filter; with DERIVE_CCLM_DIMD the
@@ -932,6 +934,7 @@ static_assert( SP_TEMPLATES == 2 + SIGN_PRED_MAX_NUM, "signPred layout" );
 // Tu::lmcs
 constexpr int LMCS_BF_INVERSE  = 1;   // the intra bilateral filter works on inverse-mapped samples
 constexpr int LMCS_CHROMA_SCALE = 2;   // the chroma residual is scaled by the CU's neighbouring luma
+constexpr int LMCS_INTER_FWD    = 4;   // an inter block's prediction is forward-mapped (luma)
 
 // Tu::quant
 constexpr int QUANT_DEP = 1;   // dependent quantization: the coefficients are quantization indices (DepQuant)
@@ -1248,6 +1251,7 @@ struct Params
   uint64_t ccpData;
   uint64_t mpmOut;
   uint64_t eipOut;
+  uint64_t interPred;
   int32_t  origin[3];
   int32_t  stride[3];
   int32_t  width[3];
@@ -1275,7 +1279,7 @@ struct Params
   int32_t  cccmDecim;              // DECIM_BITS of the luma bit depth (intra_cccm.glsl's cccmDecim)
   int32_t  ccpDerivedGl;           // decoder-derived CCP fusion's GL-CCCM mode above this many chroma samples
 };
-static_assert( offsetof( Params, origin ) == 320 && offsetof( Params, edgeCap ) == 400 && sizeof( Params ) == 488,
+static_assert( offsetof( Params, origin ) == 328 && offsetof( Params, edgeCap ) == 408 && sizeof( Params ) == 496,
                "Params layout" );
 
 struct Push
@@ -1987,6 +1991,7 @@ struct GpuIntraRec::Impl
   const Shared*               sh  = nullptr;
   std::unique_ptr<gpu::Stream> stream;
   gpu::Buffer                 params, tus, coeffs, planes[3], owner[3], sched, dbgPred, dbgResi, lmcs, signPredBuf;
+  gpu::Buffer                 interPredBuf;
   gpu::Buffer                 cuBuf, dbgParams;   // the CU records and their modes; the derived parameters (verification)
   gpu::Buffer                 scratch;            // intra_rec's: DIMD / OBIC blending's sums, then CCCM's data
   Reshape*                    reshape = nullptr;   // the decoder's reshaper (LMCS state of the picture being decoded)
@@ -2107,6 +2112,11 @@ struct GpuIntraRec::Impl
   };
   std::vector<CpuCcp>                                          cpuCcp;
   std::unordered_map<const TransformUnit*, int32_t>            ccpTuIndex;
+  // partial verification: the inter CUs the GPU reconstructs (from interCu to recordInterCu), the kinds of the
+  // prediction of those (interKind, totals) and the CPU's prediction of their blocks (Params::interPred, per sample)
+  std::unordered_set<const CodingUnit*>                        interPending;
+  std::map<std::string, int>                                   interKinds;
+  std::vector<int16_t>                                         interPred;
   // partial verification: the temporal CCP merge candidates (JVET-AE0043) of inter slices, the collocated picture's
   // models (the CPU's, as its decoding kept them: m_ccpModelLUT) as records of their own, per picture and model index
   std::deque<CCPModelCandidate>                                ccpTemporalModels;
@@ -2181,6 +2191,21 @@ GpuIntraRec::~GpuIntraRec()
         }
         std::sort( byCount.rbegin(), byCount.rend() );
         printf( "[gpu-intra] CUs taken from the CPU:" );
+        for( const auto& r: byCount )
+        {
+          printf( " %s %d;", r.second.c_str(), r.first );
+        }
+        printf( "\n" );
+      }
+      if( !m.interKinds.empty() )   // (the inter CUs whose prediction is the CPU's, by its kind)
+      {
+        std::vector<std::pair<int, std::string>> byCount;
+        for( const auto& r: m.interKinds )
+        {
+          byCount.emplace_back( r.second, r.first );
+        }
+        std::sort( byCount.rbegin(), byCount.rend() );
+        printf( "[gpu-intra] inter CUs predicted by the CPU:" );
         for( const auto& r: byCount )
         {
           printf( " %s %d;", r.second.c_str(), r.first );
@@ -2340,6 +2365,8 @@ void GpuIntraRec::beginPicture( const CodingStructure& cs )
   m.mergeTmpCus.clear();
   m.cpuCcp.clear();
   m.ccpTuIndex.clear();
+  m.interPending.clear();
+  m.interPred.clear();
   m.ccpTemporalModels.clear();
   m.ccpTemporal.clear();
   m.ccpInterCccm.clear();
@@ -6483,6 +6510,298 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
   m.rec.push_back( t );
 }
 
+// ----- inter CUs (partial verification): their blocks on the GPU from the CPU's prediction, the residual the GPU's
+
+// the kind of inter CU cu's prediction, for the report of what the port of inter prediction has left: the first of
+// multi-hypothesis, GPM, affine, CIIP, sub-block motion, LIC, non-local LIC, OBMC, bi- and uni-prediction
+static const char* interKind( const CodingUnit& cu )
+{
+  const PredictionUnit& pu = *cu.firstPU;
+#if MULTI_HYP_PRED
+  if( !pu.addHypData.empty() )
+  {
+    return "multi-hypothesis";
+  }
+#endif
+  if( cu.geoFlag )
+  {
+    return "GPM";
+  }
+  if( cu.affine )
+  {
+    return "affine";
+  }
+  if( pu.ciipFlag )
+  {
+    return "CIIP";
+  }
+  if( pu.mergeType != MRG_TYPE_DEFAULT_N )
+  {
+    return "sub-block motion";
+  }
+#if INTER_LIC
+  if( cu.licFlag )
+  {
+    return "LIC";
+  }
+#endif
+#if JVET_AG0276_NLIC
+  if( cu.altLMFlag )
+  {
+    return "non-local LIC";
+  }
+#endif
+#if ENABLE_OBMC
+  if( cu.obmcFlag )
+  {
+    return "OBMC";
+  }
+#endif
+  return pu.interDir == 3 ? "bi-prediction" : "uni-prediction";
+}
+
+// why non-intra CU cu is taken from the CPU, nullptr for an inter CU whose blocks the GPU reconstructs: what the GPU
+// lacks of its residual (inter LFNST / NSPT, whose mode is a DIMD of the prediction; inter CCCM and CCP merge, which
+// replace its chroma prediction; ASBT; sign prediction, whose templates read the prediction's border)
+static const char* interWhy( const GpuIntraRec::Impl& m, const CodingUnit& cu )
+{
+  if( !m.partial )
+  {
+    return "inter / IBC / palette CU";
+  }
+  if( CU::isIBC( cu ) )
+  {
+    return "IBC CU";
+  }
+  if( CU::isPLT( cu ) )
+  {
+    return "palette CU";
+  }
+  if( getenv( "ECM_GPU_NO_INTER" ) )   // (all inter CUs from the CPU)
+  {
+    return "inter CU";
+  }
+  if( cu.colorTransform )
+  {
+    return "inter CU with ACT";
+  }
+#if JVET_AG0061_INTER_LFNST_NSPT
+  if( cu.lfnstIdx )
+  {
+    return "inter LFNST / NSPT";
+  }
+#endif
+#if JVET_AH0066_JVET_AH0202_CCP_MERGE_LUMACBF0
+  if( cu.interCcpMergeZeroRootCbfIdc )
+  {
+    return "inter CCP merge";
+  }
+#endif
+  for( const TransformUnit& tu: CU::traverseTUs( cu ) )
+  {
+#if JVET_AE0059_INTER_CCCM
+    if( tu.interCccm )
+    {
+      return "inter CCCM";
+    }
+#endif
+#if JVET_AF0073_INTER_CCP_MERGE
+    if( tu.interCcpMerge )
+    {
+      return "inter CCP merge";
+    }
+#endif
+    for( int c = 0; c < MAX_NUM_COMPONENT; c++ )
+    {
+#if JVET_AL0181_ASBT
+      if( tu.asbtDecimW[c] || tu.asbtDecimH[c] )
+      {
+        return "ASBT";
+      }
+#endif
+      const ComponentID comp = ComponentID( c );
+      if( tu.blocks[comp].valid() && cu.rootCbf && ( TU::getCbf( tu, comp ) || ( isChroma( comp ) && tu.jointCbCr ) )
+          && TU::getUseSignPred( tu, comp ) )
+      {
+        return "inter sign prediction";
+      }
+    }
+  }
+  return nullptr;
+}
+
+void GpuIntraRec::interCu( const CodingUnit& cu )
+{
+  Impl&             m   = *m_impl;
+  const char* const why = interWhy( m, cu );
+  if( why )
+  {
+    cpuCu( cu, why );
+    return;
+  }
+  m.interPending.insert( &cu );
+}
+
+// the record of block compID of TU tu of an inter CU (recordInterCu): the CPU's prediction (Params::interPred at the
+// block's samples; luma forward-mapped by LMCS on the GPU where DecCu::xDecodeInterTU maps it) and the GPU's residual
+// as an intra block's (joint CbCr, transforms, dequantization, levels), reconstructed as xDecodeInterTU does: clipped to
+// the slice's range (luma's adaptive, mapped with LMCS), the chroma residual scaled by the CU's neighbouring luma (also
+// where the CTU has no LMCS). False with why set where the GPU lacks something
+static bool recordInterBlock( GpuIntraRec::Impl& m, const TransformUnit& tu, const ComponentID compID, const char*& why )
+{
+  const CodingUnit&      cu    = *tu.cu;
+  const PredictionUnit&  pu    = *cu.firstPU;
+  const CodingStructure& cs    = *tu.cs;
+  const SPS&             sps   = *cs.sps;
+  const Slice&           slice = *cs.slice;
+  const CompArea&        area  = tu.blocks[compID];
+  if( m.cpuDummyCu < 0 )
+  {
+    m.cpuDummyCu = knownCuRecord( m, CompArea(), -1 );
+  }
+  Tu t{};
+  t.comp      = compID;
+  t.x         = area.x;
+  t.y         = area.y;
+  t.w         = area.width;
+  t.h         = area.height;
+  t.regX      = area.x;
+  t.regW      = area.width;
+  t.mipMatrix = -1;
+  t.ispPrev = t.spCoded = t.spOffset = t.resiFrom = t.cflm = t.ccp = t.ccpMerge = t.pdp = t.pnn = -1;
+  t.derive    = DERIVE_INTER;
+  t.cu        = m.cpuDummyCu;
+  const PreCalcValues& pcv     = *cs.pcv;
+  const bool           noShift = pcv.noChroma2x2 && area.width == 4;
+  t.unitW    = pcv.minCUWidth >> ( noShift ? 0 : getComponentScaleX( compID, sps.getChromaFormatIdc() ) );
+  t.unitH    = pcv.minCUHeight >> ( noShift ? 0 : getComponentScaleY( compID, sps.getChromaFormatIdc() ) );
+  t.bitDepth = sps.getBitDepth( toChannelType( compID ) );
+  // joint CbCr (TrQuant::invTransformICT at the Cb block): the coded component's levels give both residuals, the Cr
+  // block right after the Cb one takes its own
+  ComponentID resiComp = compID;
+  if( tu.jointCbCr && compID == COMPONENT_Cb )
+  {
+    t.jccr   = TU::getICTMode( tu );
+    resiComp = ( tu.jointCbCr >> 1 ) ? COMPONENT_Cb : COMPONENT_Cr;
+  }
+  else if( tu.jointCbCr && compID == COMPONENT_Cr )
+  {
+    const Tu* cb = m.rec.empty() ? nullptr : &m.rec.back();
+    if( !cb || cb->comp != COMPONENT_Cb || cb->x != area.x || cb->y != area.y || cb->jccr == 0
+        || cb->jccrOffset != (int32_t) m.numSamples )
+    {
+      why = "joint CbCr: a Cr block not right after its Cb block";
+      return false;
+    }
+    t.jccr = JCCR_DERIVED;
+  }
+  // (a CU without residual has none in any block: xDecodeInterTexture's rootCbf)
+  const QpParam resiQp( tu, resiComp );
+  t.cbf           = cu.rootCbf && t.jccr != JCCR_DERIVED && TU::getCbf( tu, resiComp ) ? 1 : 0;
+  t.transformSkip = tu.mtsIdx[resiComp] == MTS_SKIP ? 1 : 0;
+  Secondary sec;
+  if( !transformFields( m, tu, resiComp, area, t, sec, why ) || !dequantFields( tu, resiComp, resiQp, area, t, why ) )
+  {
+    return false;
+  }
+  // xDecodeInterTU's clipping: luma the slice's adaptive range (mapped with LMCS), chroma the slice's
+  const bool lmcsPic = sps.getUseLmcs() && cs.picHeader->getLmcsEnabledFlag();
+  if( compID == COMPONENT_Y )
+  {
+    t.recMin = lmcsPic ? m.reshape->getFwdLUT()[slice.getLumaPelMin()] : slice.getLumaPelMin();
+    t.recMax = lmcsPic ? m.reshape->getFwdLUT()[slice.getLumaPelMax()] : slice.getLumaPelMax();
+  }
+  else
+  {
+    t.recMin = slice.clpRng( compID ).min;
+    t.recMax = slice.clpRng( compID ).max;
+  }
+  // LMCS: the luma prediction forward-mapped (a CU without CIIP, intra GPM or IBC, where the CTU has LMCS); the chroma
+  // residual scaled by the luma next to the CU (xDecodeInterTexture's calculateChromaAdjVpduNei, LMCS_CHROMA_CALC_CU)
+  t.lmcs = 0;
+  const bool fwd = lmcsPic && compID == COMPONENT_Y && m.reshape->getCTUFlag() && !pu.ciipFlag && !pu.gpmIntraFlag
+                   && !CU::isIBC( cu );
+  if( sps.getUseLmcs() )
+  {
+    t.lmcs |= fwd ? LMCS_INTER_FWD : 0;
+    if( slice.getLmcsEnabledFlag() && isChroma( compID ) && cu.rootCbf && ( TU::getCbf( tu, compID ) || tu.jointCbCr )
+        && cs.picHeader->getLmcsChromaResidualScaleFlag() && area.width * area.height > 4 )
+    {
+      t.lmcs |= LMCS_CHROMA_SCALE;
+      const Area         areaY = cu.Y();
+      const CodingUnit * cuLeft, *cuAbove;
+      Reshape::getChromaAdjNeighbours( tu, areaY.pos(), cuLeft, cuAbove );
+      t.crsX     = areaY.x;
+      t.crsY     = areaY.y;
+      t.crsW     = areaY.width;
+      t.crsH     = areaY.height;
+      t.crsAvail = ( cuLeft ? 1 : 0 ) | ( cuAbove ? 2 : 0 );
+    }
+    m.lmcsUsed |= t.lmcs != 0;
+  }
+  if( !coefficientFields( m, tu, resiComp, area, t, nullptr, why ) )
+  {
+    return false;
+  }
+  // the CPU's prediction (its buffer keeps the unmapped luma: xDecodeInterTU maps a copy) and, for the comparison, the
+  // prediction and the residual the CPU reconstructs with
+  const CPelBuf pred    = cs.getPredBuf( area );
+  const CPelBuf resi    = cs.getResiBuf( area );
+  const bool    hasResi = cu.rootCbf && ( TU::getCbf( tu, compID ) || tu.jointCbCr );
+  m.interPred.resize( m.numSamples, 0 );
+  for( int y = 0; y < (int) area.height; y++ )
+  {
+    for( int x = 0; x < (int) area.width; x++ )
+    {
+      const Pel p = pred.at( x, y );
+      m.interPred[t.dbgOffset + y * area.width + x] = p;
+      if( !m.on )
+      {
+        m.cpuPred.push_back( fwd ? m.reshape->getFwdLUT()[p] : p );
+        m.cpuResi.push_back( hasResi ? resi.at( x, y ) : 0 );
+      }
+    }
+  }
+  m.cuTus[&cu].push_back( (int32_t) m.rec.size() );
+  m.rec.push_back( t );
+  return true;
+}
+
+void GpuIntraRec::recordInterCu( const CodingUnit& cu )
+{
+  Impl& m = *m_impl;
+  if( !m.interPending.erase( &cu ) || !m.unsupportedWhy.empty() )
+  {
+    return;
+  }
+  const int numComp = cu.chromaFormat == CHROMA_400 ? 1 : MAX_NUM_COMPONENT;
+  for( const TransformUnit& tu: CU::traverseTUs( cu ) )
+  {
+    for( int c = 0; c < numComp; c++ )
+    {
+      const ComponentID comp = ComponentID( c );
+      if( !tu.blocks[comp].valid() )
+      {
+        continue;
+      }
+      const char* why = nullptr;
+      if( m.cpuCus.count( &cu ) )   // (a block after one the GPU lacks something for: its CU is the CPU's)
+      {
+        cpuFillBlock( m, comp, tu.blocks[comp] );
+      }
+      else if( !recordInterBlock( m, tu, comp, why ) )
+      {
+        cpuFillCu( m, cu, why );
+        cpuFillBlock( m, comp, tu.blocks[comp] );
+      }
+    }
+  }
+  if( !m.cpuCus.count( &cu ) )
+  {
+    m.interKinds[interKind( cu )]++;
+  }
+}
+
 void GpuIntraRec::endPicture( const CodingStructure& cs )
 {
   Impl& m = *m_impl;
@@ -6826,6 +7145,41 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
       memset( t.readMax, 0, sizeof( t.readMax ) );
       memset( t.bfAvail, 0, sizeof( t.bfAvail ) );
       t.ispSide = 0;
+      // what the residual reads: with joint CbCr and sign prediction the decision in the other block of the pair, before
+      // or after this one; with LMCS chroma residual scaling the luma column left of and the row above the CU, clipped
+      auto residualDeps = [&]()
+      {
+        if( t.resiFrom >= 0 && mark[t.resiFrom] != i )
+        {
+          mark[t.resiFrom] = i;
+          deps[i].push_back( t.resiFrom );
+        }
+        if( t.lmcs & LMCS_CHROMA_SCALE )   // the luma column left of and the row above the CU, clipped to the picture
+        {
+          auto addLuma = [&]( int sx, int sy )
+          {
+            const int o = ownerMap[COMPONENT_Y][size_t( sy >> P.unitLog2Y[0] ) * P.ownerW[0] + ( sx >> P.unitLog2X[0] )];
+            if( o >= 0 && o < i && mark[o] != i )
+            {
+              mark[o] = i;
+              deps[i].push_back( o );
+            }
+          };
+          if( t.crsAvail & 1 )
+          {
+            for( int k = 0; k < t.crsH; k++ ) addLuma( t.crsX - 1, std::min( t.crsY + k, P.height[0] - 1 ) );
+          }
+          if( t.crsAvail & 2 )
+          {
+            for( int k = 0; k < t.crsW; k++ ) addLuma( std::min( t.crsX + k, P.width[0] - 1 ), t.crsY - 1 );
+          }
+        }
+      };
+      if( t.derive & DERIVE_INTER )   // an inter CU's block: its prediction given, nothing more
+      {
+        residualDeps();
+        continue;
+      }
       // the area the references are filled for: the block with arms of 8x its size, for ISP the CU with arms of twice
       // its size; the prediction's arm lengths (m_topRefLength / m_leftRefLength): 8x the block, for ISP the CU's
       // size plus the prediction region's
@@ -7152,33 +7506,7 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
           addOwner( t.x + k, t.y - 2 );
         }
       }
-      // joint CbCr with sign prediction: the residual comes from the decision in the other block of the pair, before
-      // or after this one
-      if( t.resiFrom >= 0 && mark[t.resiFrom] != i )
-      {
-        mark[t.resiFrom] = i;
-        deps[i].push_back( t.resiFrom );
-      }
-      if( t.lmcs & LMCS_CHROMA_SCALE )   // the luma column left of and the row above the CU, clipped to the picture
-      {
-        auto addLuma = [&]( int sx, int sy )
-        {
-          const int o = ownerMap[COMPONENT_Y][size_t( sy >> P.unitLog2Y[0] ) * P.ownerW[0] + ( sx >> P.unitLog2X[0] )];
-          if( o >= 0 && o < i && mark[o] != i )
-          {
-            mark[o] = i;
-            deps[i].push_back( o );
-          }
-        };
-        if( t.crsAvail & 1 )
-        {
-          for( int k = 0; k < t.crsH; k++ ) addLuma( t.crsX - 1, std::min( t.crsY + k, P.height[0] - 1 ) );
-        }
-        if( t.crsAvail & 2 )
-        {
-          for( int k = 0; k < t.crsW; k++ ) addLuma( std::min( t.crsX + k, P.width[0] - 1 ), t.crsY - 1 );
-        }
-      }
+      residualDeps();
     }
   }
   double         ms      = 0;
@@ -7202,6 +7530,11 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
   m.signPredBuf.ensure( ctx, std::max<size_t>( spBytes, 4 ), gpu::Buffer::DEVICE );
   m.dbgPred.ensure( ctx, dbgBytes, gpu::Buffer::DEVICE );
   m.dbgResi.ensure( ctx, dbgBytes, gpu::Buffer::DEVICE );
+  // (the inter blocks' prediction, at their samples: partial verification's, the CPU's)
+  m.interPred.resize( m.interPred.empty() ? 0 : ( m.numSamples + 1 ) & ~size_t( 1 ), 0 );
+  const size_t interBytes = m.interPred.size() * 2;
+  m.interPredBuf.ensure( ctx, std::max<size_t>( interBytes, 4 ), gpu::Buffer::DEVICE );
+  P.interPred = m.interPredBuf.addr;
   P.tus      = m.tus.addr;
   P.coeffs   = m.coeffs.addr;
   P.signPred   = m.signPredBuf.addr;
@@ -7594,7 +7927,7 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
     }
     const size_t upCcp   = sizeof( Params ) + tuBytes + coefBytes + lmcsBytes + spBytes + cuBytes + planesUp;
     const size_t ccpUp   = m.partial ? ccpBytes : 0;
-    const size_t upBytes = upCcp + ccpUp;
+    const size_t upInter = upCcp + ccpUp, upBytes = upInter + interBytes;
     const size_t upSign  = sizeof( Params ) + tuBytes + coefBytes + lmcsBytes;   // where the signPred data goes
     const size_t upCu    = upSign + spBytes;                                      // the CU records and modes
     m.upload.ensure( ctx, upBytes, gpu::Buffer::UPLOAD );
@@ -7604,6 +7937,7 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
     memcpy( (char*) m.upload.mapped + sizeof( Params ) + tuBytes + coefBytes, lmcsTable.data(), lmcsBytes );
     memcpy( (char*) m.upload.mapped + upSign, m.signPred.data(), spBytes );
     memcpy( (char*) m.upload.mapped + upCu, cuData.data(), cuBytes );
+    memcpy( (char*) m.upload.mapped + upInter, m.interPred.data(), interBytes );
     // partial verification: the planes start as the CPU's reconstruction (the CUs taken from it, the inter, IBC and
     // palette CUs) but 0 in the GPU's blocks, so that a block the GPU leaves unwritten shows
     for( int c = 0; c < numComp && m.partial; c++ )
@@ -7681,6 +8015,10 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
     if( ccpUp )
     {
       s.copy( m.upload, upCcp, m.cuBuf, ccpOffset, ccpUp );
+    }
+    if( interBytes )
+    {
+      s.copy( m.upload, upInter, m.interPredBuf, 0, interBytes );
     }
     for( int c = 0; c < numComp; c++ )
     {

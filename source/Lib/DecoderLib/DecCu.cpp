@@ -290,9 +290,9 @@ void DecCu::decompressCtu( CodingStructure& cs, const UnitArea& ctuArea )
 #endif
 
 #if ECM_VULKAN
-      if( m_gpuIntraRec && currCU.predMode != MODE_INTRA )
+      if( m_gpuIntraRec && currCU.predMode != MODE_INTRA )   // (from the GPU's reconstruction, else the CPU's)
       {
-        m_gpuIntraRec->cpuCu( currCU, "inter / IBC / palette CU" );
+        m_gpuIntraRec->interCu( currCU );
       }
 #endif
       if (currCU.predMode != MODE_INTRA && currCU.predMode != MODE_PLT && currCU.Y().valid())
@@ -527,9 +527,10 @@ void DecCu::decompressCtu( CodingStructure& cs, const UnitArea& ctuArea )
         CU::saveProCcpInfo(currCU);
 #endif
 #if ECM_VULKAN
-        if( m_gpuIntraRec )   // (... and those saveProCcpInfo gives the TUs without one, candidates only)
+        if( m_gpuIntraRec )   // (... and those saveProCcpInfo gives the TUs without one, candidates only; its blocks)
         {
           m_gpuIntraRec->cpuCuModels( currCU, false );
+          m_gpuIntraRec->recordInterCu( currCU );
         }
 #endif
         break;

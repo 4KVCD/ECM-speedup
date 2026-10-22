@@ -1467,6 +1467,27 @@ void releaseDependents( int d0, int d1, int lid, int NT )
   }
 }
 
+// LMCS chroma residual scaling (Reshape::calculateChromaAdjVpduNei with LMCS_CHROMA_CALC_CU): the rounded
+// mean of the luma column left of and the row above the CU (rows / columns beyond the picture replaced by the last
+// one), clipped, selects the scale; without neighbours the mid-level value does (g_crs, g_crsScale; all
+// invocations)
+void crsSetup( Tu t, int lid, int NT )
+{
+  g_crs      = ( t.lmcs & 2 ) != 0;
+  g_crsScale = 0;
+  if( g_crs )
+  {
+    const bool hasLeft = ( t.crsAvail & 1 ) != 0, hasAbove = ( t.crsAvail & 2 ) != 0;
+    int sum = 0;
+    for( int k = lid; hasLeft && k < t.crsH; k += NT ) sum += recoAt( 0, t.crsX - 1, min( t.crsY + k, P.height[0] - 1 ) );
+    for( int k = lid; hasAbove && k < t.crsW; k += NT ) sum += recoAt( 0, min( t.crsX + k, P.width[0] - 1 ), t.crsY - 1 );
+    const int total  = wgSum2( sum, 0, 0 ).x;
+    const int pelnum = ( hasLeft ? t.crsH : 0 ) + ( hasAbove ? t.crsW : 0 );
+    const int lumaValue = pelnum > 0 ? clip3i( P.lumaClipMin, P.lumaClipMax, ( total + ( pelnum >> 1 ) ) / pelnum ) : P.lmcsLutSize >> 1;
+    g_crsScale = BufI32( P.lmcs ).v[2 * P.lmcsLutSize + lumaValue];
+  }
+}
+
 void main()
 {
   const int lid = int( gl_LocalInvocationID.x );
@@ -1749,6 +1770,21 @@ void main()
       releaseDependents( d0, d1, lid, NT );
       continue;
     }
+    // ----- an inter CU's block (partial verification: its prediction the CPU's, Params::interPred at the block's
+    // samples): the prediction - luma forward-mapped by LMCS where DecCu::xDecodeInterTU maps it (LMCS_INTER_FWD) -
+    // reconstructed with intra_resi's residual, the chroma residual scaled as an intra block's
+    if( ( t.derive & DERIVE_INTER ) != 0 )
+    {
+      crsSetup( t, lid, NT );
+      BufI16 ip = BufI16( P.interPred );
+      for( int i = lid; i < t.w * t.h; i += NT )
+      {
+        const int p = int( ip.v[t.dbgOffset + i] );
+        storeRecon( t, i % t.w, i / t.w, ( t.lmcs & LMCS_INTER_FWD ) != 0 ? fwdLut( p ) : p );
+      }
+      releaseDependents( d0, d1, lid, NT );
+      continue;
+    }
     // ----- a block of a CU whose mode its node derived: the parameters for the mode
     if( ( t.derive & DERIVE_MODE ) != 0 )
     {
@@ -1925,22 +1961,8 @@ void main()
     const int predStride = topLen + 1 + mrl, predSize = topLen, predHSize = leftLen;
     const bool fusion = t.fusion != 0;
 
-    // ----- LMCS chroma residual scaling (Reshape::calculateChromaAdjVpduNei with LMCS_CHROMA_CALC_CU): the rounded
-    // mean of the luma column left of and the row above the CU (rows / columns beyond the picture replaced by the last
-    // one), clipped, selects the scale; without neighbours the mid-level value does
-    g_crs      = ( t.lmcs & 2 ) != 0;
-    g_crsScale = 0;
-    if( g_crs )
-    {
-      const bool hasLeft = ( t.crsAvail & 1 ) != 0, hasAbove = ( t.crsAvail & 2 ) != 0;
-      int sum = 0;
-      for( int k = lid; hasLeft && k < t.crsH; k += NT ) sum += recoAt( 0, t.crsX - 1, min( t.crsY + k, P.height[0] - 1 ) );
-      for( int k = lid; hasAbove && k < t.crsW; k += NT ) sum += recoAt( 0, min( t.crsX + k, P.width[0] - 1 ), t.crsY - 1 );
-      const int total  = wgSum2( sum, 0, 0 ).x;
-      const int pelnum = ( hasLeft ? t.crsH : 0 ) + ( hasAbove ? t.crsW : 0 );
-      const int lumaValue = pelnum > 0 ? clip3i( P.lumaClipMin, P.lumaClipMax, ( total + ( pelnum >> 1 ) ) / pelnum ) : P.lmcsLutSize >> 1;
-      g_crsScale = BufI32( P.lmcs ).v[2 * P.lmcsLutSize + lumaValue];
-    }
+    // ----- LMCS chroma residual scaling (crsSetup)
+    crsSetup( t, lid, NT );
 
     // ----- LM chroma fusion (geneChromaFusionPred): of its first type, and of CCP merge fusion with CCCM, the CCCM
     // prediction it blends in (storeRegion), into the scratch before the references and the prediction take s_tmp and

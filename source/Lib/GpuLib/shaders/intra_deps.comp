@@ -360,6 +360,22 @@ void bilateralFilterDeps( inout Tu t, int comp, int availComp, int fx, int fy, i
   }
 }
 
+// LMCS chroma residual scaling's reads (Tu::lmcs 2): the luma column left of and the row above the CU, clipped
+void crsDeps( Tu t )
+{
+  if( ( t.lmcs & 2 ) != 0 )
+  {
+    if( ( t.crsAvail & 1 ) != 0 )
+    {
+      for( int k = 0; k < t.crsH; k++ ) addDep( ownerLumaAt( t.crsX - 1, min( t.crsY + k, P.height[0] - 1 ) ) );
+    }
+    if( ( t.crsAvail & 2 ) != 0 )
+    {
+      for( int k = 0; k < t.crsW; k++ ) addDep( ownerLumaAt( min( t.crsX + k, P.width[0] - 1 ), t.crsY - 1 ) );
+    }
+  }
+}
+
 // GpuIntraRec::endPicture's dependency loop for block g_i (passes 1 and 2); pass 1 writes the availability, read
 // ranges and ISP side flag into the block record, which refSource reads (from the local copy) and pass 2 reloads
 void dependencies( int comp )
@@ -502,6 +518,12 @@ void dependencies( int comp )
     {
       chromaTmrlDeps( c );
     }
+    return;
+  }
+  if( ( t.derive & DERIVE_INTER ) != 0 )   // an inter CU's block: its prediction given, it reads what its residual needs
+  {
+    addEdge( t.resiFrom );
+    crsDeps( t );
     return;
   }
   const int availComp = t.comp == 0 ? 0 : 1;
@@ -689,17 +711,7 @@ void dependencies( int comp )
     BufTu( P.tus ).v[g_i].bfAvail = t.bfAvail;
     BufTu( P.tus ).v[g_i].ispSide = t.ispSide;
   }
-  if( ( t.lmcs & 2 ) != 0 )   // LMCS chroma residual scaling: the luma column left of and the row above the CU, clipped
-  {
-    if( ( t.crsAvail & 1 ) != 0 )
-    {
-      for( int k = 0; k < t.crsH; k++ ) addDep( ownerLumaAt( t.crsX - 1, min( t.crsY + k, P.height[0] - 1 ) ) );
-    }
-    if( ( t.crsAvail & 2 ) != 0 )
-    {
-      for( int k = 0; k < t.crsW; k++ ) addDep( ownerLumaAt( min( t.crsX + k, P.width[0] - 1 ), t.crsY - 1 ) );
-    }
-  }
+  crsDeps( t );
 }
 
 void main()

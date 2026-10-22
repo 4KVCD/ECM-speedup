@@ -449,7 +449,7 @@ wall-clock gains with threads are "the easy baseline". Decoder status: single-th
 (`--GpuLoopFilter=1`: ALF, SAO, BIF, CCSAO, LF-CCCM, offset refinement on Vulkan). The user then asked for **a full
 GPU decoder in Vulkan, optimized until nothing is left** ("The GPU decoder needs to fully decode the frame on the
 GPU"; "Your first Vulkan version is going to be slow. That's OK"). That work is branch `dec-gpurecon`: intra
-reconstruction on the GPU (`--GpuRecon`), tool levels M1-M88 done and verified bit-exact (M19: DIMD, M20: OBIC, M21:
+reconstruction on the GPU (`--GpuRecon`), tool levels M1-M89 done and verified bit-exact (M19: DIMD, M20: OBIC, M21:
 intra merge, M22: the transforms of DIMD CUs, M23: LFNST of MIP, M24: TIMD, M25: OBIC and intra merge with TIMD
 neighbours, M26: TIMD-SAD, M27: OBIC and intra merge with TIMD-SAD neighbours, M28: TIMD merge, M29: TMRL of luma,
 M30: chroma TMRL, M31: CCLM, M32: LFNST / NSPT of CCLM, M33: GLM's gradient patterns, M34: CCCM, M35: GL-CCCM, M36:
@@ -2135,6 +2135,22 @@ EIP ones from the CPU had both identical; ai_foreman352_q37 and ra_foreman_q32 i
 Integration of M85-M88 on M84 (2026-10-22, builds gpu23 / gpu24): all 50 streams identical. MTSS of regression SGPM
 (rejected while merging M87, which predates M76's regression SGPM) verified on the 18 streams with such CUs (23) and
 taken: identical.
+M89 (2026-10-22): inter CUs on the GPU from the CPU's prediction (partial verification; the first step of the inter
+port, the residual side): DecCu calls interCu before an inter / IBC / palette CU (a CU the GPU lacks something for is
+taken from the CPU as before, with a finer reason: IBC CU, palette CU, inter LFNST / NSPT, inter CCCM, inter CCP
+merge, ASBT, inter sign prediction) and recordInterCu after the CPU reconstructed it: per TU and component a
+DERIVE_INTER block whose prediction is the CPU's (Params::interPred at the block's samples; intra_rec forward-maps luma
+by LMCS where DecCu::xDecodeInterTU maps it, LMCS_INTER_FWD) and whose residual is the GPU's as an intra block's
+(intra_resi; record()'s transform, dequantization and level parts became shared helpers, 4766bd917), reconstructed with
+xDecodeInterTU's clipping (luma adaptive, mapped with LMCS), the chroma residual scaled by the CU's neighbouring luma
+(crsSetup; also where the CTU has no LMCS), rootCbf 0 as no residual in any block. Such a block reads only what its
+residual needs (intra_deps' and the host's crsDeps / residualDeps: joint CbCr, chroma residual scaling). The report
+counts the inter CUs whose prediction the CPU made by kind (interKind: the first of multi-hypothesis, GPM, affine, CIIP,
+sub-block motion, LIC, non-local LIC, OBMC flag, bi- / uni-prediction) - what the motion compensation port has to do.
+Results (50 streams, build gpu26): every verified picture identical; inter CUs reconstructed from the CPU's prediction
+10912 (OBMC flag 5836, affine 2359, GPM 1423, LIC 557, uni-prediction 481, bi-prediction 119, non-local LIC 113, CIIP
+14, multi-hypothesis 10); still taken from the CPU: inter sign prediction 3157, IBC CU 2472, inter LFNST / NSPT 1255,
+inter CCP merge 128, palette CU 123, ASBT 101, inter CCCM 16.
 
 
 ## 8. Numbers (i7-10700 8C/16T, Win11, GCC 16.2, RTX 3070 driver 616.92)

@@ -27,6 +27,7 @@ env = dict(os.environ, ECM_GPU_PARTIAL='1', __GL_SHADER_DISK_CACHE_PATH=cache,
            __GL_SHADER_DISK_CACHE_SIZE='8000000000', __GL_SHADER_DISK_CACHE_SKIP_CLEANUP='1',
            ECM_GPU_PIPELINE_CACHE=pipes)
 total = Counter()
+interTotal = Counter()   # the inter CUs reconstructed from the CPU's prediction, by its kind
 
 
 def run(name):
@@ -46,6 +47,13 @@ def run(name):
             if part:
                 k, n = part.rsplit(' ', 1)
                 reasons[k] += int(n)
+    m = re.search(r'inter CUs predicted by the CPU:(.*)', out)
+    if m:
+        for part in m.group(1).split(';'):
+            part = part.strip()
+            if part:
+                k, n = part.rsplit(' ', 1)
+                interTotal[k] += int(n)
     failure = re.search(r'\[exit code [^\n]*', out)
     return name, s.groups() if s else None, first, reasons, failure.group(0) if failure else ''
 
@@ -73,3 +81,5 @@ with ThreadPoolExecutor(jobs) as ex:
 for name in lost:
     report(*run(name))
 print('CUs from the CPU, all streams:', '; '.join(f'{k} {n}' for k, n in total.most_common()))
+if interTotal:
+    print('inter CUs predicted by the CPU, all streams:', '; '.join(f'{k} {n}' for k, n in interTotal.most_common()))

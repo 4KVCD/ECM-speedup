@@ -110,6 +110,11 @@ public:
   /// (called before CU::saveProCcpInfo, whose models of the TUs without one are candidates only: again without)
   /// (an intra CU: where it was taken from the CPU at its luma in a single tree, its chroma's record, now decoded)
   void cpuCuModels( const CodingUnit& cu, bool history = true );
+  /// non-intra CU cu, before the CPU decodes it: with partial verification an inter CU the GPU reconstructs from the
+  /// CPU's prediction (recordInterCu records its blocks), else one taken from the CPU (cpuCu: the reason)
+  void interCu( const CodingUnit& cu );
+  /// inter CU cu, which the CPU has reconstructed: the records of its blocks (interCu's CUs)
+  void recordInterCu( const CodingUnit& cu );
   /// reconstructs the recorded picture on the GPU; on: into the picture's reconstruction buffer, off: compared with
   /// the CPU's reconstruction
   void endPicture( const CodingStructure& cs );

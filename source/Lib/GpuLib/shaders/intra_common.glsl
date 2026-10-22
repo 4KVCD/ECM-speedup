@@ -255,6 +255,12 @@ const int DERIVE_BVG = 67108864;
 // an SGPM CU's luma block (intra_sgpm.glsl): the predictions of its node's two modes blended by the weights of the
 // partition its node chose; its transforms by a DIMD of that blend (with the partition's angle and the two modes)
 const int DERIVE_SGPM = 134217728;
+// an inter CU's block: its prediction given (Params::interPred; partial verification's, the CPU's), its
+// residual the GPU's, reconstructed as DecCu::xDecodeInterTU does
+const int DERIVE_INTER = 268435456;
+// Tu::lmcs (1: the bilateral filter on inverse-mapped samples, 2: chroma residual scaling): an inter block's
+// prediction forward-mapped (luma)
+const int LMCS_INTER_FWD = 4;
 
 // a CU's block vectors as the lists of later CUs take them (Params::bvOut per luma CU, by its index in the
 // CodingStructure: getNeighBv's vectors of the CU in its order, which getArBvMergeCandidate cascades), written by the
@@ -873,6 +879,7 @@ struct Params
                         // CUs' sources (Tu::ccpMerge; intra_ccp.glsl)
   uint64_t mpmOut;      // int32 per MPM record (MPM_OUT): its MDIP, written by its node (for the comparison)
   uint64_t eipOut;      // int32 per EIP CU (EIP_OUT): its model, written by its node (a CU from the CPU's uploaded)
+  uint64_t interPred;   // int16 at the samples of the inter CUs' blocks (DERIVE_INTER): their prediction
   int      origin[3];
   int      stride[3];
   int      width[3];
