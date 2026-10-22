@@ -874,7 +874,7 @@ void tmpFusionWeights( int cost[TMP_FUSION_NUM], int n, out int w[TMP_FUSION_NUM
 
 // CccmCovariance::solve1 of M (<= 6) parameters from the products' sums over `samples` samples (ata's upper triangle,
 // atb): the offset taken out of the cross-correlations, both scaled to 28 bits less the samples' and the bit depth's
-// (GLM_MATRIX: bit depths up to 10), gaussElimination with the regularization 2 << (bitDepth - 8) and xDivide's
+// (cccmMatrixBits: 32 above 10 bits), gaussElimination with the regularization 2 << (bitDepth - 8) and xDivide's
 // division, the back substitution, the offset added to the bias; without samples clearModel's (a bias of 1)
 int64_t[6] tmpSolve1( int64_t ata[6][6], int64_t atb[6], int M, int samples, int offset, int bitDepth )
 {
@@ -883,7 +883,7 @@ int64_t[6] tmpSolve1( int64_t ata[6][6], int64_t atb[6], int M, int samples, int
   {
     for( int i = 0; i < 6; i++ )
     {
-      p[i] = i == M - 1 ? int64_t( 1 ) << CCCM_DECIM : int64_t( 0 );
+      p[i] = i == M - 1 ? int64_t( 1 ) << cccmDecim() : int64_t( 0 );
     }
   }
   else
@@ -892,7 +892,7 @@ int64_t[6] tmpSolve1( int64_t ata[6][6], int64_t atb[6], int M, int samples, int
     {
       atb[i] -= ( ata[i][M - 1] * int64_t( offset ) ) >> ( bitDepth - 1 );
     }
-    const int shift = GLM_MATRIX - 2 * bitDepth - cccmCeilLog2( samples );
+    const int shift = cccmMatrixBits( GLM_MATRIX ) - 2 * bitDepth - cccmCeilLog2( samples );
     int64_t   cm[6][7];
     for( int i = 0; i < M; i++ )
     {
@@ -917,7 +917,7 @@ int64_t[6] tmpSolve1( int64_t ata[6][6], int64_t atb[6], int M, int samples, int
         const int64_t f = cm[r][i];
         for( int k = i + 1; k <= M; k++ )
         {
-          cm[r][k] -= ( f * cm[i][k] + int64_t( 1 << ( CCCM_DECIM - 1 ) ) ) >> CCCM_DECIM;
+          cm[r][k] -= ( f * cm[i][k] + int64_t( 1 << ( cccmDecim() - 1 ) ) ) >> cccmDecim();
         }
       }
     }
@@ -926,11 +926,11 @@ int64_t[6] tmpSolve1( int64_t ata[6][6], int64_t atb[6], int M, int samples, int
       int64_t v = cm[i][M];
       for( int j = i + 1; j < M; j++ )
       {
-        v -= ( cm[i][j] * p[j] + int64_t( 1 << ( CCCM_DECIM - 1 ) ) ) >> CCCM_DECIM;
+        v -= ( cm[i][j] * p[j] + int64_t( 1 << ( cccmDecim() - 1 ) ) ) >> cccmDecim();
       }
       p[i] = v;
     }
-    p[M - 1] += int64_t( offset ) << ( CCCM_DECIM - ( bitDepth - 1 ) );
+    p[M - 1] += int64_t( offset ) << ( cccmDecim() - ( bitDepth - 1 ) );
   }
   return p;
 }
@@ -1198,7 +1198,7 @@ int tmpFusionSample( Cu c, int at, int x, int y, int bitDepth )
       sum += pj * int64_t( j < num ? tmpFusionInput( c, at, first, j, x, y, tempType, lic, maxPel )
                                    : 1 << ( bitDepth - 1 ) );
     }
-    return clamp( int( int16_t( ( sum + int64_t( 1 << ( CCCM_DECIM - 1 ) ) ) >> CCCM_DECIM ) ), 0, maxPel );
+    return clamp( int( int16_t( ( sum + int64_t( 1 << ( cccmDecim() - 1 ) ) ) >> cccmDecim() ) ), 0, maxPel );
   }
   const int topFirst = o.v[at + DIMD_OUT_TMP_FUS], leftFirst = o.v[at + DIMD_OUT_TMP_FUS + 1];
   if( topFirst < 0 && leftFirst < 0 )

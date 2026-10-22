@@ -282,7 +282,7 @@ int sgpmRegression( Cu c, int pa, int pb, int bitDepth, out ivec4 model )
   {
     int scale, round, shift;
     cccmDivScale( e[piv][piv] < int64_t( 1 ) ? int64_t( 1 ) : e[piv][piv], scale, round, shift );
-    scale <<= decim - CCCM_DECIM;
+    scale <<= decim - cccmDecim();   // (cccmDivScale scales to cccmDecim already: 0)
     for( int j = piv + 1; j < 4; j++ )
     {
       e[piv][j] = ( e[piv][j] * int64_t( scale ) + int64_t( round ) ) >> shift;
