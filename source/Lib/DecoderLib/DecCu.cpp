@@ -1098,6 +1098,12 @@ void DecCu::decompressCtu( CodingStructure& cs, const UnitArea& ctuArea )
 #if JVET_AD0188_CCP_MERGE
         CU::saveModelsInHCCP(currCU);
 #endif
+#if ECM_VULKAN
+        if( m_gpuIntraRec )   // (partial verification: the chroma record of a single-tree CU from the CPU)
+        {
+          m_gpuIntraRec->cpuCuModels( currCU );
+        }
+#endif
 #if JVET_AG0058_EIP
 #if JVET_AM0138_ENHANCED_TMP_MERGE_LIST_TIMD_BV
         if (chType == CHANNEL_TYPE_LUMA)

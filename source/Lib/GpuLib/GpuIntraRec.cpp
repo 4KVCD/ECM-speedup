@@ -43,6 +43,7 @@
 #include <map>
 #include <mutex>
 #include <unordered_map>
+#include <unordered_set>
 
 #include "CommonLib/CodingStructure.h"
 #include "CommonLib/BilateralFilter.h"
@@ -1920,6 +1921,7 @@ struct GpuIntraRec::Impl
   // both components' blocks write it), the PU of each record (verification compares its curCand after the picture)
   int                                                  numCcp = 0;
   std::unordered_map<const PredictionUnit*, int32_t>  ccpIndex;
+  std::unordered_set<const CodingUnit*>                cpuChromaPending;   // CPU CUs whose chroma waits (cpuFillCu)
   std::vector<const PredictionUnit*>                   ccpPu;
   std::vector<const PredictionUnit*>                   untypedCcpPu;   // the chroma PUs without a record
   // CCP merge (Params::ccpData, assembled at endPicture): per record its blocks (CCP_WRITERS), the records
@@ -2175,6 +2177,7 @@ void GpuIntraRec::beginPicture( const CodingStructure& cs )
   m.cccmScratchWords = 0;
   m.numCcp = 0;
   m.ccpIndex.clear();
+  m.cpuChromaPending.clear();
   m.ccpPu.clear();
   m.untypedCcpPu.clear();
   m.ccpWriters.clear();
@@ -2407,11 +2410,15 @@ static void cpuFillBlock( GpuIntraRec::Impl& m, const ComponentID comp, const Co
 static int32_t eipIndexOf( GpuIntraRec::Impl& m, const CodingUnit& cu );
 #endif
 
+static void cpuKnownRecord( GpuIntraRec::Impl& m, const CodingUnit& cu, int ch );
+
 // partial verification: CU cu from the CPU (why: the first reason). Its samples come with the picture (endPicture);
 // its node and blocks recorded before become nodes of a record that derives nothing, the blocks owning their areas
 // (DERIVE_CPU_FILL); an intra CU keeps a record of its mode as the CPU decoded it (CU_KNOWN) for the CUs reading it,
-// an EIP CU also its model (its EipOut uploaded)
-static void cpuFillCu( GpuIntraRec::Impl& m, const CodingUnit& cu, const char* why )
+// an EIP CU also its model (its EipOut uploaded). chromaLater: taken at a luma block of a single-tree CU, whose chroma
+// the CPU has not decoded yet (its mode, DIMD chroma's, and its CCP model, curCand, are unset): the chroma record waits
+// for the CU's end (cpuCuModels)
+static void cpuFillCu( GpuIntraRec::Impl& m, const CodingUnit& cu, const char* why, bool chromaLater = false )
 {
   if( !m.cpuCus.emplace( &cu, 0 ).second )
   {
@@ -2444,50 +2451,62 @@ static void cpuFillCu( GpuIntraRec::Impl& m, const CodingUnit& cu, const char* w
     m.eipFromCpu[eipIndexOf( m, cu )] = 1;
   }
 #endif
-  for( int ch = 0; ch < 2; ch++ )
+  cpuKnownRecord( m, cu, 0 );
+  if( chromaLater )
   {
-    const ComponentID first = ch == 0 ? COMPONENT_Y : COMPONENT_Cb;
-    if( !cu.blocks[first].valid() || ( ch == 1 && cu.chromaFormat == CHROMA_400 ) )
-    {
-      continue;
-    }
-    const PredictionUnit& pu   = *cu.firstPU;
-    const int32_t         mode = ch == 0 ? neighbourLumaMode( pu ) : (int32_t) PU::getFinalIntraMode( pu, CHANNEL_TYPE_CHROMA );
-#if JVET_AD0188_CCP_MERGE
-    // its CCP model, the CPU's, for the merge CUs (getCCPModelCandidateList: any typed curCand of an intra PU) and,
-    // where it is an LM CU, the CTU row's history (CU::saveModelsInHCCP) that read it
-    if( ch == 1 && pu.curCand.type != CCP_TYPE_NONE )
-    {
-      bool          newRecord = false;
-      const int32_t r         = ccpRecord( m, pu, &newRecord );
-      m.cpuCcp.push_back( { r, &pu.curCand, pu.idxNonLocalCCP != 0 } );
-      if( newRecord && PU::isLMCMode( mode ) )
-      {
-        cpuCcpHistory( m, cu, r );
-      }
-    }
-#endif
-    const auto            rec  = m.cuIndex[ch].find( &cu );
-    if( rec == m.cuIndex[ch].end() )
-    {
-      m.cuIndex[ch][&cu] = knownCuRecord( m, cu.blocks[first], mode );
-      continue;
-    }
-    Cu& c = m.cus[rec->second];
-#if JVET_AB0155_SGPM
-    if( c.sgpm >= 0 )   // (what the MPM lists read of it, its record of that: the CPU's too)
-    {
-      const int32_t view = m.timdData[c.sgpm + SGPM_HEAD_VIEW];
-      m.cus[view].kind   = CU_KNOWN;
-      m.cus[view].node   = -1;
-      m.cuMode[view]     = sgpmMpmMode( cu );
-    }
-#endif
-    c.kind = CU_KNOWN;
-    c.node = c.dimd = c.obic = c.merge = c.mtss = c.timd = c.tmrl = c.mpm = c.eip = c.bvList = c.tmp = c.sgpm = -1;
-    m.cuMode[rec->second] = mode;   // (and a TIMD record's CPU fields stay: an SGPM CU's TIMD pass compares none)
-    m.cuMipDimd[rec->second] = 0;   // (no block of it derives a DIMD of its prediction any more: none is verified)
+    m.cpuChromaPending.insert( &cu );
   }
+  else
+  {
+    cpuKnownRecord( m, cu, 1 );
+  }
+}
+
+// the record of CU cu from the CPU of channel type ch (cpuFillCu): its mode as the CPU decoded it (CU_KNOWN; a record
+// made before turned into one), for chroma its CCP model and the CTU row's history
+static void cpuKnownRecord( GpuIntraRec::Impl& m, const CodingUnit& cu, int ch )
+{
+  const ComponentID first = ch == 0 ? COMPONENT_Y : COMPONENT_Cb;
+  if( !cu.blocks[first].valid() || ( ch == 1 && cu.chromaFormat == CHROMA_400 ) )
+  {
+    return;
+  }
+  const PredictionUnit& pu = *cu.firstPU;
+  const int32_t mode = ch == 0 ? neighbourLumaMode( pu ) : (int32_t) PU::getFinalIntraMode( pu, CHANNEL_TYPE_CHROMA );
+#if JVET_AD0188_CCP_MERGE
+  // its CCP model, the CPU's, for the merge CUs (getCCPModelCandidateList: any typed curCand of an intra PU) and,
+  // where it is an LM CU, the CTU row's history (CU::saveModelsInHCCP) that read it
+  if( ch == 1 && pu.curCand.type != CCP_TYPE_NONE )
+  {
+    bool          newRecord = false;
+    const int32_t r         = ccpRecord( m, pu, &newRecord );
+    m.cpuCcp.push_back( { r, &pu.curCand, pu.idxNonLocalCCP != 0 } );
+    if( newRecord && PU::isLMCMode( mode ) )
+    {
+      cpuCcpHistory( m, cu, r );
+    }
+  }
+#endif
+  const auto rec = m.cuIndex[ch].find( &cu );
+  if( rec == m.cuIndex[ch].end() )
+  {
+    m.cuIndex[ch][&cu] = knownCuRecord( m, cu.blocks[first], mode );
+    return;
+  }
+  Cu& c = m.cus[rec->second];
+#if JVET_AB0155_SGPM
+  if( c.sgpm >= 0 )   // (what the MPM lists read of it, its record of that: the CPU's too)
+  {
+    const int32_t view = m.timdData[c.sgpm + SGPM_HEAD_VIEW];
+    m.cus[view].kind   = CU_KNOWN;
+    m.cus[view].node   = -1;
+    m.cuMode[view]     = sgpmMpmMode( cu );
+  }
+#endif
+  c.kind = CU_KNOWN;
+  c.node = c.dimd = c.obic = c.merge = c.mtss = c.timd = c.tmrl = c.mpm = c.eip = c.bvList = c.tmp = c.sgpm = -1;
+  m.cuMode[rec->second] = mode;   // (and a TIMD record's CPU fields stay: an SGPM CU's TIMD pass compares none)
+  m.cuMipDimd[rec->second] = 0;   // (no block of it derives a DIMD of its prediction any more: none is verified)
 }
 
 // partial verification: the CTU row's history of CCP models takes record r (CU::saveModelsInHCCP at CU cu, reset at
@@ -2509,12 +2528,22 @@ static void cpuCcpHistory( GpuIntraRec::Impl& m, const CodingUnit& cu, int32_t r
 
 void GpuIntraRec::cpuCuModels( const CodingUnit& cu )
 {
-#if JVET_AD0188_CCP_MERGE && JVET_AF0073_INTER_CCP_MERGE
   Impl& m = *m_impl;
-  if( !m.partial || cu.chromaFormat == CHROMA_400 || !cu.blocks[COMPONENT_Cb].valid() || CU::isIntra( cu ) )
+  if( !m.partial || cu.chromaFormat == CHROMA_400 || !cu.blocks[COMPONENT_Cb].valid() )
   {
     return;
   }
+  // an intra CU from the CPU taken at its luma in a single tree: its chroma record now that the CPU decoded its chroma
+  // (CU::saveModelsInHCCP has just pushed its model into the CTU row's history)
+  if( CU::isIntra( cu ) )
+  {
+    if( m.cpuChromaPending.erase( &cu ) )
+    {
+      cpuKnownRecord( m, cu, 1 );
+    }
+    return;
+  }
+#if JVET_AD0188_CCP_MERGE && JVET_AF0073_INTER_CCP_MERGE
   for( const TransformUnit& tu: CU::traverseTUs( cu ) )
   {
     if( tu.curCand.type != CCP_TYPE_NONE )
@@ -4931,7 +4960,9 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
   {
     if( m.partial )
     {
-      cpuFillCu( m, cu, reason );
+      cpuFillCu( m, cu, reason,
+                 isLuma( compID ) && !CS::isDualITree( *cu.cs ) && cu.chromaFormat != CHROMA_400
+                   && cu.blocks[COMPONENT_Cb].valid() );
       cpuFillBlock( m, compID, tu.blocks[compID] );
     }
     else
@@ -5538,8 +5569,9 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
                | ( mergeCu ? DERIVE_MERGE : 0 ) | ( timdCu ? DERIVE_TIMD : 0 ) | ( timdMergeCu ? DERIVE_TIMD_MERGE : 0 )
                | ( tmrlCu ? DERIVE_TMRL : 0 ) | ( sgpmCu ? DERIVE_SGPM : 0 );
     // a CCP merge block of fusion with DIMD chroma (its CU's node a DIMD chroma one): intra_rec's blending of the merge
-    // prediction and the mode's, each weighed 1, the average rounded
-    const bool ccpDimd = ccpFusionDimd( pu );
+    // prediction and the mode's, each weighed 1, the average rounded (chroma only: a single-tree CU's luma block shares
+    // the PU)
+    const bool ccpDimd = !isLuma( compID ) && ccpFusionDimd( pu );
     t.derive |= ccpDimd ? DERIVE_CCP_DIMD : 0;
     m.blendBlocks = m.blendBlocks || dimdCu || bvgCu || obicCu || mergeCu || timdCu || ccpDimd || sgpmCu;
 #if GPU_TIMD

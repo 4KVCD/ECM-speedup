@@ -107,6 +107,7 @@ public:
   void cpuCu( const CodingUnit& cu, const char* why );
   /// partial verification: the CCP models of non-intra CU cu, which the CPU has reconstructed (JVET-AF0073: each TU's
   /// a candidate of the merge CUs next to it and of the CTU row's history)
+  /// (an intra CU: where it was taken from the CPU at its luma in a single tree, its chroma's record, now decoded)
   void cpuCuModels( const CodingUnit& cu );
   /// reconstructs the recorded picture on the GPU; on: into the picture's reconstruction buffer, off: compared with
   /// the CPU's reconstruction

@@ -1999,6 +1999,19 @@ Limits: the 4x4 kernel's uint32_t result can wrap (a lane's sum past 2^16 below 
 sum, the CPU's 64-bit, so two such blocks in one arm would differ (needs differences averaging above ~2^10 in a 4x4
 block's DC lane). Chroma TMRL above 10 bits stays rejected (its co-located luma SATD takes the 16x8 / 8x16 AVX2
 kernels: not ported; 99 CUs on t12).
+Single tree (2026-10-22, agent st; SPS DualITree=0, where a CU's PU holds luma and chroma): the two single-tree streams
+differed since M66 (section 9's a2), from two host bugs. (1) A CCP merge PU of fusion with DIMD chroma
+(ccpFusionDimd) set DERIVE_CCP_DIMD on its luma block too: intra_rec blended the luma prediction with "the DIMD chroma
+mode" (ra_nodualtree_q32's luma MPM block at 32,24, then DIMD chroma's second mode from its luma; in
+ai_nodualtree_q27 the 3 such CUs' luma, then NN's indicesRepresentationPnn from that reconstruction). Now chroma
+blocks only. (2) Partial verification: a single-tree CU taken from the CPU at its luma block (cpuFillCu) made its
+chroma record at once, before the CPU decoded its chroma - curCand still untyped, so no CCP record, no history entry
+(and DIMD chroma's mode unset): the merge CUs after it lacked that candidate (ai_nodualtree_q27's CCP merge block at
+0,56: the CPU's list 128, 1, 16, ..., the GPU's without the CCLM model of a CPU CU). Now cpuFillCu defers the chroma
+record (cpuChromaPending, cpuKnownRecord) to the CU's end: DecCu's intra case calls cpuCuModels after
+CU::saveModelsInHCCP, which makes it then. Results (Intel PC, build agst5, non-inlined SPIR-V): ai_nodualtree_q27,
+ra_nodualtree_q32 identical (were MISMATCH); ai_scc2_q32, ai_foreman352_q37, ra_foreman_q32 as before (same CPU CU
+reasons). Host only.
 
 
 ## 8. Numbers (i7-10700 8C/16T, Win11, GCC 16.2, RTX 3070 driver 616.92)
@@ -2023,7 +2036,7 @@ Profile of a GPU-on decode (non-LTO, m2_park16, share of all samples): parsing ~
 0. Now (2026-10-15, the intra phase; the user's order: all intra first, then inter), by the CPU CUs they free:
    a. Done (2026-10-16): M67, committed on dec-gpurecon from the WIP commit's diff (the branch
       dec-gpurecon-m67-wip keeps the WIP commit as it was pushed).
-   a2. Open (found 2026-10-16 on the Intel PC's corpus; older than M67, identical at M66): the two single-tree intra
+   a2. Done (2026-10-22, section 7's "Single tree"; found 2026-10-16): the two single-tree intra
       streams (`--DualITree=0`; CTC's intra slices are dual tree) differ in partial verification - ai_nodualtree_q27
       (a CCP merge chroma block inherits the wrong model type, CCLM instead of CCCM, first seen as NN's
       indicesRepresentationPnn) and ra_nodualtree_q32 (a luma MPM block's prediction, then DIMD chroma's second
