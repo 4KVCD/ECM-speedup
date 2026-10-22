@@ -10,6 +10,11 @@ foreach( V GLSLANG SPIRV_OPT SHADER OUT VAR INCLUDE )
   endif()
 endforeach()
 string( REPLACE "," ";" DEFINES "${DEFINES}" )
+# INLINE 0: no --inline-entry-points-exhaustive (the driver gets the functions; an experiment on its compile memory)
+set( INLINE_PASS --inline-entry-points-exhaustive )
+if( DEFINED INLINE AND NOT INLINE )
+  set( INLINE_PASS )
+endif()
 set( RAW "${OUT}.raw.spv" )
 set( OPT "${OUT}.spv" )
 execute_process( COMMAND "${GLSLANG}" -V --target-env vulkan1.3 ${DEFINES} "-I${INCLUDE}" --depfile "${OUT}.raw.d"
@@ -20,7 +25,7 @@ if( RC )
 endif()
 # glslang -O's passes (glslang's SpvTools.cpp, SpvToolsTransform without optimizeSize), then --compact-ids
 execute_process( COMMAND "${SPIRV_OPT}" --target-env=vulkan1.3 --max-id-bound=67108863
-                         --wrap-opkill --eliminate-dead-branches --merge-return --inline-entry-points-exhaustive
+                         --wrap-opkill --eliminate-dead-branches --merge-return ${INLINE_PASS}
                          --eliminate-dead-functions --scalar-replacement --convert-local-access-chains
                          --eliminate-local-single-block --eliminate-local-single-store --simplify-instructions
                          --eliminate-dead-code-aggressive --vector-dce --eliminate-dead-inserts

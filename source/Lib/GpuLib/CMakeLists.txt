@@ -23,6 +23,7 @@ file( GLOB SHADER_INCLUDES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/shader
 # (intra_rec 1.96M against 3.72M of the 4.19M a module may have: -Os inlines every call site). With ECM_SPIRV_OPT (the
 # Vulkan SDK's spirv-opt) glslang compiles without its optimizer and spirv-opt runs the same passes with a raised ID
 # limit and compacts the IDs (spv_build.cmake): no ID budget any more (intra_rec 0.28M IDs), ~5x faster
+option( ECM_SPIRV_INLINE "with ECM_SPIRV_OPT: inline every call (glslang -O's pass list)" ON )
 set( GLSLANG_OPT -O CACHE STRING "glslang's optimization option for the shaders (-O; empty: none)" )
 set( SPV_DIR "${CMAKE_CURRENT_BINARY_DIR}/spv" )
 file( MAKE_DIRECTORY "${SPV_DIR}" )
@@ -40,7 +41,7 @@ function( spv_header NAME SHADER )
     add_custom_command( OUTPUT "${OUT}"
                         COMMAND "${CMAKE_COMMAND}" "-DGLSLANG=${ECM_GLSLANG}" "-DSPIRV_OPT=${ECM_SPIRV_OPT}"
                                 "-DSHADER=${SHADER}" "-DOUT=${OUT}" "-DVAR=spv_${NAME}"
-                                "-DINCLUDE=${CMAKE_CURRENT_SOURCE_DIR}/shaders" "-DDEFINES=${DEFINES_ARG}"
+                                "-DINCLUDE=${CMAKE_CURRENT_SOURCE_DIR}/shaders" "-DDEFINES=${DEFINES_ARG}" "-DINLINE=${ECM_SPIRV_INLINE}"
                                 -P "${CMAKE_CURRENT_SOURCE_DIR}/spv_build.cmake"
                         DEPENDS "${SHADER}" "${CMAKE_CURRENT_SOURCE_DIR}/spv_build.cmake"
                         DEPFILE "${OUT}.d"

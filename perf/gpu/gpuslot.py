@@ -4,7 +4,7 @@
 # time (2026-10-22: 3 decoders and the agents' glslang -O builds reached 177 GB). `with slot():` takes one of
 # ECM_GPU_SLOTS (default 1) slots - directories C:/Code/ECM/runs/gpuslots/<n> made atomically, holding the owner's PID;
 # a slot whose owner process is gone is taken over - once the committed memory plus `need` GB (ECM_GPU_NEED_GB,
-# default 26 for a decoder) fits the budget, and frees it at the end. As a command it runs one under a slot of its own
+# default 14 for a decoder) fits the budget, and frees it at the end. As a command it runs one under a slot of its own
 # kind (builds: `python perf/gpu/gpuslot.py --kind build --need 12 -- powershell -ExecutionPolicy Bypass -File
 # perf\build.ps1 ...`), so a build waits for memory too, but not for a decoder's slot. run() runs a decoder under a slot
 # and stops it (its own child) where the machine's commit passes the budget less 1 GB, then runs it again once memory
@@ -15,7 +15,7 @@ from contextlib import contextmanager
 ROOT = 'C:/Code/ECM/runs/gpuslots'
 SLOTS = int(os.environ.get('ECM_GPU_SLOTS', '1'))
 LIMIT = float(os.environ.get('ECM_MEM_LIMIT_GB', '60')) * (1 << 30)
-NEED = float(os.environ.get('ECM_GPU_NEED_GB', '26'))
+NEED = float(os.environ.get('ECM_GPU_NEED_GB', '14'))
 _local = threading.Lock()
 
 
