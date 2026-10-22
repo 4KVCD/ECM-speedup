@@ -449,7 +449,7 @@ wall-clock gains with threads are "the easy baseline". Decoder status: single-th
 (`--GpuLoopFilter=1`: ALF, SAO, BIF, CCSAO, LF-CCCM, offset refinement on Vulkan). The user then asked for **a full
 GPU decoder in Vulkan, optimized until nothing is left** ("The GPU decoder needs to fully decode the frame on the
 GPU"; "Your first Vulkan version is going to be slow. That's OK"). That work is branch `dec-gpurecon`: intra
-reconstruction on the GPU (`--GpuRecon`), tool levels M1-M92 done and verified bit-exact (M19: DIMD, M20: OBIC, M21:
+reconstruction on the GPU (`--GpuRecon`), tool levels M1-M93 done and verified bit-exact (M19: DIMD, M20: OBIC, M21:
 intra merge, M22: the transforms of DIMD CUs, M23: LFNST of MIP, M24: TIMD, M25: OBIC and intra merge with TIMD
 neighbours, M26: TIMD-SAD, M27: OBIC and intra merge with TIMD-SAD neighbours, M28: TIMD merge, M29: TMRL of luma,
 M30: chroma TMRL, M31: CCLM, M32: LFNST / NSPT of CCLM, M33: GLM's gradient patterns, M34: CCCM, M35: GL-CCCM, M36:
@@ -2169,6 +2169,21 @@ MIN_MTSS_SIZE on; DERIVE_INTER_SECOND for lfnstIntra), then selectTransform and 
 mode; verification compares the transforms chosen. A CU whose transform block is not its luma (several TUs without
 SBT) or without DIMD stays the CPU's. Results (50 streams, build gpu30): every picture identical; "inter LFNST / NSPT"
 1255 -> 22 (without DIMD); inter CUs from the CPU's prediction 13873 -> 15000.
+M93 (2026-10-22): motion compensation on the GPU (inter_mc.comp, the first step of the inter prediction port):
+uni-prediction CUs without other tools (InterPrediction::xPredInterUni without bi, xWeightedAverage's copyClip): per
+inter block a job (McJob: the block, the PU's size, its list's vector clipped by clipMv as xPredInterUni clips it, the
+reference slot, AMVR's half-sample flag, the bit depth and the slice's clipping range) that writes the block's
+prediction into Params::interPred before intra_rec (the CPU's staged prediction stays below it: ECM_GPU_NO_MC=1 keeps
+it); InterpolationFilter's filters line by line (m_lumaFilter12, the alternative half-sample filter, m_chromaFilter;
+the copy, one pass or two through 16-bit rows, rounded and clipped as filter<N, isVertical, isFirst, isLast> does), the
+tables appended to Shared::matrices from the CPU's own (mcFilters). The reference pictures are the CPU's, uploaded with
+their margins each picture: the margins hold JVET-AA0096 / JVET-AK0085's motion-compensated boundary padding, so the
+GPU cannot replicate the picture's edge (ON mode will need that padding on the GPU). Found on the way (ra_scc_q32):
+AMVP with SbTMVP (JVET-AG0098's amvpSbTmvpFlag) predicts per sub-block (xSubPuMC) with mergeType DEFAULT_N, keeping the
+PU's own vector beside them - interKind counts it as sub-block motion now (also affine sub-block BDOF's refined
+vectors); and a merge CU's motion is derived after interCu (xDeriveCUMV), so the choice is made in recordInterCu. A
+scaled reference (RPR) is rejected per PU, not the SPS's RPR switch. Results (50 streams, build gpu32): every picture
+identical; 585 uni-prediction CUs predicted by the GPU (all the corpus has).
 M91 (2026-10-22, agent lf): the deblocking filter on the GPU (LoopFilter.cpp, GpuLib's dbf.comp, GpuAlf). The host derives
 everything that does not read samples with the CPU's own code: LoopFilter::setGpuRecord makes loopFilterPic record,
 per segment it filters (4 luma lines, or a chroma part of uiLoopLength lines, per component), a GpuDbfSeg - position,

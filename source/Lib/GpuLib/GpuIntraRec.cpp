@@ -65,6 +65,7 @@
 #include "intra_rec.spv.h"
 #include "intra_rec_lfnst.spv.h"
 #include "intra_resi.spv.h"
+#include "inter_mc.spv.h"
 #include "intra_deps.spv.h"
 #include "scan.spv.h"
 
@@ -1291,6 +1292,17 @@ struct Push
   int32_t  verify;   // intra_deps: the pass
 };
 
+// inter_mc.comp's push constants and records (its MC_*): a job per inter block whose prediction the GPU makes
+struct PushMc
+{
+  uint64_t jobs, refs, planes, filters, out;
+  int32_t  numJobs, pad;
+};
+constexpr int MC_COMP = 0, MC_X = 1, MC_Y = 2, MC_W = 3, MC_H = 4, MC_DST = 5, MC_PU_W = 6, MC_PU_H = 7, MC_MVX = 8;
+constexpr int MC_MVY = 9, MC_REF = 10, MC_FLAGS = 11, MC_BD = 12, MC_CLIP_MIN = 13, MC_CLIP_MAX = 14, MC_JOB = 16;
+constexpr int MC_ALT_HPEL = 1;
+constexpr int MC_REF_COMP = 5;   // per reference slot and component: origin, stride, width, height, margin
+
 struct PushScan
 {
   uint64_t src, dst;
@@ -1345,7 +1357,9 @@ struct Shared
   mutable gpu::Kernel              kernel[NUM_VARIANTS][NUM_LM_LEVELS];
   mutable std::once_flag           kernelOnce[NUM_VARIANTS][NUM_LM_LEVELS];
   gpu::Kernel                      kernelResi, kernelDeps, kernelScan;
+  gpu::Kernel                      kernelMc;                      // inter_mc
   gpu::Buffer                      filters, matrices;
+  int32_t                          mcFilters = 0;                 // of inter_mc's interpolation filters in matrices
   gpu::Buffer                      secKernels;                    // int8: the CPU's LFNST and NSPT tables, one after the other
   int32_t                          trOffset[NUM_TRANS_TYPE][7];   // of the inverse transform matrices of sizes 2..128 in matrices (-1: none)
   int32_t                          qcsOffset = 0;                 // of the QCS weights in matrices
@@ -1640,6 +1654,7 @@ Shared* createShared( gpu::Context& ctx )
   sh->kernelResi.create( ctx, spv_intra_resi, sizeof( spv_intra_resi ), sizeof( Push ), "intra_resi" );
   sh->kernelDeps.create( ctx, spv_intra_deps, sizeof( spv_intra_deps ), sizeof( Push ), "intra_deps" );
   sh->kernelScan.create( ctx, spv_scan, sizeof( spv_scan ), sizeof( PushScan ), "scan" );
+  sh->kernelMc.create( ctx, spv_inter_mc, sizeof( spv_inter_mc ), sizeof( PushMc ), "inter_mc" );
 
   // tables, from the C++ tables themselves
   sh->bif.reset( new BilateralFilter );   // BilateralFilter::create derives the LUTs
@@ -1931,6 +1946,24 @@ Shared* createShared( gpu::Context& ctx )
     mat.insert( mat.end(), dir.begin(), dir.end() );
     mat.insert( mat.end(), tail.begin(), tail.end() );
   }
+  // inter_mc's interpolation filters (InterpolationFilter's tables, inter_mc.comp's MC_FILT_*): m_lumaFilter12 and
+  // m_lumaFilter12bi (16 fractions x 12 taps), m_lumaAltHpelIFilter (8 taps; private: its values, x 4 with IF_12TAP),
+  // m_chromaFilter (32 x 6)
+  sh->mcFilters = (int32_t) mat.size();
+  for( int f = 0; f < LUMA_INTERPOLATION_FILTER_SUB_SAMPLE_POSITIONS; f++ )
+  {
+    mat.insert( mat.end(), InterpolationFilter::m_lumaFilter12[f], InterpolationFilter::m_lumaFilter12[f] + 12 );
+  }
+  for( int f = 0; f < LUMA_INTERPOLATION_FILTER_SUB_SAMPLE_POSITIONS; f++ )
+  {
+    mat.insert( mat.end(), InterpolationFilter::m_lumaFilter12bi[f], InterpolationFilter::m_lumaFilter12bi[f] + 12 );
+  }
+  static_assert( IF_FILTER_PREC == 8 && NTAPS_CHROMA == 6, "inter_mc.comp's filters" );
+  mat.insert( mat.end(), { 0 * 4, 3 * 4, 9 * 4, 20 * 4, 20 * 4, 9 * 4, 3 * 4, 0 * 4 } );
+  for( int f = 0; f < CHROMA_INTERPOLATION_FILTER_SUB_SAMPLE_POSITIONS; f++ )
+  {
+    mat.insert( mat.end(), InterpolationFilter::m_chromaFilter[f], InterpolationFilter::m_chromaFilter[f] + NTAPS_CHROMA );
+  }
   sh->filters.create( ctx, filt.size() * 4, gpu::Buffer::DEVICE );
   sh->matrices.create( ctx, mat.size() * 4, gpu::Buffer::DEVICE );
   sh->secKernels.create( ctx, kernels.size(), gpu::Buffer::DEVICE );
@@ -2119,6 +2152,13 @@ struct GpuIntraRec::Impl
   std::unordered_set<const CodingUnit*>                        interPending;
   std::map<std::string, int>                                   interKinds;
   std::vector<int16_t>                                         interPred;
+  // motion compensation on the GPU (inter_mc.comp): the inter CUs whose prediction it makes, their blocks' jobs
+  // (MC_JOB each), the reference pictures they read (their slots), the CUs by kind (interKind, totals)
+  std::unordered_set<const CodingUnit*>                        mcCus;
+  std::vector<int32_t>                                         mcJobs;
+  std::vector<const Picture*>                                  mcRefs;
+  std::map<std::string, int>                                   mcKinds;
+  gpu::Buffer                                                  mcJobBuf, mcRefBuf, mcPlaneBuf;
   // the predicted signs of their blocks (prepareInterSignPred: the CPU decodes the CU before recordInterCu), per TU and
   // component
   std::map<std::pair<const TransformUnit*, int>, PendingSignPred> interSign;
@@ -2214,6 +2254,15 @@ GpuIntraRec::~GpuIntraRec()
         for( const auto& r: byCount )
         {
           printf( " %s %d;", r.second.c_str(), r.first );
+        }
+        printf( "\n" );
+      }
+      if( !m.mcKinds.empty() )   // (those whose prediction the GPU makes)
+      {
+        printf( "[gpu-intra] inter CUs predicted by the GPU:" );
+        for( const auto& r: m.mcKinds )
+        {
+          printf( " %s %d;", r.first.c_str(), r.second );
         }
         printf( "\n" );
       }
@@ -2372,6 +2421,9 @@ void GpuIntraRec::beginPicture( const CodingStructure& cs )
   m.ccpTuIndex.clear();
   m.interPending.clear();
   m.interPred.clear();
+  m.mcCus.clear();
+  m.mcJobs.clear();
+  m.mcRefs.clear();
   m.interSign.clear();
   m.ccpTemporalModels.clear();
   m.ccpTemporal.clear();
@@ -6541,7 +6593,17 @@ static const char* interKind( const CodingUnit& cu )
   {
     return "CIIP";
   }
-  if( pu.mergeType != MRG_TYPE_DEFAULT_N )
+  // (motionCompensation's xSubPuMC: a merge type of sub-blocks, AMVP with SbTMVP - JVET-AG0098, which keeps the PU's
+  // own motion beside its sub-blocks' -, affine sub-block BDOF's refined vectors)
+  if( pu.mergeType != MRG_TYPE_DEFAULT_N
+#if JVET_AG0098_AMVP_WITH_SBTMVP
+      || pu.amvpSbTmvpFlag
+#endif
+#if JVET_AF0159_AFFINE_SUBPU_BDOF_REFINEMENT
+      || pu.availableBdofRefinedMv == AFFINE_SUBPU_BDOF_APPLY_AND_STORE_MV
+      || pu.availableBdofRefinedMv == AFFINE_SUBPU_BDOF_APPLY_WITHOUT_STORE_MV
+#endif
+  )
   {
     return "sub-block motion";
   }
@@ -6657,6 +6719,23 @@ void GpuIntraRec::prepareInterSignPred( TransformUnit& tu, const ComponentID com
     m.interSign[std::make_pair( (const TransformUnit*) &tu, (int) compID )] = m.pendingSign;
     m.pendingSign.num = 0;
   }
+}
+
+// whether the GPU makes the prediction of inter CU cu (inter_mc.comp): uni-prediction without other tools
+// (InterPrediction::xPredInterUni without bi or BDOF, then xWeightedAverage's copyClip), 4:2:0, without weighted
+// prediction, a scaled reference (RPR's xPredInterBlkRPR) or wrap-around; ECM_GPU_NO_MC=1 leaves every prediction
+// the CPU's
+static bool interMcGpu( const CodingUnit& cu )
+{
+  const PredictionUnit& pu    = *cu.firstPU;
+  const Slice&          slice = *cu.slice;
+  const PPS&            pps   = *cu.cs->pps;
+  const SPS&            sps   = *cu.cs->sps;
+  return !getenv( "ECM_GPU_NO_MC" ) && !strcmp( interKind( cu ), "uni-prediction" ) && ( pu.interDir == 1 || pu.interDir == 2 )
+         && cu.chromaFormat == CHROMA_420 && !( pps.getUseWP() && slice.getSliceType() == P_SLICE )
+         && !( pps.getWPBiPred() && slice.getSliceType() == B_SLICE )
+         && !( sps.getRprEnabledFlag() && slice.getRefPic( RefPicList( pu.interDir - 1 ), pu.refIdx[pu.interDir - 1] )->isRefScaled( &pps ) )
+         && !pps.getWrapAroundEnabledFlag();
 }
 
 void GpuIntraRec::interCu( const CodingUnit& cu )
@@ -6847,6 +6926,39 @@ static bool recordInterBlock( GpuIntraRec::Impl& m, const TransformUnit& tu, con
       }
     }
   }
+  // the GPU's prediction (inter_mc.comp writes it over the CPU's): the PU's motion of its list, clipped as
+  // xPredInterUni clips it (clipMv, the PU's position and size), the reference picture's slot
+  if( m.mcCus.count( &cu ) )
+  {
+    const int  list = pu.interDir == 1 ? 0 : 1;
+    Mv         mv   = pu.mv[list];
+    clipMv( mv, pu.lumaPos(), pu.lumaSize(), sps, *cs.pps );
+    const Picture* ref  = slice.getRefPic( RefPicList( list ), pu.refIdx[list] )->unscaledPic;
+    auto           it   = std::find( m.mcRefs.begin(), m.mcRefs.end(), ref );
+    const int      slot = (int) ( it - m.mcRefs.begin() );
+    if( it == m.mcRefs.end() )
+    {
+      m.mcRefs.push_back( ref );
+    }
+    const ClpRng& clp = slice.clpRng( compID );
+    int32_t       j[MC_JOB] = {};
+    j[MC_COMP]     = compID;
+    j[MC_X]        = area.x;
+    j[MC_Y]        = area.y;
+    j[MC_W]        = area.width;
+    j[MC_H]        = area.height;
+    j[MC_DST]      = t.dbgOffset;
+    j[MC_PU_W]     = pu.blocks[compID].width;
+    j[MC_PU_H]     = pu.blocks[compID].height;
+    j[MC_MVX]      = mv.getHor();
+    j[MC_MVY]      = mv.getVer();
+    j[MC_REF]      = slot;
+    j[MC_FLAGS]    = cu.imv == IMV_HPEL ? MC_ALT_HPEL : 0;
+    j[MC_BD]       = t.bitDepth;
+    j[MC_CLIP_MIN] = clp.min;
+    j[MC_CLIP_MAX] = clp.max;
+    m.mcJobs.insert( m.mcJobs.end(), j, j + MC_JOB );
+  }
   m.cuTus[&cu].push_back( (int32_t) m.rec.size() );
   m.rec.push_back( t );
   return true;
@@ -6858,6 +6970,11 @@ void GpuIntraRec::recordInterCu( const CodingUnit& cu )
   if( !m.interPending.erase( &cu ) || !m.unsupportedWhy.empty() )
   {
     return;
+  }
+  // (its motion is known now: DecCu derives a merge CU's after interCu, xDeriveCUMV)
+  if( interMcGpu( cu ) )
+  {
+    m.mcCus.insert( &cu );
   }
   const int numComp = cu.chromaFormat == CHROMA_400 ? 1 : MAX_NUM_COMPONENT;
   for( const TransformUnit& tu: CU::traverseTUs( cu ) )
@@ -6883,7 +7000,7 @@ void GpuIntraRec::recordInterCu( const CodingUnit& cu )
   }
   if( !m.cpuCus.count( &cu ) )
   {
-    m.interKinds[interKind( cu )]++;
+    ( m.mcCus.count( &cu ) ? m.mcKinds : m.interKinds )[interKind( cu )]++;
   }
 }
 
@@ -8013,7 +8130,30 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
     }
     const size_t upCcp   = sizeof( Params ) + tuBytes + coefBytes + lmcsBytes + spBytes + cuBytes + planesUp;
     const size_t ccpUp   = m.partial ? ccpBytes : 0;
-    const size_t upInter = upCcp + ccpUp, upBytes = upInter + interBytes;
+    // (motion compensation: the jobs, per reference slot and component its plane's record, the planes with their
+    // margins - the CPU's padding, motion-compensated by JVET-AA0096 / JVET-AK0085 -, 16-bit samples)
+    std::vector<int32_t> mcRefTab;
+    std::vector<int16_t> mcPlanes;
+    for( const Picture* pic: m.mcRefs )
+    {
+      for( int c = 0; c < 3; c++ )
+      {
+        const CPelBuf  b      = pic->getRecoBuf( ComponentID( c ) );
+        const int      margin = (int) pic->margin >> ( c ? 1 : 0 );   // (4:2:0, PelStorage's scaled chroma margin)
+        const int      stride = (int) b.width + 2 * margin;
+        mcRefTab.insert( mcRefTab.end(), { (int32_t) mcPlanes.size() + margin * stride + margin, stride, (int32_t) b.width,
+                                           (int32_t) b.height, margin } );
+        for( int y = -margin; y < (int) b.height + margin; y++ )
+        {
+          const Pel* row = b.buf + ptrdiff_t( y ) * b.stride - margin;
+          mcPlanes.insert( mcPlanes.end(), row, row + stride );
+        }
+      }
+    }
+    mcPlanes.resize( ( mcPlanes.size() + 1 ) & ~size_t( 1 ), 0 );
+    const size_t mcJobBytes = m.mcJobs.size() * 4, mcRefBytes = mcRefTab.size() * 4, mcPlaneBytes = mcPlanes.size() * 2;
+    const size_t upInter = upCcp + ccpUp, upMc = upInter + interBytes;
+    const size_t upBytes = upMc + mcJobBytes + mcRefBytes + mcPlaneBytes;
     const size_t upSign  = sizeof( Params ) + tuBytes + coefBytes + lmcsBytes;   // where the signPred data goes
     const size_t upCu    = upSign + spBytes;                                      // the CU records and modes
     m.upload.ensure( ctx, upBytes, gpu::Buffer::UPLOAD );
@@ -8024,6 +8164,15 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
     memcpy( (char*) m.upload.mapped + upSign, m.signPred.data(), spBytes );
     memcpy( (char*) m.upload.mapped + upCu, cuData.data(), cuBytes );
     memcpy( (char*) m.upload.mapped + upInter, m.interPred.data(), interBytes );
+    memcpy( (char*) m.upload.mapped + upMc, m.mcJobs.data(), mcJobBytes );
+    memcpy( (char*) m.upload.mapped + upMc + mcJobBytes, mcRefTab.data(), mcRefBytes );
+    memcpy( (char*) m.upload.mapped + upMc + mcJobBytes + mcRefBytes, mcPlanes.data(), mcPlaneBytes );
+    if( mcJobBytes )
+    {
+      m.mcJobBuf.ensure( ctx, mcJobBytes, gpu::Buffer::DEVICE );
+      m.mcRefBuf.ensure( ctx, mcRefBytes, gpu::Buffer::DEVICE );
+      m.mcPlaneBuf.ensure( ctx, mcPlaneBytes, gpu::Buffer::DEVICE );
+    }
     // partial verification: the planes start as the CPU's reconstruction (the CUs taken from it, the inter, IBC and
     // palette CUs) but 0 in the GPU's blocks, so that a block the GPU leaves unwritten shows
     for( int c = 0; c < numComp && m.partial; c++ )
@@ -8106,6 +8255,12 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
     {
       s.copy( m.upload, upInter, m.interPredBuf, 0, interBytes );
     }
+    if( mcJobBytes )
+    {
+      s.copy( m.upload, upMc, m.mcJobBuf, 0, mcJobBytes );
+      s.copy( m.upload, upMc + mcJobBytes, m.mcRefBuf, 0, mcRefBytes );
+      s.copy( m.upload, upMc + mcJobBytes + mcRefBytes, m.mcPlaneBuf, 0, mcPlaneBytes );
+    }
     for( int c = 0; c < numComp; c++ )
     {
       s.fill( m.owner[c], 0, ownerBytes[c], 0xFFFFFFFFu );
@@ -8123,6 +8278,13 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
     s.fill( m.sched, oNumDep * 4, n * 4, 0 );
     s.barrier();
     const uint32_t t0 = s.timestamp();
+    if( mcJobBytes )   // the inter blocks' predictions the GPU makes (intra_rec reads them after the barriers below)
+    {
+      const int32_t numJobs = (int32_t) ( m.mcJobs.size() / MC_JOB );
+      PushMc        mc{ m.mcJobBuf.addr, m.mcRefBuf.addr, m.mcPlaneBuf.addr,
+                        m.sh->matrices.addr + uint64_t( m.sh->mcFilters ) * 4, m.interPredBuf.addr, numJobs, 0 };
+      s.dispatch( m.sh->kernelMc, &mc, (uint32_t) std::min<int32_t>( numJobs, 4096 ) );
+    }
     const uint32_t depGroups = (uint32_t) ( ( n + 63 ) / 64 );
     Push push{ m.params.addr, (int32_t) n, m.on ? 0 : 1 };
     s.dispatch( m.sh->kernelResi, &push, (uint32_t) std::min<size_t>( RESI_GROUPS, n ) );   // the residuals

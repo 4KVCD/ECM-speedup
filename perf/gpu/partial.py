@@ -28,6 +28,7 @@ env = dict(os.environ, ECM_GPU_PARTIAL='1', __GL_SHADER_DISK_CACHE_PATH=cache,
            ECM_GPU_PIPELINE_CACHE=pipes)
 total = Counter()
 interTotal = Counter()   # the inter CUs reconstructed from the CPU's prediction, by its kind
+mcTotal = Counter()      # and those from the GPU's
 
 
 def run(name):
@@ -47,13 +48,14 @@ def run(name):
             if part:
                 k, n = part.rsplit(' ', 1)
                 reasons[k] += int(n)
-    m = re.search(r'inter CUs predicted by the CPU:(.*)', out)
-    if m:
-        for part in m.group(1).split(';'):
-            part = part.strip()
-            if part:
-                k, n = part.rsplit(' ', 1)
-                interTotal[k] += int(n)
+    for label, counter in (('CPU', interTotal), ('GPU', mcTotal)):
+        m = re.search(r'inter CUs predicted by the ' + label + r':(.*)', out)
+        if m:
+            for part in m.group(1).split(';'):
+                part = part.strip()
+                if part:
+                    k, n = part.rsplit(' ', 1)
+                    counter[k] += int(n)
     failure = re.search(r'\[exit code [^\n]*', out)
     return name, s.groups() if s else None, first, reasons, failure.group(0) if failure else ''
 
@@ -83,3 +85,5 @@ for name in lost:
 print('CUs from the CPU, all streams:', '; '.join(f'{k} {n}' for k, n in total.most_common()))
 if interTotal:
     print('inter CUs predicted by the CPU, all streams:', '; '.join(f'{k} {n}' for k, n in interTotal.most_common()))
+if mcTotal:
+    print('inter CUs predicted by the GPU, all streams:', '; '.join(f'{k} {n}' for k, n in mcTotal.most_common()))
