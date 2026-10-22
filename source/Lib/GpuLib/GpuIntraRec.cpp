@@ -3875,8 +3875,6 @@ static bool addSgpmRecord( GpuIntraRec::Impl& m, const CodingUnit& cu, Cu& c, co
   why = source ? source
         : missed ? "SGPM with a vector its neighbours' checks missed"
         : cu.lwidth() * cu.lheight() > 32 * 32 ? "SGPM above 1024 samples"
-        // (MTSS of regression SGPM: not verified yet)
-        : usesMtss( *cu.firstTU ) && PU::isRegressionSgpm( pu ) ? "regression SGPM with MTSS"
         : PU::isDbvMode( pu.intraDir[CHANNEL_TYPE_CHROMA] ) ? "SGPM with a DBV chroma mode" : nullptr;
   // DecCu derives timdHor / timdVer for a CU of 1024 samples at most with the SPS's TIMD, not for regression SGPM; else
   // they keep initData's -1, which getSgpmIntraMPMs skips

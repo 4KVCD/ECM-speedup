@@ -2132,6 +2132,9 @@ their own mode (DM reads the luma block's eipDimdMode, which it publishes as the
 luma alone. Results (build aglf7): 10 -> 0 CUs from the CPU (ai_nodualtree_q27 and ra_nodualtree_q32, 5 each: EIP CUs
 on the GPU 0 -> 5 per stream); both differ first where they did before; a temporary build that took every CU but the
 EIP ones from the CPU had both identical; ai_foreman352_q37 and ra_foreman_q32 identical, unchanged.
+Integration of M85-M88 on M84 (2026-10-22, builds gpu23 / gpu24): all 50 streams identical. MTSS of regression SGPM
+(rejected while merging M87, which predates M76's regression SGPM) verified on the 18 streams with such CUs (23) and
+taken: identical.
 
 
 ## 8. Numbers (i7-10700 8C/16T, Win11, GCC 16.2, RTX 3070 driver 616.92)
