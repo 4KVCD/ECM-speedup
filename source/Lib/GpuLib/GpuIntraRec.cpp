@@ -5291,6 +5291,241 @@ static int32_t ccpDerivedEntry( GpuIntraRec::Impl& m )
 }
 #endif
 
+// TrQuant::xIT's transform types (DCT-II, or those of explicit MTS) and their matrices; with lfnstIdx the inverse
+// LFNST before them or NSPT instead of them (invSecondary: the CPU's own choices of matrix, scan and sizes)
+static bool transformFields( GpuIntraRec::Impl& m, const TransformUnit& tu, const ComponentID resiComp, const CompArea& area,
+                             Tu& t, Secondary& sec, const char*& why )
+{
+  const bool ts = t.transformSkip != 0;
+  t.mtxV = t.mtxH = 0;
+  t.secKind = SEC_NONE;
+  t.secMatrix = t.secRowLength = t.secNumIn = t.secScan = t.secLayout = t.secSize = t.secTranspose = 0;
+  if( t.cbf && !ts )
+  {
+    if( !m.trQuant )
+    {
+      why = "transform types without the decoder's TrQuant";
+      return false;
+    }
+    invSecondary( tu, resiComp, sec );
+    int        trTypeHor, trTypeVer;
+    const bool separable = m.trQuant->getInvTransformTypes( tu, resiComp, trTypeHor, trTypeVer );
+    if( area.width > 1 && area.height > 1 && separable == ( sec.kind == SEC_NSPT ) )   // xIT: NSPT or the separable one
+    {
+      why = "NSPT where xIT does not apply it";
+      return false;
+    }
+    if( sec.kind != SEC_NONE )
+    {
+      t.secKind      = sec.kind;
+      t.secMatrix    = m.sh->kernelOffset( sec.matrix );
+      t.secRowLength = sec.rowLength;
+      t.secNumIn     = sec.numIn;
+      t.secScan      = m.sh->scanOffset( sec.scan );
+      t.secSize      = sec.sbSize;
+      t.secTranspose = sec.transpose ? 1 : 0;
+      t.secLayout    = sec.kind != SEC_LFNST ? 0
+                       : sec.ext ? m.sh->lfnstLayout[floorLog2( sec.sbSize ) - 2][t.secTranspose]
+                                 : m.sh->lfnstLayoutVvc[floorLog2( sec.sbSize ) - 2][t.secTranspose];
+      if( t.secMatrix < 0 || t.secScan < 0 || sec.numIn > 64 || ( sec.kind == SEC_LFNST && sec.rowLength > 96 ) )
+      {
+        why = "an LFNST / NSPT matrix or scan the GPU lacks";
+        return false;
+      }
+    }
+    if( sec.kind == SEC_NSPT )
+    {
+      // its matrix gives the residual
+    }
+    else if( !separable )
+    {
+      if( area.width == 1 || area.height == 1 )   // xIT's 1-D transform (ISP sub-partitions): one stage along the block
+      {
+        t.mtxV = area.width == 1 ? m.sh->trOffset[trTypeVer][floorLog2( area.height ) - 1] : 0;
+        t.mtxH = area.height == 1 ? m.sh->trOffset[trTypeHor][floorLog2( area.width ) - 1] : 0;
+        if( t.mtxV < 0 || t.mtxH < 0 )
+        {
+          why = "a transform type without a matrix of this size";
+          return false;
+        }
+      }
+      else
+      {
+        why = "a transform the GPU lacks";
+        return false;
+      }
+    }
+    else
+    {
+      t.mtxV = m.sh->trOffset[trTypeVer][floorLog2( area.height ) - 1];
+      t.mtxH = m.sh->trOffset[trTypeHor][floorLog2( area.width ) - 1];
+      if( t.mtxV < 0 || t.mtxH < 0 )
+      {
+        why = "a transform type without a matrix of this size";
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+// dequantization without scaling lists or extended precision: DepQuant::dequant (dequantBlock) with dependent
+// quantization (not for transform skip, which uses its own residual coding), else Quant::dequant; QCS blends either
+// with the dequantization of the next larger index; TrQuant::xIT's range and shifts
+static bool dequantFields( const TransformUnit& tu, const ComponentID resiComp, const QpParam& resiQp, const CompArea& area,
+                           Tu& t, const char*& why )
+{
+  const SPS&        sps    = *tu.cs->sps;
+  const Slice&      slice  = *tu.cs->slice;
+  const ChannelType chType = toChannelType( resiComp );
+  const bool        ts     = t.transformSkip != 0;
+  const int maxLog2TrDynamicRange = sps.getMaxLog2TrDynamicRange( chType );
+  t.quant = ( slice.getDepQuantEnabledIdc() && !ts ? QUANT_DEP : 0 ) | ( sps.getUseQcs() ? QUANT_QCS : 0 );
+  if( t.quant & QUANT_DEP )
+  {
+    // the index of a level depends on the quantizer state (the indices are derived with the levels below); QP + 1,
+    // and the scale is shifted left instead of a negative right shift, without rounding
+    const bool sqrt2          = TU::needsSqrt2Scale( tu, resiComp );
+    const int  qpDQ           = resiQp.Qp( false ) + 1;
+    const int  qpPer          = qpDQ / 6;
+    const int  qpRem          = qpDQ - 6 * qpPer;
+    const int  transformShift = getTransformShift( t.bitDepth, area.size(), maxLog2TrDynamicRange ) + ( sqrt2 ? -1 : 0 );
+    const int  shift          = IQUANT_SHIFT + 1 - qpPer - transformShift;
+    const int  scale          = g_invQuantScales[sqrt2 ? 1 : 0][qpRem];
+    t.dqScale      = shift < 0 ? scale << -shift : scale;
+    t.dqRightShift = std::max( shift, 0 );
+    t.dqInMin      = INT32_MIN;   // the indices are not clipped
+    t.dqInMax      = INT32_MAX;
+  }
+  else
+  {
+    // transform skip: the QP of transform skip, and no transform shift
+    const bool needSqrtAdjustment  = TU::needsBlockSizeTrafoScale( tu, resiComp );
+    const int  iTransformShift     = getTransformShift( t.bitDepth, area.size(), maxLog2TrDynamicRange ) + ( needSqrtAdjustment ? -1 : 0 );
+    const int  rightShift          = IQUANT_SHIFT - ( ( ts ? 0 : iTransformShift ) + resiQp.per( ts ) );
+    const int  scaleBits           = IQUANT_SHIFT + 1;
+    const int  targetInputBitDepth = std::min<int>( maxLog2TrDynamicRange + 1, 32 + rightShift - scaleBits );
+    t.dqScale      = g_invQuantScales[needSqrtAdjustment ? 1 : 0][resiQp.rem( ts )];
+    t.dqRightShift = rightShift;
+    t.dqInMin      = -( 1 << ( targetInputBitDepth - 1 ) );
+    t.dqInMax      = ( 1 << ( targetInputBitDepth - 1 ) ) - 1;
+  }
+  t.trMin        = -( 1 << maxLog2TrDynamicRange );
+  t.trMax        = ( 1 << maxLog2TrDynamicRange ) - 1;
+  if( t.trMin < INT16_MIN || t.trMax > INT16_MAX )   // intra_resi keeps the first transform stage in 16 bits
+  {
+    why = "transform range above 16 bits";
+    return false;
+  }
+  // TrQuant::xIT
+  const int transformMatrixShift = g_transformMatrixShift[TRANSFORM_INVERSE];
+  t.shift1 = transformMatrixShift + 1 + COM16_C806_TRANS_PREC;
+  t.shift2 = ( transformMatrixShift + maxLog2TrDynamicRange - 1 ) - t.bitDepth + COM16_C806_TRANS_PREC;
+  return true;
+}
+
+// the levels: only the region holding the nonzero ones (rows < nzRows, columns < nzCols), from signCoef where sign
+// prediction gave them, else the TU's; the block's samples (dbgOffset)
+static bool coefficientFields( GpuIntraRec::Impl& m, const TransformUnit& tu, const ComponentID resiComp,
+                               const CompArea& area, Tu& t, const TCoeff* signCoef, const char*& why )
+{
+  const CodingUnit& cu    = *tu.cu;
+  const Slice&      slice = *tu.cs->slice;
+  t.coeffOffset = (int32_t) m.coef.size();
+  t.dbgOffset   = (int32_t) m.numSamples;
+  m.numSamples += size_t( area.width ) * area.height;
+  if( t.jccr != 0 && t.jccr != JCCR_DERIVED )
+  {
+    t.jccrOffset = (int32_t) m.numSamples;   // the Cr block's samples
+  }
+  t.nzRows = t.nzCols = 0;
+  if( t.cbf )
+  {
+    // BDPCM (Quant::dequant, with transform skip): the levels accumulated along the rows or columns
+    const bool          bdpcm = isLuma( resiComp ) ? cu.bdpcmMode != 0 : cu.bdpcmModeChroma != 0;
+    std::vector<TCoeff> accumulated;
+    CCoeffBuf           c = signCoef ? CCoeffBuf( signCoef, area.width, area.height ) : tu.getCoeffs( resiComp );
+    if( bdpcm )
+    {
+      accumulated.resize( area.area() );
+      CoeffBuf acc( accumulated.data(), area.width, area.height );
+      invResDPCM( tu, resiComp, acc );
+      c = CCoeffBuf( accumulated.data(), area.width, area.height );
+    }
+    for( int y = 0; y < (int) area.height; y++ )
+    {
+      const TCoeff* row = c.bufAt( 0, y );
+      for( int x = (int) area.width - 1; x >= t.nzCols; x-- )
+      {
+        if( row[x] != 0 )
+        {
+          t.nzRows = y + 1;
+          t.nzCols = x + 1;
+          break;
+        }
+      }
+      if( t.nzRows < y + 1 )
+      {
+        for( int x = 0; x < t.nzCols; x++ )
+        {
+          if( row[x] != 0 )
+          {
+            t.nzRows = y + 1;
+            break;
+          }
+        }
+      }
+    }
+    if( t.secKind == SEC_LFNST )   // intra_resi takes the whole region of its outputs, which holds every level
+    {
+      if( t.nzRows > t.secSize || t.nzCols > t.secSize )
+      {
+        why = "LFNST with levels outside its region";
+        return false;
+      }
+      t.nzRows = t.nzCols = t.secSize;
+    }
+    // intra_rec keeps the coefficients of a derived mode's LFNST / NSPT (at most 16 x 16) and of sign prediction's
+    // blocks (at most 32 x 32) in 32 x 32 entries
+    if( ( t.derive & DERIVE_TRANSFORM ) && ( t.secKind != SEC_NONE || signCoef ) && t.nzRows * t.nzCols > 1024 )
+    {
+      why = "a derived mode's transform with more than 32 x 32 coefficients";
+      return false;
+    }
+    for( int y = 0; y < t.nzRows; y++ )
+    {
+      const TCoeff* row = c.bufAt( 0, y );
+      m.coef.insert( m.coef.end(), row, row + t.nzCols );
+    }
+    if( t.quant & QUANT_DEP )
+    {
+      // DepQuant's dequantBlock: from the last nonzero level down the diagonal scan, the quantizer state (a function
+      // of the levels' parities only) turns each level into its quantization index
+      CHECK( c.stride != area.width, "coefficients of a TU are contiguous" );
+      const ScanElement* scan = g_scanOrder[SCAN_GROUPED_4x4][SCAN_DIAG][gp_sizeIdxInfo->idxFrom( area.width )]
+                                           [gp_sizeIdxInfo->idxFrom( area.height )];
+      const uint64_t     stateTransTab = g_stateTransTab[slice.getDepQuantEnabledIdc()];
+      int                lastScanIdx   = (int) area.area() - 1;
+      while( lastScanIdx >= 0 && c.buf[scan[lastScanIdx].idx] == 0 )
+      {
+        lastScanIdx--;
+      }
+      for( int state = 0, scanIdx = lastScanIdx; scanIdx >= 0; scanIdx-- )
+      {
+        const unsigned rasterPos = scan[scanIdx].idx;
+        const TCoeff   level     = c.buf[rasterPos];
+        if( level )
+        {
+          m.coef[t.coeffOffset + ( rasterPos / area.width ) * t.nzCols + rasterPos % area.width] =
+            ( level << 1 ) + ( level > 0 ? -( state & 1 ) : ( state & 1 ) );
+        }
+        state = int( ( stateTransTab >> ( ( state << 3 ) + ( ( level & 1 ) << 2 ) ) ) & 15 );
+      }
+    }
+  }
+  return true;
+}
+
 void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, const IntraPrediction::IpaSnapshot& ipaIn,
                           const QpParam& qp, const CPelBuf* pred, const CPelBuf* resi )
 {
@@ -6074,77 +6309,15 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
   const bool ts   = tu.mtsIdx[resiComp] == MTS_SKIP;
   t.transformSkip = ts ? 1 : 0;
 
-  // TrQuant::xIT's transform types (DCT-II, or those of explicit MTS) and their matrices; with lfnstIdx the inverse
-  // LFNST before them or NSPT instead of them (invSecondary: the CPU's own choices of matrix, scan and sizes)
-  t.mtxV = t.mtxH = 0;
-  t.secKind = SEC_NONE;
-  t.secMatrix = t.secRowLength = t.secNumIn = t.secScan = t.secLayout = t.secSize = t.secTranspose = 0;
+  Secondary   sec;
+  const char* trWhy = nullptr;
+  if( !transformFields( m, tu, resiComp, area, t, sec, trWhy ) )
+  {
+    reject( trWhy );
+    return;
+  }
   if( t.cbf && !ts )
   {
-    if( !m.trQuant )
-    {
-      reject( "transform types without the decoder's TrQuant" );
-      return;
-    }
-    Secondary sec;
-    invSecondary( tu, resiComp, sec );
-    int        trTypeHor, trTypeVer;
-    const bool separable = m.trQuant->getInvTransformTypes( tu, resiComp, trTypeHor, trTypeVer );
-    if( area.width > 1 && area.height > 1 && separable == ( sec.kind == SEC_NSPT ) )   // xIT: NSPT or the separable one
-    {
-      reject( "NSPT where xIT does not apply it" );
-      return;
-    }
-    if( sec.kind != SEC_NONE )
-    {
-      t.secKind      = sec.kind;
-      t.secMatrix    = m.sh->kernelOffset( sec.matrix );
-      t.secRowLength = sec.rowLength;
-      t.secNumIn     = sec.numIn;
-      t.secScan      = m.sh->scanOffset( sec.scan );
-      t.secSize      = sec.sbSize;
-      t.secTranspose = sec.transpose ? 1 : 0;
-      t.secLayout    = sec.kind != SEC_LFNST ? 0
-                       : sec.ext ? m.sh->lfnstLayout[floorLog2( sec.sbSize ) - 2][t.secTranspose]
-                                 : m.sh->lfnstLayoutVvc[floorLog2( sec.sbSize ) - 2][t.secTranspose];
-      if( t.secMatrix < 0 || t.secScan < 0 || sec.numIn > 64 || ( sec.kind == SEC_LFNST && sec.rowLength > 96 ) )
-      {
-        reject( "an LFNST / NSPT matrix or scan the GPU lacks" );
-        return;
-      }
-    }
-    if( sec.kind == SEC_NSPT )
-    {
-      // its matrix gives the residual
-    }
-    else if( !separable )
-    {
-      if( area.width == 1 || area.height == 1 )   // xIT's 1-D transform (ISP sub-partitions): one stage along the block
-      {
-        t.mtxV = area.width == 1 ? m.sh->trOffset[trTypeVer][floorLog2( area.height ) - 1] : 0;
-        t.mtxH = area.height == 1 ? m.sh->trOffset[trTypeHor][floorLog2( area.width ) - 1] : 0;
-        if( t.mtxV < 0 || t.mtxH < 0 )
-        {
-          reject( "a transform type without a matrix of this size" );
-          return;
-        }
-      }
-      else
-      {
-        reject( "a transform the GPU lacks" );
-        return;
-      }
-    }
-    else
-    {
-      t.mtxV = m.sh->trOffset[trTypeVer][floorLog2( area.height ) - 1];
-      t.mtxH = m.sh->trOffset[trTypeHor][floorLog2( area.width ) - 1];
-      if( t.mtxV < 0 || t.mtxH < 0 )
-      {
-        reject( "a transform type without a matrix of this size" );
-        return;
-      }
-    }
     // a derived mode's transforms (intra_rec's selectTransform): the kernel pair of ECM's explicit MTS
     // (TrQuant::getTrTypes with MTSExt) and the LFNST / NSPT matrix and transposition (getFinalIntraModeForTransform)
     // depend on the mode; the host gives what does not, and intra_rec computes the residual after the mode's node.
@@ -6207,51 +6380,12 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
     return;
   }
 
-  // dequantization without scaling lists or extended precision: DepQuant::dequant (dequantBlock) with dependent
-  // quantization (not for transform skip, which uses its own residual coding), else Quant::dequant; QCS blends either
-  // with the dequantization of the next larger index
-  const int maxLog2TrDynamicRange = sps.getMaxLog2TrDynamicRange( chType );
-  t.quant = ( slice.getDepQuantEnabledIdc() && !ts ? QUANT_DEP : 0 ) | ( sps.getUseQcs() ? QUANT_QCS : 0 );
-  if( t.quant & QUANT_DEP )
+  const char* dqWhy = nullptr;
+  if( !dequantFields( tu, resiComp, resiQp, area, t, dqWhy ) )
   {
-    // the index of a level depends on the quantizer state (the indices are derived with the levels below); QP + 1,
-    // and the scale is shifted left instead of a negative right shift, without rounding
-    const bool sqrt2          = TU::needsSqrt2Scale( tu, resiComp );
-    const int  qpDQ           = resiQp.Qp( false ) + 1;
-    const int  qpPer          = qpDQ / 6;
-    const int  qpRem          = qpDQ - 6 * qpPer;
-    const int  transformShift = getTransformShift( t.bitDepth, area.size(), maxLog2TrDynamicRange ) + ( sqrt2 ? -1 : 0 );
-    const int  shift          = IQUANT_SHIFT + 1 - qpPer - transformShift;
-    const int  scale          = g_invQuantScales[sqrt2 ? 1 : 0][qpRem];
-    t.dqScale      = shift < 0 ? scale << -shift : scale;
-    t.dqRightShift = std::max( shift, 0 );
-    t.dqInMin      = INT32_MIN;   // the indices are not clipped
-    t.dqInMax      = INT32_MAX;
-  }
-  else
-  {
-    // transform skip: the QP of transform skip, and no transform shift
-    const bool needSqrtAdjustment  = TU::needsBlockSizeTrafoScale( tu, resiComp );
-    const int  iTransformShift     = getTransformShift( t.bitDepth, area.size(), maxLog2TrDynamicRange ) + ( needSqrtAdjustment ? -1 : 0 );
-    const int  rightShift          = IQUANT_SHIFT - ( ( ts ? 0 : iTransformShift ) + resiQp.per( ts ) );
-    const int  scaleBits           = IQUANT_SHIFT + 1;
-    const int  targetInputBitDepth = std::min<int>( maxLog2TrDynamicRange + 1, 32 + rightShift - scaleBits );
-    t.dqScale      = g_invQuantScales[needSqrtAdjustment ? 1 : 0][resiQp.rem( ts )];
-    t.dqRightShift = rightShift;
-    t.dqInMin      = -( 1 << ( targetInputBitDepth - 1 ) );
-    t.dqInMax      = ( 1 << ( targetInputBitDepth - 1 ) ) - 1;
-  }
-  t.trMin        = -( 1 << maxLog2TrDynamicRange );
-  t.trMax        = ( 1 << maxLog2TrDynamicRange ) - 1;
-  if( t.trMin < INT16_MIN || t.trMax > INT16_MAX )   // intra_resi keeps the first transform stage in 16 bits
-  {
-    reject( "transform range above 16 bits" );
+    reject( dqWhy );
     return;
   }
-  // TrQuant::xIT
-  const int transformMatrixShift = g_transformMatrixShift[TRANSFORM_INVERSE];
-  t.shift1 = transformMatrixShift + 1 + COM16_C806_TRANS_PREC;
-  t.shift2 = ( transformMatrixShift + maxLog2TrDynamicRange - 1 ) - t.bitDepth + COM16_C806_TRANS_PREC;
   // DecCu::xIntraRecBlk reconstruction clipping (adaptive clipping for luma)
   if( compID == COMPONENT_Y )
   {
@@ -6303,98 +6437,11 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
     m.lmcsUsed |= t.lmcs != 0;
   }
 
-  // the levels: only the region holding the nonzero ones (rows < nzRows, columns < nzCols)
-  t.coeffOffset = (int32_t) m.coef.size();
-  t.dbgOffset   = (int32_t) m.numSamples;
-  m.numSamples += size_t( area.width ) * area.height;
-  if( t.jccr != 0 && t.jccr != JCCR_DERIVED )
+  const char* cfWhy = nullptr;
+  if( !coefficientFields( m, tu, resiComp, area, t, signPred ? sign.coef.data() : nullptr, cfWhy ) )
   {
-    t.jccrOffset = (int32_t) m.numSamples;   // the Cr block's samples
-  }
-  t.nzRows = t.nzCols = 0;
-  if( t.cbf )
-  {
-    // BDPCM (Quant::dequant, with transform skip): the levels accumulated along the rows or columns
-    const bool          bdpcm = isLuma( resiComp ) ? cu.bdpcmMode != 0 : cu.bdpcmModeChroma != 0;
-    std::vector<TCoeff> accumulated;
-    CCoeffBuf           c = signPred ? CCoeffBuf( sign.coef.data(), area.width, area.height ) : tu.getCoeffs( resiComp );
-    if( bdpcm )
-    {
-      accumulated.resize( area.area() );
-      CoeffBuf acc( accumulated.data(), area.width, area.height );
-      invResDPCM( tu, resiComp, acc );
-      c = CCoeffBuf( accumulated.data(), area.width, area.height );
-    }
-    for( int y = 0; y < (int) area.height; y++ )
-    {
-      const TCoeff* row = c.bufAt( 0, y );
-      for( int x = (int) area.width - 1; x >= t.nzCols; x-- )
-      {
-        if( row[x] != 0 )
-        {
-          t.nzRows = y + 1;
-          t.nzCols = x + 1;
-          break;
-        }
-      }
-      if( t.nzRows < y + 1 )
-      {
-        for( int x = 0; x < t.nzCols; x++ )
-        {
-          if( row[x] != 0 )
-          {
-            t.nzRows = y + 1;
-            break;
-          }
-        }
-      }
-    }
-    if( t.secKind == SEC_LFNST )   // intra_resi takes the whole region of its outputs, which holds every level
-    {
-      if( t.nzRows > t.secSize || t.nzCols > t.secSize )
-      {
-        reject( "LFNST with levels outside its region" );
-        return;
-      }
-      t.nzRows = t.nzCols = t.secSize;
-    }
-    // intra_rec keeps the coefficients of a derived mode's LFNST / NSPT (at most 16 x 16) and of sign prediction's
-    // blocks (at most 32 x 32) in 32 x 32 entries
-    if( ( t.derive & DERIVE_TRANSFORM ) && ( t.secKind != SEC_NONE || signPred ) && t.nzRows * t.nzCols > 1024 )
-    {
-      reject( "a derived mode's transform with more than 32 x 32 coefficients" );
-      return;
-    }
-    for( int y = 0; y < t.nzRows; y++ )
-    {
-      const TCoeff* row = c.bufAt( 0, y );
-      m.coef.insert( m.coef.end(), row, row + t.nzCols );
-    }
-    if( t.quant & QUANT_DEP )
-    {
-      // DepQuant's dequantBlock: from the last nonzero level down the diagonal scan, the quantizer state (a function
-      // of the levels' parities only) turns each level into its quantization index
-      CHECK( c.stride != area.width, "coefficients of a TU are contiguous" );
-      const ScanElement* scan = g_scanOrder[SCAN_GROUPED_4x4][SCAN_DIAG][gp_sizeIdxInfo->idxFrom( area.width )]
-                                           [gp_sizeIdxInfo->idxFrom( area.height )];
-      const uint64_t     stateTransTab = g_stateTransTab[slice.getDepQuantEnabledIdc()];
-      int                lastScanIdx   = (int) area.area() - 1;
-      while( lastScanIdx >= 0 && c.buf[scan[lastScanIdx].idx] == 0 )
-      {
-        lastScanIdx--;
-      }
-      for( int state = 0, scanIdx = lastScanIdx; scanIdx >= 0; scanIdx-- )
-      {
-        const unsigned rasterPos = scan[scanIdx].idx;
-        const TCoeff   level     = c.buf[rasterPos];
-        if( level )
-        {
-          m.coef[t.coeffOffset + ( rasterPos / area.width ) * t.nzCols + rasterPos % area.width] =
-            ( level << 1 ) + ( level > 0 ? -( state & 1 ) : ( state & 1 ) );
-        }
-        state = int( ( stateTransTab >> ( ( state << 3 ) + ( ( level & 1 ) << 2 ) ) ) & 15 );
-      }
-    }
+    reject( cfWhy );
+    return;
   }
   if( signPred )   // the signPred data; the block decides itself unless its pair's Cr is coded
   {
