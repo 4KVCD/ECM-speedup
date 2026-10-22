@@ -538,6 +538,23 @@ void reconstruct( Tu t, int x, int y, int pr, int re )
   }
 }
 
+// sign prediction of an inter block above 32 x 32 (up to SIGN_PRED_MAX_BS_INTER, 128 x 128; signPredictionLarge): its
+// work area in the workgroup's scratch (BLEND_ACC int32: the prediction, then per border entry - at most 256 - the
+// border the neighbours predict, the base residual, the templates of the predicted coefficients and the halves)
+const int SPL_PRED   = 0;
+const int SPL_BORDER = SPL_PRED + 128 * 128;
+const int SPL_BASE   = SPL_BORDER + 256;
+const int SPL_TEMPL  = SPL_BASE + 256;
+const int SPL_LOW    = SPL_TEMPL + 8 * 256;
+const int SPL_HIGH   = SPL_LOW + 16 * 256;
+int  splGet( int o )        { return CBufI32( P.scratch ).v[int( gl_WorkGroupID.x ) * BLEND_ACC + o]; }
+void splSet( int o, int v ) { CBufI32( P.scratch ).v[int( gl_WorkGroupID.x ) * BLEND_ACC + o] = v; }
+void splSync()
+{
+  controlBarrier( gl_ScopeWorkgroup, gl_ScopeWorkgroup, gl_StorageSemanticsBuffer | gl_StorageSemanticsShared,
+                  gl_SemanticsAcquireRelease );
+}
+
 // predicted sample (x, y) of block t: reconstructed with the residual intra_resi computed, or one written in intra_rec
 // (Tu::resiFrom, read device-coherent): with joint CbCr by the pair's other block (sign prediction's decision, or the
 // Cb block whose transforms depend on a derived mode), or by this block (inChainResidual, which sets its local copy's
@@ -546,7 +563,11 @@ void storeRecon( Tu t, int x, int y, int pr )
 {
   if( t.spCoded >= 0 || g_deferRecon )
   {
-    if( g_pnnLarge < 0 )   // (a large NN block's prediction is computed again: pnnSample)
+    if( t.w > 32 || t.h > 32 )   // (sign prediction of an inter block above 32 x 32: signPredictionLarge)
+    {
+      splSet( SPL_PRED + y * t.w + x, pr );
+    }
+    else if( g_pnnLarge < 0 )   // (a large NN block's prediction is computed again: pnnSample)
     {
       s_spPred[y * t.w + x] = int16_t( pr );
     }
@@ -1546,8 +1567,303 @@ void signPredData( Tu c, int n, int lid, int NT )
 // both transform stages as in intra_resi, with joint CbCr also the other component's, for the other block of the pair,
 // which waits for this one). A block whose transforms depend on a derived mode (DERIVE_TRANSFORM; chosen into t before)
 // gets its data here (signPredData) and its residual computed in any case.
+// signPredData of a block above 32 x 32 (signPredictionLarge): the border of the residual with every predicted sign
+// positive into SPL_BASE and the templates into SPL_TEMPL (as signPredData computes them into s_spBase / s_spTempl),
+// the first stages in chunks of rows that fit s_spStage1. All invocations, ending with a barrier
+void signPredDataLarge( Tu c, int n, int lid, int NT )
+{
+  BufI32    sp      = BufI32( P.signPred );
+  BufI32    mt      = BufI32( P.matrices );
+  BufI8     kernels = BufI8( P.secKernels );
+  BufI32    cf      = BufI32( P.coeffs );
+  const int W = c.w, H = c.h, len = W + H, nzR = c.nzRows, nzC = c.nzCols, addDq = dequantAdd( c );
+  const int rnd1 = 1 << ( c.shift1 - 1 ), rnd2 = 1 << ( c.shift2 - 1 ), nsptShift = c.shift1 + c.shift2 - 7;
+  const int none[8] = int[8]( -1, -1, -1, -1, -1, -1, -1, -1 );
+  const bool prepared = c.secKind != SEC_NONE;
+  if( prepared )
+  {
+    prepareCoefficients( c, none, lid, NT );
+  }
+  const int chunk = c.secKind == SEC_NSPT ? H : min( H, 1024 / nzC );
+  for( int y0 = 0; y0 < H; y0 += chunk )   // (the base: the left column's rows of the chunk, the top row in the first)
+  {
+    const int rows = min( chunk, H - y0 );
+    if( c.secKind != SEC_NSPT )
+    {
+      firstStageRows( c, y0, rows, prepared, lid, NT );
+    }
+    for( int j = lid; j < len; j += NT )
+    {
+      const int y = j < H ? H - 1 - j : 0;
+      if( y >= y0 && y < y0 + rows )
+      {
+        splSet( SPL_BASE + j, j < H ? secondStage( c, 0, y, y0, rows ) : secondStage( c, j - H, 0, y0, rows ) );
+      }
+    }
+    SYNC();
+  }
+  if( c.secKind != SEC_LFNST )
+  {
+    for( int i = lid; i < n * len; i += NT )
+    {
+      const int k = i / len, j = i % len;
+      const int pos = sp.v[c.spOffset + SP_POS + k], px = pos & 0xffff, py = pos >> 16;
+      const int r = j < H ? H - 1 - j : 0, col = j < H ? 0 : j - H;
+      int basis;
+      if( c.secKind == SEC_NSPT )
+      {
+        int scanIdx = 0;
+        while( scanIdx < c.secNumIn && mt.v[c.secScan + scanIdx] != pos )
+        {
+          scanIdx++;
+        }
+        const int jj = c.secTranspose != 0 ? col * H + r : r * W + col;
+        const int k8 = scanIdx < c.secNumIn ? int( kernels.v[c.secMatrix + scanIdx * c.secRowLength + jj] ) : 0;
+        basis = clip3i( c.trMin, c.trMax, ( 256 * k8 + ( 1 << ( nsptShift - 1 ) ) ) >> nsptShift );
+      }
+      else
+      {
+        const int stage1 = clip3i( c.trMin, c.trMax, ( mt.v[c.mtxV + py * H + r] * 256 + rnd1 ) >> c.shift1 );
+        basis = clip3i( c.trMin, c.trMax, ( mt.v[c.mtxH + px * W + col] * stage1 + rnd2 ) >> c.shift2 );
+      }
+      const int coeffVal = dequant( c, cf.v[c.coeffOffset + py * nzC + px], addDq, mt, P.qcsOffset );
+      splSet( SPL_TEMPL + i, int( int16_t( ( coeffVal * basis + 128 ) >> 8 ) ) );
+    }
+    splSync();
+    return;
+  }
+  // (LFNST: per predicted coefficient its region alone through the LFNST, then both stages at the border by chunks)
+  for( int k = 0; k < n; k++ )
+  {
+    const int pos = sp.v[c.spOffset + SP_POS + k];
+    int scanIdx = 0;
+    while( scanIdx < c.secNumIn && mt.v[c.secScan + scanIdx] != pos )
+    {
+      scanIdx++;
+    }
+    for( int i = lid; i < nzR * nzC; i += NT )
+    {
+      s_spCoef[i] = int16_t( 0 );
+    }
+    SYNC();
+    for( int j = lid; j < c.secRowLength && scanIdx < c.secNumIn; j += NT )
+    {
+      const int lp = mt.v[c.secLayout + j];
+      s_spCoef[( lp >> 16 ) * nzC + ( lp & 0xffff )] =
+        int16_t( clip3i( c.trMin, c.trMax, ( 256 * int( kernels.v[c.secMatrix + scanIdx * c.secRowLength + j] ) + 64 ) >> 7 ) );
+    }
+    SYNC();
+    const int coeffVal = dequant( c, cf.v[c.coeffOffset + ( pos >> 16 ) * nzC + ( pos & 0xffff )], addDq, mt, P.qcsOffset );
+    for( int y0 = 0; y0 < H; y0 += chunk )
+    {
+      const int rows = min( chunk, H - y0 );
+      for( int i = lid; i < nzC * rows; i += NT )
+      {
+        const int xf = i / rows, y = y0 + i % rows;
+        int sum = 0;
+        for( int ky = 0; ky < nzR; ky++ ) sum += mt.v[c.mtxV + ky * H + y] * int( s_spCoef[ky * nzC + xf] );
+        s_spStage1[i] = int16_t( clip3i( c.trMin, c.trMax, ( sum + rnd1 ) >> c.shift1 ) );
+      }
+      SYNC();
+      for( int j = lid; j < len; j += NT )
+      {
+        const int r = j < H ? H - 1 - j : 0, col = j < H ? 0 : j - H;
+        if( r >= y0 && r < y0 + rows )
+        {
+          int sum = 0;
+          for( int xf = 0; xf < nzC; xf++ ) sum += mt.v[c.mtxH + xf * W + col] * int( s_spStage1[xf * rows + r - y0] );
+          const int basis = clip3i( c.trMin, c.trMax, ( sum + rnd2 ) >> c.shift2 );
+          splSet( SPL_TEMPL + k * len + j, int( int16_t( ( coeffVal * basis + 128 ) >> 8 ) ) );
+        }
+      }
+      SYNC();
+    }
+  }
+  splSync();
+}
+
+// signPrediction of an inter block above 32 x 32 (up to SIGN_PRED_MAX_BS_INTER, 128 x 128), its arrays in the
+// workgroup's scratch (SPL_*; the values as the CPU's Pel, as signPrediction's 16-bit arrays keep them), the first
+// stages in chunks of rows that fit s_spStage1 (as inChainResidual): with LFNST / NSPT (a derived mode's transforms,
+// chosen into t before) its data computed here (signPredDataLarge) and its residual in any case
+void signPredictionLarge( Tu t, int lid, int NT )
+{
+  splSync();   // (the prediction storeRecon kept)
+  Tu c = t.spCoded == g_ti ? t : BufTu( P.tus ).v[t.spCoded];   // the block with the coefficients
+  const bool inChain = WITH_DERIVED_TRANSFORMS && ( c.derive & DERIVE_TRANSFORM ) != 0;
+  if( inChain && t.spCoded != g_ti )   // (the other block of a joint CbCr pair: its CU's mode, as signPrediction's)
+  {
+    const bool cclmDimd = WITH_CCLM && ( c.derive & DERIVE_CCLM_DIMD ) != 0;
+    selectTransform( c, cclmDimd ? s_predDimdMode : s_mode, cclmDimd ? 0 : BufCu( P.cus ).v[c.cu].plIdx );
+  }
+  const int W = t.w, H = t.h, len = W + H;
+  BufI32    sp   = BufI32( P.signPred );
+  BufI16    resi = BufI16( P.dbgResi );
+  const int n = sp.v[c.spOffset + SP_NUM], codedSigns = sp.v[c.spOffset + SP_SIGNS];
+  const bool useLeft = t.x != 0 || t.y == 0, useTop = t.y != 0 || t.x == 0;
+  const int  first = useLeft ? 0 : H, last = useTop ? len : H;
+  if( inChain )
+  {
+    signPredDataLarge( c, n, lid, NT );
+  }
+  for( int j = lid; j < len; j += NT )
+  {
+    const bool left = j < H;
+    const int  x = left ? 0 : j - H, y = left ? H - 1 - j : 0;
+    int predicted = 1 << ( t.bitDepth - 1 );
+    if( left ? t.x != 0 : t.y != 0 )
+    {
+      const int nextTo = left ? recoAt( t.comp, t.x - 1, t.y + y ) : recoAt( t.comp, t.x + x, t.y - 1 );
+      const int beyond = left ? recoAt( t.comp, t.x - 2, t.y + y ) : recoAt( t.comp, t.x + x, t.y - 2 );
+      predicted = asPel( 2 * nextTo - beyond );
+    }
+    splSet( SPL_BORDER + j, int( int16_t( predicted - splGet( SPL_PRED + y * W + x ) ) ) );
+    if( !inChain )
+    {
+      splSet( SPL_BASE + j, int( resi.v[t.dbgOffset + y * W + x] ) );
+    }
+  }
+  for( int i = lid; i < n * len && !inChain; i += NT )
+  {
+    splSet( SPL_TEMPL + i, int( int16_t( sp.v[c.spOffset + SP_TEMPLATES + i] ) ) );
+  }
+  splSync();
+  for( int i = lid; i < 16 * len; i += NT )   // (the halves, as signPrediction's)
+  {
+    const int j = i >> 4, h = i & 15;
+    int low = splGet( SPL_BASE + j ), high = 0;
+    for( int b = 0; b < 4; b++ )
+    {
+      if( ( ( h >> b ) & 1 ) != 0 && b < n )
+      {
+        low -= 2 * splGet( SPL_TEMPL + ( n - 1 - b ) * len + j );
+      }
+      if( ( ( h >> b ) & 1 ) != 0 && b + 4 < n )
+      {
+        high -= 2 * splGet( SPL_TEMPL + ( n - 5 - b ) * len + j );
+      }
+    }
+    splSet( SPL_LOW + i, int( int16_t( low ) ) );
+    splSet( SPL_HIGH + i, int( int16_t( high ) ) );
+  }
+  splSync();
+  const int maxPel = ( 1 << t.bitDepth ) - 1;
+  for( int s = lid; s < ( 1 << n ); s += NT )
+  {
+    const int low = s & 15, high = s >> 4;
+    uint cost = 0;
+    for( int j = first; j < last; j++ )
+    {
+      int v = asPel( splGet( SPL_LOW + j * 16 + low ) + splGet( SPL_HIGH + j * 16 + high ) );
+      if( g_crs )
+      {
+        v = scalePel( v, g_crsScale, maxPel );
+      }
+      cost += uint( abs( splGet( SPL_BORDER + j ) - v ) );
+    }
+    s_spCost[s] = ( cost << 8 ) | uint( s );
+  }
+  SYNC();
+  // (the decision, as signPrediction's)
+  uint minIdx = 0, base = 0, signMask = 1u << n;
+  bool wrong    = true;
+  int  negative = 0;
+  for( int k = 0; k < n; k++ )
+  {
+    if( wrong )
+    {
+      uint m = 0xffffffffu;
+      for( uint idx = base + gl_SubgroupInvocationID; idx < base + signMask; idx += gl_SubgroupSize )
+      {
+        m = min( m, s_spCost[idx] );
+      }
+      minIdx = subgroupMin( m ) & 0xffu;
+    }
+    signMask >>= 1;
+    const bool predSign = ( minIdx & signMask ) != 0;
+    wrong = ( ( codedSigns >> k ) & 1 ) != 0;
+    if( predSign != wrong )
+    {
+      negative |= 1 << k;
+      base += signMask;
+    }
+  }
+  if( negative == 0 && !inChain )
+  {
+    for( int i = lid; i < W * H; i += NT )
+    {
+      reconstruct( t, i % W, i / W, splGet( SPL_PRED + i ), int( resi.v[t.dbgOffset + i] ) );
+    }
+    return;
+  }
+  // the residual with the decided signs (the positions of the negative ones, x | y << 16, else -1), by chunks of rows
+  int negativeAt[8];
+  for( int k = 0; k < 8; k++ )
+  {
+    negativeAt[k] = k < n && ( ( negative >> k ) & 1 ) != 0 ? sp.v[c.spOffset + SP_POS + k] : -1;
+  }
+  BufI32     mt       = BufI32( P.matrices );
+  BufI32     cf       = BufI32( P.coeffs );
+  const bool prepared = c.secKind != SEC_NONE;   // (LFNST / NSPT: their inputs and outputs in shared memory)
+  if( prepared )
+  {
+    prepareCoefficients( c, negativeAt, lid, NT );
+  }
+  const int nzR = c.nzRows, nzC = c.nzCols, addDq = dequantAdd( c ), rnd1 = 1 << ( c.shift1 - 1 );
+  const int chunk = c.secKind == SEC_NSPT ? H : min( H, 1024 / nzC );
+  const int derivedOffset = abs( c.jccr ) == 3 ? c.dbgOffset : c.jccrOffset;
+  for( int y0 = 0; y0 < H; y0 += chunk )
+  {
+    const int rows = min( chunk, H - y0 );
+    if( prepared && c.secKind != SEC_NSPT )
+    {
+      firstStageRows( c, y0, rows, true, lid, NT );
+    }
+    else if( !prepared )
+    {
+      for( int i = lid; i < nzC * rows; i += NT )   // (firstStageRows with the decided signs)
+      {
+        const int xf = i / rows, y = y0 + i % rows;
+        int sum = 0;
+        for( int k = 0; k < nzR; k++ )
+        {
+          int       q   = cf.v[c.coeffOffset + k * nzC + xf];
+          const int pos = xf | ( k << 16 );
+          for( int b = 0; b < 8; b++ )
+          {
+            q = negativeAt[b] == pos ? -q : q;
+          }
+          sum += q != 0 ? mt.v[c.mtxV + k * H + y] * dequant( c, q, addDq, mt, P.qcsOffset ) : 0;
+        }
+        s_spStage1[i] = int16_t( clip3i( c.trMin, c.trMax, ( sum + rnd1 ) >> c.shift1 ) );
+      }
+      SYNC();
+    }
+    for( int i = lid; i < rows * W; i += NT )
+    {
+      const int x = i % W, y = y0 + i / W, o = y * W + x;
+      const int re = secondStage( c, x, y, y0, rows );
+      if( c.jccr != 0 )
+      {
+        CBufI16( P.dbgResi ).v[derivedOffset + o] = int16_t( jccrDerived( c.jccr, re ) );
+      }
+      if( pc.verify != 0 )
+      {
+        resi.v[t.dbgOffset + o] = int16_t( re );
+      }
+      reconstruct( t, x, y, splGet( SPL_PRED + o ), re );
+    }
+    SYNC();   // (s_spStage1 is the next rows')
+  }
+}
+
 void signPrediction( Tu t, int lid, int NT )
 {
+  if( t.w > 32 || t.h > 32 )
+  {
+    signPredictionLarge( t, lid, NT );
+    return;
+  }
   Tu c = t.spCoded == g_ti ? t : BufTu( P.tus ).v[t.spCoded];   // the block with the coefficients
   const bool inChain = WITH_DERIVED_TRANSFORMS && ( c.derive & DERIVE_TRANSFORM ) != 0;
   if( inChain && t.spCoded != g_ti )   // the other block of a joint CbCr pair, in the same CU (CCLM: its DIMD, found too)

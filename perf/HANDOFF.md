@@ -2424,6 +2424,15 @@ the CU's prediction; selectOBMCmode's template of the CU's own motion takes it t
 streams, build gpu55): every picture identical (ra_wpp_q32 skipped as before); non-local LIC 113 CUs predicted by the
 GPU, affine 1490 (+82); from the CPU: non-local LIC (with BDOF) 17, (OBMC with an intra neighbour) 12, (other) 3,
 (resampling) 2.
+Sign prediction of inter blocks above 32 x 32 (2026-10-22, agent lf; partial verification): an inter block predicts
+signs up to SIGN_PRED_MAX_BS_INTER (128 x 128), intra_rec's signPrediction keeps 32 x 32 in shared memory. A block wider
+or taller than 32 takes signPredictionLarge, whose arrays are in the workgroup's scratch (SPL_*: the prediction, which
+storeRecon keeps there instead of s_spPred, the border, the base residual, the templates, the halves; their values cut
+to the CPU's Pel as the shared arrays' int16 cut them) and which computes the first transform stage in chunks of rows
+that fit s_spStage1 (as inChainResidual): the residual with the decided signs (without LFNST / NSPT the negated levels
+dequantized on the fly) and, with LFNST / NSPT (DERIVE_TRANSFORM: their mode a DIMD of the prediction), the base border
+and the templates (signPredDataLarge). The intra path is unchanged: blocks up to 32 x 32 take signPrediction as before
+(storeRecon has one more branch, taken only where sign prediction keeps the prediction).
 
 
 ## 8. Numbers (i7-10700 8C/16T, Win11, GCC 16.2, RTX 3070 driver 616.92)

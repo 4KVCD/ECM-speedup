@@ -7619,6 +7619,12 @@ void GpuIntraRec::interCu( const CodingUnit& cu )
   m.interPending.insert( &cu );
 }
 
+// sign prediction of an inter block above 32 x 32 (intra_rec's signPredictionLarge, in the workgroup's scratch)
+static void signPredLarge( GpuIntraRec::Impl& m )
+{
+  m.blendBlocks = true;   // (its work area)
+}
+
 // the record of block compID of TU tu of an inter CU (recordInterCu): the CPU's prediction (Params::interPred at the
 // block's samples; luma forward-mapped by LMCS on the GPU where DecCu::xDecodeInterTU maps it) and the GPU's residual
 // as an intra block's (joint CbCr, sign prediction, transforms, dequantization, levels), reconstructed as xDecodeInterTU does: clipped to
@@ -7858,11 +7864,10 @@ static bool recordInterBlock( GpuIntraRec::Impl& m, const TransformUnit& tu, con
     why = "inter sign prediction outside TU::getUseSignPred's conditions";
     return false;
   }
-  // (an inter block's up to SIGN_PRED_MAX_BS_INTER, 128; intra_rec's signPrediction keeps 32 x 32)
+  // (an inter block's up to SIGN_PRED_MAX_BS_INTER, 128: intra_rec's signPredictionLarge)
   if( signPred && ( area.width > 32 || area.height > 32 ) )
   {
-    why = "inter sign prediction above 32 x 32";
-    return false;
+    signPredLarge( m );
   }
   Secondary sec;
   if( !transformFields( m, tu, resiComp, area, t, sec, why ) || !dequantFields( tu, resiComp, resiQp, area, t, why ) )
