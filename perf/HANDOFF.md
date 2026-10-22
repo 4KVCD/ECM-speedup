@@ -2021,6 +2021,20 @@ its mode). What remains is the chroma mode: an IntraTMP luma CU makes DBV availa
 rejected as before); one CU (ra_nodualtree_q32) moved to the GPU. DBV (refineChromaBv's template refinement, IBC's
 fractional interpolation, RR-IBC flips) is the next step for these CUs. Results (build agst6): the 5 streams
 identical, the CPU CU reasons otherwise unchanged. Host only.
+LFNST without the SPS's LFNSTExt (2026-10-22): VVC's kernels (TrQuant::xInvLfnst / invLfnstNxN with lfnstExtFlag
+off: g_vvcLfnstLut's 4 sets, lfnstIdx 1-2, g_vvcLfnst4x4 16 x 16 or g_vvcLfnst8x8 16 x 48; no 16 x 16 region, so a
+block of 8 x 8 and above takes the 8x8 region and g_coefTopLeftDiagScan8x8; 16 inputs, getLFNSTMatrixDim's 16, for
+every size). Host only: invSecondary chooses them like the CPU, the kernel tables join secKernels, the output
+arrangements (lfnstOutputLayout with ext off: 48 outputs, untransposed rows 0-3 of 8 and 4-7 of 4) and a second
+TR_TAB directory (Params::trTables by the SPS) whose LFNST matrix table holds VVC's matrices under g_lfnstLut's set
+(g_vvcLfnstLut is a function of it, checked at creation; MTSS compares g_lfnstLut's sets in any case), so intra_rec's
+selectTransform and mtssChoice are unchanged. CPU quirk: transposed, xInvLfnst copies the 8x8 region as for the
+extension's 64 outputs, columns 6-7 from entries 48-63 of m_tempOutMatrix, which no VVC kernel writes (zero); those
+levels are zero too (lfnstIdx is parsed only with the last level in the first 16 scan positions), so the layout leaves
+them out. Results (Intel PC, build aglf1): ai_off15_q27, ra_off15_q32, ra_off5_q32 identical, "LFNST without its
+extension (the VVC kernels)" 77 / 106 / 106 -> 0 CUs from the CPU (a debug count saw every kind: 4x4 / 8x8 regions,
+both indices, transposed or not); ai_foreman352_q37 and ra_foreman_q32 identical with the same CPU CUs. No shader
+change.
 
 
 ## 8. Numbers (i7-10700 8C/16T, Win11, GCC 16.2, RTX 3070 driver 616.92)

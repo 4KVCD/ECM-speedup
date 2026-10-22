@@ -950,10 +950,13 @@ struct Secondary
   const ScanElement* scan      = nullptr;
   int                sbSize    = 0;       // LFNST: its outputs lie in the top-left sbSize x sbSize
   bool               transpose = false;
+  bool               ext       = true;    // LFNST: the SPS's LFNSTExt (else the VVC kernels)
 };
 
-// false where the block's LFNST is one the GPU path does not have (the VVC kernels without the extension)
-bool invSecondary( const TransformUnit& tu, const ComponentID compID, Secondary& s )
+// the block's LFNST or NSPT as TrQuant::xInvLfnst / xInvNspt choose it: without the SPS's LFNSTExt the VVC kernels
+// (g_vvcLfnstLut's 4 sets, 2 indices, 16 inputs; 16 outputs in a 4x4 region, or 48 in an 8x8 region, also for blocks
+// of 16 x 16 and above)
+void invSecondary( const TransformUnit& tu, const ComponentID compID, Secondary& s )
 {
   s = Secondary();
   const CodingUnit& cu   = *tu.cu;
@@ -962,7 +965,7 @@ bool invSecondary( const TransformUnit& tu, const ComponentID compID, Secondary&
   const int         W = area.width, H = area.height;
   if( !cu.lfnstIdx || W < 2 || H < 2 )   // NSPT is in xIT's 2-D path only; LFNST is not signalled there
   {
-    return true;
+    return;
   }
   const bool spsIntraLfnstEnabled = ( cu.slice->getSliceType() == I_SLICE && sps.getUseIntraLFNSTISlice() )
                                     || ( cu.slice->getSliceType() != I_SLICE && sps.getUseIntraLFNSTPBSlice() );
@@ -978,44 +981,53 @@ bool invSecondary( const TransformUnit& tu, const ComponentID compID, Secondary&
     s.matrix     = TrQuant::getNsptMatrix( g_nsptLut[intraMode], tw, th, cu.lfnstIdx - 1, PU::getNSPTBucket( tu, secondBucket, compID ) );
     s.rowLength  = tw * th;
     s.scan       = g_scanOrder[SCAN_GROUPED_4x4][SCAN_DIAG][gp_sizeIdxInfo->idxFrom( W )][gp_sizeIdxInfo->idxFrom( H )];
-    return true;
+    return;
   }
   const bool lfnstOn = ( spsIntraLfnstEnabled && CU::isIntra( cu ) ) || ( sps.getUseInterLFNST() && CU::isInter( cu ) );
   if( !lfnstOn || tu.mtsIdx[compID] == MTS_SKIP || !( cu.separateTree || isLuma( compID ) ) || allowNSPT )
   {
-    return true;
+    return;
   }
   const bool ext = sps.getUseLFNSTExt();
   if( cu.lfnstIdx >= ( ext ? 4 : 3 ) )
   {
-    return true;
-  }
-  if( !ext )
-  {
-    return false;
+    return;
   }
   const uint32_t intraMode = PU::getFinalIntraModeForTransform( secondBucket, tu, compID ).first;
-  const bool     whge4 = PU::getUseLFNST16( W, H ), whge3 = PU::getUseLFNST8( W, H );
+  const bool     whge4 = ext && PU::getUseLFNST16( W, H ), whge3 = PU::getUseLFNST8( W, H );
   const int      widthIdx = gp_sizeIdxInfo->idxFrom( W ), heightIdx = gp_sizeIdxInfo->idxFrom( H );
-  const int      mode = g_lfnstLut[intraMode], index = cu.lfnstIdx - 1;
+  const int      mode = ext ? g_lfnstLut[intraMode] : g_vvcLfnstLut[intraMode], index = cu.lfnstIdx - 1;
   s.kind      = SEC_LFNST;
+  s.ext       = ext;
   s.transpose = PU::getTransposeFlag( intraMode );
   s.sbSize    = whge4 ? 16 : whge3 ? 8 : 4;
   s.scan      = whge4 ? g_coefTopLeftDiagScan16x16[widthIdx]
                       : whge3 ? g_coefTopLeftDiagScan8x8[widthIdx] : g_scanOrder[SCAN_GROUPED_4x4][SCAN_DIAG][widthIdx][heightIdx];
-  s.numIn     = PU::getLFNSTMatrixDim( W, H, ext );   // zeroOutSize: the inputs invLfnstNxN uses
-  s.matrix    = s.sbSize > 8 ? &g_lfnst16x16[mode][index][0][0] : s.sbSize > 4 ? &g_lfnst8x8[mode][index][0][0] : &g_lfnst4x4[mode][index][0][0];
-  s.rowLength = s.sbSize > 8 ? L16W_ZO : s.sbSize > 4 ? L8W_ZO : 16;
-  return true;
+  // zeroOutSize: the inputs invLfnstNxN uses (without the extension 16, as many as xInvLfnst gathers)
+  s.numIn     = PU::getLFNSTMatrixDim( W, H, ext );
+  if( ext )
+  {
+    s.matrix    = s.sbSize > 8 ? &g_lfnst16x16[mode][index][0][0] : s.sbSize > 4 ? &g_lfnst8x8[mode][index][0][0] : &g_lfnst4x4[mode][index][0][0];
+    s.rowLength = s.sbSize > 8 ? L16W_ZO : s.sbSize > 4 ? L8W_ZO : 16;
+  }
+  else
+  {
+    s.matrix    = s.sbSize > 4 ? &g_vvcLfnst8x8[mode][index][0][0] : &g_vvcLfnst4x4[mode][index][0][0];
+    s.rowLength = s.sbSize > 4 ? 48 : 16;
+  }
 }
 
-// xInvLfnst's arrangement of the extended LFNST's outputs in the top-left sbSize x sbSize of the coefficients: the
-// position x | y << 16 of each output, found by replaying its copies (with the CPU's row stride sbSize) on the outputs'
-// numbers
-std::vector<int32_t> lfnstOutputLayout( const int sbSize, const bool transpose )
+// xInvLfnst's arrangement of the LFNST's outputs in the top-left sbSize x sbSize of the coefficients: the position
+// x | y << 16 of each output, found by replaying its copies (with the CPU's row stride sbSize) on the outputs' numbers.
+// Without the extension (ext false) the 8x8 region takes 48 outputs: untransposed rows 0..3 of 8 and 4..7 of 4;
+// transposed xInvLfnst copies as for the extension's 64, columns 0..5 from the 48 outputs and columns 6 and 7 from
+// entries 48..63 of m_tempOutMatrix, which no VVC kernel writes (zero, as TrQuant's buffer is never written there; the
+// levels these positions held are zero too, as lfnstIdx is parsed only for blocks whose last level lies in the first
+// 16 scan positions): the layout leaves them out, keeping the region's coefficients there
+std::vector<int32_t> lfnstOutputLayout( const int sbSize, const bool transpose, const bool ext = true )
 {
-  const int            numOut = sbSize > 8 ? L16W_ZO : sbSize > 4 ? L8W_ZO : 16, width = sbSize;
-  std::vector<int32_t> out( numOut ), region( sbSize * sbSize, -1 );
+  const int            numOut = !ext ? ( sbSize > 4 ? 48 : 16 ) : sbSize > 8 ? L16W_ZO : sbSize > 4 ? L8W_ZO : 16, width = sbSize;
+  std::vector<int32_t> out( std::max( numOut, sbSize == 8 ? 64 : 0 ), -1 ), region( sbSize * sbSize, -1 );
   for( int j = 0; j < numOut; j++ )
   {
     out[j] = j;
@@ -1058,7 +1070,7 @@ std::vector<int32_t> lfnstOutputLayout( const int sbSize, const bool transpose )
   {
     for( int y = 0; y < ( sbSize == 16 ? 12 : sbSize ); y++, coeffTemp += width )
     {
-      const int stride = sbSize == 16 ? ( y < 4 ? 12 : y < 8 ? 8 : 4 ) : sbSize;
+      const int stride = sbSize == 16 ? ( y < 4 ? 12 : y < 8 ? 8 : 4 ) : ext || y < 4 ? sbSize : 4;
       std::copy_n( lfnstTemp, stride, coeffTemp );
       lfnstTemp += stride;
     }
@@ -1323,7 +1335,9 @@ struct Shared
   int32_t                          qcsOffset = 0;                 // of the QCS weights in matrices
   int32_t                          mipOffset[3] = {};             // of the MIP matrices of each size class in matrices
   int32_t                          lfnstLayout[3][2] = {};        // of the LFNST output positions in matrices (sbSize 4, 8, 16; transposed)
+  int32_t                          lfnstLayoutVvc[2][2] = {};     // those without LFNSTExt (sbSize 4, 8; transposed)
   int32_t                          trTables = 0;                  // of the transform tables' directory in matrices (TR_TAB_*)
+  int32_t                          trTablesVvc = 0;               // of the directory for SPSs without LFNSTExt
   int32_t                          pdpTable = 0;                  // of PDP's filters' offsets in matrices
   int32_t                          sgpmWeights[5][5][3] = {};     // per SGPM CU size (log2 - 2) the offsets of its
                                                                   // template's and block's weights in matrices (the
@@ -1709,10 +1723,17 @@ Shared* createShared( gpu::Context& ctx )
       const std::vector<int32_t> layout = lfnstOutputLayout( 4 << s, transpose != 0 );
       sh->lfnstLayout[s][transpose] = (int32_t) mat.size();
       mat.insert( mat.end(), layout.begin(), layout.end() );
+      if( s < 2 )   // without the extension
+      {
+        const std::vector<int32_t> layoutVvc = lfnstOutputLayout( 4 << s, transpose != 0, false );
+        sh->lfnstLayoutVvc[s][transpose] = (int32_t) mat.size();
+        mat.insert( mat.end(), layoutVvc.begin(), layoutVvc.end() );
+      }
     }
   }
-  // the CPU's LFNST (extended) and NSPT matrices as they are (int8)
-  sh->secTables = { { &g_lfnst4x4[0][0][0][0], sizeof( g_lfnst4x4 ) },   { &g_lfnst8x8[0][0][0][0], sizeof( g_lfnst8x8 ) },
+  // the CPU's LFNST (extended, and VVC's for SPSs without LFNSTExt) and NSPT matrices as they are (int8)
+  sh->secTables = { { &g_vvcLfnst4x4[0][0][0][0], sizeof( g_vvcLfnst4x4 ) }, { &g_vvcLfnst8x8[0][0][0][0], sizeof( g_vvcLfnst8x8 ) },
+                    { &g_lfnst4x4[0][0][0][0], sizeof( g_lfnst4x4 ) },   { &g_lfnst8x8[0][0][0][0], sizeof( g_lfnst8x8 ) },
                     { &g_lfnst16x16[0][0][0][0], sizeof( g_lfnst16x16 ) }, { &g_nspt4x4[0][0][0], sizeof( g_nspt4x4 ) },
                     { &g_nspt4x8[0][0][0], sizeof( g_nspt4x8 ) },          { &g_nspt8x4[0][0][0], sizeof( g_nspt8x4 ) },
                     { &g_nspt8x8[0][0][0], sizeof( g_nspt8x8 ) },          { &g_nspt4x16[0][0][0], sizeof( g_nspt4x16 ) },
@@ -1795,6 +1816,37 @@ Shared* createShared( gpu::Context& ctx )
 #endif
     sh->trTables = (int32_t) mat.size();
     mat.insert( mat.end(), tab.begin(), tab.end() );
+    // the directory for SPSs without LFNSTExt (Params::trTables): the one above but for the LFNST matrices and output
+    // arrangements, VVC's (sbSize 4 and 8, indices 0 and 1). Its matrix table stays indexed by g_lfnstLut's set (which
+    // MTSS's choice compares in any case, mtssChoice): g_vvcLfnstLut is a function of that set, checked here
+    std::vector<int32_t> vvcSet( 35, -1 );
+    for( int im = 0; im < NUM_LFNST_INTRA_MODES; im++ )
+    {
+      int& set = vvcSet[g_lfnstLut[im]];
+      CHECK( set >= 0 && set != g_vvcLfnstLut[im], "g_vvcLfnstLut is not a function of g_lfnstLut" );
+      set = g_vvcLfnstLut[im];
+    }
+    std::vector<int32_t> dir( tab.begin(), tab.begin() + TR_TAB_NUM ), tail;
+    for( int s = 0; s < 3; s++ )
+    {
+      for( int set = 0; set < 35; set++ )
+      {
+        for( int idx = 0; idx < 3; idx++ )
+        {
+          const int vs = vvcSet[set];
+          tail.push_back( s > 1 || idx > 1 || vs < 0 ? -1
+                          : sh->kernelOffset( s == 0 ? &g_vvcLfnst4x4[vs][idx][0][0] : &g_vvcLfnst8x8[vs][idx][0][0] ) );
+          CHECK( s < 2 && idx < 2 && vs >= 0 && tail.back() < 0, "a VVC LFNST matrix outside the kernels" );
+        }
+      }
+    }
+    dir[TR_TAB_LFNST_MATRIX] = (int32_t) ( mat.size() + TR_TAB_NUM );
+    dir[TR_TAB_LFNST_LAYOUT] = (int32_t) ( mat.size() + TR_TAB_NUM + tail.size() );
+    tail.insert( tail.end(), &sh->lfnstLayoutVvc[0][0], &sh->lfnstLayoutVvc[0][0] + 4 );
+    tail.insert( tail.end(), { -1, -1 } );   // (no 16 x 16 region)
+    sh->trTablesVvc = (int32_t) mat.size();
+    mat.insert( mat.end(), dir.begin(), dir.end() );
+    mat.insert( mat.end(), tail.begin(), tail.end() );
   }
   sh->filters.create( ctx, filt.size() * 4, gpu::Buffer::DEVICE );
   sh->matrices.create( ctx, mat.size() * 4, gpu::Buffer::DEVICE );
@@ -5696,11 +5748,7 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
       return;
     }
     Secondary sec;
-    if( !invSecondary( tu, resiComp, sec ) )
-    {
-      reject( "LFNST without its extension (the VVC kernels)" );
-      return;
-    }
+    invSecondary( tu, resiComp, sec );
     int        trTypeHor, trTypeVer;
     const bool separable = m.trQuant->getInvTransformTypes( tu, resiComp, trTypeHor, trTypeVer );
     if( area.width > 1 && area.height > 1 && separable == ( sec.kind == SEC_NSPT ) )   // xIT: NSPT or the separable one
@@ -5717,7 +5765,9 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
       t.secScan      = m.sh->scanOffset( sec.scan );
       t.secSize      = sec.sbSize;
       t.secTranspose = sec.transpose ? 1 : 0;
-      t.secLayout    = sec.kind == SEC_LFNST ? m.sh->lfnstLayout[floorLog2( sec.sbSize ) - 2][t.secTranspose] : 0;
+      t.secLayout    = sec.kind != SEC_LFNST ? 0
+                       : sec.ext ? m.sh->lfnstLayout[floorLog2( sec.sbSize ) - 2][t.secTranspose]
+                                 : m.sh->lfnstLayoutVvc[floorLog2( sec.sbSize ) - 2][t.secTranspose];
       if( t.secMatrix < 0 || t.secScan < 0 || sec.numIn > 64 || ( sec.kind == SEC_LFNST && sec.rowLength > 96 ) )
       {
         reject( "an LFNST / NSPT matrix or scan the GPU lacks" );
@@ -6777,7 +6827,7 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
   P.lumaClipMin = cs.slice->clpRng( COMPONENT_Y ).min;
   P.lumaClipMax = cs.slice->clpRng( COMPONENT_Y ).max;
   P.qcsOffset   = m.sh->qcsOffset;
-  P.trTables    = m.sh->trTables;
+  P.trTables    = cs.sps->getUseLFNSTExt() ? m.sh->trTables : m.sh->trTablesVvc;
   P.pdpTable    = m.sh->pdpTable;
   P.ctuSize     = (int32_t) cs.sps->getCTUSize();
 #if JVET_AD0208_IBC_ADAPT_FOR_CAM_CAPTURED_CONTENTS
