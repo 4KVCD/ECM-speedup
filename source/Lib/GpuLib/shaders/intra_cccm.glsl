@@ -45,9 +45,8 @@
 
 const int CCCM_WINDOW   = 6;         // CCCM_WINDOW_SIZE: the template's rows above / columns left of the block
 const int CCCM_MAX_PARAMS = 11;      // a model's parameters: CCCM_NUM_PARAMS 7, else 9 to 11 (GLM with luma 3)
-const int CCCM_DECIM    = 16;        // DECIM_BITS (bit depths up to 10)
-const int CCCM_MATRIX   = 22;        // CCCM_MATRIX_BITS
-const int GLM_MATRIX    = 28;        // solve1's matrix bits (GLM with luma)
+const int CCCM_MATRIX   = 22;        // CCCM_MATRIX_BITS (bit depths up to 10)
+const int GLM_MATRIX    = 28;        // solve1's matrix bits (GLM with luma; up to 10 bits)
 const int GLM_PARAMS    = 3;         // GLM_NUM_PARAMS
 const int CCCM_LUMA_MAX = 4 * ANG;   // the luma buffer's capacity in shared memory (GpuIntraRec.cpp's CCCM_LUMA_MAX)
 const int CCCM_PRED_MAX = 2048;      // the largest block whose prediction s_tmp keeps (larger: the scratch)
@@ -504,7 +503,8 @@ int cccmEntryIndex( int i, int j, int M )
   return i * M - ( ( i * ( i - 1 ) ) >> 1 ) + j - i;
 }
 
-int cccmNonlinear( int v, int bitDepth ) { return ( v * v + ( 1 << ( bitDepth - 1 ) ) ) >> bitDepth; }
+// CccmModel::nonlinear, a Pel (above 10 bits the term of a filter's gradient can pass 2^15)
+int cccmNonlinear( int v, int bitDepth ) { return int( int16_t( ( v * v + ( 1 << ( bitDepth - 1 ) ) ) >> bitDepth ) ); }
 
 // CCCM without subsampling (xCccmCalcModels' / ApplyModel's vectors by chromaloctype): per chroma location type
 // (Params::cclmFilter) the luma taps around the co-located luma sample - the averaging type's 2 x 2 samples, the
@@ -543,8 +543,8 @@ int cccmNoSubFeature( int f, int x, int y, int bitDepth )
 //   the bias
 // - GLM with luma: the gradient pattern's value (buffer 1), the sample, the bias
 // - CFLM: the sample, the chroma prediction (cflmChroma), the bias; both chroma features its block's component's
-// Each below 2^15 in magnitude up to 10 bits (the nonlinear terms of the filters' gradients the largest): their
-// products fit 32 bits
+// Each a Pel, as the CPU's vectors hold them (below 2^15 in magnitude up to 10 bits; above, the nonlinear terms of the
+// filters' gradients wrap as the CPU's): their products fit 32 bits
 int cflmChroma( int x, int y );
 
 int cccmFeature( int f, int x, int y, int c, int bitDepth )
@@ -674,6 +674,14 @@ void cccmAccumulate( Tu t, int k, bool twoModels, int lid, int NT )
 
 int64_t cccmSum( int e ) { return cccmTmpLoad( CCCM_SUMS + e ); }
 
+// the models' precision, DECIM_BITS of the bit depth: 16 bits up to 10, else 22 (JVET-AJ0237's CCCM_DECIM_BITS_HBD;
+// Params::cccmDecim)
+int cccmDecim() { return P.cccmDecim; }
+
+// the solvers' matrix bits: lowBits up to 10 bits (solve2's CCCM_MATRIX_BITS, solve1's and solveEip's 28), else 32
+// (CCCM_MATRIX_BITS_HBD)
+int cccmMatrixBits( int lowBits ) { return P.cccmDecim > 16 ? 32 : lowBits; }
+
 // xDivide's tables (JVET-AB0174's division without a divider)
 const int CCCM_DIV_W[8] = int[8]( 214, 153, 113, 86, 67, 53, 43, 35 );
 const int CCCM_DIV_O[8] = int[8]( 4822, 5952, 6624, 6792, 6408, 5424, 3792, 1466 );
@@ -691,7 +699,7 @@ void cccmDivScale( int64_t denom, out int scale, out int round, out int shift )
   const int normDiff2 = normDiff - CCCM_DIV_O[diffFull];
   scale = ( ( CCCM_DIV_W[diffFull] * ( ( normDiff2 * normDiff2 ) >> 14 ) ) >> 8 ) - ( normDiff2 >> 1 )
           + CCCM_DIV_B[diffFull];
-  scale <<= CCCM_DECIM - 14;
+  scale <<= cccmDecim() - 14;
 }
 
 // xCccmDivideLowPrec: num / denom (denom > 0) by xDivide, its magnitude truncated
@@ -699,7 +707,7 @@ int cccmDivideLowPrec( int num, int denom )
 {
   int scale, round, shift;
   cccmDivScale( int64_t( denom ), scale, round, shift );
-  const int q = int( ( int64_t( abs( num ) ) * int64_t( scale ) + int64_t( round ) ) >> shift >> CCCM_DECIM );
+  const int q = int( ( int64_t( abs( num ) ) * int64_t( scale ) + int64_t( round ) ) >> shift >> cccmDecim() );
   return num < 0 ? -q : q;
 }
 
@@ -753,7 +761,7 @@ void cccmSolve( Tu t, int k, int lid )
     {
       for( int p = 0; p < M; p++ )
       {
-        cccmStore( cccmParamWord( k, lid, p ), p == M - 1 ? int64_t( 1 << CCCM_DECIM ) : int64_t( 0 ) );
+        cccmStore( cccmParamWord( k, lid, p ), p == M - 1 ? int64_t( 1 << cccmDecim() ) : int64_t( 0 ) );
       }
       s_cclm[CCCM_CLIP + ( k * 2 + lid ) * 2]     = 0;
       s_cclm[CCCM_CLIP + ( k * 2 + lid ) * 2 + 1] = maxPel;
@@ -771,14 +779,15 @@ void cccmSolve( Tu t, int k, int lid )
     const int64_t bias = cccmSum( cccmEntryIndex( lid, M - 1, M ) );
     a[M]     = cccmSum( triangle + lid ) - ( ( bias * int64_t( offCb ) ) >> ( bitDepth - 1 ) );
     a[M + 1] = cccmSum( triangle + M + lid ) - ( ( bias * int64_t( offCr ) ) >> ( bitDepth - 1 ) );
-    const int shift = ( g_cccmGlmLuma || ( WITH_CFLM && g_cccmCflm ) ? GLM_MATRIX : CCCM_MATRIX ) - 2 * bitDepth
-                      - cccmCeilLog2( n );
+    const int shift = cccmMatrixBits( g_cccmGlmLuma || ( WITH_CFLM && g_cccmCflm ) ? GLM_MATRIX : CCCM_MATRIX )
+                      - 2 * bitDepth - cccmCeilLog2( n );
     for( int j = 0; j < M + 2; j++ )
     {
       a[j] = shift > 0 ? a[j] << shift : a[j] >> -shift;
     }
     a[lid] += int64_t( 2 << ( bitDepth - 8 ) );
   }
+  const int decim = cccmDecim();
   for( int piv = 0; piv < M; piv++ )
   {
     if( lid == piv )
@@ -797,7 +806,7 @@ void cccmSolve( Tu t, int k, int lid )
       const int64_t f = a[piv];
       for( int j = piv + 1; j < M + 2; j++ )
       {
-        a[j] -= ( f * cccmLoad( CCCM_PIVOT_BASE + 2 * j ) + int64_t( 1 << ( CCCM_DECIM - 1 ) ) ) >> CCCM_DECIM;
+        a[j] -= ( f * cccmLoad( CCCM_PIVOT_BASE + 2 * j ) + int64_t( 1 << ( decim - 1 ) ) ) >> decim;
       }
     }
     SYNC();
@@ -818,11 +827,11 @@ void cccmSolve( Tu t, int k, int lid )
       int64_t v = cccmTmpLoad( i * CCCM_ROW + M + lid );
       for( int j = i + 1; j < M; j++ )
       {
-        v -= ( cccmTmpLoad( i * CCCM_ROW + j ) * x[j] + int64_t( 1 << ( CCCM_DECIM - 1 ) ) ) >> CCCM_DECIM;
+        v -= ( cccmTmpLoad( i * CCCM_ROW + j ) * x[j] + int64_t( 1 << ( decim - 1 ) ) ) >> decim;
       }
       x[i] = v;
     }
-    x[M - 1] += int64_t( lid == 0 ? offCb : offCr ) << ( CCCM_DECIM - ( bitDepth - 1 ) );
+    x[M - 1] += int64_t( lid == 0 ? offCb : offCr ) << ( decim - ( bitDepth - 1 ) );
     for( int p = 0; p < M; p++ )
     {
       cccmStore( cccmParamWord( k, lid, p ), x[p] );
@@ -849,7 +858,7 @@ int cccmPredict( int set, int c, int x, int y, bool twoModels, int bitDepth )
   {
     sum += cccmLoad( cccmParamWord( k, c, p ) ) * int64_t( cccmFeature( p, x, y, lc, bitDepth ) );
   }
-  const int v    = int( int16_t( int( ( sum + int64_t( 1 << ( CCCM_DECIM - 1 ) ) ) >> CCCM_DECIM ) ) );
+  const int v    = int( int16_t( int( ( sum + int64_t( 1 << ( cccmDecim() - 1 ) ) ) >> cccmDecim() ) ) );
   const int clip = CCCM_CLIP + ( k * 2 + c ) * 2;
   return clamp( v, s_cclm[clip], s_cclm[clip + 1] );
 }

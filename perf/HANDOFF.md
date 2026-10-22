@@ -1931,6 +1931,37 @@ it puts an MPM CU's DIMD kept aside to use) and makes such merge nodes prefix no
 gpu12): every stream identical but the 2 single-tree ones; intra CUs from the CPU 1697 -> 1477 ("an IntraTMP
 neighbour of intra merge" 200 -> 0, 9 for the new reason; "an intra merge neighbour of a kind the GPU lacks" 308 ->
 279).
+M75 (2026-10-22, agent hb): 12-bit internal bit depth for the tools rejected above 10 bits (JVET-AJ0237 is compiled
+in; the SPS has one bit depth for luma and chroma, sps_bitdepth_minus8, so "unequal bit depths" cannot occur in a
+decoded stream and those checks stay). The template costs: xGetHADs_SIMD's kernels keep 16-bit lanes up to 12 bits -
+the 4x4 kernel wholly (the column and row transforms wrap, each lane - one vertical frequency - adds its four absolute
+values in 16 bits, unsigned, then sad - absDc + absDc / 4 in uint32_t), the 8x4 / 4x8 kernels for the column transform
+only (>= 10 bits: widened to 32 for the rows), the thin ones (1x16, 1x8) only for the difference; timdHad now does the
+column transform first and wraps where the kernels do (lane16): identical to the kernels at 8, 10 and 12 bits in a
+harness of 24M random / extreme / overshooting blocks (the old code differed at 12 bits on 4x4 and 4x8; nothing wraps
+up to 10 bits). TIMD-SAD's xGetMRSAD_SIMD adds an AVX2 lane's 8 distances of a 128-wide arm in 16 bits, saturating at
+32767 (reachable from 12 bits): timdTemplateCosts sums such an arm per row and lane, min 32767. Each call site calls
+timdHad once (arguments by arm; it is inlined: the CCP-LFNST module 26k -> 54k IDs left with all of this). The
+CCP / EIP models: Params::cccmDecim (DECIM_BITS
+of the luma bit depth, 22 above 10 bits) replaces CCCM_DECIM in the divisions (xGetDivScaleRoundShift's scale,
+xCccmDivideLowPrec), the eliminations, back substitutions, the bias offsets, clearModel's bias, the convolutions, the
+blend model's shift (decimBits - 5) and CCP merge adjustment's deltas (<< decimBits - 5); cccmMatrixBits gives the
+solvers' matrix bits (32 above 10 bits for solve1 / solve2 / solveEip); cccmNonlinear returns a Pel as
+CccmModel::nonlinear does (the nonlinear term of a several-filters gradient passes 2^15 at 12 bits). CCLM's fit already
+was JVET-AJ0237's 64-bit code. The rejections now read "above 12 bits" (the scalar distortion forms and 13+ bits are not
+ported). Test set: t12 (C:\Code\ECM\streams_hb, not in git: the stock encoder's AI configuration with every tool,
+--InternalBitDepth=12 from 8-bit sources, 2-3 pictures: foreman CIF QP 22 / 27 / 37, ParkJoy 416x240 QP 27 / 37,
+CrowdRun and FourPeople 256x256 QP 32, gen_screen.py's screen content QP 22 / 32). Results (Intel Core Ultra 7 265K
+iGPU, build aghb2, partial verification): every t12 picture as with gpu5 (all identical but t12_four32's POC 2, whose
+first difference - indicesRepresentationPnn of an NN CU - gpu5 shows alike); intra CUs from the CPU on the 9 streams by
+the seven reasons 11138 -> 0 (MPM sorting / MDIP 3545, TIMD 3052, CCLM 2309, TMRL 1165, EIP 579, intra merge 424, LM
+chroma fusion 64), 370 of them now rejected for a neighbour the GPU lacks (an IntraTMP / intra merge neighbour of intra
+merge 363). ra_internal12_q32: identical, intra CUs from the CPU 147 -> 4 (the seven reasons' 142 -> 0);
+ai_foreman352_q37, ra_foreman_q32, ra_10bit_q32 identical with the same CUs from the CPU as gpu5.
+Limits: the 4x4 kernel's uint32_t result can wrap (a lane's sum past 2^16 below absDc); an arm's GPU cost is a 32-bit
+sum, the CPU's 64-bit, so two such blocks in one arm would differ (needs differences averaging above ~2^10 in a 4x4
+block's DC lane). Chroma TMRL above 10 bits stays rejected (its co-located luma SATD takes the 16x8 / 8x16 AVX2
+kernels: not ported; 99 CUs on t12).
 
 
 ## 8. Numbers (i7-10700 8C/16T, Win11, GCC 16.2, RTX 3070 driver 616.92)

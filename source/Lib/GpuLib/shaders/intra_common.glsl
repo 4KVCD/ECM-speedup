@@ -895,6 +895,7 @@ struct Params
   int      bvMap;
   int      bvMapW;
   int      ibcFrac;     // the SPS's IBCFracFlag: IBC's vectors (and so SGPM's) may point between samples
+  int      cccmDecim;   // DECIM_BITS of the SPS's luma bit depth: the precision of the CCCM / EIP models' parameters
 };
 layout( buffer_reference, std430, buffer_reference_align = 8 ) buffer BufParams { Params p; };
 

@@ -475,6 +475,9 @@ int timdPredict( int mode, TimdParams p, int x, int y, int W, int H, int tw, int
 
 // ----- the SATD (RdCost::xGetHADs_SIMD's kernels for the template's arms: 2x2, 4x4, 8x4, 4x8)
 
+// v as a 16-bit SIMD lane holds it (int16_t)
+int lane16( int v ) { return ( v << 16 ) >> 16; }
+
 // the difference of the original (the reconstruction of the template) and the prediction at (x, y) of an arm
 // (s_tmp from predOffset, rows of w samples; the original from (ox, oy))
 int timdDiff( int ox, int oy, int predOffset, int w, int x, int y )
@@ -562,31 +565,37 @@ int timdHad( int ox, int oy, int predOffset, int w, int bx, int by, int kw, int 
     const int m0 = d[0] + d[2], m1 = d[1] + d[3], m2 = d[0] - d[2], m3 = d[1] - d[3];
     return ( abs( m0 + m1 ) >> 2 ) + abs( m0 - m1 ) + abs( m2 + m3 ) + abs( m2 - m3 );
   }
-  // the Hadamard transform of rows of kw, then of columns of kh, in place (the order of the butterflies does not
-  // change the absolute values: each output is a signed sum of the inputs)
+  // the Hadamard transform of columns of kh, then of rows of kw (the order of the butterflies does not change the
+  // values: each output is a signed sum of the inputs) in the kernels' lanes: the columns' in 16-bit lanes (wrapped;
+  // the 8x4 / 4x8 kernels widen them to 32 bits for the rows, the 4x4 kernel keeps 16 bits throughout and adds the
+  // absolute values of a vertical frequency - one lane - in 16 bits, unsigned). Nothing wraps up to 10 bits (checked
+  // against the kernels at 8, 10 and 12 bits, random and extreme differences)
   int t[32];
-  for( int j = 0; j < kh; j++ )
-  {
-    for( int i = 0; i < kw; i++ )
-    {
-      int s = 0;
-      for( int k = 0; k < kw; k++ ) s += ( bitCount( uint( i & k ) ) & 1 ) != 0 ? -d[j * kw + k] : d[j * kw + k];
-      t[j * kw + i] = s;
-    }
-  }
-  int sad = 0, dc = 0;
   for( int i = 0; i < kw; i++ )
   {
     for( int j = 0; j < kh; j++ )
     {
       int s = 0;
-      for( int k = 0; k < kh; k++ ) s += ( bitCount( uint( j & k ) ) & 1 ) != 0 ? -t[k * kw + i] : t[k * kw + i];
-      sad += abs( s );
-      dc = i == 0 && j == 0 ? abs( s ) : dc;
+      for( int k = 0; k < kh; k++ ) s += ( bitCount( uint( j & k ) ) & 1 ) != 0 ? -d[k * kw + i] : d[k * kw + i];
+      t[j * kw + i] = lane16( s );
     }
   }
-  sad = sad - dc + ( dc >> 2 );
-  return kw == kh ? ( sad + 1 ) >> 1 : timdScaleSqrt8( sad );
+  uint sad = 0u, dc = 0u;
+  for( int j = 0; j < kh; j++ )
+  {
+    uint lane = 0u;
+    for( int i = 0; i < kw; i++ )
+    {
+      int s = 0;
+      for( int k = 0; k < kw; k++ ) s += ( bitCount( uint( i & k ) ) & 1 ) != 0 ? -t[j * kw + k] : t[j * kw + k];
+      s = kw == kh ? lane16( s ) : s;
+      lane += uint( abs( s ) );
+      dc = i == 0 && j == 0 ? uint( abs( s ) ) : dc;
+    }
+    sad += kw == kh ? lane & 0xffffu : lane;
+  }
+  sad = sad - dc + ( dc >> 2 );   // (the 4x4 kernel's uint32_t arithmetic)
+  return kw == kh ? int( ( sad + 1u ) >> 1 ) : timdScaleSqrt8( int( sad ) );
 }
 
 // the kernel xGetHADs_SIMD takes for an arm of w x h: of the arms 2 or 4 thick of TIMD's templates 8x4, 4x8, 4x4 or 2x2;
@@ -640,8 +649,7 @@ const int TIMD_MRSAD_CANDS = 64;
 // zeroed by the caller), as many candidates at once as s_tmp holds their templates (the above arm's rows of c.w, then the
 // left arm's rows of tw), predicted in parallel, then the cost of the reconstruction against each in parallel: the SATD
 // block by block, or with mrsad deriveTimdModeSad's mean-removed SAD (RdCost::xGetMRSAD per arm: the sum of the
-// differences' distances from their mean, the mean truncated toward 0; its SIMD forms, whose 16-bit lanes saturate,
-// agree up to 11 bits, the GPU's TIMD up to 10)
+// differences' distances from their mean, the mean truncated toward 0, as its SIMD forms add them in 16-bit lanes)
 void timdTemplateCosts( Cu c, TemplateUnits t, int candBase, int numCands, int costA, int costL, int dc, int maxPel, bool noPdpc,
                         bool mrsad, int lid, int NT )
 {
@@ -684,13 +692,32 @@ void timdTemplateCosts( Cu c, TemplateUnits t, int candBase, int numCands, int c
         atomicAdd( s_timdArmDiff[2 * ( i / T ) + ( i % T < nA ? 0 : 1 )], timdTemplateDiff( c, t, ( i / T ) * T, i % T ) );
       }
       SYNC();
+      // (an above arm 128 wide: xGetMRSAD_SIMD's AVX2 form adds the distances of a row's every 16th sample, 8, in a
+      // 16-bit lane that saturates at 32767, which they can pass from 12 bits on; per row and lane there)
+      const bool lanes = c.w >= 128;
       for( int i = lid; i < n * T; i += NT )
       {
         const int m = i / T, s = i % T, arm = s < nA ? 0 : 1;
+        if( arm == 0 && lanes )
+        {
+          continue;
+        }
         const int sum = s_timdArmDiff[2 * m + arm], count = arm == 0 ? nA : T - nA;
         const int mean = sum < 0 ? -( -sum / count ) : sum / count;
         atomicAdd( s_spCost[( arm == 0 ? costA : costL ) + timdCandSlot( s_spCost[candBase + first + m] )],
                    uint( abs( timdTemplateDiff( c, t, m * T, s ) - mean ) ) );
+      }
+      const int G = lanes ? t.th * 16 : 0;   // the above arm's lanes per candidate
+      for( int i = lid; i < n * G; i += NT )
+      {
+        const int m = i / G, row = ( i % G ) >> 4, sum = s_timdArmDiff[2 * m];
+        const int mean = sum < 0 ? -( -sum / nA ) : sum / nA;
+        int lane = 0;
+        for( int x = i & 15; x < c.w; x += 16 )
+        {
+          lane += abs( timdTemplateDiff( c, t, m * T, row * c.w + x ) - mean );
+        }
+        atomicAdd( s_spCost[costA + timdCandSlot( s_spCost[candBase + first + m] )], uint( min( lane, 32767 ) ) );
       }
     }
     else
@@ -698,8 +725,10 @@ void timdTemplateCosts( Cu c, TemplateUnits t, int candBase, int numCands, int c
       for( int i = lid; i < n * B; i += NT )
       {
         const int m = i / B, b = i % B, k = b - nbA;
-        const int satd = b < nbA ? timdHad( c.x, c.y - t.th, m * T, c.w, ( b % colsA ) * ka.x, ( b / colsA ) * ka.y, ka.x, ka.y )
-                                 : timdHad( c.x - t.tw, c.y, m * T + nA, t.tw, ( k % colsL ) * kl.x, ( k / colsL ) * kl.y, kl.x, kl.y );
+        const bool top  = b < nbA;   // (one call: each is inlined)
+        const int  satd = timdHad( top ? c.x : c.x - t.tw, top ? c.y - t.th : c.y, top ? m * T : m * T + nA,
+                                   top ? c.w : t.tw, top ? ( b % colsA ) * ka.x : ( k % colsL ) * kl.x,
+                                   top ? ( b / colsA ) * ka.y : ( k / colsL ) * kl.y, top ? ka.x : kl.x, top ? ka.y : kl.y );
         atomicAdd( s_spCost[( b < nbA ? costA : costL ) + timdCandSlot( s_spCost[candBase + first + m] )], uint( satd ) );
       }
     }

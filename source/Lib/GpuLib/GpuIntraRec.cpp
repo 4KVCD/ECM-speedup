@@ -531,7 +531,7 @@ static_assert( NUM_GLM_PATTERN == 4, "intra_cclm.glsl's GLM_PATTERN" );
 #endif
 // the CCCM the kernels have (intra_cccm.glsl): the plain 7-tap models, GL-CCCM's (JVET-AC0054), those of several
 // downsampling filters (JVET-AD0202), without subsampling (JVET-AC0147) and GLM with luma's (JVET-AB0092; the
-// division-free solver: JVET-AB0174, the Gaussian elimination: JVET-AC0053, JVET-AJ0237's precision up to 10 bits),
+// division-free solver: JVET-AB0174, the Gaussian elimination: JVET-AC0053, JVET-AJ0237's precision up to 12 bits),
 // the template selection (JVET-AB0143), the clipping (JVET-AP0168), LBCCP's two sets of models and inside filter
 // (JVET-AD0120, chosen by the template's SATD with JVET-AJ0096's kernels), the downsampling and the taps of CCLM's
 // location types (JVET-AN0090, JVET-AP0105); BVG-CCCM, CCP merge and decoder-derived CCP fusion are rejected
@@ -1246,8 +1246,9 @@ struct Params
   int32_t  pdpTable;
   int32_t  bvOut, bvMap, bvMapW;   // in timdData: the CUs' block vectors (BV_OUT each), the luma units' CUs (4 x 4)
   int32_t  ibcFrac;                // the SPS's IBCFracFlag (IBC's interpolation, intra_ibc.glsl)
+  int32_t  cccmDecim;              // DECIM_BITS of the luma bit depth (intra_cccm.glsl's cccmDecim)
 };
-static_assert( offsetof( Params, origin ) == 320 && offsetof( Params, edgeCap ) == 400 && sizeof( Params ) == 480,
+static_assert( offsetof( Params, origin ) == 320 && offsetof( Params, edgeCap ) == 400 && sizeof( Params ) == 488,
                "Params layout" );
 
 struct Push
@@ -2889,10 +2890,10 @@ static const CodingUnit* itmpMergeRef( const CodingUnit& n )
 static bool addMergeRecord( GpuIntraRec::Impl& m, const CodingUnit& cu, Cu& c, const char*& why )
 {
 #if GPU_DIMD && JVET_AJ0146_TIMDSAD && JVET_AG0146_DIMD_ITMP_IBC && JVET_AM0074_INTRA_MERGE   // IntraPrediction's helpers
-  // the CPU's SATD (xGetHADs_SIMD) adds in 16-bit lanes, exactly only up to 10 bits
-  if( cu.cs->sps->getBitDepth( CHANNEL_TYPE_LUMA ) > 10 )
+  // the CPU's SATD: xGetHADs_SIMD's kernels up to 12 bits (intra_timd.glsl's timdHad), xGetHADs above
+  if( cu.cs->sps->getBitDepth( CHANNEL_TYPE_LUMA ) > 12 )
   {
-    why = "intra merge above 10 bits";
+    why = "intra merge above 12 bits";
     return false;
   }
   // the node's shared arrays hold the neighbour list and the reference units of a CU up to 128 x 128 (intra_merge.glsl's
@@ -3459,10 +3460,11 @@ static std::pair<int, int> timdSadTemplateArms( const CodingUnit& cu )
 static bool addTimdRecord( GpuIntraRec::Impl& m, const CodingUnit& cu, Cu& c, const char*& why )
 {
 #if GPU_TIMD
-  // the CPU's SATD (xGetHADs_SIMD) adds in 16-bit lanes, exactly only up to 10 bits
-  if( cu.cs->sps->getBitDepth( CHANNEL_TYPE_LUMA ) > 10 )
+  // the CPU's SATD and mean-removed SAD: xGetHADs_SIMD's and xGetMRSAD_SIMD's 16-bit lanes up to 12 bits
+  // (intra_timd.glsl's timdHad, timdTemplateCosts), the scalar forms above
+  if( cu.cs->sps->getBitDepth( CHANNEL_TYPE_LUMA ) > 12 )
   {
-    why = "TIMD above 10 bits";
+    why = "TIMD above 12 bits";
     return false;
   }
   if( !m.trQuant )
@@ -3790,11 +3792,12 @@ static bool addMpmRecord( GpuIntraRec::Impl& m, const CodingUnit& cu, Cu& c, con
                  | ( mdip ? MPM_MDIP : 0 ) | ( sps.getUseMdip() && ( sps.getUseDimd() || mdip ) ? MPM_EXCLUDED : 0 )
                  | ( cu.slice->getSliceType() == I_SLICE ? MPM_I_SLICE : 0 );
   }
-  // the sortings' template costs are TIMD's SATD (xGetHADs_SIMD), which adds in 16-bit lanes: exact up to 10 bits
+  // the sortings' template costs are TIMD's SATD: xGetHADs_SIMD's kernels up to 12 bits (intra_timd.glsl's timdHad),
+  // xGetHADs above
   const bool templateCosts = sorted || ( mdip && cu.lwidth() * cu.lheight() <= 256 );
-  if( templateCosts && sps.getBitDepth( CHANNEL_TYPE_LUMA ) > 10 )
+  if( templateCosts && sps.getBitDepth( CHANNEL_TYPE_LUMA ) > 12 )
   {
-    why = "MPM sorting / MDIP above 10 bits";
+    why = "MPM sorting / MDIP above 12 bits";
     return false;
   }
   head.type = cu.lx() > 0 && cu.ly() > 0 ? TIMD_BOTH : cu.lx() > 0 ? TIMD_LEFT : cu.ly() > 0 ? TIMD_ABOVE : TIMD_NONE;
@@ -4171,7 +4174,7 @@ static void tmpSearchRecord( GpuIntraRec::Impl& m, const CodingUnit& cu, Cu& c, 
 // regions of recoType and models: getAllowedCurEip's list) or a merge candidate (the EIP CUs at eipMergeNeighbours'
 // positions, then its CTU row's before it, each as its CU record and EIP index) - and its reference area
 // (eipReferenceArea). False with why set where it cannot be read: EIP with a block vector (IntraTMP's search), in an
-// inter slice (temporal merge candidates), above 10 bits (CCCM's elimination)
+// inter slice (temporal merge candidates), above 12 bits (CCCM's elimination has JVET-AJ0237's precision up to 12)
 static bool addEipRecord( GpuIntraRec::Impl& m, const CodingUnit& cu, Cu& c, const char*& why )
 {
 #if GPU_EIP
@@ -4186,9 +4189,9 @@ static bool addEipRecord( GpuIntraRec::Impl& m, const CodingUnit& cu, Cu& c, con
     why = "EIP in an inter slice";
     return false;
   }
-  if( cu.cs->sps->getBitDepth( CHANNEL_TYPE_LUMA ) > 10 )
+  if( cu.cs->sps->getBitDepth( CHANNEL_TYPE_LUMA ) > 12 )
   {
-    why = "EIP above 10 bits";
+    why = "EIP above 12 bits";
     return false;
   }
   std::vector<int32_t> rec( EIP_HEAD, 0 );
@@ -4374,10 +4377,11 @@ static int32_t cuRecord( GpuIntraRec::Impl& m, const TransformUnit& tu, const Co
     // lines, the entry its index selects; the CPU's mode and line (from tmrlList), compared in verification
     else if( m.deriveModes && cu.tmrlFlag )
     {
-      // its template costs are TIMD's SATD (xGetHADs_SIMD), which adds in 16-bit lanes, exactly only up to 10 bits
-      if( cu.cs->sps->getBitDepth( CHANNEL_TYPE_LUMA ) > 10 )
+      // its template costs are TIMD's SATD: xGetHADs_SIMD's kernels up to 12 bits (intra_timd.glsl's timdHad),
+      // xGetHADs above
+      if( cu.cs->sps->getBitDepth( CHANNEL_TYPE_LUMA ) > 12 )
       {
-        why = "TMRL above 10 bits";
+        why = "TMRL above 12 bits";
         return -1;
       }
       if( !addMpmNeighbours( m, cu, c, why ) )
@@ -5065,8 +5069,9 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
   // luma (JVET-AB0092: glmIdc beyond the patterns) a CCCM model (intra_cccm.glsl), of the same kind in both components
   // (CABACReader::glmIdc gives Cr Cb's glmIdc; with LFNST / NSPT both predictions are the block's cccmPrediction's).
   // With LFNST / NSPT their mode is a DIMD of the CU's Cb and / or Cr predictions (deriveChromaIpmForTransform), which
-  // without DIMD in the SPS leaves the mode the transforms read unset. Not above 10 bits (no test stream) nor with
-  // unequal bit depths (the model takes the chroma bit depth, its division table m_auShiftLM the luma's)
+  // without DIMD in the SPS leaves the mode the transforms read unset. Not above 12 bits (JVET-AJ0237's precision of
+  // the models: CCLM's sums, CCCM's DECIM_BITS and matrix bits, Params::cccmDecim) nor with unequal bit depths (the
+  // model takes the chroma bit depth, its division table m_auShiftLM the luma's)
   // CCCM (an LM mode with cccmFlag, JVET-AA0057): intra_cccm.glsl's plain models, GL-CCCM's (JVET-AC0054), those of
   // several downsampling filters (JVET-AD0202) and without subsampling (JVET-AC0147); with LFNST / NSPT their mode is
   // the DIMD of both components' CCCM predictions, which predIntraCCCM makes at the Cb block (each block on the GPU)
@@ -5081,7 +5086,7 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
   // CCCM models of two (MMLM_CHROMA_IDX's), where PU::cccmMultiModeAvail allows them (else the CPU blends in a buffer
   // of a previous block); CFLM (types 2, 3) replaces it by a model of its own prediction and the luma
   // (xCflmCreateLumaRef downsamples the luma as xCccmGetLumaVal does: never without subsampling, which a cccmNoSubFlag
-  // would select). The CPU predicts at the PU, the GPU at the block: one per component. Not above 10 bits nor with
+  // would select). The CPU predicts at the PU, the GPU at the block: one per component. Not above 12 bits nor with
   // unequal bit depths (the CCCM solvers' precision; CFLM's bias takes the luma bit depth)
   else if( !isLuma( compID ) && pu.isChromaFusion > 1 && !GPU_CFLM )         why = "CFLM";
   else if( !isLuma( compID ) && pu.isChromaFusion > 1 && pu.cccmNoSubFlag )  why = "CFLM without subsampling";
@@ -5091,15 +5096,15 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
   else if( !isLuma( compID ) && pu.isChromaFusion && area != cu.blocks[compID] )
     why = "LM chroma fusion CU with several transform blocks";
   else if( !isLuma( compID ) && pu.isChromaFusion
-           && ( sps.getBitDepth( CHANNEL_TYPE_LUMA ) > 10
+           && ( sps.getBitDepth( CHANNEL_TYPE_LUMA ) > 12
                 || sps.getBitDepth( CHANNEL_TYPE_CHROMA ) != sps.getBitDepth( CHANNEL_TYPE_LUMA ) ) )
-    why = "LM chroma fusion above 10 bits or with unequal bit depths";
+    why = "LM chroma fusion above 12 bits or with unequal bit depths";
   else if( !isLuma( compID ) && PU::isLMCMode( dirMode ) && cu.lfnstIdx && !sps.getUseDimd() ) why = "CCLM with LFNST / NSPT without DIMD";
   // (DecCu::xIntraRecBlk with JVET-AK0064: the Cb block also predicts Cr, over the CU's area)
   else if( !isLuma( compID ) && PU::isLMCMode( dirMode ) && area != cu.blocks[compID] ) why = "CCLM CU with several transform blocks";
-  else if( !isLuma( compID ) && PU::isLMCMode( dirMode ) && ( sps.getBitDepth( CHANNEL_TYPE_LUMA ) > 10
+  else if( !isLuma( compID ) && PU::isLMCMode( dirMode ) && ( sps.getBitDepth( CHANNEL_TYPE_LUMA ) > 12
                                                               || sps.getBitDepth( CHANNEL_TYPE_CHROMA ) != sps.getBitDepth( CHANNEL_TYPE_LUMA ) ) )
-    why = "CCLM above 10 bits or with unequal bit depths";
+    why = "CCLM above 12 bits or with unequal bit depths";
   else if( dirMode >= NUM_LUMA_MODE && !( ( cu.timd || cu.tmrlFlag ) && isLuma( compID ) ) && !( !isLuma( compID ) && PU::isLMCMode( dirMode ) ) )
     why = "intra mode beyond 66 (NN / ...)";
   else if( sps.getUseLmcs() && !m.reshape )                         why = "LMCS without the decoder's reshaper";
@@ -6723,6 +6728,13 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
   P.ctuSize     = (int32_t) cs.sps->getCTUSize();
 #if JVET_AD0208_IBC_ADAPT_FOR_CAM_CAPTURED_CONTENTS
   P.ibcFrac     = cs.sps->getIBCFracFlag() ? 1 : 0;
+#endif
+  // the CCCM / EIP models' precision (CccmModel::decimBits: JVET-AJ0237's 22 bits above 10 bits, else 16; the CCP tools
+  // with unequal luma and chroma bit depths are rejected, EIP is luma)
+#if JVET_AJ0237_INTERNAL_12BIT
+  P.cccmDecim   = DECIM_BITS( cs.sps->getBitDepth( CHANNEL_TYPE_LUMA ) );
+#else
+  P.cccmDecim   = CCCM_DECIM_BITS;
 #endif
   P.lumaUnitW   = (int32_t) cs.pcv->minCUWidth;
   P.lumaUnitH   = (int32_t) cs.pcv->minCUHeight;

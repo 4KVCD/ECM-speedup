@@ -612,8 +612,9 @@ void ccpBlendModel( Tu t, int a, int b, int dst, bool compare )
       costAverage += abs( reco - ( ( p0 + p1 + 1 ) >> 1 ) );
     }
   }
-  // solve1: scaled to 28 bits over the samples, regularized, eliminated with xDivide's scales, substituted back
-  const int matrixShift = 28 - 2 * bitDepth - cccmCeilLog2( max( n, 1 ) );
+  // solve1: scaled to 28 bits (above 10 bits 32) over the samples, regularized, eliminated with xDivide's scales,
+  // substituted back
+  const int matrixShift = cccmMatrixBits( 28 ) - 2 * bitDepth - cccmCeilLog2( max( n, 1 ) ), decim = cccmDecim();
   for( int i = 0; i < 12; i++ )   // (the upper triangle and the right-hand side scaled, then the lower triangle)
   {
     const int r = i / 4, col = i % 4;
@@ -643,7 +644,7 @@ void ccpBlendModel( Tu t, int a, int b, int dst, bool compare )
       const int64_t f = e[r][piv];
       for( int j = piv + 1; j < 4; j++ )
       {
-        e[r][j] -= ( f * e[piv][j] + int64_t( 1 << ( CCCM_DECIM - 1 ) ) ) >> CCCM_DECIM;
+        e[r][j] -= ( f * e[piv][j] + int64_t( 1 << ( decim - 1 ) ) ) >> decim;
       }
     }
   }
@@ -653,10 +654,10 @@ void ccpBlendModel( Tu t, int a, int b, int dst, bool compare )
     x[r] = e[r][3];
     for( int j = r + 1; j < 3; j++ )
     {
-      x[r] -= ( e[r][j] * x[j] + int64_t( 1 << ( CCCM_DECIM - 1 ) ) ) >> CCCM_DECIM;
+      x[r] -= ( e[r][j] * x[j] + int64_t( 1 << ( decim - 1 ) ) ) >> decim;
     }
   }
-  int p0 = int( x[0] ), p1 = int( x[1] ), p2 = int( x[2] ), shift = CCCM_DECIM - 5, offset = 1 << ( shift - 1 );
+  int p0 = int( x[0] ), p1 = int( x[1] ), p2 = int( x[2] ), shift = decim - 5, offset = 1 << ( shift - 1 );
   int lo = 31, hi = 1;
   for( int corner = 0; corner < 4; corner++ )
   {
@@ -897,7 +898,7 @@ const int CCP_ADJUST_DELTA[2 * CCP_ADJUST_DELTAS] = int[]( 1, -1, 3, -3, 5, -5, 
 // coefficient v moved by delta away from 0 (towards it where positive), in 1/32 of the coefficient's unit
 int64_t ccpAdjusted( int64_t v, int delta )
 {
-  return v + int64_t( ( v > int64_t( 0 ) ? -delta : delta ) << ( CCCM_DECIM - 5 ) );
+  return v + int64_t( ( v > int64_t( 0 ) ? -delta : delta ) << ( cccmDecim() - 5 ) );
 }
 
 // the coefficients pass `pass` of record x's models moves (adjustCCPCandidates' pMinIdx .. pMaxIdx - 1): the co-located

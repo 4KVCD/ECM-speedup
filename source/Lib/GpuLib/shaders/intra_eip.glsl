@@ -255,7 +255,7 @@ void eipNode( Cu c, int cuIndex, int at, int bitDepth, int lid, int NT )
   for( int part = 0; part < parts; part++ )
   {
     // the rows of the system (row i in invocation i): ATA (regularized but the bias) and ATY less the luma offset's
-    // share, scaled to 28 bits over the samples, gaussElimination's regularization
+    // share, scaled to 28 bits (above 10 bits 32) over the samples, gaussElimination's regularization
     const int base = part * EIP_SUMS;
     const int n    = int( cccmTmpLoad( base + eipEntryIndex( EIP_TAPS - 1, EIP_TAPS - 1 ) ) >> ( 2 * bitDepth - 2 ) );
     int64_t a[EIP_TAPS + 1];
@@ -271,7 +271,7 @@ void eipNode( Cu c, int cuIndex, int at, int bitDepth, int lid, int NT )
       }
       a[EIP_TAPS] = cccmTmpLoad( base + EIP_ATA + lid )
                     - ( ( a[EIP_TAPS - 1] * int64_t( lumaOffset ) ) >> ( bitDepth - 1 ) );
-      const int shift = 28 - 2 * bitDepth - ( n == 0 ? -1 : cccmCeilLog2( n ) );
+      const int shift = cccmMatrixBits( 28 ) - 2 * bitDepth - ( n == 0 ? -1 : cccmCeilLog2( n ) );
       for( int j = 0; j <= EIP_TAPS; j++ )
       {
         a[j] = shift > 0 ? a[j] << shift : a[j] >> -shift;
@@ -297,7 +297,7 @@ void eipNode( Cu c, int cuIndex, int at, int bitDepth, int lid, int NT )
         const int64_t f = a[piv];
         for( int j = piv + 1; j <= EIP_TAPS; j++ )
         {
-          a[j] -= ( f * cccmLoad( 2 * j ) + int64_t( 1 << ( CCCM_DECIM - 1 ) ) ) >> CCCM_DECIM;
+          a[j] -= ( f * cccmLoad( 2 * j ) + int64_t( 1 << ( cccmDecim() - 1 ) ) ) >> cccmDecim();
         }
       }
       SYNC();
@@ -319,11 +319,11 @@ void eipNode( Cu c, int cuIndex, int at, int bitDepth, int lid, int NT )
         int64_t   v   = cccmTmpLoad( row + EIP_TAPS );
         for( int j = i + 1; j < EIP_TAPS; j++ )
         {
-          v -= ( cccmTmpLoad( row + j ) * x[j] + int64_t( 1 << ( CCCM_DECIM - 1 ) ) ) >> CCCM_DECIM;
+          v -= ( cccmTmpLoad( row + j ) * x[j] + int64_t( 1 << ( cccmDecim() - 1 ) ) ) >> cccmDecim();
         }
         x[i] = v;
       }
-      x[EIP_TAPS - 1] += int64_t( lumaOffset ) << ( CCCM_DECIM - ( bitDepth - 1 ) );
+      x[EIP_TAPS - 1] += int64_t( lumaOffset ) << ( cccmDecim() - ( bitDepth - 1 ) );
       CBufI32 o = CBufI32( P.eipOut );
       for( int k = 0; k < EIP_TAPS; k++ )
       {
@@ -404,7 +404,7 @@ int eipTemplatePredict( Cu c, int outBase, int s, int lo, int hi, int bitDepth )
   {
     sum += eipParam( outBase, part, k ) * int64_t( inputs[k] );
   }
-  return clamp( int( int16_t( int( ( sum + int64_t( 1 << ( CCCM_DECIM - 1 ) ) ) >> CCCM_DECIM ) ) ), lo, hi );
+  return clamp( int( int16_t( int( ( sum + int64_t( 1 << ( cccmDecim() - 1 ) ) ) >> cccmDecim() ) ) ), lo, hi );
 }
 
 // the node of EIP merge CU c (all invocations, uniform control flow): its area's clipping range, its candidates (their
@@ -485,8 +485,9 @@ void eipMergeNode( Cu c, int at, int bitDepth, int lid, int NT )
     for( int i = lid; i < numCands * B; i += NT )
     {
       const int m = i / B, b = i % B;
-      const int satd = b < nbA ? timdHad( c.x, c.y - 1, m * T, c.w, b * ka.x, 0, ka.x, 1 )
-                               : timdHad( c.x - 1, c.y, m * T + c.w, 1, 0, ( b - nbA ) * kl.y, 1, kl.y );
+      const bool top  = b < nbA;   // (one call: each is inlined)
+      const int  satd = timdHad( top ? c.x : c.x - 1, top ? c.y - 1 : c.y, top ? m * T : m * T + c.w, top ? c.w : 1,
+                                 top ? b * ka.x : 0, top ? 0 : ( b - nbA ) * kl.y, top ? ka.x : 1, top ? 1 : kl.y );
       atomicAdd( s_spCost[( b < nbA ? TC_COST_A : TC_COST_L ) + m], uint( satd ) );
     }
     SYNC();
@@ -566,7 +567,7 @@ void eipPredict( Tu t, int outBase, int lid, int NT )
       {
         sum += eipParam( outBase, part, k ) * int64_t( inputs[k] );
       }
-      const int v = int( int16_t( int( ( sum + int64_t( 1 << ( CCCM_DECIM - 1 ) ) ) >> CCCM_DECIM ) ) );
+      const int v = int( int16_t( int( ( sum + int64_t( 1 << ( cccmDecim() - 1 ) ) ) >> cccmDecim() ) ) );
       s_spPred[y * W + x] = int16_t( clamp( v, lo, hi ) );
     }
     SYNC();

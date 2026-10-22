@@ -352,11 +352,10 @@ void mpmTemplateCosts( Cu c, TemplateUnits t, MpmPdp pdp, int numCands, int dc, 
     for( int i = lid; i < n * B; i += NT )
     {
       const int m = i / B, b = i % B, k = b - nbA;
-      const int satd = b < nbA
-                         ? timdHad( c.x, c.y - t.th, m * T, c.w, ( b % colsA ) * ka.x, ( b / colsA ) * ka.y, ka.x,
-                                    ka.y )
-                         : timdHad( c.x - t.tw, c.y, m * T + nA, t.tw, ( k % colsL ) * kl.x, ( k / colsL ) * kl.y, kl.x,
-                                    kl.y );
+      const bool top  = b < nbA;   // (one call: each is inlined)
+      const int  satd = timdHad( top ? c.x : c.x - t.tw, top ? c.y - t.th : c.y, top ? m * T : m * T + nA,
+                                 top ? c.w : t.tw, top ? ( b % colsA ) * ka.x : ( k % colsL ) * kl.x,
+                                 top ? ( b / colsA ) * ka.y : ( k / colsL ) * kl.y, top ? ka.x : kl.x, top ? ka.y : kl.y );
       const int slot = timdCandSlot( s_spCost[TC_CAND + first + m] );
       atomicAdd( s_spCost[( b < nbA ? TC_COST_A : TC_COST_L ) + slot], uint( satd ) );
     }

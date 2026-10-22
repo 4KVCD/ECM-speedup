@@ -256,8 +256,9 @@ void tmrlLineCosts( Cu c, int li, int mrl, int predStride, int dc, int maxPel, i
     for( int i = lid; i < n * B; i += NT )
     {
       const int m = i / B, b = i % B;
-      const int satd = b < nbA ? timdHad( c.x, c.y - 1, m * T, c.w, b * ka.x, 0, ka.x, 1 )
-                               : timdHad( c.x - 1, c.y, m * T + c.w, 1, 0, ( b - nbA ) * kl.y, 1, kl.y );
+      const bool top  = b < nbA;   // (one call: each is inlined)
+      const int  satd = timdHad( top ? c.x : c.x - 1, top ? c.y - 1 : c.y, top ? m * T : m * T + c.w, top ? c.w : 1,
+                                 top ? b * ka.x : 0, top ? 0 : ( b - nbA ) * kl.y, top ? ka.x : 1, top ? 1 : kl.y );
       atomicAdd( s_spCost[TC_COST_A + li * TMRL_MODES + first + m], uint( satd ) );
     }
     SYNC();
