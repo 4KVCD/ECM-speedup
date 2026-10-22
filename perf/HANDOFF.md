@@ -2468,6 +2468,18 @@ decoder-derived fusion it stays the CPU's. Results (build aglft9, all 50 streams
 fixed before): "inter CCCM" 18 -> 0 (1 now "inter CCCM with ASBT": its luma prediction lies in several records), "CCP
 merge with an inter CCCM candidate" 14 -> 0 (4 now "CCP merge adjustment or decoder-derived fusion with an inter CCCM
 candidate"). Inter CCP merge (161 CUs) is still the CPU's.
+ON mode with ALF (2026-10-22, agent st): with ALF on (JVET-AC0162, ALF's residual input) the ON mode output differed
+from the CPU's on intra pictures the GPU reconstructed (test streams of runs/agents/st/enc encoded with the CTC intra
+cfg, the tools still gated off: bis_alf with ALF / CCALF / ALF-CCCM alone differs, deblocking, SAO / CCSAO and BIF
+alone are identical; with --GpuLoopFilter=0 and =3 alike). Cause: AdaptiveLoopFilter::copyResiData copies the
+picture's luma residual buffer (cs.getResiBuf()), which DecCu writes as each block's piResi; DecCu's derive-only pass
+returns before the residual, so ALF read a stale buffer (the previous picture's). Change: in ON mode with ALF in the
+SPS intra_rec writes each luma sample's residual - the value it reconstructs with, piResi's - into a picture-sized
+int16 plane (Params::resiPlane, new at the end of Params: 504 bytes), downloaded into the picture's residual buffer
+with the reconstruction. Verification and partial verification are unchanged (no plane). Results (agst22 without,
+agst23 with the change, --GpuRecon=3): bis_alf differed with --GpuLoopFilter=0 and =3, now identical with both;
+cr_fore32, cr_park27, nocr_fore32 (all in-loop filters of the CTC cfg) identical; partial verification of 8 streams
+identical.
 
 
 ## 8. Numbers (i7-10700 8C/16T, Win11, GCC 16.2, RTX 3070 driver 616.92)

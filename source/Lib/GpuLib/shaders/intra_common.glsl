@@ -938,6 +938,8 @@ struct Params
   int      ibcFrac;     // the SPS's IBCFracFlag: IBC's vectors (and so SGPM's) may point between samples
   int      cccmDecim;   // DECIM_BITS of the SPS's luma bit depth: the precision of the CCCM / EIP models' parameters
   int      ccpDerivedGl;   // decoder-derived CCP fusion's GL-CCCM mode above this many chroma samples (8 outside I slices)
+  uint64_t resiPlane;   // ON mode with ALF: int16 luma residual (written, origin / stride of plane 0; 0: none), which
+                        // ALF reads (JVET-AC0162, the CPU's picture residual buffer)
 };
 layout( buffer_reference, std430, buffer_reference_align = 8 ) buffer BufParams { Params p; };
 

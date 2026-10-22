@@ -531,6 +531,10 @@ void reconstruct( Tu t, int x, int y, int pr, int re )
     }
   }
   const int px = g_recFlip == 1 ? t.w - 1 - x : x, py = g_recFlip == 2 ? t.h - 1 - y : y;
+  if( t.comp == 0 && P.resiPlane != 0ul )   // (ON mode with ALF: the luma residual, as DecCu's piResi)
+  {
+    BufI16( P.resiPlane ).v[P.origin[0] + ( t.y + y ) * P.stride[0] + t.x + x] = int16_t( re );
+  }
   CBufI16( P.plane[t.comp] ).v[P.origin[t.comp] + ( t.y + py ) * P.stride[t.comp] + t.x + px] = int16_t( clip3i( t.recMin, t.recMax, pr + re ) );
   if( pc.verify != 0 )
   {

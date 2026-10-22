@@ -1319,8 +1319,10 @@ struct Params
   int32_t  ibcFrac;                // the SPS's IBCFracFlag (IBC's interpolation, intra_ibc.glsl)
   int32_t  cccmDecim;              // DECIM_BITS of the luma bit depth (intra_cccm.glsl's cccmDecim)
   int32_t  ccpDerivedGl;           // decoder-derived CCP fusion's GL-CCCM mode above this many chroma samples
+  uint64_t resiPlane;              // ON mode with ALF: the luma residual intra_rec writes (0: none)
 };
-static_assert( offsetof( Params, origin ) == 328 && offsetof( Params, edgeCap ) == 408 && sizeof( Params ) == 496,
+static_assert( offsetof( Params, origin ) == 328 && offsetof( Params, edgeCap ) == 408
+                 && offsetof( Params, resiPlane ) == 496 && sizeof( Params ) == 504,
                "Params layout" );
 
 struct Push
@@ -2107,6 +2109,7 @@ struct GpuIntraRec::Impl
   std::unique_ptr<gpu::Stream> stream;
   gpu::Buffer                 params, tus, coeffs, planes[3], owner[3], sched, dbgPred, dbgResi, lmcs, signPredBuf;
   gpu::Buffer                 interPredBuf;
+  gpu::Buffer                 resiPlane;   // ON mode with ALF: the picture's luma residual (Params::resiPlane)
   gpu::Buffer                 cuBuf, dbgParams;   // the CU records and their modes; the derived parameters (verification)
   gpu::Buffer                 scratch;            // intra_rec's: DIMD / OBIC blending's sums, then CCCM's data
   Reshape*                    reshape = nullptr;   // the decoder's reshaper (LMCS state of the picture being decoded)
@@ -2292,7 +2295,7 @@ struct GpuIntraRec::Impl
     }
     for( gpu::Buffer* b: { &params, &tus, &coeffs, &planes[0], &planes[1], &planes[2], &owner[0], &owner[1], &owner[2],
                            &sched, &dbgPred, &dbgResi, &lmcs, &signPredBuf, &cuBuf, &dbgParams, &scratch,
-                           &upload, &download } )
+                           &upload, &download, &resiPlane } )
     {
       b->destroy( *ctx );
     }
@@ -9534,6 +9537,7 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
   }
   double         ms      = 0;
   const int16_t* gPlanes = nullptr;   // the downloaded results
+  const int16_t* gResiPlane = nullptr;
   const int16_t* gPredDl = nullptr;
   const Tu*      gTusDl  = nullptr;
   const int32_t* gOffDl  = nullptr;
@@ -9572,6 +9576,16 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
   const size_t interBytes = m.interPred.size() * 2;
   m.interPredBuf.ensure( ctx, std::max<size_t>( interBytes, 4 ), gpu::Buffer::DEVICE );
   P.interPred = m.interPredBuf.addr;
+#if JVET_AC0162_ALF_RESIDUAL_SAMPLES_INPUT
+  // ON mode with ALF: its residual input (AdaptiveLoopFilter::copyResiData reads the picture's luma residual, which
+  // DecCu's derive-only pass leaves unwritten)
+  if( m.on && cs.sps->getALFEnabledFlag() )
+  {
+    m.resiPlane.ensure( ctx, size_t( cs.picture->getRecoBuf( COMPONENT_Y ).width ) * cs.picture->getRecoBuf( COMPONENT_Y ).height * 2,
+                        gpu::Buffer::DEVICE );
+    P.resiPlane = m.resiPlane.addr;
+  }
+#endif
   P.tus      = m.tus.addr;
   P.coeffs   = m.coeffs.addr;
   P.signPred   = m.signPredBuf.addr;
@@ -10104,6 +10118,8 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
       dPlane[c] = downBytes;
       downBytes += planeBytes[c];
     }
+    const size_t dResiPlane = downBytes;   // (ON mode with ALF: the luma residual)
+    downBytes += P.resiPlane ? planeBytes[0] : 0;
     m.download.ensure( ctx, downBytes, gpu::Buffer::DOWNLOAD );
 
     gpu::Stream& s = *m.stream;
@@ -10171,6 +10187,10 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
       {
         s.fill( m.planes[c], 0, ( planeBytes[c] + 3 ) & ~size_t( 3 ), 0 );
       }
+    }
+    if( P.resiPlane )
+    {
+      s.fill( m.resiPlane, 0, ( planeBytes[0] + 3 ) & ~size_t( 3 ), 0 );
     }
     s.fill( m.sched, oQueue * 4, n * 4, 0xFFFFFFFFu );
     s.fill( m.sched, oCounter * 4, 4 * 4, 0 );
@@ -10268,6 +10288,10 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
     {
       s.copy( m.planes[c], 0, m.download, dPlane[c], planeBytes[c] );
     }
+    if( P.resiPlane )
+    {
+      s.copy( m.resiPlane, 0, m.download, dResiPlane, planeBytes[0] );
+    }
     s.submitAndWait();
     const size_t numEdges = (size_t) *(const int32_t*) m.download.mapped;
     if( numEdges > cap )   // nothing was reconstructed: again with room for them
@@ -10281,6 +10305,7 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
     }
     ms = s.elapsedNs( t0, t1 ) * 1e-6;
     gPlanes  = (const int16_t*) ( (const char*) m.download.mapped + dPlane[0] );
+    gResiPlane = P.resiPlane ? (const int16_t*) ( (const char*) m.download.mapped + dResiPlane ) : nullptr;
     gPredDl  = (const int16_t*) ( (const char*) m.download.mapped + dPred );
     gTusDl   = (const Tu*) ( (const char*) m.download.mapped + dTus );
     gOffDl   = (const int32_t*) ( (const char*) m.download.mapped + dOffset );
@@ -10304,6 +10329,14 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
         memcpy( reco.bufAt( 0, y ), gPlane + size_t( y ) * P.width[c], P.width[c] * sizeof( Pel ) );
       }
       gPlane += size_t( P.width[c] ) * P.height[c];
+    }
+    if( gResiPlane )   // (ALF's residual input: DecCu's piResi of every luma block, which the CPU did not compute)
+    {
+      PelBuf resi = cs.picture->getResiBuf( cs.picture->blocks[COMPONENT_Y] );
+      for( int y = 0; y < P.height[0]; y++ )
+      {
+        memcpy( resi.bufAt( 0, y ), gResiPlane + size_t( y ) * P.width[0], P.width[0] * sizeof( Pel ) );
+      }
     }
     m.numOn++;
     return;
