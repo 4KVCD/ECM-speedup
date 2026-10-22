@@ -432,9 +432,12 @@ ivec3 mtssList()
 // its second bucket. mode1: the mode without MTSS; second: the mode MTSS tries first (-1: none); list: MTSS's mode
 // list. A mode whose LFNST set or transposition differs from the first one's is taken: second, else the list's last
 // entry where any entry differs (the CPU's loop over the list does not stop at the first), else its first; NSPT takes
-// the first mode in its second bucket instead where the chosen one is within 2 of it
+// the first mode in its second bucket instead where the chosen one is within 2 of it. Without DIMD in the SPS
+// (Cu::mtssNspt's MTSS_NO_LIST) the list is empty: second, where there is one, even where its set and transposition
+// are the same, else planar (the CPU's testMode as it starts), NSPT's second bucket by the same rule
 ivec2 mtssChoice( Cu c, int mode1, int second, ivec3 list )
 {
+  const bool noList = ( c.mtssNspt & MTSS_NO_LIST ) != 0;
   BufI32     mt         = BufI32( P.matrices );
   const int  lut        = trTab( TR_TAB_LFNST_LUT );
   const int  im         = nsptMode( c.w, c.h, mode1 );
@@ -447,7 +450,7 @@ ivec2 mtssChoice( Cu c, int mode1, int second, ivec3 list )
     test  = nsptMode( c.w, c.h, second );
     valid = mt.v[lut + test] != mt.v[lut + im] || nsptTranspose( test ) != transposed;
   }
-  if( !valid )
+  if( !valid && !noList )
   {
     for( int i = 0; i < 3; i++ )
     {
@@ -456,12 +459,12 @@ ivec2 mtssChoice( Cu c, int mode1, int second, ivec3 list )
       valid = valid || mt.v[lut + test] != mt.v[lut + im] || nsptTranspose( test ) != transposed;
     }
   }
-  if( !valid )
+  if( !valid && !noList )
   {
     mode2 = list[0];
     test  = nsptMode( c.w, c.h, list[0] );
   }
-  const bool secondBucket = c.mtssNspt != 0 && abs( mode2 - mode1 ) <= 2;
+  const bool secondBucket = ( c.mtssNspt & 1 ) != 0 && abs( mode2 - mode1 ) <= 2;
   return ivec2( secondBucket ? im : test, secondBucket ? 1 : 0 );
 }
 
@@ -707,7 +710,7 @@ void mipTransformMode( Tu t, int W, int H, int ps, int upH, int upV, int predStr
       o.v[base + DIMD_OUT_MODE]      = first;
       o.v[base + DIMD_OUT_TR_SECOND] = second;
     }
-    if( ( t.derive & DERIVE_MTSS ) != 0 )
+    if( ( t.derive & DERIVE_MTSS ) != 0 && !( WITH_MPM && ( t.derive & DERIVE_SGPM ) != 0 ) )   // (SGPM: sgpmMtss)
     {
       const ivec3 list   = ivec3( o.v[base + DIMD_OUT_MTSS_LIST], o.v[base + DIMD_OUT_MTSS_LIST + 1], o.v[base + DIMD_OUT_MTSS_LIST + 2] );
       const ivec2 choice = mtssChoice( BufCu( P.cus ).v[t.cu], first, second, list );
@@ -1701,17 +1704,21 @@ void main()
       {
         CBufI32( P.cuMode ).v[t.cu] = cuMode;
       }
-      // MTSS (a DIMD, OBIC, intra merge, TIMD, MIP, EIP or IntraTMP CU with mdirIdx): its mode list from histograms of
-      // its own (deriveDimdModeList), once dimdSelect and obicSelect have read theirs, then the LFNST / NSPT mode and
-      // bucket of its luma block (a MIP, EIP or IntraTMP block chooses them itself, from its prediction:
-      // mipTransformMode)
+      // MTSS (a DIMD, OBIC, intra merge, TIMD, MIP, EIP, IntraTMP or SGPM CU with mdirIdx): its mode list from
+      // histograms of its own (deriveDimdModeList; without DIMD in the SPS none: MTSS_NO_LIST), once dimdSelect and
+      // obicSelect have read theirs, then the LFNST / NSPT mode and bucket of its luma block (a MIP, EIP or IntraTMP
+      // block chooses them itself, from its prediction: mipTransformMode; an SGPM block after it: sgpmMtss)
       if( WITH_DIMD && WITH_DERIVED_TRANSFORMS && c.mtss >= 0 )
       {
+        const bool noList = ( c.mtssNspt & MTSS_NO_LIST ) != 0;
         SYNC();
-        dimdHistogramsOf( c.mtss, MTSS_CALLS, c.w, c.h, lid, NT );
-        if( lid == 0 && ( c.kind == CU_KNOWN || c.kind == CU_EIP || c.kind == CU_TMP ) )   // (its block chooses itself)
+        if( !noList )
         {
-          const ivec3 list = mtssList();
+          dimdHistogramsOf( c.mtss, MTSS_CALLS, c.w, c.h, lid, NT );
+        }
+        if( lid == 0 && ( c.kind == CU_KNOWN || c.kind == CU_EIP || c.kind == CU_TMP || c.kind == CU_SGPM ) )
+        {
+          const ivec3 list = noList ? ivec3( -1 ) : mtssList();
           for( int k = 0; k < 3; k++ )
           {
             CBufI32( P.dimdOut ).v[t.cu * DIMD_OUT + DIMD_OUT_MTSS_LIST + k] = list[k];
@@ -1727,7 +1734,7 @@ void main()
           const int   second = c.kind == CU_DIMD ? d.trSecond
                                : c.kind == CU_OBIC ? max( CBufI32( P.obicOut ).v[c.obic * OBIC_OUT + OBIC_OUT_MODE + 1], PLANAR_IDX )
                                : c.kind == CU_TIMD || c.kind == CU_BVG ? mtssSecond : -1;
-          const ivec3 list   = mtssList();
+          const ivec3 list   = noList ? ivec3( -1 ) : mtssList();
           const ivec2 choice = mtssChoice( c, mode, second, list );
           CBufI32     o      = CBufI32( P.dimdOut );
           const int   base   = t.cu * DIMD_OUT;
@@ -2738,6 +2745,10 @@ void main()
         const bool  sgpm      = WITH_MPM && ( t.derive & DERIVE_SGPM ) != 0;
         const ivec2 sgpmModes = sgpm ? sgpmTransformModes( t ) : ivec2( 0 );
         g_secMode = sgpm ? sgpmModes.y : g_secMode;
+        if( sgpm && ( t.derive & DERIVE_MTSS ) != 0 )
+        {
+          sgpmMtss( t, sgpmModes.y, lid );
+        }
         selectTransform( t, sgpm ? sgpmModes.x : s_predDimdMode, 0 );
         if( pc.verify != 0 && lid == 0 )
         {

@@ -303,7 +303,7 @@ struct Cu
   int32_t obic;      // an OBIC CU's index among the picture's OBIC CUs (its neighbours, its OBIC; -1: not OBIC)
   int32_t merge;     // an intra merge CU's record in Params::mergeData (MergeHead; -1: not intra merge)
   int32_t mtss;      // with MTSS (mdirIdx) the first of the MTSS_CALLS histograms of its mode list (-1: no MTSS)
-  int32_t mtssNspt;  // its luma block may use NSPT (CU::isNSPTAllowed), which MTSS's choice depends on
+  int32_t mtssNspt;  // its luma block may use NSPT (CU::isNSPTAllowed), which MTSS's choice depends on (bit 0), MTSS_NO_LIST
   int32_t timd;      // a TIMD CU's record in Params::timdData (TimdHead; -1: not TIMD)
   int32_t tmrl;      // a TMRL CU's index among the picture's TMRL CUs (Params::tmrlOut; -1: not TMRL)
   int32_t mpm;       // an MPM CU's record in Params::timdData where MPM sorting, MDIP or PDP shape its lists, an MDIP
@@ -468,6 +468,7 @@ constexpr int SGPM_HEAD_IDX = 0, SGPM_HEAD_FLAGS = 1, SGPM_HEAD_NBR = 2, SGPM_HE
 constexpr int SGPM_HEAD_WEIGHTS = 9, SGPM_HEAD_T = 11;
 constexpr int SGPM_REGRESSION = 1, SGPM_NO_TIMD = 2, SGPM_NO_DIMD = 4;   // SGPM_HEAD_FLAGS
 constexpr int MTSS_CALLS           = 3;      // the histograms of deriveDimdModeList (left, above, above-left)
+constexpr int MTSS_NO_LIST         = 2;      // in Cu::mtssNspt: no DIMD in the SPS, MTSS's mode list is empty
 // the transforms of DIMD CUs the kernels have: getFinalIntraModeForTransform's DIMD branch (JVET-AM0138; without
 // BVG-DIMD and intra merge it would take intra merge CUs too), MTSS (JVET-AK0217) with JVET-AK0187's mode pairs
 #if GPU_DIMD && JVET_AM0138_ENHANCED_TMP_MERGE_LIST_TIMD_BV && JVET_AL0108_BVG_DIMD && JVET_AM0074_INTRA_MERGE \
@@ -2878,7 +2879,8 @@ static void addMtssCalls( GpuIntraRec::Impl& m, const CodingUnit& cu, Cu& c )
   }
   const TransformUnit& tu   = *cu.firstTU;
   const CompArea&      area = tu.blocksResidual[COMPONENT_Y];
-  c.mtssNspt = CU::isNSPTAllowed( tu, COMPONENT_Y, area.width, area.height, CU::isIntra( cu ) ) ? 1 : 0;
+  c.mtssNspt = ( CU::isNSPTAllowed( tu, COMPONENT_Y, area.width, area.height, CU::isIntra( cu ) ) ? 1 : 0 )
+               | ( cu.cs->sps->getUseDimd() ? 0 : MTSS_NO_LIST );   // (without DIMD: no mode list)
 #endif
 }
 
@@ -3873,7 +3875,8 @@ static bool addSgpmRecord( GpuIntraRec::Impl& m, const CodingUnit& cu, Cu& c, co
   why = source ? source
         : missed ? "SGPM with a vector its neighbours' checks missed"
         : cu.lwidth() * cu.lheight() > 32 * 32 ? "SGPM above 1024 samples"
-        : usesMtss( *cu.firstTU ) ? "SGPM with MTSS"
+        // (MTSS of regression SGPM: not verified yet)
+        : usesMtss( *cu.firstTU ) && PU::isRegressionSgpm( pu ) ? "regression SGPM with MTSS"
         : PU::isDbvMode( pu.intraDir[CHANNEL_TYPE_CHROMA] ) ? "SGPM with a DBV chroma mode" : nullptr;
   // DecCu derives timdHor / timdVer for a CU of 1024 samples at most with the SPS's TIMD, not for regression SGPM; else
   // they keep initData's -1, which getSgpmIntraMPMs skips
@@ -4686,10 +4689,10 @@ static int32_t cuRecord( GpuIntraRec::Impl& m, const TransformUnit& tu, const Co
       }
     }
     // MTSS's mode list, in the CU's node: of a DIMD, OBIC, intra merge, TIMD or BVG-DIMD CU, and of a MIP CU
-    // (CU_KNOWN), an EIP or an IntraTMP CU, whose node derives only that list of MTSS (its block the rest, from its
-    // prediction)
+    // (CU_KNOWN), an EIP, an IntraTMP or an SGPM CU, whose node derives only that list of MTSS (its block the rest, from
+    // its prediction)
     if( ( c.kind == CU_DIMD || c.kind == CU_OBIC || c.kind == CU_MERGE || c.kind == CU_TIMD || c.kind == CU_EIP
-          || c.kind == CU_TMP || c.kind == CU_BVG || ( GPU_MIP_DIMD && cu.mipFlag ) )
+          || c.kind == CU_TMP || c.kind == CU_BVG || c.kind == CU_SGPM || ( GPU_MIP_DIMD && cu.mipFlag ) )
         && usesMtss( *cu.firstTU ) )
     {
       addMtssCalls( m, cu, c );
@@ -4961,8 +4964,10 @@ static int32_t cuRecord( GpuIntraRec::Impl& m, const TransformUnit& tu, const Co
   // from samples it has not reconstructed)
   if( c.mtss >= 0 && !m.on )
   {
-    CHECK( cu.candModeListForTransformMtss.size() != MTSS_LIST_SIZE, "MTSS's mode list" );
-    std::copy_n( cu.candModeListForTransformMtss.begin(), MTSS_LIST_SIZE, d + DIMD_OUT_MTSS_LIST );
+    // (without DIMD the list is empty: -1, as the node writes it)
+    CHECK( cu.candModeListForTransformMtss.size() != ( cu.cs->sps->getUseDimd() ? MTSS_LIST_SIZE : 0 ), "MTSS's mode list" );
+    std::fill_n( d + DIMD_OUT_MTSS_LIST, MTSS_LIST_SIZE, -1 );
+    std::copy_n( cu.candModeListForTransformMtss.begin(), cu.candModeListForTransformMtss.size(), d + DIMD_OUT_MTSS_LIST );
     bool secondBucket = false;
     d[DIMD_OUT_MTSS_MODE]   = (int32_t) PU::getFinalIntraModeForTransform( secondBucket, *cu.firstTU, COMPONENT_Y ).first;
     d[DIMD_OUT_MTSS_BUCKET] = secondBucket ? 1 : 0;
@@ -5418,11 +5423,13 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
   else if( !GPU_DIMD_TRANSFORMS && cu.dimd && isLuma( compID ) && ( tu.mtsIdx[COMPONENT_Y] > MTS_SKIP || cu.lfnstIdx ) )
     why = "the transforms of a DIMD CU";
   // MTSS without DIMD in the SPS: the CPU's mode list stays empty (deriveDimdModeList returns at once) and its transform
-  // choice skips the list (getFinalIntraModeForTransform); the kernels derive the list from DIMD's histograms
-  else if( isLuma( compID ) && usesMtss( tu ) && !cu.cs->sps->getUseDimd() ) why = "MTSS without DIMD";
-  // MTSS of other CUs than DIMD's, MIP's, TIMD's, EIP's and IntraTMP's (SGPM: rejected itself)
+  // choice skips the list (getFinalIntraModeForTransform): a TIMD CU's node chooses without one (MTSS_NO_LIST); MIP,
+  // EIP and IntraTMP CUs (no test stream) stay on the CPU
+  else if( isLuma( compID ) && usesMtss( tu ) && !cu.cs->sps->getUseDimd() && !( GPU_TIMD && cu.timd ) )
+    why = "MTSS without DIMD";
+  // MTSS of other CUs than DIMD's, MIP's, TIMD's, EIP's, IntraTMP's and SGPM's (the CU kinds isMdirAllowed allows)
   else if( isLuma( compID ) && usesMtss( tu )
-           && ( !( cu.dimd || cu.mipFlag || ( GPU_TIMD && cu.timd ) || ( GPU_EIP && cu.eipFlag ) || cu.tmpFlag )
+           && ( !( cu.dimd || cu.mipFlag || ( GPU_TIMD && cu.timd ) || ( GPU_EIP && cu.eipFlag ) || cu.tmpFlag || cu.sgpm )
                 || !GPU_DIMD_TRANSFORMS ) )
     why = "MTSS";
   // TIMD (luma; plain TIMD, TIMD-SAD and TIMD merge): its CU is one block, which predicts the CU's modes. TIMD with MRL

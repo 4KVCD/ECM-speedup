@@ -303,7 +303,7 @@ struct Cu
   int obic;              // an OBIC CU's index among the OBIC CUs (Params::obicNbrs, obicOut; -1: not OBIC)
   int merge;             // an intra merge CU's record in Params::mergeData (MergeHead; -1: not intra merge)
   int mtss;              // with MTSS the first of the MTSS_CALLS histograms of its mode list in Params::dimdCalls (-1: none)
-  int mtssNspt;          // with MTSS: its luma block may use NSPT (CU::isNSPTAllowed)
+  int mtssNspt;          // with MTSS: its luma block may use NSPT (CU::isNSPTAllowed; bit 0), MTSS_NO_LIST
   int timd;              // a TIMD CU's record in Params::timdData (TimdHead; -1: not TIMD)
   int tmrl;              // a TMRL CU's index among the TMRL CUs (Params::tmrlOut; -1: not TMRL)
   int mpm;               // an MPM CU's record in Params::timdData where MPM sorting, MDIP or PDP shape its lists, an
@@ -459,6 +459,7 @@ const int DIMD_OUT_SGPM_BV     = 39;   // its modes' vectors (2 x, y in 1/16 sam
 const int DIMD_OUT_SGPM_LIC    = 43;   // and their LIC models (2, offsets in Params::timdData; -1: none),
 const int DIMD_OUT_SGPM_MODEL  = 45;   // regression SGPM's blendModel (params[0..2], shift; offset from shift)
 const int MTSS_CALLS           = 3;    // the histograms of MTSS's mode list (deriveDimdModeList: left, above, above-left)
+const int MTSS_NO_LIST         = 2;    // in Cu::mtssNspt: no DIMD in the SPS, MTSS's mode list is empty
 
 // an SGPM CU's record in Params::timdData (Cu::sgpm; layout shared with GpuIntraRec.cpp's addSgpmRecord): the index of
 // its list's entry (sgpmIdx, less the regression entries where the CU allows them but is not regression SGPM) and its

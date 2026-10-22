@@ -667,4 +667,32 @@ ivec2 sgpmTransformModes( Tu t )
   return ivec2( mts, firstFar && secondFar ? angle : firstFar ? second : first );
 }
 
+// MTSS of SGPM block t (DERIVE_MTSS, after sgpmTransformModes; getFinalIntraModeForTransform's mdirIdx branch of an
+// SGPM CU): the mode tried first is the DIMD of the prediction's second mode (dimdDerivedIntraDir2nd) where the LFNST /
+// NSPT mode is the partition's angle, else its main one (dimdDerivedIntraDir) where it is not that mode, else the second;
+// at the angle the main one instead where the second mode lies more than 2 from both of the CU's modes. The CPU
+// compares the mode in NSPT's numbering (after the wide angle) with those modes. mode1: the LFNST / NSPT mode without
+// MTSS; invocation 0 writes the choice into the CU's DimdOut, which selectTransform reads; ending with a barrier
+void sgpmMtss( Tu t, int mode1, int lid )
+{
+  if( lid == 0 )
+  {
+    CBufI32   o      = CBufI32( P.dimdOut );
+    const int base   = t.cu * DIMD_OUT;
+    const Cu  c      = BufCu( P.cus ).v[t.cu];
+    const int angle  = sgpmTable( SGPM_TAB_ANGLE + o.v[base + DIMD_OUT_SGPM_SPLIT] );
+    const int first  = o.v[base + DIMD_OUT_SGPM_PRED], second = o.v[base + DIMD_OUT_SGPM_PRED + 1];
+    const int mode0  = o.v[base + DIMD_OUT_SGPM_MODE], mode1s = o.v[base + DIMD_OUT_SGPM_MODE + 1];
+    const int im     = nsptMode( c.w, c.h, mode1 );
+    const bool secondFar = abs( second - mode0 ) > 2 && abs( second - mode1s ) > 2;   // SGPM_VIPM_TH
+    const int test   = im == angle ? ( secondFar ? first : second ) : im == first ? second : first;
+    const ivec3 list = ivec3( o.v[base + DIMD_OUT_MTSS_LIST], o.v[base + DIMD_OUT_MTSS_LIST + 1], o.v[base + DIMD_OUT_MTSS_LIST + 2] );
+    const ivec2 choice = mtssChoice( c, mode1, test < NUM_LUMA_MODE ? test : -1, list );
+    o.v[base + DIMD_OUT_MTSS_MODE]   = choice.x;
+    o.v[base + DIMD_OUT_MTSS_BUCKET] = choice.y;
+  }
+  controlBarrier( gl_ScopeWorkgroup, gl_ScopeWorkgroup, gl_StorageSemanticsBuffer | gl_StorageSemanticsShared,
+                  gl_SemanticsAcquireRelease );
+}
+
 #endif

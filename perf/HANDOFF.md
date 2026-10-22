@@ -2112,6 +2112,20 @@ deferred reconstruction; storeRecon keeps nothing then). No bilateral filter the
 "NN intra prediction of a split CU or above 32 x 32" 11 -> 0 (ai_parkjoy_q27 2, ra_parkjoy832_q32 9; all 64 x 64, 10
 of them with DERIVE_PNN_DIMD: MTS, LFNST, lfnstSecFlag); those three streams, ai_foreman352_q37 and ra_foreman_q32
 identical, the others' CPU CUs unchanged.
+M87 (2026-10-22, agent lf): MTSS of SGPM CUs and of TIMD CUs without DIMD: "MTSS" were SGPM CUs with mdirIdx (isMdirAllowed's last
+kind; the rule came before SGPM's own rejections, so 17 of its 28 CUs were regression SGPM, now reported as that). An
+SGPM CU's node derives MTSS's mode list (CU_SGPM with the list-only kinds), its block after sgpmTransformModes chooses
+(sgpmMtss: getFinalIntraModeForTransform's SGPM branch - the mode tried first is the prediction's DIMD second mode
+where the LFNST / NSPT mode, in NSPT's numbering, equals the partition's angle, its main mode where it does not and is
+not that mode, else the second; at the angle the main one where the second lies more than 2 from both of the CU's
+modes - then mtssChoice) into its DimdOut before selectTransform; mipTransformMode leaves an SGPM block's MTSS alone.
+Without DIMD in the SPS the mode list is empty (Cu::mtssNspt's MTSS_NO_LIST): mtssChoice then takes the mode tried first
+(a blended TIMD CU's secondary) even where its set and transposition are the first one's, else planar (the CPU's
+testMode as it starts), NSPT's second bucket by the same rule; the node skips the list's histograms and writes -1s,
+which verification compares with the CPU's empty list. Still rejected: MTSS without DIMD of MIP, EIP and IntraTMP CUs
+(no test stream). Results (build aglf6, the 27 streams with either reason): "MTSS" 28 -> 0 (11 SGPM CUs on the GPU, 17
+"SGPM (regression)"), "MTSS without DIMD" 2 -> 0 (ra_off4_q32's TIMD CUs); every stream identical but the two
+single-tree ones, which differ first where they did before.
 
 
 ## 8. Numbers (i7-10700 8C/16T, Win11, GCC 16.2, RTX 3070 driver 616.92)
