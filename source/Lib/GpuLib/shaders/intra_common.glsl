@@ -258,6 +258,9 @@ const int DERIVE_SGPM = 134217728;
 // an inter CU's block: its prediction given (Params::interPred; partial verification's, the CPU's), its
 // residual the GPU's, reconstructed as DecCu::xDecodeInterTU does
 const int DERIVE_INTER = 268435456;
+// with DERIVE_TRANSFORM, an inter block whose LFNST / NSPT take the second mode of the DIMD of its prediction
+// (lfnstIntra, JVET-AI0050)
+const int DERIVE_INTER_SECOND = 536870912;
 // Tu::lmcs (1: the bilateral filter on inverse-mapped samples, 2: chroma residual scaling): an inter block's
 // prediction forward-mapped (luma)
 const int LMCS_INTER_FWD = 4;

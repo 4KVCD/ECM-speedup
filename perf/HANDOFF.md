@@ -449,7 +449,7 @@ wall-clock gains with threads are "the easy baseline". Decoder status: single-th
 (`--GpuLoopFilter=1`: ALF, SAO, BIF, CCSAO, LF-CCCM, offset refinement on Vulkan). The user then asked for **a full
 GPU decoder in Vulkan, optimized until nothing is left** ("The GPU decoder needs to fully decode the frame on the
 GPU"; "Your first Vulkan version is going to be slow. That's OK"). That work is branch `dec-gpurecon`: intra
-reconstruction on the GPU (`--GpuRecon`), tool levels M1-M91 done and verified bit-exact (M19: DIMD, M20: OBIC, M21:
+reconstruction on the GPU (`--GpuRecon`), tool levels M1-M92 done and verified bit-exact (M19: DIMD, M20: OBIC, M21:
 intra merge, M22: the transforms of DIMD CUs, M23: LFNST of MIP, M24: TIMD, M25: OBIC and intra merge with TIMD
 neighbours, M26: TIMD-SAD, M27: OBIC and intra merge with TIMD-SAD neighbours, M28: TIMD merge, M29: TMRL of luma,
 M30: chroma TMRL, M31: CCLM, M32: LFNST / NSPT of CCLM, M33: GLM's gradient patterns, M34: CCCM, M35: GL-CCCM, M36:
@@ -2160,6 +2160,15 @@ residualDeps) are shared with intra blocks. Inter blocks may predict signs up to
 GPU's signPrediction keeps 32 x 32: "inter sign prediction above 32 x 32". Results (50 streams, build gpu28): every
 picture identical; "inter sign prediction" 3157 -> 127 (above 32 x 32); inter CUs from the CPU's prediction 10912 ->
 13873.
+M92 (2026-10-22): LFNST / NSPT of inter blocks on the GPU (JVET-AG0061; a single tree's: luma only): their mode is
+getFinalIntraModeForTransform's inter branch, dimdDerivedIntraDir (with lfnstIntra, JVET-AI0050's inter MTSS, the
+second mode), DecCu::xDecodeInterTexture's deriveIpmForTransform of the unmapped prediction of the CU's luma (of SBT's
+part with residual); the GPU derives it from the block's prediction (intra_rec's interTransformMode: buildHistogram's
+3x3 gradients - the 2x2 ones up to DIMD_SMALL_BLOCK_THR samples, JVET-AJ0203's aligned design -, subsampled from
+MIN_MTSS_SIZE on; DERIVE_INTER_SECOND for lfnstIntra), then selectTransform and inChainResidual as for a derived intra
+mode; verification compares the transforms chosen. A CU whose transform block is not its luma (several TUs without
+SBT) or without DIMD stays the CPU's. Results (50 streams, build gpu30): every picture identical; "inter LFNST / NSPT"
+1255 -> 22 (without DIMD); inter CUs from the CPU's prediction 13873 -> 15000.
 M91 (2026-10-22, agent lf): the deblocking filter on the GPU (LoopFilter.cpp, GpuLib's dbf.comp, GpuAlf). The host derives
 everything that does not read samples with the CPU's own code: LoopFilter::setGpuRecord makes loopFilterPic record,
 per segment it filters (4 luma lines, or a chroma part of uiLoopLength lines, per component), a GpuDbfSeg - position,

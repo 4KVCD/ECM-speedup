@@ -175,6 +175,8 @@ constexpr int DERIVE_SGPM         = 134217728; // an SGPM CU's luma block: its n
                                                // partition's weights, its transforms' modes from a DIMD of that
 constexpr int DERIVE_INTER        = 268435456; // an inter CU's block: its prediction given (Params::interPred),
                                                // its residual the GPU's (recordInterBlock)
+constexpr int DERIVE_INTER_SECOND = 536870912; // with DERIVE_TRANSFORM, an inter block whose LFNST / NSPT take
+                                               // the second mode of the DIMD of its prediction (lfnstIntra)
 
 // Tu::lm (intra_common.glsl's LM_*): whether the block is a CCLM block (the modes from 67 on are also those of TIMD /
 // TMRL luma blocks), its slope adjustments (+ 8, in 4 bits each) and LBCCP's inside filter; with DERIVE_CCLM_DIMD the
@@ -6565,8 +6567,8 @@ static const char* interKind( const CodingUnit& cu )
 }
 
 // why non-intra CU cu is taken from the CPU, nullptr for an inter CU whose blocks the GPU reconstructs: what the GPU
-// lacks of its residual (inter LFNST / NSPT, whose mode is a DIMD of the prediction; inter CCCM and CCP merge, which
-// replace its chroma prediction; ASBT)
+// lacks of its residual (inter CCCM and CCP merge, which replace its chroma prediction; ASBT; LFNST / NSPT where
+// their mode's DIMD is not of one block's prediction)
 static const char* interWhy( const GpuIntraRec::Impl& m, const CodingUnit& cu )
 {
   if( !m.partial )
@@ -6590,9 +6592,23 @@ static const char* interWhy( const GpuIntraRec::Impl& m, const CodingUnit& cu )
     return "inter CU with ACT";
   }
 #if JVET_AG0061_INTER_LFNST_NSPT
-  if( cu.lfnstIdx )
+  // (LFNST / NSPT of a single tree: luma only; their mode a DIMD of the prediction of the CU's luma, or of SBT's part
+  // with residual, which the GPU derives from the block's: the CU must be that block)
+  if( cu.lfnstIdx && !cu.cs->sps->getUseDimd() )
   {
-    return "inter LFNST / NSPT";
+    return "inter LFNST / NSPT without DIMD";
+  }
+  if( cu.lfnstIdx && !cu.sbtInfo && cu.firstTU->blocks[COMPONENT_Y] != cu.blocks[COMPONENT_Y] )
+  {
+    return "inter LFNST / NSPT of a CU of several transform blocks";
+  }
+#if JVET_AI0050_SBT_LFNST
+  if( cu.lfnstIdx && cu.sbtInfo && !cu.cs->sps->getUseSbtLFNST() )
+#else
+  if( cu.lfnstIdx && cu.sbtInfo )
+#endif
+  {
+    return "inter LFNST / NSPT with SBT";
   }
 #endif
 #if JVET_AH0066_JVET_AH0202_CCP_MERGE_LUMACBF0
@@ -6745,6 +6761,23 @@ static bool recordInterBlock( GpuIntraRec::Impl& m, const TransformUnit& tu, con
   if( !transformFields( m, tu, resiComp, area, t, sec, why ) || !dequantFields( tu, resiComp, resiQp, area, t, why ) )
   {
     return false;
+  }
+  // LFNST / NSPT (luma: a single tree's): their mode (getFinalIntraModeForTransform's inter branch: dimdDerivedIntraDir,
+  // with lfnstIntra the second mode) is a DIMD of the unmapped prediction (DecCu::xDecodeInterTexture's
+  // deriveIpmForTransform, the 2x2 operator up to DIMD_SMALL_BLOCK_THR samples), which intra_rec derives from the
+  // block's (interTransformMode); the host gives what does not depend on it
+  if( t.cbf && !t.transformSkip && sec.kind != SEC_NONE )
+  {
+    CHECK( compID != COMPONENT_Y || !cu.lfnstIdx, "an inter block's LFNST / NSPT outside a single tree's luma" );
+#if JVET_AI0050_INTER_MTSS
+    const bool second = cu.lfnstIntra;
+#else
+    const bool second = false;
+#endif
+    t.derive   |= DERIVE_TRANSFORM | ( second ? DERIVE_INTER_SECOND : 0 );
+    t.mtsSet    = 0;
+    t.secIdx    = cu.lfnstIdx - 1;
+    t.secBucket = sec.kind == SEC_NSPT ? PU::getNSPTBucket( tu, false, resiComp ) : 0;
   }
   // xDecodeInterTU's clipping: luma the slice's adaptive range (mapped with LMCS), chroma the slice's
   const bool lmcsPic = sps.getUseLmcs() && cs.picHeader->getLmcsEnabledFlag();
@@ -8631,7 +8664,9 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
   for( int i = 0; i < numTus && first.empty(); i++ )
   {
     const Tu& h = m.rec[i];
-    if( !( h.derive & ( DERIVE_MODE | DERIVE_MIP_DIMD | DERIVE_CCLM_DIMD ) ) )
+    // (an inter block's derived transforms: of its LFNST / NSPT)
+    if( !( h.derive & ( DERIVE_MODE | DERIVE_MIP_DIMD | DERIVE_CCLM_DIMD ) )
+        && !( ( h.derive & DERIVE_INTER ) && ( h.derive & DERIVE_TRANSFORM ) ) )
     {
       continue;
     }

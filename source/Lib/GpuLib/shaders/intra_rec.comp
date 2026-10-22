@@ -722,6 +722,72 @@ void mipTransformMode( Tu t, int W, int H, int ps, int upH, int upV, int predStr
                   gl_SemanticsAcquireRelease );
 }
 
+// the LFNST / NSPT mode of inter block t (DERIVE_INTER with DERIVE_TRANSFORM), all invocations, ending with a barrier:
+// deriveIpmForTransform over its prediction (prediction p, unmapped): buildHistogram's 3x3 gradients - the 2x2 ones up
+// to DIMD_SMALL_BLOCK_THR samples (JVET-AJ0203's enableAlignedDesign) - at the samples inside the block, subsampled
+// from MIN_MTSS_SIZE samples on; the strongest mode, with DERIVE_INTER_SECOND the second strongest (lfnstIntra), into
+// s_predDimdMode
+int interPredAt( Tu t, int x, int y )
+{
+  return int( BufI16( P.interPred ).v[t.dbgOffset + y * t.w + x] );
+}
+void interTransformMode( Tu t, int lid, int NT )
+{
+  const int W = t.w, H = t.h;
+  for( int i = lid; i < NUM_LUMA_MODE; i += NT )
+  {
+    s_dimdHist[i] = 0;
+  }
+  SYNC();
+  const bool small = W * H <= 32;   // (DIMD_SMALL_BLOCK_THR)
+  const int  iw = W - 2, ih = H - 2, step = iw * ih >= MIN_MTSS_SIZE ? 2 : 1;
+  const int  cols = ( iw + step - 1 ) / step, rows = ( ih + step - 1 ) / step;
+  for( int i = lid; i < cols * rows; i += NT )
+  {
+    const int x = 1 + ( i % cols ) * step, y = 1 + ( i / cols ) * step;
+    ivec2     g;
+    if( small )
+    {
+      const int a = interPredAt( t, x - 1, y - 1 ), b = interPredAt( t, x, y - 1 ), c = interPredAt( t, x - 1, y );
+      const int d = interPredAt( t, x, y );
+      g = ivec2( c + d - a - b, a + c - b - d );
+    }
+    else
+    {
+      g = sobel3x3( interPredAt( t, x - 1, y - 1 ), interPredAt( t, x, y - 1 ), interPredAt( t, x + 1, y - 1 ),
+                    interPredAt( t, x - 1, y ), interPredAt( t, x + 1, y ),
+                    interPredAt( t, x - 1, y + 1 ), interPredAt( t, x, y + 1 ), interPredAt( t, x + 1, y + 1 ) );
+    }
+    if( g.x != 0 || g.y != 0 )
+    {
+      atomicAdd( s_dimdHist[dimdAngle( g )], abs( g.x ) + abs( g.y ) );
+    }
+  }
+  SYNC();
+  if( lid == 0 )
+  {
+    int firstAmp = 0, secondAmp = 0, first = 0, second = 0;
+    for( int i = 0; i < NUM_LUMA_MODE; i++ )
+    {
+      const int amp = s_dimdHist[i];
+      if( amp > firstAmp )
+      {
+        secondAmp = firstAmp;
+        second    = first;
+        firstAmp  = amp;
+        first     = i;
+      }
+      else if( amp > secondAmp )
+      {
+        secondAmp = amp;
+        second    = i;
+      }
+    }
+    s_predDimdMode = ( t.derive & DERIVE_INTER_SECOND ) != 0 ? second : first;
+  }
+  SYNC();
+}
+
 // workgroup sums of a and b (all invocations, uniform control flow; the slots are zero before)
 ivec2 wgSum2( int a, int b, int slot )
 {
@@ -1772,11 +1838,26 @@ void main()
     }
     // ----- an inter CU's block (partial verification: its prediction the CPU's, Params::interPred at the block's
     // samples): the prediction - luma forward-mapped by LMCS where DecCu::xDecodeInterTU maps it (LMCS_INTER_FWD) -
-    // reconstructed with intra_resi's residual, the chroma residual scaled as an intra block's; with sign prediction
-    // after the signs are decided on it
+    // reconstructed with intra_resi's residual (or, with LFNST / NSPT, the one computed after their mode, a DIMD of the
+    // prediction), the chroma residual scaled as an intra block's; with sign prediction after the signs are decided
     if( ( t.derive & DERIVE_INTER ) != 0 )
     {
       crsSetup( t, lid, NT );
+      // (LFNST / NSPT: their mode from a DIMD of the prediction, the residual computed here: inChainResidual)
+      if( WITH_DERIVED_TRANSFORMS && ( t.derive & DERIVE_TRANSFORM ) != 0 )
+      {
+        interTransformMode( t, lid, NT );
+        selectTransform( t, s_predDimdMode, 0 );
+        if( pc.verify != 0 && lid == 0 )
+        {
+          storeDbgTransforms( t );
+        }
+        if( t.spCoded < 0 && t.resiFrom < 0 )
+        {
+          inChainResidual( t, lid, NT );
+          t.resiFrom = g_ti;   // storeRecon reads it device-coherent
+        }
+      }
       BufI16 ip = BufI16( P.interPred );
       for( int i = lid; i < t.w * t.h; i += NT )
       {
