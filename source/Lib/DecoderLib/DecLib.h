@@ -270,6 +270,7 @@ private:
   // loop filters on a Vulkan compute device (source/Lib/GpuLib), created by the context that filters a picture
   int                     m_gpuLoopFilter = 0;      ///< GpuAlf::Mode
   bool                    m_gpuUnavailable = false;
+  PelStorage              m_dbfBefore;              ///< --GpuLoopFilter=2: the picture before deblocking
   std::unique_ptr<GpuAlfHook> m_gpuAlf;
   // GPU reconstruction (so far: intra pictures, verification against the CPU)
   std::unique_ptr<GpuIntraRec> m_gpuIntraRec;

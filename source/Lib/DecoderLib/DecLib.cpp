@@ -767,9 +767,9 @@ void DecLib::xPollGpuRecon()
 void DecLib::setGpuLoopFilter( int mode )
 {
   m_gpuLoopFilter = mode;
-  if( mode == GpuAlf::VERIFY )
+  if( mode == GpuAlf::VERIFY || mode == GpuAlf::ON_WAIT )
   {
-    GpuAlf::prefetch( mode );   // every picture is verified
+    GpuAlf::prefetch( mode == GpuAlf::ON_WAIT ? int( GpuAlf::ON ) : mode );   // every picture is filtered on the GPU
   }
 }
 #endif
@@ -1088,17 +1088,18 @@ void DecLib::xExecuteLoopFilters( LfCtrlState* lf )
   const bool storeCodingInfo = cs.sps->getALFEnabledFlag();
 #endif
   PelUnitBuf codingInfoBuf = storeCodingInfo ? m_cALF.callCodingInfoBuf( cs ) : PelUnitBuf();
-  m_cLoopFilter.loopFilterPic( cs, codingInfoBuf, storeCodingInfo );
+  auto deblock = [&]() { m_cLoopFilter.loopFilterPic( cs, codingInfoBuf, storeCodingInfo ); };
 #else
-  m_cLoopFilter.loopFilterPic( cs );
+  auto deblock = [&]() { m_cLoopFilter.loopFilterPic( cs ); };
 #endif
 
 #if ECM_VULKAN
-  // pictures filtered before the device is ready take the CPU path (verification waits for it)
-  if( cs.sps->getALFEnabledFlag() && m_gpuLoopFilter && !m_gpuAlf && !m_gpuUnavailable
-      && ( m_gpuLoopFilter == GpuAlf::VERIFY || GpuAlf::ready() ) )
+  // pictures filtered before the device is ready take the CPU path (verification waits for it); the hook is also made
+  // without ALF, for the verification of the deblocking
+  if( m_gpuLoopFilter && !m_gpuAlf && !m_gpuUnavailable
+      && ( m_gpuLoopFilter == GpuAlf::VERIFY || m_gpuLoopFilter == GpuAlf::ON_WAIT || GpuAlf::ready() ) )
   {
-    m_gpuAlf.reset( GpuAlfHook::create( m_gpuLoopFilter ) );
+    m_gpuAlf.reset( GpuAlfHook::create( m_gpuLoopFilter == GpuAlf::ON_WAIT ? int( GpuAlf::ON ) : m_gpuLoopFilter ) );
     m_gpuUnavailable = !m_gpuAlf;
     m_cALF.setProcessHook( m_gpuAlf.get() );
   }
@@ -1108,6 +1109,42 @@ void DecLib::xExecuteLoopFilters( LfCtrlState* lf )
 #else
   const bool gpuDeferred = m_gpuAlf && cs.sps->getALFEnabledFlag();
 #endif
+  // the deblocking on the GPU (GpuAlf's dbf.comp, from the segments LoopFilter records): verified against the CPU's,
+  // or in ON mode deferred to ALFProcess with the rest (LoopFilter only derives the segments then)
+  GpuDbfJob  dbfJob;
+  const bool dbfVerify   = m_gpuAlf && m_gpuLoopFilter == GpuAlf::VERIFY;
+  const bool dbfDeferred = gpuDeferred && ( m_gpuLoopFilter == GpuAlf::ON || m_gpuLoopFilter == GpuAlf::ON_WAIT );
+  if( dbfVerify )
+  {
+    if( m_dbfBefore.bufs.empty() || m_dbfBefore.Y().width != cs.area.lwidth() || m_dbfBefore.Y().height != cs.area.lheight()
+        || m_dbfBefore.chromaFormat != cs.area.chromaFormat )
+    {
+      m_dbfBefore.destroy();
+      m_dbfBefore.create( cs.area );
+    }
+    m_dbfBefore.copyFrom( cs.getRecoBuf() );
+  }
+  if( dbfVerify || dbfDeferred )
+  {
+    m_cLoopFilter.setGpuRecord( &dbfJob.segs, !dbfDeferred );
+  }
+#endif
+  deblock();
+#if ECM_VULKAN
+  if( dbfVerify || dbfDeferred )
+  {
+    dbfJob.supported = !m_cLoopFilter.gpuRecordUnsupported();
+    m_cLoopFilter.setGpuRecord( nullptr, true );
+  }
+  if( dbfVerify )
+  {
+    m_gpuAlf->verifyDeblocking( cs, m_dbfBefore, dbfJob );
+  }
+  if( dbfDeferred )
+  {
+    dbfJob.cpu = deblock;
+    m_gpuAlf->setDbf( &dbfJob );
+  }
 #endif
 #if JVET_AK0121_LOOPFILTER_OFFSET_REFINEMENT
   bool sliceTypeCondition = true;
@@ -1346,6 +1383,7 @@ void DecLib::xExecuteLoopFilters( LfCtrlState* lf )
     {
       m_gpuAlf->setSao( nullptr );
       m_gpuAlf->setLfCccm( nullptr );
+      m_gpuAlf->setDbf( nullptr );
     }
 #endif
     CHECK( lf && lf->slice != cs.slice, "ALFProcess ended with another slice than the loop filter state was set up for" );
@@ -2911,7 +2949,8 @@ void DecLib::xActivateParameterSets( const InputNALUnit nalu )
     if( m_gpuLoopFilter && sps->getALFEnabledFlag()
         && GpuAlf::worthwhile( pps->getPicWidthInLumaSamples(), pps->getPicHeightInLumaSamples() ) )
     {
-      GpuAlf::prefetch( m_gpuLoopFilter, pps->getPicWidthInLumaSamples(), pps->getPicHeightInLumaSamples(), sps->getMaxCUWidth() );
+      GpuAlf::prefetch( m_gpuLoopFilter == GpuAlf::ON_WAIT ? int( GpuAlf::ON ) : m_gpuLoopFilter,
+                        pps->getPicWidthInLumaSamples(), pps->getPicHeightInLumaSamples(), sps->getMaxCUWidth() );
     }
 #endif
 

@@ -156,6 +156,48 @@ public:
 
   void resetFilterLengths();
 
+  /// the decoder's GPU deblocking (GpuLib's dbf.comp): per segment of an edge that xEdgeFilterLuma /
+  /// xEdgeFilterChroma filter (4 luma lines or a chroma part), what the filtering needs besides the samples - all of it
+  /// from syntax, geometry and motion, the decisions and LADF's luma level are the kernel's (see GpuDbfSeg's flags)
+  struct GpuDbfSeg
+  {
+    int32_t pos;     ///< x | y << 16 of its first sample in the component: the q side's first sample on the edge
+    int32_t flags;   ///< GPU_DBF_* fields
+    int32_t tc;      ///< luma: tc's table index before LADF and its clipping; chroma: tc
+    int32_t beta;    ///< luma: beta's table index before LADF and its clipping; chroma: beta (largeBoundary)
+  };
+  // GpuDbfSeg::flags (GpuLib/shaders/dbf.comp): the component; a horizontal edge; the lines (or columns) of the
+  // segment; luma: maxFilterLengthP / Q (P after the affine limit), sidePisLarge / sideQisLarge; the palette's
+  // bPartPNoFilter / bPartQNoFilter; the asymmetric filtering (m_applyAsymmetricDB); chroma: largeBoundary,
+  // isChromaHorCTBBoundary; the second line of the decisions (3, or 1 for subsampled chroma); luma: LADF
+  static constexpr int GPU_DBF_HOR         = 1 << 2;
+  static constexpr int GPU_DBF_LINES_SHIFT = 3;
+  static constexpr int GPU_DBF_MAXP_SHIFT  = 6;
+  static constexpr int GPU_DBF_MAXQ_SHIFT  = 10;
+  static constexpr int GPU_DBF_SIDE_P      = 1 << 14;
+  static constexpr int GPU_DBF_SIDE_Q      = 1 << 15;
+  static constexpr int GPU_DBF_NO_P        = 1 << 16;
+  static constexpr int GPU_DBF_NO_Q        = 1 << 17;
+  static constexpr int GPU_DBF_ASYM        = 1 << 18;
+  static constexpr int GPU_DBF_LARGE       = 1 << 19;
+  static constexpr int GPU_DBF_CTB         = 1 << 20;
+  static constexpr int GPU_DBF_LINE3_SHIFT = 21;
+  static constexpr int GPU_DBF_LADF        = 1 << 23;
+  /// with rec, loopFilterPic appends the segments it filters in its order (in each pass, component and line of
+  /// segments, increasing along the line); filter: also filters (else only derives, its boundary strengths kept as the
+  /// filtering would keep them, the ALF coding information stored)
+  void setGpuRecord( std::vector<GpuDbfSeg>* rec, bool filter ) { m_gpuRec = rec; m_gpuFilter = filter; m_gpuUnsupported = false; }
+  /// something of the recorded picture the kernel does not do (a minimum CU size other than 4 with LADF)
+  bool gpuRecordUnsupported() const { return m_gpuUnsupported; }
+  static const uint16_t* tcTable() { return sm_tcTable; }
+  static const uint8_t*  betaTable() { return sm_betaTable; }
+
+private:
+  std::vector<GpuDbfSeg>* m_gpuRec = nullptr;
+  bool                    m_gpuFilter = true;
+  bool                    m_gpuUnsupported = false;
+public:
+
 #if JVET_AB0171_ASYMMETRIC_DB_FOR_GDR
 private:
   bool m_applyAsymmetricDB;

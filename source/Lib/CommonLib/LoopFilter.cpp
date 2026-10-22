@@ -1410,6 +1410,7 @@ void LoopFilter::xEdgeFilterLuma( const CodingUnit& cu, const DeblockEdgeDir edg
         }
       }
       iQP = (cuP.qp + cuQ.qp + 1) >> 1;
+      const int iQPBeforeLadf = iQP;   // (the GPU deblocking's record: the kernel adds LADF's shift)
 
 #if LUMA_ADAPTIVE_DEBLOCKING_FILTER_QP_OFFSET
       if ( sps.getLadfEnabled() )
@@ -1456,6 +1457,37 @@ void LoopFilter::xEdgeFilterLuma( const CodingUnit& cu, const DeblockEdgeDir edg
       const int iThrCut   = iTc * 10;
 
       const unsigned uiBlocksInPart = pelsInPart / 4 ? pelsInPart / 4 : 1;
+
+      if( m_gpuRec )
+      {
+        // the GPU deblocking's segments of 4 lines (LADF's luma level comes from the part's first one: the kernel has
+        // it only where the part is one segment)
+        bool ladf = false;
+#if LUMA_ADAPTIVE_DEBLOCKING_FILTER_QP_OFFSET
+        ladf = sps.getLadfEnabled();
+#endif
+        m_gpuUnsupported = m_gpuUnsupported || ( ladf && uiBlocksInPart != 1 );
+        const int flags = int( COMPONENT_Y ) | ( edgeDir == EDGE_HOR ? GPU_DBF_HOR : 0 ) | ( 4 << GPU_DBF_LINES_SHIFT )
+                          | ( maxFilterLengthP << GPU_DBF_MAXP_SHIFT ) | ( maxFilterLengthQ << GPU_DBF_MAXQ_SHIFT )
+                          | ( sidePisLarge ? GPU_DBF_SIDE_P : 0 ) | ( sideQisLarge ? GPU_DBF_SIDE_Q : 0 )
+                          | ( spsPaletteEnabledFlag && CU::isPLT( cuP ) ? GPU_DBF_NO_P : 0 )
+                          | ( spsPaletteEnabledFlag && CU::isPLT( cuQ ) ? GPU_DBF_NO_Q : 0 )
+#if JVET_AB0171_ASYMMETRIC_DB_FOR_GDR
+                          | ( m_applyAsymmetricDB ? GPU_DBF_ASYM : 0 )
+#endif
+                          | ( 3 << GPU_DBF_LINE3_SHIFT ) | ( ladf ? GPU_DBF_LADF : 0 );
+        for( int iBlkIdx = 0; iBlkIdx < (int) uiBlocksInPart; iBlkIdx++ )
+        {
+          const int x = edgeDir == EDGE_VER ? pos.x : pos.x + iBlkIdx * 4, y = edgeDir == EDGE_VER ? pos.y + iBlkIdx * 4 : pos.y;
+          m_gpuRec->push_back( { x | ( y << 16 ), flags,
+                                 iQPBeforeLadf + DEFAULT_INTRA_TC_OFFSET * int( uiBs - 1 ) + ( tcOffsetDiv2 << 1 ),
+                                 iQPBeforeLadf + ( betaOffsetDiv2 << 1 ) } );
+        }
+        if( !m_gpuFilter )
+        {
+          continue;
+        }
+      }
 
       for( int iBlkIdx = 0; iBlkIdx < uiBlocksInPart; iBlkIdx++ )
       {
@@ -1745,6 +1777,27 @@ void LoopFilter::xEdgeFilterChroma(const CodingUnit& cu, const DeblockEdgeDir ed
           const int iTc = bitDepthChroma < 10
             ? ( ( sm_tcTable[iIndexTC] + ( 1 << ( 9 - bitDepthChroma ) ) ) >> ( 10 - bitDepthChroma ) )
             : ( ( sm_tcTable[iIndexTC] ) << ( bitDepthChroma - 10 ) );
+          if( m_gpuRec )   // the GPU deblocking's segment: a part of the chroma component
+          {
+            const int subShift = ( edgeDir == EDGE_VER ) ? m_shiftVer : m_shiftHor;
+            const int beta     = sm_betaTable[Clip3<int>( 0, MAX_QP, iQP + ( betaOffsetDiv2[chromaIdx] << 1 ) )] * iBitdepthScale;
+            const int x = edgeDir == EDGE_VER ? cu.blocks[COMPONENT_Cb].x + iEdge * uiPelsInPartChromaH
+                                              : cu.blocks[COMPONENT_Cb].x + iIdx * uiLoopLength;
+            const int y = edgeDir == EDGE_VER ? cu.blocks[COMPONENT_Cb].y + iIdx * uiLoopLength
+                                              : cu.blocks[COMPONENT_Cb].y + iEdge * uiPelsInPartChromaV;
+            const int flags = ( chromaIdx + 1 ) | ( edgeDir == EDGE_HOR ? GPU_DBF_HOR : 0 ) | ( int( uiLoopLength ) << GPU_DBF_LINES_SHIFT )
+                              | ( bPartPNoFilter ? GPU_DBF_NO_P : 0 ) | ( bPartQNoFilter ? GPU_DBF_NO_Q : 0 )
+#if JVET_AB0171_ASYMMETRIC_DB_FOR_GDR
+                              | ( m_applyAsymmetricDB ? GPU_DBF_ASYM : 0 )
+#endif
+                              | ( largeBoundary ? GPU_DBF_LARGE : 0 ) | ( isChromaHorCTBBoundary ? GPU_DBF_CTB : 0 )
+                              | ( ( subShift == 1 ? 1 : 3 ) << GPU_DBF_LINE3_SHIFT );
+            m_gpuRec->push_back( { x | ( y << 16 ), flags, iTc, largeBoundary ? beta : 0 } );
+            if( !m_gpuFilter )
+            {
+              continue;
+            }
+          }
           bool useLongFilter = false;
           if( largeBoundary )
           {

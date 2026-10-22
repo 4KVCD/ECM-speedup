@@ -39,6 +39,7 @@
 #define __GPUALF__
 
 #include "CommonLib/AdaptiveLoopFilter.h"
+#include "CommonLib/LoopFilter.h"
 #include "CommonLib/SampleAdaptiveOffset.h"
 #include "VkCompute.h"
 
@@ -65,6 +66,16 @@ struct GpuLfCccmJob
   bool                  applied    = false;     ///< the GPU added the correction to the filtered picture
 };
 
+/// the deblocking (LoopFilter::loopFilterPic) of the picture that ALFProcess filters next, its segments recorded by
+/// LoopFilter (setGpuRecord): in ON mode the decoder defers it to ALFProcess, which deblocks on the GPU (dbf.comp) with
+/// the rest, or calls cpu() first
+struct GpuDbfJob
+{
+  std::function<void()>              cpu;               ///< deblocks on the CPU
+  std::vector<LoopFilter::GpuDbfSeg> segs;              ///< the segments LoopFilter filters, in its order
+  bool                               supported = true;  ///< !LoopFilter::gpuRecordUnsupported()
+};
+
 /// the GPU resources to filter one picture at a time (command stream, buffers); see GpuAlfHook
 class GpuAlf
 {
@@ -73,7 +84,8 @@ public:
   {
     OFF    = 0,
     ON     = 1,   ///< the GPU filters the pictures it supports
-    VERIFY = 2    ///< the CPU filters every picture, the GPU result is compared with it
+    VERIFY = 2,   ///< the CPU filters every picture, the GPU result is compared with it
+    ON_WAIT = 3   ///< ON from the first picture of any size, waiting for the device (tests; the decoder's mode)
   };
 
   /// smaller pictures are filtered on the CPU: the fixed costs of the device exceed what it saves
@@ -90,7 +102,10 @@ public:
   ~GpuAlf();
   /// with `sao`, SAO first; with `lfCccm`, also the LF-CCCM correction (the GPU adds it, or lfCccm->cpu() derives it
   /// before the CPU filters)
-  bool process( AdaptiveLoopFilter& alf, CodingStructure& cs, GpuSaoJob* sao, GpuLfCccmJob* lfCccm );
+  bool process( AdaptiveLoopFilter& alf, CodingStructure& cs, GpuSaoJob* sao, GpuLfCccmJob* lfCccm, GpuDbfJob* dbf );
+  /// VERIFY: deblocks `before` (the picture before deblocking) on the GPU with the segments of job and compares the
+  /// result with cs's picture, which the CPU deblocked; the first differences are reported
+  void verifyDeblocking( const CodingStructure& cs, const CPelUnitBuf& before, const GpuDbfJob& job );
 
 private:
   friend class GpuAlfHook;
@@ -158,6 +173,11 @@ private:
   void run( const AdaptiveLoopFilter& alf, const CodingStructure& cs );
   void output( AdaptiveLoopFilter& alf, CodingStructure& cs ) const;
   bool verify( const AdaptiveLoopFilter& alf, const CodingStructure& cs, const GpuLfCccmJob* lfCccm );
+  /// the strips of the deblocking (dbf.comp) into m_dbfData; false when the GPU does not deblock the picture
+  bool dbfPrepare( const CodingStructure& cs, const GpuDbfJob& job );
+  /// records into the stream (begun): the copy of the picture from src to dst, the vertical edges, the horizontal ones
+  void dbfRecord( const CodingStructure& cs, const gpu::Buffer& srcBuf, const PlaneDesc src[3], const gpu::Buffer& dstBuf,
+                  const PlaneDesc dst[3] );
 
   gpu::Context&                m_ctx;
   const Shared&                m_k;
@@ -191,6 +211,17 @@ private:
   gpu::Buffer                  m_outDev, m_download, m_workDownload, m_saoDownload;
   bool                         m_saoLumaDownloaded = false;
   PelStorage                   m_verifyDeblocked;   ///< the verification's copy of the picture before SAO
+  // the deblocking: segments then the vertical and horizontal strips (int32, dbf.comp), on the device; ON: whether
+  // this picture's deblocking runs on the GPU (from m_inDb into m_inDeblocked)
+  std::vector<int32_t>         m_dbfData;
+  int                          m_dbfNumV = 0, m_dbfNumH = 0;
+  VkDeviceSize                 m_dbfOffsetV = 0, m_dbfOffsetH = 0;
+  gpu::Buffer                  m_dbfDev, m_dbfUpload;
+  bool                         m_dbfGpu = false;
+  // VERIFY (verifyDeblocking): the picture before deblocking and the GPU's result, with margins
+  PlaneDesc                    m_dbfBefore[3], m_dbfAfter[3];
+  int                          m_dbfWidth = 0, m_dbfHeight = 0;
+  gpu::Buffer                  m_dbfPic, m_dbfPicUpload, m_dbfPicDownload;
 };
 
 /// ALFProcess on the GPU for a decoder context: every picture is filtered with a GpuAlf of a pool that all decoder
@@ -204,7 +235,11 @@ public:
   /// the deferred SAO and the LF-CCCM correction of the next picture, nullptr when it has none (process() takes them)
   void setSao( GpuSaoJob* job ) { m_sao = job; }
   void setLfCccm( GpuLfCccmJob* job ) { m_lfCccm = job; }
+  /// the deferred deblocking of the next picture (ON mode), nullptr when the CPU deblocked it
+  void setDbf( GpuDbfJob* job ) { m_dbf = job; }
   bool process( AdaptiveLoopFilter& alf, CodingStructure& cs ) override;
+  /// VERIFY: GpuAlf::verifyDeblocking with a GpuAlf of the pool
+  void verifyDeblocking( const CodingStructure& cs, const CPelUnitBuf& before, const GpuDbfJob& job );
 
 private:
   GpuAlfHook( gpu::Context& ctx, int mode ) : m_ctx( ctx ), m_mode( mode ) {}
@@ -213,6 +248,7 @@ private:
   int           m_mode;
   GpuSaoJob*    m_sao    = nullptr;
   GpuLfCccmJob* m_lfCccm = nullptr;
+  GpuDbfJob*    m_dbf    = nullptr;
 };
 
 #endif

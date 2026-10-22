@@ -151,7 +151,7 @@ bool DecAppCfg::parseCfg( int argc, char* argv[] )
   ("FrameThreadsSerial",       m_frameThreadsSerial,                    false,     "Test: decode one picture at a time on the frame threads\n")
 #if ECM_VULKAN
   ("GpuRecon",                 m_gpuRecon,                                  0,     "Reconstruction on the Vulkan compute device of the intra pictures the GPU path supports: 0 off, 1 on (the CPU reconstructs until the device is ready), 2 verify (the CPU reconstructs, the GPU result is compared), 3 on, waiting for the device at the first picture\n")
-  ("GpuLoopFilter",            m_gpuLoopFilter,                             0,     "Loop filters on the Vulkan compute device: 0 off, 1 on, 2 verify (the CPU filters, the GPU result is compared). Without a usable device the CPU filters\n")
+  ("GpuLoopFilter",            m_gpuLoopFilter,                             0,     "Loop filters on the Vulkan compute device: 0 off, 1 on, 2 verify (the CPU filters, the GPU result is compared), 3 on from the first picture of any size, waiting for the device (tests). Without a usable device the CPU filters\n")
 #endif
   ;
 

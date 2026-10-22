@@ -1,0 +1,601 @@
+#version 460
+// the deblocking filter (LoopFilter::loopFilterPic) of a picture whose edges and boundary strengths the host derived:
+// LoopFilter records per segment of an edge it filters (4 luma lines, or a chroma part of 2 or 4 lines) everything but
+// the samples (LoopFilter::GpuDbfSeg); this kernel makes the decisions and filters, line by line after
+// xEdgeFilterLuma / xEdgeFilterChroma, xPelFilterLuma, xFilteringPandQ, xBilinearFilter, xPelFilterChroma,
+// xUseStrongFiltering, xCalcDP / xCalcDQ and deriveLADFShift. The CPU filters the vertical edges of the whole picture,
+// then the horizontal ones, edge by edge in coding order, each reading what the edges before it wrote: along a row
+// (vertical edges) its coding order is left to right, along a column (horizontal edges) top to bottom. So one
+// invocation takes a strip - the lines of one segment row of a component (vertical edges) or the columns of one
+// segment column (horizontal edges) - and filters its segments in that order, in place; strips never share samples.
+// Mode 0 copies the picture first (the input planes to the filtered ones).
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+layout( local_size_x = 64 ) in;
+
+layout( push_constant ) uniform Push
+{
+  Plane    dst[3];        // the picture, filtered in place
+  Plane    src[3];        // mode 0: the picture before deblocking
+  uint64_t segs;          // int32 [4] per segment (LoopFilter::GpuDbfSeg), grouped by strip
+  uint64_t strips;        // int32 [2] per strip: its first segment, its number of segments
+  uint64_t tables;        // int32: sm_tcTable [MAX_QP + 3], then sm_betaTable [MAX_QP + 1]
+  int      mode;          // 0: copy, 1: filter the strips
+  int      numStrips;
+  int      width;         // luma
+  int      height;
+  int      chromaShiftX;
+  int      chromaShiftY;
+  int      clipMin[3];    // the slice's clipping ranges (ClpRng) per component
+  int      clipMax[3];
+  int      bitDepthLuma;
+  int      bitDepthChroma;
+  int      ladfNum;       // LADF (sps.getLadfNumIntervals, lower bounds, QP offsets)
+  int      ladfLower[5];
+  int      ladfOffset[5];
+} pc;
+
+const int MAX_QP = 63;
+const int TC_TABLE = 0, BETA_TABLE = MAX_QP + 3;
+
+// GpuDbfSeg::flags (LoopFilter.h's GPU_DBF_*)
+const int F_HOR = 1 << 2, LINES_SHIFT = 3, MAXP_SHIFT = 6, MAXQ_SHIFT = 10, F_SIDE_P = 1 << 14, F_SIDE_Q = 1 << 15;
+const int F_NO_P = 1 << 16, F_NO_Q = 1 << 17, F_ASYM = 1 << 18, F_LARGE = 1 << 19, F_CTB = 1 << 20, LINE3_SHIFT = 21;
+const int F_LADF = 1 << 23;
+
+// the segment being filtered: sample k of its line l (k < 0 the P side, k >= 0 the Q side)
+Plane g_p;
+ivec2 g_base;   // the Q side's first sample of line 0
+ivec2 g_along;  // across the edge (k)
+ivec2 g_line;   // the next line
+int   g_min, g_max;   // ClipPel's range
+
+int S( int l, int k )
+{
+  const ivec2 q = g_base + g_line * l + g_along * k;
+  return ld( g_p, q.x, q.y );
+}
+
+void W( int l, int k, int v )
+{
+  const ivec2 q = g_base + g_line * l + g_along * k;
+  st( g_p, q.x, q.y, v );
+}
+
+int clipPel( int v )
+{
+  return clamp( v, g_min, g_max );
+}
+
+int calcDP( int l, bool ctb )   // xCalcDP (at the CTB boundary its first term is the second's sample)
+{
+  return ctb ? abs( S( l, -2 ) - 2 * S( l, -2 ) + S( l, -1 ) ) : abs( S( l, -3 ) - 2 * S( l, -2 ) + S( l, -1 ) );
+}
+
+int calcDQ( int l, int k0 )   // xCalcDQ at sample k0 of the Q side
+{
+  return abs( S( l, k0 ) - 2 * S( l, k0 + 1 ) + S( l, k0 + 2 ) );
+}
+
+int calcDPAt( int l, int k0 )   // xCalcDP( piSrc + k0 * iOffset ) (k0 <= 0)
+{
+  return abs( S( l, k0 - 3 ) - 2 * S( l, k0 - 2 ) + S( l, k0 - 1 ) );
+}
+
+bool useStrongFiltering( int l, int d, int beta, int tc, bool sideP, bool sideQ, int maxP, int maxQ, bool ctb )
+{
+  const int m4 = S( l, 0 ), m3 = S( l, -1 ), m7 = S( l, 3 ), m0 = S( l, -4 ), m2 = S( l, -2 );
+  int sp3 = abs( m0 - m3 );
+  if( ctb )
+  {
+    sp3 = abs( m2 - m3 );
+  }
+  int       sq3     = abs( m7 - m4 );
+  const int dStrong = sp3 + sq3;
+  if( sideP || sideQ )
+  {
+    if( sideP )
+    {
+      int mP4;
+      if( maxP == 7 )
+      {
+        const int mP5 = S( l, -5 ), mP6 = S( l, -6 ), mP7 = S( l, -7 );
+        mP4 = S( l, -8 );
+        sp3 = sp3 + abs( mP5 - mP6 - mP7 + mP4 );
+      }
+      else
+      {
+        mP4 = S( l, -6 );
+      }
+      sp3 = ( sp3 + abs( m0 - mP4 ) + 1 ) >> 1;
+    }
+    if( sideQ )
+    {
+      int m11;
+      if( maxQ == 7 )
+      {
+        const int m8 = S( l, 4 ), m9 = S( l, 5 ), m10 = S( l, 6 );
+        m11 = S( l, 7 );
+        sq3 = sq3 + abs( m8 - m9 - m10 + m11 );
+      }
+      else
+      {
+        m11 = S( l, 5 );
+      }
+      sq3 = ( sq3 + abs( m11 - m7 ) + 1 ) >> 1;
+    }
+    return ( ( sp3 + sq3 ) < ( beta * 3 >> 5 ) ) && ( d < ( beta >> 4 ) ) && ( abs( m3 - m4 ) < ( ( tc * 5 + 1 ) >> 1 ) );
+  }
+  return ( dStrong < ( beta >> 3 ) ) && ( d < ( beta >> 2 ) ) && ( abs( m3 - m4 ) < ( ( tc * 5 + 1 ) >> 1 ) );
+}
+
+int dbCoeff( int n, int pos )
+{
+  if( n == 7 )
+  {
+    return pos == 0 ? 59 : pos == 1 ? 50 : pos == 2 ? 41 : pos == 3 ? 32 : pos == 4 ? 23 : pos == 5 ? 14 : 5;
+  }
+  if( n == 5 )
+  {
+    return pos == 0 ? 58 : pos == 1 ? 45 : pos == 2 ? 32 : pos == 3 ? 19 : 6;
+  }
+  return pos == 0 ? 53 : pos == 1 ? 32 : 11;
+}
+
+int tcWeight( int n, int pos )   // xBilinearFilter's tc3 / tc7
+{
+  if( n == 3 )
+  {
+    return pos == 0 ? 6 : pos == 1 ? 4 : 2;
+  }
+  return pos == 0 ? 6 : pos == 1 ? 5 : pos == 2 ? 4 : pos == 3 ? 3 : pos == 4 ? 2 : 1;
+}
+
+// xFilteringPandQ and xBilinearFilter on line l: P sample j is S( -1 - j ), Q sample j is S( j )
+void filteringPandQ( int l, int nP, int nQ, int tc, bool asym )
+{
+  int refP = 0, refQ = 0, refMiddle = 0;
+  if( nP == 7 ) refP = ( S( l, -7 ) + S( l, -8 ) + 1 ) >> 1;
+  else if( nP == 3 ) refP = ( S( l, -3 ) + S( l, -4 ) + 1 ) >> 1;
+  else if( nP == 5 ) refP = ( S( l, -5 ) + S( l, -6 ) + 1 ) >> 1;
+  if( nQ == 7 ) refQ = ( S( l, 6 ) + S( l, 7 ) + 1 ) >> 1;
+  else if( nQ == 3 ) refQ = ( S( l, 2 ) + S( l, 3 ) + 1 ) >> 1;
+  else if( nQ == 5 ) refQ = ( S( l, 4 ) + S( l, 5 ) + 1 ) >> 1;
+  if( nP == nQ )
+  {
+    if( nP == 5 )
+    {
+      refMiddle = ( 2 * ( S( l, -1 ) + S( l, 0 ) + S( l, -2 ) + S( l, 1 ) + S( l, -3 ) + S( l, 2 ) ) + S( l, -4 ) + S( l, 3 )
+                    + S( l, -5 ) + S( l, 4 ) + 8 ) >> 4;
+    }
+    else
+    {
+      refMiddle = ( 2 * ( S( l, -1 ) + S( l, 0 ) ) + S( l, -2 ) + S( l, 1 ) + S( l, -3 ) + S( l, 2 ) + S( l, -4 ) + S( l, 3 )
+                    + S( l, -5 ) + S( l, 4 ) + S( l, -6 ) + S( l, 5 ) + S( l, -7 ) + S( l, 6 ) + 8 ) >> 4;
+    }
+  }
+  else
+  {
+    // the longer side as P (srcPt), the shorter as Q (srcQt): Pt j is the long side's sample j from the edge
+    const bool swapped = nQ > nP;
+    const int  nLong = swapped ? nQ : nP, nShort = swapped ? nP : nQ;
+    if( nLong == 7 && nShort == 5 )
+    {
+      refMiddle = ( 2 * ( S( l, -1 ) + S( l, 0 ) + S( l, -2 ) + S( l, 1 ) ) + S( l, -3 ) + S( l, 2 ) + S( l, -4 ) + S( l, 3 )
+                    + S( l, -5 ) + S( l, 4 ) + S( l, -6 ) + S( l, 5 ) + 8 ) >> 4;
+    }
+    else if( nLong == 7 && nShort == 3 )
+    {
+      int pt[7], qt[3];
+      for( int j = 0; j < 7; j++ ) pt[j] = swapped ? S( l, j ) : S( l, -1 - j );
+      for( int j = 0; j < 3; j++ ) qt[j] = swapped ? S( l, -1 - j ) : S( l, j );
+      refMiddle = ( 2 * ( pt[0] + qt[0] ) + qt[0] + 2 * ( qt[1] + qt[2] ) + pt[1] + qt[1] + pt[2] + pt[3] + pt[4] + pt[5]
+                    + pt[6] + 8 ) >> 4;
+    }
+    else
+    {
+      refMiddle = ( S( l, -1 ) + S( l, 0 ) + S( l, -2 ) + S( l, 1 ) + S( l, -3 ) + S( l, 2 ) + S( l, -4 ) + S( l, 3 ) + 4 ) >> 3;
+    }
+  }
+  // xBilinearFilter (its own difference array, zero)
+  int diff[7] = int[7]( 0, 0, 0, 0, 0, 0, 0 );
+  for( int pos = 0; pos < nP; pos++ )
+  {
+    const int src    = S( l, -1 - pos );
+    const int cvalue = ( tc * tcWeight( nP, pos ) ) >> 1;
+    const int c      = dbCoeff( nP, pos );
+    const int v      = ( refMiddle * c + refP * ( 64 - c ) + 32 ) >> 6;
+    if( asym )
+    {
+      diff[pos] = clamp( v - src, -cvalue, cvalue );
+      W( l, -1 - pos, src );
+    }
+    else
+    {
+      W( l, -1 - pos, clamp( v, src - cvalue, src + cvalue ) );
+    }
+  }
+  for( int pos = 0; pos < nQ; pos++ )
+  {
+    const int src    = S( l, pos );
+    const int cvalue = ( tc * tcWeight( nQ, pos ) ) >> 1;
+    const int c      = dbCoeff( nQ, pos );
+    const int v      = ( refMiddle * c + refQ * ( 64 - c ) + 32 ) >> 6;
+    if( asym )
+    {
+      W( l, pos, clipPel( clamp( v - ( pos < 7 ? diff[pos] : 0 ), src - cvalue, src + cvalue ) ) );
+    }
+    else
+    {
+      W( l, pos, clamp( v, src - cvalue, src + cvalue ) );
+    }
+  }
+}
+
+// xPelFilterLuma on line l (diffP[-k] of the CPU is d[k])
+void pelFilterLuma( int l, int tc, bool sw, bool noP, bool noQ, int thrCut, bool secondP, bool secondQ, bool sideP,
+                    bool sideQ, int maxP, int maxQ, bool asym )
+{
+  const int m4 = S( l, 0 ), m3 = S( l, -1 ), m5 = S( l, 1 ), m2 = S( l, -2 ), m6 = S( l, 2 ), m1 = S( l, -3 );
+  const int m7 = S( l, 3 ), m0 = S( l, -4 ), mP1 = S( l, -5 ), mP2 = S( l, -6 ), mP3 = S( l, -7 ), m8 = S( l, 4 );
+  const int m9 = S( l, 5 ), m10 = S( l, 6 );
+  int d[8] = int[8]( 0, 0, 0, 0, 0, 0, 0, 0 );
+  if( sw )
+  {
+    if( sideP || sideQ )
+    {
+      filteringPandQ( l, sideP ? maxP : 3, sideQ ? maxQ : 3, tc, asym );
+    }
+    else if( asym )
+    {
+      d[1] = clamp( ( ( m1 + 2 * m2 + 2 * m3 + 2 * m4 + m5 + 4 ) >> 3 ) - m3, -3 * tc, 3 * tc );
+      d[2] = clamp( ( ( m1 + m2 + m3 + m4 + 2 ) >> 2 ) - m2, -2 * tc, 2 * tc );
+      d[3] = clamp( ( ( 2 * m0 + 3 * m1 + m2 + m3 + m4 + 4 ) >> 3 ) - m1, -tc, tc );
+      W( l, 0, clipPel( clamp( ( ( m2 + 2 * m3 + 2 * m4 + 2 * m5 + m6 + 4 ) >> 3 ) - d[1], m4 - 3 * tc, m4 + 3 * tc ) ) );
+      W( l, 1, clipPel( clamp( ( ( m3 + m4 + m5 + m6 + 2 ) >> 2 ) - d[2], m5 - 2 * tc, m5 + 2 * tc ) ) );
+      W( l, 2, clipPel( clamp( ( ( m3 + m4 + m5 + 3 * m6 + 2 * m7 + 4 ) >> 3 ) - d[3], m6 - tc, m6 + tc ) ) );
+    }
+    else
+    {
+      W( l, -1, clamp( ( m1 + 2 * m2 + 2 * m3 + 2 * m4 + m5 + 4 ) >> 3, m3 - 3 * tc, m3 + 3 * tc ) );
+      W( l, 0, clamp( ( m2 + 2 * m3 + 2 * m4 + 2 * m5 + m6 + 4 ) >> 3, m4 - 3 * tc, m4 + 3 * tc ) );
+      W( l, -2, clamp( ( m1 + m2 + m3 + m4 + 2 ) >> 2, m2 - 2 * tc, m2 + 2 * tc ) );
+      W( l, 1, clamp( ( m3 + m4 + m5 + m6 + 2 ) >> 2, m5 - 2 * tc, m5 + 2 * tc ) );
+      W( l, -3, clamp( ( 2 * m0 + 3 * m1 + m2 + m3 + m4 + 4 ) >> 3, m1 - tc, m1 + tc ) );
+      W( l, 2, clamp( ( m3 + m4 + m5 + 3 * m6 + 2 * m7 + 4 ) >> 3, m6 - tc, m6 + tc ) );
+    }
+  }
+  else
+  {
+    int delta = ( 9 * ( m4 - m3 ) - 3 * ( m5 - m2 ) + 8 ) >> 4;
+    if( abs( delta ) < thrCut )
+    {
+      delta = clamp( delta, -tc, tc );
+      if( asym )
+      {
+        W( l, -1, m3 );
+        d[1] = delta;
+        W( l, 0, clipPel( m4 - delta - d[1] ) );
+      }
+      else
+      {
+        W( l, -1, clipPel( m3 + delta ) );
+        W( l, 0, clipPel( m4 - delta ) );
+      }
+      const int tc2 = tc >> 1;
+      if( secondP )
+      {
+        const int delta1 = clamp( ( ( ( m1 + m3 + 1 ) >> 1 ) - m2 + delta ) >> 1, -tc2, tc2 );
+        if( asym )
+        {
+          d[2] = delta1;
+          W( l, -2, m2 );
+        }
+        else
+        {
+          W( l, -2, clipPel( m2 + delta1 ) );
+        }
+      }
+      if( secondQ )
+      {
+        const int delta2 = clamp( ( ( ( m6 + m4 + 1 ) >> 1 ) - m5 - delta ) >> 1, -tc2, tc2 );
+        W( l, 1, asym ? clipPel( m5 + delta2 - d[2] ) : clipPel( m5 + delta2 ) );
+      }
+    }
+  }
+  if( noP )
+  {
+    d[1] = d[2] = d[3] = 0;
+    W( l, -1, m3 );
+    W( l, -2, m2 );
+    W( l, -3, m1 );
+    if( sideP )
+    {
+      d[4] = d[5] = d[6] = d[7] = 0;
+      W( l, -4, m0 );
+      W( l, -5, mP1 );
+      W( l, -6, mP2 );
+      W( l, -7, mP3 );
+    }
+  }
+  if( noQ )
+  {
+    if( asym )
+    {
+      W( l, 0, clipPel( m4 - d[1] ) );
+      W( l, 1, clipPel( m5 - d[2] ) );
+      W( l, 2, clipPel( m6 - d[3] ) );
+    }
+    else
+    {
+      W( l, 0, m4 );
+      W( l, 1, m5 );
+      W( l, 2, m6 );
+    }
+    if( sideQ )
+    {
+      if( asym )
+      {
+        W( l, 3, clipPel( m7 - d[4] ) );
+        W( l, 4, clipPel( m8 - d[5] ) );
+        W( l, 5, clipPel( m9 - d[6] ) );
+        W( l, 6, clipPel( m10 - d[7] ) );
+      }
+      else
+      {
+        W( l, 3, m7 );
+        W( l, 4, m8 );
+        W( l, 5, m9 );
+        W( l, 6, m10 );
+      }
+    }
+  }
+}
+
+// xPelFilterChroma on line l
+void pelFilterChroma( int l, int tc, bool sw, bool noP, bool noQ, bool large, bool ctb, bool asym )
+{
+  const int m0 = S( l, -4 ), m1 = S( l, -3 ), m2 = S( l, -2 ), m3 = S( l, -1 ), m4 = S( l, 0 ), m5 = S( l, 1 );
+  const int m6 = S( l, 2 ), m7 = S( l, 3 );
+  int d[4] = int[4]( 0, 0, 0, 0 );
+  if( sw )
+  {
+    if( ctb )
+    {
+      W( l, -1, clamp( ( 3 * m2 + 2 * m3 + m4 + m5 + m6 + 4 ) >> 3, m3 - tc, m3 + tc ) );
+      W( l, 0, clamp( ( 2 * m2 + m3 + 2 * m4 + m5 + m6 + m7 + 4 ) >> 3, m4 - tc, m4 + tc ) );
+      W( l, 1, clamp( ( m2 + m3 + m4 + 2 * m5 + m6 + 2 * m7 + 4 ) >> 3, m5 - tc, m5 + tc ) );
+      W( l, 2, clamp( ( m3 + m4 + m5 + 2 * m6 + 3 * m7 + 4 ) >> 3, m6 - tc, m6 + tc ) );
+    }
+    else if( asym )
+    {
+      d[3] = clamp( ( ( 3 * m0 + 2 * m1 + m2 + m3 + m4 + 4 ) >> 3 ) - m1, -tc, tc );
+      d[2] = clamp( ( ( 2 * m0 + m1 + 2 * m2 + m3 + m4 + m5 + 4 ) >> 3 ) - m2, -tc, tc );
+      d[1] = clamp( ( ( m0 + m1 + m2 + 2 * m3 + m4 + m5 + m6 + 4 ) >> 3 ) - m3, -tc, tc );
+      W( l, -3, m1 );
+      W( l, -2, m2 );
+      W( l, -1, m3 );
+      W( l, 0, clipPel( clamp( ( ( m1 + m2 + m3 + 2 * m4 + m5 + m6 + m7 + 4 ) >> 3 ) - d[1], m4 - tc, m4 + tc ) ) );
+      W( l, 1, clipPel( clamp( ( ( m2 + m3 + m4 + 2 * m5 + m6 + 2 * m7 + 4 ) >> 3 ) - d[2], m5 - tc, m5 + tc ) ) );
+      W( l, 2, clipPel( clamp( ( ( m3 + m4 + m5 + 2 * m6 + 3 * m7 + 4 ) >> 3 ) - d[3], m6 - tc, m6 + tc ) ) );
+    }
+    else
+    {
+      W( l, -3, clamp( ( 3 * m0 + 2 * m1 + m2 + m3 + m4 + 4 ) >> 3, m1 - tc, m1 + tc ) );
+      W( l, -2, clamp( ( 2 * m0 + m1 + 2 * m2 + m3 + m4 + m5 + 4 ) >> 3, m2 - tc, m2 + tc ) );
+      W( l, -1, clamp( ( m0 + m1 + m2 + 2 * m3 + m4 + m5 + m6 + 4 ) >> 3, m3 - tc, m3 + tc ) );
+      W( l, 0, clamp( ( m1 + m2 + m3 + 2 * m4 + m5 + m6 + m7 + 4 ) >> 3, m4 - tc, m4 + tc ) );
+      W( l, 1, clamp( ( m2 + m3 + m4 + 2 * m5 + m6 + 2 * m7 + 4 ) >> 3, m5 - tc, m5 + tc ) );
+      W( l, 2, clamp( ( m3 + m4 + m5 + 2 * m6 + 3 * m7 + 4 ) >> 3, m6 - tc, m6 + tc ) );
+    }
+  }
+  else
+  {
+    const int delta = clamp( ( ( ( m4 - m3 ) << 2 ) + m2 - m5 + 4 ) >> 3, -tc, tc );
+    if( asym )
+    {
+      d[1] = delta;
+      W( l, -1, m3 );
+      W( l, 0, clipPel( m4 - delta - d[1] ) );
+    }
+    else
+    {
+      W( l, -1, clipPel( m3 + delta ) );
+      W( l, 0, clipPel( m4 - delta ) );
+    }
+  }
+  if( noP )
+  {
+    if( large )
+    {
+      d[3] = d[2] = 0;
+      W( l, -3, m1 );
+      W( l, -2, m2 );
+    }
+    d[1] = 0;
+    W( l, -1, m3 );
+  }
+  if( noQ )
+  {
+    if( large )
+    {
+      W( l, 1, asym ? clipPel( m5 - d[2] ) : m5 );
+      W( l, 2, asym ? clipPel( m6 - d[3] ) : m6 );
+    }
+    W( l, 0, asym ? clipPel( m4 - d[1] ) : m4 );
+  }
+}
+
+int table( int i )
+{
+  return BufI32( pc.tables ).v[i];
+}
+
+// xEdgeFilterLuma's segment: LADF, tc and beta, the decisions on lines 0 and 3, the filtering of the 4 lines
+void lumaSegment( int flags, int tcIndex, int betaIndex )
+{
+  const int  maxQ  = ( flags >> MAXQ_SHIFT ) & 15;
+  int        maxP  = ( flags >> MAXP_SHIFT ) & 15;
+  const bool sideP = ( flags & F_SIDE_P ) != 0, sideQ = ( flags & F_SIDE_Q ) != 0;
+  const bool noP = ( flags & F_NO_P ) != 0, noQ = ( flags & F_NO_Q ) != 0, asym = ( flags & F_ASYM ) != 0;
+  if( ( flags & F_LADF ) != 0 )   // deriveLADFShift: the luma level of lines 0 and 3 either side of the edge
+  {
+    const uint lumaLevel = uint( S( 0, 0 ) + S( 3, 0 ) + S( 0, -1 ) + S( 3, -1 ) ) >> 2;
+    int        shift     = pc.ladfOffset[0];
+    for( int k = 1; k < pc.ladfNum; k++ )
+    {
+      if( lumaLevel > uint( pc.ladfLower[k] ) )
+      {
+        shift = pc.ladfOffset[k];
+      }
+      else
+      {
+        break;
+      }
+    }
+    tcIndex += shift;
+    betaIndex += shift;
+  }
+  const int bd        = pc.bitDepthLuma;
+  const int iIndexTC  = clamp( tcIndex, 0, MAX_QP + 2 );
+  const int iIndexB   = clamp( betaIndex, 0, MAX_QP );
+  const int tc        = bd < 10 ? ( ( table( TC_TABLE + iIndexTC ) + ( 1 << ( 9 - bd ) ) ) >> ( 10 - bd ) )
+                                : ( table( TC_TABLE + iIndexTC ) << ( bd - 10 ) );
+  const int beta      = table( BETA_TABLE + iIndexB ) * ( 1 << ( bd - 8 ) );
+  const int sideThr   = ( beta + ( beta >> 1 ) ) >> 3;
+  const int thrCut    = tc * 10;
+  const int dp0 = calcDP( 0, false ), dq0 = calcDQ( 0, 0 ), dp3 = calcDP( 3, false ), dq3 = calcDQ( 3, 0 );
+  int dp0L = dp0, dq0L = dq0, dp3L = dp3, dq3L = dq3;
+  if( sideP )
+  {
+    dp0L = ( dp0L + calcDPAt( 0, -3 ) + 1 ) >> 1;
+    dp3L = ( dp3L + calcDPAt( 3, -3 ) + 1 ) >> 1;
+  }
+  if( sideQ )
+  {
+    dq0L = ( dq0L + calcDQ( 0, 3 ) + 1 ) >> 1;
+    dq3L = ( dq3L + calcDQ( 3, 3 ) + 1 ) >> 1;
+  }
+  bool useLongtap = false;
+  if( sideP || sideQ )
+  {
+    const int d0L = dp0L + dq0L, d3L = dp3L + dq3L, dpL = dp0L + dp3L, dqL = dq0L + dq3L, dL = d0L + d3L;
+    if( dL < beta )
+    {
+      const bool filterP = dpL < sideThr, filterQ = dqL < sideThr;
+      const bool swL = useStrongFiltering( 0, 2 * d0L, beta, tc, sideP, sideQ, maxP, maxQ, false )
+                       && useStrongFiltering( 3, 2 * d3L, beta, tc, sideP, sideQ, maxP, maxQ, false );
+      if( swL )
+      {
+        useLongtap = true;
+        for( int i = 0; i < 4; i++ )
+        {
+          pelFilterLuma( i, tc, swL, noP, noQ, thrCut, filterP, filterQ, sideP, sideQ, maxP, maxQ, asym );
+        }
+      }
+    }
+  }
+  if( !useLongtap )
+  {
+    const int d0 = dp0 + dq0, d3 = dp3 + dq3, dp = dp0 + dp3, dq = dq0 + dq3, d = d0 + d3;
+    if( d < beta )
+    {
+      bool filterP = false, filterQ = false;
+      if( maxP > 1 && maxQ > 1 )
+      {
+        filterP = dp < sideThr;
+        filterQ = dq < sideThr;
+      }
+      bool sw = false;
+      if( maxP > 2 && maxQ > 2 )
+      {
+        sw = useStrongFiltering( 0, 2 * d0, beta, tc, false, false, 7, 7, false )
+             && useStrongFiltering( 3, 2 * d3, beta, tc, false, false, 7, 7, false );
+      }
+      for( int i = 0; i < 4; i++ )
+      {
+        pelFilterLuma( i, tc, sw, noP, noQ, thrCut, filterP, filterQ, false, false, 7, 7, asym );
+      }
+    }
+  }
+}
+
+// xEdgeFilterChroma's part of one chroma component (the host decided it is filtered and derived tc and beta)
+void chromaSegment( int flags, int tc, int beta )
+{
+  const int  lines = ( flags >> LINES_SHIFT ) & 7, line3 = ( flags >> LINE3_SHIFT ) & 3;
+  const bool large = ( flags & F_LARGE ) != 0, ctb = ( flags & F_CTB ) != 0;
+  const bool noP = ( flags & F_NO_P ) != 0, noQ = ( flags & F_NO_Q ) != 0, asym = ( flags & F_ASYM ) != 0;
+  bool useLong = false;
+  if( large )
+  {
+    const int dp0 = calcDP( 0, ctb ), dq0 = calcDQ( 0, 0 ), dp3 = calcDP( line3, ctb ), dq3 = calcDQ( line3, 0 );
+    const int d0 = dp0 + dq0, d3 = dp3 + dq3, d = d0 + d3;
+    if( d < beta )
+    {
+      useLong       = true;
+      const bool sw = useStrongFiltering( 0, 2 * d0, beta, tc, false, false, 7, 7, ctb )
+                      && useStrongFiltering( line3, 2 * d3, beta, tc, false, false, 7, 7, ctb );
+      for( int l = 0; l < lines; l++ )
+      {
+        pelFilterChroma( l, tc, sw, noP, noQ, large, ctb, asym );
+      }
+    }
+  }
+  if( !useLong )
+  {
+    for( int l = 0; l < lines; l++ )
+    {
+      pelFilterChroma( l, tc, false, noP, noQ, large, ctb, asym );
+    }
+  }
+}
+
+void main()
+{
+  const int id = int( gl_GlobalInvocationID.x );
+  if( pc.mode == 0 )   // copy (groups: luma columns of 64, rows)
+  {
+    const int x = id, y = int( gl_GlobalInvocationID.y );
+    if( x >= pc.width || y >= pc.height )
+    {
+      return;
+    }
+    st( pc.dst[0], x, y, ld( pc.src[0], x, y ) );
+    const int xc = x >> pc.chromaShiftX, yc = y >> pc.chromaShiftY;
+    if( ( xc << pc.chromaShiftX ) == x && ( yc << pc.chromaShiftY ) == y )
+    {
+      st( pc.dst[1], xc, yc, ld( pc.src[1], xc, yc ) );
+      st( pc.dst[2], xc, yc, ld( pc.src[2], xc, yc ) );
+    }
+    return;
+  }
+  if( id >= pc.numStrips )
+  {
+    return;
+  }
+  BufI32    strips = BufI32( pc.strips );
+  BufI32    segs   = BufI32( pc.segs );
+  const int first = strips.v[2 * id], count = strips.v[2 * id + 1];
+  for( int s = first; s < first + count; s++ )
+  {
+    const int pos = segs.v[4 * s], flags = segs.v[4 * s + 1], a = segs.v[4 * s + 2], b = segs.v[4 * s + 3];
+    const int comp = flags & 3;
+    g_p    = pc.dst[comp];
+    g_min  = pc.clipMin[comp];
+    g_max  = pc.clipMax[comp];
+    g_base = ivec2( pos & 0xffff, pos >> 16 );
+    const bool hor = ( flags & F_HOR ) != 0;
+    g_along = hor ? ivec2( 0, 1 ) : ivec2( 1, 0 );
+    g_line  = hor ? ivec2( 1, 0 ) : ivec2( 0, 1 );
+    if( comp == 0 )
+    {
+      lumaSegment( flags, a, b );
+    }
+    else
+    {
+      chromaSegment( flags, a, b );
+    }
+  }
+}

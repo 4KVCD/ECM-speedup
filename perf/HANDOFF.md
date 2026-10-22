@@ -449,7 +449,7 @@ wall-clock gains with threads are "the easy baseline". Decoder status: single-th
 (`--GpuLoopFilter=1`: ALF, SAO, BIF, CCSAO, LF-CCCM, offset refinement on Vulkan). The user then asked for **a full
 GPU decoder in Vulkan, optimized until nothing is left** ("The GPU decoder needs to fully decode the frame on the
 GPU"; "Your first Vulkan version is going to be slow. That's OK"). That work is branch `dec-gpurecon`: intra
-reconstruction on the GPU (`--GpuRecon`), tool levels M1-M90 done and verified bit-exact (M19: DIMD, M20: OBIC, M21:
+reconstruction on the GPU (`--GpuRecon`), tool levels M1-M91 done and verified bit-exact (M19: DIMD, M20: OBIC, M21:
 intra merge, M22: the transforms of DIMD CUs, M23: LFNST of MIP, M24: TIMD, M25: OBIC and intra merge with TIMD
 neighbours, M26: TIMD-SAD, M27: OBIC and intra merge with TIMD-SAD neighbours, M28: TIMD merge, M29: TMRL of luma,
 M30: chroma TMRL, M31: CCLM, M32: LFNST / NSPT of CCLM, M33: GLM's gradient patterns, M34: CCCM, M35: GL-CCCM, M36:
@@ -2160,6 +2160,37 @@ residualDeps) are shared with intra blocks. Inter blocks may predict signs up to
 GPU's signPrediction keeps 32 x 32: "inter sign prediction above 32 x 32". Results (50 streams, build gpu28): every
 picture identical; "inter sign prediction" 3157 -> 127 (above 32 x 32); inter CUs from the CPU's prediction 10912 ->
 13873.
+M91 (2026-10-22, agent lf): the deblocking filter on the GPU (LoopFilter.cpp, GpuLib's dbf.comp, GpuAlf). The host derives
+everything that does not read samples with the CPU's own code: LoopFilter::setGpuRecord makes loopFilterPic record,
+per segment it filters (4 luma lines, or a chroma part of uiLoopLength lines, per component), a GpuDbfSeg - position,
+flags (component, direction, lines, luma maxFilterLengthP / Q after the affine limit and sidePisLarge / sideQisLarge,
+the palette's bPartP / QNoFilter, m_applyAsymmetricDB, chroma largeBoundary and isChromaHorCTBBoundary, the decision's
+second line, LADF), luma tc / beta table indices before LADF's shift, chroma tc / beta -, with or without filtering (ON
+mode: derive only). Edge flags, boundary strengths (motion from the CPU), filter lengths, availability across slices /
+tiles / sub-pictures and virtual boundaries are thus the CPU's; a later GPU motion field would only have to fill the
+same records. dbf.comp makes the decisions (xCalcDP / DQ, xUseStrongFiltering, LADF's luma level of lines 0 and 3) and
+filters (xPelFilterLuma, xFilteringPandQ / xBilinearFilter with their asymmetric variants, xPelFilterChroma) line by
+line after the C++. Order: the CPU filters all vertical edges, then all horizontal ones, CU by CU in coding order, each
+edge reading what the ones before it wrote; along a row of segments (a column for horizontal edges) coding order is
+left to right (top to bottom), and segments of different rows never share samples. So the host sorts the segments into
+strips (pass, component, row / column of segments; GpuAlf::dbfPrepare, which refuses two segments at one place) and one
+invocation filters a strip in order, in place, after a copy of the picture (mode 0). Not on the GPU: 4:0:0, several
+slices (the slices' clipping ranges), LADF with a minimum CU size other than 4 (LADF's level comes from a part's first
+segment). --GpuLoopFilter=2 (verify) deblocks a copy of the picture before deblocking right after the CPU's
+loopFilterPic, also without ALF, and compares every sample (GpuAlf::verifyDeblocking; "GPU deblocking verification: N
+pictures, M with differences" at the end, the first 3 differing samples per picture). ON mode (1, and 3: from the first
+picture of any size, waiting for the device - tests) defers it to ALFProcess like SAO: when SAO runs on the GPU,
+dbf.comp deblocks m_inDb (the picture before deblocking, which ALF uploads anyway) into m_inDeblocked (now with a margin
+of 8: the filters read, and do not use, samples up to 8 beyond a segment) before the offset refinement and SAO, else
+GpuDbfJob::cpu deblocks first. Creating a buffer waits for every submission (Context::inFlight), the recording
+stream's own too: dbfPrepare allocates before the stream begins (the first version deadlocked there). New script:
+perf/gpu/dbf_verify.py <build> [--on] (decoders under gpuslot.run; --on compares ON mode's output with the build's CPU
+decoding). Results (Intel PC, build aglfd7): all 50 streams in C:\Code\ECM\streams, 331 pictures, deblocking identical
+(ra_nodbk_q32, ra_dbkparams_q32, 10 / 12 bits, RPR, CTU 256, LMCS off, ALF off, SCC included); ALF / SAO
+verification unchanged; ON mode (3) output identical with the CPU's on all 50, 318 pictures deblocked on the GPU, 8 on
+the CPU (no SAO on the GPU). GPU time per picture (copy and both passes): 0.02 ms (deblocking off) to 1.4 ms on these
+small pictures (ai_crowdrun832_q27 0.9 ms, ra_parkjoy832_q32 1.4 ms); there is no 1080p stream on this PC. Not known to be exercised by any stream:
+asymmetric deblocking (GDR), LADF, virtual boundaries, 4:2:2 / 4:4:4 (palette only as far as the SCC streams use it).
 
 
 ## 8. Numbers (i7-10700 8C/16T, Win11, GCC 16.2, RTX 3070 driver 616.92)
