@@ -44,11 +44,43 @@ def _alive(pid):
     return bool(ok) and code.value == 259     # STILL_ACTIVE
 
 
+def _first_in_line(kind, ticket):
+    """whether ticket is the oldest live waiter's for slots of this kind (FIFO: a freed slot went to whichever waiter
+    polled first, so a decoder thread could wait while another thread of the same partial.py took every slot again)"""
+    oldest = None
+    for name in os.listdir(f'{ROOT}/queue'):
+        k, t, pid, tid = name.rsplit('-', 3)
+        if k != kind:
+            continue
+        if not _alive(int(pid)):
+            try:
+                os.remove(f'{ROOT}/queue/{name}')
+            except OSError:
+                pass
+            continue
+        if oldest is None or (int(t), name) < oldest:
+            oldest = (int(t), name)
+    return oldest is None or oldest[1] == ticket
+
+
 def _take(kind, slots, need):
-    os.makedirs(ROOT, exist_ok=True)
+    os.makedirs(f'{ROOT}/queue', exist_ok=True)
+    ticket = f'{kind or "dec"}-{time.time_ns()}-{os.getpid()}-{threading.get_ident()}'
+    open(f'{ROOT}/queue/{ticket}', 'w').close()
+    try:
+        return _take_in_turn(kind, slots, need, ticket)
+    finally:
+        try:
+            os.remove(f'{ROOT}/queue/{ticket}')
+        except OSError:
+            pass
+
+
+def _take_in_turn(kind, slots, need, ticket):
     while True:
         with _local:
-            for n in range(slots if committed() + need * (1 << 30) <= LIMIT else 0):
+            first = _first_in_line(kind or 'dec', ticket)
+            for n in range(slots if first and committed() + need * (1 << 30) <= LIMIT else 0):
                 d = f'{ROOT}/{kind}{n}'
                 try:
                     os.mkdir(d)
