@@ -5404,15 +5404,12 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
   else if( pdpMipSet >= 0 && pdp >= PDP_SIZES )                     why = "PDP of MIP beyond 32x32";
   else if( pdp >= 0 && area != cu.blocks[COMPONENT_Y] )             why = "PDP of a CU with several blocks";
 #endif
-  // NN intra prediction: its CU is one block up to 32 x 32 (its transforms' mode, where they depend on one, a DIMD of
-  // its prediction intra_rec derives: DERIVE_PNN_DIMD)
+  // NN intra prediction: its CU is one block (its transforms' mode, where they depend on one, a DIMD of its prediction
+  // intra_rec derives: DERIVE_PNN_DIMD; without DIMD in the SPS planar, the host's: below); a 64 x 64 one's prediction
+  // is computed where it is read (intra_rec's g_pnnLarge)
   else if( pnn && m.sh->pnnModel.empty() )                          why = "NN intra prediction without its models";
-  // without DIMD in the SPS the CPU's DIMD of the prediction is planar (deriveIpmForTransform returns at once), the
-  // GPU's NN blocks derive it from the prediction
-  else if( pnn && !cu.cs->sps->getUseDimd() )                    why = "NN intra prediction without DIMD";
-  else if( pnn && ( area != cu.blocks[COMPONENT_Y] || area.width > 32 || area.height > 32 ) )
-    why = "NN intra prediction of a split CU or above 32 x 32";
-  else if( pnn && !m.deriveModes && ( cu.lfnstIdx || tu.mtsIdx[COMPONENT_Y] > MTS_SKIP ) )
+  else if( pnn && area != cu.blocks[COMPONENT_Y] )                  why = "NN intra prediction of a split CU";
+  else if( pnn && sps.getUseDimd() && !m.deriveModes && ( cu.lfnstIdx || tu.mtsIdx[COMPONENT_Y] > MTS_SKIP ) )
     why = "NN intra prediction with LFNST / NSPT or MTS without the GPU's mode derivation";
   // a DIMD CU (CU_DIMD, CU_OBIC, CU_MERGE) blends planar predicted from the CU's reference line at the block's size
   // (predIntraAng: initIntraPatternChType with the CU's area), the GPU from the block's: the same only where the CU is
@@ -5608,6 +5605,17 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
 #if JVET_AJ0249_NEURAL_NETWORK_BASED
   if( pnn )
   {
+    // without DIMD in the SPS xPredIntraPnn's deriveIpmForTransform returns planar at once and its second mode stays DC:
+    // the CU's indicesRepresentationPnn, which its transforms (getFinalIntraModeForTransform, getNSPTBucket), chroma DM
+    // and the chroma blocks' LFNST read. In ON mode the CPU does not predict, so the host sets them (verification: they
+    // are the CPU's)
+    if( !sps.getUseDimd() )
+    {
+      auto& rep = const_cast<CodingUnit&>( cu ).indicesRepresentationPnn[COMPONENT_Y];
+      CHECK( !m.on && ( rep[0] != PLANAR_IDX || rep[1] != DC_IDX ), "an NN CU's modes without DIMD are not planar and DC" );
+      rep[0] = PLANAR_IDX;
+      rep[1] = DC_IDX;
+    }
     const IntraPredictionNN::GpuBlock b = IntraPredictionNN::gpuBlock( area, cu );
     if( b.model < 0 || b.model >= (int) m.sh->pnnModel.size() )
     {
@@ -6143,7 +6151,7 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
     const bool cclmDimd  = ( ( t.lm & LM_ACTIVE ) || t.ccpMerge >= 0 ) && cu.lfnstIdx;
     // an NN block's (MTS too): a DIMD of its prediction (indicesRepresentationPnn), LFNST / NSPT by the lfnstSecFlag
     // rule where it applies (getFinalIntraModeForTransform)
-    const bool pnnDimd   = pnn;
+    const bool pnnDimd   = pnn && sps.getUseDimd();   // (without DIMD planar and DC, the host's)
 #if JVET_AJ0249_NEURAL_NETWORK_BASED
     const bool pnnSec    = pnn && cu.lfnstSecFlag && isAllowedMultiple( area.width, area.height );
 #else

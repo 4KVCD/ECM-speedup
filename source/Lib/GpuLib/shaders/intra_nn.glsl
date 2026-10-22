@@ -119,7 +119,28 @@ int pnnUpsample( int u, int f, int left, int center, int right )
   return ( ( center << ( s + 1 ) ) + ( right - center ) + k * ( ( right - center ) << 1 ) + rnd ) >> ( s + 1 );
 }
 
-// the NN prediction of block t (W x H <= 32 x 32) into s_spPred, all invocations, ending with a barrier
+// upsample2d's second stage: the prediction's sample (col, u) of the NN block of W x H whose record is at r, down its
+// column from the source's rows j (s_spHigh's rows with a first stage, else the source's) and the reference row above
+// (s_ref[0]); the boundary of a line without one is its first sample
+int pnnSample( int r, int W, int H, int col, int u )
+{
+  BufI32     d  = BufI32( P.timdData );
+  const bool tr = d.v[r + PNN_REC_TRANSPOSED] != 0;
+  const int  fV = d.v[r + PNN_REC_FACTOR_VER], fH = d.v[r + PNN_REC_FACTOR_HOR];
+  const int  stride = d.v[r + PNN_REC_TARGET + 1];
+  const int  hS = H / fV;
+  const bool topB = d.v[r + PNN_REC_TOP_BOUNDARY] != 0, rowsFirst = fH > 1;
+  const int  j = u / fV, jr = min( j + 1, hS - 1 );
+  const int  c     = rowsFirst ? int( s_spHigh[j * W + col] ) : pnnSource( tr, j, col, stride );
+  const int  first = rowsFirst ? int( s_spHigh[col] ) : pnnSource( tr, 0, col, stride );
+  const int  above = j == 0 ? ( topB ? int( s_ref[0][1 + col] ) : first )
+                            : rowsFirst ? int( s_spHigh[( j - 1 ) * W + col] ) : pnnSource( tr, j - 1, col, stride );
+  const int  below = rowsFirst ? int( s_spHigh[jr * W + col] ) : pnnSource( tr, jr, col, stride );
+  return pnnUpsample( u, fV, above, c, below );
+}
+
+// the NN prediction of block t into s_spPred (up to 32 x 32; a 64 x 64 block's upsampling stops after its first stage,
+// its samples come from pnnSample where they are read: g_pnnLarge), all invocations, ending with a barrier
 void pnnPredict( Tu t, int predStride, int lid, int NT )
 {
   const int r = t.pnn;
@@ -206,8 +227,8 @@ void pnnPredict( Tu t, int predStride, int lid, int NT )
   }
   SYNC();
   // upsample2d: with fH > 1 the rows first (into every fV-th row, from the reference column left), then down the
-  // columns (from the reference row above); the boundary of a line without one is its first sample
-  const bool leftB = d.v[r + PNN_REC_LEFT_BOUNDARY] != 0, topB = d.v[r + PNN_REC_TOP_BOUNDARY] != 0;
+  // columns (from the reference row above: pnnSample); the boundary of a line without one is its first sample
+  const bool leftB = d.v[r + PNN_REC_LEFT_BOUNDARY] != 0;
   const bool rowsFirst = fH > 1;
   if( rowsFirst )   // into s_spHigh's rows (the block's row fV - 1 + row fV), from the left boundary's same rows
   {
@@ -221,15 +242,9 @@ void pnnPredict( Tu t, int predStride, int lid, int NT )
     }
     SYNC();
   }
-  for( int i = lid; i < W * H; i += NT )   // down each column: the source's rows j
+  for( int i = lid; i < W * H && W * H <= 32 * 32; i += NT )   // down each column
   {
-    const int col = i % W, u = i / W, j = u / fV, jr = min( j + 1, hS - 1 );
-    const int c     = rowsFirst ? int( s_spHigh[j * W + col] ) : pnnSource( tr, j, col, stride );
-    const int first = rowsFirst ? int( s_spHigh[col] ) : pnnSource( tr, 0, col, stride );
-    const int above = j == 0 ? ( topB ? int( s_ref[0][1 + col] ) : first )
-                             : rowsFirst ? int( s_spHigh[( j - 1 ) * W + col] ) : pnnSource( tr, j - 1, col, stride );
-    const int below = rowsFirst ? int( s_spHigh[jr * W + col] ) : pnnSource( tr, jr, col, stride );
-    s_spPred[u * W + col] = int16_t( pnnUpsample( u, fV, above, c, below ) );
+    s_spPred[i] = int16_t( pnnSample( r, W, H, i % W, i / W ) );
   }
   SYNC();
 }

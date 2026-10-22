@@ -2098,6 +2098,20 @@ an invalid mv[0], padding or an EIP luma CU. Open: the dual tree's DBV (deriveCh
 adjustChromaBv, chroma reordering's choice among them - which partial verification would take from the CPU as it takes
 the reordered modes -, refineChromaBv's template matching over mv[0] +- one luma sample - SAD, SATD for blocks of at
 least 4 x 4, on one-row templates - with RR-IBC flips, the flipped reconstruction).
+M86 (2026-10-22, agent lf): NN intra prediction without DIMD and of 64 x 64 CUs: without DIMD in the SPS xPredIntraPnn's
+deriveIpmForTransform returns planar at once and its second mode stays DC, so the CU's indicesRepresentationPnn are
+{planar, DC} - what its transforms (getFinalIntraModeForTransform: LFNST / NSPT, also by the lfnstSecFlag rule,
+explicit MTS; getNSPTBucket) and chroma DM read. The host sets them in ON mode (the CPU has not predicted; checked equal
+to the CPU's in verification) and chooses the transforms itself (no DERIVE_PNN_DIMD). A 64 x 64 NN CU (the only shape
+above 32 x 32: a 16 x 16 model, factor 4) has a prediction that does not fit s_spPred: pnnPredict stops after
+upsample2d's first stage (s_spHigh, 16 rows of 64) and pnnSample computes each sample of the second stage where it is
+read (intra_rec's g_pnnLarge: emitPred, the DIMD of the prediction for DERIVE_PNN_DIMD's transforms - mipPredAt -, the
+deferred reconstruction; storeRecon keeps nothing then). No bilateral filter there (W x H < 1024) nor sign prediction
+(up to 32 x 32). Still rejected: an NN CU of several blocks ("NN intra prediction of a split CU"; none seen). Results
+(build aglf5): "NN intra prediction without DIMD" 47 -> 0 (ra_off4_q32; 25 of them with LFNST / NSPT or MTS),
+"NN intra prediction of a split CU or above 32 x 32" 11 -> 0 (ai_parkjoy_q27 2, ra_parkjoy832_q32 9; all 64 x 64, 10
+of them with DERIVE_PNN_DIMD: MTS, LFNST, lfnstSecFlag); those three streams, ai_foreman352_q37 and ra_foreman_q32
+identical, the others' CPU CUs unchanged.
 
 
 ## 8. Numbers (i7-10700 8C/16T, Win11, GCC 16.2, RTX 3070 driver 616.92)

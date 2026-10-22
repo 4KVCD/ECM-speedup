@@ -108,6 +108,9 @@ int    g_crsScale;  // its scale (Reshape::calculateChromaAdj)
 // takes (-1: the same)
 bool   g_deferRecon;
 int    g_secMode;
+// an NN block above 32 x 32 (64 x 64; intra_nn.glsl): its record (Tu::pnn; -1: another block) - its prediction does
+// not fit s_spPred, pnnSample computes each sample from the upsampling's first stage when it is read
+int    g_pnnLarge;
 // a block's predictions that are copies of the reconstruction at a block vector (not with ISP; mvOfSub): bit k for
 // its k-th prediction of a blend (a TIMD block's mode, secondary, non-angular one; a DIMD or intra merge block's
 // planar, an OBIC block's planar blend modes), the main one's alone without blending; with g_bvTransform its
@@ -534,7 +537,10 @@ void storeRecon( Tu t, int x, int y, int pr )
 {
   if( t.spCoded >= 0 || g_deferRecon )
   {
-    s_spPred[y * t.w + x] = int16_t( pr );
+    if( g_pnnLarge < 0 )   // (a large NN block's prediction is computed again: pnnSample)
+    {
+      s_spPred[y * t.w + x] = int16_t( pr );
+    }
     return;
   }
   const int o  = t.dbgOffset + y * t.w + x;
@@ -544,6 +550,7 @@ void storeRecon( Tu t, int x, int y, int pr )
 
 int  cccmFusionBlend( Tu t, int x, int y, int pr );   // (intra_cccm.glsl)
 bool sgpmNoDimd( Tu t );   // (intra_sgpm.glsl)
+int  pnnSample( int r, int W, int H, int col, int u );   // (intra_nn.glsl)
 void cflmStore( Tu t, int x, int y, int pr );
 
 // sample (x, y) of the predicted region: reconstructed if it lies in the block (the region of an ISP sub-partition 1
@@ -640,9 +647,10 @@ const int MIN_MTSS_SIZE = 128;
 // strongest, dimdDerivedIntraDir2nd), into s_predDimdMode and for the comparison the CU's DimdOut; with MTSS
 // (DERIVE_MTSS) MTSS's choice among them and the mode list of the CU's node, into the DimdOut that selectTransform
 // reads. pdp: the prediction is PDP's (intra_pdp.glsl, in s_spPred)
-int mipPredAt( int x, int y, int W, int ps, int upH, int upV, int predStride, bool pdp )
+int mipPredAt( int x, int y, int W, int H, int ps, int upH, int upV, int predStride, bool pdp )
 {
-  return pdp ? int( s_spPred[y * W + x] ) : mipSample( x, y, ps, upH, upV, predStride );
+  return !pdp ? mipSample( x, y, ps, upH, upV, predStride )
+              : g_pnnLarge >= 0 ? pnnSample( g_pnnLarge, W, H, x, y ) : int( s_spPred[y * W + x] );
 }
 void mipTransformMode( Tu t, int W, int H, int ps, int upH, int upV, int predStride, bool pdp, int lid, int NT )
 {
@@ -653,14 +661,14 @@ void mipTransformMode( Tu t, int W, int H, int ps, int upH, int upV, int predStr
   for( int i = lid; i < num; i += NT )
   {
     const int   x = 1 + ( i % cols ) * step, y = 1 + ( i / cols ) * step;
-    const ivec2 g = sobel3x3( mipPredAt( x - 1, y - 1, W, ps, upH, upV, predStride, pdp ),
-                              mipPredAt( x, y - 1, W, ps, upH, upV, predStride, pdp ),
-                              mipPredAt( x + 1, y - 1, W, ps, upH, upV, predStride, pdp ),
-                              mipPredAt( x - 1, y, W, ps, upH, upV, predStride, pdp ),
-                              mipPredAt( x + 1, y, W, ps, upH, upV, predStride, pdp ),
-                              mipPredAt( x - 1, y + 1, W, ps, upH, upV, predStride, pdp ),
-                              mipPredAt( x, y + 1, W, ps, upH, upV, predStride, pdp ),
-                              mipPredAt( x + 1, y + 1, W, ps, upH, upV, predStride, pdp ) );
+    const ivec2 g = sobel3x3( mipPredAt( x - 1, y - 1, W, H, ps, upH, upV, predStride, pdp ),
+                              mipPredAt( x, y - 1, W, H, ps, upH, upV, predStride, pdp ),
+                              mipPredAt( x + 1, y - 1, W, H, ps, upH, upV, predStride, pdp ),
+                              mipPredAt( x - 1, y, W, H, ps, upH, upV, predStride, pdp ),
+                              mipPredAt( x + 1, y, W, H, ps, upH, upV, predStride, pdp ),
+                              mipPredAt( x - 1, y + 1, W, H, ps, upH, upV, predStride, pdp ),
+                              mipPredAt( x, y + 1, W, H, ps, upH, upV, predStride, pdp ),
+                              mipPredAt( x + 1, y + 1, W, H, ps, upH, upV, predStride, pdp ) );
     if( g.x != 0 || g.y != 0 )
     {
       atomicAdd( s_dimdHist[dimdAngle( g )], abs( g.x ) + abs( g.y ) );
@@ -1526,6 +1534,7 @@ void main()
     g_deferRecon = WITH_DERIVED_TRANSFORMS
                    && ( t.derive & ( DERIVE_PNN_DIMD | DERIVE_EIP | DERIVE_TMP | DERIVE_SGPM ) ) != 0;
     g_secMode    = -1;
+    g_pnnLarge   = t.pnn >= 0 && t.w * t.h > 32 * 32 ? t.pnn : -1;
     g_bvSubs     = 0;
     g_bvTransform = false;
     g_sgpmBlend   = false;
@@ -2207,7 +2216,10 @@ void main()
       else if( t.pnn >= 0 )   // NN intra prediction (intra_nn.glsl), then the bilateral filter as for DC
       {
         pnnPredict( t, predStride, lid, NT );
-        for( int i = lid; i < N; i += NT ) emitPred( t, i % W, i / W, int( s_spPred[i] ), bf );
+        for( int i = lid; i < N; i += NT )
+        {
+          emitPred( t, i % W, i / W, g_pnnLarge >= 0 ? pnnSample( t.pnn, W, H, i % W, i / W ) : int( s_spPred[i] ), bf );
+        }
       }
       else if( WITH_CCLM && !( ccpDimd && sub == 1 )   // (the merge's LM fields stay: its second prediction is angular)
                && ( ( t.lm & LM_ACTIVE ) != 0 || ( WITH_CCP_MERGE && t.ccpMerge >= 0 ) ) )
@@ -2740,7 +2752,7 @@ void main()
       g_deferRecon = false;
       for( int i = lid; i < N && t.spCoded < 0; i += NT )
       {
-        storeRecon( t, i % W, i / W, int( s_spPred[i] ) );
+        storeRecon( t, i % W, i / W, g_pnnLarge >= 0 ? pnnSample( t.pnn, W, H, i % W, i / W ) : int( s_spPred[i] ) );
       }
     }
 
