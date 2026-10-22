@@ -5455,9 +5455,10 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
   else if( !isLuma( compID ) && pu.chromaTmrlFlag && ( (int) sps.getMaxPicWidthInLumaSamples() != cs.pps->getPicWidthInLumaSamples()
                                                        || (int) sps.getMaxPicHeightInLumaSamples() != cs.pps->getPicHeightInLumaSamples() ) )
     why = "chroma TMRL in a picture smaller than the SPS's";
-  // EIP (luma): its CU is one block, predicted by its node's model (intra_eip.glsl)
+  // EIP (luma): its CU is one block, predicted by its node's model (intra_eip.glsl); a single tree's chroma blocks
+  // predict by their own mode (DM: the luma block's eipDimdMode)
   else if( cu.eipFlag && ( !GPU_EIP || !m.deriveModes ) )           why = "EIP";
-  else if( cu.eipFlag && ( area != cu.blocks[COMPONENT_Y] || cu.ispMode ) )
+  else if( cu.eipFlag && isLuma( compID ) && ( area != cu.blocks[COMPONENT_Y] || cu.ispMode ) )
     why = "EIP CU with several transform blocks";
   else if( !isLuma( compID ) && ipa.multiRefIndex && !pu.chromaTmrlFlag ) why = "chroma MRL";
   // CCP merge (JVET-AD0188: a model from a neighbour's, the history's or the defaults, the candidates ranked by

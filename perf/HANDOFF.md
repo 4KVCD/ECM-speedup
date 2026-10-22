@@ -449,7 +449,7 @@ wall-clock gains with threads are "the easy baseline". Decoder status: single-th
 (`--GpuLoopFilter=1`: ALF, SAO, BIF, CCSAO, LF-CCCM, offset refinement on Vulkan). The user then asked for **a full
 GPU decoder in Vulkan, optimized until nothing is left** ("The GPU decoder needs to fully decode the frame on the
 GPU"; "Your first Vulkan version is going to be slow. That's OK"). That work is branch `dec-gpurecon`: intra
-reconstruction on the GPU (`--GpuRecon`), tool levels M1-M84 done and verified bit-exact (M19: DIMD, M20: OBIC, M21:
+reconstruction on the GPU (`--GpuRecon`), tool levels M1-M88 done and verified bit-exact (M19: DIMD, M20: OBIC, M21:
 intra merge, M22: the transforms of DIMD CUs, M23: LFNST of MIP, M24: TIMD, M25: OBIC and intra merge with TIMD
 neighbours, M26: TIMD-SAD, M27: OBIC and intra merge with TIMD-SAD neighbours, M28: TIMD merge, M29: TMRL of luma,
 M30: chroma TMRL, M31: CCLM, M32: LFNST / NSPT of CCLM, M33: GLM's gradient patterns, M34: CCCM, M35: GL-CCCM, M36:
@@ -2126,6 +2126,12 @@ which verification compares with the CPU's empty list. Still rejected: MTSS with
 (no test stream). Results (build aglf6, the 27 streams with either reason): "MTSS" 28 -> 0 (11 SGPM CUs on the GPU, 17
 "SGPM (regression)"), "MTSS without DIMD" 2 -> 0 (ra_off4_q32's TIMD CUs); every stream identical but the two
 single-tree ones, which differ first where they did before.
+M88 (2026-10-22, agent lf): EIP CUs of a single tree: "EIP CU with several transform blocks" were the chroma blocks of single-tree
+EIP CUs (record() compared the chroma block with the CU's luma block); EIP is luma only, the chroma blocks predict by
+their own mode (DM reads the luma block's eipDimdMode, which it publishes as the CU's mode) - the rule now applies to
+luma alone. Results (build aglf7): 10 -> 0 CUs from the CPU (ai_nodualtree_q27 and ra_nodualtree_q32, 5 each: EIP CUs
+on the GPU 0 -> 5 per stream); both differ first where they did before; a temporary build that took every CU but the
+EIP ones from the CPU had both identical; ai_foreman352_q37 and ra_foreman_q32 identical, unchanged.
 
 
 ## 8. Numbers (i7-10700 8C/16T, Win11, GCC 16.2, RTX 3070 driver 616.92)
