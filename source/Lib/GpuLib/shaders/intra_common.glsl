@@ -173,7 +173,7 @@ const int CCP_TYPE_GLCCCM = 32, CCP_TYPE_NSCCCM = 64, CCP_TYPE_MDFCCCM = 128;
 // non-adjacent positions' PUs, decoded before the CU, typed, each once)
 const int CCP_WRITERS = 2;
 const int CCP_MERGE_HIST = 0, CCP_MERGE_HIST_NUM = 1, CCP_MERGE_INDEX = 2, CCP_MERGE_DEFAULTS = 3;
-const int CCP_MERGE_KIND = 4, CCP_MERGE_NUM_SPATIAL = 5, CCP_MERGE_SPATIAL = 6;
+const int CCP_MERGE_KIND = 4, CCP_MERGE_NUM_SPATIAL = 5, CCP_MERGE_NUM_AFTER = 6, CCP_MERGE_SPATIAL = 7;
 const int CCP_KIND_DERIVED = 3, CCP_KIND_DD_FUSION = 4, CCP_KIND_FUSION_BLEND = 5;
 
 // a block of NN intra prediction's record in Params::timdData (Tu::pnn, intra_nn.glsl; layout shared with
@@ -901,6 +901,7 @@ struct Params
   int      bvMapW;
   int      ibcFrac;     // the SPS's IBCFracFlag: IBC's vectors (and so SGPM's) may point between samples
   int      cccmDecim;   // DECIM_BITS of the SPS's luma bit depth: the precision of the CCCM / EIP models' parameters
+  int      ccpDerivedGl;   // decoder-derived CCP fusion's GL-CCCM mode above this many chroma samples (8 outside I slices)
 };
 layout( buffer_reference, std430, buffer_reference_align = 8 ) buffer BufParams { Params p; };
 

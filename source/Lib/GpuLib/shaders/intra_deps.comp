@@ -285,7 +285,7 @@ void ccpMergeDeps( Tu t )
 {
   BufI32    d = BufI32( P.ccpData );
   const int e = t.ccpMerge;
-  for( int s = 0; s < d.v[e + CCP_MERGE_NUM_SPATIAL]; s++ )
+  for( int s = 0; s < d.v[e + CCP_MERGE_NUM_SPATIAL] + d.v[e + CCP_MERGE_NUM_AFTER]; s++ )
   {
     ccpWriterDeps( d.v[e + CCP_MERGE_SPATIAL + s] );
   }

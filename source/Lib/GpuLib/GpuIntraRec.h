@@ -106,9 +106,10 @@ public:
   /// samples are taken from the CPU, else as unsupported()
   void cpuCu( const CodingUnit& cu, const char* why );
   /// partial verification: the CCP models of non-intra CU cu, which the CPU has reconstructed (JVET-AF0073: each TU's
-  /// a candidate of the merge CUs next to it and of the CTU row's history)
+  /// a candidate of the merge CUs next to it), with history those CU::saveModelsInHCCP puts into the CTU row's history
+  /// (called before CU::saveProCcpInfo, whose models of the TUs without one are candidates only: again without)
   /// (an intra CU: where it was taken from the CPU at its luma in a single tree, its chroma's record, now decoded)
-  void cpuCuModels( const CodingUnit& cu );
+  void cpuCuModels( const CodingUnit& cu, bool history = true );
   /// reconstructs the recorded picture on the GPU; on: into the picture's reconstruction buffer, off: compared with
   /// the CPU's reconstruction
   void endPicture( const CodingStructure& cs );

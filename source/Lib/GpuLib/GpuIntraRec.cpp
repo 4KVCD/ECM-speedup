@@ -40,6 +40,7 @@
 #include "VkCompute.h"
 
 #include <algorithm>
+#include <deque>
 #include <map>
 #include <mutex>
 #include <unordered_map>
@@ -204,7 +205,7 @@ constexpr int CCP_OUT = CCP_OUT_PARAMS2 + 4 * CCP_MAX_PARAMS;
 // CCP_KIND_DERIVED or CCP_KIND_DD_FUSION, the spatial sources)
 constexpr int CCP_WRITERS = 2, CCP_DEFAULTS = 12;
 constexpr int CCP_MERGE_HIST = 0, CCP_MERGE_HIST_NUM = 1, CCP_MERGE_INDEX = 2, CCP_MERGE_DEFAULTS = 3;
-constexpr int CCP_MERGE_KIND = 4, CCP_MERGE_NUM_SPATIAL = 5, CCP_MERGE_SPATIAL = 6;
+constexpr int CCP_MERGE_KIND = 4, CCP_MERGE_NUM_SPATIAL = 5, CCP_MERGE_NUM_AFTER = 6, CCP_MERGE_SPATIAL = 7;
 // the kinds beyond ccpMergeAdjustFlag's values: a block of decoder-derived CCP fusion, one of decoder-derived CCP merge
 // fusion (its entry's index the pair's, ddNonLocalCCPFusion - 1), one of merge fusion with CCCM by a blend model
 constexpr int CCP_KIND_DERIVED = 3, CCP_KIND_DD_FUSION = 4, CCP_KIND_FUSION_BLEND = 5;
@@ -1264,6 +1265,7 @@ struct Params
   int32_t  bvOut, bvMap, bvMapW;   // in timdData: the CUs' block vectors (BV_OUT each), the luma units' CUs (4 x 4)
   int32_t  ibcFrac;                // the SPS's IBCFracFlag (IBC's interpolation, intra_ibc.glsl)
   int32_t  cccmDecim;              // DECIM_BITS of the luma bit depth (intra_cccm.glsl's cccmDecim)
+  int32_t  ccpDerivedGl;           // decoder-derived CCP fusion's GL-CCCM mode above this many chroma samples
 };
 static_assert( offsetof( Params, origin ) == 320 && offsetof( Params, edgeCap ) == 400 && sizeof( Params ) == 488,
                "Params layout" );
@@ -2097,6 +2099,11 @@ struct GpuIntraRec::Impl
   };
   std::vector<CpuCcp>                                          cpuCcp;
   std::unordered_map<const TransformUnit*, int32_t>            ccpTuIndex;
+  // partial verification: the temporal CCP merge candidates (JVET-AE0043) of inter slices, the collocated picture's
+  // models (the CPU's, as its decoding kept them: m_ccpModelLUT) as records of their own, per picture and model index
+  std::deque<CCPModelCandidate>                                ccpTemporalModels;
+  std::unordered_set<int32_t>                                  ccpInterCccm;   // the records of inter CCCM models
+  std::map<std::pair<const Picture*, int>, int32_t>            ccpTemporal;
   std::map<std::string, int>  cpuReasons;        // totals: why CUs were taken from the CPU
 
   // totals
@@ -2213,7 +2220,8 @@ bool GpuIntraRec::supported( const Slice& slice, std::string& why, bool partial 
   // verification takes the CUs of such tools from the CPU (record) and checks the tool families below per CU
   const SPS& sps = *slice.getSPS();
   why.clear();
-  if( !slice.isIntra() )                                                                  why = "not an intra slice";
+  // (partial verification takes inter slices too: their inter CUs come from the CPU, cpuCu)
+  if( !slice.isIntra() && !partial )                                                      why = "not an intra slice";
   else if( sps.getChromaFormatIdc() != CHROMA_420 && sps.getChromaFormatIdc() != CHROMA_400 ) why = "chroma format";
   else if( sps.getLog2MaxTbSize() > 7 )                                                   why = "transform blocks above 128";
   // the reference availability of the kernels is "decoded earlier"; the CPU's (CodingStructure::getCURestricted) also
@@ -2324,6 +2332,9 @@ void GpuIntraRec::beginPicture( const CodingStructure& cs )
   m.mergeTmpCus.clear();
   m.cpuCcp.clear();
   m.ccpTuIndex.clear();
+  m.ccpTemporalModels.clear();
+  m.ccpTemporal.clear();
+  m.ccpInterCccm.clear();
   std::string why;
   if( !supported( *cs.slice, why, m.partial ) )
   {
@@ -2645,7 +2656,7 @@ static void cpuCcpHistory( GpuIntraRec::Impl& m, const CodingUnit& cu, int32_t r
   }
 }
 
-void GpuIntraRec::cpuCuModels( const CodingUnit& cu )
+void GpuIntraRec::cpuCuModels( const CodingUnit& cu, bool history )
 {
   Impl& m = *m_impl;
   if( !m.partial || cu.chromaFormat == CHROMA_400 || !cu.blocks[COMPONENT_Cb].valid() )
@@ -2668,14 +2679,22 @@ void GpuIntraRec::cpuCuModels( const CodingUnit& cu )
     if( tu.curCand.type != CCP_TYPE_NONE )
     {
       const auto r = m.ccpTuIndex.emplace( &tu, m.numCcp );
-      if( r.second )   // (a record of no PU: verification compares the GPU's records only)
+      if( !r.second )   // (its record from the first call: a model saveProCcpInfo leaves as it is)
       {
-        m.numCcp++;
-        m.ccpPu.push_back( nullptr );
-        m.ccpWriters.insert( m.ccpWriters.end(), CCP_WRITERS, -1 );
+        continue;
       }
+      m.numCcp++;   // (a record of no PU: verification compares the GPU's records only)
+      m.ccpPu.push_back( nullptr );
+      m.ccpWriters.insert( m.ccpWriters.end(), CCP_WRITERS, -1 );
       m.cpuCcp.push_back( { r.first->second, &tu.curCand, false } );
-      cpuCcpHistory( m, cu, r.first->second );
+      if( tu.curCand.type & CCP_TYPE_INTER_CCCM )
+      {
+        m.ccpInterCccm.insert( r.first->second );
+      }
+      if( history )
+      {
+        cpuCcpHistory( m, cu, r.first->second );
+      }
     }
   }
 #endif
@@ -4972,12 +4991,25 @@ static int32_t ccpRecord( GpuIntraRec::Impl& m, const PredictionUnit& pu, bool* 
 // sizes: a single-tree CU's luma ones, the CPU's, added to the chroma position), each where getPUFromPos finds a PU (in
 // the picture, decoded before: with one slice and tile, recorded before) with a CCP model (typed: a record), each
 // record once (a later one is left out as equal to it)
+static void ccpMergeSources( GpuIntraRec::Impl& m, const PredictionUnit& pu, std::vector<int32_t>& d, int& numBefore );
+
+// whether the CTU row's history takes part in CCP merge PU pu's list (getCCPModelCandidateList's tryHistCCP: not in an
+// inter slice with separate trees)
+static bool ccpMergeHistory( const PredictionUnit& pu )
+{
+#if JVET_AI0136_ADAPTIVE_DUAL_TREE
+  return pu.cs->slice->isIntra() || !pu.cs->slice->getSeparateTreeEnabled();
+#else
+  return true;
+#endif
+}
+
 static int32_t ccpMergeEntry( GpuIntraRec::Impl& m, const PredictionUnit& pu )
 {
   std::vector<int32_t>& d = m.ccpMerge;
   const int32_t         e = (int32_t) d.size();
   d.push_back( (int32_t) m.ccpHistRowStart );
-  d.push_back( (int32_t)( m.ccpHist.size() - m.ccpHistRowStart ) );
+  d.push_back( ccpMergeHistory( pu ) ? (int32_t)( m.ccpHist.size() - m.ccpHistRowStart ) : 0 );
 #if JVET_AG0154_DECODER_DERIVED_CCP_FUSION
   const bool ddFusion = pu.ddNonLocalCCPFusion > 0;   // (then idxNonLocalCCP is 1: the candidate is the pair's)
   d.push_back( ddFusion ? pu.ddNonLocalCCPFusion - 1 : pu.idxNonLocalCCP - 1 );
@@ -4992,11 +5024,29 @@ static int32_t ccpMergeEntry( GpuIntraRec::Impl& m, const PredictionUnit& pu )
   const int adjust = 0;
 #endif
   d.push_back( ddFusion ? CCP_KIND_DD_FUSION : ccpFusionBlend( pu ) ? CCP_KIND_FUSION_BLEND : adjust );
-  d.push_back( 0 );
+  std::vector<int32_t> sources;
+  int                  numBefore = 0;
+  ccpMergeSources( m, pu, sources, numBefore );
+  d.push_back( numBefore );
+  d.push_back( (int32_t) sources.size() - numBefore );
+  d.insert( d.end(), sources.begin(), sources.end() );
+  return e;
+}
+
+// the spatial and temporal sources of CCP merge PU pu (ccpMergeEntry), each record once
+static void ccpMergeSources( GpuIntraRec::Impl& m, const PredictionUnit& pu, std::vector<int32_t>& d, int& numBefore )
+{
   const CodingStructure& cs  = *pu.cs;
   const CompArea&        cb  = pu.blocks[COMPONENT_Cb];
   const Position         pos = pu.chromaPos();
   const Size             chromaPic( cs.picture->chromaSize() );
+  auto add = [&]( int32_t r )
+  {
+    if( std::find( d.begin(), d.end(), r ) == d.end() )
+    {
+      d.push_back( r );
+    }
+  };
   auto addAt = [&]( int dx, int dy )
   {
     const Position p = pos.offset( dx, dy );
@@ -5005,13 +5055,6 @@ static int32_t ccpMergeEntry( GpuIntraRec::Impl& m, const PredictionUnit& pu )
       return;
     }
     const PredictionUnit* q = cs.getPU( p, CHANNEL_TYPE_CHROMA );
-    auto add = [&]( int32_t r )
-    {
-      if( std::find( d.begin() + e + CCP_MERGE_SPATIAL, d.end(), r ) == d.end() )
-      {
-        d.push_back( r );
-      }
-    };
     const auto r = q ? m.ccpIndex.find( q ) : m.ccpIndex.end();
     if( r != m.ccpIndex.end() )
     {
@@ -5037,6 +5080,90 @@ static int32_t ccpMergeEntry( GpuIntraRec::Impl& m, const PredictionUnit& pu )
   addAt( -1, iH );
   addAt( iW, -1 );
   addAt( -1, -1 );
+#if JVET_AE0043_CCP_MERGE_TEMPORAL
+  // an inter slice's temporal candidates (getCCPModelCandidateList for an intra PU: not JVET-AF0073's ones of an inter
+  // CU): per distance and position pair the model at the first position in the picture (C0, else C1) of the
+  // collocated picture, the positions moved by a chroma vector shift; twice, after the adjacent positions without a
+  // shift and after the history by a neighbour's vector to the collocated picture (temporalAt)
+  const Slice& slice = *cs.slice;
+  const Picture* const colPic =
+    slice.isIntra() ? nullptr : slice.getRefPic( RefPicList( slice.isInterB() ? 1 - slice.getColFromL0Flag() : 0 ), slice.getColRefIdx() );
+  const bool temporal = colPic && !colPic->isRefScaled( slice.getPPS() );
+  const int  sx = getChannelTypeScaleX( CHANNEL_TYPE_CHROMA, pu.chromaFormat );
+  const int  sy = getChannelTypeScaleY( CHANNEL_TYPE_CHROMA, pu.chromaFormat );
+  auto temporalAt = [&]( const Mv shift )
+  {
+    CHECK( !m.partial, "temporal CCP merge candidates outside partial verification" );
+    const SubPic&  subPic = slice.getPPS()->getSubPicFromPos( pu.lumaPos() );
+    const Position posRB = cb.bottomRight().offset( -1, -1 ), posCenter = cb.center();
+    auto inside = [&]( const Position& p, int dx, int dy )
+    {
+      dx += shift.hor;
+      dy += shift.ver;
+      return subPic.getTreatedAsPicFlag()
+               ? p.x + dx <= int( subPic.getSubPicRight() >> sx ) && p.y + dy <= int( subPic.getSubPicBottom() >> sy )
+               : p.x + dx < int( cs.pcv->lumaWidth >> sx ) && p.y + dy < int( cs.pcv->lumaHeight >> sy );
+    };
+    int offsetX0 = 0, offsetX1 = 0, offsetX2 = 0, offsetX3 = cb.width >> 1;
+    int offsetY0 = 0, offsetY1 = 0, offsetY2 = 0, offsetY3 = cb.height >> 1;
+    for( int dist = 0; dist < 5; dist++ )
+    {
+      const int dH = cb.width * dist, dV = cb.height * dist;
+      for( int k = 0; k < 2; k++ )
+      {
+        const int kind = k == 0 ? 0 : dist == 0 ? 1 : 2;
+        if( kind == 0 )
+        {
+          offsetX0 = offsetX2 = 2 + dH;
+          offsetY0 = offsetY2 = 2 + dV;
+          offsetX1 = dH;
+          offsetY1 = dV;
+        }
+        else if( kind == 1 )
+        {
+          offsetX0 = 2, offsetY0 = 0, offsetX1 = 0, offsetY1 = 2;
+        }
+        else
+        {
+          offsetX0 = offsetX2, offsetY0 = 2 - offsetY3, offsetX1 = 2 - offsetX3, offsetY1 = offsetY2;
+        }
+        const Position& p1 = kind == 0 ? posCenter : posRB;
+        const bool c0 = inside( posRB, offsetX0, offsetY0 ), c1 = inside( p1, offsetX1, offsetY1 );
+        if( !c0 && !c1 )
+        {
+          continue;
+        }
+        const int modelIdx = c0 ? colPic->cs->getCcpmIdxInfo( posRB.offset( offsetX0 + shift.hor, offsetY0 + shift.ver ) )
+                                : colPic->cs->getCcpmIdxInfo( p1.offset( offsetX1 + shift.hor, offsetY1 + shift.ver ) );
+        if( modelIdx <= 0 )
+        {
+          continue;
+        }
+        const auto t = m.ccpTemporal.emplace( std::make_pair( colPic, modelIdx ), m.numCcp );
+        if( t.second )   // (a record of no PU, written by the host: verification compares the GPU's records only)
+        {
+          m.numCcp++;
+          m.ccpPu.push_back( nullptr );
+          m.ccpWriters.insert( m.ccpWriters.end(), CCP_WRITERS, -1 );
+          m.ccpTemporalModels.push_back( colPic->cs->m_ccpModelLUT[modelIdx - 1] );
+          CHECK( m.ccpTemporalModels.back().type <= 0, "a temporal CCP model without a type" );
+          m.cpuCcp.push_back( { t.first->second, &m.ccpTemporalModels.back(), false } );
+#if JVET_AF0073_INTER_CCP_MERGE
+          if( m.ccpTemporalModels.back().type & CCP_TYPE_INTER_CCCM )
+          {
+            m.ccpInterCccm.insert( t.first->second );
+          }
+#endif
+        }
+        add( t.first->second );
+      }
+    }
+  };
+  if( temporal )
+  {
+    temporalAt( Mv( 0, 0 ) );
+  }
+#endif
   const bool luma   = pu.chType == CHANNEL_TYPE_LUMA;
   const int  sizeW  = luma ? pu.Y().width : cb.width, sizeH = luma ? pu.Y().height : cb.height;
   const int  horInt = std::max( sizeW, 4 ), verInt = std::max( sizeH, 4 );   // horNAInterval, verNAInterval
@@ -5061,8 +5188,70 @@ static int32_t ccpMergeEntry( GpuIntraRec::Impl& m, const PredictionUnit& pu )
     addAt( offsetX0, offsetY0 + ( ( offsetY2 - offsetY0 ) >> 1 ) );
     addAt( offsetX0 + ( ( offsetX2 - offsetX0 ) >> 1 ), offsetY0 );
   }
-  d[e + CCP_MERGE_NUM_SPATIAL] = (int32_t) d.size() - e - CCP_MERGE_SPATIAL;
-  return e;
+  numBefore = (int) d.size();
+#if JVET_AE0043_CCP_MERGE_TEMPORAL
+  // after the history: the temporal candidates moved by the vector to the collocated picture of the first inter
+  // neighbour at the adjacent positions that has one (as the CPU looks them up: the chroma positions in the PU's
+  // channel type, the motion at them - scaled for a chroma CU of a separate tree -, outside the PU's merge estimation
+  // region), its list 0 vector first; in partial verification the CPU's motion
+  if( temporal )
+  {
+    const unsigned plevel = cs.sps->getLog2ParallelMergeLevelMinus2() + 2;
+    const Position posCand[5] = { pos.offset( -1, iH - 1 ), pos.offset( iW - 1, -1 ), pos.offset( -1, iH ),
+                                  pos.offset( iW, -1 ), pos.offset( -1, -1 ) };
+    Mv   shift( 0, 0 );
+    bool found = false;
+    for( int k = 0; k < 5 && !found; k++ )
+    {
+      Position lumaPos = posCand[k];
+#if JVET_AI0136_ADAPTIVE_DUAL_TREE
+      if( CU::isIntra( *pu.cu ) && pu.cu->separateTree && pu.chType == CHANNEL_TYPE_CHROMA )
+      {
+        lumaPos.x <<= sx;
+        lumaPos.y <<= sy;
+      }
+#endif
+      const PredictionUnit* q = cs.getPURestricted( posCand[k], pu, pu.chType );
+      if( !q || !CU::isInter( *q->cu ) || !PU::isDiffMER( pu.lumaPos(), lumaPos, plevel ) || q->cu == pu.cu
+          || !q->getMotionInfo( lumaPos ).isInter )
+      {
+        continue;
+      }
+      const MotionInfo mi = q->getMotionInfo( lumaPos );
+      for( int l = 0; l < 2 && !found; l++ )
+      {
+        if( mi.refIdx[l] != -1 && slice.getRefPic( RefPicList( l ), mi.refIdx[l] )->getPOC() == colPic->getPOC() )
+        {
+          found = true;
+          shift = mi.mv[l];
+          shift.changePrecision( MV_PRECISION_INTERNAL, MV_PRECISION_INT );
+          shift.hor >>= sx;
+          shift.ver >>= sy;
+        }
+      }
+    }
+    temporalAt( shift );
+  }
+#endif
+}
+
+// partial verification: whether CCP merge PU pu has a candidate of inter CCCM (CCP_TYPE_INTER_CCCM, JVET-AE0059: an
+// inter CU's TU model, a temporal one) among its sources or its CTU row's history so far, a model kind the GPU lacks
+static bool ccpMergeInterCccm( GpuIntraRec::Impl& m, const PredictionUnit& pu )
+{
+  if( m.ccpInterCccm.empty() )
+  {
+    return false;
+  }
+  std::vector<int32_t> sources;
+  int                  numBefore = 0;
+  ccpMergeSources( m, pu, sources, numBefore );
+  const int row = ( pu.Cb().y << getComponentScaleY( COMPONENT_Cb, pu.chromaFormat ) ) / (int) pu.cs->sps->getMaxCUHeight();
+  if( row == m.ccpHistRow && ccpMergeHistory( pu ) )
+  {
+    sources.insert( sources.end(), m.ccpHist.begin() + m.ccpHistRowStart, m.ccpHist.end() );
+  }
+  return std::any_of( sources.begin(), sources.end(), [&]( int32_t r ) { return m.ccpInterCccm.count( r ) != 0; } );
 }
 
 // the entry of a decoder-derived CCP fusion PU (intra_ccp.glsl derives it as a merge block of this kind): no history,
@@ -5071,7 +5260,7 @@ static int32_t ccpDerivedEntry( GpuIntraRec::Impl& m )
 {
   std::vector<int32_t>& d = m.ccpMerge;
   const int32_t         e = (int32_t) d.size();
-  d.insert( d.end(), { 0, 0, 0, m.numCcpMerge++, CCP_KIND_DERIVED, 0 } );
+  d.insert( d.end(), { 0, 0, 0, m.numCcpMerge++, CCP_KIND_DERIVED, 0, 0 } );
   return e;
 }
 #endif
@@ -5246,6 +5435,8 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
     why = "decoder-derived CCP merge fusion without the regression blend";
 #endif
   else if( !isLuma( compID ) && pu.idxNonLocalCCP && !GPU_CCCM )    why = "CCP merge of another configuration";
+  else if( !isLuma( compID ) && pu.idxNonLocalCCP && ccpMergeInterCccm( m, pu ) )
+    why = "CCP merge with an inter CCCM candidate";
 #endif
 #if JVET_AG0154_DECODER_DERIVED_CCP_FUSION
   // decoder-derived CCP fusion (JVET-AG0154: of a CCLM model and CCCM models fitted to the template the one of the
@@ -5281,6 +5472,8 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
   else if( !isLuma( compID ) && pu.isChromaFusion > 1 && !GPU_CFLM )         why = "CFLM";
   else if( !isLuma( compID ) && pu.isChromaFusion > 1 && pu.cccmNoSubFlag )  why = "CFLM without subsampling";
   else if( !isLuma( compID ) && pu.isChromaFusion && !GPU_CCCM )    why = "LM chroma fusion";
+  // (geneChromaFusionPred's first type in an inter slice blends an MMLM CCLM model's prediction instead of CCCM's)
+  else if( !isLuma( compID ) && pu.isChromaFusion == 1 && !slice.isIntra() ) why = "LM chroma fusion in an inter slice";
   else if( !isLuma( compID ) && pu.isChromaFusion == 1 && !PU::cccmMultiModeAvail( pu, MMLM_CHROMA_IDX, true ) )
     why = "LM chroma fusion without its CCCM models";
   else if( !isLuma( compID ) && pu.isChromaFusion && area != cu.blocks[compID] )
@@ -6786,7 +6979,7 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
           }
         };
         const int32_t* e = &ccpData[t.ccpMerge];
-        for( int s = 0; s < e[CCP_MERGE_NUM_SPATIAL]; s++ )
+        for( int s = 0; s < e[CCP_MERGE_NUM_SPATIAL] + e[CCP_MERGE_NUM_AFTER]; s++ )
         {
           addWriters( e[CCP_MERGE_SPATIAL + s] );
         }
@@ -6932,10 +7125,10 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
   const bool cclmVer = cs.sps->getCclmVerCollocatedChromaFlag(), cclmHor = cs.sps->getCclmHorCollocatedChromaFlag();
   P.cclmFilter  = !cclmVer && !cclmHor ? 0 : cclmVer && cclmHor ? 1 : 2;
   // CCCM: in a dual tree its luma reaches right of / below the block (xCccmCreateLumaRef); LBCCP's second set of models
-  // (predIntraCCCM: an intra slice with the TM non-inter tools; supported() takes intra slices only)
+  // (predIntraCCCM: an intra slice with the TM non-inter tools)
   P.dualTree  = CS::isDualITree( cs ) ? 1 : 0;
 #if GPU_CCCM
-  P.cccmLbccp = cs.sps->getTMnoninterToolsEnableFlag() ? 1 : 0;
+  P.cccmLbccp = cs.sps->getTMnoninterToolsEnableFlag() && cs.slice->isIntra() ? 1 : 0;
 #else
   P.cccmLbccp = 0;
 #endif
@@ -6943,6 +7136,10 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
   // decoder-derived CCP merge fusion's pairs of candidates (PU::getMaxNumCcpFusionModel: fewer without the SPS's
   // ccpFusionMode)
   P.ccpFusionPairs = cs.sps->getCcpFusionMode() ? MAX_CCP_FUSION_NUM : MAX_CCP_FUSION_NUM - 4;
+#endif
+#if JVET_AG0154_DECODER_DERIVED_CCP_FUSION
+  // decoder-derived CCP fusion's GL-CCCM mode (decoderDerivedCcp: above 32 chroma samples in an I slice, else 8)
+  P.ccpDerivedGl = cs.slice->getSliceType() == I_SLICE ? 32 : 8;
 #endif
   // block vectors (intra_bv.glsl): the lists of the TIMD CUs whose candidates may include them (their CodingStructure
   // indices, those of the CUs their lists take vectors from) and the prefix waits of their nodes; then every CU's

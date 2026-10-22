@@ -139,6 +139,15 @@ bool ccpEqual( int x, int y )
 
 // ----- the list (PU::getCCPModelCandidateList)
 
+// source s of merge entry e: the spatial sources (and an inter slice's first temporal ones), the history (s_ccp's LUT),
+// then the sources after it (an inter slice's second temporal ones)
+int ccpMergeSource( int e, int s, int numSpatial, int numLut )
+{
+  BufI32 d = BufI32( P.ccpData );
+  return s < numSpatial ? d.v[e + CCP_MERGE_SPATIAL + s] : s < numSpatial + numLut ? s_ccp[CCP_LUT + s - numSpatial]
+                        : d.v[e + CCP_MERGE_SPATIAL + s - numLut];
+}
+
 // the history of merge block t into s_ccp (invocation 0): cs.ccpLut, whose addCCPToLut drops a model equal to the new
 // one (else the oldest when full) before appending it, so it holds the latest model of each of the last CCP_HIST_MAX
 // distinct ones, read most recent first: the CTU row's models walked back from the latest, each unless equal to one
@@ -163,11 +172,11 @@ void ccpMergeHistory( Tu t )
     }
   }
   s_ccp[CCP_LUT_NUM] = lutNum;
-  const int numSpatial = d.v[e + CCP_MERGE_NUM_SPATIAL];
+  const int numSpatial = d.v[e + CCP_MERGE_NUM_SPATIAL], numAfter = d.v[e + CCP_MERGE_NUM_AFTER];
   s_ccp[CCP_FOUND] = 0;
-  for( int s = 0; s < numSpatial + lutNum && s_ccp[CCP_FOUND] == 0; s++ )
+  for( int s = 0; s < numSpatial + lutNum + numAfter && s_ccp[CCP_FOUND] == 0; s++ )
   {
-    const int r = s < numSpatial ? d.v[e + CCP_MERGE_SPATIAL + s] : s_ccp[CCP_LUT + s - numSpatial];
+    const int r = ccpMergeSource( e, s, numSpatial, lutNum );
     if( ccpWord( r, CCP_OUT_TYPE ) == CCP_TYPE_CCLM )
     {
       for( int c = 0; c < 2; c++ )
@@ -246,22 +255,22 @@ void ccpMergeDefaults( Tu t, int lid, int NT )
   cccmSync();
 }
 
-// the list of merge block t (invocation 0, after the history and the defaults): the spatial sources in order, the
-// history, the defaults, each unless equal to one before it (the CPU compares a default with each the other way
+// the list of merge block t (invocation 0, after the history and the defaults): the spatial (and an inter slice's first
+// temporal) sources in order, the history, the sources after it (an inter slice's second temporal ones), the defaults, each unless equal to one before it (the CPU compares a default with each the other way
 // round, the same for a CCLM model), at most CCP_MAX_CANDS. With adjustment the CCCM models alone (of a type above
 // CCP_TYPE_GLM4567's), at most CCP_MAX_LIST, no defaults (the on-the-fly models follow: ccpFitModels)
 void ccpMergeList( Tu t )
 {
   BufI32     d = BufI32( P.ccpData );
   const int  e = t.ccpMerge, numSpatial = d.v[e + CCP_MERGE_NUM_SPATIAL], numLut = s_ccp[CCP_LUT_NUM];
+  const int  numSources = numSpatial + numLut + d.v[e + CCP_MERGE_NUM_AFTER];
   const int  kind = d.v[e + CCP_MERGE_KIND];
   const bool adjust = kind != 0 && kind < CCP_KIND_DERIVED;
   const int  maxNum = adjust ? CCP_MAX_LIST : CCP_MAX_CANDS, numDefaults = adjust ? 0 : CCP_MAX_CANDS;
   int        num = 0;
-  for( int s = 0; s < numSpatial + numLut + numDefaults && num < maxNum; s++ )
+  for( int s = 0; s < numSources + numDefaults && num < maxNum; s++ )
   {
-    const int r = s < numSpatial ? d.v[e + CCP_MERGE_SPATIAL + s] : s < numSpatial + numLut
-                ? s_ccp[CCP_LUT + s - numSpatial] : ccpDefaultRecords( t ) + s - numSpatial - numLut;
+    const int r = s < numSources ? ccpMergeSource( e, s, numSpatial, numLut ) : ccpDefaultRecords( t ) + s - numSources;
     if( adjust && ccpWord( r, CCP_OUT_TYPE ) <= CCP_TYPE_GLM4567 )
     {
       continue;
@@ -274,8 +283,8 @@ void ccpMergeList( Tu t )
     if( !known )
     {
       s_ccp[CCP_LIST + num]        = r;
-      s_ccp[CCP_LIST_INSIDE + num] = s < numSpatial ? ccpWord( r, CCP_OUT_INSIDE )
-                                   : s < numSpatial + numLut ? ccpWord( r, CCP_OUT_INSIDE_HIST ) : 0;
+      s_ccp[CCP_LIST_INSIDE + num] = s >= numSpatial && s < numSpatial + numLut ? ccpWord( r, CCP_OUT_INSIDE_HIST )
+                                   : s < numSources ? ccpWord( r, CCP_OUT_INSIDE ) : 0;
       num++;
     }
   }
@@ -285,7 +294,7 @@ void ccpMergeList( Tu t )
 // the list of decoder-derived CCP fusion block t (invocation 0): its modes
 void ccpDerivedList( Tu t )
 {
-  const int num = t.w * t.h > 32 ? CCP_DERIVED_MODES : CCP_DERIVED_MODES - 1;
+  const int num = t.w * t.h > P.ccpDerivedGl ? CCP_DERIVED_MODES : CCP_DERIVED_MODES - 1;
   for( int m = 0; m < num; m++ )
   {
     s_ccp[CCP_LIST + m]        = ccpDefaultRecords( t ) + CCP_DERIVED_RECORD[m];
@@ -850,7 +859,7 @@ void ccpFitModels( Tu t, bool derived, int lid, int NT )
     s_cclm[CCCM_THRESHOLD] = derived ? ( total + ( 1 << ( shift - 1 ) ) ) >> shift
                            : num == 0 ? 1 << ( t.bitDepth - 1 ) : cccmDivideLowPrec( total, num );
   }
-  const int numFits = !derived ? CCP_FLY_MAX : t.w * t.h > 32 ? 3 : 2;
+  const int numFits = !derived ? CCP_FLY_MAX : t.w * t.h > P.ccpDerivedGl ? 3 : 2;
   for( int k = 0; k < numFits; k++ )
   {
     const bool two   = derived ? k == 1 : k == 0 || k >= 4;

@@ -518,12 +518,18 @@ void DecCu::decompressCtu( CodingStructure& cs, const UnitArea& ctuArea )
         xReconInter( currCU );
 #if JVET_AF0073_INTER_CCP_MERGE
         CU::saveModelsInHCCP(currCU);
+#if ECM_VULKAN
+        if( m_gpuIntraRec )   // (partial verification: its TUs' CCP models for the GPU's merge CUs, in the history)
+        {
+          m_gpuIntraRec->cpuCuModels( currCU );
+        }
+#endif
         CU::saveProCcpInfo(currCU);
 #endif
 #if ECM_VULKAN
-        if( m_gpuIntraRec )   // (partial verification: its TUs' CCP models for the GPU's merge CUs)
+        if( m_gpuIntraRec )   // (... and those saveProCcpInfo gives the TUs without one, candidates only)
         {
-          m_gpuIntraRec->cpuCuModels( currCU );
+          m_gpuIntraRec->cpuCuModels( currCU, false );
         }
 #endif
         break;

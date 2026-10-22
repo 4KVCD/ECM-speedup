@@ -449,7 +449,7 @@ wall-clock gains with threads are "the easy baseline". Decoder status: single-th
 (`--GpuLoopFilter=1`: ALF, SAO, BIF, CCSAO, LF-CCCM, offset refinement on Vulkan). The user then asked for **a full
 GPU decoder in Vulkan, optimized until nothing is left** ("The GPU decoder needs to fully decode the frame on the
 GPU"; "Your first Vulkan version is going to be slow. That's OK"). That work is branch `dec-gpurecon`: intra
-reconstruction on the GPU (`--GpuRecon`), tool levels M1-M83 done and verified bit-exact (M19: DIMD, M20: OBIC, M21:
+reconstruction on the GPU (`--GpuRecon`), tool levels M1-M84 done and verified bit-exact (M19: DIMD, M20: OBIC, M21:
 intra merge, M22: the transforms of DIMD CUs, M23: LFNST of MIP, M24: TIMD, M25: OBIC and intra merge with TIMD
 neighbours, M26: TIMD-SAD, M27: OBIC and intra merge with TIMD-SAD neighbours, M28: TIMD merge, M29: TMRL of luma,
 M30: chroma TMRL, M31: CCLM, M32: LFNST / NSPT of CCLM, M33: GLM's gradient patterns, M34: CCCM, M35: GL-CCCM, M36:
@@ -1980,6 +1980,23 @@ identical; "IntraTMP OBMC with a neighbour with LIC" 102 and "... with an SGPM n
 M83 (2026-10-22): a palette CU as an MPM neighbour: its mode at the position as the CPU keeps it (getIpmInfo), as
 for IBC and inter neighbours. Results (ai_scc2_q32, ai_scc_q27, ld_scc_q32, build gpu16): identical; "an MPM neighbour
 that is not a recorded intra CU" 58 -> 0 (most of those CUs now stop at "DBV").
+M84 (2026-10-22): partial verification of inter slices: supported() takes them with ECM_GPU_PARTIAL (ON mode still
+stops at "not an intra slice"), their inter / IBC / palette CUs come from the CPU (cpuCu) and their intra CUs are
+verified like an intra slice's. What inter slices change for intra CUs: CCP merge (getCCPModelCandidateList) takes
+temporal candidates (JVET-AE0043) after the 5 adjacent positions - the collocated picture's models at C0 / C1 per
+distance (m_ccpModelLUT, the CPU's: host-written records, ccpTemporal; ON mode will need the collocated picture's
+records kept on the GPU) - and again after the history, moved by the first inter neighbour's vector to the
+collocated picture (Params::ccpData's CCP_MERGE_NUM_AFTER sources, after the LUT in intra_ccp.glsl's ccpMergeSource;
+the first CCLM candidate is looked for there too); no history with separate trees in an inter slice
+(ccpMergeHistory); an inter CU's TU models (JVET-AF0073) enter the history only as CU::saveModelsInHCCP finds them,
+before CU::saveProCcpInfo gives the TUs without one the collocated picture's model at their motion (candidates only:
+cpuCuModels' second call); LBCCP (CCCM's second set of models) is intra slices' only (Params::cccmLbccp); decoder-
+derived CCP fusion's GL-CCCM mode is there above 8 chroma samples instead of 32 (Params::ccpDerivedGl). Rejected for
+now: a CCP merge CU with an inter CCCM candidate (CCP_TYPE_INTER_CCCM: its own model kind), LM chroma fusion's first
+type in an inter slice (it blends an MMLM CCLM prediction there). Results (50 streams, build gpu22): every verified
+picture identical (327 pictures, 273 of them inter pictures (54 before)); the intra CUs from the CPU in inter
+pictures by reason: EIP in an inter slice 67, IntraTMP OBMC with a neighbour of two vectors or inter 25 (9 before), CCP merge
+with an inter CCCM candidate 14, an inter OBIC neighbour 5, LM chroma fusion in an inter slice 3.
 M75 (2026-10-22, agent hb): 12-bit internal bit depth for the tools rejected above 10 bits (JVET-AJ0237 is compiled
 in; the SPS has one bit depth for luma and chroma, sps_bitdepth_minus8, so "unequal bit depths" cannot occur in a
 decoded stream and those checks stay). The template costs: xGetHADs_SIMD's kernels keep 16-bit lanes up to 12 bits -

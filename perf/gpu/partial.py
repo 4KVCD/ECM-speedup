@@ -16,6 +16,8 @@ jobs = 4
 if args and args[0] == '-j':
     jobs = int(args[1])
     args = args[2:]
+if not os.path.isfile(f'C:/Code/ECM/bin/{build}/DecoderApp.exe'):   # (a failed build: nothing to run)
+    sys.exit(f'partial.py: no C:/Code/ECM/bin/{build}/DecoderApp.exe')
 streams = args or sorted(f[:-4] for f in os.listdir('C:/Code/ECM/streams') if f.endswith('.bin'))
 cache = 'C:/Code/ECM/runs/nvcache'
 os.makedirs(cache, exist_ok=True)   # (the driver does not create it: without it nothing is cached)
