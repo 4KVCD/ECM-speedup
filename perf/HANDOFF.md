@@ -449,7 +449,7 @@ wall-clock gains with threads are "the easy baseline". Decoder status: single-th
 (`--GpuLoopFilter=1`: ALF, SAO, BIF, CCSAO, LF-CCCM, offset refinement on Vulkan). The user then asked for **a full
 GPU decoder in Vulkan, optimized until nothing is left** ("The GPU decoder needs to fully decode the frame on the
 GPU"; "Your first Vulkan version is going to be slow. That's OK"). That work is branch `dec-gpurecon`: intra
-reconstruction on the GPU (`--GpuRecon`), tool levels M1-M74 done and verified bit-exact (M19: DIMD, M20: OBIC, M21:
+reconstruction on the GPU (`--GpuRecon`), tool levels M1-M80 done and verified bit-exact (M19: DIMD, M20: OBIC, M21:
 intra merge, M22: the transforms of DIMD CUs, M23: LFNST of MIP, M24: TIMD, M25: OBIC and intra merge with TIMD
 neighbours, M26: TIMD-SAD, M27: OBIC and intra merge with TIMD-SAD neighbours, M28: TIMD merge, M29: TMRL of luma,
 M30: chroma TMRL, M31: CCLM, M32: LFNST / NSPT of CCLM, M33: GLM's gradient patterns, M34: CCCM, M35: GL-CCCM, M36:
@@ -462,7 +462,8 @@ MPM lists of MPM sorting, MDIP and PDP, M58: EIP, M59-M61: block vectors - TIMD,
 IntraTMP's search, without LIC / fusion / FLM / sub-sample vectors / OBMC, M63: EIP with a vector, M64: intra
 merge with vectors, M65: BVG-DIMD, M66: SGPM without vectors or regression, M67: SGPM's integer vectors with
 their LIC models, M68: IBC's interpolation, SGPM's fractional vectors, M69: IntraTMP's sub-sample vectors, M70:
-IntraTMP's OBMC, M71-M73: IntraTMP's LIC, fusion and FLM, M74: intra merge's IntraTMP neighbours); it is
+IntraTMP's OBMC, M71-M73: IntraTMP's LIC, fusion and FLM, M74: intra merge's IntraTMP neighbours, M75: 12 bits, M76: SGPM's
+regression, M77 / M78: single tree, M79 / M80: VVC's LFNST, LFNST of MIP); it is
 **not yet faster than the CPU
 decoder** (see section 8) and supports only a restricted tool set (in ON mode the real CTC streams still fall back to
 the CPU, first reason: chroma reordering / DBV). Partial verification (`perf/gpu/partial.py`, section 7's "Partial
@@ -471,8 +472,8 @@ picture is identical but the known CCP merge blocks (fp720_ai's 3 pictures, ra72
 still come from the CPU (IntraTMP LIC 4159, intra merge with a neighbour of a missing kind 2586, IntraTMP
 sub-sample vectors 1900, SGPM with vectors 3152 and regression 795, IntraTMP OBMC / fusion / FLM ~2200, ...; plus
 32777 inter / IBC / palette CUs of inter pictures). M67-M70 (2026-10-16 / 21) took SGPM's vectors, IntraTMP's
-sub-sample ones and its OBMC, M71-M74 (2026-10-22) the rest of IntraTMP and intra merge's IntraTMP neighbours; the
-agents' branches (12-bit, SGPM regression, single tree, VVC LFNST) follow; then section 9's d and e.
+sub-sample ones and its OBMC, M71-M74 (2026-10-22) the rest of IntraTMP and intra merge's IntraTMP neighbours, M75-M80 (the
+agents') 12-bit, the rest of SGPM, single tree, VVC's LFNST and LFNST of MIP; then section 9's d and e.
 
 ## 1a. Working fast (development time)
 
@@ -1880,7 +1881,7 @@ the GPU 65 -> 318; the first three streams verified alone had 128 intra strips (
 prepareRef) and 41 motion runs on the CPU (its debug counts). SPIR-V: 3.34M / 4.17M IDs - only 26k left in
 the CCP-LFNST module: the next milestone must make room first (the strip's angular code is a second copy of the main
 path's; a shared call site would save ~60k).
-Regression SGPM and the rest of SGPM (2026-10-22, agent sg; milestone number for the lead to assign): JVET-AJ0112's
+M76 (2026-10-22, agent sg): regression SGPM and the rest of SGPM: JVET-AJ0112's
 regression SGPM, SGPM without blending and without TIMD / DIMD. A regression SGPM CU (PU::isRegressionSgpm: sgpmIdx
 below RSGPM_CAND_NUM in a CU above 4 x 4) skips deriveSgpmModeOrdered's partitions: its list is the MPM list's first
 six (planar, getSpatialIpm forced valid without MDIP's exclusions - DecCu clears isModeExcluded around it -,
@@ -1999,7 +2000,7 @@ Limits: the 4x4 kernel's uint32_t result can wrap (a lane's sum past 2^16 below 
 sum, the CPU's 64-bit, so two such blocks in one arm would differ (needs differences averaging above ~2^10 in a 4x4
 block's DC lane). Chroma TMRL above 10 bits stays rejected (its co-located luma SATD takes the 16x8 / 8x16 AVX2
 kernels: not ported; 99 CUs on t12).
-Single tree (2026-10-22, agent st; SPS DualITree=0, where a CU's PU holds luma and chroma): the two single-tree streams
+M77 (2026-10-22, agent st): single tree (SPS DualITree=0, where a CU's PU holds luma and chroma): the two single-tree streams
 differed since M66 (section 9's a2), from two host bugs. (1) A CCP merge PU of fusion with DIMD chroma
 (ccpFusionDimd) set DERIVE_CCP_DIMD on its luma block too: intra_rec blended the luma prediction with "the DIMD chroma
 mode" (ra_nodualtree_q32's luma MPM block at 32,24, then DIMD chroma's second mode from its luma; in
@@ -2012,7 +2013,7 @@ record (cpuChromaPending, cpuKnownRecord) to the CU's end: DecCu's intra case ca
 CU::saveModelsInHCCP, which makes it then. Results (Intel PC, build agst5, non-inlined SPIR-V): ai_nodualtree_q27,
 ra_nodualtree_q32 identical (were MISMATCH); ai_scc2_q32, ai_foreman352_q37, ra_foreman_q32 as before (same CPU CU
 reasons). Host only.
-IntraTMP's chroma in a single tree (2026-10-22, agent st): the rejection "IntraTMP's chroma (single tree)" (134 CUs
+M78 (2026-10-22, agent st): IntraTMP's chroma in a single tree: the rejection "IntraTMP's chroma (single tree)" (134 CUs
 on ai_nodualtree_q27 1, ra_nodualtree_q32 2, ai_scc2_q32 131) is gone: the CPU predicts such a CU's chroma as any
 chroma CU's (xIntraRecBlk: initIntraPatternChType, no IntraTMP step; its OBMC, LIC and sub-sample vectors are luma's;
 DM and the candidates' substitution read planar, getIntraDirLuma of an IntraTMP PU, which the CU's node publishes as
@@ -2021,7 +2022,7 @@ its mode). What remains is the chroma mode: an IntraTMP luma CU makes DBV availa
 rejected as before); one CU (ra_nodualtree_q32) moved to the GPU. DBV (refineChromaBv's template refinement, IBC's
 fractional interpolation, RR-IBC flips) is the next step for these CUs. Results (build agst6): the 5 streams
 identical, the CPU CU reasons otherwise unchanged. Host only.
-LFNST without the SPS's LFNSTExt (2026-10-22): VVC's kernels (TrQuant::xInvLfnst / invLfnstNxN with lfnstExtFlag
+M79 (2026-10-22, agent lf): LFNST without the SPS's LFNSTExt: VVC's kernels (TrQuant::xInvLfnst / invLfnstNxN with lfnstExtFlag
 off: g_vvcLfnstLut's 4 sets, lfnstIdx 1-2, g_vvcLfnst4x4 16 x 16 or g_vvcLfnst8x8 16 x 48; no 16 x 16 region, so a
 block of 8 x 8 and above takes the 8x8 region and g_coefTopLeftDiagScan8x8; 16 inputs, getLFNSTMatrixDim's 16, for
 every size). Host only: invSecondary chooses them like the CPU, the kernel tables join secKernels, the output
@@ -2035,7 +2036,7 @@ them out. Results (Intel PC, build aglf1): ai_off15_q27, ra_off15_q32, ra_off5_q
 extension (the VVC kernels)" 77 / 106 / 106 -> 0 CUs from the CPU (a debug count saw every kind: 4x4 / 8x8 regions,
 both indices, transposed or not); ai_foreman352_q37 and ra_foreman_q32 identical with the same CPU CUs. No shader
 change.
-LFNST of MIP, the rest of M23's rejections (2026-10-22): without DIMD in the SPS deriveIpmForTransform returns planar
+M80 (2026-10-22, agent lf): LFNST of MIP, the rest of M23's rejections: without DIMD in the SPS deriveIpmForTransform returns planar
 at once (mipDimdMode planar, dimdDerivedIntraDir2nd 0), so the host's choice is the CPU's (CodingUnit::initData's
 values in ON mode) and the block derives nothing (no DERIVE_MIP_DIMD); a single tree's chroma blocks of a MIP CU with
 lfnstIdx take no LFNST / NSPT (luma only) and were rejected for nothing. Still rejected: a MIP CU of several blocks with
@@ -2071,7 +2072,7 @@ Profile of a GPU-on decode (non-LTO, m2_park16, share of all samples): parsing ~
 0. Now (2026-10-15, the intra phase; the user's order: all intra first, then inter), by the CPU CUs they free:
    a. Done (2026-10-16): M67, committed on dec-gpurecon from the WIP commit's diff (the branch
       dec-gpurecon-m67-wip keeps the WIP commit as it was pushed).
-   a2. Done (2026-10-22, section 7's "Single tree"; found 2026-10-16): the two single-tree intra
+   a2. Done (2026-10-22, M77; found 2026-10-16): the two single-tree intra
       streams (`--DualITree=0`; CTC's intra slices are dual tree) differ in partial verification - ai_nodualtree_q27
       (a CCP merge chroma block inherits the wrong model type, CCLM instead of CCCM, first seen as NN's
       indicesRepresentationPnn) and ra_nodualtree_q32 (a luma MPM block's prediction, then DIMD chroma's second
