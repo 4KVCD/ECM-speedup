@@ -1,15 +1,20 @@
-# gpuslot.py: a machine-wide limit on concurrent GPU decoders (several sessions or agents verifying at once). The Intel
-# driver compiles an intra_rec pipeline in 20-30 GB of commit (a decoder that compiles several grew to 33 GB), so 3
-# cold decoders beside builds exhausted the 64 GB PC (2026-10-22: 177 GB of 178 GB committed). `with slot():` takes one
-# of ECM_GPU_SLOTS (default 2) slots - directories C:/Code/ECM/runs/gpuslots/<n> made atomically, holding the owner's
-# PID; a slot whose owner process is gone is taken over -, and only while the machine has ECM_GPU_MIN_FREE_GB (default
-# 24) of physical memory and twice that of commit free; it frees the slot at the end.
-import ctypes, os, threading, time
+# gpuslot.py: a machine-wide limit on memory-heavy jobs (several sessions or agents verifying and building at once).
+# The user's budget: the system's committed memory stays below 60 GB (ECM_MEM_LIMIT_GB). The Intel driver compiles an
+# intra_rec pipeline in 20-35 GB of commit (a decoder that compiled several grew to 33 GB), so one cold decoder at a
+# time (2026-10-22: 3 decoders and the agents' glslang -O builds reached 177 GB). `with slot():` takes one of
+# ECM_GPU_SLOTS (default 1) slots - directories C:/Code/ECM/runs/gpuslots/<n> made atomically, holding the owner's PID;
+# a slot whose owner process is gone is taken over - once the committed memory plus `need` GB (ECM_GPU_NEED_GB,
+# default 35 for a decoder) fits the budget, and frees it at the end. As a command it runs one under a slot of its own
+# kind (builds: `python perf/gpu/gpuslot.py --kind build --need 12 -- powershell -File perf\build.ps1 ...`), so a build
+# waits for memory too, but not for a decoder's slot.
+import ctypes, os, subprocess, sys, threading, time
 from contextlib import contextmanager
 
 ROOT = 'C:/Code/ECM/runs/gpuslots'
-SLOTS = int(os.environ.get('ECM_GPU_SLOTS', '2'))
-MIN_FREE = float(os.environ.get('ECM_GPU_MIN_FREE_GB', '24')) * (1 << 30)
+SLOTS = int(os.environ.get('ECM_GPU_SLOTS', '1'))
+LIMIT = float(os.environ.get('ECM_MEM_LIMIT_GB', '60')) * (1 << 30)
+NEED = float(os.environ.get('ECM_GPU_NEED_GB', '35'))
+_local = threading.Lock()
 
 
 class _MemStatus(ctypes.Structure):
@@ -19,12 +24,11 @@ class _MemStatus(ctypes.Structure):
                 ('ullAvailVirtual', ctypes.c_ulonglong), ('ullAvailExtendedVirtual', ctypes.c_ulonglong)]
 
 
-def _memory_ok():
+def committed():
     m = _MemStatus()
     m.dwLength = ctypes.sizeof(m)
     ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(m))
-    return m.ullAvailPhys >= MIN_FREE and m.ullAvailPageFile >= 2 * MIN_FREE
-_local = threading.Lock()
+    return m.ullTotalPageFile - m.ullAvailPageFile
 
 
 def _alive(pid):
@@ -38,12 +42,12 @@ def _alive(pid):
     return bool(ok) and code.value == 259     # STILL_ACTIVE
 
 
-def _take():
+def _take(kind, slots, need):
     os.makedirs(ROOT, exist_ok=True)
     while True:
         with _local:
-            for n in range(SLOTS if _memory_ok() else 0):
-                d = f'{ROOT}/{n}'
+            for n in range(slots if committed() + need * (1 << 30) <= LIMIT else 0):
+                d = f'{ROOT}/{kind}{n}'
                 try:
                     os.mkdir(d)
                 except FileExistsError:
@@ -66,12 +70,12 @@ def _take():
                     continue
                 open(f'{d}/pid', 'w').write(str(os.getpid()))
                 return d
-        time.sleep(2)
+        time.sleep(5)
 
 
 @contextmanager
-def slot():
-    d = _take()
+def slot(kind='', slots=None, need=None):
+    d = _take(kind, SLOTS if slots is None else slots, NEED if need is None else need)
     try:
         yield
     finally:
@@ -80,3 +84,16 @@ def slot():
             os.rmdir(d)
         except OSError:
             pass
+
+
+if __name__ == '__main__':   # gpuslot.py [--kind K] [--need GB] -- command...
+    args = sys.argv[1:]
+    kind, need = 'job', NEED
+    while args and args[0] != '--':
+        if args[0] == '--kind':
+            kind = args[1]
+        elif args[0] == '--need':
+            need = float(args[1])
+        args = args[2:]
+    with slot(kind, 1, need):
+        sys.exit(subprocess.run(args[1:]).returncode)
