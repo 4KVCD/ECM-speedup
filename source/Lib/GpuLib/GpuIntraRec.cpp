@@ -3189,9 +3189,9 @@ static bool addMpmNeighbours( GpuIntraRec::Impl& m, const CodingUnit& cu, Cu& c,
     {
       continue;
     }
-    // an IBC or inter CU (all on the CPU): its intra mode as its motion field keeps it (getIpmInfo), a GPM CU's
-    // partition angle, as a record of that mode
-    if( CU::isInter( *nb->cu ) || CU::isIBC( *nb->cu ) )
+    // an IBC, inter or palette CU (all on the CPU): its intra mode as its motion field keeps it (getIpmInfo), a GPM
+    // CU's partition angle, as a record of that mode
+    if( CU::isInter( *nb->cu ) || CU::isIBC( *nb->cu ) || CU::isPLT( *nb->cu ) )
     {
       int mode = nb->getIpmInfo( pos[k] );
       if( nb->cu->geoFlag )

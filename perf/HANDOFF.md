@@ -449,7 +449,7 @@ wall-clock gains with threads are "the easy baseline". Decoder status: single-th
 (`--GpuLoopFilter=1`: ALF, SAO, BIF, CCSAO, LF-CCCM, offset refinement on Vulkan). The user then asked for **a full
 GPU decoder in Vulkan, optimized until nothing is left** ("The GPU decoder needs to fully decode the frame on the
 GPU"; "Your first Vulkan version is going to be slow. That's OK"). That work is branch `dec-gpurecon`: intra
-reconstruction on the GPU (`--GpuRecon`), tool levels M1-M82 done and verified bit-exact (M19: DIMD, M20: OBIC, M21:
+reconstruction on the GPU (`--GpuRecon`), tool levels M1-M83 done and verified bit-exact (M19: DIMD, M20: OBIC, M21:
 intra merge, M22: the transforms of DIMD CUs, M23: LFNST of MIP, M24: TIMD, M25: OBIC and intra merge with TIMD
 neighbours, M26: TIMD-SAD, M27: OBIC and intra merge with TIMD-SAD neighbours, M28: TIMD merge, M29: TMRL of luma,
 M30: chroma TMRL, M31: CCLM, M32: LFNST / NSPT of CCLM, M33: GLM's gradient patterns, M34: CCCM, M35: GL-CCCM, M36:
@@ -1977,6 +1977,9 @@ M82 (2026-10-22): IntraTMP OBMC with an SGPM neighbour: the unit's mode is the S
 (spanIpmInfoSgpm's tpmMask per 4 x 4 unit, tabled per CU size and partition after sgpmTables' weights; a vector's
 mode planar), from the SGPM node's partition and modes. Results (9 streams with these CUs, build gpu16): all
 identical; "IntraTMP OBMC with a neighbour with LIC" 102 and "... with an SGPM neighbour" 49 -> 0.
+M83 (2026-10-22): a palette CU as an MPM neighbour: its mode at the position as the CPU keeps it (getIpmInfo), as
+for IBC and inter neighbours. Results (ai_scc2_q32, ai_scc_q27, ld_scc_q32, build gpu16): identical; "an MPM neighbour
+that is not a recorded intra CU" 58 -> 0 (most of those CUs now stop at "DBV").
 M75 (2026-10-22, agent hb): 12-bit internal bit depth for the tools rejected above 10 bits (JVET-AJ0237 is compiled
 in; the SPS has one bit depth for luma and chroma, sps_bitdepth_minus8, so "unequal bit depths" cannot occur in a
 decoded stream and those checks stay). The template costs: xGetHADs_SIMD's kernels keep 16-bit lanes up to 12 bits -
