@@ -5067,10 +5067,11 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
   else if( !isLuma( compID ) && PU::isMIP( pu, chType ) )           why = "chroma MIP (4:4:4)";
   else if( cu.ispMode && ipa.multiRefIndex )                        why = "ISP with MRL";
   // LFNST / NSPT of MIP blocks select their kernel by a DIMD mode the CPU derives from the MIP prediction
-  // (deriveIpmForTransform), which intra_rec derives for a luma block that is the whole CU where the SPS has DIMD
-  // (without, the CPU's is planar)
-  else if( cu.mipFlag && cu.lfnstIdx
-           && ( !GPU_MIP_DIMD || !isLuma( compID ) || !sps.getUseDimd() || area != cu.blocks[COMPONENT_Y] ) ) why = "LFNST of MIP";
+  // (deriveIpmForTransform), which intra_rec derives for a luma block that is the whole CU where the SPS has DIMD;
+  // without DIMD it is planar (deriveIpmForTransform returns at once), the host's (in ON mode CodingUnit::initData's
+  // mipDimdMode, planar). A single tree's chroma blocks take no LFNST / NSPT (luma only)
+  else if( cu.mipFlag && cu.lfnstIdx && isLuma( compID )
+           && ( !GPU_MIP_DIMD || ( sps.getUseDimd() && area != cu.blocks[COMPONENT_Y] ) ) ) why = "LFNST of MIP";
   // transform skip with the regular residual coding is dequantized like a transform block (DepQuant::dequant)
   else if( ( tu.mtsIdx[compID] == MTS_SKIP || ( tu.jointCbCr && tu.mtsIdx[COMPONENT_Cr] == MTS_SKIP ) )
            && slice.getTSResidualCodingDisabledFlag() )             why = "transform skip with regular residual coding";
@@ -5813,7 +5814,7 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
     // a DIMD of its own prediction, which intra_rec derives after the prediction (MTS of MIP takes planar's kernels)
     const bool mtsByMode = isLuma( resiComp ) && sps.getUseMTS() && sps.getUseIntraMTS() && sps.getUseMTSExt()
                            && !cu.ispMode && tu.mtsIdx[resiComp] > MTS_SKIP;
-    const bool mipDimd   = GPU_MIP_DIMD && mip && cu.lfnstIdx;
+    const bool mipDimd   = GPU_MIP_DIMD && mip && cu.lfnstIdx && sps.getUseDimd();   // (without DIMD planar, the host's)
     // (a DIMD of the CU's chroma predictions: an LM block's, a CCP merge block's)
     const bool cclmDimd  = ( ( t.lm & LM_ACTIVE ) || t.ccpMerge >= 0 ) && cu.lfnstIdx;
     // an NN block's (MTS too): a DIMD of its prediction (indicesRepresentationPnn), LFNST / NSPT by the lfnstSecFlag

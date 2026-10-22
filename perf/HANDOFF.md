@@ -2035,6 +2035,18 @@ them out. Results (Intel PC, build aglf1): ai_off15_q27, ra_off15_q32, ra_off5_q
 extension (the VVC kernels)" 77 / 106 / 106 -> 0 CUs from the CPU (a debug count saw every kind: 4x4 / 8x8 regions,
 both indices, transposed or not); ai_foreman352_q37 and ra_foreman_q32 identical with the same CPU CUs. No shader
 change.
+LFNST of MIP, the rest of M23's rejections (2026-10-22): without DIMD in the SPS deriveIpmForTransform returns planar
+at once (mipDimdMode planar, dimdDerivedIntraDir2nd 0), so the host's choice is the CPU's (CodingUnit::initData's
+values in ON mode) and the block derives nothing (no DERIVE_MIP_DIMD); a single tree's chroma blocks of a MIP CU with
+lfnstIdx take no LFNST / NSPT (luma only) and were rejected for nothing. Still rejected: a MIP CU of several blocks with
+DIMD (none on the streams). Results (build aglf3, with the ECM_SPIRV_OPT / ECM_SPIRV_INLINE=OFF shaders): "LFNST of
+MIP" 33 -> 0 CUs from the CPU (ai_off15_q27 8, ra_off15_q32 15, ra_off4_q32 2, ai_nodualtree_q27 4,
+ra_nodualtree_q32 4); ai_off15_q27, ra_off15_q32, ra_off4_q32, ra_off5_q32, ai_foreman352_q37, ra_foreman_q32
+identical; the two single-tree streams differ first where they did before (gpu5: the same field and block). Their 8
+MIP blocks with LFNST / NSPT (DERIVE_MIP_DIMD) lie after that difference, so a temporary build that took every other
+CU from the CPU checked them: all 8 identical (prediction, residual, derived transforms); ra_nodualtree_q32 then
+identical, ai_nodualtree_q27 differed at the chroma block of one of them, a CCP merge block (its model's type), the
+kind of block the known single-tree difference starts at - open.
 
 
 ## 8. Numbers (i7-10700 8C/16T, Win11, GCC 16.2, RTX 3070 driver 616.92)
