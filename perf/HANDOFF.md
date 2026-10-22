@@ -491,8 +491,8 @@ min instead of ~2 h, each covering a whole tool family on real streams. Keep it 
   `precompile.py <build> -j 7 8:0 8:1 8:2 8:3 8:4 8:5 8:6` (~7 min: the MPM variant, which every regular stream's
   pictures take since EIP / IntraTMP / SGPM CUs force it), not all 63 (~26 min with 14 at a time; only needed before
   the 444-stream regression). Pipelines then load from runs/pipecache in 0.0 s. Check a shader edit with glslang
-  first (`spirv_ids.py`: compile errors in a few minutes and the SPIR-V ID budget, 4.19M per module; the CCP-LFNST
-  module is the tight one, ~180k left at M66). Host-only edits need no compile at all.
+  first (`spirv_ids.py`: compile errors and each module's size in about a minute; since 2026-10-22 the build's
+  spirv-opt step removed the SPIR-V ID budget that bound M45-M70). Host-only edits need no compile at all.
 - Never wait idle: builds, precompiles and test runs go to the background while you read the CPU code for the next
   step or write the next part. Use at most one agent (the user's rule); parallelize with background processes.
 - Debug with the verification's first differing field / block (the report names the CU, the field, CPU vs GPU
@@ -585,14 +585,17 @@ old C:\Code\build and C:\Code\wt-* paths, so CMake refuses to configure it. The 
 Toolchain used (Windows 11): WinLibs GCC 16.2 (mingw64), CMake 4.4.4, Ninja, MinGit, gh. Vulkan: no SDK needed;
 `vulkan-1.dll` is loaded at run time. Build inputs (download only with the user's OK): Vulkan-Headers tag
 `vulkan-sdk-1.4.363.0` (C:\Code\ECM\tools\vulkan-headers\Vulkan-Headers-vulkan-sdk-1.4.363.0) and glslang 16.6.0
-(C:\Code\ECM\tools\glslang\bin\glslang.exe). The GPU must support Vulkan 1.3 compute with buffer device address and
+(C:\Code\ECM\tools\glslang\bin\glslang.exe); since 2026-10-22 also spirv-opt from the Vulkan SDK (1.4.357, installed
+copy-only with the user's OK to C:\Code\tools\vksdk: `vulkansdk-windows-X64-1.4.357.0.exe --root C:\Code\tools\vksdk
+--accept-licenses --default-answer --confirm-command install copy_only=1`; only Bin\spirv-opt.exe and its DLL are used),
+passed as `-DECM_SPIRV_OPT=C:/Code/tools/vksdk/Bin/spirv-opt.exe`. The GPU must support Vulkan 1.3 compute with buffer device address and
 the **vulkanMemoryModel** feature (GpuIntraRec::create returns null otherwise); tested only on an RTX 3070 (driver
 616.92).
 
 Builds (from a worktree, e.g. `C:\Code\ECM\wt-gr` on branch dec-gpurecon):
 ```
-perf\build.ps1 gr -NoLto '-DECM_VULKAN=ON' '-DECM_VULKAN_HEADERS=C:/Code/ECM/tools/vulkan-headers/Vulkan-Headers-vulkan-sdk-1.4.363.0/include' '-DECM_GLSLANG=C:/Code/ECM/tools/glslang/bin/glslang.exe'
-perf\build.ps1 grL '-DECM_VULKAN=ON' <same two paths>        # LTO, for timing
+perf\build.ps1 gr -NoLto '-DECM_VULKAN=ON' '-DECM_VULKAN_HEADERS=C:/Code/ECM/tools/vulkan-headers/Vulkan-Headers-vulkan-sdk-1.4.363.0/include' '-DECM_GLSLANG=C:/Code/ECM/tools/glslang/bin/glslang.exe' '-DECM_SPIRV_OPT=C:/Code/tools/vksdk/Bin/spirv-opt.exe'
+perf\build.ps1 grL '-DECM_VULKAN=ON' <same three paths>      # LTO, for timing
 ```
 Quote the -D arguments in PowerShell: unquoted, `-DNAME=C:/...` is split at the colon and the configure fails.
 Likewise PowerShell 5.1 drops an empty argument, so `-o ""` makes the next option the output file name.
@@ -694,7 +697,7 @@ commands that combine `Remove-Item` with `//` text. `perf\gpu\crlf.ps1 <worktree
 | `verify_all.py [-j N] <build> [streams]` | the full regression: `--GpuRecon=2` over the 444 GPU test streams (C:\Code\ECM\streams_gpu); M66 baseline 1565 verified, 8 skipped, 0 differences |
 | `cpu_cus.py <build> ...` | sums partial.py's "CUs taken from the CPU" per reason over the logs: what to port next |
 | `long_lines.py <worktree> <files>` | added lines over 120 columns (the style rule) |
-| `spirv_ids.py [worktree]` | compiles intra_rec's two modules with glslang, prints their SPIR-V ID bounds (limit 4194303) |
+| `spirv_ids.py [worktree]` | compiles intra_rec's two modules as the build does (spv_build.cmake), prints their ID bounds and times |
 | `gpucheck.py [-j N] <build> [streams] -- <decoder args>` | decodes every GPU stream with the build and with the stock decoder (cached), compares all frames, prints the `[gpu-intra]` lines. Use `--GpuRecon=2` (verify) and `--GpuRecon=3`, also with `--FrameThreads=8`. `-j N` decodes N streams at a time (6 for verification, 3 with 8 frame threads; 1, the default, for timings): a full regression then takes minutes instead of most of an hour. |
 | `stress.py <build> <reps> [args]` | repeats verify decodes, saves the output of any run that is not "all verified, 0 differences, 0 skipped" (caught the m_timdMrg bug, 1 in ~650 runs) |
 | `gpuload.py <build> <seconds>` | keeps the GPU busy (decodes with `--GpuRecon=3 --FrameThreads=8`); run it beside stress.py, GPU synchronization bugs needed the load to show (intra_resi scratch, 2026-10-11) |
@@ -2087,7 +2090,14 @@ Profile of a GPU-on decode (non-LTO, m2_park16, share of all samples): parsing ~
   uses `-O` (GpuLib's CMakeLists, GLSLANG_OPT): the same kernel speed (plain, m19, m24, m48 within noise) and cold
   pipeline compile (24 s plain, 108 s CCP merge: the same), bound 1.96M. Check the bound of a large change (word 3 of
   the module: glslang `-V --target-env vulkan1.3 -O` into a short path) and keep new code to one call site per large
-  function. A spirv-opt with `--compact-ids` in the recipe would lift the limit further (not installed).
+  function. Since 2026-10-22 (the user's OK to install the Vulkan SDK's spirv-opt) the build with ECM_SPIRV_OPT runs
+  glslang without its optimizer and then spirv-opt with glslang -O's pass list (glslang's SpvTools.cpp), a raised
+  `--max-id-bound` and `--compact-ids` (GpuLib's spv_build.cmake, which also writes the header and the include
+  depfile): the bound was dead IDs of the optimizer's passes - the finished modules hold ~280k / 335k IDs (M70's code:
+  3.34M / 4.17M with glslang -O) - and the newer SPIRV-Tools take ~35 s instead of 160 s for intra_rec. The SPIR-V is
+  not glslang -O's word for word (another SPIRV-Tools version); its corpus verification and kernel timing are in the
+  next milestone's paragraph. Memory: glslang -O took 17-19 GB per intra_rec module (two at once per build), this
+  recipe ~2 GB. Without ECM_SPIRV_OPT the old glslang -O recipe still builds, until a module passes 4.19M IDs.
 - Buffer references (device addresses) have no robustness: a read past a plane's end loses the device
   (VK_ERROR_DEVICE_LOST, nvlddmkm event 153; all three decodes running at the time failed), and one past a row's end reads
   the next row unnoticed. To find such a read without more device losses (M31's first version: luma TIMD / TMRL blocks

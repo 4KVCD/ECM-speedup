@@ -7,6 +7,9 @@ endif()
 if( NOT ECM_GLSLANG OR NOT EXISTS "${ECM_GLSLANG}" )
   message( FATAL_ERROR "ECM_VULKAN: set ECM_GLSLANG to the glslang executable" )
 endif()
+if( ECM_SPIRV_OPT AND NOT EXISTS "${ECM_SPIRV_OPT}" )
+  message( FATAL_ERROR "ECM_VULKAN: ECM_SPIRV_OPT (${ECM_SPIRV_OPT}) does not exist" )
+endif()
 
 file( GLOB SRC_FILES "*.cpp" )
 file( GLOB INC_FILES "*.h" )
@@ -17,7 +20,9 @@ file( GLOB SHADER_INCLUDES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/shader
 # the includes each one reads, so a change to one include recompiles only the shaders that read it (CMake 3.21 has
 # DEPFILE for every generator; before, each shader depends on all includes). glslang's optimizer matters (without it
 # the kernels run up to 18 % slower); -O gives the speed and cold pipeline compile of -Os with half the SPIR-V IDs
-# (intra_rec 1.96M against 3.72M of the 4.19M a module may have: -Os inlines every call site)
+# (intra_rec 1.96M against 3.72M of the 4.19M a module may have: -Os inlines every call site). With ECM_SPIRV_OPT (the
+# Vulkan SDK's spirv-opt) glslang compiles without its optimizer and spirv-opt runs the same passes with a raised ID
+# limit and compacts the IDs (spv_build.cmake): no ID budget any more (intra_rec 0.28M IDs), ~5x faster
 set( GLSLANG_OPT -O CACHE STRING "glslang's optimization option for the shaders (-O; empty: none)" )
 set( SPV_DIR "${CMAKE_CURRENT_BINARY_DIR}/spv" )
 file( MAKE_DIRECTORY "${SPV_DIR}" )
@@ -30,7 +35,17 @@ function( spv_header NAME SHADER )
   foreach( MACRO ${ARGN} )
     list( APPEND DEFINES "-D${MACRO}" )
   endforeach()
-  if( CMAKE_VERSION VERSION_GREATER_EQUAL 3.21 )
+  string( REPLACE ";" "," DEFINES_ARG "${DEFINES}" )   # (a ; would split the argument)
+  if( ECM_SPIRV_OPT AND CMAKE_VERSION VERSION_GREATER_EQUAL 3.21 )
+    add_custom_command( OUTPUT "${OUT}"
+                        COMMAND "${CMAKE_COMMAND}" "-DGLSLANG=${ECM_GLSLANG}" "-DSPIRV_OPT=${ECM_SPIRV_OPT}"
+                                "-DSHADER=${SHADER}" "-DOUT=${OUT}" "-DVAR=spv_${NAME}"
+                                "-DINCLUDE=${CMAKE_CURRENT_SOURCE_DIR}/shaders" "-DDEFINES=${DEFINES_ARG}"
+                                -P "${CMAKE_CURRENT_SOURCE_DIR}/spv_build.cmake"
+                        DEPENDS "${SHADER}" "${CMAKE_CURRENT_SOURCE_DIR}/spv_build.cmake"
+                        DEPFILE "${OUT}.d"
+                        COMMENT "glslang + spirv-opt ${NAME}" VERBATIM )
+  elseif( CMAKE_VERSION VERSION_GREATER_EQUAL 3.21 )
     add_custom_command( OUTPUT "${OUT}"
                         COMMAND "${ECM_GLSLANG}" -V --target-env vulkan1.3 ${GLSLANG_OPT} ${DEFINES}
                                 -I${CMAKE_CURRENT_SOURCE_DIR}/shaders --vn spv_${NAME} --depfile "${OUT}.d" -o "${OUT}"
