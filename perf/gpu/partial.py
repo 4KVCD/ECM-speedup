@@ -6,6 +6,7 @@
 # The NVIDIA driver's shader cache: runs/nvcache, a cache of its own (the shared one stops storing at 1 GB); the
 # pipelines' own files (VkCompute's ECM_GPU_PIPELINE_CACHE, which precompile.py fills): runs/pipecache.
 import os, re, subprocess, sys
+from gpuslot import slot   # (at most ECM_GPU_SLOTS decoders on the machine at a time)
 from concurrent.futures import ThreadPoolExecutor
 from collections import Counter
 
@@ -27,8 +28,9 @@ total = Counter()
 
 
 def run(name):
-    p = subprocess.run([f'C:/Code/ECM/bin/{build}/DecoderApp.exe', '-b', f'C:/Code/ECM/streams/{name}.bin', '-o', '',
-                        '--GpuRecon=2'], capture_output=True, text=True, env=env)
+    with slot():
+        p = subprocess.run([f'C:/Code/ECM/bin/{build}/DecoderApp.exe', '-b', f'C:/Code/ECM/streams/{name}.bin', '-o', '',
+                            '--GpuRecon=2'], capture_output=True, text=True, env=env)
     out = p.stdout
     if p.returncode != 0:   # (a decoder that failed: its exit code and error output, in the log and the report)
         out += f'\n[exit code {p.returncode}] ' + ' | '.join(p.stderr.strip()[-500:].splitlines()) + '\n'
