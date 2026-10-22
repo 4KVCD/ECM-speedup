@@ -4,16 +4,18 @@
 # time (2026-10-22: 3 decoders and the agents' glslang -O builds reached 177 GB). `with slot():` takes one of
 # ECM_GPU_SLOTS (default 1) slots - directories C:/Code/ECM/runs/gpuslots/<n> made atomically, holding the owner's PID;
 # a slot whose owner process is gone is taken over - once the committed memory plus `need` GB (ECM_GPU_NEED_GB,
-# default 35 for a decoder) fits the budget, and frees it at the end. As a command it runs one under a slot of its own
-# kind (builds: `python perf/gpu/gpuslot.py --kind build --need 12 -- powershell -File perf\build.ps1 ...`), so a build
-# waits for memory too, but not for a decoder's slot.
-import ctypes, os, subprocess, sys, threading, time
+# default 26 for a decoder) fits the budget, and frees it at the end. As a command it runs one under a slot of its own
+# kind (builds: `python perf/gpu/gpuslot.py --kind build --need 12 -- powershell -ExecutionPolicy Bypass -File
+# perf\build.ps1 ...`), so a build waits for memory too, but not for a decoder's slot. run() runs a decoder under a slot
+# and stops it (its own child) where the machine's commit passes the budget less 1 GB, then runs it again once memory
+# allows: one cold intra_rec pipeline peaked at 16.9 GB of commit (MPM + CCLM, 760 s), larger levels take more.
+import ctypes, os, subprocess, sys, tempfile, threading, time
 from contextlib import contextmanager
 
 ROOT = 'C:/Code/ECM/runs/gpuslots'
 SLOTS = int(os.environ.get('ECM_GPU_SLOTS', '1'))
 LIMIT = float(os.environ.get('ECM_MEM_LIMIT_GB', '60')) * (1 << 30)
-NEED = float(os.environ.get('ECM_GPU_NEED_GB', '35'))
+NEED = float(os.environ.get('ECM_GPU_NEED_GB', '26'))
 _local = threading.Lock()
 
 
@@ -84,6 +86,28 @@ def slot(kind='', slots=None, need=None):
             os.rmdir(d)
         except OSError:
             pass
+
+
+def run(cmd, env=None, need=None):
+    """cmd under a slot with the memory watchdog: (returncode, stdout, stderr)"""
+    while True:
+        with slot(need=need), tempfile.TemporaryFile('w+') as out, tempfile.TemporaryFile('w+') as err:
+            p = subprocess.Popen(cmd, stdout=out, stderr=err, text=True, env=env)
+            killed = False
+            while p.poll() is None:
+                if committed() > LIMIT - (1 << 30):
+                    p.kill()
+                    p.wait()
+                    killed = True
+                    break
+                time.sleep(2)
+            if not killed:
+                out.seek(0)
+                err.seek(0)
+                return p.returncode, out.read(), err.read()
+        print(f'[gpuslot] {os.path.basename(cmd[0])} {" ".join(cmd[1:3])}: stopped at the memory budget, again later',
+              flush=True)
+        time.sleep(60)
 
 
 if __name__ == '__main__':   # gpuslot.py [--kind K] [--need GB] -- command...

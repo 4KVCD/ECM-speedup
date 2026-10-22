@@ -10,7 +10,7 @@
 # the directory holds more than PIPECACHE_GB.
 import glob, os, subprocess, sys, time
 from concurrent.futures import ThreadPoolExecutor
-from gpuslot import slot   # (at most ECM_GPU_SLOTS decoders on the machine at a time)
+import gpuslot   # (the memory budget: at most ECM_GPU_SLOTS decoders, stopped and rerun past it)
 
 PIPECACHE_GB = 30
 
@@ -40,11 +40,10 @@ base = dict(os.environ, __GL_SHADER_DISK_CACHE_PATH=cache, __GL_SHADER_DISK_CACH
 def run(p):
     env = dict(base, ECM_GPU_PRECOMPILE=p)
     start = time.time()
-    with slot():
-        r = subprocess.run([f'C:/Code/ECM/bin/{build}/DecoderApp.exe', '-b', 'C:/Code/ECM/streams/ai_foreman.bin',
-                            '-o', '', '--GpuRecon=2'], capture_output=True, text=True, env=env)
-    times = [l for l in r.stderr.splitlines() if l.startswith('[gpu] pipeline intra_rec')]
-    return p, r.returncode, time.time() - start, times
+    rc, out, err = gpuslot.run([f'C:/Code/ECM/bin/{build}/DecoderApp.exe', '-b', 'C:/Code/ECM/streams/ai_foreman.bin',
+                                '-o', '', '--GpuRecon=2'], env)
+    times = [l for l in err.splitlines() if l.startswith('[gpu] pipeline intra_rec')]
+    return p, rc, time.time() - start, times
 
 
 start = time.time()
