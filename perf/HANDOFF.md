@@ -2012,6 +2012,15 @@ record (cpuChromaPending, cpuKnownRecord) to the CU's end: DecCu's intra case ca
 CU::saveModelsInHCCP, which makes it then. Results (Intel PC, build agst5, non-inlined SPIR-V): ai_nodualtree_q27,
 ra_nodualtree_q32 identical (were MISMATCH); ai_scc2_q32, ai_foreman352_q37, ra_foreman_q32 as before (same CPU CU
 reasons). Host only.
+IntraTMP's chroma in a single tree (2026-10-22, agent st): the rejection "IntraTMP's chroma (single tree)" (134 CUs
+on ai_nodualtree_q27 1, ra_nodualtree_q32 2, ai_scc2_q32 131) is gone: the CPU predicts such a CU's chroma as any
+chroma CU's (xIntraRecBlk: initIntraPatternChType, no IntraTMP step; its OBMC, LIC and sub-sample vectors are luma's;
+DM and the candidates' substitution read planar, getIntraDirLuma of an IntraTMP PU, which the CU's node publishes as
+its mode). What remains is the chroma mode: an IntraTMP luma CU makes DBV available (PU::dbvModeAvail) and 133 of the
+134 CUs take a DBV mode, now counted as "DBV" (4 -> 137 on those streams; BVG-CCCM, also offered by it, stays
+rejected as before); one CU (ra_nodualtree_q32) moved to the GPU. DBV (refineChromaBv's template refinement, IBC's
+fractional interpolation, RR-IBC flips) is the next step for these CUs. Results (build agst6): the 5 streams
+identical, the CPU CU reasons otherwise unchanged. Host only.
 
 
 ## 8. Numbers (i7-10700 8C/16T, Win11, GCC 16.2, RTX 3070 driver 616.92)

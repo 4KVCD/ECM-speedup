@@ -5022,11 +5022,14 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
   // transform skip with the regular residual coding is dequantized like a transform block (DepQuant::dequant)
   else if( ( tu.mtsIdx[compID] == MTS_SKIP || ( tu.jointCbCr && tu.mtsIdx[COMPONENT_Cr] == MTS_SKIP ) )
            && slice.getTSResidualCodingDisabledFlag() )             why = "transform skip with regular residual coding";
-  // IntraTMP: a luma block that is its CU, whose node searches its vectors (the rest of what it needs in addTmpRecord)
-  else if( cu.tmpFlag && ( !GPU_TMP || !isLuma( compID ) || !m.deriveModes || area != cu.blocks[COMPONENT_Y] ) )
+  // IntraTMP: a luma block that is its CU, whose node searches its vectors (the rest of what it needs in addTmpRecord).
+  // Its chroma (single tree) is a regular chroma CU's: the chroma modes see planar for its luma (getIntraDirLuma of
+  // an IntraTMP PU, the mode its node publishes), its OBMC and LIC are luma's, DBV and BVG-CCCM (which an IntraTMP luma
+  // CU allows) are rejected below
+  else if( cu.tmpFlag && isLuma( compID ) && ( !GPU_TMP || !m.deriveModes || area != cu.blocks[COMPONENT_Y] ) )
   {
-    why = !GPU_TMP ? "IntraTMP" : !isLuma( compID ) ? "IntraTMP's chroma (single tree)"
-          : !m.deriveModes ? "IntraTMP without the GPU's derivation" : "IntraTMP CU with several transform blocks";
+    why = !GPU_TMP ? "IntraTMP" : !m.deriveModes ? "IntraTMP without the GPU's derivation"
+          : "IntraTMP CU with several transform blocks";
   }
 #if JVET_AC0071_DBV
   else if( !isLuma( compID ) && PU::isDbvMode( dirMode ) )           why = "DBV";
