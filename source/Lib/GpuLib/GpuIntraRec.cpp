@@ -345,14 +345,21 @@ constexpr int CU_SGPM        = 15;  // luma: an SGPM CU (intra_sgpm.glsl): its n
                                     // reads its first mode)
 constexpr int CU_SGPM_MPM    = 16;  // luma: what the MPM lists read of an SGPM CU (getSpatialIpm: its partition's
                                     // angle), which that CU's node writes; derives nothing itself
+constexpr int CU_CHROMA_DBV  = 17;  // chroma: DBV of a single tree: its node DBV_MODE where the CU's luma (IntraTMP,
+                                    // BVG-DIMD, EIP with a vector) has a vector, else planar; its blocks the copy at it
+constexpr int DBV_MODE       = 74;  // intra_common.glsl's (DBV_CHROMA_IDX)
+#if JVET_AC0071_DBV
+static_assert( DBV_MODE == DBV_CHROMA_IDX, "intra_common.glsl's DBV_MODE" );
+#endif
 
 // a CU kind's name, for the verification's reports
 static const char* cuKindName( int kind )
 {
   static const char* const NAMES[] = { "known mode", "MPM", "chroma DM", "chroma candidate", "DIMD", "DIMD chroma",
                                        "OBIC", "intra merge", "TIMD", "TMRL", "chroma TMRL", "EIP",
-                                       "known mode (131)", "IntraTMP", "BVG-DIMD", "SGPM", "SGPM's MPM mode" };
-  return kind >= 0 && kind <= CU_SGPM_MPM ? NAMES[kind] : "?";
+                                       "known mode (131)", "IntraTMP", "BVG-DIMD", "SGPM", "SGPM's MPM mode",
+                                       "DBV chroma" };
+  return kind >= 0 && kind <= CU_CHROMA_DBV ? NAMES[kind] : "?";
 }
 
 // an EIP CU's record in Params::timdData (intra_common.glsl's EIP_HEAD_*; layout shared): its index (Params::eipOut),
@@ -4712,6 +4719,21 @@ static int32_t cuRecord( GpuIntraRec::Impl& m, const TransformUnit& tu, const Co
       m.cpuTmrl.push_back( pu.chromaMrlIdx );
       addDimdCalls( m, cu, chType, c );
     }
+#if JVET_AC0071_DBV
+    else if( m.deriveModes && PU::isDbvMode( pu.intraDir[CHANNEL_TYPE_CHROMA] ) )
+    {
+      // DBV of a single tree (record() takes no other): its node DBV_MODE where the CU's own luma, of a kind whose
+      // node publishes its vector, has one, else planar (getFinalIntraMode); it waits for all before it (the copy may
+      // read anything decoded before)
+      const int k = c.lumaCu >= 0 ? m.cus[c.lumaCu].kind : -1;
+      if( !( k == CU_TMP || k == CU_BVG || ( k == CU_EIP && m.cus[c.lumaCu].tmp >= 0 ) ) )
+      {
+        why = "DBV with a luma CU of another kind";
+        return -1;
+      }
+      c.kind = CU_CHROMA_DBV;
+    }
+#endif
     else if( m.deriveModes && ( pu.intraDir[CHANNEL_TYPE_CHROMA] == DIMD_CHROMA_IDX || ccpFusionDimd( pu ) )
              && !cu.bdpcmModeChroma )
     {
@@ -4771,6 +4793,7 @@ static int32_t cuRecord( GpuIntraRec::Impl& m, const TransformUnit& tu, const Co
     node.unitW     = cu.cs->pcv->minCUWidth >> ( noShift ? 0 : getComponentScaleX( ComponentID( node.comp ), cu.cs->sps->getChromaFormatIdc() ) );
     node.unitH     = cu.cs->pcv->minCUHeight >> ( noShift ? 0 : getComponentScaleY( ComponentID( node.comp ), cu.cs->sps->getChromaFormatIdc() ) );
     node.disableRefFilter = cu.cs->sps->getDisableRefFilter();
+    node.derive   |= c.kind == CU_CHROMA_DBV ? DERIVE_PREFIX : 0;
     c.node         = (int32_t) m.rec.size();
     if( m.partial )
     {
@@ -5334,6 +5357,12 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
 #endif
 #endif
 
+  // a DBV block (the parsed mode: getFinalIntraMode gives planar where the luma CU has no vector)
+#if JVET_AC0071_DBV
+  const bool dbv = !isLuma( compID ) && PU::isDbvMode( pu.intraDir[CHANNEL_TYPE_CHROMA] );
+#else
+  const bool dbv = false;
+#endif
   // what the GPU path does not do yet
   const char* why = nullptr;
   if( !CU::isIntra( cu ) )                                          why = "not intra";
@@ -5350,15 +5379,25 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
            && slice.getTSResidualCodingDisabledFlag() )             why = "transform skip with regular residual coding";
   // IntraTMP: a luma block that is its CU, whose node searches its vectors (the rest of what it needs in addTmpRecord).
   // Its chroma (single tree) is a regular chroma CU's: the chroma modes see planar for its luma (getIntraDirLuma of
-  // an IntraTMP PU, the mode its node publishes), its OBMC and LIC are luma's, DBV and BVG-CCCM (which an IntraTMP luma
-  // CU allows) are rejected below
+  // an IntraTMP PU, the mode its node publishes), its OBMC and LIC are luma's; DBV (below) copies at its vector,
+  // BVG-CCCM (which an IntraTMP luma CU allows too) is rejected below
   else if( cu.tmpFlag && isLuma( compID ) && ( !GPU_TMP || !m.deriveModes || area != cu.blocks[COMPONENT_Y] ) )
   {
     why = !GPU_TMP ? "IntraTMP" : !m.deriveModes ? "IntraTMP without the GPU's derivation"
           : "IntraTMP CU with several transform blocks";
   }
 #if JVET_AC0071_DBV
-  else if( !isLuma( compID ) && PU::isDbvMode( dirMode ) )           why = "DBV";
+  // DBV (JVET-AC0071, the parsed DBV_CHROMA_IDX): of a single tree (predIntraDbv's first branch) the copy at the vector
+  // of the CU's own luma (an IntraTMP, BVG-DIMD or EIP-with-vector CU, its node's: CU_CHROMA_DBV), planar where it has
+  // none; its CU one chroma block (predIntraDbv copies at the PU's position), 4:2:0, without LM chroma fusion
+  // (geneChromaFusionPred after it), IBC's LIC or an RR-IBC flip. A dual tree's (chroma reordering's list,
+  // deriveChromaBv's luma CUs, refineChromaBv's template matching, the flipped reconstruction) is not on the GPU yet
+  else if( dbv && ( CS::isDualITree( cs ) || ( cu.isSST && cu.separateTree ) ) ) why = "DBV (dual tree)";
+  else if( dbv && ( !GPU_TMP || !m.deriveModes ) )                  why = "DBV";
+  else if( dbv && ( cu.chromaFormat != CHROMA_420 || area != cu.blocks[compID] ) )
+    why = "DBV of a CU with several chroma blocks or not 4:2:0";
+  else if( dbv && ( pu.isChromaFusion || cu.rribcFlipType || cu.ibcLicFlag ) )
+    why = "DBV with LM chroma fusion, LIC or a flip";
 #endif
 #if JVET_AH0209_PDP
   // PDP: a PDP size's CU is one block
@@ -5488,7 +5527,8 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
   else if( !isLuma( compID ) && PU::isLMCMode( dirMode ) && ( sps.getBitDepth( CHANNEL_TYPE_LUMA ) > 12
                                                               || sps.getBitDepth( CHANNEL_TYPE_CHROMA ) != sps.getBitDepth( CHANNEL_TYPE_LUMA ) ) )
     why = "CCLM above 12 bits or with unequal bit depths";
-  else if( dirMode >= NUM_LUMA_MODE && !( ( cu.timd || cu.tmrlFlag ) && isLuma( compID ) ) && !( !isLuma( compID ) && PU::isLMCMode( dirMode ) ) )
+  else if( dirMode >= NUM_LUMA_MODE && !( ( cu.timd || cu.tmrlFlag ) && isLuma( compID ) ) && !( !isLuma( compID ) && PU::isLMCMode( dirMode ) )
+           && !dbv )
     why = "intra mode beyond 66 (NN / ...)";
   else if( sps.getUseLmcs() && !m.reshape )                         why = "LMCS without the decoder's reshaper";
   else if( sps.getScalingListFlag() )                               why = "scaling lists";
@@ -5541,6 +5581,13 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
   // MRL (luma): the reference line, the fusion line is the next one; xPredIntraAng turns the bilateral filter off
   // for it, the DC prediction (MRL excludes planar) keeps it
   t.mrl = ipa.multiRefIndex;
+  // DBV (its CU's node CU_CHROMA_DBV): no mode's parameters, those the GPU reports 0 (the CPU's snapshot is of the DBV
+  // index)
+  if( dbv && PU::isDbvMode( dirMode ) )
+  {
+    t.isModeVer = t.intraPredAngle = t.absInvAngle = t.angularScale = t.useCubic = 0;
+    t.refFilter = t.applyPDPC = t.gradPDPC = t.fusion = t.plIdx = t.mrl = 0;
+  }
   // CCLM: the block's mark, the slope adjustments of the component's two models (cclmOffsets) and LBCCP's inside filter;
   // CCCM: the mark, LBCCP's inside filter and the template selection
   t.lm       = 0;
@@ -7386,7 +7433,7 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
   for( const Cu& c: m.cus )
   {
     dimd = dimd || c.dimd >= 0 || c.obic >= 0 || c.merge >= 0 || c.mtss >= 0;
-    eip  = eip || c.eip >= 0 || c.tmp >= 0 || c.sgpm >= 0;
+    eip  = eip || c.eip >= 0 || c.tmp >= 0 || c.sgpm >= 0 || c.kind == CU_CHROMA_DBV;
   }
   for( const Tu& t: m.rec )
   {

@@ -115,6 +115,8 @@ int    g_secMode;
 // its CU's records keep apart
 int    g_bvSubs;
 bool   g_bvTransform;
+// a DBV block (a CU_CHROMA_DBV CU's of DBV_MODE): its prediction the copy at the co-located luma CU's vector
+bool   g_dbv;
 // blending (a DERIVE_DIMD block whose CU's DIMD blends, a DERIVE_OBIC or DERIVE_MERGE block): the predictions of the
 // CU's modes (s_blendMode: DIMD's or the intra merge candidate's main mode, planar and blend modes, OBIC's modes) are
 // summed per location dependence class (emitPred), weighted, in the workgroup's BLEND_ACC sums at the start of the
@@ -724,6 +726,19 @@ ivec2 wgSum2( int a, int b, int slot )
 
 #include "intra_bv.glsl"
 #include "intra_ibc.glsl"
+
+// DBV: the block vector of luma CU n as its node published it (PU::mv[0] in 1/16 samples, PU::bv): an IntraTMP CU's
+// (DIMD_OUT_TMP_MV, DIMD_OUT_BV), an EIP CU's with a vector (DIMD_OUT_BV, mv[0] its x 16), a BVG-DIMD CU's first of
+// its vectors (bvDimdList[0], x 16; 0 without vectors)
+ivec4 dbvLumaVector( int n )
+{
+  CBufI32     o    = CBufI32( P.dimdOut );
+  const int   at   = n * DIMD_OUT, kind = BufCu( P.cus ).v[n].kind;
+  const bool  none = kind == CU_BVG && o.v[at + DIMD_OUT_BVG_NUM] <= 0;
+  const ivec2 bv   = none ? ivec2( 0 ) : bvUnpack( o.v[at + ( kind == CU_BVG ? DIMD_OUT_BVG_BV : DIMD_OUT_BV )] );
+  const ivec2 mv   = kind == CU_TMP ? ivec2( o.v[at + DIMD_OUT_TMP_MV], o.v[at + DIMD_OUT_TMP_MV + 1] ) : bv << 4;
+  return ivec4( mv, bv );
+}
 #include "intra_timd.glsl"
 #include "intra_merge.glsl"
 
@@ -1514,6 +1529,7 @@ void main()
     g_bvSubs     = 0;
     g_bvTransform = false;
     g_sgpmBlend   = false;
+    g_dbv        = false;
     // the dependents, prefetched (their release ends the block)
     const int d0 = BufI32( P.depOffset ).v[g_ti], d1 = BufI32( P.depOffset ).v[g_ti + 1];
     if( lid < d1 - d0 )
@@ -1658,6 +1674,10 @@ void main()
       else if( WITH_MPM && c.kind == CU_BVG )   // intra_bvg.glsl, from the vectors of the search (above)
       {
         cuMode = bvgNode( c, t.cu, mtssSecond, lid, NT );
+      }
+      else if( WITH_MPM && c.kind == CU_CHROMA_DBV )   // DBV, but planar where the luma CU has no vector
+      {
+        cuMode = dbvLumaVector( c.lumaCu ).zw != ivec2( 0 ) ? DBV_MODE : PLANAR_IDX;
       }
       else if( lid == 0 && c.kind != CU_KNOWN )
       {
@@ -1821,6 +1841,14 @@ void main()
       else if( WITH_TMRL && ( t.derive & DERIVE_TMRL ) != 0 )   // its node's mode and line (intra_tmrl.glsl)
       {
         tmrlBlockParams( t );
+      }
+      else if( WITH_MPM && s_mode == DBV_MODE )   // DBV: none of a mode's parameters (verification: 0)
+      {
+        t.dirMode   = DBV_MODE;
+        t.isModeVer = t.intraPredAngle = t.absInvAngle = t.angularScale = t.useCubic = 0;
+        t.refFilter = t.applyPDPC = t.gradPDPC = t.fusion = t.bf = t.plIdx = t.mrl = 0;
+        t.pdp       = -1;
+        g_dbv       = true;
       }
       else
       {
@@ -2124,7 +2152,21 @@ void main()
       const bool pdpSub   = t.pdp >= 0 && ( !blend || sub == 0 || blendPdp );
       const int  pdpFilt = pdpSub && t.mipMatrix < 0 ? pdpFilters( t, t.dirMode ) : -1;
       const int  bvSub   = blend ? sub : 0;   // (a prediction from a block vector: predUsingBv's copy)
-      if( ( ( g_bvSubs >> bvSub ) & 1 ) != 0 )
+      if( WITH_MPM && g_dbv )
+      {
+        // DBV of a single tree (predIntraDbv, refineChromaBv): the luma CU's mv[0] where its integer chroma part is a
+        // valid vector for the CU's Cb block (checkIsChromaBvCandidateValid), else its bv, the CU's chroma at it
+        const Cu    c   = BufCu( P.cus ).v[t.cu];
+        const ivec4 v   = dbvLumaVector( c.lumaCu );
+        const ivec2 mv  = ibcChromaValid( t.comp, c.x, c.y, c.w, c.h, v.xy, 0, 0, g_ti ) ? v.xy : v.zw << 4;
+        for( int i = lid; i < N; i += NT )
+        {
+          emitPred( t, i % W, i / W,
+                    ibcChromaPredict( t.comp, c.x, c.y, c.w, c.h, mv, t.x - c.x + i % W, t.y - c.y + i / W, g_ti,
+                                      t.bitDepth ), false );
+        }
+      }
+      else if( ( ( g_bvSubs >> bvSub ) & 1 ) != 0 )
       {
         const bool  fused = WITH_MPM && ( t.derive & DERIVE_BVG ) != 0;   // (BVG-DIMD: its vectors' fusion)
         const ivec2 mv    = fused ? ivec2( 0 ) : mvOfSub( t, bvSub );

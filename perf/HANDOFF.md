@@ -2076,6 +2076,28 @@ MIP blocks with LFNST / NSPT (DERIVE_MIP_DIMD) lie after that difference, so a t
 CU from the CPU checked them: all 8 identical (prediction, residual, derived transforms); ra_nodualtree_q32 then
 identical, ai_nodualtree_q27 differed at the chroma block of one of them, a CCP merge block (its model's type), the
 kind of block the known single-tree difference starts at - open.
+M85 (2026-10-22, agent st): DBV of a single tree (JVET-AC0071's DBV_CHROMA_IDX in a CU whose own luma has a block vector):
+IntraPrediction::predIntraDbv's first branch. refineChromaBv takes the luma PU's mv[0] where its integer chroma part
+is a valid vector for the CU's Cb block (checkIsChromaBvCandidateValid: checkValidBv without the fraction, PU::searchBv
+on the chroma decoded map), else bv x 16; the chroma block is then the copy at it or, with the SPS's IBCFrac and a
+fraction of 1/32, getPredIBCBlk's chroma interpolation (m_chromaFilter, 6 taps, one pass or two through the 14-bit
+intermediate, xPredIBCBlkPadding where checkValidBv with the taps' reach - 6 x 2 luma samples - says
+IBC_INT_BV_VALID); getFinalIntraMode makes it planar where bv is 0. GPU: a chroma CU kind CU_CHROMA_DBV (17) whose
+node (DERIVE_PREFIX: the copy may read anything decoded before) publishes DBV_MODE (74, DBV_CHROMA_IDX) or planar from
+the luma CU's vector as its node wrote it (dbvLumaVector: an IntraTMP CU's DIMD_OUT_TMP_MV / DIMD_OUT_BV, an EIP CU's
+with a vector DIMD_OUT_BV, a BVG-DIMD CU's first DIMD_OUT_BVG_BV; mv[0] their x 16 but IntraTMP's); its blocks with
+DBV_MODE take no mode parameters (0, also in the host's record for the comparison) and predict with ibcChromaValid /
+ibcChromaPredict (intra_ibc.glsl; IbcRef has a component now, ibcRef pads in that component's owner map). Host:
+record()'s "DBV" became "DBV (dual tree)" plus the narrower single-tree rules (one chroma block per CU - predIntraDbv
+copies at the PU's position -, 4:2:0, no LM chroma fusion, IBC LIC or RR-IBC flip, a luma CU of those kinds). Results
+(Intel PC, build agst9, non-inlined SPIR-V, the 50 streams of C:/Code/ECM/streams, partial.py -j 1): every stream
+identical; intra CUs from the CPU 2453 -> 2317 against gpu5 ("IntraTMP's chroma (single tree)" 134 -> 0, "DBV" 30 ->
+"DBV (dual tree)" 28). The 270 DBV blocks of the three single-tree streams (debug count): 266 integer copies, 4 with a
+fraction (interpolated, none padded), all at mv[0], luma IntraTMP (266) and BVG-DIMD (4); no stream has bv 0 (planar),
+an invalid mv[0], padding or an EIP luma CU. Open: the dual tree's DBV (deriveChromaBv's luma CUs at 5 positions with
+adjustChromaBv, chroma reordering's choice among them - which partial verification would take from the CPU as it takes
+the reordered modes -, refineChromaBv's template matching over mv[0] +- one luma sample - SAD, SATD for blocks of at
+least 4 x 4, on one-row templates - with RR-IBC flips, the flipped reconstruction).
 
 
 ## 8. Numbers (i7-10700 8C/16T, Win11, GCC 16.2, RTX 3070 driver 616.92)

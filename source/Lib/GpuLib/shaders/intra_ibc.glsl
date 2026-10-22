@@ -59,6 +59,7 @@ struct IbcRef
   int  ox, oy, w, h, xTap, yTap;
   bool pad;
   int  before, dx, dy;
+  int  comp;   // (the component; DBV's chroma: ibcChromaPredict)
 };
 
 // reference sample (x, y) of g (relative to its top-left), padded as xPredIBCBlkPadding pads: first per row of the
@@ -66,9 +67,10 @@ struct IbcRef
 // then per column the rows above / below it take the one nearer the region where their unit is not decoded
 int ibcRef( IbcRef g, int x, int y )
 {
+  const int ch = g.comp == 0 ? 0 : 1;
   if( g.pad )
   {
-    OwnerMap  om = OwnerMap( BufI32( P.owner[0] ), P.ownerW[0], P.ownerH[0], P.unitLog2X[0], P.unitLog2Y[0] );
+    OwnerMap  om = OwnerMap( BufI32( P.owner[g.comp] ), P.ownerW[ch], P.ownerH[ch], P.unitLog2X[ch], P.unitLog2Y[ch] );
     const int L  = om.log2X, U = 1 << L;
     const int rx = g.ox + g.dx, ry = g.oy + g.dy;   // (the padding's region; x, y relative to it from here)
     x -= g.dx;
@@ -104,9 +106,9 @@ int ibcRef( IbcRef g, int x, int y )
         }
       }
     }
-    return recoAt( 0, rx + x, ry + y );
+    return recoAt( g.comp, rx + x, ry + y );
   }
-  return recoAt( 0, g.ox + x, g.oy + y );
+  return recoAt( g.comp, g.ox + x, g.oy + y );
 }
 
 // sample (i, j) of the prediction of the region of w x h at (px, py) at vector mv (1/16 samples) with the luma filter
@@ -127,6 +129,7 @@ int ibcPredict( int px, int py, int w, int h, ivec2 mv, bool bilinear, int i, in
   g.before = before;
   g.dx     = delta.x;
   g.dy     = delta.y;
+  g.comp   = 0;
   g.pad    = ( fx != 0 || fy != 0 )
            && !ibcAreaValid( px, py, w, h, ivec2( g.ox - px, g.oy - py ), g.xTap, g.yTap, before );
   // per row of the filter's reach down (one without yTap) the horizontal pass (the sample without xTap), then the
@@ -159,6 +162,104 @@ int ibcPredict( int px, int py, int w, int h, ivec2 mv, bool bilinear, int i, in
     return sum;
   }
   return clamp( both ? ( sum + ( 1 << ( sh2 - 1 ) ) + ( 8192 << 8 ) ) >> sh2 : ( sum + 128 ) >> 8, 0, maxPel );
+}
+
+// ----- DBV's chroma (IntraPrediction::predIntraDbv of a single tree: getPredIBCBlk of a chroma component, 4:2:0)
+
+// m_chromaFilter (6 taps, x 4: IF_FILTER_PREC 8) per fraction of 1/32
+const int IBC_CHROMA_FILTER[32 * 6] = int[32 * 6](
+    0,   0, 256,   0,   0,   0,      1,  -6, 256,   7,  -2,   0,
+    2, -11, 253,  15,  -4,   1,      3, -16, 251,  23,  -6,   1,
+    4, -21, 248,  33, -10,   2,      5, -25, 244,  42, -12,   2,
+    7, -30, 239,  53, -17,   4,      7, -32, 234,  62, -19,   4,
+    8, -35, 227,  73, -22,   5,      9, -38, 220,  84, -26,   7,
+   10, -40, 213,  95, -29,   7,     10, -41, 204, 106, -31,   8,
+   10, -42, 196, 117, -34,   9,     10, -41, 187, 127, -35,   8,
+   11, -42, 177, 138, -38,  10,     10, -41, 168, 148, -39,  10,
+   10, -40, 158, 158, -40,  10,     10, -39, 148, 168, -41,  10,
+   10, -38, 138, 177, -42,  11,      8, -35, 127, 187, -41,  10,
+    9, -34, 117, 196, -42,  10,      8, -31, 106, 204, -41,  10,
+    7, -29,  95, 213, -40,  10,      7, -26,  84, 220, -38,   9,
+    5, -22,  73, 227, -35,   8,      4, -19,  62, 234, -32,   7,
+    4, -17,  53, 239, -30,   7,      2, -12,  42, 244, -25,   5,
+    2, -10,  33, 248, -21,   4,      1,  -6,  23, 251, -16,   3,
+    1,  -4,  15, 253, -11,   2,      0,  -2,   7, 256,  -6,   1 );
+
+// PU::searchBv of chroma component comp (checkValidBv's form, in luma samples: the region of w x h at chroma (px, py)
+// and the integer part of vector mv (1/16 luma samples, 1/32 chroma) x 2, its last column / row one luma sample
+// short; with the SPS's fractional IBC xTap / yTap luma taps of reach): inside the picture, not right of and below the
+// region's position at once, not below its CTU row nor right of its CTU in that row, its corners (in chroma samples)
+// decoded for block `before`
+bool ibcChromaValid( int comp, int px, int py, int w, int h, ivec2 mv, int xTap, int yTap, int before )
+{
+  OwnerMap  om = OwnerMap( BufI32( P.owner[comp] ), P.ownerW[1], P.ownerH[1], P.unitLog2X[1], P.unitLog2Y[1] );
+  const int s  = findLSB( P.ctuSize );
+  const int x0 = px << 1, y0 = py << 1;
+  int       l  = x0 + ( ( mv.x >> 5 ) << 1 ), t = y0 + ( ( mv.y >> 5 ) << 1 );
+  int       r  = l + ( w << 1 ) - 2, d = t + ( h << 1 ) - 2;
+  if( P.ibcFrac != 0 && xTap > 0 )
+  {
+    l -= ( xTap >> 1 ) - 2;
+    r += xTap >> 1;
+  }
+  if( P.ibcFrac != 0 && yTap > 0 )
+  {
+    t -= ( yTap >> 1 ) - 2;
+    d += yTap >> 1;
+  }
+  return l >= 0 && r < P.width[0] && t >= 0 && d < P.height[0] && !( r >= x0 && d >= y0 )
+         && ( d >> s ) <= ( y0 >> s ) && !( ( t >> s ) == ( y0 >> s ) && ( r >> s ) > ( x0 >> s ) )
+         && decodedBefore( om, r >> 1, d >> 1, before ) && decodedBefore( om, l >> 1, t >> 1, before );
+}
+
+// sample (i, j) of the chroma prediction of the region of w x h at (px, py) of component comp at vector mv (1/16 luma
+// samples) for block `before` (xPredInterBlk with isIBC: without the SPS's fractional IBC, or at an integer chroma
+// vector, the copy at the integer part; else m_chromaFilter in one pass rounded to the sample or in two through the
+// 14-bit intermediate, padded as xPredIBCBlkPadding pads where checkValidBv's reach - 6 chroma taps - is not all
+// decoded: IBC_INT_BV_VALID)
+int ibcChromaPredict( int comp, int px, int py, int w, int h, ivec2 mv, int i, int j, int before, int bitDepth )
+{
+  IbcRef    g;
+  const int fx = P.ibcFrac != 0 ? mv.x & 31 : 0, fy = P.ibcFrac != 0 ? mv.y & 31 : 0;
+  const int taps = 6, lead = 2;
+  g.ox     = px + ( mv.x >> 5 );
+  g.oy     = py + ( mv.y >> 5 );
+  g.w      = w;
+  g.h      = h;
+  g.xTap   = fx != 0 ? taps : 0;
+  g.yTap   = fy != 0 ? taps : 0;
+  g.before = before;
+  g.dx     = 0;
+  g.dy     = 0;
+  g.comp   = comp;
+  g.pad    = ( fx != 0 || fy != 0 ) && !ibcChromaValid( comp, px, py, w, h, mv, fx != 0 ? 2 * taps : 0,
+                                                       fy != 0 ? 2 * taps : 0, before );
+  const bool both     = fx != 0 && fy != 0;
+  const int  headRoom = max( 2, 14 - bitDepth ), sh1 = 8 - headRoom, sh2 = 8 + headRoom;
+  const int  nx = fx != 0 ? taps : 1, ny = fy != 0 ? taps : 1;
+  int        sum = 0, row = 0;
+  for( int n = 0; n < nx * ny; n++ )
+  {
+    const int k = n / nx, m = n % nx;
+    const int v = ibcRef( g, fx != 0 ? i - lead + m : i, fy != 0 ? j - lead + k : j )
+                  * ( fx != 0 ? IBC_CHROMA_FILTER[fx * 6 + m] : 1 );
+    if( !both )
+    {
+      sum += v * ( fy != 0 ? IBC_CHROMA_FILTER[fy * 6 + k] : 1 );
+      continue;
+    }
+    row = m == 0 ? v : row + v;
+    if( m == nx - 1 )
+    {
+      sum += IBC_CHROMA_FILTER[fy * 6 + k] * ( ( row - ( 8192 << sh1 ) ) >> sh1 );
+    }
+  }
+  if( fx == 0 && fy == 0 )
+  {
+    return sum;
+  }
+  return clamp( both ? ( sum + ( 1 << ( sh2 - 1 ) ) + ( 8192 << 8 ) ) >> sh2 : ( sum + 128 ) >> 8, 0,
+                ( 1 << bitDepth ) - 1 );
 }
 
 #endif

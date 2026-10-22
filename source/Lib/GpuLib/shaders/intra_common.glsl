@@ -346,6 +346,10 @@ const int CU_SGPM        = 15;  // luma: an SGPM CU (intra_sgpm.glsl): its node 
                                 // first mode)
 const int CU_SGPM_MPM    = 16;  // luma: what the MPM lists read of an SGPM CU (getSpatialIpm: its partition's angle),
                                 // which that CU's node writes; derives nothing itself
+const int CU_CHROMA_DBV  = 17;  // chroma: DBV of a single tree (DBV_CHROMA_IDX parsed): its node DBV_MODE where the
+                                // co-located luma CU (IntraTMP, BVG-DIMD, EIP with a vector) has a block vector, else
+                                // planar (getFinalIntraMode); its blocks copy at the vector (ibcChromaPredict)
+const int DBV_MODE       = 74;  // DBV_CHROMA_IDX (NUM_INTRA_MODE + 1)
 
 // a TMRL CU's choice as its node derives it (TMRL_OUT int32 per TMRL CU in Params::tmrlOut): the mode (131-mode set)
 // and the reference line (multiRefIdx) of m_tmrlList[tmrlListIdx], which its blocks predict with
