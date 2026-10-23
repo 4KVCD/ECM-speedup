@@ -2532,6 +2532,12 @@ intra picture by an NN CU of an SPS without DIMD (befb9754e, next paragraph); wi
 --GpuRecon=3) the 15 streams that had a GPU picture identical: ld_foreman_q32, ldp_foreman_q32, ldp_wp_q32,
 ld_parkjoy_q27, ra_10bit_q32, ra_dbkparams_q32, ra_internal8_q32, ra_nodbk_q32, ra_nolmcs_q32, ra_nosao_q32,
 ra_off3_q32, ra_off5_q32, ra_long_q32 (3 GPU pictures), ai_crowdrun_q42, ai_fast_q32.
+ON mode without supported()'s BVG-DIMD gate (2026-10-22, agent st): the sequence-level rejection of BVG-DIMD is gone;
+BVG-DIMD CUs (CU_BVG since M65) and the BVG-CCCM blocks record() rejects ("BVG-CCCM") are the GPU's per CU, what the GPU
+lacks rejected by record() (the picture the CPU's, through 44e11ef88's fallback; its side information through
+7882788d3). Results (Intel PC, agst46, --GpuRecon=3 against the build's CPU decode, the 50 streams): 50 of 50 identical;
+intra pictures on the GPU 0 -> 0 of 331 pictures; the CPU's intra pictures by their first reason: MDIP / MPM sorting 51;
+IntraTMP / IBC 3; wavefronts 1.
 
 
 ## 8. Numbers (i7-10700 8C/16T, Win11, GCC 16.2, RTX 3070 driver 616.92)
