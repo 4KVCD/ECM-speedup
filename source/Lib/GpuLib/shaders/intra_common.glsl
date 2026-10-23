@@ -163,7 +163,7 @@ const int CCP_OUT_PARAMS = 26, CCP_OUT_PARAMS2 = CCP_OUT_PARAMS + 4 * CCP_MAX_PA
 const int CCP_OUT = CCP_OUT_PARAMS2 + 4 * CCP_MAX_PARAMS;
 // CCPType
 const int CCP_TYPE_CCLM = 1, CCP_TYPE_MMLM = 2, CCP_TYPE_GLM0123 = 4, CCP_TYPE_GLM4567 = 8, CCP_TYPE_CCCM = 16;
-const int CCP_TYPE_GLCCCM = 32, CCP_TYPE_NSCCCM = 64, CCP_TYPE_MDFCCCM = 128;
+const int CCP_TYPE_GLCCCM = 32, CCP_TYPE_NSCCCM = 64, CCP_TYPE_MDFCCCM = 128, CCP_TYPE_INTER_CCCM = 256;
 // Params::ccpData (int32; layout shared with GpuIntraRec.cpp): from 0 per CCP record its blocks (CCP_WRITERS each: the
 // Cb block's, then the Cr block's index; -1: none), which intra_deps makes a merge block wait for; a CCP merge CU's
 // entry at Tu::ccpMerge: where its CTU row's history begins in ccpData (the records CU::saveModelsInHCCP pushed into
@@ -272,6 +272,8 @@ const int DERIVE_IBC   = 1073741824;   // with DERIVE_INTER: an IBC CU's block, 
 // part's weights (their offset, else -1), with IBC LIC its ibcLicIdx + 1 (else 0)
 const int IBC_REC_X = 0, IBC_REC_Y = 1, IBC_REC_W = 2, IBC_REC_H = 3, IBC_REC_MV = 4, IBC_REC_FLIP = 6;
 const int IBC_REC_MV2 = 7, IBC_REC_WEIGHTS = 9, IBC_REC_LIC = 10;
+// with DERIVE_INTER a chroma block of inter CCCM (intra_intercccm.glsl; its record at Tu::ibc)
+const int DERIVE_INTER_CCCM = int( 0x80000000 );
 // Tu::lmcs (1: the bilateral filter on inverse-mapped samples, 2: chroma residual scaling): an inter block's
 // prediction forward-mapped (luma)
 const int LMCS_INTER_FWD = 4;

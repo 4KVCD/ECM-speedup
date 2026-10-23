@@ -188,6 +188,13 @@ constexpr int DERIVE_IBC          = 1073741824; // with DERIVE_INTER an IBC CU's
 // ibcLicIdx + 1 (else 0)
 constexpr int IBC_REC_X = 0, IBC_REC_Y = 1, IBC_REC_W = 2, IBC_REC_H = 3, IBC_REC_MV = 4, IBC_REC_FLIP = 6;
 constexpr int IBC_REC_MV2 = 7, IBC_REC_WEIGHTS = 9, IBC_REC_LIC = 10, IBC_REC = 11;
+// with DERIVE_INTER a chroma block of inter CCCM (JVET-AE0059): its prediction blended with the CCCM one of a model its
+// TU's luma and chroma predictions fit (intra_intercccm.glsl); its record in Params::timdData at Tu::ibc: the luma
+// block's position and size, its prediction's offset in Params::interPred, whether that is forward-mapped by LMCS, the
+// SPS's collocated chroma (CclmCollocatedChromaFlag: five luma taps, else six)
+constexpr int DERIVE_INTER_CCCM = INT32_MIN;
+constexpr int ICCCM_REC_X = 0, ICCCM_REC_Y = 1, ICCCM_REC_W = 2, ICCCM_REC_H = 3, ICCCM_REC_PRED = 4,
+              ICCCM_REC_FWD = 5, ICCCM_REC_COLLOC = 6, ICCCM_REC = 7;
 
 // Tu::lm (intra_common.glsl's LM_*): whether the block is a CCLM block (the modes from 67 on are also those of TIMD /
 // TMRL luma blocks), its slope adjustments (+ 8, in 4 bits each) and LBCCP's inside filter; with DERIVE_CCLM_DIMD the
@@ -2229,6 +2236,7 @@ struct GpuIntraRec::Impl
   int                                                          ibcCus = 0;   // IBC CUs the GPU predicts
   int                                                          ibcGpmCus = 0;   // ... of them IBC GPM CUs
   std::unordered_map<const CodingUnit*, std::pair<Mv, Mv>>     ibcGpmMvs;   // IBC GPM CUs' parts' vectors (DecCu)
+  std::unordered_map<const TransformUnit*, std::vector<Pel>>   interCccmPreds;   // inter CCCM TUs' Cb, Cr predictions
   int                                                          pltCus = 0;   // palette CUs the GPU writes
   std::vector<int16_t>                                         interPred;
   // motion compensation on the GPU (inter_mc.comp): the inter CUs whose prediction it makes, their blocks' jobs
@@ -2536,6 +2544,7 @@ void GpuIntraRec::beginPicture( const CodingStructure& cs )
   m.cuTus.clear();
   m.cpuCus.clear();
   m.ibcGpmMvs.clear();
+  m.interCccmPreds.clear();
   m.cpuDummyCu = -1;
   m.mpmModeCus.clear();
   m.bvLists.clear();
@@ -5716,6 +5725,19 @@ static void ccpMergeSources( GpuIntraRec::Impl& m, const PredictionUnit& pu, std
 #endif
 }
 
+// whether CCP merge PU pu adjusts its model (JVET-AL0126) or fuses a pair (JVET-AG0154's merge fusion)
+static bool ccpMergeAdjustOrDd( const PredictionUnit& pu )
+{
+  bool r = false;
+#if JVET_AL0126_CCP_MERGE_WITH_ADJUST
+  r = r || pu.ccpMergeAdjustFlag;
+#endif
+#if JVET_AG0154_DECODER_DERIVED_CCP_FUSION
+  r = r || pu.ddNonLocalCCPFusion > 0;
+#endif
+  return r;
+}
+
 // partial verification: whether CCP merge PU pu has a candidate of inter CCCM (CCP_TYPE_INTER_CCCM, JVET-AE0059: an
 // inter CU's TU model, a temporal one) among its sources or its CTU row's history so far, a model kind the GPU lacks
 static bool ccpMergeInterCccm( GpuIntraRec::Impl& m, const PredictionUnit& pu )
@@ -6168,8 +6190,10 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
     why = "decoder-derived CCP merge fusion without the regression blend";
 #endif
   else if( !isLuma( compID ) && pu.idxNonLocalCCP && !GPU_CCCM )    why = "CCP merge of another configuration";
-  else if( !isLuma( compID ) && pu.idxNonLocalCCP && ccpMergeInterCccm( m, pu ) )
-    why = "CCP merge with an inter CCCM candidate";
+  // (an inter CCCM candidate predicts as intra_cccm.glsl's g_cccmInterNs; not with adjustment or decoder-derived
+  // fusion, whose own steps take its parameters)
+  else if( !isLuma( compID ) && pu.idxNonLocalCCP && ccpMergeAdjustOrDd( pu ) && ccpMergeInterCccm( m, pu ) )
+    why = "CCP merge adjustment or decoder-derived fusion with an inter CCCM candidate";
 #endif
 #if JVET_AG0154_DECODER_DERIVED_CCP_FUSION
   // decoder-derived CCP fusion (JVET-AG0154: of a CCLM model and CCCM models fitted to the template the one of the
@@ -7236,6 +7260,80 @@ static void pltRecord( GpuIntraRec::Impl& m, const CodingUnit& cu, const Compone
   }
 }
 
+// ----- inter CCCM (JVET-AE0059, partial verification): a TU's chroma prediction blended 3 : 1 with a CCCM prediction
+// from its luma reconstruction, of a model of 8 parameters fitted to its luma and chroma predictions
+// (InterPrediction::deriveInterCccmPrediction), in intra_rec (intra_intercccm.glsl)
+
+// why TU tu's inter CCCM is the CPU's, nullptr where the GPU does it
+static const char* interCccmWhy( const CodingUnit& cu, const TransformUnit& tu )
+{
+  if( cu.chromaFormat != CHROMA_420 )
+  {
+    return "inter CCCM of another chroma format";
+  }
+  if( CU::isIBC( cu ) )   // (its blocks' prediction the GPU's: intra_rec's IBC branch)
+  {
+    return "inter CCCM of an IBC CU";
+  }
+#if JVET_AL0181_ASBT
+  if( tu.asbtDecimW[COMPONENT_Y] || tu.asbtDecimH[COMPONENT_Y] )   // (its luma prediction in several records)
+  {
+    return "inter CCCM with ASBT";
+  }
+#endif
+  return nullptr;
+}
+
+// chroma block compID of inter CCCM TU tu, recorded by recordInterBlock (the last record): its inter prediction before
+// the blend (DecCu's, interCccmPred: the CPU's buffer then holds the blend, which verification compares), the record of
+// the TU's luma block; it waits for every block before it (DERIVE_PREFIX: the luma reconstruction it reads)
+static void interCccmRecord( GpuIntraRec::Impl& m, const TransformUnit& tu, const ComponentID compID )
+{
+  Tu&             t    = m.rec.back();
+  const CompArea& area = tu.blocks[compID];
+  const auto      pred = m.interCccmPreds.find( &tu );
+  CHECK( pred == m.interCccmPreds.end(), "an inter CCCM TU without its prediction" );
+  const size_t first = compID == COMPONENT_Cb ? 0 : tu.blocks[COMPONENT_Cb].area();
+  std::copy_n( pred->second.begin() + first, area.area(), m.interPred.begin() + t.dbgOffset );
+  const Tu* luma = nullptr;   // (the TU's luma record, before its chroma ones)
+  for( size_t r = m.rec.size() - 1; r-- > 0 && !luma; )
+  {
+    const Tu& l = m.rec[r];
+    luma = l.comp == COMPONENT_Y && l.x == tu.blocks[COMPONENT_Y].x && l.y == tu.blocks[COMPONENT_Y].y ? &l : nullptr;
+  }
+  CHECK( !luma || luma->w != (int) tu.blocks[COMPONENT_Y].width || luma->h != (int) tu.blocks[COMPONENT_Y].height,
+         "an inter CCCM TU without its luma record" );
+  t.derive |= DERIVE_INTER_CCCM | DERIVE_PREFIX;
+  t.ibc = (int32_t) m.timdData.size();
+#if JVET_AN0090_ADAPTIVE_SUBSAMPLING_FILTER_SELECTION
+  const bool colloc = tu.cs->sps->getCclmVerCollocatedChromaFlag();
+#else
+  const bool colloc = tu.cs->sps->getCclmCollocatedChromaFlag();
+#endif
+  const int32_t rec[ICCCM_REC] = { luma->x, luma->y, luma->w, luma->h, luma->dbgOffset,
+                                   ( luma->lmcs & LMCS_INTER_FWD ) ? 1 : 0, colloc ? 1 : 0 };
+  m.timdData.insert( m.timdData.end(), rec, rec + ICCCM_REC );
+}
+
+void GpuIntraRec::interCccmPred( const TransformUnit& tu )
+{
+  Impl& m = *m_impl;
+  if( !m.interPending.count( tu.cu ) )
+  {
+    return;
+  }
+  std::vector<Pel>& p = m.interCccmPreds[&tu];
+  p.clear();
+  for( const ComponentID c: { COMPONENT_Cb, COMPONENT_Cr } )
+  {
+    const CPelBuf b = tu.cs->getPredBuf( tu.blocks[c] );
+    for( int y = 0; y < (int) b.height; y++ )
+    {
+      p.insert( p.end(), b.bufAt( 0, y ), b.bufAt( 0, y ) + b.width );
+    }
+  }
+}
+
 // why non-intra CU cu is taken from the CPU, nullptr for an inter CU whose blocks the GPU reconstructs: what the GPU
 // lacks of its residual (inter CCCM and CCP merge, which replace its chroma prediction; ASBT; LFNST / NSPT where
 // their mode's DIMD is not of one block's prediction)
@@ -7290,9 +7388,9 @@ static const char* interWhy( const GpuIntraRec::Impl& m, const CodingUnit& cu )
   for( const TransformUnit& tu: CU::traverseTUs( cu ) )
   {
 #if JVET_AE0059_INTER_CCCM
-    if( tu.interCccm )
+    if( tu.interCccm && interCccmWhy( cu, tu ) )
     {
-      return "inter CCCM";
+      return interCccmWhy( cu, tu );
     }
 #endif
 #if JVET_AF0073_INTER_CCP_MERGE
@@ -8343,6 +8441,12 @@ void GpuIntraRec::recordInterCu( const CodingUnit& cu )
       {
         pltRecord( m, cu, comp );
       }
+#if JVET_AE0059_INTER_CCCM
+      if( tu.interCccm && isChroma( comp ) && !m.cpuCus.count( &cu ) )
+      {
+        interCccmRecord( m, tu, comp );
+      }
+#endif
     }
   }
   if( m.obmcRec >= 0 && !m.cpuCus.count( &cu ) )   // (OBMC: its segments' jobs, after its blocks')
@@ -9769,6 +9873,7 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
     derivedTransforms = derivedTransforms || ( t.derive & ( DERIVE_TRANSFORM | DERIVE_PNN_DIMD ) );
     cclm              = cclm || ( t.lm & LM_ACTIVE );
     cccm              = cccm || ( ( t.lm >> LM_CCCM_SHIFT ) & 3 );   // (LM chroma fusion's first type too)
+    cccm              = cccm || ( t.derive & DERIVE_INTER_CCCM );   // (intra_intercccm.glsl's solve)
     cflm              = cflm || lmFusionType( t ) > 1;
     ccpMerge          = ccpMerge || t.ccpMerge >= 0;
   }

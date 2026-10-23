@@ -122,6 +122,8 @@ public:
   /// inter CU cu of multi-pass DMVR (bdmvrRefine), which the CPU has predicted: DMVR's refined vectors per 16 x 16
   /// sub-PU (InterPrediction's m_bdmvrSubPuMvBuf, stride DMVR_SUBPU_STRIDE), recordInterCu's
   void dmvrVectors( const CodingUnit& cu, const Mv* list0, const Mv* list1 );
+  /// TU tu of an inter CCCM CU, before DecCu blends its chroma prediction (deriveInterCccmPrediction): the inter one
+  void interCccmPred( const TransformUnit& tu );
   /// chroma reordering (JVET-AH0136): the index of PU pu's chroma mode in its reordered list as DecCu parsed it
   /// (chromaIdx), which the GPU's derivation of the list takes
   void chromaReorderIndex( const PredictionUnit& pu, int idx );

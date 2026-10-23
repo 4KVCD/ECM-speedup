@@ -119,6 +119,7 @@ bool ccpEqual( int x, int y )
   {
     const int mdf = ccpWord( x, CCP_OUT_MDF );
     n = ( type & ( CCP_TYPE_CCCM | CCP_TYPE_GLCCCM ) ) != 0 ? 7 : ( type & CCP_TYPE_GLM4567 ) != 0 ? GLM_PARAMS
+      : ( type & CCP_TYPE_INTER_CCCM ) != 0 ? 8
       : ( type & CCP_TYPE_NSCCCM ) != 0 ? ccpWord( x, CCP_OUT_NUM_PARAMS ) : mdf == 1 ? 10 : 11;
     if( ccpWord( x, CCP_OUT_LUMA_OFFSET ) != ccpWord( y, CCP_OUT_LUMA_OFFSET )
         || ( ( type & CCP_TYPE_MDFCCCM ) != 0 && mdf != ccpWord( y, CCP_OUT_MDF ) ) )
@@ -359,7 +360,8 @@ void ccpCccmModel( Tu t, int x, bool ownLoc, int lid, int NT )
   const int type = ccpWord( x, CCP_OUT_TYPE ), mdf = ( type & CCP_TYPE_MDFCCCM ) != 0 ? ccpWord( x, CCP_OUT_MDF ) : 0;
   g_cccmGl         = ( type & CCP_TYPE_GLCCCM ) != 0;
   g_cccmMdf        = mdf;
-  g_cccmNoSub      = ( type & CCP_TYPE_NSCCCM ) != 0;
+  g_cccmInterNs    = ( type & CCP_TYPE_INTER_CCCM ) != 0;   // (its luma buffer CCCM's without subsampling)
+  g_cccmNoSub      = ( type & ( CCP_TYPE_NSCCCM | CCP_TYPE_INTER_CCCM ) ) != 0;
   g_cccmGlmLuma    = ( type & CCP_TYPE_GLM4567 ) != 0;
   g_cccmGlmPattern = ccpWord( x, CCP_OUT_GLM_IDC ) - NUM_GLM_PATTERN;
   g_cccmFusion     = false;
@@ -367,7 +369,7 @@ void ccpCccmModel( Tu t, int x, bool ownLoc, int lid, int NT )
   g_cccmBoth       = false;
   g_cccmSet        = 0;
   g_cccmShift      = g_cccmNoSub ? 1 : 0;
-  g_cccmParams     = g_cccmGlmLuma ? GLM_PARAMS
+  g_cccmParams     = g_cccmGlmLuma ? GLM_PARAMS : g_cccmInterNs ? 8
                    : g_cccmNoSub ? ( P.cclmFilter == CCLM_FILTER_AVERAGE ? 9 : 11 )
                    : mdf == 0 ? 7 : mdf == 1 ? 10 : 11;
   cccmLoadArea();
@@ -392,7 +394,8 @@ void ccpCccmModel( Tu t, int x, bool ownLoc, int lid, int NT )
   if( lid < 4 )   // (model, component)
   {
     const int   r    = CCP_OUT_RANGE + 3 * lid;
-    const ivec2 clip = cccmClipRange( ccpWord( x, r ), ccpWord( x, r + 1 ), ccpWord( x, r + 2 ) != 0, true,
+    const ivec2 clip = g_cccmInterNs ? ivec2( 0, ( 1 << t.bitDepth ) - 1 )   // (ClipPel's alone)
+                     : cccmClipRange( ccpWord( x, r ), ccpWord( x, r + 1 ), ccpWord( x, r + 2 ) != 0, true,
                                       t.w * t.h, t.bitDepth );
     s_cclm[CCCM_CLIP + lid * 2]     = clip.x;
     s_cclm[CCCM_CLIP + lid * 2 + 1] = clip.y;

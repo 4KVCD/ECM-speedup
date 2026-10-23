@@ -2451,6 +2451,23 @@ levels in blocksResidual's layout; chroma residual scaling's size test takes the
 larger block is scaled: ldp_crowdrun_q27). Still the CPU's: ASBT of an IBC CU, decimated both ways, with joint CbCr,
 with LFNST / NSPT, other chroma formats (none in the 50 streams). Results: "ASBT" 101 -> 0, every verified picture
 identical (builds aglft9 and, with the scaling's size test, aglft10).
+Inter CCCM on the GPU (2026-10-23, agent lf; partial verification): a chroma block of a TU with interCccm
+(DERIVE_INTER_CCCM, 1 << 31, with DERIVE_INTER; its record at Tu::ibc: the TU's luma block, its prediction's offset in
+Params::interPred, LMCS's forward mapping, the SPS's collocated chroma) predicts in intra_rec (intra_intercccm.glsl) as
+InterPrediction::deriveInterCccmPrediction does: a model of 8 parameters (the six luma taps around the co-located luma
+sample, five with collocated chroma, less the luma offset; the nonlinear term of the mean of the sample and the one
+below it; the bias) fitted by intra_cccm.glsl's cccmSolve in solve2's inter mode (28 matrix bits up to 10 bits,
+regularization 1: g_cccmInter) to the TU's luma prediction and the block's own chroma prediction, each less its offset
+(computeOffset: the four corners' rounded mean), on the grid the chroma size subsamples; each sample then (3 x the model
+applied to the TU's luma reconstruction + the inter prediction + 2) >> 2, clipped. DecCu hands over the inter chroma
+prediction before the CPU blends it in place (interCccmPred); the block waits for every block before it (DERIVE_PREFIX:
+the luma reconstruction). A CCP merge candidate of inter CCCM (CCP_TYPE_INTER_CCCM: an inter CU's TU model, or a
+temporal one) predicts with xInterCccmApplyModelOffset's features (intra_cccm.glsl's g_cccmInterNs: the six taps of the
+luma without subsampling, the nonlinear term, the bias) clipped to ClipPel's range alone; with merge adjustment or
+decoder-derived fusion it stays the CPU's. Results (build aglft9, all 50 streams but ldp_crowdrun_q27's ASBT difference,
+fixed before): "inter CCCM" 18 -> 0 (1 now "inter CCCM with ASBT": its luma prediction lies in several records), "CCP
+merge with an inter CCCM candidate" 14 -> 0 (4 now "CCP merge adjustment or decoder-derived fusion with an inter CCCM
+candidate"). Inter CCP merge (161 CUs) is still the CPU's.
 
 
 ## 8. Numbers (i7-10700 8C/16T, Win11, GCC 16.2, RTX 3070 driver 616.92)

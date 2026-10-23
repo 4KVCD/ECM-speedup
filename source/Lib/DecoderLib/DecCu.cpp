@@ -3952,6 +3952,12 @@ void DecCu::xDecodeInterTexture(CodingUnit &cu)
 
         PelBuf bufCb = cs.getPredBuf( currTU.blocks[COMPONENT_Cb] );
         PelBuf bufCr = cs.getPredBuf( currTU.blocks[COMPONENT_Cr] );
+#if ECM_VULKAN
+        if( m_gpuIntraRec )   // (partial verification: the inter prediction the GPU blends itself)
+        {
+          m_gpuIntraRec->interCccmPred( currTU );
+        }
+#endif
 
         const bool valid = m_pcInterPred->deriveInterCccmPrediction(&currTU, tmpInterCccmStorage.getBuf(COMPONENT_Y), cs.getRecoBuf(currTU.blocks[COMPONENT_Y]), bufCb, bufCr, bufCb, bufCr );
 

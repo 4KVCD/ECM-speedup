@@ -124,6 +124,8 @@ bool g_cccmNoSub;        // CCCM without subsampling (cccmNoSubFlag): the luma b
 bool g_cccmBoth;         // the block predicts both chroma components (cccmPrediction's `both`)
 bool g_cccmGlmLuma;      // GLM with luma (glmIdc 5 .. 8): the model of a gradient pattern's value and the luma
 bool g_cccmFusion;       // LM chroma fusion's CCCM prediction (luma buffer and prediction in the scratch)
+bool g_cccmInter = false;   // inter CCCM's model (intra_intercccm.glsl: solve2's interCccmMode)
+bool g_cccmInterNs = false;   // a CCP merge candidate's inter CCCM model (CCP_TYPE_INTER_CCCM): its own features
 bool g_cccmCflm;         // CFLM's models (the features, the template without its corner, solve1; WITH_CFLM only)
 int  g_cflmComp;         // its block's component (both right-hand sides its chroma)
 int  g_cccmGlmPattern;   // its gradient pattern (1 .. NUM_GLM_PATTERN)
@@ -566,6 +568,16 @@ int cccmFeature( int f, int x, int y, int c, int bitDepth )
   {
     return f == 0 ? cccmLumaOf( 1, x, y ) : c;
   }
+  if( g_cccmInterNs )   // (xInterCccmApplyModelOffset's: the six luma taps of rows 2y and 2y + 1, the nonlinear term)
+  {
+    const ivec2 d[6] = ivec2[6]( ivec2( 0, 0 ), ivec2( 0, 1 ), ivec2( -1, 0 ), ivec2( 1, 0 ), ivec2( -1, 1 ), ivec2( 1, 1 ) );
+    if( f == 6 )
+    {
+      return cccmNonlinear( int( int16_t( ( cccmLuma( x << 1, y << 1 ) + cccmLuma( x << 1, ( y << 1 ) + 1 ) + 1 ) >> 1 ) ),
+                            bitDepth );
+    }
+    return cccmLuma( ( x << 1 ) + d[f].x, ( y << 1 ) + d[f].y );
+  }
   if( g_cccmNoSub )
   {
     return cccmNoSubFeature( f, x, y, bitDepth );
@@ -779,13 +791,13 @@ void cccmSolve( Tu t, int k, int lid )
     const int64_t bias = cccmSum( cccmEntryIndex( lid, M - 1, M ) );
     a[M]     = cccmSum( triangle + lid ) - ( ( bias * int64_t( offCb ) ) >> ( bitDepth - 1 ) );
     a[M + 1] = cccmSum( triangle + M + lid ) - ( ( bias * int64_t( offCr ) ) >> ( bitDepth - 1 ) );
-    const int shift = cccmMatrixBits( g_cccmGlmLuma || ( WITH_CFLM && g_cccmCflm ) ? GLM_MATRIX : CCCM_MATRIX )
+    const int shift = cccmMatrixBits( g_cccmGlmLuma || ( WITH_CFLM && g_cccmCflm ) || g_cccmInter ? GLM_MATRIX : CCCM_MATRIX )
                       - 2 * bitDepth - cccmCeilLog2( n );
     for( int j = 0; j < M + 2; j++ )
     {
       a[j] = shift > 0 ? a[j] << shift : a[j] >> -shift;
     }
-    a[lid] += int64_t( 2 << ( bitDepth - 8 ) );
+    a[lid] += g_cccmInter ? int64_t( 1 ) : int64_t( 2 << ( bitDepth - 8 ) );   // (gaussElimination's regularization)
   }
   const int decim = cccmDecim();
   for( int piv = 0; piv < M; piv++ )
