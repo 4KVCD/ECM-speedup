@@ -82,6 +82,9 @@ struct Tu
   int pnn;
   // an IBC CU's block (DERIVE_IBC): its record in Params::timdData (IBC_REC_*; read with DERIVE_IBC only)
   int ibc;
+  // an OBMC CU's block on the CU's top or left band: its CU's OBMC record in Params::timdData + 1 (intra_rec's
+  // OBMC_REC_*; 0: none)
+  int obmc;
 };
 layout( buffer_reference, std430, buffer_reference_align = 4 ) buffer BufTu { Tu v[]; };
 

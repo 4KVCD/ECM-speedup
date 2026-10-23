@@ -449,7 +449,7 @@ wall-clock gains with threads are "the easy baseline". Decoder status: single-th
 (`--GpuLoopFilter=1`: ALF, SAO, BIF, CCSAO, LF-CCCM, offset refinement on Vulkan). The user then asked for **a full
 GPU decoder in Vulkan, optimized until nothing is left** ("The GPU decoder needs to fully decode the frame on the
 GPU"; "Your first Vulkan version is going to be slow. That's OK"). That work is branch `dec-gpurecon`: intra
-reconstruction on the GPU (`--GpuRecon`), tool levels M1-M98 done and verified bit-exact (M19: DIMD, M20: OBIC, M21:
+reconstruction on the GPU (`--GpuRecon`), tool levels M1-M99 done and verified bit-exact (M19: DIMD, M20: OBIC, M21:
 intra merge, M22: the transforms of DIMD CUs, M23: LFNST of MIP, M24: TIMD, M25: OBIC and intra merge with TIMD
 neighbours, M26: TIMD-SAD, M27: OBIC and intra merge with TIMD-SAD neighbours, M28: TIMD merge, M29: TMRL of luma,
 M30: chroma TMRL, M31: CCLM, M32: LFNST / NSPT of CCLM, M33: GLM's gradient patterns, M34: CCCM, M35: GL-CCCM, M36:
@@ -2336,6 +2336,28 @@ tiles live in the PU's scratch (coherent buffer references, barriers between the
 unit as m_bdofSubPuMvOffset / m_bdofSubPuMvOffse2. clipMvInl's bounds come with the job (subpicture clipping is
 rejected). Results (50 streams, build gpu38): every picture identical; bi-prediction with DMVR 50 CUs
 predicted by the GPU (all the corpus has: no bi-prediction CU remains the CPU's).
+M99 (2026-10-22): OBMC on the GPU for CUs whose base prediction the GPU makes (kind "OBMC" without sub-block motion;
+DecCu's subBlockOBMC). The host lays out each boundary's segments of one neighbouring motion with the CPU's own
+PU::getSameNeigMotion (partial verification: the CPU's motion), the JVET-AD0193 screen-content exit (isSCC, mirrored),
+the template availability (xAMLIsTopTempAvailable / Left), and writes a record per CU (Params::timdData, OBMC_REC_*;
+Tu::obmc, new, marks the blocks on the CU's top / left band). inter_mc.comp's mode 3 (after the blocks' jobs) does per
+segment what does not read the current picture: the band's prediction with the neighbour's motion (bi-prediction with
+the neighbour's BCW weight and out-of-boundary samples, the CU's half-sample flag; mcSample, the blocks' per-sample
+prediction refactored out of mode 0), skipObmcConditionByPixel per component (each list of the neighbour's motion at
+its integer vector against the CU's prediction there, threshold 96 << (bd - 8)), and with JVET-Z0061's TM OBMC the
+one-sample templates beside the segment predicted with the CU's and the neighbour's motion through the 4-tap TM filter
+(xPredInterBlk's fastOBMC: filterIdx 1 with use4TapTM, g_aiExtIntraCubicFilter appended to the filters); its data go
+after the blocks' samples in Params::interPred. intra_rec then, in the dependency chain (intra_deps adds the owners of
+the CU's one-sample templates), chooses each segment's mode as selectOBMCmode does - the SADs of the reconstructed
+template (inverse-mapped with LMCS) against the current motion's, the neighbour's and their 26/6 blend, without
+DISTORTION_PRECISION_ADJUSTMENT as FULL_NBIT is set - and blends the band's samples in place in Params::interPred
+(weightObmcBoundary's 26/6, 28/4, 30/2, 31/1 from the mode's first row; chroma one row; the top segments, then the
+left ones over their result; the SIMD kernel's per-row weights are the same fractions), before the inter LFNST's
+DIMD, sign prediction and LMCS read the prediction (coherent reads). The verifier's mirror of the scheduling data adds
+the same template owners. Found on the way (ra_foreman_q22): RdCost's SAD keeps all bits here, a shift by bd - 8 chose
+other modes. Still the CPU's, by reason (partial.py's "OBMC (...)"): OBMC of sub-block motion (DMVR CUs: inner
+sub-block OBMC), LIC / non-local LIC neighbours, intra neighbours with DIMD (JVET-AJ0161's intra OBMC), IBC
+neighbours. Results (50 streams, build gpu42): RESULTS_M99.
 
 
 ## 8. Numbers (i7-10700 8C/16T, Win11, GCC 16.2, RTX 3070 driver 616.92)

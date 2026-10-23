@@ -182,6 +182,10 @@ private:
   static const TFilterCoeff m_bilinearFilterPrec4[LUMA_INTERPOLATION_FILTER_SUB_SAMPLE_POSITIONS][NTAPS_BILINEAR]; ///< bilinear filter taps
 #if JVET_AD0208_IBC_ADAPT_FOR_CAM_CAPTURED_CONTENTS
 public:
+#if ECM_VULKAN && JVET_W0123_TIMD_FUSION && JVET_Z0117_CHROMA_IF
+  // GpuLib (OBMC's templates, the 4-tap TM filter): g_aiExtIntraCubicFilter's row f
+  static const TFilterCoeff* cubicFilterRow( int f ) { return g_aiExtIntraCubicFilter[f]; }
+#endif
   static const TFilterCoeff m_bilinearFilterChroma[CHROMA_INTERPOLATION_FILTER_SUB_SAMPLE_POSITIONS][NTAPS_BILINEAR]; ///< bilinear filter taps for chroma
 #endif
 public:

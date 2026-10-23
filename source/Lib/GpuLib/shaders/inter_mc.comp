@@ -24,6 +24,8 @@
 //   a sample out of boundary in either list (JVET-Z0136: those samples one list alone)
 // - multi-pass DMVR (bdmvrRefine): one workgroup per PU (mode 2, dmvrJob) replays xPredInterBi's DMVR branch from the
 //   CPU's sub-PU vectors into pc.bdofOut (luma and chroma), which all its blocks' jobs copy
+// - OBMC (mode 3, after the blocks' jobs): per boundary segment of an OBMC CU what its blending needs that does not
+//   read the current picture (obmcJob), for intra_rec, which chooses and blends in the dependency chain
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_GOOGLE_include_directive : require
@@ -42,7 +44,8 @@ layout( push_constant ) uniform PushMc
   uint64_t bdofOut;   // BDOF PUs' luma predictions, DMVR PUs' predictions (int16, McJob's MC_BDOF_OUT)
   uint64_t scratch;   // DMVR PUs' scratch (int32: their BDOF offsets, two tiles)
   int      numJobs;
-  int      mode;      // 0: the blocks' jobs, 1: BDOF's sub-block jobs, 2: DMVR's PUs (1 and 2 before 0)
+  int      mode;      // 0: the blocks' jobs, 1: BDOF's sub-block jobs, 2: DMVR's PUs (1 and 2 before 0), 3: OBMC's
+                      // segments (pc.scratch: the blocks' jobs)
 } pc;
 
 // McJob (int32): the block (component, position and size in the component's samples), where its prediction goes in
@@ -70,6 +73,7 @@ const int MC_REF_COMP = 5;
 // m_chromaFilter (32 x 6), g_bdofWeight (1600: calcBIOParamSumHighPrecision_SSE's weights)
 const int MC_FILT_LUMA = 0, MC_FILT_LUMA_BI = 16 * 12, MC_FILT_ALT = 2 * 16 * 12, MC_FILT_CHROMA = MC_FILT_ALT + 8;
 const int MC_FILT_BDOF_W = MC_FILT_CHROMA + 32 * 6;
+const int MC_FILT_CUBIC  = MC_FILT_BDOF_W + 1600;   // g_aiExtIntraCubicFilter (64 x 4): the TM filter (JVET-AL0161)
 
 const int IF_INTERNAL_PREC = 14, IF_FILTER_PREC = 8, IF_INTERNAL_OFFS = 1 << ( IF_INTERNAL_PREC - 1 );
 const int BCW_LOG2_WEIGHT_BASE = 3;   // g_bcwLog2WeightBase
@@ -81,10 +85,16 @@ int refAt( int slot, int comp, int x, int y )
   return int( BufI16( pc.planes ).v[r.v[b + MC_REF_ORIGIN] + y * r.v[b + MC_REF_STRIDE] + x] );
 }
 
+bool mcTm = false;   // mcPredictTaps: the 4-tap TM filter for luma (filterIdx 1 with use4TapTM)
+
 // the taps of one pass: the table's start and the tap count (filterHor / filterVer's choice for this fraction; the
 // sharp bi-prediction filter where the pass's block is above 4 x 4)
 ivec2 mcTaps( bool luma, int frac, bool altHpel, bool sharp )
 {
+  if( mcTm && luma )
+  {
+    return ivec2( MC_FILT_CUBIC + ( frac << 2 ) * 4, 4 );
+  }
   if( !luma )
   {
     return ivec2( MC_FILT_CHROMA + frac * 6, 6 );
@@ -153,6 +163,17 @@ int mcPredict( int slot, int comp, int x, int y, int xFrac, int yFrac, bool alt,
   }
   const int shift2 = IF_FILTER_PREC + headRoom, offset2 = ( 1 << ( shift2 - 1 ) ) + ( IF_INTERNAL_OFFS << IF_FILTER_PREC );
   return clamp( int( int16_t( ( sum + offset2 ) >> shift2 ) ), clipMin, clipMax );
+}
+
+// mcPredict with the 4-tap TM filter (xPredInterBlk's filterIdx 1 with use4TapTM: g_aiExtIntraCubicFilter at the
+// fraction's quadruple)
+int mcPredictTaps( int slot, int comp, int x, int y, int xFrac, int yFrac, bool tm, bool bi, int W, int H, int bd,
+                   int clipMin, int clipMax )
+{
+  mcTm        = tm;
+  const int v = mcPredict( slot, comp, x, y, xFrac, yFrac, false, bi, W, H, bd, clipMin, clipMax );
+  mcTm        = false;
+  return v;
 }
 
 // isMvOOB's mask at luma sample (px, py) of the PU (relative to it) for an unclipped vector: more than half a sample
@@ -850,6 +871,166 @@ void dmvrJob( int o )
   bdofGlobal = false;
 }
 
+// ----- the blocks' jobs (mode 0)
+
+// component comp's sample (x, y) (the component's coordinates) predicted with job o's motion (MC_MVX.., MC_REF..,
+// MC_FLAGS' MC_ALT_HPEL / MC_BI / MC_BDOF, MC_W0 / MC_W1, MC_OOB with the unclipped vectors, MC_PU_X / MC_PU_Y its PU's
+// luma position, MC_PIC_W / MC_PIC_H, MC_BDOF_OUT), its PU of puW x puH samples in the component (the sharp filter),
+// clipped to [clipMin, clipMax]
+int mcSample( BufI32 jb, int o, int comp, int x, int y, int puW, int puH, int bd, int clipMin, int clipMax )
+{
+  const int   flags = jb.v[o + MC_FLAGS];
+  const bool  luma = comp == 0, alt = ( flags & MC_ALT_HPEL ) != 0, bi = ( flags & MC_BI ) != 0;
+  const int   cs = luma ? 0 : 1;   // (4:2:0)
+  const int   shift = 4 + cs, mask = ( 1 << shift ) - 1;
+  const ivec2 mv0 = ivec2( jb.v[o + MC_MVX], jb.v[o + MC_MVY] ), mv1 = ivec2( jb.v[o + MC_MV1X], jb.v[o + MC_MV1Y] );
+  const int   slot0 = jb.v[o + MC_REF], slot1 = jb.v[o + MC_REF1];
+  const int   headRoom = max( 2, IF_INTERNAL_PREC - bd );
+  if( ( flags & MC_BDOF ) != 0 )   // the PU's BDOF / DMVR prediction
+  {
+    return int( BufI16( pc.bdofOut )
+                  .v[jb.v[o + MC_BDOF_OUT] + ( y - ( jb.v[o + MC_PU_Y] >> cs ) ) * puW + x - ( jb.v[o + MC_PU_X] >> cs )] );
+  }
+  if( !bi )
+  {
+    return mcPredict( slot0, comp, x + ( mv0.x >> shift ), y + ( mv0.y >> shift ), mv0.x & mask, mv0.y & mask, alt, false,
+                      puW, puH, bd, clipMin, clipMax );
+  }
+  const int p0 = mcPredict( slot0, comp, x + ( mv0.x >> shift ), y + ( mv0.y >> shift ), mv0.x & mask, mv0.y & mask, alt,
+                            true, puW, puH, bd, clipMin, clipMax );
+  const int p1 = mcPredict( slot1, comp, x + ( mv1.x >> shift ), y + ( mv1.y >> shift ), mv1.x & mask, mv1.y & mask, alt,
+                            true, puW, puH, bd, clipMin, clipMax );
+  const int oob = jb.v[o + MC_OOB];
+  bool      o0 = false, o1 = false;
+  if( oob != 0 )   // (the PU's luma sample of this sample: chroma's at twice its position)
+  {
+    const int px = ( x - ( jb.v[o + MC_PU_X] >> cs ) ) << cs, py = ( y - ( jb.v[o + MC_PU_Y] >> cs ) ) << cs;
+    o0 = ( oob & 1 ) != 0 && mcOutOfBoundary( jb, o, px, py, jb.v[o + MC_RAW0X], jb.v[o + MC_RAW0Y] );
+    o1 = ( oob & 2 ) != 0 && mcOutOfBoundary( jb, o, px, py, jb.v[o + MC_RAW1X], jb.v[o + MC_RAW1Y] );
+  }
+  if( o0 != o1 )   // one list alone: rounded from the intermediate
+  {
+    const int shift2 = headRoom, offset2 = ( 1 << ( shift2 - 1 ) ) + IF_INTERNAL_OFFS;
+    return clamp( ( ( o0 ? p1 : p0 ) + offset2 ) >> shift2, clipMin, clipMax );
+  }
+  // addWeightedAvg (weightedAvg's formula; BCW_DEFAULT's weights 4 and 4)
+  const int shiftNum = headRoom + BCW_LOG2_WEIGHT_BASE;
+  const int offset   = ( 1 << ( shiftNum - 1 ) ) + ( IF_INTERNAL_OFFS << BCW_LOG2_WEIGHT_BASE );
+  return clamp( ( p0 * jb.v[o + MC_W0] + p1 * jb.v[o + MC_W1] + offset ) >> shiftNum, clipMin, clipMax );
+}
+
+// ----- OBMC (mode 3, after the blocks' jobs): one boundary segment of an OBMC CU per job (subBlockOBMC's segments of
+// one neighbouring motion, which the host takes from PU::getSameNeigMotion): what does not read the current picture,
+// into the segment's data in pc.outPred (OBMC_D_*), for intra_rec's choice and blending
+// - the band's prediction with the neighbour's motion (xSubBlockMotionCompensation: bi-prediction with the neighbour's
+//   BCW weight, its out-of-boundary samples; the CU's half-sample filter flag) per component
+// - per component skipObmcConditionByPixel: the neighbour's motion rounded to integer samples, each of its lists
+//   predicted alone over the band, against the CU's prediction there (the blocks' jobs' motion: mcSample) - a
+//   difference of 96 << (bit depth - 8) or more skips that component
+// - with JVET-Z0061's TM OBMC the one-sample templates beside the segment predicted with the CU's motion and the
+//   neighbour's (getBlkOBMCRefTemplate: the 4-tap TM filter, bi-prediction averaged with the BCW weight of the motion's
+//   CU)
+
+// an OBMC job (int32, 2 x MC_JOB): an McJob of the neighbour's motion over the band (MC_X, MC_Y, MC_W, MC_H: the band's
+// luma area; MC_DST: where its data goes in pc.outPred; MC_PU_X / MC_PU_Y the band's position), then OBMC_J_*
+const int OBMC_J_DIR = 32, OBMC_J_FLAGS = 33, OBMC_J_BASE = 34, OBMC_J_THRESHOLD = 37, OBMC_J_INT_MV = 39;
+const int OBMC_J_INT_DIR = 43, OBMC_J_TPL = 44, OBMC_J_TPL_MOTION = 9, OBMC_J = 64;
+// a template motion (OBMC_J_TPL: the CU's, then the neighbour's): list 0's vector, list 1's (clipped as
+// getBlkOBMCRefTemplate clips them, the template's offset in), the slots, the kind (0: list 0, 1: list 1, 2: both),
+// the BCW weights
+const int OBMC_T_MV0 = 0, OBMC_T_MV1 = 2, OBMC_T_REF0 = 4, OBMC_T_REF1 = 5, OBMC_T_KIND = 6, OBMC_T_W0 = 7, OBMC_T_W1 = 8;
+const int OBMC_TM = 1;   // OBMC_J_FLAGS: the templates
+// a segment's data (int16): the skip flags (Y, Cb, Cr), the templates with the CU's and the neighbour's motion (L each),
+// the band's luma prediction (W x H), Cb's, Cr's (W / 2 x H / 2)
+const int OBMC_D_SKIP = 0, OBMC_D_TPL = 3;
+
+shared int sObmcSkip;
+
+// the 4-tap TM filter's prediction of a template sample at (x, y) of reference slot (luma; uni: rounded and clipped,
+// bi: the 14-bit intermediate), the template a block of tw x th samples
+int obmcTplPredict( int slot, int x, int y, ivec2 mv, bool bi, int tw, int th, int bd, int clipMin, int clipMax )
+{
+  return mcPredictTaps( slot, 0, x + ( mv.x >> 4 ), y + ( mv.y >> 4 ), mv.x & 15, mv.y & 15, true, bi, tw, th, bd, clipMin,
+                        clipMax );
+}
+
+int obmcTpl( BufI32 jb, int t, int x, int y, int tw, int th, int bd, int clipMin, int clipMax )
+{
+  const int kind = jb.v[t + OBMC_T_KIND];
+  if( kind != 2 )
+  {
+    const int l = kind;
+    return obmcTplPredict( jb.v[t + OBMC_T_REF0 + l], x, y, ivec2( jb.v[t + OBMC_T_MV0 + 2 * l], jb.v[t + OBMC_T_MV0 + 2 * l + 1] ),
+                           false, tw, th, bd, clipMin, clipMax );
+  }
+  const int p0 = obmcTplPredict( jb.v[t + OBMC_T_REF0], x, y, ivec2( jb.v[t + OBMC_T_MV0], jb.v[t + OBMC_T_MV0 + 1] ), true, tw,
+                                 th, bd, clipMin, clipMax );
+  const int p1 = obmcTplPredict( jb.v[t + OBMC_T_REF1], x, y, ivec2( jb.v[t + OBMC_T_MV1], jb.v[t + OBMC_T_MV1 + 1] ), true, tw,
+                                 th, bd, clipMin, clipMax );
+  const int headRoom = max( 2, IF_INTERNAL_PREC - bd ), shiftNum = headRoom + BCW_LOG2_WEIGHT_BASE;
+  const int offset   = ( 1 << ( shiftNum - 1 ) ) + ( IF_INTERNAL_OFFS << BCW_LOG2_WEIGHT_BASE );
+  return clamp( ( p0 * jb.v[t + OBMC_T_W0] + p1 * jb.v[t + OBMC_T_W1] + offset ) >> shiftNum, clipMin, clipMax );
+}
+
+void obmcJob( int o, int lid )
+{
+  BufI32    jb = BufI32( pc.jobs ), base = BufI32( pc.scratch );
+  BufI16    od = BufI16( pc.outPred );
+  const int bx = jb.v[o + MC_X], by = jb.v[o + MC_Y], W = jb.v[o + MC_W], H = jb.v[o + MC_H], dst = jb.v[o + MC_DST];
+  const int bd = jb.v[o + MC_BD], clipMin = jb.v[o + MC_CLIP_MIN], clipMax = jb.v[o + MC_CLIP_MAX];
+  const int dir = jb.v[o + OBMC_J_DIR], L = dir == 0 ? W : H;
+  const int predOff[3] = int[]( dst + OBMC_D_TPL + 2 * L, dst + OBMC_D_TPL + 2 * L + W * H,
+                                dst + OBMC_D_TPL + 2 * L + W * H + ( W >> 1 ) * ( H >> 1 ) );
+  for( int comp = 0; comp < 3; comp++ )
+  {
+    const int cs = comp == 0 ? 0 : 1, cw = W >> cs, ch = H >> cs, cx = bx >> cs, cy = by >> cs;
+    const int bj = jb.v[o + OBMC_J_BASE + comp] * MC_JOB;   // (the CU's block job of this component)
+    if( lid == 0 )
+    {
+      sObmcSkip = 0;
+    }
+    barrier();
+    for( int i = lid; i < cw * ch; i += 64 )
+    {
+      const int x = cx + i % cw, y = cy + i / cw;
+      od.v[predOff[comp] + i] = int16_t( mcSample( jb, o, comp, x, y, cw, ch, bd, clipMin, clipMax ) );
+      // skipObmcConditionByPixel: each list of the neighbour's motion at its integer vector, uni-prediction of the band
+      const int before = mcSample( base, bj, comp, x, y, base.v[bj + MC_PU_W], base.v[bj + MC_PU_H], bd, clipMin, clipMax );
+      for( int l = 0; l < 2; l++ )
+      {
+        if( ( jb.v[o + OBMC_J_INT_DIR] & ( 1 << l ) ) != 0 )
+        {
+          const ivec2 mv = ivec2( jb.v[o + OBMC_J_INT_MV + 2 * l], jb.v[o + OBMC_J_INT_MV + 2 * l + 1] );
+          const int   shift = 4 + cs, mask = ( 1 << shift ) - 1;
+          const int   r = mcPredict( jb.v[o + ( l == 0 ? MC_REF : MC_REF1 )], comp, x + ( mv.x >> shift ), y + ( mv.y >> shift ),
+                                     mv.x & mask, mv.y & mask, ( jb.v[o + MC_FLAGS] & MC_ALT_HPEL ) != 0, false, cw, ch, bd,
+                                     clipMin, clipMax );
+          if( abs( before - r ) >= jb.v[o + OBMC_J_THRESHOLD + ( comp == 0 ? 0 : 1 )] )
+          {
+            atomicOr( sObmcSkip, 1 );
+          }
+        }
+      }
+    }
+    barrier();
+    if( lid == 0 )
+    {
+      od.v[dst + OBMC_D_SKIP + comp] = int16_t( sObmcSkip );
+    }
+    barrier();
+  }
+  if( ( jb.v[o + OBMC_J_FLAGS] & OBMC_TM ) != 0 )   // the templates: a row above the band or a column left of it
+  {
+    const int tw = dir == 0 ? W : 1, th = dir == 0 ? 1 : H;
+    for( int i = lid; i < 2 * L; i += 64 )
+    {
+      const int k = i % L, t = o + OBMC_J_TPL + ( i / L ) * OBMC_J_TPL_MOTION;
+      const int x = bx + ( dir == 0 ? k : 0 ), y = by + ( dir == 0 ? 0 : k );
+      od.v[dst + OBMC_D_TPL + i] = int16_t( obmcTpl( jb, t, x, y, tw, th, bd, clipMin, clipMax ) );
+    }
+  }
+}
+
 void main()
 {
   const int lid = int( gl_LocalInvocationID.x );
@@ -865,58 +1046,19 @@ void main()
       dmvrJob( j * MC_JOB );
       continue;
     }
+    if( pc.mode == 3 )
+    {
+      obmcJob( j * OBMC_J, lid );
+      continue;
+    }
     BufI32    jb   = BufI32( pc.jobs );
     const int o    = j * MC_JOB;
     const int comp = jb.v[o + MC_COMP], bx = jb.v[o + MC_X], by = jb.v[o + MC_Y], W = jb.v[o + MC_W], H = jb.v[o + MC_H];
-    const int dst = jb.v[o + MC_DST], flags = jb.v[o + MC_FLAGS], bd = jb.v[o + MC_BD];
-    const int clipMin = jb.v[o + MC_CLIP_MIN], clipMax = jb.v[o + MC_CLIP_MAX];
-    const int puW = jb.v[o + MC_PU_W], puH = jb.v[o + MC_PU_H];
-    const bool luma = comp == 0, alt = ( flags & MC_ALT_HPEL ) != 0, bi = ( flags & MC_BI ) != 0;
-    const int  cs   = luma ? 0 : 1;   // (4:2:0)
-    const int  shift = 4 + cs, mask = ( 1 << shift ) - 1;
-    const ivec2 mv0 = ivec2( jb.v[o + MC_MVX], jb.v[o + MC_MVY] ), mv1 = ivec2( jb.v[o + MC_MV1X], jb.v[o + MC_MV1Y] );
-    const int   slot0 = jb.v[o + MC_REF], slot1 = jb.v[o + MC_REF1];
-    const int   headRoom = max( 2, IF_INTERNAL_PREC - bd );
+    const int dst = jb.v[o + MC_DST], bd = jb.v[o + MC_BD];
     for( int i = lid; i < W * H; i += 64 )
     {
-      const int x = bx + i % W, y = by + i / W;
-      int       v;
-      if( ( flags & MC_BDOF ) != 0 )   // the PU's BDOF / DMVR prediction
-      {
-        v = int( BufI16( pc.bdofOut )
-                   .v[jb.v[o + MC_BDOF_OUT] + ( y - ( jb.v[o + MC_PU_Y] >> cs ) ) * puW + x - ( jb.v[o + MC_PU_X] >> cs )] );
-      }
-      else if( !bi )
-      {
-        v = mcPredict( slot0, comp, x + ( mv0.x >> shift ), y + ( mv0.y >> shift ), mv0.x & mask, mv0.y & mask, alt, false,
-                       puW, puH, bd, clipMin, clipMax );
-      }
-      else
-      {
-        const int p0 = mcPredict( slot0, comp, x + ( mv0.x >> shift ), y + ( mv0.y >> shift ), mv0.x & mask, mv0.y & mask,
-                                  alt, true, puW, puH, bd, clipMin, clipMax );
-        const int p1 = mcPredict( slot1, comp, x + ( mv1.x >> shift ), y + ( mv1.y >> shift ), mv1.x & mask, mv1.y & mask,
-                                  alt, true, puW, puH, bd, clipMin, clipMax );
-        const int oob = jb.v[o + MC_OOB];
-        bool      o0 = false, o1 = false;
-        if( oob != 0 )   // (the PU's luma sample of this sample: chroma's at twice its position)
-        {
-          const int px = ( x - ( jb.v[o + MC_PU_X] >> cs ) ) << cs, py = ( y - ( jb.v[o + MC_PU_Y] >> cs ) ) << cs;
-          o0 = ( oob & 1 ) != 0 && mcOutOfBoundary( jb, o, px, py, jb.v[o + MC_RAW0X], jb.v[o + MC_RAW0Y] );
-          o1 = ( oob & 2 ) != 0 && mcOutOfBoundary( jb, o, px, py, jb.v[o + MC_RAW1X], jb.v[o + MC_RAW1Y] );
-        }
-        if( o0 != o1 )   // one list alone: rounded from the intermediate
-        {
-          const int shift2 = headRoom, offset2 = ( 1 << ( shift2 - 1 ) ) + IF_INTERNAL_OFFS;
-          v = clamp( ( ( o0 ? p1 : p0 ) + offset2 ) >> shift2, clipMin, clipMax );
-        }
-        else   // addWeightedAvg (weightedAvg's formula; BCW_DEFAULT's weights 4 and 4)
-        {
-          const int shiftNum = headRoom + BCW_LOG2_WEIGHT_BASE;
-          const int offset   = ( 1 << ( shiftNum - 1 ) ) + ( IF_INTERNAL_OFFS << BCW_LOG2_WEIGHT_BASE );
-          v = clamp( ( p0 * jb.v[o + MC_W0] + p1 * jb.v[o + MC_W1] + offset ) >> shiftNum, clipMin, clipMax );
-        }
-      }
+      const int v = mcSample( jb, o, comp, bx + i % W, by + i / W, jb.v[o + MC_PU_W], jb.v[o + MC_PU_H], bd,
+                              jb.v[o + MC_CLIP_MIN], jb.v[o + MC_CLIP_MAX] );
       BufI16( pc.outPred ).v[dst + i] = int16_t( v );
     }
   }

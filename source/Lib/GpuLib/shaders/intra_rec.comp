@@ -733,9 +733,142 @@ void mipTransformMode( Tu t, int W, int H, int ps, int upH, int upV, int predStr
 // to DIMD_SMALL_BLOCK_THR samples (JVET-AJ0203's enableAlignedDesign) - at the samples inside the block, subsampled
 // from MIN_MTSS_SIZE samples on; the strongest mode, with DERIVE_INTER_SECOND the second strongest (lfnstIntra), into
 // s_predDimdMode
+// ----- OBMC (subBlockOBMC) of an inter block on its CU's top or left band: per boundary segment of one neighbouring
+// motion (the host's, PU::getSameNeigMotion) its mode - JVET-Z0061's TM OBMC from the CU's one-sample templates (the
+// reconstruction, inverse-mapped with LMCS) against inter_mc's templates of the CU's and the neighbour's motion
+// (selectOBMCmode's SADs) -, then per component unless skipObmcConditionByPixel skips
+// it the blending with the neighbour's prediction (weightObmcBoundary: 26/6, 28/4, 30/2, 31/1 from the mode's first
+// row; chroma one row), the top segments first, then the left ones over their result
+
+// an OBMC CU's record in Params::timdData (Tu::obmc - 1): the CU (luma), the flags, the segments (OBMC_SEG_* each: the
+// boundary - 0 top, 1 left -, the first luma sample along it relative to the CU, the length, its data in
+// Params::interPred: inter_mc.comp's OBMC_D_*)
+const int OBMC_REC_X = 0, OBMC_REC_Y = 1, OBMC_REC_W = 2, OBMC_REC_H = 3, OBMC_REC_FLAGS = 4, OBMC_REC_NUM = 5;
+const int OBMC_REC_BD = 6, OBMC_REC_BASE = 7, OBMC_REC_SEG = 8;   // (BASE: where the segments' data start)
+const int OBMC_SEG_DIR = 0, OBMC_SEG_START = 1, OBMC_SEG_LEN = 2, OBMC_SEG_DATA = 3, OBMC_SEG = 4;
+const int OBMC_REC_TM = 1, OBMC_REC_TOP = 2, OBMC_REC_LEFT = 4, OBMC_REC_INV_LMCS = 8;
+const int OBMC_D_SKIP = 0, OBMC_D_TPL = 3;
+const int OBMC_MAX_SEG = 64;
+shared int  s_obmcMode[OBMC_MAX_SEG];
+shared uint s_obmcCost[3];
+
+// the modes of record r's segments (selectOBMCmode; -1 without TM OBMC: plain blending), all invocations
+void obmcModes( int r, int bd, int lid, int NT )
+{
+  BufI32    rec  = BufI32( P.timdData );
+  BufI16    data = BufI16( P.interPred );
+  const int flags = rec.v[r + OBMC_REC_FLAGS], num = rec.v[r + OBMC_REC_NUM];
+  const int cuX = rec.v[r + OBMC_REC_X], cuY = rec.v[r + OBMC_REC_Y];
+  for( int s = 0; s < num; s++ )
+  {
+    const int o = r + OBMC_REC_SEG + s * OBMC_SEG;
+    const int dir = rec.v[o + OBMC_SEG_DIR], start = rec.v[o + OBMC_SEG_START], len = rec.v[o + OBMC_SEG_LEN];
+    const int d = rec.v[r + OBMC_REC_BASE] + rec.v[o + OBMC_SEG_DATA];
+    if( ( flags & OBMC_REC_TM ) == 0 || ( flags & ( dir == 0 ? OBMC_REC_TOP : OBMC_REC_LEFT ) ) == 0 )
+    {
+      if( lid == 0 )
+      {
+        s_obmcMode[s] = ( flags & OBMC_REC_TM ) == 0 ? -1 : 0;
+      }
+      continue;
+    }
+    if( lid < 3 )
+    {
+      s_obmcCost[lid] = 0;
+    }
+    SYNC();
+    for( int i = lid; i < len; i += NT )
+    {
+      int cur = dir == 0 ? recoAt( 0, cuX + start + i, cuY - 1 ) : recoAt( 0, cuX - 1, cuY + start + i );
+      if( ( flags & OBMC_REC_INV_LMCS ) != 0 )
+      {
+        cur = invLut( cur );
+      }
+      const int p0 = int( data.v[d + OBMC_D_TPL + i] ), p1 = int( data.v[d + OBMC_D_TPL + len + i] );
+      atomicAdd( s_obmcCost[0], uint( abs( cur - p0 ) ) );
+      atomicAdd( s_obmcCost[1], uint( abs( cur - p1 ) ) );
+      atomicAdd( s_obmcCost[2], uint( abs( cur - ( ( 26 * p0 + 6 * p1 + 16 ) >> 5 ) ) ) );
+    }
+    SYNC();
+    if( lid == 0 )
+    {
+      uint       c0 = s_obmcCost[0], c1 = s_obmcCost[1];   // (FULL_NBIT: no DISTORTION_PRECISION_ADJUSTMENT)
+      const uint c2 = s_obmcCost[2];
+      int        mode = 0;
+      if( c0 < c1 && c0 < c2 )
+      {
+        mode = 1;
+      }
+      else
+      {
+        c0 <<= 3;
+        c1 <<= 3;
+        mode = c1 + ( c1 >> 2 ) + ( c1 >> 3 ) <= c0 ? 2 : c0 <= c1 ? 3 : 4;
+      }
+      s_obmcMode[s] = mode;
+    }
+    SYNC();
+  }
+  SYNC();   // (the modes written by invocation 0 for segments without TM)
+}
+
+// weightObmcBoundary's blend of prediction p with the neighbour's nb at row (top) or column (left) k of the band
+int obmcWeight( int p, int nb, int mode, int k )
+{
+  const int rowStart = mode == 2 || mode == -1 ? 0 : mode == 4 ? 1 : 2;
+  const int j = rowStart + k;
+  if( j > 3 )
+  {
+    return p;
+  }
+  const int w0 = j == 0 ? 26 : j == 1 ? 28 : j == 2 ? 30 : 31;
+  return ( w0 * p + ( 32 - w0 ) * nb + 16 ) >> 5;
+}
+
+// block t's sample (x, y) (relative to the block) of prediction p after OBMC (record r, modes in s_obmcMode)
+int obmcSample( Tu t, int r, int x, int y, int p )
+{
+  BufI32    rec  = BufI32( P.timdData );
+  BufI16    data = BufI16( P.interPred );
+  const int comp = t.comp, cs = comp == 0 ? 0 : 1;
+  const int cuX = rec.v[r + OBMC_REC_X] >> cs, cuY = rec.v[r + OBMC_REC_Y] >> cs, num = rec.v[r + OBMC_REC_NUM];
+  const int cx = t.x + x - cuX, cy = t.y + y - cuY;   // (relative to the CU, the component's samples)
+  const int band = comp == 0 ? 4 : 1;                 // (luma's rows, chroma's one)
+  for( int pass = 0; pass < 2; pass++ )               // top, then left
+  {
+    if( ( pass == 0 ? cy : cx ) >= band )
+    {
+      continue;
+    }
+    for( int s = 0; s < num; s++ )
+    {
+      const int o = r + OBMC_REC_SEG + s * OBMC_SEG;
+      if( rec.v[o + OBMC_SEG_DIR] != pass )
+      {
+        continue;
+      }
+      const int start = rec.v[o + OBMC_SEG_START] >> cs, len = rec.v[o + OBMC_SEG_LEN] >> cs, along = pass == 0 ? cx : cy;
+      if( along < start || along >= start + len )
+      {
+        continue;
+      }
+      const int mode = s_obmcMode[s], d = rec.v[r + OBMC_REC_BASE] + rec.v[o + OBMC_SEG_DATA];
+      if( mode != 1 && data.v[d + OBMC_D_SKIP + comp] == 0 )
+      {
+        const int L = rec.v[o + OBMC_SEG_LEN], W = pass == 0 ? L : 4, H = pass == 0 ? 4 : L;
+        const int pred = d + OBMC_D_TPL + 2 * L + ( comp == 0 ? 0 : W * H + ( comp - 1 ) * ( W >> 1 ) * ( H >> 1 ) );
+        const int bw = W >> cs, i = pass == 0 ? ( along - start ) + cy * bw : cx + ( along - start ) * bw;
+        p = obmcWeight( p, int( data.v[pred + i] ), mode, pass == 0 ? cy : cx );
+      }
+      break;
+    }
+  }
+  return p;
+}
+
 int interPredAt( Tu t, int x, int y )
 {
-  return int( BufI16( P.interPred ).v[t.dbgOffset + y * t.w + x] );
+  return int( CBufI16( P.interPred ).v[t.dbgOffset + y * t.w + x] );   // (coherent: OBMC wrote it)
 }
 void interTransformMode( Tu t, int lid, int NT )
 {
@@ -1873,6 +2006,17 @@ void main()
     if( ( t.derive & DERIVE_INTER ) != 0 )
     {
       crsSetup( t, lid, NT );
+      if( t.obmc != 0 )   // OBMC on the CU's top / left band (M99): the blended prediction over the block's own
+      {
+        const int r = t.obmc - 1;
+        obmcModes( r, BufI32( P.timdData ).v[r + OBMC_REC_BD], lid, NT );
+        for( int i = lid; i < t.w * t.h; i += NT )
+        {
+          CBufI16( P.interPred ).v[t.dbgOffset + i] =
+            int16_t( obmcSample( t, r, i % t.w, i / t.w, int( CBufI16( P.interPred ).v[t.dbgOffset + i] ) ) );
+        }
+        SYNC();
+      }
       // (LFNST / NSPT: their mode from a DIMD of the prediction, the residual computed here: inChainResidual)
       if( WITH_DERIVED_TRANSFORMS && ( t.derive & DERIVE_TRANSFORM ) != 0 )
       {
@@ -1888,7 +2032,7 @@ void main()
           t.resiFrom = g_ti;   // storeRecon reads it device-coherent
         }
       }
-      BufI16 ip = BufI16( P.interPred );
+      CBufI16 ip = CBufI16( P.interPred );
       for( int i = lid; i < t.w * t.h; i += NT )
       {
         const int p = int( ip.v[t.dbgOffset + i] );
