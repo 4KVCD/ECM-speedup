@@ -2626,6 +2626,13 @@ ciipFields sets no PDP for it (found on the way, ld_foreman_q32 and three more: 
 Results (50 streams, build gpm2, with M107): every picture identical (ra_wpp_q32 skipped as before; ai_foreman352_q22
 lost the device in the parallel run and passed alone); CIIP 200 CUs predicted by the GPU (+101); from the CPU: CIIP
 with LFNST / NSPT 117, with LIC 66, OBMC with an intra neighbour 47, OBMC 13, with inter CCCM 1.
+Inter CCCM with OBMC (2026-10-23, agent lf; fixes 9886461dd): since M99 the GPU blends OBMC's band into an inter block's
+prediction in place (the DERIVE_INTER branch), and the CPU's motion compensation does it before
+deriveInterCccmPrediction blends; the inter CCCM branch now does the same first (interObmcBand, the DERIVE_INTER
+branch's step for the block), so the model fits and the blend takes the OBMC'd chroma prediction (the luma's is the luma
+block's, OBMC'd before by DERIVE_PREFIX). Found on the way (dec-gr-ccpmerge's 50-stream run on 2de8ee5a9):
+ld_parkjoy_q27, ldp_crowdrun_q27, ra_foreman_q22, ra_parkjoy832_q32 and ra_parkjoy_q37 differed at inter CCCM chroma
+blocks of OBMC CUs, by 1 to 3.
 
 
 ## 8. Numbers (i7-10700 8C/16T, Win11, GCC 16.2, RTX 3070 driver 616.92)
