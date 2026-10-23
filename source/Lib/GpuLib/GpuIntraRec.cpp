@@ -2474,7 +2474,6 @@ bool GpuIntraRec::supported( const Slice& slice, std::string& why, bool partial 
   else if( partial )                                                                      return true;
   // chroma reordering and DBV: the GPU's per CU (CU_CHROMA_REORDER, CU_CHROMA_DBV), what it lacks rejected by record()
   else if( ( sps.getUseChromaReordering() || sps.getUseIntraDBV() ) && !GPU_CHROMA_REORDER ) why = "chroma reordering / DBV";
-  else if( sps.getUseMdip() || sps.getUseMpmSorting() )                                   why = "MDIP / MPM sorting";
   // (also what leaves TIMD's block vector candidates empty, JVET-AM0138's: they come from IntraTMP / IBC CUs and the
   // CUs that took a vector from one; EIP and SGPM below)
   else if( sps.getUseIntraTMP() || sps.getIBCFlag() )                                     why = "IntraTMP / IBC";

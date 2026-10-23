@@ -2538,6 +2538,12 @@ lacks rejected by record() (the picture the CPU's, through 44e11ef88's fallback;
 7882788d3). Results (Intel PC, agst46, --GpuRecon=3 against the build's CPU decode, the 50 streams): 50 of 50 identical;
 intra pictures on the GPU 0 -> 0 of 331 pictures; the CPU's intra pictures by their first reason: MDIP / MPM sorting 51;
 IntraTMP / IBC 3; wavefronts 1.
+ON mode without supported()'s MDIP / MPM sorting gate (2026-10-22, agent st): the sequence-level rejection of MDIP / MPM
+sorting is gone; MDIP and MPM sorting (the MPM records of M57, derived by the CUs' nodes) are the GPU's per CU, what the
+GPU lacks rejected by record() (the picture the CPU's, through 44e11ef88's fallback; its side information through
+7882788d3). Results (Intel PC, agst47, --GpuRecon=3 against the build's CPU decode, the 50 streams): 50 of 50 identical;
+intra pictures on the GPU 0 -> 0 of 331 pictures; the CPU's intra pictures by their first reason: IntraTMP / IBC 54;
+wavefronts 1.
 
 
 ## 8. Numbers (i7-10700 8C/16T, Win11, GCC 16.2, RTX 3070 driver 616.92)
