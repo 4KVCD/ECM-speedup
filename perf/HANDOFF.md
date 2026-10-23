@@ -2572,6 +2572,13 @@ identical; intra pictures on the GPU 1 -> 17 of 331 pictures; the CPU's intra pi
 IBC / palette CU 16; DBV with LM chroma fusion 10; CCLM with LFNST / NSPT without DIMD 2; BVG-CCCM 2; IntraTMP OBMC with
 a neighbour of two vectors or inter 2; IntraTMP above 1024 samples 1; IntraTMP fusion / FLM above 10 bits 1; DBV with LM
 chroma fusion, LIC or a flip 1.
+Chroma reordering over an NN CU without DIMD (2026-10-22, agent st): partial verification of ra_off4_q32 (an SPS without
+DIMD) differed in its intra picture: indicesRepresentationPnn of an NN CU, CPU planar, GPU 63, and from there a chroma
+reordering CU's DM. befb9754e (chroma reordering) has every NN block of a dual tree with reordering derive the DIMD of
+its prediction (DERIVE_PNN_DIMD) for that DM, but without DIMD in the SPS xPredIntraPnn's deriveIpmForTransform returns
+planar at once (M86: the host sets planar and DC). Now no such derivation without DIMD, and the reordering CU takes the
+host's mode then. Results (agst53): partial verification of ra_off4_q32, ra_off15_q32, ai_off15_q27, ra_off1_q32
+identical; ON mode (--GpuRecon=3) on the 50 streams identical, 17 intra pictures on the GPU.
 
 
 ## 8. Numbers (i7-10700 8C/16T, Win11, GCC 16.2, RTX 3070 driver 616.92)

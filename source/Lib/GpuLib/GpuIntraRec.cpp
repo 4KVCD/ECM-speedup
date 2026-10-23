@@ -3612,12 +3612,14 @@ static bool chromaReorderCu( GpuIntraRec::Impl& m, const CodingUnit& cu, const P
   std::copy_n( nbr, 10, c.nbr );
   c.ipredIdx = idx->second;
   // the DM mode (getCoLocatedIntraLumaMode): the co-located luma CU's mode as its record has it, of an NN CU the DIMD
-  // of its prediction its block derives (getCoLocatedIdxRepresentationPnn; of one from the CPU the CPU's)
+  // of its prediction its block derives (getCoLocatedIdxRepresentationPnn; of one from the CPU the CPU's; without
+  // DIMD in the SPS planar, which the host has set at its block)
   c.nbr[CR_NBR_DM] = -1;
   if( PU::getCoLocatedIntraLumaMode( pu ) == PNN_IDX )
   {
     const CodingUnit& lumaCu = *PU::getCoLocatedLumaPU( pu ).cu;
-    c.nbr[CR_NBR_DM] = m.cpuCus.count( &lumaCu ) ? (int32_t) lumaCu.indicesRepresentationPnn[COMPONENT_Y][0] : -2;
+    c.nbr[CR_NBR_DM]         = m.cpuCus.count( &lumaCu ) || !sps.getUseDimd()
+                                 ? (int32_t) lumaCu.indicesRepresentationPnn[COMPONENT_Y][0] : -2;
   }
   // DBV (hasChromaBvFlag): deriveChromaBv's sources, the luma CUs at the five positions with a block vector (IBC,
   // IntraTMP, BVG-DIMD, EIP with a vector) in its order, each as the GPU reads its vector - a GPU CU's record (its
@@ -6867,8 +6869,8 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
   }
 #if GPU_CHROMA_REORDER
   // an NN block's DIMD of its prediction (indicesRepresentationPnn) also where its transforms do not read it (no
-  // coefficients, transform skip): the DM mode of chroma reordering's list (getCoLocatedIdxRepresentationPnn)
-  // (without DIMD in the SPS the host's planar and DC: M86)
+  // coefficients, transform skip): the DM mode of chroma reordering's list (getCoLocatedIdxRepresentationPnn); none
+  // without DIMD in the SPS (planar, the host's: above)
   if( pnn && cuIdx >= 0 && !( t.derive & DERIVE_PNN_DIMD ) && sps.getUseChromaReordering() && CS::isDualITree( cs )
       && sps.getUseDimd() )
   {
