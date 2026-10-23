@@ -449,7 +449,7 @@ wall-clock gains with threads are "the easy baseline". Decoder status: single-th
 (`--GpuLoopFilter=1`: ALF, SAO, BIF, CCSAO, LF-CCCM, offset refinement on Vulkan). The user then asked for **a full
 GPU decoder in Vulkan, optimized until nothing is left** ("The GPU decoder needs to fully decode the frame on the
 GPU"; "Your first Vulkan version is going to be slow. That's OK"). That work is branch `dec-gpurecon`: intra
-reconstruction on the GPU (`--GpuRecon`), tool levels M1-M99 done and verified bit-exact (M19: DIMD, M20: OBIC, M21:
+reconstruction on the GPU (`--GpuRecon`), tool levels M1-M102 done and verified bit-exact (M19: DIMD, M20: OBIC, M21:
 intra merge, M22: the transforms of DIMD CUs, M23: LFNST of MIP, M24: TIMD, M25: OBIC and intra merge with TIMD
 neighbours, M26: TIMD-SAD, M27: OBIC and intra merge with TIMD-SAD neighbours, M28: TIMD merge, M29: TMRL of luma,
 M30: chroma TMRL, M31: CCLM, M32: LFNST / NSPT of CCLM, M33: GLM's gradient patterns, M34: CCCM, M35: GL-CCCM, M36:
@@ -2352,12 +2352,46 @@ the CU's one-sample templates), chooses each segment's mode as selectOBMCmode do
 template (inverse-mapped with LMCS) against the current motion's, the neighbour's and their 26/6 blend, without
 DISTORTION_PRECISION_ADJUSTMENT as FULL_NBIT is set - and blends the band's samples in place in Params::interPred
 (weightObmcBoundary's 26/6, 28/4, 30/2, 31/1 from the mode's first row; chroma one row; the top segments, then the
-left ones over their result; the SIMD kernel's per-row weights are the same fractions), before the inter LFNST's
-DIMD, sign prediction and LMCS read the prediction (coherent reads). The verifier's mirror of the scheduling data adds
-the same template owners. Found on the way (ra_foreman_q22): RdCost's SAD keeps all bits here, a shift by bd - 8 chose
+left ones over their result; the SIMD kernel's per-row weights are the same fractions), before the inter LFNST's DIMD,
+sign prediction and LMCS read the prediction (coherent reads). The verifier's mirror of the scheduling data adds the
+same template owners. Found on the way (ra_foreman_q22): RdCost's SAD keeps all bits here, a shift by bd - 8 chose
 other modes. Still the CPU's, by reason (partial.py's "OBMC (...)"): OBMC of sub-block motion (DMVR CUs: inner
 sub-block OBMC), LIC / non-local LIC neighbours, intra neighbours with DIMD (JVET-AJ0161's intra OBMC), IBC
-neighbours. Results (50 streams, build gpu42): RESULTS_M99.
+neighbours. Results (50 streams, build gpu42): every picture identical; OBMC 3000 CUs predicted by the GPU; from the
+CPU: OBMC (its base prediction - the DMVR CUs, whose inner sub-block OBMC M100 adds) 3083, OBMC with a LIC neighbour
+481, with an intra neighbour 327, with an IBC neighbour 4.
+M100 (2026-10-23): OBMC of DMVR CUs on the GPU (subBlockOBMC's bSubMotion: the boundaries at the CU's stored sub-PU
+motion, then the inner sub-blocks). The host lays out per 4 x 4 inner sub-block the neighbours inside the CU whose
+motion differs (getNeighborMotion with JVET-AL0081's threshold: half a sample for bi-prediction from one direction at
+unequal distances, else 1) into inner jobs (OBMC_I_*: one MC job per neighbour); inter_mc.comp's mode 4 predicts them
+after the blocks' jobs, and intra_rec blends them in place after the boundaries' segments (xSubblockOBMCBlending: luma
+per position with currWeights for the set of differing neighbours and neigWeights per neighbour, in 1/128; chroma's
+2 x 2 with the corner's two neighbours at 27/128 each). Results with M101.
+M101 (2026-10-23): OBMC with LIC and non-local LIC neighbours on the GPU. A LIC neighbour's band and its templates take
+the neighbour's stored models (JVET-AD0213: per list and component, a list it lacks 32 / 0; uni-prediction from list 1
+reads list 1's - MC_L1); bi-prediction applies them to each list's 14-bit intermediate as xLicCompAdj's OBMC branch
+does (mcLicBi); a non-local LIC neighbour's model (JVET-AG0276, secAltLMParaUnit) goes on the band's final prediction.
+skipObmcConditionByPixel uses the model the CPU's band prediction left in m_iRefListIdx (list 1 after bi-prediction,
+else its one list) for both lists. Results (50 streams, build gpu47, M100 and M101): every picture identical; OBMC
+6353 CUs predicted by the GPU; from the CPU: OBMC with an intra neighbour 418, its base prediction 120, with an IBC
+neighbour 4.
+M102 (2026-10-23): affine prediction on the GPU (xPredAffineBlk per list, then xPredInterBi's average), with OBMC at
+the boundaries (JVET-AL0079: affine without affine BDOF has no inner sub-block OBMC). The host writes a record per CU
+(inter_mc.comp's AF_*, Params' mcAffineBuf) as xPredAffineBlk derives it per list and component class: the base vector
+and deltas of the control points (4- / 6-parameter), the adaptive sub-block size (JVET-AC0158: from 1 up while the
+scaled delta stays below the threshold, a quarter for luma; pixel blocks where a side stays below 4), PROF (luma
+sub-blocks of 4 x 4 and up, unless the picture header disables it or the motion is translational),
+xCheckIdenticalMotion, BCW, and the stored luma motion per 4 x 4 unit that chroma's sub-blocks average. A block's job
+with MC_AFFINE predicts per sample: its sub-block's vector (roundAffineMv to 1/16, clipToStorageBitDepth, clipMvInl;
+luma at 1/64 through m_lumaFilter64 - JVET-AJ0158, appended to the filters - where the integer parts agree), PROF's
+refinement of the intermediate by the per-position offsets and 3-tap gradients (the ring around the sub-block the
+integer samples), bi-prediction's average with BCW and per-sub-block out-of-boundary samples. Still the CPU's, by
+reason (partial.py's "affine (...)"): affine BDOF and its inner OBMC, LIC / non-local LIC, sub-block merge, CIIP
+(geneWeightedCIIPAffinePred: found on the way, ra_foreman_q22 - the CIIP blend runs after OBMC), DMVR, intra / IBC
+neighbours of OBMC. Results (50 streams, build gpu52): every picture identical (ra_wpp_q32 skipped as before,
+wavefronts); affine 1028 CUs predicted by the GPU; from the CPU: affine (sub-block merge) 810, (with LIC) 663, (OBMC
+of sub-block motion: affine BDOF) 663, (CIIP) 197, (OBMC with an intra neighbour) 132, (other: affineGpu's remaining
+conditions) 97, (OBMC with an IBC neighbour) 4.
 
 
 ## 8. Numbers (i7-10700 8C/16T, Win11, GCC 16.2, RTX 3070 driver 616.92)

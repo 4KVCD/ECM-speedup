@@ -43,6 +43,7 @@ layout( push_constant ) uniform PushMc
   uint64_t outPred;   // Params::interPred (int16)
   uint64_t bdofOut;   // BDOF PUs' luma predictions, DMVR PUs' predictions (int16, McJob's MC_BDOF_OUT)
   uint64_t scratch;   // DMVR PUs' scratch (int32: their BDOF offsets, two tiles)
+  uint64_t affine;    // affine PUs' records (int32, AF_*)
   int      numJobs;
   int      mode;      // 0: the blocks' jobs, 1: BDOF's sub-block jobs, 2: DMVR's PUs (1 and 2 before 0), 3: OBMC's
                       // segments (pc.scratch: the blocks' jobs), 4: OBMC's inner sub-blocks
@@ -67,6 +68,7 @@ const int MC_BI       = 2;   // two lists, averaged
 const int MC_BDOF     = 4;   // BDOF's luma
 const int MC_NO_MEAN  = 8;   // BDOF without the mean removal (noMeanRm4Sample)
 const int MC_L1       = 64;  // uni-prediction from list 1 (LIC's model)
+const int MC_AFFINE   = 128; // an affine PU's block: its record at MC_BDOF_OUT in pc.affine (afSample)
 // McRef (int32) per slot and component: the index of sample (0, 0) in pc.planes, the stride, the size, the margin
 const int MC_REF_ORIGIN = 0, MC_REF_STRIDE = 1, MC_REF_W = 2, MC_REF_H = 3, MC_REF_MARGIN = 4;
 const int MC_REF_COMP = 5;
@@ -75,6 +77,7 @@ const int MC_REF_COMP = 5;
 const int MC_FILT_LUMA = 0, MC_FILT_LUMA_BI = 16 * 12, MC_FILT_ALT = 2 * 16 * 12, MC_FILT_CHROMA = MC_FILT_ALT + 8;
 const int MC_FILT_BDOF_W = MC_FILT_CHROMA + 32 * 6;
 const int MC_FILT_CUBIC  = MC_FILT_BDOF_W + 1600;   // g_aiExtIntraCubicFilter (64 x 4): the TM filter (JVET-AL0161)
+const int MC_FILT_L64    = MC_FILT_CUBIC + 64 * 4;   // m_lumaFilter64 (64 x 12): affine's 1/64 luma (JVET-AJ0158)
 
 const int IF_INTERNAL_PREC = 14, IF_FILTER_PREC = 8, IF_INTERNAL_OFFS = 1 << ( IF_INTERNAL_PREC - 1 );
 const int BCW_LOG2_WEIGHT_BASE = 3;   // g_bcwLog2WeightBase
@@ -86,7 +89,8 @@ int refAt( int slot, int comp, int x, int y )
   return int( BufI16( pc.planes ).v[r.v[b + MC_REF_ORIGIN] + y * r.v[b + MC_REF_STRIDE] + x] );
 }
 
-bool mcTm = false;   // mcPredictTaps: the 4-tap TM filter for luma (filterIdx 1 with use4TapTM)
+bool mcTm  = false;   // mcPredictTaps: the 4-tap TM filter for luma (filterIdx 1 with use4TapTM)
+bool mcF64 = false;   // affine: m_lumaFilter64's 1/64 taps for luma (filterIdx -2)
 
 // the taps of one pass: the table's start and the tap count (filterHor / filterVer's choice for this fraction; the
 // sharp bi-prediction filter where the pass's block is above 4 x 4)
@@ -95,6 +99,10 @@ ivec2 mcTaps( bool luma, int frac, bool altHpel, bool sharp )
   if( mcTm && luma )
   {
     return ivec2( MC_FILT_CUBIC + ( frac << 2 ) * 4, 4 );
+  }
+  if( mcF64 && luma )
+  {
+    return ivec2( MC_FILT_L64 + frac * 12, 12 );
   }
   if( !luma )
   {
@@ -874,6 +882,180 @@ void dmvrJob( int o )
 
 // ----- the blocks' jobs (mode 0)
 
+// ----- affine (InterPrediction::xPredAffineBlk per list, then xPredInterBi's average): a block's job with MC_AFFINE
+// reads its PU's record in pc.affine (AF_*), per sample: its sub-block of the list's adaptive size (from the control
+// points' deltas: 4 x 4 and up, or JVET-AC0158's pixel blocks below 4), the sub-block's vector (rounded to 1/16 and
+// clipped; luma at 1/64 with m_lumaFilter64 where its integer part agrees - JVET-AJ0158 -, chroma the average of the
+// stored luma motion of the sub-block's corner units, or with pixel blocks its own vector), with PROF (luma sub-blocks
+// of 4 x 4 and up: the intermediate refined by the per-position vector offsets and the 3-tap gradients, the ring
+// around the sub-block integer samples), bi-prediction's average with BCW and the out-of-boundary samples per
+// sub-block
+const int AF_X = 0, AF_Y = 1, AF_W = 2, AF_H = 3, AF_BI = 4, AF_LIST = 5, AF_SHIFT = 6, AF_W0 = 7, AF_W1 = 8;
+const int AF_HMAX = 9, AF_HMIN = 10, AF_VMAX = 11, AF_VMIN = 12, AF_PIC_W = 13, AF_PIC_H = 14, AF_BD = 15;
+const int AF_CLIP_MIN = 16, AF_CLIP_MAX = 17, AF_MVF = 18, AF_C0 = 20;
+// per list and component class (luma, chroma): the base vector (mvLT << iBit), the deltas, the sub-block size, pixel
+// blocks, PROF, the slot
+const int AF_MVH = 0, AF_MVV = 1, AF_DHX = 2, AF_DHY = 3, AF_DVX = 4, AF_DVY = 5, AF_BW = 6, AF_BH = 7, AF_1X1 = 8;
+const int AF_PROF = 9, AF_SLOT = 10, AF_C = 12;
+
+int afJ( int r, int f )
+{
+  return BufI32( pc.affine ).v[r + f];
+}
+
+// roundAffineMv
+ivec2 afRound( ivec2 v, int s )
+{
+  return ( v + ( 1 << ( s - 1 ) ) - ivec2( greaterThanEqual( v, ivec2( 0 ) ) ) ) >> s;
+}
+
+// clipToStorageBitDepth, then clipMvInl at the PU
+ivec2 afClip( int r, ivec2 mv )
+{
+  mv = clamp( mv, ivec2( -( 1 << 17 ) ), ivec2( ( 1 << 17 ) - 1 ) );
+  return ivec2( clamp( mv.x, ( afJ( r, AF_HMIN ) - afJ( r, AF_X ) ) << 4, ( afJ( r, AF_HMAX ) - afJ( r, AF_X ) ) << 4 ),
+                clamp( mv.y, ( afJ( r, AF_VMIN ) - afJ( r, AF_Y ) ) << 4, ( afJ( r, AF_VMAX ) - afJ( r, AF_Y ) ) << 4 ) );
+}
+
+// list l's sub-block of component comp's sample (x, y) relative to the PU: its origin, size, vector (1/16 luma), luma's
+// 1/64 fractions
+void afSubBlock( int r, int l, int comp, int x, int y, out ivec2 org, out ivec2 size, out ivec2 mv, out ivec2 frac64 )
+{
+  const int  c  = r + AF_C0 + ( l * 2 + ( comp == 0 ? 0 : 1 ) ) * AF_C;
+  const int  bw = afJ( c, AF_BW ), bh = afJ( c, AF_BH ), shift = afJ( r, AF_SHIFT );
+  const bool px = afJ( c, AF_1X1 ) != 0;
+  org  = ivec2( x - x % bw, y - y % bh );
+  size = ivec2( bw, bh );
+  if( comp != 0 && !px )   // (chroma: the stored luma motion of the corner units, xPredAffineBlk's miLine / miLine2)
+  {
+    BufI32    a  = BufI32( pc.affine );
+    const int uw = afJ( r, AF_W ) >> 2;
+    const int u0 = afJ( r, AF_MVF ) + ( ( org.y >> 1 ) * uw + ( org.x >> 1 ) ) * 4 + l * 2;
+    const int u1 = u0 + ( uw + 1 ) * 4;
+    mv     = afRound( ivec2( a.v[u0] + a.v[u1], a.v[u0 + 1] + a.v[u1 + 1] ), 1 );
+    mv     = ivec2( clamp( mv.x, ( afJ( r, AF_HMIN ) - afJ( r, AF_X ) ) << 4, ( afJ( r, AF_HMAX ) - afJ( r, AF_X ) ) << 4 ),
+                    clamp( mv.y, ( afJ( r, AF_VMIN ) - afJ( r, AF_Y ) ) << 4, ( afJ( r, AF_VMAX ) - afJ( r, AF_Y ) ) << 4 ) );
+    frac64 = ivec2( 0 );
+    return;
+  }
+  const ivec2 base = ivec2( afJ( c, AF_MVH ), afJ( c, AF_MVV ) )
+                     + ( ( ivec2( afJ( c, AF_DHX ), afJ( c, AF_DHY ) ) * bw + ivec2( afJ( c, AF_DVX ), afJ( c, AF_DVY ) ) * bh ) >> 1 );
+  const ivec2 v  = base + ivec2( afJ( c, AF_DHX ), afJ( c, AF_DHY ) ) * org.x + ivec2( afJ( c, AF_DVX ), afJ( c, AF_DVY ) ) * org.y;
+  const ivec2 hp = afRound( v, shift - 2 );
+  mv             = afClip( r, afRound( v, shift ) );
+  if( comp == 0 )   // (the 1/64 fraction where its integer part is the clipped vector's, else the 1/16 one's)
+  {
+    frac64 = ( hp >> 6 ) == ( mv >> 4 ) ? hp & 63 : ( mv & 15 ) << 2;
+    if( ( hp.x >> 6 ) != ( mv.x >> 4 ) || ( hp.y >> 6 ) != ( mv.y >> 4 ) )
+    {
+      frac64 = ( mv & 15 ) << 2;
+    }
+  }
+  else
+  {
+    frac64 = ivec2( 0 );
+  }
+}
+
+// list l's prediction of component comp at sample (x, y) relative to the PU before PROF (bi: the intermediate)
+int afPredict( int r, int l, int comp, int x, int y, ivec2 mv, ivec2 frac64, ivec2 size, bool bi )
+{
+  const int c  = r + AF_C0 + ( l * 2 + ( comp == 0 ? 0 : 1 ) ) * AF_C, slot = afJ( c, AF_SLOT );
+  const int cs = comp == 0 ? 0 : 1;
+  const int ax = ( afJ( r, AF_X ) >> cs ) + x, ay = ( afJ( r, AF_Y ) >> cs ) + y;
+  const int bd = afJ( r, AF_BD ), clipMin = afJ( r, AF_CLIP_MIN ), clipMax = afJ( r, AF_CLIP_MAX );
+  if( comp == 0 )
+  {
+    mcF64       = true;
+    const int v = mcPredict( slot, 0, ax + ( mv.x >> 4 ), ay + ( mv.y >> 4 ), frac64.x, frac64.y, false, bi, size.x, size.y, bd,
+                             clipMin, clipMax );
+    mcF64       = false;
+    return v;
+  }
+  return mcPredict( slot, comp, ax + ( mv.x >> 5 ), ay + ( mv.y >> 5 ), mv.x & 31, mv.y & 31, false, bi, size.x, size.y, bd,
+                    clipMin, clipMax );
+}
+
+// PROF's intermediate at (u, v) relative to the PU: inside the sub-block its prediction, on the ring around it the
+// integer sample at the rounded vector (leftShift_round - IF_INTERNAL_OFFS)
+int afProfP( int r, int l, int u, int v, ivec2 org, ivec2 size, ivec2 mv, ivec2 frac64 )
+{
+  if( u >= org.x && u < org.x + size.x && v >= org.y && v < org.y + size.y )
+  {
+    return afPredict( r, l, 0, u, v, mv, frac64, size, true );
+  }
+  const int c = r + AF_C0 + l * 2 * AF_C, shift = max( 2, IF_INTERNAL_PREC - afJ( r, AF_BD ) );
+  const int s = refAt( afJ( c, AF_SLOT ), 0, afJ( r, AF_X ) + u + ( mv.x >> 4 ) + ( frac64.x >> 5 ),
+                       afJ( r, AF_Y ) + v + ( mv.y >> 4 ) + ( frac64.y >> 5 ) );
+  return int( int16_t( ( s << shift ) - IF_INTERNAL_OFFS ) );
+}
+
+// list l's sample of component comp at (x, y) relative to the PU (uni: final; bi: the 14-bit intermediate)
+int afList( int r, int l, int comp, int x, int y, bool bi )
+{
+  ivec2 org, size, mv, frac64;
+  afSubBlock( r, l, comp, x, y, org, size, mv, frac64 );
+  const int c = r + AF_C0 + ( l * 2 + ( comp == 0 ? 0 : 1 ) ) * AF_C;
+  if( comp != 0 || afJ( c, AF_PROF ) == 0 )
+  {
+    return afPredict( r, l, comp, x, y, mv, frac64, size, bi );
+  }
+  // PROF: the 4 x 4 pattern of vector offsets (rounded by 1 << (iBit + 1), clipped to +-31), the gradients
+  const int src = afPredict( r, l, 0, x, y, mv, frac64, size, true );
+  const int gx  = int( int16_t( ( afProfP( r, l, x + 1, y, org, size, mv, frac64 ) >> 6 )
+                                - ( afProfP( r, l, x - 1, y, org, size, mv, frac64 ) >> 6 ) ) );
+  const int gy  = int( int16_t( ( afProfP( r, l, x, y + 1, org, size, mv, frac64 ) >> 6 )
+                                - ( afProfP( r, l, x, y - 1, org, size, mv, frac64 ) >> 6 ) ) );
+  const ivec2 dh = ivec2( afJ( c, AF_DHX ), afJ( c, AF_DHY ) ), dv = ivec2( afJ( c, AF_DVX ), afJ( c, AF_DVY ) );
+  const ivec2 d0 = ( ( dh + dv ) << 1 ) - ( ( ( dh << 2 ) + ( dv << 2 ) ) << 1 );
+  const ivec2 dm = clamp( afRound( d0 + ( dh << 2 ) * ( x & 3 ) + ( dv << 2 ) * ( y & 3 ), afJ( r, AF_SHIFT ) + 1 ), ivec2( -31 ),
+                          ivec2( 31 ) );
+  const int bd = afJ( r, AF_BD ), lim = 1 << max( bd + 1, 13 );
+  const int dI = clamp( dm.x * gx + dm.y * gy, -lim, lim - 1 );
+  const int p  = int( int16_t( src + dI ) );
+  if( bi )
+  {
+    return p;
+  }
+  const int shiftNum = max( 2, IF_INTERNAL_PREC - bd );
+  return clamp( ( p + ( 1 << ( shiftNum - 1 ) ) + IF_INTERNAL_OFFS ) >> shiftNum, afJ( r, AF_CLIP_MIN ), afJ( r, AF_CLIP_MAX ) );
+}
+
+// isMvOOBSubBlk of list l at luma sample (lx, ly) relative to the PU: its sub-block's (at least 4 x 4) clipped vector
+bool afOob( int r, int l, int lx, int ly )
+{
+  const int c  = r + AF_C0 + l * 2 * AF_C;
+  const int bw = afJ( c, AF_BW ), bh = afJ( c, AF_BH );
+  const int sw = max( bw, 4 ), sh = max( bh, 4 );
+  ivec2     org, size, mv, frac64;
+  afSubBlock( r, l, 0, lx - lx % sw, ly - ly % sh, org, size, mv, frac64 );
+  const int ox = ( ( afJ( r, AF_X ) + lx ) << 4 ) + mv.x, oy = ( ( afJ( r, AF_Y ) + ly ) << 4 ) + mv.y;
+  return ox <= -8 || ox >= ( ( afJ( r, AF_PIC_W ) - 1 ) << 4 ) + 8 || oy <= -8 || oy >= ( ( afJ( r, AF_PIC_H ) - 1 ) << 4 ) + 8;
+}
+
+// an affine PU's sample of component comp at (x, y) (the component's coordinates)
+int afSample( int r, int comp, int x, int y )
+{
+  const int cs = comp == 0 ? 0 : 1;
+  const int px = x - ( afJ( r, AF_X ) >> cs ), py = y - ( afJ( r, AF_Y ) >> cs );
+  if( afJ( r, AF_BI ) == 0 )
+  {
+    return afList( r, afJ( r, AF_LIST ), comp, px, py, false );
+  }
+  const int  p0 = afList( r, 0, comp, px, py, true ), p1 = afList( r, 1, comp, px, py, true );
+  const bool o0 = afOob( r, 0, px << cs, py << cs ), o1 = afOob( r, 1, px << cs, py << cs );
+  const int  bd = afJ( r, AF_BD ), headRoom = max( 2, IF_INTERNAL_PREC - bd );
+  const int  clipMin = afJ( r, AF_CLIP_MIN ), clipMax = afJ( r, AF_CLIP_MAX );
+  if( o0 != o1 )
+  {
+    return clamp( ( ( o0 ? p1 : p0 ) + ( 1 << ( headRoom - 1 ) ) + IF_INTERNAL_OFFS ) >> headRoom, clipMin, clipMax );
+  }
+  const int shiftNum = headRoom + BCW_LOG2_WEIGHT_BASE;
+  return clamp( ( p0 * afJ( r, AF_W0 ) + p1 * afJ( r, AF_W1 ) + ( 1 << ( shiftNum - 1 ) ) + ( IF_INTERNAL_OFFS << BCW_LOG2_WEIGHT_BASE ) )
+                  >> shiftNum,
+                clipMin, clipMax );
+}
+
 // LIC's model of list l and component comp at lo (scale, offset: the neighbour's stored one, JVET-AD0213) on a sample
 // (linearTransform: (scale v >> 5) + offset, clipped)
 int mcLic( BufI32 jb, int lo, int l, int comp, int v, int clipMin, int clipMax )
@@ -903,6 +1085,10 @@ int mcSample( BufI32 jb, int o, int comp, int x, int y, int puW, int puH, int bd
   const ivec2 mv0 = ivec2( jb.v[o + MC_MVX], jb.v[o + MC_MVY] ), mv1 = ivec2( jb.v[o + MC_MV1X], jb.v[o + MC_MV1Y] );
   const int   slot0 = jb.v[o + MC_REF], slot1 = jb.v[o + MC_REF1];
   const int   headRoom = max( 2, IF_INTERNAL_PREC - bd );
+  if( ( flags & MC_AFFINE ) != 0 )
+  {
+    return afSample( jb.v[o + MC_BDOF_OUT], comp, x, y );
+  }
   if( ( flags & MC_BDOF ) != 0 )   // the PU's BDOF / DMVR prediction
   {
     return int( BufI16( pc.bdofOut )
