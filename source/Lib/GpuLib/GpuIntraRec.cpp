@@ -8807,6 +8807,326 @@ void GpuIntraRec::dmvrVectors( const CodingUnit& cu, const Mv* list0, const Mv* 
   }
 }
 
+// ON mode's side information of an intra picture: what the later pictures read of it, which the CPU derives in its
+// reconstruction - the CU's luma intra modes (spanIpmInfoIntra / spanIpmInfoSgpm; spanIpmInfoInter reads them from the
+// reference pictures), the motion of a CU with a block vector (IntraTMP, BVG-DIMD, EIP with a vector: spanMotionInfo,
+// its IPM spanIpmInfoIBC's, the referenced unit's), the CCP models (CS::saveTemporalCcpModel's curCand) and the EIP
+// models (CS::saveTemporalEipModel's eipModel) - from the GPU's outputs (gModes: the CUs' modes, gDimd: their DimdOut,
+// gEip: the EIP CUs' models, gCcp: the CCP records): written into the CPU's CUs (ON mode) or, in verification, compared
+// with the CPU's (the first difference; empty where none)
+static std::string sideInformation( GpuIntraRec::Impl& m, const CodingStructure& csIn, const int32_t* gModes,
+                                    const int32_t* gDimd, const int32_t* gEip, const int32_t* gCcp, bool write )
+{
+  CodingStructure& cs = const_cast<CodingStructure&>( csIn );
+  char             buf[200];
+  auto differs = [&]( const char* what, const CodingUnit& cu, long long cpu, long long gpu )
+  {
+    const CompArea& a = cu.blocks[cu.chType == CHANNEL_TYPE_LUMA ? COMPONENT_Y : COMPONENT_Cb];
+    snprintf( buf, sizeof( buf ), "%s of the %s CU at %d,%d %dx%d: CPU %lld GPU %lld", what,
+              cu.chType == CHANNEL_TYPE_LUMA ? "luma" : "chroma", a.x, a.y, a.width, a.height, cpu, gpu );
+    return std::string( buf );
+  };
+  auto unpack = []( int32_t w ) { return Mv( int16_t( w & 0xFFFF ), int16_t( uint32_t( w ) >> 16 ) ); };
+  auto pack   = []( const Mv& v ) { return ( (long long) v.ver << 32 ) | (long long) uint32_t( v.hor ); };
+  // the luma CUs in decoding order (an IPM from a block vector reads the referenced unit's, final before it)
+  for( CodingUnit* cuPtr: cs.cus )
+  {
+    CodingUnit& cu = *cuPtr;
+    if( !CU::isIntra( cu ) || !cu.blocks[COMPONENT_Y].valid() || m.cpuCus.count( &cu ) )
+    {
+      continue;
+    }
+    const auto rec = m.cuIndex[CHANNEL_TYPE_LUMA].find( &cu );
+    if( rec == m.cuIndex[CHANNEL_TYPE_LUMA].end() )
+    {
+      continue;
+    }
+    const int       r     = rec->second;
+    const int       kind  = m.cus[r].kind;
+    const int32_t*  d     = gDimd + size_t( r ) * DIMD_OUT;
+    PredictionUnit& pu    = *cu.firstPU;
+#if JVET_AL0106_BV_EIP
+    const bool      eipBv = kind == CU_EIP && PU::isBvEip( pu );
+#else
+    const bool      eipBv = false;
+#endif
+    if( kind == CU_TMP || kind == CU_BVG || eipBv )   // (its vector the GPU's; its IPM the referenced unit's)
+    {
+      const Mv mv = kind == CU_TMP ? Mv( d[DIMD_OUT_TMP_MV], d[DIMD_OUT_TMP_MV + 1] )
+                                   : Mv( unpack( d[kind == CU_BVG ? DIMD_OUT_BVG_BV : DIMD_OUT_BV] ).hor * 16,
+                                         unpack( d[kind == CU_BVG ? DIMD_OUT_BVG_BV : DIMD_OUT_BV] ).ver * 16 );
+      // (an IntraTMP CU's bv the integer one of its list, of fusion the fused set's first: its mv may be a sub-sample
+      // one's; else the mv's)
+      Mv bv( mv.hor >> 4, mv.ver >> 4 );
+#if GPU_TMP
+      if( kind == CU_TMP && cu.tempType != NO_TEMPLATE )
+      {
+        bv = unpack( d[DIMD_OUT_TMP_BV + ( cu.tmpFusionFlag ? getTmpFusionIdx( cu.tmpIdx ) : cu.tmpIdx )] );
+      }
+#endif
+      if( !write )
+      {
+        if( pu.mv[REF_PIC_LIST_0] != mv )
+        {
+          return differs( "mv[0] (packed)", cu, pack( pu.mv[REF_PIC_LIST_0] ), pack( mv ) );
+        }
+        if( pu.bv != bv )
+        {
+          return differs( "bv (packed)", cu, pack( pu.bv ), pack( bv ) );
+        }
+        continue;
+      }
+      pu.interDir               = 1;
+      pu.refIdx[REF_PIC_LIST_0] = MAX_NUM_REF;
+      pu.mv[REF_PIC_LIST_0]     = mv;
+      pu.bv                     = bv;
+      PU::spanMotionInfo( pu );
+      continue;
+    }
+#if JVET_AB0155_SGPM
+    if( kind == CU_SGPM )   // (its partition and its parts' modes the GPU's)
+    {
+      const int split = d[DIMD_OUT_SGPM_SPLIT], mode0 = d[DIMD_OUT_SGPM_MODE], mode1 = d[DIMD_OUT_SGPM_MODE + 1];
+      if( !write )
+      {
+        if( cu.sgpmSplitDir != split || cu.sgpmMode0 != mode0 || cu.sgpmMode1 != mode1 )
+        {
+          return differs( "sgpmSplitDir, sgpmMode0, sgpmMode1 (packed)", cu,
+                          ( cu.sgpmSplitDir << 20 ) | ( cu.sgpmMode0 << 10 ) | cu.sgpmMode1,
+                          ( split << 20 ) | ( mode0 << 10 ) | mode1 );
+        }
+        continue;
+      }
+      cu.sgpmSplitDir = split;
+      cu.sgpmMode0    = mode0;
+      cu.sgpmMode1    = mode1;
+      PU::spanIpmInfoSgpm( pu );
+      continue;
+    }
+#endif
+    if( kind == CU_MPM || kind == CU_DIMD || kind == CU_OBIC || kind == CU_MERGE || kind == CU_TIMD || kind == CU_TMRL )
+    {
+      const int ipm = gModes[r];
+      if( !write )
+      {
+        const int cpu = cs.getIpmInfo( cu.lumaPos() );
+        if( cpu != ipm )
+        {
+          return differs( "IPM", cu, cpu, ipm );
+        }
+        continue;
+      }
+      pu.getIpmBuf().fill( uint8_t( ipm ) );
+    }
+  }
+#if JVET_AD0188_CCP_MERGE
+  // the CCP models: the GPU's records as the CPU's candidates (cpuCcpWords' fields; CCCM's with the bit depth of its
+  // models)
+  const int bitDepth = cs.sps->getBitDepth( CHANNEL_TYPE_LUMA );
+  for( const auto& pe: m.ccpIndex )
+  {
+    const PredictionUnit* puC = pe.first;
+    const int             r   = pe.second;
+    if( !puC || r >= (int) m.ccpPu.size() || m.ccpPu[r] != puC || !CU::isIntra( *puC->cu ) || m.cpuCus.count( puC->cu ) )
+    {
+      continue;
+    }
+    const int32_t*     o   = gCcp + size_t( r ) * CCP_OUT;
+    CCPModelCandidate& cpu = const_cast<PredictionUnit*>( puC )->curCand;
+    // (the fields the GPU has; the others, which the CPU's later use of the candidate does not read, stay - the
+    // second model's of one, the parameters past numParams)
+    CCPModelCandidate h = cpu;
+    auto get = [&]( bool second, int c, int p )
+    {
+      const int i = ( second ? CCP_OUT_PARAMS2 : CCP_OUT_PARAMS ) + 2 * ( c * CCP_MAX_PARAMS + p );
+      return int64_t( uint64_t( uint32_t( o[i] ) ) | ( uint64_t( uint32_t( o[i + 1] ) ) << 32 ) );
+    };
+    h.type           = o[CCP_OUT_TYPE];
+    h.ccInsideFilter = o[CCP_OUT_INSIDE];
+    h.glmIdc         = int8_t( o[CCP_OUT_GLM_IDC] );
+    const bool two   = ( h.type & CCP_TYPE_MMLM ) != 0;
+    if( two )
+    {
+      h.yThres = o[CCP_OUT_Y_THRES];
+    }
+    if( h.type & ( CCP_TYPE_CCLM | CCP_TYPE_GLM0123 ) )
+    {
+      h.numParams = o[CCP_OUT_NUM_PARAMS];
+      for( int c = 0; c < 2; c++ )
+      {
+        h.shift[c]     = o[CCP_OUT_SHIFT + c];
+        h.params[c][0] = get( false, c, 0 );
+        h.params[c][1] = get( false, c, 1 );
+        if( two )
+        {
+          h.shift2[c]     = o[CCP_OUT_SHIFT2 + c];
+          h.params2[c][0] = get( true, c, 0 );
+          h.params2[c][1] = get( true, c, 1 );
+        }
+      }
+    }
+    else if( h.type != 0 )
+    {
+      h.lumaOffset         = o[CCP_OUT_LUMA_OFFSET];
+      h.corOffX            = o[CCP_OUT_COR_OFF];
+      h.corOffY            = o[CCP_OUT_COR_OFF + 1];
+      h.cccmMultiFilterIdx = o[CCP_OUT_MDF];
+      h.numParams          = o[CCP_OUT_NUM_PARAMS];
+      h.bd                 = bitDepth;
+      h.midVal             = 1 << ( bitDepth - 1 );
+      const int32_t* rg    = o + CCP_OUT_RANGE;
+      h.rangeMinCb = rg[0], h.rangeMaxCb = rg[1], h.rangeChangeCb = rg[2] != 0;
+      h.rangeMinCr = rg[3], h.rangeMaxCr = rg[4], h.rangeChangeCr = rg[5] != 0;
+      if( two )
+      {
+        h.rangeMinCb2 = rg[6], h.rangeMaxCb2 = rg[7], h.rangeChangeCb2 = rg[8] != 0;
+        h.rangeMinCr2 = rg[9], h.rangeMaxCr2 = rg[10], h.rangeChangeCr2 = rg[11] != 0;
+      }
+      const int numParams = ( h.type & CCP_TYPE_GLM4567 ) ? GLM_NUM_PARAMS : std::min( h.numParams, CCP_MAX_PARAMS );
+      for( int k = 0; k < ( two ? 2 : 1 ); k++ )
+      {
+        for( int c = 0; c < 2; c++ )
+        {
+          for( int p = 0; p < numParams; p++ )
+          {
+            ( k ? h.params2 : h.params )[c][p] = get( k != 0, c, p );
+          }
+        }
+      }
+    }
+    if( write )
+    {
+      cpu = h;
+      continue;
+    }
+    // every field
+    const CodingUnit& cu = *puC->cu;
+    std::string       f;
+    auto cmp = [&]( const char* name, long long a, long long b )
+    {
+      if( f.empty() && a != b )
+      {
+        f = differs( ( std::string( "curCand." ) + name ).c_str(), cu, a, b );
+      }
+    };
+    cmp( "type", cpu.type, h.type );
+    for( int c = 0; c < 2; c++ )
+    {
+      for( int p = 0; p < NUM_CCP_PARAMS; p++ )
+      {
+        cmp( "params", cpu.params[c][p], h.params[c][p] );
+        cmp( "params2", cpu.params2[c][p], h.params2[c][p] );
+      }
+      cmp( "shift", cpu.shift[c], h.shift[c] );
+      cmp( "shift2", cpu.shift2[c], h.shift2[c] );
+    }
+    cmp( "yThres", cpu.yThres, h.yThres );
+    cmp( "bd", cpu.bd, h.bd );
+    cmp( "midVal", cpu.midVal, h.midVal );
+    cmp( "rangeMinCb", cpu.rangeMinCb, h.rangeMinCb );
+    cmp( "rangeMaxCb", cpu.rangeMaxCb, h.rangeMaxCb );
+    cmp( "rangeChangeCb", cpu.rangeChangeCb, h.rangeChangeCb );
+    cmp( "rangeMinCr", cpu.rangeMinCr, h.rangeMinCr );
+    cmp( "rangeMaxCr", cpu.rangeMaxCr, h.rangeMaxCr );
+    cmp( "rangeChangeCr", cpu.rangeChangeCr, h.rangeChangeCr );
+    cmp( "rangeMinCb2", cpu.rangeMinCb2, h.rangeMinCb2 );
+    cmp( "rangeMaxCb2", cpu.rangeMaxCb2, h.rangeMaxCb2 );
+    cmp( "rangeChangeCb2", cpu.rangeChangeCb2, h.rangeChangeCb2 );
+    cmp( "rangeMinCr2", cpu.rangeMinCr2, h.rangeMinCr2 );
+    cmp( "rangeMaxCr2", cpu.rangeMaxCr2, h.rangeMaxCr2 );
+    cmp( "rangeChangeCr2", cpu.rangeChangeCr2, h.rangeChangeCr2 );
+    cmp( "lumaOffset", cpu.lumaOffset, h.lumaOffset );
+    cmp( "corOffX", cpu.corOffX, h.corOffX );
+    cmp( "corOffY", cpu.corOffY, h.corOffY );
+    cmp( "cccmMultiFilterIdx", cpu.cccmMultiFilterIdx, h.cccmMultiFilterIdx );
+    cmp( "glmIdc", cpu.glmIdc, h.glmIdc );
+    cmp( "ccInsideFilter", cpu.ccInsideFilter, h.ccInsideFilter );
+    cmp( "numParams", cpu.numParams, h.numParams );
+    if( !f.empty() )
+    {
+      return f;
+    }
+  }
+#endif
+#if JVET_AG0058_EIP
+  // the EIP models: the GPU's (an EIP CU from the CPU keeps its own)
+  for( const auto& pe: m.eipIndex )
+  {
+    const int e = pe.second;
+    if( !pe.first || m.cpuCus.count( pe.first ) || ( e < (int) m.eipFromCpu.size() && m.eipFromCpu[e] ) )
+    {
+      continue;
+    }
+    const int32_t*    w = gEip + size_t( e ) * EIP_OUT;
+    EipModelCandidate h;
+    auto word64 = [&]( int i ) { return int64_t( uint64_t( uint32_t( w[i] ) ) | ( uint64_t( uint32_t( w[i + 1] ) ) << 32 ) ); };
+    for( int k = 0; k < EIP_TAPS; k++ )
+    {
+      h.params[k] = word64( EIP_OUT_PARAMS + 2 * k );
+#if JVET_AJ0082_MM_EIP
+      h.params1[k] = word64( EIP_OUT_PARAMS1 + 2 * k );
+#endif
+    }
+    h.filterShape = w[EIP_OUT_SHAPE];
+#if JVET_AJ0082_MM_EIP
+    h.bMm       = w[EIP_OUT_MM] != 0;
+    h.eipMmThrd = Pel( w[EIP_OUT_THRD] );
+#endif
+    // (the DIMD of its prediction: its block's, in the CU's DimdOut)
+    const auto rec = m.cuIndex[CHANNEL_TYPE_LUMA].find( pe.first );
+    if( rec == m.cuIndex[CHANNEL_TYPE_LUMA].end() )
+    {
+      continue;
+    }
+    h.eipDimdMode = gDimd[size_t( rec->second ) * DIMD_OUT];
+#if JVET_AK0217_INTRA_MTSS || JVET_AK0187_IMPLICIT_MTS_LUT_EXTENSION
+    h.eipDimdMode2nd = gDimd[size_t( rec->second ) * DIMD_OUT + DIMD_OUT_TR_SECOND];
+#endif
+    EipModelCandidate& cpu = const_cast<CodingUnit*>( pe.first )->eipModel;
+    if( write )
+    {
+      cpu = h;
+      continue;
+    }
+    const CodingUnit& cu = *pe.first;
+    for( int k = 0; k < EIP_TAPS; k++ )
+    {
+      if( cpu.params[k] != h.params[k] )
+      {
+        return differs( "eipModel.params", cu, cpu.params[k], h.params[k] );
+      }
+#if JVET_AJ0082_MM_EIP
+      if( cpu.params1[k] != h.params1[k] )
+      {
+        return differs( "eipModel.params1", cu, cpu.params1[k], h.params1[k] );
+      }
+#endif
+    }
+    if( cpu.filterShape != h.filterShape )
+    {
+      return differs( "eipModel.filterShape", cu, cpu.filterShape, h.filterShape );
+    }
+#if JVET_AJ0082_MM_EIP
+    if( cpu.bMm != h.bMm || cpu.eipMmThrd != h.eipMmThrd )
+    {
+      return differs( "eipModel.bMm, eipMmThrd (packed)", cu, cpu.bMm * 65536 + cpu.eipMmThrd, h.bMm * 65536 + h.eipMmThrd );
+    }
+#endif
+    if( cpu.eipDimdMode != h.eipDimdMode )
+    {
+      return differs( "eipModel.eipDimdMode", cu, cpu.eipDimdMode, h.eipDimdMode );
+    }
+#if JVET_AK0217_INTRA_MTSS || JVET_AK0187_IMPLICIT_MTS_LUT_EXTENSION
+    if( cpu.eipDimdMode2nd != h.eipDimdMode2nd )
+    {
+      return differs( "eipModel.eipDimdMode2nd", cu, cpu.eipDimdMode2nd, h.eipDimdMode2nd );
+    }
+#endif
+  }
+#endif
+  return std::string();
+}
+
 void GpuIntraRec::endPicture( const CodingStructure& cs )
 {
   Impl& m = *m_impl;
@@ -9549,6 +9869,7 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
   double         ms      = 0;
   const int16_t* gPlanes = nullptr;   // the downloaded results
   const int16_t* gResiPlane = nullptr;
+  const int32_t* gModesDl   = nullptr;
   const int16_t* gPredDl = nullptr;
   const Tu*      gTusDl  = nullptr;
   const int32_t* gOffDl  = nullptr;
@@ -10119,14 +10440,13 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
     // scheduling data and the derived parameters, then the planes
     size_t downBytes = 8;
     const size_t dPred = downBytes, dResi = dPred + dbgBytes, dTus = dResi + dbgBytes, dOffset = dTus + tuBytes;
-    const size_t dList = dOffset + ( n + 1 ) * 4, dParams = dList + cap * 4, dDimd = dParams + dbgParamsBytes;
-    // the EIP CUs' models, DimdOut, ObicOut, ..., the merge costs
+    const size_t dList = dOffset + ( n + 1 ) * 4, dParams = dList + cap * 4;
+    // the EIP CUs' models, DimdOut, ObicOut, ..., the merge costs (ON mode too: the side information, sideInformation)
+    const size_t dDimd = m.on ? downBytes : dParams + dbgParamsBytes;
     const size_t nodeOutBytes = eipOutBytes + costOffset + costBytes - cuBytes;
-    const size_t dCcp = dDimd + nodeOutBytes;                        // the CCP models
-    if( !m.on )
-    {
-      downBytes = dCcp + ccpBytes;
-    }
+    const size_t dCcp   = dDimd + nodeOutBytes;   // the CCP models
+    const size_t dModes = dCcp + ccpBytes;        // the CUs' modes
+    downBytes = dModes + modeBytes;
     size_t dPlane[3] = {};
     for( int c = 0; c < numComp; c++ )
     {
@@ -10290,14 +10610,18 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
       s.copy( m.sched, oOffset * 4, m.download, dOffset, ( n + 1 ) * 4 );
       s.copy( m.sched, oList * 4, m.download, dList, cap * 4 );
       s.copy( m.dbgParams, 0, m.download, dParams, dbgParamsBytes );
-      if( dimdOutBytes )   // the CUs' DIMD, the OBIC CUs' OBIC, the intra merge CUs' template costs
-      {
-        s.copy( m.cuBuf, cuBytes - eipOutBytes, m.download, dDimd, nodeOutBytes );
-      }
-      if( ccpBytes )
-      {
-        s.copy( m.cuBuf, ccpOffset, m.download, dCcp, ccpBytes );
-      }
+    }
+    if( dimdOutBytes )   // the CUs' DIMD, the OBIC CUs' OBIC, the intra merge CUs' template costs
+    {
+      s.copy( m.cuBuf, cuBytes - eipOutBytes, m.download, dDimd, nodeOutBytes );
+    }
+    if( ccpBytes )
+    {
+      s.copy( m.cuBuf, ccpOffset, m.download, dCcp, ccpBytes );
+    }
+    if( modeBytes )
+    {
+      s.copy( m.cuBuf, cusBytes, m.download, dModes, modeBytes );
     }
     for( int c = 0; c < numComp; c++ )
     {
@@ -10329,6 +10653,7 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
     gEipDl    = (const int32_t*) ( (const char*) m.download.mapped + dDimd );
     gDimdDl   = (const int32_t*) ( (const char*) m.download.mapped + dDimd + eipOutBytes );
     gCcpDl    = (const int32_t*) ( (const char*) m.download.mapped + dCcp );
+    gModesDl  = (const int32_t*) ( (const char*) m.download.mapped + dModes );
     break;
   }
   m.gpuMs += ms;
@@ -10353,6 +10678,8 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
         memcpy( resi.bufAt( 0, y ), gResiPlane + size_t( y ) * P.width[0], P.width[0] * sizeof( Pel ) );
       }
     }
+    // the side information of the picture, which the later pictures read (intra slices only reach here)
+    sideInformation( m, cs, gModesDl, gDimdDl, gEipDl, gCcpDl, true );
     m.numOn++;
     return;
   }
@@ -10958,6 +11285,15 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
       }
     }
     gPlane += P.width[c] * P.height[c];
+  }
+  // what ON mode writes back of an intra picture (sideInformation) against the CPU's
+  if( first.empty() && cs.slice->isIntra() )
+  {
+    const std::string side = sideInformation( m, cs, gModesDl, gDimdDl, gEipDl, gCcpDl, false );
+    if( !side.empty() )
+    {
+      first = "ON mode's side information: " + side;
+    }
   }
   m.numVerified++;
   const bool bad = numBad > 0 || !first.empty();

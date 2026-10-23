@@ -2509,6 +2509,29 @@ of (1)) cr_fore32, cr_park27, bis_alf went from different (chroma) to identical.
 agst40): 37 of the 50 streams identical; the 13 others reconstruct their intra picture on the GPU, but their inter
 pictures differ (ld_foreman_q32: pictures 0 and 1 identical, 2 on different): they read side information of the intra
 picture that the GPU did not write back to the CPU (next paragraph).
+ON mode's side information (2026-10-22, agent st): an intra picture the GPU reconstructs in ON mode leaves in the CPU's
+CodingStructure what the CPU's derive-only pass derived from samples it had not reconstructed, and the later inter
+pictures read four kinds of it from their reference pictures: the luma intra modes (IPM: spanIpmInfoInter reads the
+reference unit's; an intra CU's from spanIpmInfoIntra / spanIpmInfoSgpm, a CU with a block vector's from the unit it
+references, spanIpmInfoIBC), the motion of the CUs with a vector (IntraTMP, BVG-DIMD, EIP with a vector), the CCP models
+(CS::saveTemporalCcpModel stores each intra PU's curCand for temporal CCP merge) and the EIP models
+(CS::saveTemporalEipModel). With the gates lifted (agst40) 13 streams reconstructed their intra picture on the GPU and
+then differed in their inter pictures (ld_foreman_q32 from picture 2 on). Change: sideInformation() takes them from the
+GPU's outputs - the CUs' modes (cuMode: the mode the MPM lists read, which is the IPM for MPM, DIMD, OBIC, intra merge,
+TIMD and TMRL CUs), their DimdOut (an SGPM CU's split and part modes, an IntraTMP CU's mv[0] and list - bv is the list's
+entry its index, of fusion the fused set's first, selects: mv[0] may be a sub-sample vector -, a BVG-DIMD CU's first
+vector, an EIP CU's pu.bv and its DIMD), the EIP models and the CCP records (cpuCcpWords' fields, the others kept;
+CCCM's and GLM's models with the bit depth and mid value of CccmModel) - and writes them in decoding order with the
+CPU's own spanning (spanMotionInfo for a vector, spanIpmInfoSgpm, the IPM buffer, curCand, eipModel). In verification of
+an intra picture it compares them with the CPU's instead ("ON mode's side information: ..."), so that partial.py checks
+what ON mode writes: the first versions differed in curCand's numParams (CCLM's 2) and the second model's ranges of one
+model (fields the GPU does not have, now kept), in an IntraTMP CU's bv (sub-sample) and in eipDimdMode (the GPU's is the
+block's, in DimdOut). ON mode now downloads the CU modes, DimdOut and the CCP records too. Results (Intel PC, agst44 /
+agst45): partial verification of the 50 streams with the side information: 49 identical, ra_off4_q32 differs in its
+intra picture by an NN CU of an SPS without DIMD (befb9754e, next paragraph); with the gates lifted (agst45,
+--GpuRecon=3) the 15 streams that had a GPU picture identical: ld_foreman_q32, ldp_foreman_q32, ldp_wp_q32,
+ld_parkjoy_q27, ra_10bit_q32, ra_dbkparams_q32, ra_internal8_q32, ra_nodbk_q32, ra_nolmcs_q32, ra_nosao_q32,
+ra_off3_q32, ra_off5_q32, ra_long_q32 (3 GPU pictures), ai_crowdrun_q42, ai_fast_q32.
 
 
 ## 8. Numbers (i7-10700 8C/16T, Win11, GCC 16.2, RTX 3070 driver 616.92)
