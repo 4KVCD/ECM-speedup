@@ -1325,15 +1325,16 @@ struct Push
 // inter_mc.comp's push constants and records (its MC_*): a job per inter block whose prediction the GPU makes
 struct PushMc
 {
-  uint64_t jobs, refs, planes, filters, out;
-  int32_t  numJobs, pad;
+  uint64_t jobs, refs, planes, filters, out, bdofOut;
+  int32_t  numJobs, mode;
 };
 constexpr int MC_COMP = 0, MC_X = 1, MC_Y = 2, MC_W = 3, MC_H = 4, MC_DST = 5, MC_PU_W = 6, MC_PU_H = 7, MC_MVX = 8;
-constexpr int MC_MVY = 9, MC_REF = 10, MC_FLAGS = 11, MC_BD = 12, MC_CLIP_MIN = 13, MC_CLIP_MAX = 14;
+constexpr int MC_MVY = 9, MC_REF = 10, MC_FLAGS = 11, MC_BD = 12, MC_CLIP_MIN = 13, MC_CLIP_MAX = 14, MC_BDOF_TH = 15;
 constexpr int MC_MV1X = 16, MC_MV1Y = 17, MC_REF1 = 18, MC_W0 = 19, MC_W1 = 20, MC_OOB = 21, MC_RAW0X = 22;
 constexpr int MC_RAW0Y = 23, MC_RAW1X = 24, MC_RAW1Y = 25, MC_PU_X = 26, MC_PU_Y = 27, MC_PIC_W = 28, MC_PIC_H = 29;
-constexpr int MC_JOB = 32;
-constexpr int MC_ALT_HPEL = 1, MC_BI = 2;
+constexpr int MC_BDOF_OUT = 30, MC_JOB = 32;
+constexpr int MC_ALT_HPEL = 1, MC_BI = 2, MC_BDOF = 4, MC_NO_MEAN = 8;
+constexpr int MC_BDOF_SUB = 16;   // BDOF's sub-blocks: at most 16 x 16 (JVET-AG0067's scaleBDOF 4)
 constexpr int MC_REF_COMP = 5;   // per reference slot and component: origin, stride, width, height, margin
 
 struct PushScan
@@ -2195,6 +2196,11 @@ struct GpuIntraRec::Impl
   // (MC_JOB each), the reference pictures they read (their slots), the CUs by kind (interKind, totals)
   std::unordered_set<const CodingUnit*>                        mcCus;
   std::vector<int32_t>                                         mcJobs;
+  // BDOF: its PUs' luma predictions (where in mcBdofBuf, int16) and the sub-blocks' jobs (inter_mc's mode 1)
+  std::unordered_map<const CodingUnit*, int32_t>               bdofOut;
+  std::vector<int32_t>                                         bdofJobs;
+  int32_t                                                      bdofSamples = 0;
+  gpu::Buffer                                                  mcBdofJobBuf, mcBdofBuf;
   std::vector<const Picture*>                                  mcRefs;
   std::map<std::string, int>                                   mcKinds;
   gpu::Buffer                                                  mcJobBuf, mcRefBuf, mcPlaneBuf;
@@ -2484,6 +2490,9 @@ void GpuIntraRec::beginPicture( const CodingStructure& cs )
   m.interPred.clear();
   m.mcCus.clear();
   m.mcJobs.clear();
+  m.bdofOut.clear();
+  m.bdofJobs.clear();
+  m.bdofSamples = 0;
   m.mcRefs.clear();
   m.interSign.clear();
   m.ccpTemporalModels.clear();
@@ -7248,37 +7257,35 @@ void GpuIntraRec::prepareInterSignPred( TransformUnit& tu, const ComponentID com
   }
 }
 
-// whether bi-prediction PU pu may take DMVR or BDOF, which the GPU lacks (xPredInterBi's conditions, conservatively:
-// DMVR's bdmvrRefine / mvRefine with checkDMVRCondition; BDOF's switches, BCW's default weights, no SMVD, equal
-// distances in different directions or JVET-AJ0097's same direction, at least 8 x 8 and 128 samples unless
-// BDOF_RM_CONSTRAINTS removes the size limits)
-static bool mcRefines( const PredictionUnit& pu )
+// whether bi-prediction PU pu takes DMVR, which the GPU lacks (xPredInterBi: multi-pass DMVR's bdmvrRefine, DMVR's
+// mvRefine with checkDMVRCondition)
+static bool mcDmvr( const PredictionUnit& pu )
 {
-  const CodingUnit& cu = *pu.cu;
 #if MULTI_PASS_DMVR
   if( pu.bdmvrRefine )
   {
     return true;
   }
 #endif
-  if( pu.mvRefine && PU::checkDMVRCondition( pu ) )
-  {
-    return true;
-  }
-  if( !cu.cs->sps->getBDOFEnabledFlag() || cu.cs->picHeader->getDisBdofFlag() || cu.bcwIdx != BCW_DEFAULT || cu.smvdMode )
+  return pu.mvRefine && PU::checkDMVRCondition( pu );
+}
+
+// xPredInterBi's bioApplied for a bi-prediction PU of the kinds interMcGpu takes (not affine, LIC, non-local LIC,
+// CIIP, GPM, sub-block motion; no weighted prediction, no scaled reference): BDOF's switches, equal distances in
+// different directions or JVET-AJ0097's same direction with the merge index's condition, no SMVD, BCW's default weight
+static bool mcBdof( const PredictionUnit& pu )
+{
+  const CodingUnit& cu = *pu.cu;
+  if( !cu.cs->sps->getBDOFEnabledFlag() || cu.cs->picHeader->getDisBdofFlag() || cu.smvdMode
+      || ( cu.cs->sps->getUseBcw() && cu.bcwIdx != BCW_DEFAULT ) )
   {
     return false;
   }
-  const bool dist = PU::isBiPredFromDifferentDirEqDistPoc( pu )
+  return PU::isBiPredFromDifferentDirEqDistPoc( pu )
 #if JVET_AJ0097_BDOF_LDB
-                    || PU::isBiPredFromSameDirUnEqDistPoc( pu )
+         || ( PU::isBiPredFromSameDirUnEqDistPoc( pu ) && PU::isMergeIndexBDOFCondition( pu ) )
 #endif
     ;
-#if BDOF_RM_CONSTRAINTS
-  return dist;
-#else
-  return dist && pu.lwidth() >= 8 && pu.lheight() >= 8 && pu.lwidth() * pu.lheight() >= 128;
-#endif
 }
 
 // xCheckIdenticalMotion: a B slice's bi-prediction of one reference picture and one vector, which motionCompensation
@@ -7292,9 +7299,10 @@ static bool mcIdentical( const PredictionUnit& pu )
 }
 
 // whether the GPU makes the prediction of inter CU cu (inter_mc.comp): uni-prediction (xPredInterUni without bi, then
-// xWeightedAverage's copyClip) or bi-prediction without DMVR or BDOF (xPredInterBi, xWeightedAverage's
-// addWeightedAvg) - each without other tools -, 4:2:0, without weighted prediction, a scaled reference (RPR's
-// xPredInterBlkRPR) or wrap-around; ECM_GPU_NO_MC=1 leaves every prediction the CPU's
+// xWeightedAverage's copyClip) or bi-prediction without DMVR (xPredInterBi, xWeightedAverage's addWeightedAvg or
+// BDOF's applyBiOptFlow) - each without other tools -, 4:2:0, without weighted prediction, a scaled reference (RPR's
+// xPredInterBlkRPR) or wrap-around; BDOF in sub-blocks that tile the PU; ECM_GPU_NO_MC=1 leaves every prediction the
+// CPU's
 static bool interMcGpu( const CodingUnit& cu )
 {
   const PredictionUnit& pu    = *cu.firstPU;
@@ -7315,7 +7323,16 @@ static bool interMcGpu( const CodingUnit& cu )
       return false;
     }
   }
-  return uni ? pu.interDir == 1 || pu.interDir == 2 : pu.interDir == 3 && ( mcIdentical( pu ) || !mcRefines( pu ) );
+  if( uni )
+  {
+    return pu.interDir == 1 || pu.interDir == 2;
+  }
+  if( pu.interDir != 3 || ( !mcIdentical( pu ) && mcDmvr( pu ) ) )
+  {
+    return false;
+  }
+  const int sw = std::min<int>( pu.lwidth(), MC_BDOF_SUB ), sh = std::min<int>( pu.lheight(), MC_BDOF_SUB );
+  return mcIdentical( pu ) || !mcBdof( pu ) || ( pu.lwidth() % sw == 0 && pu.lheight() % sh == 0 );
 }
 
 void GpuIntraRec::interCu( const CodingUnit& cu )
@@ -7510,9 +7527,12 @@ static bool recordInterBlock( GpuIntraRec::Impl& m, const TransformUnit& tu, con
   // xPredInterUni clips it (clipMv, the PU's position and size), the reference picture's slot
   if( m.mcCus.count( &cu ) )
   {
-    // (identical motion: list 0 alone)
-    const bool bi   = pu.interDir == 3 && !mcIdentical( pu );
-    const int  list = pu.interDir == 2 ? 1 : 0;
+    // (identical motion: list 0 alone; BDOF: xPredInterUni clips the vectors at the position grown by
+    // BIO_EXTEND_SIZE + 1, also chroma's in xPredInterBiSubPuBDOF)
+    const bool     bi   = pu.interDir == 3 && !mcIdentical( pu );
+    const bool     bdof = bi && mcBdof( pu );
+    const int      list = pu.interDir == 2 ? 1 : 0;
+    const Position clipPos = bdof ? pu.lumaPos().offset( -( BIO_EXTEND_SIZE + 1 ), -( BIO_EXTEND_SIZE + 1 ) ) : pu.lumaPos();
     auto slotOf = [&]( int l )
     {
       const Picture* ref = slice.getRefPic( RefPicList( l ), pu.refIdx[l] )->unscaledPic;
@@ -7525,7 +7545,7 @@ static bool recordInterBlock( GpuIntraRec::Impl& m, const TransformUnit& tu, con
       return (int) ( it - m.mcRefs.begin() );
     };
     Mv mv = pu.mv[list];
-    clipMv( mv, pu.lumaPos(), pu.lumaSize(), sps, *cs.pps );
+    clipMv( mv, clipPos, pu.lumaSize(), sps, *cs.pps );
     const int     slot = slotOf( list );
     const ClpRng& clp  = slice.clpRng( compID );
     int32_t       j[MC_JOB] = {};
@@ -7547,7 +7567,7 @@ static bool recordInterBlock( GpuIntraRec::Impl& m, const TransformUnit& tu, con
     if( bi )   // list 1, BCW's weights, the lists out of boundary (isMvOOB at the unclipped vectors)
     {
       Mv mv1 = pu.mv[1];
-      clipMv( mv1, pu.lumaPos(), pu.lumaSize(), sps, *cs.pps );
+      clipMv( mv1, clipPos, pu.lumaSize(), sps, *cs.pps );
       j[MC_FLAGS] |= MC_BI;
       j[MC_MV1X]   = mv1.getHor();
       j[MC_MV1Y]   = mv1.getVer();
@@ -7575,6 +7595,41 @@ static bool recordInterBlock( GpuIntraRec::Impl& m, const TransformUnit& tu, con
       j[MC_PU_Y]   = pu.lumaPos().y;
       j[MC_PIC_W]  = (int) cs.pps->getPicWidthInLumaSamples();
       j[MC_PIC_H]  = (int) cs.pps->getPicHeightInLumaSamples();
+    }
+    if( bdof && compID == COMPONENT_Y )   // the PU's luma prediction refined by sub-blocks (first block: their jobs)
+    {
+      auto out = m.bdofOut.find( &cu );
+      if( out == m.bdofOut.end() )
+      {
+        out = m.bdofOut.emplace( &cu, m.bdofSamples ).first;
+        m.bdofSamples += (int32_t) ( pu.lwidth() * pu.lheight() );
+        // applyBiOptFlow: bioDx x bioDy (scaleBDOF 4), the SAD threshold bioBlockDistTh (not sub-PU MC, iteration 0),
+        // JVET-AL0081's noMeanRm4Sample
+        const int sw = std::min<int>( pu.lwidth(), MC_BDOF_SUB ), sh = std::min<int>( pu.lheight(), MC_BDOF_SUB );
+        bool      noMean = PU::isBiPredFromSameDirUnEqDistPoc( pu ) && cu.bcwIdx == BCW_DEFAULT;
+        if( noMean && pu.lwidth() * pu.lheight() >= BDOF_SUBPU_AREA_THRESHOLD1 && PU::getLdbMvRefineMode( pu ) == 2 )
+        {
+          noMean = false;
+        }
+        int32_t b[MC_JOB];
+        std::copy( j, j + MC_JOB, b );
+        b[MC_DST]     = out->second;
+        b[MC_BDOF_TH] = ( sw * sh ) << ( 6 - 4 + ( ( cs.pps->getPicInitQPMinus26() + 26 ) >> 5 ) );
+        b[MC_FLAGS] |= noMean ? MC_NO_MEAN : 0;
+        for( int y = 0; y < (int) pu.lheight(); y += sh )
+        {
+          for( int x = 0; x < (int) pu.lwidth(); x += sw )
+          {
+            b[MC_X] = x;
+            b[MC_Y] = y;
+            b[MC_W] = sw;
+            b[MC_H] = sh;
+            m.bdofJobs.insert( m.bdofJobs.end(), b, b + MC_JOB );
+          }
+        }
+      }
+      j[MC_FLAGS] |= MC_BDOF;
+      j[MC_BDOF_OUT] = out->second;
     }
     m.mcJobs.insert( m.mcJobs.end(), j, j + MC_JOB );
   }
@@ -7636,7 +7691,14 @@ void GpuIntraRec::recordInterCu( const CodingUnit& cu )
     }
     else
     {
-      ( m.mcCus.count( &cu ) ? m.mcKinds : m.interKinds )[interKind( cu )]++;
+      // (bi-prediction by DMVR / BDOF)
+      const PredictionUnit& pu   = *cu.firstPU;
+      std::string           kind = interKind( cu );
+      if( kind == "bi-prediction" && !mcIdentical( pu ) )
+      {
+        kind += mcDmvr( pu ) ? " with DMVR" : mcBdof( pu ) ? " with BDOF" : "";
+      }
+      ( m.mcCus.count( &cu ) ? m.mcKinds : m.interKinds )[kind]++;
     }
     m.ibcGpmCus += CU::isIBC( cu ) && cu.firstPU->ibcGpmFlag ? 1 : 0;
   }
@@ -8796,8 +8858,10 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
     }
     mcPlanes.resize( ( mcPlanes.size() + 1 ) & ~size_t( 1 ), 0 );
     const size_t mcJobBytes = m.mcJobs.size() * 4, mcRefBytes = mcRefTab.size() * 4, mcPlaneBytes = mcPlanes.size() * 2;
+    const size_t bdofJobBytes = m.bdofJobs.size() * 4, bdofBytes = ( size_t( m.bdofSamples ) * 2 + 3 ) & ~size_t( 3 );
     const size_t upInter = upCcp + ccpUp, upMc = upInter + interBytes;
-    const size_t upBytes = upMc + mcJobBytes + mcRefBytes + mcPlaneBytes;
+    const size_t upBdof  = upMc + mcJobBytes + mcRefBytes + mcPlaneBytes;
+    const size_t upBytes = upBdof + bdofJobBytes;
     const size_t upSign  = sizeof( Params ) + tuBytes + coefBytes + lmcsBytes;   // where the signPred data goes
     const size_t upCu    = upSign + spBytes;                                      // the CU records and modes
     m.upload.ensure( ctx, upBytes, gpu::Buffer::UPLOAD );
@@ -8811,11 +8875,17 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
     memcpy( (char*) m.upload.mapped + upMc, m.mcJobs.data(), mcJobBytes );
     memcpy( (char*) m.upload.mapped + upMc + mcJobBytes, mcRefTab.data(), mcRefBytes );
     memcpy( (char*) m.upload.mapped + upMc + mcJobBytes + mcRefBytes, mcPlanes.data(), mcPlaneBytes );
+    memcpy( (char*) m.upload.mapped + upBdof, m.bdofJobs.data(), bdofJobBytes );
     if( mcJobBytes )
     {
       m.mcJobBuf.ensure( ctx, mcJobBytes, gpu::Buffer::DEVICE );
       m.mcRefBuf.ensure( ctx, mcRefBytes, gpu::Buffer::DEVICE );
       m.mcPlaneBuf.ensure( ctx, mcPlaneBytes, gpu::Buffer::DEVICE );
+    }
+    if( bdofJobBytes )
+    {
+      m.mcBdofJobBuf.ensure( ctx, bdofJobBytes, gpu::Buffer::DEVICE );
+      m.mcBdofBuf.ensure( ctx, bdofBytes, gpu::Buffer::DEVICE );
     }
     // partial verification: the planes start as the CPU's reconstruction (the CUs taken from it, the inter, IBC and
     // palette CUs) but 0 in the GPU's blocks, so that a block the GPU leaves unwritten shows
@@ -8904,6 +8974,10 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
       s.copy( m.upload, upMc, m.mcJobBuf, 0, mcJobBytes );
       s.copy( m.upload, upMc + mcJobBytes, m.mcRefBuf, 0, mcRefBytes );
       s.copy( m.upload, upMc + mcJobBytes + mcRefBytes, m.mcPlaneBuf, 0, mcPlaneBytes );
+      if( bdofJobBytes )
+      {
+        s.copy( m.upload, upBdof, m.mcBdofJobBuf, 0, bdofJobBytes );
+      }
     }
     for( int c = 0; c < numComp; c++ )
     {
@@ -8925,8 +8999,17 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
     if( mcJobBytes )   // the inter blocks' predictions the GPU makes (intra_rec reads them after the barriers below)
     {
       const int32_t numJobs = (int32_t) ( m.mcJobs.size() / MC_JOB );
-      PushMc        mc{ m.mcJobBuf.addr, m.mcRefBuf.addr, m.mcPlaneBuf.addr,
-                        m.sh->matrices.addr + uint64_t( m.sh->mcFilters ) * 4, m.interPredBuf.addr, numJobs, 0 };
+      const uint64_t filters = m.sh->matrices.addr + uint64_t( m.sh->mcFilters ) * 4;
+      if( bdofJobBytes )   // BDOF's sub-blocks first: the PUs' luma predictions the blocks' jobs copy
+      {
+        const int32_t numBdof = (int32_t) ( m.bdofJobs.size() / MC_JOB );
+        PushMc        bdof{ m.mcBdofJobBuf.addr, m.mcRefBuf.addr, m.mcPlaneBuf.addr, filters, m.interPredBuf.addr,
+                            m.mcBdofBuf.addr, numBdof, 1 };
+        s.dispatch( m.sh->kernelMc, &bdof, (uint32_t) std::min<int32_t>( numBdof, 4096 ) );
+        s.barrier();
+      }
+      PushMc mc{ m.mcJobBuf.addr, m.mcRefBuf.addr, m.mcPlaneBuf.addr, filters, m.interPredBuf.addr,
+                 bdofJobBytes ? m.mcBdofBuf.addr : 0, numJobs, 0 };
       s.dispatch( m.sh->kernelMc, &mc, (uint32_t) std::min<int32_t>( numJobs, 4096 ) );
     }
     const uint32_t depGroups = (uint32_t) ( ( n + 63 ) / 64 );

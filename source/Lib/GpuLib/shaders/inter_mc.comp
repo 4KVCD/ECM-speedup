@@ -12,6 +12,16 @@
 //   with BCW's weights; JVET-Z0136: where one list's reference sample lies more than half a sample outside the
 //   picture (isMvOOB at the unclipped vector, per luma sample; chroma takes the luma sample at twice its position) the
 //   other list alone
+// - BDOF (MC_BDOF, xPredInterBi's bioApplied without DMVR): a first dispatch (mode 1) refines each luma sub-block of
+//   the PU - min(16, W) x min(16, H), JVET-AG0067's scaleBDOF 4 - into pc.bdofOut (the PU's luma prediction), which the
+//   luma jobs of its blocks then copy (mode 0); its chroma blocks are bi-prediction jobs. Per sub-block (bdofJob): both
+//   lists' 14-bit predictions over the PU grown by 2 samples (xPredInterBlk with bioApplied: the sharp filter, as its
+//   block is above 4 x 4) and padded by one more (the AF0159 replication), the SAD of dI (calAbsSum) against
+//   bioBlockDistTh: below it addAvg, else subBlockBiOptFlow - JVET-AI0046's per-sample refinement: the 5 x 5 weighted
+//   sums of the high-precision BIO parameters (calcBIOParameterHighPrecision, calcBIOParamSum5NOSIM with
+//   JVET-AG0067's mean removal unless JVET-AL0081's noMeanRm4Sample), divTable's division into vx / vy (clipped to
+//   +-31), addBIOAvgN's average at the sample moved by one where |v| > 16 - or without the move where the sub-block has
+//   a sample out of boundary in either list (JVET-Z0136: those samples one list alone)
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_GOOGLE_include_directive : require
@@ -27,22 +37,29 @@ layout( push_constant ) uniform PushMc
   uint64_t planes;    // the reference planes (int16), where McRef's origins point
   uint64_t filters;   // InterpolationFilter's tables (MC_FILT_*: int32 taps)
   uint64_t outPred;   // Params::interPred (int16)
+  uint64_t bdofOut;   // BDOF PUs' luma predictions (int16, McJob's MC_BDOF_OUT)
   int      numJobs;
-  int      pad;
+  int      mode;      // 0: the blocks' jobs, 1: BDOF's sub-block jobs (before them)
 } pc;
 
 // McJob (int32): the block (component, position and size in the component's samples), where its prediction goes in
 // Params::interPred, the PU's size in the component's samples (the filter choice), list 0's (or the one list's)
 // motion vector (1/16 luma samples, clipped by the host: clipMvInl) and reference slot, the flags, the bit depth and
 // the clipping range; with MC_BI list 1's vector and slot, BCW's weights, which lists are out of boundary somewhere
-// (MC_OOB: bit 0 list 0, bit 1 list 1), the unclipped vectors, the PU's luma position and the picture's luma size
+// (MC_OOB: bit 0 list 0, bit 1 list 1), the unclipped vectors, the PU's luma position and the picture's luma size;
+// with MC_BDOF where the PU's luma prediction is in pc.bdofOut (MC_BDOF_OUT). A BDOF job (mode 1): the sub-block
+// (MC_X, MC_Y, MC_W, MC_H relative to the PU), the PU's luma size, its two lists' vectors (clipped at the position
+// grown by BIO_EXTEND_SIZE + 1, as xPredInterUni clips with bioApplied), the SAD threshold (MC_BDOF_TH) and
+// MC_NO_MEAN
 const int MC_COMP = 0, MC_X = 1, MC_Y = 2, MC_W = 3, MC_H = 4, MC_DST = 5, MC_PU_W = 6, MC_PU_H = 7, MC_MVX = 8;
-const int MC_MVY = 9, MC_REF = 10, MC_FLAGS = 11, MC_BD = 12, MC_CLIP_MIN = 13, MC_CLIP_MAX = 14;
+const int MC_MVY = 9, MC_REF = 10, MC_FLAGS = 11, MC_BD = 12, MC_CLIP_MIN = 13, MC_CLIP_MAX = 14, MC_BDOF_TH = 15;
 const int MC_MV1X = 16, MC_MV1Y = 17, MC_REF1 = 18, MC_W0 = 19, MC_W1 = 20, MC_OOB = 21, MC_RAW0X = 22, MC_RAW0Y = 23;
 const int MC_RAW1X = 24, MC_RAW1Y = 25, MC_PU_X = 26, MC_PU_Y = 27, MC_PIC_W = 28, MC_PIC_H = 29;
-const int MC_JOB = 32;
+const int MC_BDOF_OUT = 30, MC_JOB = 32;
 const int MC_ALT_HPEL = 1;   // AMVR's half-sample precision: the alternative half-sample luma filter (8 taps)
 const int MC_BI       = 2;   // two lists, averaged
+const int MC_BDOF     = 4;   // BDOF's luma
+const int MC_NO_MEAN  = 8;   // BDOF without the mean removal (noMeanRm4Sample)
 // McRef (int32) per slot and component: the index of sample (0, 0) in pc.planes, the stride, the size, the margin
 const int MC_REF_ORIGIN = 0, MC_REF_STRIDE = 1, MC_REF_W = 2, MC_REF_H = 3, MC_REF_MARGIN = 4;
 const int MC_REF_COMP = 5;
@@ -143,11 +160,171 @@ bool mcOutOfBoundary( BufI32 jb, int o, int px, int py, int rawX, int rawY )
   return offsetX <= -8 || offsetX >= horMax || offsetY <= -8 || offsetY >= verMax;
 }
 
+// ----- BDOF (mode 1): one sub-block of a PU per job
+
+const int BDOF_TILE = 16 + 6;   // a sub-block's predictions with 3 samples around it
+shared int sP0[BDOF_TILE * BDOF_TILE], sP1[BDOF_TILE * BDOF_TILE];
+shared int sSad, sOob;
+int        bdofX0, bdofY0, bdofTw;   // the tile's first sample (relative to the PU) and width
+
+// list l's prediction at (qx, qy) relative to the PU (in the tile)
+int bdofP( int l, int qx, int qy )
+{
+  const int i = ( qy - bdofY0 ) * bdofTw + qx - bdofX0;
+  return l == 0 ? sP0[i] : sP1[i];
+}
+
+// gradFilter: list l's gradients at (qx, qy)
+ivec2 bdofGrad( int l, int qx, int qy )
+{
+  return ivec2( int( int16_t( ( bdofP( l, qx + 1, qy ) >> 6 ) - ( bdofP( l, qx - 1, qy ) >> 6 ) ) ),
+                int( int16_t( ( bdofP( l, qx, qy + 1 ) >> 6 ) - ( bdofP( l, qx, qy - 1 ) >> 6 ) ) ) );
+}
+
+// calcBIOParameterHighPrecision's dI (a Pel)
+int bdofDI( int qx, int qy )
+{
+  return int( int16_t( ( bdofP( 1, qx, qy ) >> 4 ) - ( bdofP( 0, qx, qy ) >> 4 ) ) );
+}
+
+// (subBlockBiOptFlow's divTable)
+const int BDOF_DIV[32] = int[]( 32, 31, 30, 29, 28, 28, 27, 26, 26, 25, 24, 24, 23, 23, 22, 22, 21, 21, 20, 20, 20, 19, 19,
+                                19, 18, 18, 18, 17, 17, 17, 17, 16 );
+
+// (sum * 8 * invD + offsetD) >> shiftD for divisor d (> 0), clipped to +-limit
+int bdofDiv( int num, int d, int limit )
+{
+  const int log2D = findMSB( d ), msbD = ( ( d << 5 ) >> log2D ) & 31, shiftD = log2D + 5;
+  return clamp( ( num * BDOF_DIV[msbD] + ( 1 << ( shiftD - 1 ) ) ) >> shiftD, -limit, limit );
+}
+
+void bdofJob( BufI32 jb, int o, int lid )
+{
+  const int  sx = jb.v[o + MC_X], sy = jb.v[o + MC_Y], bw = jb.v[o + MC_W], bh = jb.v[o + MC_H];
+  const int  W = jb.v[o + MC_PU_W], H = jb.v[o + MC_PU_H], puX = jb.v[o + MC_PU_X], puY = jb.v[o + MC_PU_Y];
+  const int  flags = jb.v[o + MC_FLAGS], bd = jb.v[o + MC_BD];
+  const int  clipMin = jb.v[o + MC_CLIP_MIN], clipMax = jb.v[o + MC_CLIP_MAX];
+  const bool alt = ( flags & MC_ALT_HPEL ) != 0;
+  const ivec2 mv0 = ivec2( jb.v[o + MC_MVX], jb.v[o + MC_MVY] ), mv1 = ivec2( jb.v[o + MC_MV1X], jb.v[o + MC_MV1Y] );
+  const int   slot0 = jb.v[o + MC_REF], slot1 = jb.v[o + MC_REF1], oob = jb.v[o + MC_OOB];
+  bdofX0 = sx - 3;
+  bdofY0 = sy - 3;
+  bdofTw = bw + 6;
+  if( lid == 0 )
+  {
+    sSad = 0;
+    sOob = 0;
+  }
+  // the predictions over the PU grown by 2 (the sharp filter: W + 4 x H + 4 is above 4 x 4), the ring beyond them a
+  // replication
+  for( int i = lid; i < bdofTw * ( bh + 6 ); i += 64 )
+  {
+    const int cx = clamp( bdofX0 + i % bdofTw, -2, W + 1 ), cy = clamp( bdofY0 + i / bdofTw, -2, H + 1 );
+    sP0[i] = mcPredict( slot0, 0, puX + cx + ( mv0.x >> 4 ), puY + cy + ( mv0.y >> 4 ), mv0.x & 15, mv0.y & 15, alt, true,
+                        W + 4, H + 4, bd, clipMin, clipMax );
+    sP1[i] = mcPredict( slot1, 0, puX + cx + ( mv1.x >> 4 ), puY + cy + ( mv1.y >> 4 ), mv1.x & 15, mv1.y & 15, alt, true,
+                        W + 4, H + 4, bd, clipMin, clipMax );
+  }
+  barrier();
+  // the sub-block's SAD of dI and its samples out of boundary
+  for( int i = lid; i < bw * bh; i += 64 )
+  {
+    const int x = sx + i % bw, y = sy + i / bw;
+    atomicAdd( sSad, abs( bdofDI( x, y ) ) );
+    if( oob != 0 )
+    {
+      const bool o0 = ( oob & 1 ) != 0 && mcOutOfBoundary( jb, o, x, y, jb.v[o + MC_RAW0X], jb.v[o + MC_RAW0Y] );
+      const bool o1 = ( oob & 2 ) != 0 && mcOutOfBoundary( jb, o, x, y, jb.v[o + MC_RAW1X], jb.v[o + MC_RAW1Y] );
+      atomicOr( sOob, ( o0 ? 1 : 0 ) | ( o1 ? 2 : 0 ) );
+    }
+  }
+  barrier();
+  const bool skip     = sSad < jb.v[o + MC_BDOF_TH];
+  const bool noMean   = ( flags & MC_NO_MEAN ) != 0;
+  const int  headRoom = max( 2, IF_INTERNAL_PREC - bd );
+  const int  shiftNum = headRoom + 1, offset = ( 1 << ( shiftNum - 1 ) ) + 2 * IF_INTERNAL_OFFS;
+  for( int i = lid; i < bw * bh; i += 64 )
+  {
+    const int x = sx + i % bw, y = sy + i / bw;
+    const int p0 = bdofP( 0, x, y ), p1 = bdofP( 1, x, y );
+    bool      o0 = false, o1 = false;
+    if( oob != 0 )
+    {
+      o0 = ( oob & 1 ) != 0 && mcOutOfBoundary( jb, o, x, y, jb.v[o + MC_RAW0X], jb.v[o + MC_RAW0Y] );
+      o1 = ( oob & 2 ) != 0 && mcOutOfBoundary( jb, o, x, y, jb.v[o + MC_RAW1X], jb.v[o + MC_RAW1Y] );
+    }
+    int v;
+    if( o0 != o1 )   // one list alone (addAvg's and addBIOAvgN's out-of-boundary branch)
+    {
+      v = ( ( o0 ? p1 : p0 ) + ( offset >> 1 ) ) >> ( shiftNum - 1 );
+    }
+    else if( skip )   // addAvg
+    {
+      v = ( p0 + p1 + offset ) >> shiftNum;
+    }
+    else
+    {
+      // calcBIOParamSum5NOSIM: the 5 x 5 weighted sums (weights 1 2 4 2 1 by row and column, 16 in the centre), the
+      // mean of dI, the gradients' sums
+      int sGx2 = 0, sGy2 = 0, sGxDI = 0, sGyDI = 0, sGxGy = 0, mean = 0, absMean = 0, sX0 = 0, sX1 = 0;
+      for( int yy = 0; yy < 5; yy++ )
+      {
+        for( int xx = 0; xx < 5; xx++ )
+        {
+          const int   qx = x - 2 + xx, qy = y - 2 + yy;
+          const int   w  = ( xx == 2 ? 4 : xx == 0 || xx == 4 ? 1 : 2 ) * ( yy == 2 ? 4 : yy == 0 || yy == 4 ? 1 : 2 );
+          const ivec2 g  = bdofGrad( 0, qx, qy ) + bdofGrad( 1, qx, qy );
+          const int   d  = bdofDI( qx, qy );
+          sGx2 += w * g.x * g.x;
+          sGy2 += w * g.y * g.y;
+          sGxDI += w * g.x * d;
+          sGyDI += w * g.y * d;
+          sGxGy += w * g.x * g.y;
+          mean += d;
+          absMean += abs( d );
+          sX0 -= w * int( int16_t( g.x ) );
+          sX1 -= w * int( int16_t( g.y ) );
+        }
+      }
+      const int meanDiff = noMean || absMean > 2 * abs( mean ) ? 0 : ( mean + 32 ) >> 6;
+      sGxDI += sX0 * meanDiff;
+      sGyDI += sX1 * meanDiff;
+      sGxDI += ( sGxDI + 2 ) >> 2;
+      sGyDI += ( sGyDI + 2 ) >> 2;
+      sGx2 += 2528;
+      sGy2 += 2528;
+      const int limit = 31;
+      const int vx    = sGx2 > 0 ? bdofDiv( sGxDI << 3, sGx2, limit ) : 0;
+      const int vy    = sGy2 > 0 ? bdofDiv( ( sGyDI << 3 ) - ( ( vx * sGxGy ) >> 1 ), sGy2, limit ) : 0;
+      if( sOob != 0 )   // addBIOAvgN's out-of-boundary branch: no move
+      {
+        const ivec2 g0 = bdofGrad( 0, x, y ), g1 = bdofGrad( 1, x, y );
+        v = ( p0 + p1 + vx * ( g0.x - g1.x ) + vy * ( g0.y - g1.y ) + offset ) >> shiftNum;
+      }
+      else   // JVET-AI0046: the sample moved by one where |v| > 16, the rest of v on its gradients
+      {
+        const int   pX = vx > 16 ? 1 : vx < -16 ? -1 : 0, pY = vy > 16 ? 1 : vy < -16 ? -1 : 0;
+        const ivec2 g0 = bdofGrad( 0, x + pX, y + pY ), g1 = bdofGrad( 1, x - pX, y - pY );
+        v = ( bdofP( 0, x + pX, y + pY ) + bdofP( 1, x - pX, y - pY ) + ( vx - 32 * pX ) * ( g0.x - g1.x )
+              + ( vy - 32 * pY ) * ( g0.y - g1.y ) + offset )
+            >> shiftNum;
+      }
+    }
+    BufI16( pc.bdofOut ).v[jb.v[o + MC_DST] + y * W + x] = int16_t( clamp( v, clipMin, clipMax ) );
+  }
+  barrier();   // (the shared tile's next job)
+}
+
 void main()
 {
   const int lid = int( gl_LocalInvocationID.x );
   for( int j = int( gl_WorkGroupID.x ); j < pc.numJobs; j += int( gl_NumWorkGroups.x ) )
   {
+    if( pc.mode == 1 )
+    {
+      bdofJob( BufI32( pc.jobs ), j * MC_JOB, lid );
+      continue;
+    }
     BufI32    jb   = BufI32( pc.jobs );
     const int o    = j * MC_JOB;
     const int comp = jb.v[o + MC_COMP], bx = jb.v[o + MC_X], by = jb.v[o + MC_Y], W = jb.v[o + MC_W], H = jb.v[o + MC_H];
@@ -164,7 +341,11 @@ void main()
     {
       const int x = bx + i % W, y = by + i / W;
       int       v;
-      if( !bi )
+      if( ( flags & MC_BDOF ) != 0 )   // the PU's BDOF prediction
+      {
+        v = int( BufI16( pc.bdofOut ).v[jb.v[o + MC_BDOF_OUT] + ( y - jb.v[o + MC_PU_Y] ) * puW + x - jb.v[o + MC_PU_X]] );
+      }
+      else if( !bi )
       {
         v = mcPredict( slot0, comp, x + ( mv0.x >> shift ), y + ( mv0.y >> shift ), mv0.x & mask, mv0.y & mask, alt, false,
                        puW, puH, bd, clipMin, clipMax );
