@@ -449,7 +449,7 @@ wall-clock gains with threads are "the easy baseline". Decoder status: single-th
 (`--GpuLoopFilter=1`: ALF, SAO, BIF, CCSAO, LF-CCCM, offset refinement on Vulkan). The user then asked for **a full
 GPU decoder in Vulkan, optimized until nothing is left** ("The GPU decoder needs to fully decode the frame on the
 GPU"; "Your first Vulkan version is going to be slow. That's OK"). That work is branch `dec-gpurecon`: intra
-reconstruction on the GPU (`--GpuRecon`), tool levels M1-M104 done and verified bit-exact (M19: DIMD, M20: OBIC, M21:
+reconstruction on the GPU (`--GpuRecon`), tool levels M1-M105 done and verified bit-exact (M19: DIMD, M20: OBIC, M21:
 intra merge, M22: the transforms of DIMD CUs, M23: LFNST of MIP, M24: TIMD, M25: OBIC and intra merge with TIMD
 neighbours, M26: TIMD-SAD, M27: OBIC and intra merge with TIMD-SAD neighbours, M28: TIMD merge, M29: TMRL of luma,
 M30: chroma TMRL, M31: CCLM, M32: LFNST / NSPT of CCLM, M33: GLM's gradient patterns, M34: CCCM, M35: GL-CCCM, M36:
@@ -2414,6 +2414,16 @@ later runs alone: a device loss on that all-intra stream that does not depend on
 dispatch sizes; ra_wpp_q32 skipped as before); affine 1408 CUs predicted by the GPU (+380); from the CPU: affine
 (sub-block merge) 810, (OBMC of sub-block motion) 663, (OBMC with an intra neighbour) 209, (CIIP) 197, (with non-local
 LIC) 150, (other) 105, (with inherited LIC or resampling) 48, (OBMC with an IBC neighbour) 4.
+M105 (2026-10-23): non-local LIC CUs on the GPU (JVET-AG0276, kind "non-local LIC" and affine ones; not with BDOF,
+DMVR or resampling). xPredInterBi applies the CU's altLMParaUnit to the final prediction (all components, shift 5,
+clipped); after the CU's reconstruction DecCu moves that model to secAltLMParaUnit and derives another into
+altLMParaUnit for its merge neighbours (xDevSecLicPara), so the host, which records the CU afterwards, takes
+secAltLMParaUnit: found on the way (ra_parkjoy832_q32: altLMParaUnit gave other pictures). A block job with MC_NLIC
+points at the model (MC_NLIC_AT) and mcSample, now mcSampleBase plus the model, applies it - also to OBMC's view of
+the CU's prediction; selectOBMCmode's template of the CU's own motion takes it too (OBMC_J_CNLIC). Results (50
+streams, build gpu55): every picture identical (ra_wpp_q32 skipped as before); non-local LIC 113 CUs predicted by the
+GPU, affine 1490 (+82); from the CPU: non-local LIC (with BDOF) 17, (OBMC with an intra neighbour) 12, (other) 3,
+(resampling) 2.
 
 
 ## 8. Numbers (i7-10700 8C/16T, Win11, GCC 16.2, RTX 3070 driver 616.92)
