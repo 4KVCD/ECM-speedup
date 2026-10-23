@@ -122,9 +122,11 @@ public:
   /// inter CU cu of multi-pass DMVR (bdmvrRefine), which the CPU has predicted: DMVR's refined vectors per 16 x 16
   /// sub-PU (InterPrediction's m_bdmvrSubPuMvBuf, stride DMVR_SUBPU_STRIDE), recordInterCu's
   void dmvrVectors( const CodingUnit& cu, const Mv* list0, const Mv* list1 );
-  /// GPM CU cu, which the CPU has predicted (motionCompensationGeo): whether it took the plain blend, the split
-  /// direction, the blending index and each part's motion (InterPrediction::m_gpuGeoPart), recordInterCu's
-  void gpmParts( const CodingUnit& cu, bool plain, int splitDir, int bldIdx, const int32_t parts[2][22] );
+  /// GPM CU cu, which the CPU has predicted (motionCompensationGeo): the blend it took (1 the plain one, 2 the rounded
+  /// one after each part's own OBMC, 0 another), the split direction, the blending index, each part's motion
+  /// (InterPrediction::m_gpuGeoPart) and its motion and flags at its OBMC (m_gpuGeoMi, m_gpuGeoObmc), recordInterCu's
+  void gpmParts( const CodingUnit& cu, int kind, int splitDir, int bldIdx, const int32_t parts[2][22],
+                 const MotionInfo partMi[2], const int32_t partObmc[2] );
   /// TU tu of an inter CCCM or inter CCP merge CU, before DecCu blends its chroma prediction
   /// (deriveInterCccmPrediction, deriveInterCcpMergePrediction): the inter one
   void interChromaPred( const TransformUnit& tu );

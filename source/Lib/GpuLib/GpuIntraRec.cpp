@@ -40,6 +40,7 @@
 #include "VkCompute.h"
 
 #include <algorithm>
+#include <array>
 #include <deque>
 #include <map>
 #include <mutex>
@@ -126,8 +127,9 @@ struct Tu
   int32_t ibc;        // an IBC CU's block (DERIVE_IBC): its record in Params::timdData (IBC_REC_*; read with it only)
   int32_t obmc;       // an OBMC CU's block on its top / left band: the CU's OBMC record in Params::timdData + 1 (0: none)
   int32_t ciip;       // a CIIP CU's block: CIIP_* (intra_common.glsl; 0: none)
+  int32_t gpm;        // a block of a GPM CU with separate OBMC: its GPMR_* record in Params::timdData + 1 (0: none)
 };
-static_assert( sizeof( Tu ) == 108 * 4, "Tu layout" );
+static_assert( sizeof( Tu ) == 109 * 4, "Tu layout" );
 
 // a block of NN intra prediction's record in Params::timdData (intra_common.glsl's PNN_REC_*)
 constexpr int PNN_REC_AVAIL = 12, PNN_REC_TARGET = 16, PNN_REC_TOP_BOUNDARY = 19;
@@ -1372,8 +1374,12 @@ constexpr int OBMC_REC_TM = 1, OBMC_REC_TOP = 2, OBMC_REC_LEFT = 4, OBMC_REC_INV
 constexpr int OBMC_J_DIR = 32, OBMC_J_FLAGS = 33, OBMC_J_BASE = 34, OBMC_J_THRESHOLD = 37, OBMC_J_INT_MV = 39;
 constexpr int OBMC_J_INT_DIR = 43, OBMC_J_TPL = 44, OBMC_J_TPL_MOTION = 9, OBMC_J_LIC = 64, OBMC_J_NLIC = 76;
 constexpr int OBMC_J_CLIC = 88, OBMC_J_CNLIC = 100, OBMC_J = 106;
+// (OBMC_*: a (non-local) LIC neighbour's models, the CU's own; MC_*: uni-prediction from list 1, affine, LIC, non-local
+// LIC and the place of its model, GPM, GPM with separate OBMC, no sharp bi filter)
 constexpr int OBMC_LIC = 2, OBMC_NLIC = 4, OBMC_CLIC = 8, OBMC_CNLIC = 16, MC_L1 = 64, MC_AFFINE = 128, MC_LIC = 256;
-constexpr int MC_NLIC = 512, MC_NLIC_AT = 31, MC_GPM = 1024;   // (non-local LIC: the flag, the place of the CU's model)   // (a (non-local) LIC neighbour's models; uni-prediction from list 1)
+constexpr int MC_NLIC = 512, MC_NLIC_AT = 31, MC_GPM = 1024, MC_GPM_SEP = 2048, MC_NO_SHARP = 4096;
+constexpr int GPMR_P1 = 0, GPMR_OBMC1 = 1, GPMR_W = 2;   // (Tu::gpm's record)
+constexpr int OBMC_REC_GEO = 32;   // (GPM's separate OBMC - m_geoOBMC -: no skipObmcConditionByPixel, no sharp bi filter)
 constexpr int OBMC_T_MV0 = 0, OBMC_T_MV1 = 2, OBMC_T_REF0 = 4, OBMC_T_REF1 = 5, OBMC_T_KIND = 6, OBMC_T_W0 = 7, OBMC_T_W1 = 8;
 constexpr int OBMC_TM = 1;
 constexpr int OBMC_D_TPL = 3;
@@ -2269,6 +2275,9 @@ struct GpuIntraRec::Impl
   // weights of each CU's components in affineData
   std::unordered_map<const CodingUnit*, std::vector<int32_t>>  gpmInfo;
   std::map<std::pair<const CodingUnit*, int>, int32_t>         gpmRec;
+  std::unordered_map<const CodingUnit*, std::array<MotionInfo, 2>> gpmMi;   // (each part's motion at its OBMC)
+  std::vector<int32_t>                                         gpmSepRecs;   // (Tu::gpm records: GPMR_P1 to patch)
+  int32_t                                                      obmcRec1 = -1;   // (GPM's part 1's OBMC record)
   std::vector<int32_t>                                         dmvrJobs, dmvrJobMvs;
   int32_t                                                      dmvrScratch = 0;
   gpu::Buffer                                                  mcDmvrJobBuf, mcScratchBuf;
@@ -2582,6 +2591,8 @@ void GpuIntraRec::beginPicture( const CodingStructure& cs )
   m.dmvrMvs.clear();
   m.gpmInfo.clear();
   m.gpmRec.clear();
+  m.gpmMi.clear();
+  m.gpmSepRecs.clear();
   m.dmvrJobs.clear();
   m.dmvrJobMvs.clear();
   m.dmvrScratch = 0;
@@ -7971,6 +7982,9 @@ static void ciipFields( GpuIntraRec::Impl& m, const CodingUnit& cu, const Compon
 constexpr int GPM_LIC = 8, GPM_LIC_MODELS = 9, GPM_NLIC = 21, GPM_PART = 22;
 
 // why the GPU does not predict GPM CU cu (nullptr: it does)
+struct ObmcSeg;
+static const char* gpmSepPlan( const GpuIntraRec::Impl& m, const CodingUnit& cu, std::vector<ObmcSeg>* segs );
+
 static const char* gpmWhy( const GpuIntraRec::Impl& m, const CodingUnit& cu )
 {
   const PredictionUnit& pu    = *cu.firstPU;
@@ -8001,12 +8015,6 @@ static const char* gpmWhy( const GpuIntraRec::Impl& m, const CodingUnit& cu )
     return "an IBC part";
   }
 #endif
-#if JVET_AK0212_GPM_OBMC_MODIFICATION
-  if( slice.getCheckUseSepOBMC() )
-  {
-    return "separate OBMC";
-  }
-#endif
   if( cu.licFlag || cu.altLMFlag )
   {
     return "LIC";
@@ -8017,7 +8025,7 @@ static const char* gpmWhy( const GpuIntraRec::Impl& m, const CodingUnit& cu )
     return "other";
   }
   const auto g = m.gpmInfo.find( &cu );
-  if( g == m.gpmInfo.end() || !g->second[0] )
+  if( g == m.gpmInfo.end() || g->second[0] != ( slice.getCheckUseSepOBMC() ? 2 : 1 ) )
   {
     return "not the plain blend";
   }
@@ -8031,6 +8039,10 @@ static const char* gpmWhy( const GpuIntraRec::Impl& m, const CodingUnit& cu )
     if( p[GPM_LIC] && sps.getRprEnabledFlag() )
     {
       return "a LIC part with resampling";
+    }
+    if( p[GPM_LIC] && slice.getCheckUseSepOBMC() )   // (its final prediction: xPredInterBlk's LIC there not ported)
+    {
+      return "separate OBMC with a LIC part";
     }
     if( p[6] != 1 && p[6] != 2 )
     {
@@ -8046,7 +8058,7 @@ static const char* gpmWhy( const GpuIntraRec::Impl& m, const CodingUnit& cu )
       return "a scaled reference";
     }
   }
-  return nullptr;
+  return slice.getCheckUseSepOBMC() ? gpmSepPlan( m, cu, nullptr ) : nullptr;
 }
 
 // the weights of part 0 (of 32) over component compID of GPM PU pu, xWeightedGeoBlk's walk, appended to out
@@ -8331,6 +8343,54 @@ static const char* obmcPlan( const CodingUnit& cu, std::vector<ObmcSeg>& segs, b
     }
   }
   return nullptr;
+}
+
+// fn() with GPM CU cu's part k's motion (at its OBMC: m.gpmMi) in the CU's motion buffer, as motionCompensationGeo
+// spans it over the CU for the part's subBlockOBMC; the buffer put back after
+template<typename F> static void withPartMotion( const GpuIntraRec::Impl& m, const CodingUnit& cu, int k, F fn )
+{
+  MotionBuf               mb = const_cast<CodingStructure&>( *cu.cs ).getMotionBuf( *cu.firstPU );
+  std::vector<MotionInfo> keep;
+  for( int y = 0; y < (int) mb.height; y++ )
+  {
+    keep.insert( keep.end(), &mb.at( 0, y ), &mb.at( 0, y ) + mb.width );
+  }
+  mb.fill( m.gpmMi.at( &cu )[k] );
+  fn();
+  for( int y = 0; y < (int) mb.height; y++ )
+  {
+    std::copy( keep.begin() + y * mb.width, keep.begin() + ( y + 1 ) * mb.width, &mb.at( 0, y ) );
+  }
+}
+
+// GPM CU cu with separate OBMC (JVET-AK0212; an MMVD part's usePreCheck takes the runs saveMode found, the same as
+// getSameNeigMotion's against the part's motion, which is the same over the CU): each part's segments (segs[k], when
+// given), its plan with its motion; nullptr where the GPU can do both, else the reason
+static const char* gpmSepPlan( const GpuIntraRec::Impl& m, const CodingUnit& cu, std::vector<ObmcSeg>* segs )
+{
+  const auto g = m.gpmInfo.find( &cu );
+  if( g == m.gpmInfo.end() || !m.gpmMi.count( &cu ) )
+  {
+    return "separate OBMC unrecorded";
+  }
+  if( !cu.obmcFlag )
+  {
+    return nullptr;
+  }
+  const char* why = nullptr;
+  for( int k = 0; k < 2 && !why; k++ )
+  {
+    const int32_t ran = g->second[3 + 2 * GPM_PART + k];
+    if( ( ran & 1 ) == 0 || ( ran & 2 ) != 0 )
+    {
+      return ( ran & 1 ) == 0 ? "separate OBMC not run" : "separate OBMC of sub-block motion";
+    }
+    std::vector<ObmcSeg> s;
+    bool                 inner = false;
+    withPartMotion( m, cu, k, [&]() { why = obmcPlan( cu, segs ? segs[k] : s, inner ); } );
+    why = why ? why : inner ? "separate OBMC of sub-block motion" : nullptr;
+  }
+  return why;
 }
 
 // the reference slot of list l's picture refIdx
@@ -8666,6 +8726,26 @@ static bool recordInterBlock( GpuIntraRec::Impl& m, const TransformUnit& tu, con
         gpmWeights( pu, compID, g[1], g[2], m.affineData );
       }
       j[MC_BDOF_OUT] = rec->second;
+      if( slice.getCheckUseSepOBMC() )   // (separate OBMC: part 1's final prediction and the block's record, Tu::gpm)
+      {
+        const int  sc   = compID == COMPONENT_Y ? 0 : 1;
+        const bool band = (int) area.y - ( cu.ly() >> sc ) < ( 4 >> sc ) || (int) area.x - ( cu.lx() >> sc ) < ( 4 >> sc );
+        j[MC_FLAGS] |= MC_GPM_SEP;
+        j[MC_BDOF_TH] = m.obmcData;   // (relative to the OBMC data; made absolute at the upload)
+        m.obmcData += (int32_t) ( area.width * area.height );
+        t.gpm = (int32_t) m.timdData.size() + 1;
+        m.gpmSepRecs.push_back( (int32_t) m.timdData.size() + GPMR_P1 );
+        m.timdData.push_back( j[MC_BDOF_TH] );
+        m.timdData.push_back( m.obmcRec1 >= 0 && band ? m.obmcRec1 + 1 : 0 );
+        const CompArea& pb = pu.blocks[compID];
+        for( int y = 0; y < (int) area.height; y++ )
+        {
+          for( int x = 0; x < (int) area.width; x++ )
+          {
+            m.timdData.push_back( m.affineData[rec->second + ( area.y - pb.y + y ) * pb.width + area.x - pb.x + x] );
+          }
+        }
+      }
     }
     if( cu.altLMFlag )   // (non-local LIC: the CU's model, at its first block - the one applied, which DecCu moved to
                          // secAltLMParaUnit after the reconstruction, deriving another for its merge neighbours)
@@ -8863,19 +8943,27 @@ void GpuIntraRec::recordInterCu( const CodingUnit& cu )
   }
   // (its motion is known now: DecCu derives a merge CU's after interCu, xDeriveCUMV; IBC and palette CUs: their own
   // prediction, ibcRecord / pltRecord)
-  std::vector<ObmcSeg> segs;
-  bool                 inner = false;
-  m.obmcRec = -1;
+  // (GPM with separate OBMC: each part's segments, part 1's in segs1)
+  std::vector<ObmcSeg> segs, segs1, geoSegs[2];
+  bool                 inner  = false;
+  const bool           geoSep = cu.geoFlag && cu.slice->getCheckUseSepOBMC();
+  m.obmcRec = m.obmcRec1 = -1;
   for( int c = 0; c < MAX_NUM_COMPONENT; c++ )
   {
     m.cuJob[c] = -1;
   }
   if( !CU::isIBC( cu ) && !CU::isPLT( cu ) && interMcGpu( cu ) && ( !cu.geoFlag || !gpmWhy( m, cu ) )
       && ( !cu.firstPU->bdmvrRefine || mcIdentical( *cu.firstPU ) || m.dmvrMvs.count( &cu ) )
-      && ( !cu.obmcFlag || !obmcPlan( cu, segs, inner ) ) )
+      && ( !cu.obmcFlag || ( geoSep ? !gpmSepPlan( m, cu, geoSegs ) : !obmcPlan( cu, segs, inner ) ) ) )
   {
     m.mcCus.insert( &cu );
-    if( !segs.empty() || inner )   // OBMC's record (OBMC_REC_*): the CU, the flags, the segments and their data's places
+    if( geoSep )
+    {
+      segs.swap( geoSegs[0] );
+      segs1.swap( geoSegs[1] );
+    }
+    // OBMC's record (OBMC_REC_*): the CU, the flags, the segments and their data's places
+    auto obmcRecord = [&]( const std::vector<ObmcSeg>& sg, bool in )
     {
       const PredictionUnit& pu  = *cu.firstPU;
       const CodingStructure& cs = *cu.cs;
@@ -8883,26 +8971,30 @@ void GpuIntraRec::recordInterCu( const CodingUnit& cu )
                        && cs.getPURestricted( pu.Y().topRight().offset( 0, -1 ), pu, pu.chType )->cu != &cu;
       const bool left = cs.getPURestricted( pu.Y().bottomLeft().offset( -1, 0 ), pu, pu.chType ) != nullptr
                         && cs.getPURestricted( pu.Y().bottomLeft().offset( -1, 0 ), pu, pu.chType )->cu != &cu;
-      const bool tm   = cs.sps->getUseOBMCTMMode() && ( top || left );
+      const bool tm   = cs.sps->getUseOBMCTMMode() && ( top || left ) && ( !geoSep || cs.slice->getCheckLDC() );
       const bool inv  = cs.slice->getLmcsEnabledFlag() && m.reshape->getSliceReshaperInfo().getUseSliceReshaper()
                        && m.reshape->getCTUFlag();
-      m.obmcRec = (int32_t) m.timdData.size();
-      m.obmcRecs.push_back( m.obmcRec );
+      const int32_t r = (int32_t) m.timdData.size();
+      m.obmcRecs.push_back( r );
       m.timdData.insert( m.timdData.end(), { cu.lx(), cu.ly(), (int32_t) cu.lwidth(), (int32_t) cu.lheight(),
                                              ( tm ? OBMC_REC_TM : 0 ) | ( top ? OBMC_REC_TOP : 0 ) | ( left ? OBMC_REC_LEFT : 0 )
-                                               | ( inv ? OBMC_REC_INV_LMCS : 0 ) | ( inner ? OBMC_REC_SUB : 0 ),
-                                             (int32_t) segs.size(), cu.slice->clpRng( COMPONENT_Y ).bd, 0, m.obmcData, 0 } );
-      if( inner )
+                                               | ( inv ? OBMC_REC_INV_LMCS : 0 ) | ( in ? OBMC_REC_SUB : 0 )
+                                               | ( geoSep ? OBMC_REC_GEO : 0 ),
+                                             (int32_t) sg.size(), cu.slice->clpRng( COMPONENT_Y ).bd, 0, m.obmcData, 0 } );
+      if( in )
       {
         m.obmcData += (int32_t) ( ( cu.lwidth() >> 2 ) * ( cu.lheight() >> 2 ) ) * OBMC_INNER;
       }
-      for( const ObmcSeg& s: segs )
+      for( const ObmcSeg& s: sg )
       {
         const int bw = s.dir == 0 ? s.len : 4, bh = s.dir == 0 ? 4 : s.len;
         m.timdData.insert( m.timdData.end(), { s.dir, s.start, s.len, m.obmcData } );
         m.obmcData += OBMC_D_TPL + 2 * s.len + bw * bh + 2 * ( bw >> 1 ) * ( bh >> 1 );
       }
-    }
+      return r;
+    };
+    m.obmcRec  = !segs.empty() || inner ? obmcRecord( segs, inner ) : -1;
+    m.obmcRec1 = !segs1.empty() ? obmcRecord( segs1, false ) : -1;
   }
   const int numComp = cu.chromaFormat == CHROMA_400 ? 1 : MAX_NUM_COMPONENT;
   // (an IBC merge CU's motion and flags, which its merge candidate gives, are known only now)
@@ -8946,11 +9038,25 @@ void GpuIntraRec::recordInterCu( const CodingUnit& cu )
       }
     }
   }
-  if( m.obmcRec >= 0 && !m.cpuCus.count( &cu ) )   // (OBMC: its segments' jobs, after its blocks')
+  // (OBMC: its segments' jobs, after its blocks'; GPM's separate OBMC: each part's, with its motion - TM's template)
+  const int32_t rec1 = m.obmcRec1;
+  if( m.obmcRec >= 0 && !m.cpuCus.count( &cu ) )
   {
-    obmcJobs( m, cu, segs );
+    if( geoSep )
+    {
+      withPartMotion( m, cu, 0, [&]() { obmcJobs( m, cu, segs ); } );
+    }
+    else
+    {
+      obmcJobs( m, cu, segs );
+    }
   }
-  m.obmcRec = -1;
+  if( rec1 >= 0 && !m.cpuCus.count( &cu ) )
+  {
+    m.obmcRec = rec1;
+    withPartMotion( m, cu, 1, [&]() { obmcJobs( m, cu, segs1 ); } );
+  }
+  m.obmcRec = m.obmcRec1 = -1;
   if( !m.cpuCus.count( &cu ) )
   {
     if( CU::isIBC( cu ) || CU::isPLT( cu ) )
@@ -9065,6 +9171,7 @@ static void obmcJobs( GpuIntraRec::Impl& m, const CodingUnit& cu, const std::vec
     j[MC_MVY]      = mv.getVer();
     j[MC_REF]      = mcSlot( m, slice, l0, s.mi.refIdx[l0] );
     j[MC_FLAGS]    = ( cu.imv == IMV_HPEL ? MC_ALT_HPEL : 0 ) | ( bi ? MC_BI : 0 )   // (the CU's AMVR flag)
+                  | ( ( r[OBMC_REC_FLAGS] & OBMC_REC_GEO ) ? MC_NO_SHARP : 0 )   // (m_geoOBMC: no sharp bi filter)
                   | ( !bi && l0 == 1 ? MC_L1 : 0 );
     if( s.nb->cu->licFlag )   // (JVET-AD0213: the neighbour's stored models, a list it lacks 32 / 0)
     {
@@ -9150,7 +9257,7 @@ static void obmcJobs( GpuIntraRec::Impl& m, const CodingUnit& cu, const std::vec
     }
     j[OBMC_J_THRESHOLD]     = 96 << ( bd - 8 );
     j[OBMC_J_THRESHOLD + 1] = 96 << ( bdC - 8 );
-    j[OBMC_J_INT_DIR]       = s.mi.interDir;
+    j[OBMC_J_INT_DIR]       = ( r[OBMC_REC_FLAGS] & OBMC_REC_GEO ) ? 0 : s.mi.interDir;   // (0: no test)
     for( int l = 0; l < 2; l++ )
     {
       if( s.mi.interDir & ( 1 << l ) )
@@ -9285,7 +9392,8 @@ void GpuIntraRec::ibcGpmVectors( const CodingUnit& cu, const Mv& mv0, const Mv& 
   m_impl->ibcGpmMvs[&cu] = std::make_pair( mv0, mv1 );
 }
 
-void GpuIntraRec::gpmParts( const CodingUnit& cu, bool plain, int splitDir, int bldIdx, const int32_t parts[2][22] )
+void GpuIntraRec::gpmParts( const CodingUnit& cu, int kind, int splitDir, int bldIdx, const int32_t parts[2][22],
+                            const MotionInfo partMi[2], const int32_t partObmc[2] )
 {
   Impl& m = *m_impl;
   if( !m.partial || !m.interPending.count( &cu ) )
@@ -9293,9 +9401,11 @@ void GpuIntraRec::gpmParts( const CodingUnit& cu, bool plain, int splitDir, int 
     return;
   }
   std::vector<int32_t>& v = m.gpmInfo[&cu];
-  v.assign( { plain ? 1 : 0, splitDir, bldIdx } );
+  v.assign( { kind, splitDir, bldIdx } );
   v.insert( v.end(), parts[0], parts[0] + GPM_PART );
   v.insert( v.end(), parts[1], parts[1] + GPM_PART );
+  v.insert( v.end(), partObmc, partObmc + 2 );
+  m.gpmMi[&cu] = { partMi[0], partMi[1] };
 }
 
 void GpuIntraRec::dmvrVectors( const CodingUnit& cu, const Mv* list0, const Mv* list1 )
@@ -10027,9 +10137,11 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
       };
       if( t.derive & DERIVE_INTER )   // an inter CU's block: its prediction given, nothing more
       {
-        if( t.obmc )   // (OBMC's TM: the CU's one-sample templates, intra_deps' addAreaDeps)
+        // (OBMC's TM: the CU's one-sample templates, intra_deps' addAreaDeps; GPM's part 1's record where part 0 has none)
+        const int32_t ro = t.obmc ? t.obmc - 1 : t.gpm ? m.timdData[t.gpm - 1 + GPMR_OBMC1] - 1 : -1;
+        if( ro >= 0 )
         {
-          const int32_t* r = &m.timdData[t.obmc - 1];
+          const int32_t* r = &m.timdData[ro];
           auto addLumaArea = [&]( int x0, int y0, int x1, int y1 )
           {
             for( int uy = y0 >> P.unitLog2Y[0]; uy <= y1 >> P.unitLog2Y[0]; uy++ )
@@ -10416,6 +10528,14 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
   for( size_t k = 0; k < m.obmcInnerJobs.size(); k += OBMC_I )
   {
     m.obmcInnerJobs[k + OBMC_I_DST] += (int32_t) obmcBase;
+  }
+  for( size_t k = 0; k < m.mcJobs.size(); k += MC_JOB )   // (GPM's separate OBMC: part 1's predictions)
+  {
+    m.mcJobs[k + MC_BDOF_TH] += ( m.mcJobs[k + MC_FLAGS] & MC_GPM_SEP ) ? (int32_t) obmcBase : 0;
+  }
+  for( const int32_t k: m.gpmSepRecs )
+  {
+    m.timdData[k] += (int32_t) obmcBase;
   }
   m.interPred.resize( m.interPred.empty() ? 0 : obmcBase + ( ( size_t( m.obmcData ) + 1 ) & ~size_t( 1 ) ), 0 );
   const size_t interBytes = m.interPred.size() * 2;

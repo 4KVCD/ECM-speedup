@@ -88,7 +88,14 @@ struct Tu
   // a CIIP CU's block (with DERIVE_INTER; CIIP_*, 0: none): its prediction blended with its intra prediction, which the
   // intra fields above describe (geneWeightedPred)
   int ciip;
+  // a block of a GPM CU with separate OBMC (with DERIVE_INTER; JVET-AK0212): its record in Params::timdData + 1 (GPMR_*;
+  // 0: none) - part 0's prediction at the block's samples with OBMC record obmc, part 1's at GPMR_P1 with GPMR_OBMC1's,
+  // weighed by GPMR_W
+  int gpm;
 };
+// Tu::gpm's record: part 1's prediction (in Params::interPred), its OBMC record + 1 (0: none on the block), the
+// block's weights of part 0 (of 32, per sample)
+const int GPMR_P1 = 0, GPMR_OBMC1 = 1, GPMR_W = 2;
 layout( buffer_reference, std430, buffer_reference_align = 4 ) buffer BufTu { Tu v[]; };
 
 // the chroma modes of the LM family (CommonDef.h with MMLM; a CCLM block's Tu::dirMode)

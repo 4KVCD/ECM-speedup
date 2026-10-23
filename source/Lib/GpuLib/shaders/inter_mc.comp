@@ -75,6 +75,9 @@ const int MC_NLIC     = 512; // a non-local LIC CU's block: its model at MC_NLIC
 const int MC_NLIC_AT  = 31;
 const int MC_GPM      = 1024; // a GPM CU's block (weightedGeoBlk): part 0 at MC_MVX / MC_REF, part 1 at MC_MV1X /
                               // MC_REF1 (each uni-prediction), the PU's weights at MC_BDOF_OUT in pc.affine
+const int MC_GPM_SEP  = 2048; // ... with separate OBMC: each part's final prediction, part 0's at MC_DST, part 1's at
+                              // MC_BDOF_TH (intra_rec's OBMC and weightedGeoBlkRounded)
+const int MC_NO_SHARP = 4096; // without JVET-AI0094's sharp bi-prediction filter (GPM's separate OBMC: m_geoOBMC)
 // McRef (int32) per slot and component: the index of sample (0, 0) in pc.planes, the stride, the size, the margin
 const int MC_REF_ORIGIN = 0, MC_REF_STRIDE = 1, MC_REF_W = 2, MC_REF_H = 3, MC_REF_MARGIN = 4;
 const int MC_REF_COMP = 5;
@@ -97,6 +100,7 @@ int refAt( int slot, int comp, int x, int y )
 
 bool mcTm  = false;   // mcPredictTaps: the 4-tap TM filter for luma (filterIdx 1 with use4TapTM)
 bool mcF64 = false;   // affine: m_lumaFilter64's 1/64 taps for luma (filterIdx -2)
+bool mcNoSharp = false;   // MC_NO_SHARP
 
 // the taps of one pass: the table's start and the tap count (filterHor / filterVer's choice for this fraction; the
 // sharp bi-prediction filter where the pass's block is above 4 x 4)
@@ -118,7 +122,7 @@ ivec2 mcTaps( bool luma, int frac, bool altHpel, bool sharp )
   {
     return ivec2( MC_FILT_ALT, 8 );
   }
-  return ivec2( ( sharp ? MC_FILT_LUMA_BI : MC_FILT_LUMA ) + frac * 12, 12 );
+  return ivec2( ( sharp && !mcNoSharp ? MC_FILT_LUMA_BI : MC_FILT_LUMA ) + frac * 12, 12 );
 }
 
 // InterpolationFilter::filter's sum of n taps at (x, y) along the direction (dx, dy), from the first sample n / 2 - 1
@@ -1119,6 +1123,11 @@ int mcSampleBase( BufI32 jb, int o, int comp, int x, int y, int puW, int puH, in
     return int( BufI16( pc.bdofOut )
                   .v[jb.v[o + MC_BDOF_OUT] + ( y - ( jb.v[o + MC_PU_Y] >> cs ) ) * puW + x - ( jb.v[o + MC_PU_X] >> cs )] );
   }
+  if( ( flags & MC_GPM_SEP ) != 0 )   // GPM with separate OBMC: part 0's final prediction (part 1's: main)
+  {
+    return mcPredict( slot0, comp, x + ( mv0.x >> shift ), y + ( mv0.y >> shift ), mv0.x & mask, mv0.y & mask, alt, false,
+                      puW, puH, bd, clipMin, clipMax );
+  }
   if( ( flags & MC_GPM ) != 0 )   // GPM: both parts' 14-bit predictions weighed by the host's weights (of 32)
   {
     int q0 = mcPredict( slot0, comp, x + ( mv0.x >> shift ), y + ( mv0.y >> shift ), mv0.x & mask, mv0.y & mask, alt,
@@ -1272,11 +1281,15 @@ void obmcJob( int o, int lid )
     for( int i = lid; i < cw * ch; i += 64 )
     {
       const int x = cx + i % cw, y = cy + i / cw;
+      mcNoSharp = ( jb.v[o + MC_FLAGS] & MC_NO_SHARP ) != 0;
       int nbv = mcSample( jb, o, comp, x, y, cw, ch, bd, clipMin, clipMax, lic );
+      mcNoSharp = false;
       nbv     = nlic < 0 ? nbv : mcLic( jb, nlic, 0, comp, nbv, clipMin, clipMax );
       od.v[predOff[comp] + i] = int16_t( nbv );
       // skipObmcConditionByPixel: each list of the neighbour's motion at its integer vector, uni-prediction of the band
-      const int before = mcSample( base, bj, comp, x, y, base.v[bj + MC_PU_W], base.v[bj + MC_PU_H], bd, clipMin, clipMax, -1 );
+      // (no lists: no test - GPM's separate OBMC, m_geoOBMC)
+      const int before = jb.v[o + OBMC_J_INT_DIR] == 0 ? 0
+                         : mcSample( base, bj, comp, x, y, base.v[bj + MC_PU_W], base.v[bj + MC_PU_H], bd, clipMin, clipMax, -1 );
       for( int l = 0; l < 2; l++ )
       {
         if( ( jb.v[o + OBMC_J_INT_DIR] & ( 1 << l ) ) != 0 )
@@ -1311,7 +1324,9 @@ void obmcJob( int o, int lid )
     {
       const int k = i % L, t = o + OBMC_J_TPL + ( i / L ) * OBMC_J_TPL_MOTION;
       const int x = bx + ( dir == 0 ? k : 0 ), y = by + ( dir == 0 ? 0 : k );
+      mcNoSharp = ( jb.v[o + MC_FLAGS] & MC_NO_SHARP ) != 0;
       int tv = obmcTpl( jb, t, x, y, tw, th, bd, clipMin, clipMax, i < L ? clic : lic );
+      mcNoSharp = false;
       const int nl = i < L ? cnlic : nlic;
       tv     = nl < 0 ? tv : mcLic( jb, nl, 0, 0, tv, clipMin, clipMax );
       od.v[dst + OBMC_D_TPL + i] = int16_t( tv );
@@ -1391,6 +1406,15 @@ void main()
       const int v = mcSample( jb, o, comp, bx + i % W, by + i / W, jb.v[o + MC_PU_W], jb.v[o + MC_PU_H], bd,
                               jb.v[o + MC_CLIP_MIN], jb.v[o + MC_CLIP_MAX], -1 );
       BufI16( pc.outPred ).v[dst + i] = int16_t( v );
+      if( ( jb.v[o + MC_FLAGS] & MC_GPM_SEP ) != 0 )   // (GPM with separate OBMC: part 1's final prediction)
+      {
+        const int   sh = comp == 0 ? 4 : 5, mk = ( 1 << sh ) - 1;
+        const ivec2 mv1 = ivec2( jb.v[o + MC_MV1X], jb.v[o + MC_MV1Y] );
+        BufI16( pc.outPred ).v[jb.v[o + MC_BDOF_TH] + i] = int16_t(
+          mcPredict( jb.v[o + MC_REF1], comp, bx + i % W + ( mv1.x >> sh ), by + i / W + ( mv1.y >> sh ), mv1.x & mk,
+                     mv1.y & mk, false, false, jb.v[o + MC_PU_W], jb.v[o + MC_PU_H], bd, jb.v[o + MC_CLIP_MIN],
+                     jb.v[o + MC_CLIP_MAX] ) );
+      }
     }
   }
 }

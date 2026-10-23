@@ -540,10 +540,13 @@ void dependencies( int comp )
   }
   if( ( t.derive & DERIVE_INTER ) != 0 )   // an inter CU's block: its prediction given, it reads what its residual needs
   {
-    if( t.obmc != 0 )   // (OBMC's TM: the CU's one-sample templates, intra_rec's obmcModes; record: OBMC_REC_*)
+    // (OBMC's TM: the CU's one-sample templates, intra_rec's obmcModes; record: OBMC_REC_*, part 1's of a GPM CU with
+    // separate OBMC where part 0 has none - the CU's flags the same)
+    BufI32    rec = BufI32( P.timdData );
+    const int ro  = t.obmc != 0 ? t.obmc - 1 : t.gpm != 0 ? rec.v[t.gpm - 1 + GPMR_OBMC1] - 1 : -1;
+    if( ro >= 0 )
     {
-      BufI32    rec = BufI32( P.timdData );
-      const int r = t.obmc - 1, f = rec.v[r + 4], x = rec.v[r], y = rec.v[r + 1], w = rec.v[r + 2], h = rec.v[r + 3];
+      const int r = ro, f = rec.v[r + 4], x = rec.v[r], y = rec.v[r + 1], w = rec.v[r + 2], h = rec.v[r + 3];
       if( ( f & 1 ) != 0 && ( f & 2 ) != 0 )
       {
         addAreaDeps( 0, x, y - 1, x + w - 1, y - 1 );

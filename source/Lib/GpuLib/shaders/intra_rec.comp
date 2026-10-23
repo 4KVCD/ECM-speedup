@@ -1328,12 +1328,39 @@ ivec2 angularArrays( bool isVer, int W, int H, int angle, int absInvAngle, int t
 #include "intra_ibccu.glsl"
 #include "intra_intercccm.glsl"
 
-// OBMC on the CU's top / left band of an inter chroma block that blends a cross-component prediction with its inter one
-// (inter CCCM, inter CCP merge), done before the blend as the CPU's motion compensation does it: the blended
-// prediction over the block's own in Params::interPred, as the DERIVE_INTER branch blends it (all invocations, ending
-// with a barrier where it blends)
+// OBMC on the CU's top / left band of an inter block (M99; with inter CCCM or inter CCP merge before the blend, as the
+// CPU's motion compensation does it): the blended prediction over the block's own in Params::interPred (all
+// invocations, ending with a barrier where it blends); a GPM block with separate OBMC (M109): each part after its own
+// OBMC, then weightedGeoBlkRounded
 void interObmcBand( Tu t, int lid, int NT )
 {
+  if( t.gpm != 0 )
+  {
+    BufI32    gr = BufI32( P.timdData );
+    const int g = t.gpm - 1, p1 = gr.v[g + GPMR_P1];
+    for( int part = 0; part < 2; part++ )
+    {
+      const int r = part == 0 ? t.obmc - 1 : gr.v[g + GPMR_OBMC1] - 1, at = part == 0 ? t.dbgOffset : p1;
+      if( r >= 0 )
+      {
+        obmcModes( r, gr.v[r + OBMC_REC_BD], lid, NT );
+        for( int i = lid; i < t.w * t.h; i += NT )
+        {
+          CBufI16( P.interPred ).v[at + i] =
+            int16_t( obmcSample( t, r, i % t.w, i / t.w, int( CBufI16( P.interPred ).v[at + i] ) ) );
+        }
+        SYNC();
+      }
+    }
+    for( int i = lid; i < t.w * t.h; i += NT )
+    {
+      const int a = int( CBufI16( P.interPred ).v[t.dbgOffset + i] ), b = int( CBufI16( P.interPred ).v[p1 + i] );
+      const int w = gr.v[g + GPMR_W + i];
+      CBufI16( P.interPred ).v[t.dbgOffset + i] = int16_t( ( w * a + ( 32 - w ) * b + 16 ) >> 5 );
+    }
+    SYNC();
+    return;
+  }
   if( t.obmc == 0 )
   {
     return;
@@ -2519,17 +2546,7 @@ void main()
     if( ( t.derive & DERIVE_INTER ) != 0 )
     {
       crsSetup( t, lid, NT );
-      if( t.obmc != 0 )   // OBMC on the CU's top / left band (M99): the blended prediction over the block's own
-      {
-        const int r = t.obmc - 1;
-        obmcModes( r, BufI32( P.timdData ).v[r + OBMC_REC_BD], lid, NT );
-        for( int i = lid; i < t.w * t.h; i += NT )
-        {
-          CBufI16( P.interPred ).v[t.dbgOffset + i] =
-            int16_t( obmcSample( t, r, i % t.w, i / t.w, int( CBufI16( P.interPred ).v[t.dbgOffset + i] ) ) );
-        }
-        SYNC();
-      }
+      interObmcBand( t, lid, NT );   // (OBMC on the CU's top / left band; GPM's separate OBMC and blend)
       // (CIIP, M106: on to the intra prediction below, which storeRecon blends with this one)
       if( t.ciip == 0 )
       {

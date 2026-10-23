@@ -449,7 +449,7 @@ wall-clock gains with threads are "the easy baseline". Decoder status: single-th
 (`--GpuLoopFilter=1`: ALF, SAO, BIF, CCSAO, LF-CCCM, offset refinement on Vulkan). The user then asked for **a full
 GPU decoder in Vulkan, optimized until nothing is left** ("The GPU decoder needs to fully decode the frame on the
 GPU"; "Your first Vulkan version is going to be slow. That's OK"). That work is branch `dec-gpurecon`: intra
-reconstruction on the GPU (`--GpuRecon`), tool levels M1-M108 done and verified bit-exact (M19: DIMD, M20: OBIC, M21:
+reconstruction on the GPU (`--GpuRecon`), tool levels M1-M109 done and verified bit-exact (M19: DIMD, M20: OBIC, M21:
 intra merge, M22: the transforms of DIMD CUs, M23: LFNST of MIP, M24: TIMD, M25: OBIC and intra merge with TIMD
 neighbours, M26: TIMD-SAD, M27: OBIC and intra merge with TIMD-SAD neighbours, M28: TIMD merge, M29: TMRL of luma,
 M30: chroma TMRL, M31: CCLM, M32: LFNST / NSPT of CCLM, M33: GLM's gradient patterns, M34: CCCM, M35: GL-CCCM, M36:
@@ -2662,6 +2662,24 @@ CIIP CUs (M106 and the inter CCP merge port were verified apart): the CPU blends
 intra_rec blends it with the inter prediction in storeRegion, before storeRecon's CIIP blend. ciipWhy now leaves CIIP
 with inter CCP merge to the CPU (14 CUs in those four streams). Results: int2 every other picture identical
 (ra_wpp_q32 skipped as before); the four streams identical with the fix (build int3, the commit's tree).
+M109 (2026-10-23): GPM with separate OBMC on the GPU (JVET-AK0212: motionCompensationGeo predicts each part at its
+final precision, applies the part's own subBlockOBMC - with m_geoOBMC: no skipObmcConditionByPixel, no sharp bi filter
+(JVET-AI0094) for the neighbour bands and TM templates, TM only in low-delay slices - and blends weightedGeoBlkRounded,
+(w a + (32 - w) b + 16) >> 5). CommonLib records the blend taken and each part's motion as its OBMC sees it, spanned
+over the CU (m_gpuGeoSep, m_gpuGeoMi, m_gpuGeoObmc via gpuGeoObmc). The host plans each part's OBMC with that motion
+put into the CU's motion buffer and back (withPartMotion: getSameNeigMotion compares the neighbours with it; an MMVD
+part's usePreCheck runs are the same, the part's motion being the same over the CU) and makes one OBMC record per part
+(OBMC_REC_GEO; its jobs with no pixel test - OBMC_J_INT_DIR 0 - and MC_NO_SHARP; TM's current template from the part's
+motion). A block's job carries MC_GPM_SEP: mcSampleBase gives part 0's final prediction, the job writes part 1's into
+the OBMC data region (MC_BDOF_TH); Tu::gpm (Tu now 109 words) points at a record of part 1's place, its OBMC record
+and the block's weights; intra_rec's interObmcBand (now also the DERIVE_INTER branch's step) applies each part's OBMC
+and blends. intra_deps and the host's mirror take the TM templates' dependencies from part 1's record where part 0 has
+none. Found on the way: ra_crowdrun_q32 differed by 1 in OBMC bands next to bi-predicted neighbours (the sharp filter;
+MC_NO_SHARP); ra_ctu256_q32, ra_rpr15x_q32 and ra_rpr2x_q32 (low-delay slices, TM) where part 0 had no segments (the
+templates' dependencies). Still the CPU's: parts with LIC, DMVR or sub-block motion, bi-prediction parts, and the rest
+gpmWhy names. Results (50 streams, build gsep2): every picture identical (ra_wpp_q32 skipped as before); GPM 406 CUs
+predicted by the GPU (+355); from the CPU: GPM (an affine part) 613, (an intra part) 467, (regression-based blending)
+324, (a bi-prediction part) 303, (LIC) 82, (OBMC with an intra neighbour) 47, (separate OBMC with a LIC part) 45.
 
 
 ## 8. Numbers (i7-10700 8C/16T, Win11, GCC 16.2, RTX 3070 driver 616.92)

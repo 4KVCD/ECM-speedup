@@ -1854,6 +1854,12 @@ public:
     }
     m_gpuGeoPart[k][21] = pu.cu->altLMFlag ? 1 : 0;
   }
+  // ... part k's motion as its OBMC sees it (spanned over the CU) and whether its sub-block motion's inner OBMC applies
+  void    gpuGeoObmc( int k, const PredictionUnit& pu )
+  {
+    m_gpuGeoMi[k]   = pu.getMotionInfo();
+    m_gpuGeoObmc[k] = 1 | ( pu.bdmvrRefine ? 2 : 0 );
+  }
 #if JVET_AA0093_REFINED_MOTION_FOR_ARMC
 #if JVET_AI0185_ADAPTIVE_COST_IN_MERGE_MODE
   bool      processBDMVR              (PredictionUnit& pu, int step = 0, Distortion* tmCost = NULL, int mergeIdx = -1);
@@ -2090,10 +2096,15 @@ public:
   // the last motionCompensationGeo, for the GPU reconstruction: whether it blended two predictions with
   // weightedGeoBlk (its plain path), the split direction and blending index, and per part the motion it predicted
   // with (the vectors of both lists, both reference indices, interDir, bdmvrRefine; interDir 0: another part), its
-  // LIC flag and models (per list and component scale, offset) and its non-local LIC flag
-  bool    m_gpuGeoPlain = false;
-  int     m_gpuGeoSplit = 0, m_gpuGeoBld = 0;
-  int32_t m_gpuGeoPart[2][22] = {};
+  // LIC flag and models (per list and component scale, offset) and its non-local LIC flag; whether it blended them
+  // with weightedGeoBlkRounded after each part's own OBMC (JVET-AK0212, two inter parts), each part's motion at its OBMC
+  // and whether that ran (1), with sub-block motion (2)
+  bool       m_gpuGeoPlain = false;
+  bool       m_gpuGeoSep   = false;
+  int        m_gpuGeoSplit = 0, m_gpuGeoBld = 0;
+  int32_t    m_gpuGeoPart[2][22] = {};
+  MotionInfo m_gpuGeoMi[2];
+  int32_t    m_gpuGeoObmc[2] = {};
 };
 
 #if TM_AMVP || TM_MRG || JVET_Z0084_IBC_TM
