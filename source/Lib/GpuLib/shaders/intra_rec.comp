@@ -807,6 +807,11 @@ const int OBMC_REC_X = 0, OBMC_REC_Y = 1, OBMC_REC_W = 2, OBMC_REC_H = 3, OBMC_R
 const int OBMC_REC_BD = 6, OBMC_REC_BASE = 7, OBMC_REC_INNER = 8, OBMC_REC_SEG = 10;   // (BASE: where the data start)
 const int OBMC_SEG_DIR = 0, OBMC_SEG_START = 1, OBMC_SEG_LEN = 2, OBMC_SEG_DATA = 3, OBMC_SEG = 4;
 const int OBMC_REC_TM = 1, OBMC_REC_TOP = 2, OBMC_REC_LEFT = 4, OBMC_REC_INV_LMCS = 8, OBMC_REC_SUB = 16;
+// JVET-AJ0161 (intra_obmc.glsl's obmcInterIntra): a segment of an intra neighbour (its head: the boundary, OBMC_SEG_INTRA,
+// its mode << OBMC_SEG_MODE; its data the band's predictions alone); the record's flags: intra segments, their luma
+// mapped back by LMCS's inverse, the SPS's DisablePdpc and DisableRefFilter
+const int OBMC_SEG_INTRA = 2, OBMC_SEG_MODE = 8;
+const int OBMC_REC_INTRA = 256, OBMC_REC_INTRA_INV = 512, OBMC_REC_NO_PDPC = 1024, OBMC_REC_NO_REF_FILTER = 2048;
 // sub-block motion (DMVR): per 4 x 4 sub-block of the CU (OBMC_REC_INNER: where its entries start) the neighbours
 // (above, left, below, right) whose motion differs (bits) and their predictions of the sub-block (4 x 4 luma, 2 x 2 Cb
 // and Cr each); the inner blend's weights (currWeights per neighbours' set, neigWeights per neighbour)
@@ -848,13 +853,14 @@ void obmcModes( int r, int bd, int lid, int NT )
   for( int s = 0; s < num; s++ )
   {
     const int o = r + OBMC_REC_SEG + s * OBMC_SEG;
-    const int dir = rec.v[o + OBMC_SEG_DIR], start = rec.v[o + OBMC_SEG_START], len = rec.v[o + OBMC_SEG_LEN];
+    const int dir = rec.v[o + OBMC_SEG_DIR] & 1, start = rec.v[o + OBMC_SEG_START], len = rec.v[o + OBMC_SEG_LEN];
     const int d = rec.v[r + OBMC_REC_BASE] + rec.v[o + OBMC_SEG_DATA];
-    if( ( flags & OBMC_REC_TM ) == 0 || ( flags & ( dir == 0 ? OBMC_REC_TOP : OBMC_REC_LEFT ) ) == 0 )
+    const bool intra = ( rec.v[o + OBMC_SEG_DIR] & OBMC_SEG_INTRA ) != 0;   // (plain blending)
+    if( ( flags & OBMC_REC_TM ) == 0 || ( flags & ( dir == 0 ? OBMC_REC_TOP : OBMC_REC_LEFT ) ) == 0 || intra )
     {
       if( lid == 0 )
       {
-        s_obmcMode[s] = ( flags & OBMC_REC_TM ) == 0 ? -1 : 0;
+        s_obmcMode[s] = ( flags & OBMC_REC_TM ) == 0 || intra ? -1 : 0;
       }
       continue;
     }
@@ -929,7 +935,7 @@ int obmcSample( Tu t, int r, int x, int y, int p )
     for( int s = 0; s < num; s++ )
     {
       const int o = r + OBMC_REC_SEG + s * OBMC_SEG;
-      if( rec.v[o + OBMC_SEG_DIR] != pass )
+      if( ( rec.v[o + OBMC_SEG_DIR] & 1 ) != pass )
       {
         continue;
       }
@@ -944,7 +950,9 @@ int obmcSample( Tu t, int r, int x, int y, int p )
         const int L = rec.v[o + OBMC_SEG_LEN], W = pass == 0 ? L : 4, H = pass == 0 ? 4 : L;
         const int pred = d + OBMC_D_TPL + 2 * L + ( comp == 0 ? 0 : W * H + ( comp - 1 ) * ( W >> 1 ) * ( H >> 1 ) );
         const int bw = W >> cs, i = pass == 0 ? ( along - start ) + cy * bw : cx + ( along - start ) * bw;
-        p = obmcWeight( p, int( data.v[pred + i] ), mode, pass == 0 ? cy : cx );
+        const int nb = ( rec.v[o + OBMC_SEG_DIR] & OBMC_SEG_INTRA ) != 0 ? int( CBufI16( P.interPred ).v[pred + i] )
+                                                                       : int( data.v[pred + i] );   // (intra: this pass's)
+        p = obmcWeight( p, nb, mode, pass == 0 ? cy : cx );
       }
       break;
     }
@@ -1366,6 +1374,7 @@ void interObmcBand( Tu t, int lid, int NT )
     return;
   }
   const int r = t.obmc - 1;
+  obmcInterIntra( t, lid, NT );   // (intra neighbours' strips: intra_obmc.glsl)
   obmcModes( r, BufI32( P.timdData ).v[r + OBMC_REC_BD], lid, NT );
   for( int i = lid; i < t.w * t.h; i += NT )
   {
@@ -2583,6 +2592,12 @@ void main()
       continue;
       }
     }
+    // ----- an inter CCP merge block (DERIVE_INTER_BLEND without DERIVE_INTER): OBMC's band first, before its references
+    // (its intra neighbours' strips use them: intra_obmc.glsl's obmcInterIntra)
+    if( WITH_CCP_MERGE && ( t.derive & DERIVE_INTER_BLEND ) != 0 )
+    {
+      interObmcBand( t, lid, NT );
+    }
     // ----- a block of a CU whose mode its node derived: the parameters for the mode
     if( ( t.derive & DERIVE_MODE ) != 0 )
     {
@@ -3077,10 +3092,6 @@ void main()
         const int lx = t.x << 1, ly = t.y << 1;   // the co-located luma block (4:2:0)
         if( WITH_CCP_MERGE && t.ccpMerge >= 0 )
         {
-          if( ( t.derive & DERIVE_INTER_BLEND ) != 0 )   // (inter CCP merge: OBMC's band first)
-          {
-            interObmcBand( t, lid, NT );
-          }
           ccpMergePrediction( t, predStride, lid, NT );   // (t: the chosen model's LM block; its luma buffers in the
                                                           // angular arrays, cleared at the end, or the scratch)
           angClear  = g_ccpAngUsed;

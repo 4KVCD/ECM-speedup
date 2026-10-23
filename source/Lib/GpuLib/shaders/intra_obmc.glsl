@@ -290,14 +290,15 @@ void obmcSideOps( Cu c, int rec, int b, ivec2 ownMv, ivec3 ownLic, bool modes )
   }
 }
 
-// ----- an intra strip (subBlockIntraForOBMC): its prediction into TO_STRIP
+// ----- an intra strip (subBlockIntraForOBMC): its prediction into the workgroup's scratch
 
-// the references of a strip (invocation 0) into s_ref[0] (top arm, left arm at predStride): for a side's first unit
-// (state OBMC_BOTH) xFillReferenceSamples' (line 0), after it xFillReferenceSamplesOBMC's, the other side not available
-// and its own padding
-void obmcFillReferences( ivec4 s, int state, int predStride, int bitDepth, OwnerMap om )
+// the references of a strip of component comp (its samples; invocation 0) into s_ref[0] (top arm, left arm at
+// predStride): for a side's first unit (state OBMC_BOTH) xFillReferenceSamples' (line 0), after it
+// xFillReferenceSamplesOBMC's, the other side not available and its own padding; units of U samples (minCUWidth, for
+// chroma halved)
+void obmcFillReferences( ivec4 s, int state, int predStride, int bitDepth, OwnerMap om, int comp, int U )
 {
-  const int predSize = s.z << 3, predHSize = s.w << 3, U = 4;
+  const int predSize = s.z << 3, predHSize = s.w << 3;
   const int tAU = ( predSize + U - 1 ) / U, tLU = ( predHSize + U - 1 ) / U, total = tAU + tLU + 1;
   const int numA = s.z / U, numL = s.w / U, numAR = tAU - numA, numBL = tLU - numL;
   uint      f[9] = uint[9]( 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u );
@@ -331,17 +332,17 @@ void obmcFillReferences( ivec4 s, int state, int predStride, int bitDepth, Owner
     if( num == 0 || num == total )
     {
       const int dc = 1 << ( bitDepth - 1 );
-      for( int j = 0; j <= predSize; j++ ) s_ref[0][j] = int16_t( num == 0 ? dc : recoAt( 0, s.x - 1 + j, s.y - 1 ) );
+      for( int j = 0; j <= predSize; j++ ) s_ref[0][j] = int16_t( num == 0 ? dc : recoAt( comp, s.x - 1 + j, s.y - 1 ) );
       for( int i = 0; i <= predHSize; i++ )
       {
-        s_ref[0][predStride + i] = int16_t( num == 0 ? dc : recoAt( 0, s.x - 1, s.y - 1 + i ) );
+        s_ref[0][predStride + i] = int16_t( num == 0 ? dc : recoAt( comp, s.x - 1, s.y - 1 + i ) );
       }
       return;
     }
   }
   if( OBMC_FLAG( tLU ) )
   {
-    const int v = recoAt( 0, s.x - 1, s.y - 1 );
+    const int v = recoAt( comp, s.x - 1, s.y - 1 );
     s_ref[0][0]          = int16_t( v );
     s_ref[0][predStride] = int16_t( v );
   }
@@ -352,13 +353,13 @@ void obmcFillReferences( ivec4 s, int state, int predStride, int bitDepth, Owner
     {
       for( int i = 0; i < U && OBMC_FLAG( u ); i++ )
       {
-        s_ref[0][predStride + dst + i] = int16_t( recoAt( 0, s.x - 1, y + i ) );
+        s_ref[0][predStride + dst + i] = int16_t( recoAt( comp, s.x - 1, y + i ) );
       }
     }
     const int last = predHSize % U == 0 ? U : predHSize % U;
     for( int i = 0; i < last && OBMC_FLAG( 0 ); i++ )
     {
-      s_ref[0][predStride + dst + i] = int16_t( recoAt( 0, s.x - 1, y + i ) );
+      s_ref[0][predStride + dst + i] = int16_t( recoAt( comp, s.x - 1, y + i ) );
     }
   }
   if( state != OBMC_ONLY_LEFT )
@@ -366,12 +367,12 @@ void obmcFillReferences( ivec4 s, int state, int predStride, int bitDepth, Owner
     int dst = 1, x = s.x;
     for( int u = tLU + 1; u < total - 1; u++, dst += U, x += U )
     {
-      for( int j = 0; j < U && OBMC_FLAG( u ); j++ ) s_ref[0][dst + j] = int16_t( recoAt( 0, x + j, s.y - 1 ) );
+      for( int j = 0; j < U && OBMC_FLAG( u ); j++ ) s_ref[0][dst + j] = int16_t( recoAt( comp, x + j, s.y - 1 ) );
     }
     const int last = predSize % U == 0 ? U : predSize % U;
     for( int j = 0; j < last && OBMC_FLAG( total - 1 ); j++ )
     {
-      s_ref[0][dst + j] = int16_t( recoAt( 0, x + j, s.y - 1 ) );
+      s_ref[0][dst + j] = int16_t( recoAt( comp, x + j, s.y - 1 ) );
     }
   }
   // the units before the first available one take its first sample, an unavailable one the last sample of the one
@@ -450,18 +451,19 @@ void obmcFillReferences( ivec4 s, int state, int predStride, int bitDepth, Owner
 #undef OBMC_FLAG
 }
 
-// the strip of side b from unit u0 for n units predicted with mode (TO_STRIP, row-major of the strip; all invocations):
-// state m_intraOBMCNeighState (both sides for the side's first unit, else that side alone); the parameters of the mode
-// for the strip (initPredIntraParams with isobmcMC: no reference filter nor Gaussian interpolation, PDPC with both
-// sides only), the references (the regular fill for both sides, else xFillReferenceSamplesOBMC; unfiltered), with
-// prepareRef the references beyond the strip's corner taken along the side (m_refSampleForOBMCBuf) for xPredIntraAng's
-// projection, then xPredIntraAng's prediction
-void obmcIntraStrip( Tu t, Cu c, int b, int u0, int n, int mode, int lid, int NT )
+// the strip st (x, y, width, height in component t.comp's samples) of side b predicted with mode into the scratch at dst
+// (row-major of the strip; all invocations), prepareRef's buffer at prep: state m_intraOBMCNeighState (both sides for
+// the side's first unit - first -, else that side alone); the parameters of the mode for the strip (initPredIntraParams
+// with isobmcMC: no reference filter nor Gaussian interpolation, PDPC with both sides only; t's DERIVE_NO_PDPC and
+// disableRefFilter the SPS's), the references (the regular fill for both sides, else xFillReferenceSamplesOBMC;
+// unfiltered), with prepareRef the references beyond the strip's corner taken along the side (m_refSampleForOBMCBuf)
+// for xPredIntraAng's projection, then xPredIntraAng's prediction (luma cubic, chroma linear)
+void obmcStripPredict( Tu t, ivec4 st, int b, bool first, int mode, int dst, int prep, int lid, int NT )
 {
-  OwnerMap    om     = OwnerMap( BufI32( P.owner[0] ), P.ownerW[0], P.ownerH[0], P.unitLog2X[0], P.unitLog2Y[0] );
-  const ivec4 st     = obmcStrip( c, b, u0, n );
+  const int   ch     = t.comp == 0 ? 0 : 1, U = t.comp == 0 ? 4 : 2;   // (xFillReferenceSamples' units)
+  OwnerMap    om     = OwnerMap( BufI32( P.owner[t.comp] ), P.ownerW[ch], P.ownerH[ch], P.unitLog2X[ch], P.unitLog2Y[ch] );
   const bool  above  = b == 0;
-  const int   state  = u0 == 0 ? OBMC_BOTH : above ? OBMC_ONLY_ABOVE : OBMC_ONLY_LEFT;
+  const int   state  = first ? OBMC_BOTH : above ? OBMC_ONLY_ABOVE : OBMC_ONLY_LEFT;
   const int   maxPel = ( 1 << t.bitDepth ) - 1;
   const bool  prepareRef = state != OBMC_BOTH
                            && ( ( above && st.x != 0 && mode < VER_IDX ) || ( !above && st.y != 0 && mode > HOR_IDX ) );
@@ -476,7 +478,7 @@ void obmcIntraStrip( Tu t, Cu c, int b, int u0, int n, int mode, int lid, int NT
   // the references
   if( lid == 0 )
   {
-    obmcFillReferences( st, state, predStride, t.bitDepth, om );
+    obmcFillReferences( st, state, predStride, t.bitDepth, om, t.comp, U );
   }
   // prepareRef's references along the side beyond the strip's corner (sizeSide entries + 1; -1 past them, which
   // ClipPel makes 0): the side's samples outward until a unit that is not decoded, then the last one repeated
@@ -487,17 +489,17 @@ void obmcIntraStrip( Tu t, Cu c, int b, int u0, int n, int mode, int lid, int NT
     for( int i = 0; i <= side; i++ )
     {
       const int px = above ? st.x - 1 - i : st.x - 1, py = above ? st.y - 1 : st.y - 1 - i;
-      if( ( ( ( above ? px : py ) + 1 ) & 3 ) == 0 && !decodedBefore( om, px, py, g_ti ) )
+      if( ( ( ( above ? px : py ) + 1 ) & ( U - 1 ) ) == 0 && !decodedBefore( om, px, py, g_ti ) )
       {
-        for( int j = i; j <= side; j++ ) tsSet( TO_PREP + j, last );
+        for( int j = i; j <= side; j++ ) tsSet( prep + j, last );
         break;
       }
-      last = recoAt( 0, px, py );
-      tsSet( TO_PREP + i, last );
+      last = recoAt( t.comp, px, py );
+      tsSet( prep + i, last );
     }
   }
   tsSync();
-  // the angular prediction (xPredIntraAng; luma, cubic: the long taps, 10 for sides below 8)
+  // the angular prediction (xPredIntraAng; luma cubic: the long taps, 10 for sides below 8; chroma linear)
   const bool isVer = s.isModeVer != 0;
   const int  angle = s.intraPredAngle, absInvAngle = s.absInvAngle;
   const ivec2 bases = angularArrays( isVer, W, H, angle, absInvAngle, predSize, predHSize, 0, predStride,
@@ -511,14 +513,14 @@ void obmcIntraStrip( Tu t, Cu c, int b, int u0, int n, int mode, int lid, int NT
     {
       for( int k = 1 + lid; k <= W + 2; k += NT )
       {
-        mainW( isVer, 0, mainBase + k, clamp( tsGet( TO_PREP + k ), 0, maxPel ) );
+        mainW( isVer, 0, mainBase + k, clamp( tsGet( prep + k ), 0, maxPel ) );
       }
     }
     else if( ( state == OBMC_ONLY_ABOVE && isVer ) || ( state == OBMC_ONLY_LEFT && !isVer ) )
     {
       for( int k = -( sizeSide + PAD ) + lid; k <= -1; k += NT )
       {
-        const int v = -k <= side ? tsGet( TO_PREP - k ) : -1;
+        const int v = -k <= side ? tsGet( prep - k ) : -1;
         mainW( isVer, 0, mainBase + k, clamp( v, 0, maxPel ) );
       }
     }
@@ -552,10 +554,15 @@ void obmcIntraStrip( Tu t, Cu c, int b, int u0, int n, int mode, int lid, int NT
       {
         v = mainR( isVer, 0, mainBase + deltaInt + 1 + x );
       }
-      else
+      else if( t.comp == 0 )
       {
         const int c0 = lumaConv( isVer, 0, mainBase + deltaInt + x - numExtra, taps, true, false, deltaFract, false );
         v = clip3i( 0, maxPel, clip3i( 0, maxPel, ( c0 + 128 ) >> 8 ) );
+      }
+      else
+      {
+        const int p0 = mainR( isVer, 0, mainBase + deltaInt + x + 1 ), p1 = mainR( isVer, 0, mainBase + deltaInt + x + 2 );
+        v = asPel( p0 + ( ( deltaFract * ( p1 - p0 ) + 16 ) >> 5 ) );
       }
       v = asPel( v );
       if( x < pdpcLimit )
@@ -577,7 +584,7 @@ void obmcIntraStrip( Tu t, Cu c, int b, int u0, int n, int mode, int lid, int NT
       }
     }
     const int ox = isVer ? x : y, oy = isVer ? y : x;
-    tsSet( TO_STRIP + oy * W + ox, asPel( v ) );
+    tsSet( dst + oy * W + ox, asPel( v ) );
   }
   SYNC();
   for( int i = lid; i < ANG; i += NT )   // (the angular arrays are zero between predictions)
@@ -586,6 +593,12 @@ void obmcIntraStrip( Tu t, Cu c, int b, int u0, int n, int mode, int lid, int NT
     s_angL[0][i] = int16_t( 0 );
   }
   tsSync();
+}
+
+// an IntraTMP CU's strip of side b from unit u0 for n units (luma) into TO_STRIP
+void obmcIntraStrip( Tu t, Cu c, int b, int u0, int n, int mode, int lid, int NT )
+{
+  obmcStripPredict( t, obmcStrip( c, b, u0, n ), b, u0 == 0, mode, TO_STRIP, TO_PREP, lid, NT );
 }
 
 // ----- the block
@@ -747,6 +760,60 @@ void tmpObmc( Tu t, Cu c, int rec, int lid, int NT )
       s_spPred[at] = int16_t( ( w0[j] * int( s_spPred[at] ) + w1[j] * tsGet( strip + i ) + 16 ) >> 5 );
     }
     SYNC();
+  }
+}
+
+// ----- an inter CU's OBMC with intra neighbours (JVET-AJ0161: subBlockOBMC's iState 1 segments)
+
+// the strips of OBMC record r (intra_rec.comp's OBMC_REC_*) whose segments are intra ones (OBMC_SEG_INTRA, their mode
+// - getGradForOBMC's, partial verification: the CPU's - in the head; the host's obmcIntraSegs), of block t's component,
+// where they overlap block t: predicted (subBlockIntraForOBMC, obmcStripPredict; with OBMC_REC_INTRA_INV luma mapped
+// back by LMCS's inverse) into the segment's data in Params::interPred (the band's predictions, as inter_mc's mode 3
+// leaves a motion segment's), the part of block t; obmcSample blends them (weightObmcBoundary's mode -1). All
+// invocations, uniform control flow; the scratch's start (strip, prepareRef's buffer) and the angular arrays are used
+const int OBMC_INTER_STRIP = 0, OBMC_INTER_PREP = 128 * 4;
+void obmcInterIntra( Tu t, int lid, int NT )
+{
+  BufI32    rec   = BufI32( P.timdData );
+  const int r     = t.obmc - 1;
+  const int flags = rec.v[r + OBMC_REC_FLAGS], num = rec.v[r + OBMC_REC_NUM];
+  if( ( flags & OBMC_REC_INTRA ) == 0 )
+  {
+    return;
+  }
+  const int cs  = t.comp == 0 ? 0 : 1;
+  const int cuX = rec.v[r + OBMC_REC_X] >> cs, cuY = rec.v[r + OBMC_REC_Y] >> cs;
+  Tu u = t;   // (the SPS's PDPC and reference filter switches)
+  u.derive           = ( flags & OBMC_REC_NO_PDPC ) != 0 ? DERIVE_NO_PDPC : 0;
+  u.disableRefFilter = ( flags & OBMC_REC_NO_REF_FILTER ) != 0 ? 1 : 0;
+  for( int k = 0; k < num; k++ )
+  {
+    const int o = r + OBMC_REC_SEG + k * OBMC_SEG, head = rec.v[o + OBMC_SEG_DIR];
+    if( ( head & OBMC_SEG_INTRA ) == 0 )
+    {
+      continue;
+    }
+    const int   b = head & 1, start = rec.v[o + OBMC_SEG_START], len = rec.v[o + OBMC_SEG_LEN];
+    const ivec4 st = b == 0 ? ivec4( cuX + ( start >> cs ), cuY, len >> cs, 4 >> cs )
+                            : ivec4( cuX, cuY + ( start >> cs ), 4 >> cs, len >> cs );
+    const int x0 = max( st.x, t.x ), x1 = min( st.x + st.z, t.x + t.w );
+    const int y0 = max( st.y, t.y ), y1 = min( st.y + st.w, t.y + t.h );
+    if( x0 >= x1 || y0 >= y1 )
+    {
+      continue;
+    }
+    obmcStripPredict( u, st, b, start == 0, head >> OBMC_SEG_MODE, OBMC_INTER_STRIP, OBMC_INTER_PREP, lid, NT );
+    const int W = b == 0 ? len : 4, H = b == 0 ? 4 : len;   // (luma)
+    const int pred = rec.v[r + OBMC_REC_BASE] + rec.v[o + OBMC_SEG_DATA] + OBMC_D_TPL + 2 * len
+                     + ( t.comp == 0 ? 0 : W * H + ( t.comp - 1 ) * ( W >> 1 ) * ( H >> 1 ) );
+    const bool inv = t.comp == 0 && ( flags & OBMC_REC_INTRA_INV ) != 0;
+    for( int i = lid; i < ( x1 - x0 ) * ( y1 - y0 ); i += NT )
+    {
+      const int x = x0 - st.x + i % ( x1 - x0 ), y = y0 - st.y + i / ( x1 - x0 );
+      const int v = tsGet( OBMC_INTER_STRIP + y * st.z + x );
+      CBufI16( P.interPred ).v[pred + y * st.z + x] = int16_t( inv ? invLut( v ) : v );
+    }
+    tsSync();
   }
 }
 

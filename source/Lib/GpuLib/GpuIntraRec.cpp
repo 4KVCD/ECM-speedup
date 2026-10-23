@@ -1371,6 +1371,11 @@ constexpr int OBMC_I_X = 1, OBMC_I_Y = 2, OBMC_I_DST = 5, OBMC_I_BD = 12, OBMC_I
 constexpr int OBMC_I_AVAIL = 15, OBMC_I_NB = 32, OBMC_I = OBMC_I_NB + 4 * MC_JOB;
 constexpr int OBMC_SEG_DIR = 0, OBMC_SEG_START = 1, OBMC_SEG_LEN = 2, OBMC_SEG_DATA = 3, OBMC_SEG = 4;
 constexpr int OBMC_REC_TM = 1, OBMC_REC_TOP = 2, OBMC_REC_LEFT = 4, OBMC_REC_INV_LMCS = 8;
+// JVET-AJ0161 (intra_obmc.glsl's obmcInterIntra): a segment of an intra neighbour (its head: the boundary,
+// OBMC_SEG_INTRA, its mode << OBMC_SEG_MODE; its data as a motion segment's, the band's predictions alone used); the
+// record's flags: intra segments, their luma mapped back by LMCS's inverse, the SPS's DisablePdpc and DisableRefFilter
+constexpr int OBMC_SEG_INTRA = 2, OBMC_SEG_MODE = 8;
+constexpr int OBMC_REC_INTRA = 256, OBMC_REC_INTRA_INV = 512, OBMC_REC_NO_PDPC = 1024, OBMC_REC_NO_REF_FILTER = 2048;
 constexpr int OBMC_J_DIR = 32, OBMC_J_FLAGS = 33, OBMC_J_BASE = 34, OBMC_J_THRESHOLD = 37, OBMC_J_INT_MV = 39;
 constexpr int OBMC_J_INT_DIR = 43, OBMC_J_TPL = 44, OBMC_J_TPL_MOTION = 9, OBMC_J_LIC = 64, OBMC_J_NLIC = 76;
 constexpr int OBMC_J_CLIC = 88, OBMC_J_CNLIC = 100, OBMC_J = 106;
@@ -8269,11 +8274,18 @@ static bool obmcScc( const PredictionUnit& pu )
 }
 
 // subBlockOBMC's segments of OBMC CU cu (none where it does nothing) and whether its inner sub-block OBMC applies (DMVR's
-// sub-block motion); nullptr where the GPU can do it, else the reason
-static const char* obmcPlan( const CodingUnit& cu, std::vector<ObmcSeg>& segs, bool& inner )
+// sub-block motion), with intra its runs of intra neighbours where the SPS has DIMD (JVET-AJ0161: obmcIntraSegs makes
+// their segments); nullptr where the GPU can do it, else the reason
+static const char* obmcPlan( const CodingUnit& cu, std::vector<ObmcSeg>& segs, bool& inner,
+                             std::vector<ObmcSeg>* intra = nullptr )
 {
   segs.clear();
   inner = false;
+  if( intra )
+  {
+    intra->clear();
+  }
+  int intraUnits = 0;   // (each may become a segment)
   PredictionUnit&    pu    = const_cast<PredictionUnit&>( *cu.firstPU );
   const SPS&         sps   = *cu.cs->sps;
   const Slice&       slice = *cu.slice;
@@ -8332,7 +8344,15 @@ static const char* obmcPlan( const CodingUnit& cu, std::vector<ObmcSeg>& segs, b
       {
         if( state == 1 && sps.getUseDimd() )
         {
-          return "OBMC with an intra neighbour";
+          if( cu.chromaFormat != CHROMA_420 && cu.chromaFormat != CHROMA_400 )
+          {
+            return "OBMC with an intra neighbour, not 4:2:0";
+          }
+          if( intra )
+          {
+            intra->push_back( { b, s * minCUW, n * minCUW, MotionInfo(), nullptr } );
+          }
+          intraUnits += n;
         }
         s += n;
       }
@@ -8341,6 +8361,10 @@ static const char* obmcPlan( const CodingUnit& cu, std::vector<ObmcSeg>& segs, b
         break;
       }
     }
+  }
+  if( (int) segs.size() + intraUnits > OBMC_MAX_SEG )
+  {
+    return "OBMC of many segments";
   }
   return nullptr;
 }
@@ -8385,13 +8409,87 @@ static const char* gpmSepPlan( const GpuIntraRec::Impl& m, const CodingUnit& cu,
     {
       return ( ran & 1 ) == 0 ? "separate OBMC not run" : "separate OBMC of sub-block motion";
     }
-    std::vector<ObmcSeg> s;
+    std::vector<ObmcSeg> s, intra;   // (JVET-AJ0161's intra neighbours: not with separate OBMC here)
     bool                 inner = false;
-    withPartMotion( m, cu, k, [&]() { why = obmcPlan( cu, segs ? segs[k] : s, inner ); } );
-    why = why ? why : inner ? "separate OBMC of sub-block motion" : nullptr;
+    withPartMotion( m, cu, k, [&]() { why = obmcPlan( cu, segs ? segs[k] : s, inner, &intra ); } );
+    why = why ? why : inner ? "separate OBMC of sub-block motion" : !intra.empty() ? "separate OBMC with an intra neighbour" : nullptr;
   }
   return why;
 }
+
+// JVET-AJ0161: the intra modes per 4-sample unit along side b (0 top, 1 left) of OBMC CU cu, as subBlockOBMC's
+// getGradForOBMC derives them (calcGradForOBMC: a DIMD of the two rows / columns next to the CU; partial verification:
+// of the CPU's reconstruction, the CPU's modes); false where it gives none (m_modeGetCheck)
+static bool obmcSideModes( const CodingUnit& cu, int b, std::vector<int>& modes )
+{
+  const PredictionUnit&  pu    = *cu.firstPU;
+  const CodingStructure& cs    = *cu.cs;
+  const bool             above = b == 0;
+  const int              blk   = (int) cs.pcv->minCUWidth;
+  if( !cs.getPU( pu.lumaPos().offset( above ? 1 : -1, above ? -1 : 1 ), pu.chType ) )
+  {
+    return false;
+  }
+  const int total = (int) ( above ? pu.lwidth() : pu.lheight() ) / blk;
+  modes.assign( total + 1, -1 );
+  const bool first = cs.getCURestricted( cu.Y().topLeft().offset( -1, -1 ), cu, cu.chType ) != nullptr;
+  const bool last  = cs.getCURestricted( above ? cu.Y().topRight().offset( 1, -1 ) : cu.Y().bottomLeft().offset( -1, 1 ), cu,
+                                         cu.chType ) != nullptr;
+  const CPelBuf reco = cs.picture->getRecoBuf( pu.Y() );
+  calcGradForOBMC( pu, above ? reco.buf - 2 * reco.stride : reco.buf - 2, reco.stride, total, 1, blk, modes.data(), above,
+                   first, last );
+  return true;
+}
+
+// JVET-AJ0161: the intra segments of OBMC CU cu from obmcPlan's runs of intra neighbours (subBlockOBMC's iState 1 with
+// m_modeGetCheck: runs of one side mode, at most MAX_INTRA_SIZE long, whose mode lies within the side's angles - above
+// diagonal to vertical diagonal, left beyond DC up to the diagonal): per segment its head (side | OBMC_SEG_INTRA | mode
+// << OBMC_SEG_MODE), first luma sample along the side, length
+static std::vector<std::array<int32_t, 3>> obmcIntraSegs( const CodingUnit& cu, const std::vector<ObmcSeg>& runs )
+{
+  std::vector<std::array<int32_t, 3>> out;
+  const int                           blk = (int) cu.cs->pcv->minCUWidth;
+  std::vector<int>                    modes[2];
+  int                                 have[2] = { -1, -1 };   // (-1: not derived yet)
+  for( const ObmcSeg& run: runs )
+  {
+    const int b = run.dir;
+    if( have[b] < 0 )
+    {
+      have[b] = obmcSideModes( cu, b, modes[b] ) ? 1 : 0;
+    }
+    if( !have[b] )
+    {
+      continue;
+    }
+    const int n = run.len / blk;
+    int       sub = run.start / blk;
+    for( int cum = 0; cum < n; )
+    {
+      cum++;
+      int cur = 1;
+      while( cum < n && cur < MAX_INTRA_SIZE / blk && modes[b][sub + cur] == modes[b][sub] )
+      {
+        cur++;
+        cum++;
+      }
+      const int mode = modes[b][sub];
+      if( b == 0 ? mode >= DIA_IDX && mode <= VDIA_IDX : mode > DC_IDX && mode <= DIA_IDX )
+      {
+        out.push_back( { b | OBMC_SEG_INTRA | ( mode << OBMC_SEG_MODE ), sub * blk, cur * blk } );
+      }
+      sub += cur;
+    }
+  }
+  return out;
+}
+
+// JVET-AJ0161: OBMC record flags of CU cu with intra segments: their luma mapped back by LMCS's inverse
+// (subBlockIntraForOBMC: the picture's LMCS and the CTU's flag), the SPS's switches of PDPC and the reference filter
+static int32_t obmcIntraFlags( GpuIntraRec::Impl& m, const CodingUnit& cu, const std::vector<std::array<int32_t, 3>>& segs );
+
+// JVET-AJ0161: the intra segments' entries of the current OBMC record (OBMC_SEG_*) and their data's places
+static void obmcIntraRecord( GpuIntraRec::Impl& m, const std::vector<std::array<int32_t, 3>>& segs );
 
 // the reference slot of list l's picture refIdx
 static int mcSlot( GpuIntraRec::Impl& m, const Slice& slice, int l, int refIdx );
@@ -8943,8 +9041,8 @@ void GpuIntraRec::recordInterCu( const CodingUnit& cu )
   }
   // (its motion is known now: DecCu derives a merge CU's after interCu, xDeriveCUMV; IBC and palette CUs: their own
   // prediction, ibcRecord / pltRecord)
-  // (GPM with separate OBMC: each part's segments, part 1's in segs1)
-  std::vector<ObmcSeg> segs, segs1, geoSegs[2];
+  // (GPM with separate OBMC: each part's segments, part 1's in segs1; JVET-AJ0161: the intra neighbours' runs)
+  std::vector<ObmcSeg> segs, segs1, geoSegs[2], intraRuns;
   bool                 inner  = false;
   const bool           geoSep = cu.geoFlag && cu.slice->getCheckUseSepOBMC();
   m.obmcRec = m.obmcRec1 = -1;
@@ -8954,7 +9052,7 @@ void GpuIntraRec::recordInterCu( const CodingUnit& cu )
   }
   if( !CU::isIBC( cu ) && !CU::isPLT( cu ) && interMcGpu( cu ) && ( !cu.geoFlag || !gpmWhy( m, cu ) )
       && ( !cu.firstPU->bdmvrRefine || mcIdentical( *cu.firstPU ) || m.dmvrMvs.count( &cu ) )
-      && ( !cu.obmcFlag || ( geoSep ? !gpmSepPlan( m, cu, geoSegs ) : !obmcPlan( cu, segs, inner ) ) ) )
+      && ( !cu.obmcFlag || ( geoSep ? !gpmSepPlan( m, cu, geoSegs ) : !obmcPlan( cu, segs, inner, &intraRuns ) ) ) )
   {
     m.mcCus.insert( &cu );
     if( geoSep )
@@ -8962,8 +9060,10 @@ void GpuIntraRec::recordInterCu( const CodingUnit& cu )
       segs.swap( geoSegs[0] );
       segs1.swap( geoSegs[1] );
     }
-    // OBMC's record (OBMC_REC_*): the CU, the flags, the segments and their data's places
-    auto obmcRecord = [&]( const std::vector<ObmcSeg>& sg, bool in )
+    const std::vector<std::array<int32_t, 3>> intraSegs = obmcIntraSegs( cu, intraRuns );   // (JVET-AJ0161)
+    // OBMC's record (OBMC_REC_*): the CU, the flags, the segments (the motion ones, then the intra ones) and their data's
+    // places
+    auto obmcRecord = [&]( const std::vector<ObmcSeg>& sg, bool in, const std::vector<std::array<int32_t, 3>>& is )
     {
       const PredictionUnit& pu  = *cu.firstPU;
       const CodingStructure& cs = *cu.cs;
@@ -8979,8 +9079,9 @@ void GpuIntraRec::recordInterCu( const CodingUnit& cu )
       m.timdData.insert( m.timdData.end(), { cu.lx(), cu.ly(), (int32_t) cu.lwidth(), (int32_t) cu.lheight(),
                                              ( tm ? OBMC_REC_TM : 0 ) | ( top ? OBMC_REC_TOP : 0 ) | ( left ? OBMC_REC_LEFT : 0 )
                                                | ( inv ? OBMC_REC_INV_LMCS : 0 ) | ( in ? OBMC_REC_SUB : 0 )
-                                               | ( geoSep ? OBMC_REC_GEO : 0 ),
-                                             (int32_t) sg.size(), cu.slice->clpRng( COMPONENT_Y ).bd, 0, m.obmcData, 0 } );
+                                               | ( geoSep ? OBMC_REC_GEO : 0 ) | obmcIntraFlags( m, cu, is ),
+                                             (int32_t) ( sg.size() + is.size() ), cu.slice->clpRng( COMPONENT_Y ).bd, 0,
+                                             m.obmcData, 0 } );
       if( in )
       {
         m.obmcData += (int32_t) ( ( cu.lwidth() >> 2 ) * ( cu.lheight() >> 2 ) ) * OBMC_INNER;
@@ -8991,10 +9092,11 @@ void GpuIntraRec::recordInterCu( const CodingUnit& cu )
         m.timdData.insert( m.timdData.end(), { s.dir, s.start, s.len, m.obmcData } );
         m.obmcData += OBMC_D_TPL + 2 * s.len + bw * bh + 2 * ( bw >> 1 ) * ( bh >> 1 );
       }
+      obmcIntraRecord( m, is );   // (after the motion segments, which obmcJobs numbers)
       return r;
     };
-    m.obmcRec  = !segs.empty() || inner ? obmcRecord( segs, inner ) : -1;
-    m.obmcRec1 = !segs1.empty() ? obmcRecord( segs1, false ) : -1;
+    m.obmcRec  = !segs.empty() || inner || !intraSegs.empty() ? obmcRecord( segs, inner, intraSegs ) : -1;
+    m.obmcRec1 = !segs1.empty() ? obmcRecord( segs1, false, {} ) : -1;
   }
   const int numComp = cu.chromaFormat == CHROMA_400 ? 1 : MAX_NUM_COMPONENT;
   // (an IBC merge CU's motion and flags, which its merge candidate gives, are known only now)
@@ -9130,6 +9232,27 @@ void GpuIntraRec::recordInterCu( const CodingUnit& cu )
       ( m.mcCus.count( &cu ) ? m.mcKinds : m.interKinds )[kind]++;
     }
     m.ibcGpmCus += CU::isIBC( cu ) && cu.firstPU->ibcGpmFlag ? 1 : 0;
+  }
+}
+
+static int32_t obmcIntraFlags( GpuIntraRec::Impl& m, const CodingUnit& cu, const std::vector<std::array<int32_t, 3>>& segs )
+{
+  if( segs.empty() )
+  {
+    return 0;
+  }
+  const SPS& sps = *cu.cs->sps;
+  return OBMC_REC_INTRA | ( cu.cs->picHeader->getLmcsEnabledFlag() && m.reshape->getCTUFlag() ? OBMC_REC_INTRA_INV : 0 )
+         | ( sps.getDisablePdpc() ? OBMC_REC_NO_PDPC : 0 ) | ( sps.getDisableRefFilter() ? OBMC_REC_NO_REF_FILTER : 0 );
+}
+
+static void obmcIntraRecord( GpuIntraRec::Impl& m, const std::vector<std::array<int32_t, 3>>& segs )
+{
+  for( const std::array<int32_t, 3>& s: segs )
+  {
+    const int len = s[2], bw = ( s[0] & 1 ) == 0 ? len : 4, bh = ( s[0] & 1 ) == 0 ? 4 : len;
+    m.timdData.insert( m.timdData.end(), { s[0], s[1], len, m.obmcData } );
+    m.obmcData += OBMC_D_TPL + 2 * len + bw * bh + 2 * ( bw >> 1 ) * ( bh >> 1 );
   }
 }
 
@@ -10135,6 +10258,40 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
           }
         }
       };
+      // (OBMC's intra neighbours' strips, JVET-AJ0161: an inter block's, an inter CCP merge block's band; intra_deps'
+      // obmcIntraDeps: per strip its arms, 8x its sides, and prepareRef's samples along its side beyond the corner)
+      if( t.obmc && ( m.timdData[t.obmc - 1 + OBMC_REC_FLAGS] & OBMC_REC_INTRA ) )
+      {
+        const int32_t* r  = &m.timdData[t.obmc - 1];
+        const int      cs = t.comp == 0 ? 0 : 1;
+        auto addStripArea = [&]( int x0, int y0, int x1, int y1 )
+        {
+          for( int uy = std::max( y0, 0 ) >> P.unitLog2Y[ch]; uy <= y1 >> P.unitLog2Y[ch] && uy < P.ownerH[ch]; uy++ )
+          {
+            for( int ux = std::max( x0, 0 ) >> P.unitLog2X[ch]; ux <= x1 >> P.unitLog2X[ch] && ux < P.ownerW[ch]; ux++ )
+            {
+              const int o = ownerMap[t.comp][size_t( uy ) * P.ownerW[ch] + ux];
+              if( o >= 0 && o < i && mark[o] != i )
+              {
+                mark[o] = i;
+                deps[i].push_back( o );
+              }
+            }
+          }
+        };
+        for( int k = 0; k < r[OBMC_REC_NUM]; k++ )
+        {
+          const int32_t* sg = r + OBMC_REC_SEG + k * OBMC_SEG;
+          if( sg[OBMC_SEG_DIR] & OBMC_SEG_INTRA )
+          {
+            const int b = sg[OBMC_SEG_DIR] & 1, start = sg[OBMC_SEG_START] >> cs, len = sg[OBMC_SEG_LEN] >> cs;
+            const int x = ( r[OBMC_REC_X] >> cs ) + ( b == 0 ? start : 0 ), y = ( r[OBMC_REC_Y] >> cs ) + ( b == 0 ? 0 : start );
+            const int w = b == 0 ? len : 4 >> cs, h = b == 0 ? 4 >> cs : len;
+            addStripArea( x - 1 - ( h + 3 ), y - 1, x - 1 + ( w << 3 ), y - 1 );
+            addStripArea( x - 1, y - 1 - ( w + 3 ), x - 1, y - 1 + ( h << 3 ) );
+          }
+        }
+      }
       if( t.derive & DERIVE_INTER )   // an inter CU's block: its prediction given, nothing more
       {
         // (OBMC's TM: the CU's one-sample templates, intra_deps' addAreaDeps; GPM's part 1's record where part 0 has none)

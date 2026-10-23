@@ -2689,6 +2689,37 @@ interCcpWhy, the same fix as the integration paragraph's ciipWhy one, which stay
 Hardware of M99-M109 (correction, 2026-10-23): their verification ran on this PC, a Core Ultra 7 265K with its Intel
 Graphics iGPU (driver 32.0.101.8991); the commit messages 86e6c59f3 .. 30744a6ab name an i7-10700 with an RTX 3070,
 copied from older messages. Re-check on NVIDIA and AMD.
+OBMC with intra neighbours on the GPU (2026-10-23, agent lf; JVET-AJ0161; partial verification: the CPU's derived
+modes): with DIMD in the SPS, subBlockOBMC blends a run of intra neighbour units (getSameNeigMotion's iState 1) where
+getGradForOBMC gave the side's modes (m_modeGetCheck: calcGradForOBMC, a DIMD of the two rows / columns next to the
+CU): per run of one mode (at most MAX_INTRA_SIZE long) within the side's angles (above DIA_IDX to VDIA_IDX, left beyond
+DC up to DIA_IDX) an angular prediction of the strip (subBlockIntraForOBMC: predIntraAng of the 4 luma rows / columns
+and the 2 chroma ones with isobmcMC - no reference filter nor Gaussian interpolation, no bilateral filter, PDPC only
+for the side's first unit, which has both sides' references; after it xFillReferenceSamplesOBMC's one-sided references
+and prepareRef's samples along the side beyond the corner; luma mapped back by LMCS's inverse), blended by
+xSubblockOBMC as weightObmcBoundary's mode -1 (no skipObmcConditionByPixel). obmcPlan now passes these runs (rejecting
+only other chroma formats than 4:2:0, and more than OBMC_MAX_SEG segments counting each intra unit);
+obmcIntraSegs splits them by the modes obmcSideModes takes from calcGradForOBMC over the CPU's reconstruction (in
+partial verification the CPU's modes; intra_obmc.glsl's obmcGradModes is IntraTMP's GPU port of it, needing the units'
+records) and appends them to the CU's OBMC record after the motion segments (obmcJobs numbers those): head side |
+OBMC_SEG_INTRA | mode << OBMC_SEG_MODE, start, length, data laid out as a motion segment's; record flags OBMC_REC_INTRA,
+OBMC_REC_INTRA_INV (the picture's LMCS and the CTU flag), OBMC_REC_NO_PDPC, OBMC_REC_NO_REF_FILTER (the SPS's). On
+the GPU each block with Tu::obmc predicts, before obmcModes, the intra strips of its component that overlap it
+(intra_obmc.glsl's obmcInterIntra: IntraTMP's strip predictor, generalized to chroma - units of 2, linear
+interpolation - and to any scratch place, obmcStripPredict) and writes its part into the segment's band data in
+Params::interPred; obmcModes gives intra segments mode -1, obmcSample masks the side bit and reads their data
+device-coherent. The strips use s_ref[0], the angular arrays (cleared after) and the scratch's start, so an inter CCP
+merge block now applies its band (interObmcBand) at the start of the intra path, before its references, instead of
+before ccpMergePrediction. Dependencies (intra_deps' obmcIntraDeps and the host's mirror, for every block with an OBMC
+record of intra segments): per strip its arms (8x its sides) and prepareRef's samples. Results (50 streams, build
+lfio2, with the previous paragraph's fixes): every verified picture identical (ra_wpp_q32 skipped as before); the
+reasons "OBMC (OBMC with an intra neighbour)" 422, "affine (...)" 245, "LIC (...)" 150, "CIIP (...)" 47, "non-local
+LIC (...)" 13 -> 0; inter CUs predicted by the GPU against gpm2 (which lacked inter CCP merge): OBMC 6432 -> 6867,
+affine 1527 -> 1790, LIC 552 -> 739, CIIP 200 -> 247, non-local LIC 113 -> 126.
+Integration with M109 (2026-10-23): GPM with separate OBMC next to an intra neighbour stays the CPU's (gpmSepPlan:
+"separate OBMC with an intra neighbour", 45 CUs) - obmcPlan without its intra list no longer rejects intra runs, and
+the first integration build took such CUs to the GPU without their strips (12 RA streams differed); with the fix the
+50 streams are identical (build int4; ra_wpp_q32 skipped).
 
 
 ## 8. Numbers (i7-10700 8C/16T, Win11, GCC 16.2, RTX 3070 driver 616.92)

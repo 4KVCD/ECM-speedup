@@ -394,6 +394,28 @@ void crsDeps( Tu t )
   }
 }
 
+// the references of the intra neighbours' strips of OBMC record r (JVET-AJ0161; intra_obmc.glsl's obmcInterIntra; the
+// record's layout intra_rec.comp's OBMC_REC_*, a segment's OBMC_SEG_*, an intra one's head with OBMC_SEG_INTRA) in
+// block t's component: per strip its arms (8x its sides) and prepareRef's samples along its side beyond the corner
+void obmcIntraDeps( Tu t, int r )
+{
+  BufI32    rec = BufI32( P.timdData );
+  const int cs = t.comp == 0 ? 0 : 1, num = rec.v[r + 5];
+  const int cuX = rec.v[r] >> cs, cuY = rec.v[r + 1] >> cs;
+  for( int k = 0; ( rec.v[r + 4] & 256 ) != 0 && k < num; k++ )
+  {
+    const int o = r + 10 + k * 4, head = rec.v[o];
+    if( ( head & 2 ) != 0 )
+    {
+      const int b = head & 1, start = rec.v[o + 1] >> cs, len = rec.v[o + 2] >> cs, side = 4 >> cs;
+      const int x = b == 0 ? cuX + start : cuX, y = b == 0 ? cuY : cuY + start;
+      const int w = b == 0 ? len : side, h = b == 0 ? side : len;
+      addAreaDeps( t.comp, x - 1 - ( h + 3 ), y - 1, x - 1 + ( w << 3 ), y - 1 );
+      addAreaDeps( t.comp, x - 1, y - 1 - ( w + 3 ), x - 1, y - 1 + ( h << 3 ) );
+    }
+  }
+}
+
 // GpuIntraRec::endPicture's dependency loop for block g_i (passes 1 and 2); pass 1 writes the availability, read
 // ranges and ISP side flag into the block record, which refSource reads (from the local copy) and pass 2 reloads
 void dependencies( int comp )
@@ -537,6 +559,10 @@ void dependencies( int comp )
       chromaTmrlDeps( c );
     }
     return;
+  }
+  if( t.obmc != 0 )   // (OBMC's intra neighbours' strips: an inter block's, an inter CCP merge block's band)
+  {
+    obmcIntraDeps( t, t.obmc - 1 );
   }
   if( ( t.derive & DERIVE_INTER ) != 0 )   // an inter CU's block: its prediction given, it reads what its residual needs
   {
