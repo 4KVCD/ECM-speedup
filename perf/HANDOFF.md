@@ -2281,6 +2281,12 @@ reordered CUs, all the GPU's); ON mode identical without in-loop filters (crf_fo
 but different with them - also without chroma reordering (nocr_fore32) -, and bisected to ALF (bis_alf: ALF, CCALF,
 ALFCCCM on, other filters off; deblocking, SAO / CCSAO and BIF alone identical): an ON-mode ALF issue outside chroma
 reordering, open.
+Integration of M93-M95 (2026-10-22, build gpu33): all 50 streams identical after three fixes - an IBC block with sign
+prediction (M90 lets inter blocks keep it) is reconstructed by signPrediction in intra_rec's DERIVE_IBC branch too
+(else nothing wrote it: ai_parkjoy_q27, ai_crowdrun832_q27); IBC with LFNST / NSPT and RR-IBC flips with sign prediction
+stay the CPU's; IBC / palette CUs take no inter_mc job (their refIdx is not a reference picture's); chroma reordering's
+NN rule (an NN block derives the DIMD of its prediction for the DM mode) only with DIMD in the SPS, as M86 has it
+(ra_off4_q32).
 
 
 ## 8. Numbers (i7-10700 8C/16T, Win11, GCC 16.2, RTX 3070 driver 616.92)

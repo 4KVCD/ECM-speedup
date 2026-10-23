@@ -6755,7 +6755,9 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
 #if GPU_CHROMA_REORDER
   // an NN block's DIMD of its prediction (indicesRepresentationPnn) also where its transforms do not read it (no
   // coefficients, transform skip): the DM mode of chroma reordering's list (getCoLocatedIdxRepresentationPnn)
-  if( pnn && cuIdx >= 0 && !( t.derive & DERIVE_PNN_DIMD ) && sps.getUseChromaReordering() && CS::isDualITree( cs ) )
+  // (without DIMD in the SPS the host's planar and DC: M86)
+  if( pnn && cuIdx >= 0 && !( t.derive & DERIVE_PNN_DIMD ) && sps.getUseChromaReordering() && CS::isDualITree( cs )
+      && sps.getUseDimd() )
   {
     t.derive |= DERIVE_PNN_DIMD;
     m.cuMipDimd[cuIdx] = 2;
@@ -6947,6 +6949,26 @@ static const char* ibcWhy( const GpuIntraRec::Impl& m, const CodingUnit& cu )
   if( !cu.Y().valid() || ( isChromaEnabled( cu.chromaFormat ) && cu.Cb().valid() && cu.chromaFormat != CHROMA_420 ) )
   {
     return "IBC CU of another layout";
+  }
+  // (LFNST / NSPT of an inter CU take a DIMD of the prediction, M92's, in intra_rec's inter branch only)
+  if( cu.lfnstIdx )
+  {
+    return "IBC with LFNST / NSPT";
+  }
+  // (sign prediction of a flipped block: its templates of the unflipped prediction, its reconstruction flipped)
+  if( cu.rribcFlipType && cu.rootCbf )
+  {
+    for( const TransformUnit& tu: CU::traverseTUs( cu ) )
+    {
+      for( int c = 0; c < MAX_NUM_COMPONENT; c++ )
+      {
+        if( tu.blocks[c].valid() && TU::getUseSignPred( tu, ComponentID( c ) )
+            && ( TU::getCbf( tu, ComponentID( c ) ) || ( c > 0 && tu.jointCbCr ) ) )
+        {
+          return "RR-IBC flip with sign prediction";
+        }
+      }
+    }
   }
   if( cu.rribcFlipType && cu.firstTU != cu.lastTU )   // (xDecodeInterTU flips each TU, xDecodeInterTexture the CU)
   {
@@ -7473,8 +7495,9 @@ void GpuIntraRec::recordInterCu( const CodingUnit& cu )
   {
     return;
   }
-  // (its motion is known now: DecCu derives a merge CU's after interCu, xDeriveCUMV)
-  if( interMcGpu( cu ) )
+  // (its motion is known now: DecCu derives a merge CU's after interCu, xDeriveCUMV; IBC and palette CUs: their own
+  // prediction, ibcRecord / pltRecord)
+  if( !CU::isIBC( cu ) && !CU::isPLT( cu ) && interMcGpu( cu ) )
   {
     m.mcCus.insert( &cu );
   }
