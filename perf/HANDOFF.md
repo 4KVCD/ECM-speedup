@@ -2579,6 +2579,16 @@ its prediction (DERIVE_PNN_DIMD) for that DM, but without DIMD in the SPS xPredI
 planar at once (M86: the host sets planar and DC). Now no such derivation without DIMD, and the reordering CU takes the
 host's mode then. Results (agst53): partial verification of ra_off4_q32, ra_off15_q32, ai_off15_q27, ra_off1_q32
 identical; ON mode (--GpuRecon=3) on the 50 streams identical, 17 intra pictures on the GPU.
+Integration of the agents' work after M105 (2026-10-23): lf's inter sign prediction above 32 x 32 (1a9d9d19b), ASBT
+(86153b5cc) and inter CCCM (9886461dd), st's ON-mode commits 9c7de2340 .. 2de8ee5a9 (ALF's residual plane, the CPU's
+pass after a derive-only pass, an intra picture's side information, the six gates removed, the chroma reordering DM
+fix without DIMD; st's chroma reordering commit itself was already in as M95, f36a1b1ef) cherry-picked onto M105.
+Partial verification (50 streams, build gpu56): 44 identical, ra_wpp_q32 skipped, five differed at inter CCCM chroma
+blocks (ld_parkjoy_q27, ldp_crowdrun_q27, ra_foreman_q22, ra_parkjoy832_q32, ra_parkjoy_q37): intra_rec's inter CCCM
+branch blends the block's prediction before the inter branch applies OBMC to it, which on lf's base was the CPU's
+final prediction and with M96-M105 is the GPU's without OBMC yet. 3af02cfde: an inter CCCM CU keeps the CPU's
+prediction (interMcGpu); with it those streams are identical (build gpu58). ON mode (--GpuRecon=3, md5 against the
+build's CPU decoding, build gpu56): 50 of 50 identical, 17 intra pictures reconstructed on the GPU.
 
 
 ## 8. Numbers (i7-10700 8C/16T, Win11, GCC 16.2, RTX 3070 driver 616.92)

@@ -7661,6 +7661,17 @@ static void affineRecord( GpuIntraRec::Impl& m, const CodingUnit& cu )
 // CPU's
 static bool interMcGpu( const CodingUnit& cu )
 {
+#if JVET_AE0059_INTER_CCCM
+  // (an inter CCCM CU: intra_intercccm.glsl blends its chroma blocks' prediction - the CPU's final one, DecCu's - in
+  // the inter CCCM branch, before the inter branch's OBMC and the other steps of a prediction the GPU makes)
+  for( const TransformUnit& tu: CU::traverseTUs( cu ) )
+  {
+    if( tu.interCccm )
+    {
+      return false;
+    }
+  }
+#endif
   const PredictionUnit& pu    = *cu.firstPU;
   const Slice&          slice = *cu.slice;
   const PPS&            pps   = *cu.cs->pps;
