@@ -1832,6 +1832,9 @@ public:
 public:
   Mv*       getBdofSubPuMvOffset() {return m_bdofSubPuMvOffset;}
   void      setBdmvrSubPuMvBuf(Mv* mvBuf0, Mv* mvBuf1) { m_bdmvrSubPuMvBuf[0] = mvBuf0; m_bdmvrSubPuMvBuf[1] = mvBuf1; }
+#if ECM_VULKAN
+  const Mv* getBdmvrSubPuMvBuf( int list ) const { return m_bdmvrSubPuMvBuf[list]; }
+#endif
 #if JVET_AA0093_REFINED_MOTION_FOR_ARMC
 #if JVET_AI0185_ADAPTIVE_COST_IN_MERGE_MODE
   bool      processBDMVR              (PredictionUnit& pu, int step = 0, Distortion* tmCost = NULL, int mergeIdx = -1);

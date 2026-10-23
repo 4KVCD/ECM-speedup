@@ -449,7 +449,7 @@ wall-clock gains with threads are "the easy baseline". Decoder status: single-th
 (`--GpuLoopFilter=1`: ALF, SAO, BIF, CCSAO, LF-CCCM, offset refinement on Vulkan). The user then asked for **a full
 GPU decoder in Vulkan, optimized until nothing is left** ("The GPU decoder needs to fully decode the frame on the
 GPU"; "Your first Vulkan version is going to be slow. That's OK"). That work is branch `dec-gpurecon`: intra
-reconstruction on the GPU (`--GpuRecon`), tool levels M1-M97 done and verified bit-exact (M19: DIMD, M20: OBIC, M21:
+reconstruction on the GPU (`--GpuRecon`), tool levels M1-M98 done and verified bit-exact (M19: DIMD, M20: OBIC, M21:
 intra merge, M22: the transforms of DIMD CUs, M23: LFNST of MIP, M24: TIMD, M25: OBIC and intra merge with TIMD
 neighbours, M26: TIMD-SAD, M27: OBIC and intra merge with TIMD-SAD neighbours, M28: TIMD merge, M29: TMRL of luma,
 M30: chroma TMRL, M31: CCLM, M32: LFNST / NSPT of CCLM, M33: GLM's gradient patterns, M34: CCCM, M35: GL-CCCM, M36:
@@ -2316,6 +2316,26 @@ or without the move where the sub-block has a sample out of boundary in either l
 checked against the C reference the shader follows. Partial verification's totals now name bi-prediction with BDOF /
 DMVR. Results (50 streams, build gpu37): every picture identical; 6 CUs of bi-prediction with BDOF predicted by the
 GPU (all the corpus has); bi-prediction with DMVR 50 CUs from the CPU.
+M98 (2026-10-22): multi-pass DMVR on the GPU (bdmvrRefine CUs; VVC's DMVR, mvRefine, stays rejected). The refined
+vectors per 16 x 16 sub-PU are the CPU's (DecCu hands InterPrediction's m_bdmvrSubPuMvBuf over after the CU's
+prediction, dmvrVectors - motion derivation stays the CPU's); the prediction is inter_mc.comp's mode 2, one workgroup per
+PU replaying xPredInterBi's DMVR branch and motionCompensation's xPredInterBiSubPuBDOF in their order into a PU-sized
+prediction (luma and chroma, mcBdofBuf) that all the PU's blocks copy. Without BDOF (xPredInterBiBDMVR's bioApplied,
+which lacks mcBdof's merge-index condition): per run of sub-PUs of one vector pair - rows, or columns where H > W -
+bi-prediction at the run's size with BCW's weights. With BDOF: unless JVET-AL0081's same direction or JVET-AG0067's
+small PU (area < 512 or a side of 4) skips it, a first pass per run computes each BDOF block's vector offset
+(applyBiOptFlow with isBdofMvRefine: min(16, W) x min(16, H) blocks, the SAD of dI against bioBlockDistTh, else
+calcBIOParamSum4HighPrecision's weighted sums - g_bdofWeight's tables as calcBIOParamSumHighPrecision_SSE reads them,
+JVET-AI0046's own 12 x 12 weights among them, appended to inter_mc's filters -, the mean removal by getMean unless the
+same direction, the 2 x 2 solve in 64 bits with divTable and x86's 32-bit offset shift, rounded and halved); then
+xPredInterBiBDMVR2's two iterations over runs of equal offsets (16-wide, then 8 / 4) predict again at the refined
+vectors, write the luma of the blocks whose SAD is small (addAvg) or whose new offset is 0 (subBlockBiOptFlow), and
+accumulate the others; xPredInterBiSubPuBDOF finally predicts the luma of the blocks still moving at their final
+vectors with subBlockBiOptFlow everywhere and the chroma of all (bi-prediction clipped at the grown position). The
+tiles live in the PU's scratch (coherent buffer references, barriers between the steps); the offsets are per 4 x 4
+unit as m_bdofSubPuMvOffset / m_bdofSubPuMvOffse2. clipMvInl's bounds come with the job (subpicture clipping is
+rejected). Results (50 streams, build gpu38): every picture identical; bi-prediction with DMVR 50 CUs
+predicted by the GPU (all the corpus has: no bi-prediction CU remains the CPU's).
 
 
 ## 8. Numbers (i7-10700 8C/16T, Win11, GCC 16.2, RTX 3070 driver 616.92)

@@ -530,6 +530,12 @@ void DecCu::decompressCtu( CodingStructure& cs, const UnitArea& ctuArea )
         if( m_gpuIntraRec )   // (... and those saveProCcpInfo gives the TUs without one, candidates only; its blocks)
         {
           m_gpuIntraRec->cpuCuModels( currCU, false );
+#if MULTI_PASS_DMVR
+          if( currCU.firstPU->bdmvrRefine )   // (DMVR's sub-PU vectors, which its prediction used)
+          {
+            m_gpuIntraRec->dmvrVectors( currCU, m_pcInterPred->getBdmvrSubPuMvBuf( 0 ), m_pcInterPred->getBdmvrSubPuMvBuf( 1 ) );
+          }
+#endif
           m_gpuIntraRec->recordInterCu( currCU );
         }
 #endif
