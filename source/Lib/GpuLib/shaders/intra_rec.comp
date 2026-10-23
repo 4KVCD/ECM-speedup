@@ -744,9 +744,35 @@ void mipTransformMode( Tu t, int W, int H, int ps, int upH, int upV, int predStr
 // boundary - 0 top, 1 left -, the first luma sample along it relative to the CU, the length, its data in
 // Params::interPred: inter_mc.comp's OBMC_D_*)
 const int OBMC_REC_X = 0, OBMC_REC_Y = 1, OBMC_REC_W = 2, OBMC_REC_H = 3, OBMC_REC_FLAGS = 4, OBMC_REC_NUM = 5;
-const int OBMC_REC_BD = 6, OBMC_REC_BASE = 7, OBMC_REC_SEG = 8;   // (BASE: where the segments' data start)
+const int OBMC_REC_BD = 6, OBMC_REC_BASE = 7, OBMC_REC_INNER = 8, OBMC_REC_SEG = 10;   // (BASE: where the data start)
 const int OBMC_SEG_DIR = 0, OBMC_SEG_START = 1, OBMC_SEG_LEN = 2, OBMC_SEG_DATA = 3, OBMC_SEG = 4;
-const int OBMC_REC_TM = 1, OBMC_REC_TOP = 2, OBMC_REC_LEFT = 4, OBMC_REC_INV_LMCS = 8;
+const int OBMC_REC_TM = 1, OBMC_REC_TOP = 2, OBMC_REC_LEFT = 4, OBMC_REC_INV_LMCS = 8, OBMC_REC_SUB = 16;
+// sub-block motion (DMVR): per 4 x 4 sub-block of the CU (OBMC_REC_INNER: where its entries start) the neighbours
+// (above, left, below, right) whose motion differs (bits) and their predictions of the sub-block (4 x 4 luma, 2 x 2 Cb
+// and Cr each); the inner blend's weights (currWeights per neighbours' set, neigWeights per neighbour)
+const int OBMC_INNER = 1 + 4 * 24;
+const int OBMC_CURR_W[256] = int[](
+  128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128,
+  128, 122, 112, 101, 128, 122, 112, 101, 128, 122, 112, 101, 128, 122, 112, 101,
+  128, 128, 128, 128, 122, 122, 122, 122, 112, 112, 112, 112, 101, 101, 101, 101,
+  128, 122, 112, 101, 122, 116, 106,  95, 112, 106,  96,  85, 101,  95,  85,  74,
+  101, 112, 122, 128, 101, 112, 122, 128, 101, 112, 122, 128, 101, 112, 122, 128,
+  101, 106, 106, 101, 101, 106, 106, 101, 101, 106, 106, 101, 101, 106, 106, 101,
+  101, 112, 122, 128,  95, 106, 116, 122,  85,  96, 106, 112,  74,  85,  95, 101,
+  101, 106, 106, 101,  95, 100, 100,  95,  85,  90,  90,  85,  74,  79,  79,  74,
+  101, 101, 101, 101, 112, 112, 112, 112, 122, 122, 122, 122, 128, 128, 128, 128,
+  101,  95,  85,  74, 112, 106,  96,  85, 122, 116, 106,  95, 128, 122, 112, 101,
+  101, 101, 101, 101, 106, 106, 106, 106, 106, 106, 106, 106, 101, 101, 101, 101,
+  101,  95,  85,  74, 106, 100,  90,  79, 106, 100,  90,  79, 101,  95,  85,  74,
+   74,  85,  95, 101,  85,  96, 106, 112,  95, 106, 116, 122, 101, 112, 122, 128,
+   74,  79,  79,  74,  85,  90,  90,  85,  95, 100, 100,  95, 101, 106, 106, 101,
+   74,  85,  95, 101,  79,  90, 100, 106,  79,  90, 100, 106,  74,  85,  95, 101,
+   74,  79,  79,  74,  79,  84,  84,  79,  79,  84,  84,  79,  74,  79,  79,  74 );
+const int OBMC_NEIG_W[64] = int[](
+  27, 27, 27, 27, 16, 16, 16, 16,  6,  6,  6,  6,  0,  0,  0,  0,
+  27, 16,  6,  0, 27, 16,  6,  0, 27, 16,  6,  0, 27, 16,  6,  0,
+   0,  0,  0,  0,  6,  6,  6,  6, 16, 16, 16, 16, 27, 27, 27, 27,
+   0,  6, 16, 27,  0,  6, 16, 27,  0,  6, 16, 27,  0,  6, 16, 27 );
 const int OBMC_D_SKIP = 0, OBMC_D_TPL = 3;
 const int OBMC_MAX_SEG = 64;
 shared int  s_obmcMode[OBMC_MAX_SEG];
@@ -861,6 +887,42 @@ int obmcSample( Tu t, int r, int x, int y, int p )
         p = obmcWeight( p, int( data.v[pred + i] ), mode, pass == 0 ? cy : cx );
       }
       break;
+    }
+  }
+  if( ( rec.v[r + OBMC_REC_FLAGS] & OBMC_REC_SUB ) != 0 )   // the inner sub-block OBMC (xSubblockOBMCBlending)
+  {
+    const int sw = rec.v[r + OBMC_REC_W] >> 2, sx = cx >> ( 2 - cs ), sy = cy >> ( 2 - cs );
+    const int e  = rec.v[r + OBMC_REC_BASE] + rec.v[r + OBMC_REC_INNER] + ( sy * sw + sx ) * OBMC_INNER;
+    const int av = int( data.v[e] );
+    if( av != 0 )
+    {
+      const bool a = ( av & 1 ) != 0, l = ( av & 2 ) != 0, b = ( av & 4 ) != 0, rt = ( av & 8 ) != 0;
+      if( comp == 0 )
+      {
+        const int pos = ( cy & 3 ) * 4 + ( cx & 3 );
+        const int cw  = OBMC_CURR_W[( ( a ? 8 : 0 ) + ( l ? 4 : 0 ) + ( b ? 2 : 0 ) + ( rt ? 1 : 0 ) ) * 16 + pos];
+        if( cw != 128 )
+        {
+          int sum = cw * p + 64;
+          for( int k = 0; k < 4; k++ )
+          {
+            if( ( av & ( 1 << k ) ) != 0 )
+            {
+              sum += OBMC_NEIG_W[k * 16 + pos] * int( data.v[e + 1 + k * 24 + pos] );
+            }
+          }
+          p = sum >> 7;
+        }
+      }
+      else   // (2 x 2: the corner's two neighbours, weight 27 each)
+      {
+        const int px = cx & 1, py = cy & 1;   // (above & left, above & right, left & below, below & right)
+        const int k0 = py == 0 ? 0 : px == 0 ? 1 : 2, k1 = px == 0 ? ( py == 0 ? 1 : 2 ) : 3;
+        const bool u0 = ( av & ( 1 << k0 ) ) != 0, u1 = ( av & ( 1 << k1 ) ) != 0;
+        const int  w0 = u0 ? 27 : 0, w1 = u1 ? 27 : 0;
+        const int  ci = 1 + 16 + ( comp - 1 ) * 4 + py * 2 + px;
+        p = ( ( 128 - w0 - w1 ) * p + w0 * int( data.v[e + k0 * 24 + ci] ) + w1 * int( data.v[e + k1 * 24 + ci] ) + 64 ) >> 7;
+      }
     }
   }
   return p;

@@ -45,7 +45,7 @@ layout( push_constant ) uniform PushMc
   uint64_t scratch;   // DMVR PUs' scratch (int32: their BDOF offsets, two tiles)
   int      numJobs;
   int      mode;      // 0: the blocks' jobs, 1: BDOF's sub-block jobs, 2: DMVR's PUs (1 and 2 before 0), 3: OBMC's
-                      // segments (pc.scratch: the blocks' jobs)
+                      // segments (pc.scratch: the blocks' jobs), 4: OBMC's inner sub-blocks
 } pc;
 
 // McJob (int32): the block (component, position and size in the component's samples), where its prediction goes in
@@ -1031,6 +1031,44 @@ void obmcJob( int o, int lid )
   }
 }
 
+// ----- the inner sub-block OBMC of sub-block motion (mode 4): one 4 x 4 sub-block per job, its neighbours' motions
+// (above, left, below, right: each an McJob, OBMC_I_NB + k * MC_JOB, where it differs - getNeighborMotion -) predicting
+// the sub-block (xSubBlockMotionCompensation: bi-prediction with the CU's BCW weight), into its entry (OBMC_I_*)
+const int OBMC_I_X = 1, OBMC_I_Y = 2, OBMC_I_DST = 5, OBMC_I_BD = 12, OBMC_I_CLIP_MIN = 13, OBMC_I_CLIP_MAX = 14;
+const int OBMC_I_AVAIL = 15, OBMC_I_NB = 32, OBMC_I = OBMC_I_NB + 4 * MC_JOB;
+
+void obmcInnerJob( int o, int lid )
+{
+  BufI32    jb = BufI32( pc.jobs );
+  BufI16    od = BufI16( pc.outPred );
+  const int sx = jb.v[o + OBMC_I_X], sy = jb.v[o + OBMC_I_Y], dst = jb.v[o + OBMC_I_DST], av = jb.v[o + OBMC_I_AVAIL];
+  const int bd = jb.v[o + OBMC_I_BD], clipMin = jb.v[o + OBMC_I_CLIP_MIN], clipMax = jb.v[o + OBMC_I_CLIP_MAX];
+  if( lid == 0 )
+  {
+    od.v[dst] = int16_t( av );
+  }
+  for( int i = lid; i < 4 * 24; i += 64 )
+  {
+    const int k = i / 24, s = i % 24;
+    if( ( av & ( 1 << k ) ) == 0 )
+    {
+      continue;
+    }
+    int v;
+    if( s < 16 )
+    {
+      v = mcSample( jb, o + OBMC_I_NB + k * MC_JOB, 0, sx + ( s & 3 ), sy + ( s >> 2 ), 4, 4, bd, clipMin, clipMax );
+    }
+    else
+    {
+      const int c = s - 16, comp = 1 + c / 4;
+      v = mcSample( jb, o + OBMC_I_NB + k * MC_JOB, comp, ( sx >> 1 ) + ( c & 1 ), ( sy >> 1 ) + ( ( c >> 1 ) & 1 ), 2, 2, bd,
+                    clipMin, clipMax );
+    }
+    od.v[dst + 1 + i] = int16_t( v );
+  }
+}
+
 void main()
 {
   const int lid = int( gl_LocalInvocationID.x );
@@ -1049,6 +1087,11 @@ void main()
     if( pc.mode == 3 )
     {
       obmcJob( j * OBMC_J, lid );
+      continue;
+    }
+    if( pc.mode == 4 )
+    {
+      obmcInnerJob( j * OBMC_I, lid );
       continue;
     }
     BufI32    jb   = BufI32( pc.jobs );
