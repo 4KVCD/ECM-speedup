@@ -66,6 +66,7 @@ const int MC_ALT_HPEL = 1;   // AMVR's half-sample precision: the alternative ha
 const int MC_BI       = 2;   // two lists, averaged
 const int MC_BDOF     = 4;   // BDOF's luma
 const int MC_NO_MEAN  = 8;   // BDOF without the mean removal (noMeanRm4Sample)
+const int MC_L1       = 64;  // uni-prediction from list 1 (LIC's model)
 // McRef (int32) per slot and component: the index of sample (0, 0) in pc.planes, the stride, the size, the margin
 const int MC_REF_ORIGIN = 0, MC_REF_STRIDE = 1, MC_REF_W = 2, MC_REF_H = 3, MC_REF_MARGIN = 4;
 const int MC_REF_COMP = 5;
@@ -873,11 +874,27 @@ void dmvrJob( int o )
 
 // ----- the blocks' jobs (mode 0)
 
+// LIC's model of list l and component comp at lo (scale, offset: the neighbour's stored one, JVET-AD0213) on a sample
+// (linearTransform: (scale v >> 5) + offset, clipped)
+int mcLic( BufI32 jb, int lo, int l, int comp, int v, int clipMin, int clipMax )
+{
+  const int k = lo + ( l * 3 + comp ) * 2;
+  return clamp( ( ( jb.v[k] * v ) >> 5 ) + jb.v[k + 1], clipMin, clipMax );
+}
+
+// ... on a 14-bit intermediate (xLicCompAdj's OBMC branch: toLast, the model, back to the intermediate)
+int mcLicBi( BufI32 jb, int lo, int l, int comp, int p, int bd, int clipMin, int clipMax )
+{
+  const int headRoom = max( 2, IF_INTERNAL_PREC - bd );
+  const int q = clamp( ( p + ( 1 << ( headRoom - 1 ) ) + IF_INTERNAL_OFFS ) >> headRoom, clipMin, clipMax );
+  return int( int16_t( ( mcLic( jb, lo, l, comp, q, clipMin, clipMax ) << ( IF_INTERNAL_PREC - bd ) ) - IF_INTERNAL_OFFS ) );
+}
+
 // component comp's sample (x, y) (the component's coordinates) predicted with job o's motion (MC_MVX.., MC_REF..,
 // MC_FLAGS' MC_ALT_HPEL / MC_BI / MC_BDOF, MC_W0 / MC_W1, MC_OOB with the unclipped vectors, MC_PU_X / MC_PU_Y its PU's
 // luma position, MC_PIC_W / MC_PIC_H, MC_BDOF_OUT), its PU of puW x puH samples in the component (the sharp filter),
-// clipped to [clipMin, clipMax]
-int mcSample( BufI32 jb, int o, int comp, int x, int y, int puW, int puH, int bd, int clipMin, int clipMax )
+// clipped to [clipMin, clipMax]; with lo >= 0 each list's LIC model (mcLic: uni-prediction's list MC_L1 or 0)
+int mcSample( BufI32 jb, int o, int comp, int x, int y, int puW, int puH, int bd, int clipMin, int clipMax, int lo )
 {
   const int   flags = jb.v[o + MC_FLAGS];
   const bool  luma = comp == 0, alt = ( flags & MC_ALT_HPEL ) != 0, bi = ( flags & MC_BI ) != 0;
@@ -893,13 +910,19 @@ int mcSample( BufI32 jb, int o, int comp, int x, int y, int puW, int puH, int bd
   }
   if( !bi )
   {
-    return mcPredict( slot0, comp, x + ( mv0.x >> shift ), y + ( mv0.y >> shift ), mv0.x & mask, mv0.y & mask, alt, false,
-                      puW, puH, bd, clipMin, clipMax );
+    const int v = mcPredict( slot0, comp, x + ( mv0.x >> shift ), y + ( mv0.y >> shift ), mv0.x & mask, mv0.y & mask, alt,
+                             false, puW, puH, bd, clipMin, clipMax );
+    return lo < 0 ? v : mcLic( jb, lo, ( flags & MC_L1 ) != 0 ? 1 : 0, comp, v, clipMin, clipMax );
   }
-  const int p0 = mcPredict( slot0, comp, x + ( mv0.x >> shift ), y + ( mv0.y >> shift ), mv0.x & mask, mv0.y & mask, alt,
-                            true, puW, puH, bd, clipMin, clipMax );
-  const int p1 = mcPredict( slot1, comp, x + ( mv1.x >> shift ), y + ( mv1.y >> shift ), mv1.x & mask, mv1.y & mask, alt,
-                            true, puW, puH, bd, clipMin, clipMax );
+  int p0 = mcPredict( slot0, comp, x + ( mv0.x >> shift ), y + ( mv0.y >> shift ), mv0.x & mask, mv0.y & mask, alt, true,
+                      puW, puH, bd, clipMin, clipMax );
+  int p1 = mcPredict( slot1, comp, x + ( mv1.x >> shift ), y + ( mv1.y >> shift ), mv1.x & mask, mv1.y & mask, alt, true,
+                      puW, puH, bd, clipMin, clipMax );
+  if( lo >= 0 )
+  {
+    p0 = mcLicBi( jb, lo, 0, comp, p0, bd, clipMin, clipMax );
+    p1 = mcLicBi( jb, lo, 1, comp, p1, bd, clipMin, clipMax );
+  }
   const int oob = jb.v[o + MC_OOB];
   bool      o0 = false, o1 = false;
   if( oob != 0 )   // (the PU's luma sample of this sample: chroma's at twice its position)
@@ -934,7 +957,9 @@ int mcSample( BufI32 jb, int o, int comp, int x, int y, int puW, int puH, int bd
 // an OBMC job (int32, 2 x MC_JOB): an McJob of the neighbour's motion over the band (MC_X, MC_Y, MC_W, MC_H: the band's
 // luma area; MC_DST: where its data goes in pc.outPred; MC_PU_X / MC_PU_Y the band's position), then OBMC_J_*
 const int OBMC_J_DIR = 32, OBMC_J_FLAGS = 33, OBMC_J_BASE = 34, OBMC_J_THRESHOLD = 37, OBMC_J_INT_MV = 39;
-const int OBMC_J_INT_DIR = 43, OBMC_J_TPL = 44, OBMC_J_TPL_MOTION = 9, OBMC_J = 64;
+const int OBMC_J_INT_DIR = 43, OBMC_J_TPL = 44, OBMC_J_TPL_MOTION = 9, OBMC_J_LIC = 64, OBMC_J_NLIC = 76, OBMC_J = 88;
+const int OBMC_LIC  = 2;   // OBMC_J_FLAGS: the neighbour's LIC models at OBMC_J_LIC (per list and component)
+const int OBMC_NLIC = 4;   // ... its non-local LIC model (JVET-AG0276, secAltLMParaUnit) at OBMC_J_NLIC (per component)
 // a template motion (OBMC_J_TPL: the CU's, then the neighbour's): list 0's vector, list 1's (clipped as
 // getBlkOBMCRefTemplate clips them, the template's offset in), the slots, the kind (0: list 0, 1: list 1, 2: both),
 // the BCW weights
@@ -954,19 +979,26 @@ int obmcTplPredict( int slot, int x, int y, ivec2 mv, bool bi, int tw, int th, i
                         clipMax );
 }
 
-int obmcTpl( BufI32 jb, int t, int x, int y, int tw, int th, int bd, int clipMin, int clipMax )
+int obmcTpl( BufI32 jb, int t, int x, int y, int tw, int th, int bd, int clipMin, int clipMax, int lic )
 {
   const int kind = jb.v[t + OBMC_T_KIND];
   if( kind != 2 )
   {
     const int l = kind;
-    return obmcTplPredict( jb.v[t + OBMC_T_REF0 + l], x, y, ivec2( jb.v[t + OBMC_T_MV0 + 2 * l], jb.v[t + OBMC_T_MV0 + 2 * l + 1] ),
-                           false, tw, th, bd, clipMin, clipMax );
+    const int v = obmcTplPredict( jb.v[t + OBMC_T_REF0 + l], x, y,
+                                  ivec2( jb.v[t + OBMC_T_MV0 + 2 * l], jb.v[t + OBMC_T_MV0 + 2 * l + 1] ), false, tw, th, bd,
+                                  clipMin, clipMax );
+    return lic < 0 ? v : mcLic( jb, lic, l, 0, v, clipMin, clipMax );
   }
-  const int p0 = obmcTplPredict( jb.v[t + OBMC_T_REF0], x, y, ivec2( jb.v[t + OBMC_T_MV0], jb.v[t + OBMC_T_MV0 + 1] ), true, tw,
-                                 th, bd, clipMin, clipMax );
-  const int p1 = obmcTplPredict( jb.v[t + OBMC_T_REF1], x, y, ivec2( jb.v[t + OBMC_T_MV1], jb.v[t + OBMC_T_MV1 + 1] ), true, tw,
-                                 th, bd, clipMin, clipMax );
+  int p0 = obmcTplPredict( jb.v[t + OBMC_T_REF0], x, y, ivec2( jb.v[t + OBMC_T_MV0], jb.v[t + OBMC_T_MV0 + 1] ), true, tw, th,
+                           bd, clipMin, clipMax );
+  int p1 = obmcTplPredict( jb.v[t + OBMC_T_REF1], x, y, ivec2( jb.v[t + OBMC_T_MV1], jb.v[t + OBMC_T_MV1 + 1] ), true, tw, th,
+                           bd, clipMin, clipMax );
+  if( lic >= 0 )
+  {
+    p0 = mcLicBi( jb, lic, 0, 0, p0, bd, clipMin, clipMax );
+    p1 = mcLicBi( jb, lic, 1, 0, p1, bd, clipMin, clipMax );
+  }
   const int headRoom = max( 2, IF_INTERNAL_PREC - bd ), shiftNum = headRoom + BCW_LOG2_WEIGHT_BASE;
   const int offset   = ( 1 << ( shiftNum - 1 ) ) + ( IF_INTERNAL_OFFS << BCW_LOG2_WEIGHT_BASE );
   return clamp( ( p0 * jb.v[t + OBMC_T_W0] + p1 * jb.v[t + OBMC_T_W1] + offset ) >> shiftNum, clipMin, clipMax );
@@ -979,6 +1011,8 @@ void obmcJob( int o, int lid )
   const int bx = jb.v[o + MC_X], by = jb.v[o + MC_Y], W = jb.v[o + MC_W], H = jb.v[o + MC_H], dst = jb.v[o + MC_DST];
   const int bd = jb.v[o + MC_BD], clipMin = jb.v[o + MC_CLIP_MIN], clipMax = jb.v[o + MC_CLIP_MAX];
   const int dir = jb.v[o + OBMC_J_DIR], L = dir == 0 ? W : H;
+  const int lic = ( jb.v[o + OBMC_J_FLAGS] & OBMC_LIC ) != 0 ? o + OBMC_J_LIC : -1;
+  const int nlic = ( jb.v[o + OBMC_J_FLAGS] & OBMC_NLIC ) != 0 ? o + OBMC_J_NLIC : -1;   // (on the final prediction)
   const int predOff[3] = int[]( dst + OBMC_D_TPL + 2 * L, dst + OBMC_D_TPL + 2 * L + W * H,
                                 dst + OBMC_D_TPL + 2 * L + W * H + ( W >> 1 ) * ( H >> 1 ) );
   for( int comp = 0; comp < 3; comp++ )
@@ -993,18 +1027,24 @@ void obmcJob( int o, int lid )
     for( int i = lid; i < cw * ch; i += 64 )
     {
       const int x = cx + i % cw, y = cy + i / cw;
-      od.v[predOff[comp] + i] = int16_t( mcSample( jb, o, comp, x, y, cw, ch, bd, clipMin, clipMax ) );
+      int nbv = mcSample( jb, o, comp, x, y, cw, ch, bd, clipMin, clipMax, lic );
+      nbv     = nlic < 0 ? nbv : mcLic( jb, nlic, 0, comp, nbv, clipMin, clipMax );
+      od.v[predOff[comp] + i] = int16_t( nbv );
       // skipObmcConditionByPixel: each list of the neighbour's motion at its integer vector, uni-prediction of the band
-      const int before = mcSample( base, bj, comp, x, y, base.v[bj + MC_PU_W], base.v[bj + MC_PU_H], bd, clipMin, clipMax );
+      const int before = mcSample( base, bj, comp, x, y, base.v[bj + MC_PU_W], base.v[bj + MC_PU_H], bd, clipMin, clipMax, -1 );
       for( int l = 0; l < 2; l++ )
       {
         if( ( jb.v[o + OBMC_J_INT_DIR] & ( 1 << l ) ) != 0 )
         {
           const ivec2 mv = ivec2( jb.v[o + OBMC_J_INT_MV + 2 * l], jb.v[o + OBMC_J_INT_MV + 2 * l + 1] );
           const int   shift = 4 + cs, mask = ( 1 << shift ) - 1;
-          const int   r = mcPredict( jb.v[o + ( l == 0 ? MC_REF : MC_REF1 )], comp, x + ( mv.x >> shift ), y + ( mv.y >> shift ),
+          int         r = mcPredict( jb.v[o + ( l == 0 ? MC_REF : MC_REF1 )], comp, x + ( mv.x >> shift ), y + ( mv.y >> shift ),
                                      mv.x & mask, mv.y & mask, ( jb.v[o + MC_FLAGS] & MC_ALT_HPEL ) != 0, false, cw, ch, bd,
                                      clipMin, clipMax );
+          // (the CPU's model is m_iRefListIdx's, which the band's prediction left: list 1 after bi-prediction, else
+          // its one list - for both lists)
+          const int lm = ( jb.v[o + MC_FLAGS] & ( MC_BI | MC_L1 ) ) != 0 ? 1 : 0;
+          r = lic < 0 ? r : mcLic( jb, lic, lm, comp, r, clipMin, clipMax );
           if( abs( before - r ) >= jb.v[o + OBMC_J_THRESHOLD + ( comp == 0 ? 0 : 1 )] )
           {
             atomicOr( sObmcSkip, 1 );
@@ -1026,7 +1066,9 @@ void obmcJob( int o, int lid )
     {
       const int k = i % L, t = o + OBMC_J_TPL + ( i / L ) * OBMC_J_TPL_MOTION;
       const int x = bx + ( dir == 0 ? k : 0 ), y = by + ( dir == 0 ? 0 : k );
-      od.v[dst + OBMC_D_TPL + i] = int16_t( obmcTpl( jb, t, x, y, tw, th, bd, clipMin, clipMax ) );
+      int tv = obmcTpl( jb, t, x, y, tw, th, bd, clipMin, clipMax, i < L ? -1 : lic );
+      tv     = i < L || nlic < 0 ? tv : mcLic( jb, nlic, 0, 0, tv, clipMin, clipMax );
+      od.v[dst + OBMC_D_TPL + i] = int16_t( tv );
     }
   }
 }
@@ -1057,13 +1099,13 @@ void obmcInnerJob( int o, int lid )
     int v;
     if( s < 16 )
     {
-      v = mcSample( jb, o + OBMC_I_NB + k * MC_JOB, 0, sx + ( s & 3 ), sy + ( s >> 2 ), 4, 4, bd, clipMin, clipMax );
+      v = mcSample( jb, o + OBMC_I_NB + k * MC_JOB, 0, sx + ( s & 3 ), sy + ( s >> 2 ), 4, 4, bd, clipMin, clipMax, -1 );
     }
     else
     {
       const int c = s - 16, comp = 1 + c / 4;
       v = mcSample( jb, o + OBMC_I_NB + k * MC_JOB, comp, ( sx >> 1 ) + ( c & 1 ), ( sy >> 1 ) + ( ( c >> 1 ) & 1 ), 2, 2, bd,
-                    clipMin, clipMax );
+                    clipMin, clipMax, -1 );
     }
     od.v[dst + 1 + i] = int16_t( v );
   }
@@ -1101,7 +1143,7 @@ void main()
     for( int i = lid; i < W * H; i += 64 )
     {
       const int v = mcSample( jb, o, comp, bx + i % W, by + i / W, jb.v[o + MC_PU_W], jb.v[o + MC_PU_H], bd,
-                              jb.v[o + MC_CLIP_MIN], jb.v[o + MC_CLIP_MAX] );
+                              jb.v[o + MC_CLIP_MIN], jb.v[o + MC_CLIP_MAX], -1 );
       BufI16( pc.outPred ).v[dst + i] = int16_t( v );
     }
   }

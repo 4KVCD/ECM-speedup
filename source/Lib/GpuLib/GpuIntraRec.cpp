@@ -1354,7 +1354,8 @@ constexpr int OBMC_I_AVAIL = 15, OBMC_I_NB = 32, OBMC_I = OBMC_I_NB + 4 * MC_JOB
 constexpr int OBMC_SEG_DIR = 0, OBMC_SEG_START = 1, OBMC_SEG_LEN = 2, OBMC_SEG_DATA = 3, OBMC_SEG = 4;
 constexpr int OBMC_REC_TM = 1, OBMC_REC_TOP = 2, OBMC_REC_LEFT = 4, OBMC_REC_INV_LMCS = 8;
 constexpr int OBMC_J_DIR = 32, OBMC_J_FLAGS = 33, OBMC_J_BASE = 34, OBMC_J_THRESHOLD = 37, OBMC_J_INT_MV = 39;
-constexpr int OBMC_J_INT_DIR = 43, OBMC_J_TPL = 44, OBMC_J_TPL_MOTION = 9, OBMC_J = 64;
+constexpr int OBMC_J_INT_DIR = 43, OBMC_J_TPL = 44, OBMC_J_TPL_MOTION = 9, OBMC_J_LIC = 64, OBMC_J_NLIC = 76, OBMC_J = 88;
+constexpr int OBMC_LIC = 2, OBMC_NLIC = 4, MC_L1 = 64;   // (a (non-local) LIC neighbour's models; uni-prediction from list 1)
 constexpr int OBMC_T_MV0 = 0, OBMC_T_MV1 = 2, OBMC_T_REF0 = 4, OBMC_T_REF1 = 5, OBMC_T_KIND = 6, OBMC_T_W0 = 7, OBMC_T_W1 = 8;
 constexpr int OBMC_TM = 1;
 constexpr int OBMC_D_TPL = 3;
@@ -7550,9 +7551,9 @@ static const char* obmcPlan( const CodingUnit& cu, std::vector<ObmcSeg>& segs, b
         {
           return "OBMC with an IBC neighbour";
         }
-        if( !nb || nb->cu->licFlag || nb->cu->altLMFlag )
+        if( !nb )
         {
-          return "OBMC with a LIC neighbour";
+          return "OBMC without a neighbour PU";
         }
         for( int l = 0; l < 2; l++ )
         {
@@ -8079,7 +8080,20 @@ static void obmcJobs( GpuIntraRec::Impl& m, const CodingUnit& cu, const std::vec
     j[MC_MVX]      = mv.getHor();
     j[MC_MVY]      = mv.getVer();
     j[MC_REF]      = mcSlot( m, slice, l0, s.mi.refIdx[l0] );
-    j[MC_FLAGS]    = ( cu.imv == IMV_HPEL ? MC_ALT_HPEL : 0 ) | ( bi ? MC_BI : 0 );   // (the CU's AMVR flag)
+    j[MC_FLAGS]    = ( cu.imv == IMV_HPEL ? MC_ALT_HPEL : 0 ) | ( bi ? MC_BI : 0 )   // (the CU's AMVR flag)
+                  | ( !bi && l0 == 1 ? MC_L1 : 0 );
+    if( s.nb->cu->licFlag )   // (JVET-AD0213: the neighbour's stored models, a list it lacks 32 / 0)
+    {
+      for( int l = 0; l < 2; l++ )
+      {
+        for( int c = 0; c < MAX_NUM_COMPONENT; c++ )
+        {
+          const bool has = ( s.nb->interDir & ( l + 1 ) ) != 0;
+          j[OBMC_J_LIC + ( l * 3 + c ) * 2]     = has ? s.nb->cu->licScale[l][c] : 32;
+          j[OBMC_J_LIC + ( l * 3 + c ) * 2 + 1] = has ? s.nb->cu->licOffset[l][c] : 0;
+        }
+      }
+    }
     j[MC_BD]       = bd;
     j[MC_CLIP_MIN] = slice.clpRng( COMPONENT_Y ).min;
     j[MC_CLIP_MAX] = slice.clpRng( COMPONENT_Y ).max;
@@ -8116,7 +8130,16 @@ static void obmcJobs( GpuIntraRec::Impl& m, const CodingUnit& cu, const std::vec
     // the segment: its boundary, the templates, the CU's blocks' jobs, skipObmcConditionByPixel's thresholds and
     // vectors (each list of the neighbour's motion clipped at the band, rounded to integer samples)
     j[OBMC_J_DIR]   = s.dir;
-    j[OBMC_J_FLAGS] = tm && ( r[OBMC_REC_FLAGS] & ( s.dir == 0 ? OBMC_REC_TOP : OBMC_REC_LEFT ) ) ? OBMC_TM : 0;
+    j[OBMC_J_FLAGS] = ( tm && ( r[OBMC_REC_FLAGS] & ( s.dir == 0 ? OBMC_REC_TOP : OBMC_REC_LEFT ) ) ? OBMC_TM : 0 )
+                      | ( s.nb->cu->licFlag ? OBMC_LIC : 0 ) | ( s.nb->cu->altLMFlag ? OBMC_NLIC : 0 );
+    if( s.nb->cu->altLMFlag )   // (JVET-AG0276: the neighbour's secAltLMParaUnit on the final prediction)
+    {
+      for( int c = 0; c < MAX_NUM_COMPONENT; c++ )
+      {
+        j[OBMC_J_NLIC + c * 2]     = s.nb->cu->secAltLMParaUnit.scale[c];
+        j[OBMC_J_NLIC + c * 2 + 1] = s.nb->cu->secAltLMParaUnit.offset[c];
+      }
+    }
     for( int c = 0; c < MAX_NUM_COMPONENT; c++ )
     {
       j[OBMC_J_BASE + c] = m.cuJob[c];
