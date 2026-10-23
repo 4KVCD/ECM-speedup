@@ -2480,6 +2480,35 @@ with the reconstruction. Verification and partial verification are unchanged (no
 agst23 with the change, --GpuRecon=3): bis_alf differed with --GpuLoopFilter=0 and =3, now identical with both;
 cr_fore32, cr_park27, nocr_fore32 (all in-loop filters of the CTC cfg) identical; partial verification of 8 streams
 identical.
+ON mode's CPU fallback after a derive-only pass (2026-10-22, agent st): a picture that record() rejects in ON mode is
+reconstructed by the CPU in a second pass over the parsed slice after the derive-only pass (DecSlice). That second pass
+did not decode as without the first: with every gate of supported() lifted (a test build), streams whose pictures fell
+back differed from the CPU decode, and so did the test streams of runs/agents/st/enc with a forced fallback. Causes,
+each reproduced and removed: (1) the derive-only pass of chroma reordering (de070984c / befb9754e) wrote its placeholder
+over pu.intraDir[1], the chroma mode as parsed (DM, DIMD, DBV or a candidate's index), which the second pass reads again
+(DecCu::m_gpuParsedChroma keeps and restores it); (2) the derive-only pass marked the whole slice decoded (setDecomp),
+so the second pass's availability, IntraTMP's and IBC's search ranges and IBC's vector checks saw undecoded areas
+(cleared before it); (3) reconstructParsed did not reset the motion LUTs as the parsing loop does (it assumed no IBC),
+and the second pass found the first's IntraTMP / IBC vectors in them (each pass starts from the slice's LUTs and resets
+them where the loop does); (4) the rest of a derive-only pass after the GPU path gave up changed parsed state (IBC's
+vectors in xDeriveCUMV; decompressCtu now stops there). The derive-only pass also ran into the CPU's checks on values it
+derives from samples it has not reconstructed, once the gates of BVG-DIMD, MDIP, IntraTMP / IBC, EIP / SGPM, PDP and NN
+are lifted: a BVG-DIMD or intra merge CU without a mode (255; MDIP's isIdxModeValid, getFinalIntraModeForTransform), the
+DIMD modes of predictions it does not compute (EIP, IntraTMP, NN, MIP, regression SGPM, a DIMD with a vector, BVG-DIMD:
+getTrTypes, getFinalIntraModeForTransform in the host's choice of the transforms), BVG-CCCM's candidates ("No valid BV
+found"), the TIMD merge transform types getTrTypes derives after xReconIntraQT; now placeholders in range (the GPU
+derives all of them), and an IntraTMP CU spans its motion (list 0, the CPU's vector 0) so that the later CUs' OBMC
+records read its kind as the CPU's pass would (the dump comparison found an OBMC record that took a GPU IntraTMP
+neighbour for an intra one). A check that still fails in a derive-only pass makes the picture the CPU's ("a check of the
+CPU's derivation (function)"), not the decode's end. The ON summary lists the CPU's pictures by reason ("[gpu-intra]
+pictures by the CPU"); ECM_GPU_DUMP writes the CU data's section sizes, dumpdiff.py (Tu of 105 words now) names the
+section that differs. Results (Intel PC, agst41, --GpuRecon=3): the 50 streams identical with the CPU (the gates still
+in place: all pictures the CPU's); the test streams cr_fore32, cr_park27, cr_crowd32, bis_alf identical, all pictures on
+the GPU; with a debug switch forcing the fallback after a complete derive-only pass (agst33 before, agst34 after the fix
+of (1)) cr_fore32, cr_park27, bis_alf went from different (chroma) to identical. With every gate lifted (test build
+agst40): 37 of the 50 streams identical; the 13 others reconstruct their intra picture on the GPU, but their inter
+pictures differ (ld_foreman_q32: pictures 0 and 1 identical, 2 on different): they read side information of the intra
+picture that the GPU did not write back to the CPU (next paragraph).
 
 
 ## 8. Numbers (i7-10700 8C/16T, Win11, GCC 16.2, RTX 3070 driver 616.92)

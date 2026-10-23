@@ -6,7 +6,8 @@
 # (and beyond the availability, read ranges and ISP side, which intra_deps computes), with the first blocks.
 import struct, sys
 
-TU = 103   # int32 per Tu (intra_common.glsl)
+TU = 105   # int32 per Tu (intra_common.glsl)
+CU = 52    # int32 per Cu (GpuIntraRec.cpp)
 FIELDS = ["comp", "x", "y", "w", "h", "dirMode", "isModeVer", "intraPredAngle", "absInvAngle", "useCubic", "unitW",
           "unitH", "bitDepth", "cbf", "coeffOffset", "dqScale", "dqRightShift", "dqInMin", "dqInMax", "trMin", "trMax",
           "shift1", "shift2", "recMin", "recMax", "dbgOffset", "plIdx", "refFilter", "applyPDPC", "gradPDPC",
@@ -16,7 +17,7 @@ FIELDS = ["comp", "x", "y", "w", "h", "dirMode", "isModeVer", "intraPredAngle", 
           "mipSizeId", "secKind", "secMatrix", "secRowLength", "secNumIn", "secScan", "secLayout", "secSize",
           "secTranspose", "mrl", "bfAvail0", "bfAvail1", "bfAvail2", "isp", "cuX", "cuY", "cuW", "cuH", "regX", "regW",
           "ispSide", "ispPrev", "spCoded", "spOffset", "resiFrom", "cu", "derive", "mtsSet", "secIdx", "secBucket",
-          "lm", "cflm", "ccp", "ccpMerge"]
+          "lm", "cflm", "ccp", "ccpMerge", "pdp", "pnn"]
 assert len(FIELDS) == TU
 # intra_rec derives these for DERIVE_MODE blocks (applyModeParams, DIMD), the transforms for DERIVE_TRANSFORM ones
 DERIVED   = {"dirMode", "isModeVer", "intraPredAngle", "absInvAngle", "useCubic", "refFilter", "applyPDPC", "gradPDPC",
@@ -44,10 +45,25 @@ def main():
     bad = False
     for poc in pocs:
         ver, on = load(f"{prefix}_{poc}_ver.bin"), load(f"{prefix}_{poc}_on.bin")
-        for name, a, b in zip(("levels", "sign prediction", "CUs"), ver[1:], on[1:]):
+        for name, a, b in zip(("levels", "sign prediction", "CUs"), ver[1:4], on[1:4]):
             if a != b:
                 bad = True
                 print(f"POC {poc}: the {name} differ")
+        if len(ver) > 5 and ver[3] != on[3]:   # (the CU data's sections, in bytes: where they differ)
+            sizes = struct.unpack("<8Q", ver[5])
+            names = ("CU records", "CU modes", "DIMD calls", "OBIC neighbours", "intra merge data", "timdData",
+                     "CCP data", "EIP models")
+            ca = struct.unpack(f"<{len(ver[3]) // 4}i", ver[3])
+            cb = struct.unpack(f"<{len(on[3]) // 4}i", on[3])
+            start = 0
+            for name, size in zip(names, sizes):
+                words = [i for i in range(start, start + size // 4) if i < len(cb) and ca[i] != cb[i]]
+                if words:
+                    first = words[0] - start
+                    where = f"CU {first // CU} field {first % CU}" if name == "CU records" else f"word {first}"
+                    print(f"  POC {poc}: {name} differ in {len(words)} words, first {where}: verification "
+                          f"{ca[words[0]]} ON {cb[words[0]]}")
+                start += size // 4
         ta = struct.unpack(f"<{len(ver[0]) // 4}i", ver[0])
         tb = struct.unpack(f"<{len(on[0]) // 4}i", on[0])
         if len(ta) != len(tb):

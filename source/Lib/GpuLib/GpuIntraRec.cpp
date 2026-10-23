@@ -2284,6 +2284,7 @@ struct GpuIntraRec::Impl
 
   // totals
   int                         numPictures = 0, numVerified = 0, numMismatch = 0, numSkipped = 0;
+  std::map<std::string, int>  skipReasons;   // ON mode: the pictures the CPU reconstructed, by reason
   std::string                 firstSkipReason;
   double                      gpuMs = 0;
 
@@ -2334,6 +2335,15 @@ GpuIntraRec::~GpuIntraRec()
       printf( "\n[gpu-intra] %d pictures: %d reconstructed on the GPU, %d by the CPU%s%s; GPU %.1f ms\n", m.numPictures,
               m.numOn, m.numPictures - m.numOn, m.firstSkipReason.empty() ? "" : ", first reason: ", m.firstSkipReason.c_str(),
               m.gpuMs );
+      if( !m.skipReasons.empty() )
+      {
+        printf( "[gpu-intra] pictures by the CPU:" );
+        for( const auto& r: m.skipReasons )
+        {
+          printf( " %s %d;", r.first.c_str(), r.second );
+        }
+        printf( "\n" );
+      }
     }
     else
     {
@@ -8808,6 +8818,7 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
   if( !m.unsupportedWhy.empty() || m.rec.empty() )
   {
     m.numSkipped++;
+    m.skipReasons[m.unsupportedWhy.empty() ? "no intra blocks" : m.unsupportedWhy]++;
     if( m.firstSkipReason.empty() )
     {
       m.firstSkipReason = m.unsupportedWhy.empty() ? "no intra blocks" : m.unsupportedWhy;
@@ -9943,6 +9954,10 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
     put( m.signPred.data(), spBytes );
     put( cuData.data(), cuBytes );
     put( ccpData.data(), ccpDataBytes );   // (also in the CU data, at its end)
+    // the CU data's sections (dumpdiff.py names the one that differs)
+    const uint64_t sections[8] = { cusBytes, modeBytes, callBytes, nbrBytes, mergeBytes, timdBytes, ccpDataBytes,
+                                   eipOutBytes };
+    put( sections, sizeof( sections ) );
     fclose( f );
   }
   // ECM_GPU_DRY, in verification: the records built (and dumped) but not reconstructed on the GPU (the picture counts

@@ -655,6 +655,14 @@ void DecSlice::decompressSlice( Slice* slice, InputBitstream* bitstream, int deb
 #endif
   }
 #endif
+#if ECM_VULKAN
+  // (the motion LUTs as decompressCtu finds them at the slice's start: reconstructParsed starts each pass from them)
+  LutMotionCand gpuLutStart;
+  if( gpuOn )
+  {
+    gpuLutStart = cs.motionLut;
+  }
+#endif
   unsigned subStrmId = 0;
   for( unsigned ctuIdx = 0; ctuIdx < slice->getNumCtuInSlice(); ctuIdx++ )
   {
@@ -922,10 +930,12 @@ void DecSlice::decompressSlice( Slice* slice, InputBitstream* bitstream, int deb
 #if ECM_VULKAN
   if( gpuOn )
   {
-    // decompressCtu over the parsed slice, with the state decompressCtu relies on reset as in the parsing loop
-    // (an intra slice of a supported picture: no IBC, so no motion LUTs)
+    // decompressCtu over the parsed slice, with the state decompressCtu relies on reset as in the parsing loop: the
+    // motion LUTs (IntraTMP's and IBC's vectors, CU::saveMotionInHMVP) from the slice's start, reset where the loop
+    // resets them, so that the CPU's pass after a derive-only pass finds them as without it
     auto reconstructParsed = [&]()
     {
+      cs.motionLut = gpuLutStart;
       for( unsigned ctuIdx = 0; ctuIdx < slice->getNumCtuInSlice(); ctuIdx++ )
       {
         const unsigned ctuRsAddr     = slice->getCtuAddrInSlice( ctuIdx );
@@ -934,6 +944,51 @@ void DecSlice::decompressSlice( Slice* slice, InputBitstream* bitstream, int deb
         const unsigned maxCUSize     = sps->getMaxCUWidth();
         const UnitArea ctuArea( cs.area.chromaFormat, Area( ctuXPosInCtus * maxCUSize, ctuYPosInCtus * maxCUSize, maxCUSize, maxCUSize ) );
         const bool rowStart = ctuXPosInCtus == slice->getPPS()->getTileColumnBd( slice->getPPS()->ctuToTileCol( ctuXPosInCtus ) );
+#if JVET_AD0208_IBC_ADAPT_FOR_CAM_CAPTURED_CONTENTS
+        if( ( cs.slice->getSliceType() != I_SLICE || cs.slice->getUseIBC() ) && rowStart )
+#else
+        if( ( cs.slice->getSliceType() != I_SLICE || cs.sps->getIBCFlag() ) && rowStart )
+#endif
+        {
+#if JVET_Z0118_GDR
+          cs.motionLut.lut0.resize( 0 );
+          cs.motionLut.lutIbc0.resize( 0 );
+          if( cs.isGdrEnabled() )
+          {
+            cs.motionLut.lut1.resize( 0 );
+            cs.motionLut.lutIbc1.resize( 0 );
+          }
+#else
+          cs.motionLut.lut.resize( 0 );
+          cs.motionLut.lutIbc.resize( 0 );
+#endif
+#if JVET_Z0139_HIST_AFF
+          for( int i = 0; i < 2 * MAX_NUM_AFFHMVP_ENTRIES_ONELIST; i++ )
+          {
+#if JVET_Z0118_GDR
+            cs.motionLut.lutAff0[i].resize( 0 );
+            if( cs.isGdrEnabled() )
+            {
+              cs.motionLut.lutAff1[i].resize( 0 );
+            }
+#else
+            cs.motionLut.lutAff[i].resize( 0 );
+#endif
+          }
+#if JVET_Z0118_GDR
+          cs.motionLut.lutAffInherit0.resize( 0 );
+          if( cs.isGdrEnabled() )
+          {
+            cs.motionLut.lutAffInherit1.resize( 0 );
+          }
+#else
+          cs.motionLut.lutAffInherit.resize( 0 );
+#endif
+#endif
+#if !JVET_Z0153_IBC_EXT_REF
+          cs.resetIBCBuffer = true;
+#endif
+        }
 #if JVET_AD0188_CCP_MERGE
         if( ctuIdx == 0 || rowStart )
         {
@@ -960,10 +1015,31 @@ void DecSlice::decompressSlice( Slice* slice, InputBitstream* bitstream, int deb
       }
     };
     m_pcCuDecoder->setGpuDeriveOnly( true );
-    reconstructParsed();
+    // the derive-only pass runs the CPU's mode derivations on samples it has not reconstructed (the GPU derives the
+    // modes again): a check of theirs that fails there (a mode or vector out of range) says nothing about the
+    // bitstream, and the CPU reconstructs the picture (a check that fails then is the bitstream's)
+    try
+    {
+      reconstructParsed();
+    }
+    catch( const Exception& e )
+    {
+      const std::string what = e.what(), key = "In function \"";
+      const size_t      at = what.find( key ), end = at == std::string::npos ? at : what.find( '"', at + key.size() );
+      // (the state of a CU it left: DecCu::decompressCtu marks an adaptive dual tree's intra region per CU)
+#if JVET_AI0136_ADAPTIVE_DUAL_TREE
+      slice->setProcessingIntraRegion( false );
+#endif
+      gpuRec->unsupported( ( "a check of the CPU's derivation (" + ( end == std::string::npos ? std::string( "?" )
+                                                                   : what.substr( at + key.size(), end - at - key.size() ) )
+                             + ")" ).c_str() );
+    }
     m_pcCuDecoder->setGpuDeriveOnly( false );
     if( gpuRec->failed() )   // a block the GPU path cannot reconstruct: the CPU reconstructs the picture
     {
+      // (the derive-only pass marked the whole slice decoded: availability, IntraTMP's and IBC's search ranges read
+      // it as decoding goes, so the CPU starts from none, as the parsing loop leaves it; one slice per picture)
+      cs.setDecomp( cs.area, false );
       reconstructParsed();
     }
   }

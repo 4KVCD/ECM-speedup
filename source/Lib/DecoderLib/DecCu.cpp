@@ -163,6 +163,14 @@ void DecCu::decompressCtu( CodingStructure& cs, const UnitArea& ctuArea )
 
     for( auto &currCU : cs.traverseCUs( CS::getArea( cs, ctuArea, chType ), chType ) )
     {
+#if ECM_VULKAN
+      // a derive-only pass the GPU path has given up on: the CPU reconstructs the picture after it from the parsed CUs,
+      // which the steps of the rest of the pass would change (IBC's vectors, chroma reordering's modes)
+      if( m_gpuDeriveOnly && m_gpuIntraRec && m_gpuIntraRec->failed() )
+      {
+        return;
+      }
+#endif
 #if JVET_AJ0161_OBMC_EXT_WITH_INTRA_PRED
       m_pcInterPred->setDIMDForOBMC(false);
 #if JVET_AK0076_EXTENDED_OBMC_IBC && !JVET_AK0212_GPM_OBMC_MODIFICATION
@@ -293,6 +301,16 @@ void DecCu::decompressCtu( CodingStructure& cs, const UnitArea& ctuArea )
       if( m_gpuIntraRec && currCU.predMode != MODE_INTRA )   // (from the GPU's reconstruction, else the CPU's)
       {
         m_gpuIntraRec->interCu( currCU );
+      }
+      if( m_gpuDeriveOnly && m_gpuIntraRec && m_gpuIntraRec->failed() )   // (as above)
+      {
+#if JVET_AI0136_ADAPTIVE_DUAL_TREE
+        if( changeProcIntraReg )
+        {
+          currCU.slice->setProcessingIntraRegion( false );
+        }
+#endif
+        return;
       }
 #endif
       if (currCU.predMode != MODE_INTRA && currCU.predMode != MODE_PLT && currCU.Y().valid())
@@ -1090,6 +1108,16 @@ void DecCu::decompressCtu( CodingStructure& cs, const UnitArea& ctuArea )
           IntraPrediction::deriveDimdModeList(currCU.cs->picture->getRecoBuf(area), area, currCU, currCU.candModeListForTransformMtss, currCU.candCostListForTransformMtss);
         }
 #endif 
+#if ECM_VULKAN
+        // the GPU reconstructs the picture: a DIMD-derived mode (DIMD, BVG-DIMD, intra merge) of samples the CPU has
+        // not reconstructed may be none (255), with which getFinalIntraModeForTransform, getTrTypes and the later MPM
+        // lists (MDIP's isIdxModeValid) would index; a placeholder keeps it in range (the GPU derives the CU's modes)
+        if( m_gpuDeriveOnly && currCU.dimd && currCU.firstPU->intraDir[CHANNEL_TYPE_LUMA] >= NUM_LUMA_MODE
+            && currCU.firstPU->intraDir[CHANNEL_TYPE_LUMA] != PNN_IDX )
+        {
+          currCU.firstPU->intraDir[CHANNEL_TYPE_LUMA] = PLANAR_IDX;
+        }
+#endif
         xReconIntraQT( currCU );
 #if ECM_VULKAN
         if( m_gpuIntraRec && CU::isPLT( currCU ) )   // (partial verification: a palette CU's blocks)
@@ -1098,6 +1126,16 @@ void DecCu::decompressCtu( CodingStructure& cs, const UnitArea& ctuArea )
         }
 #endif
 #if JVET_AM0138_ENHANCED_TMP_MERGE_LIST_TIMD_BV
+#if ECM_VULKAN
+        // the GPU reconstructs the picture: the modes of a prediction's DIMD (EIP, IntraTMP, NN, regression SGPM) and of
+        // the block vectors (TIMD / DIMD with a vector) are not derived here, so getTrTypes would read an unset mode;
+        // the CPU's later TIMD merge lists read placeholders (the GPU derives the types, TimdOut's)
+        if( m_gpuDeriveOnly && !currCU.timdMrg && !currCU.lfnstIdx )
+        {
+          currCU.timdmTrType[NUM_TIMD_MERGE_MODES][0] = currCU.timdmTrType[NUM_TIMD_MERGE_MODES][1] = DCT2;
+        }
+        else
+#endif
         if (!currCU.timdMrg && !currCU.lfnstIdx)
         {
           m_pcTrQuant->getTrTypes(*currCU.firstTU, COMPONENT_Y, currCU.timdmTrType[NUM_TIMD_MERGE_MODES][0], currCU.timdmTrType[NUM_TIMD_MERGE_MODES][1]);
@@ -1205,6 +1243,18 @@ void DecCu::xIntraRecBlk( TransformUnit& tu, const ComponentID compID )
   PredictionUnit &pu = *tu.cs->getPU(area.pos(), chType);
 #else
   const PredictionUnit &pu  = *tu.cs->getPU( area.pos(), chType );
+#endif
+#if ECM_VULKAN
+  // the CPU's pass after a derive-only pass: the chroma mode as parsed, which chroma reordering's placeholder replaced
+  if( compID == COMPONENT_Cb && !m_gpuDeriveOnly && !m_gpuParsedChroma.empty() )
+  {
+    const auto parsed = m_gpuParsedChroma.find( &pu );
+    if( parsed != m_gpuParsedChroma.end() )
+    {
+      const_cast<PredictionUnit&>( pu ).intraDir[CHANNEL_TYPE_CHROMA] = parsed->second;
+      m_gpuParsedChroma.erase( parsed );
+    }
+  }
 #endif
 
 #if ENABLE_DIMD
@@ -1338,6 +1388,7 @@ void DecCu::xIntraRecBlk( TransformUnit& tu, const ComponentID compID )
     if( m_gpuDeriveOnly )   // (no list: a placeholder mode, which nothing the host decides reads)
     {
       std::fill_n( pu.cu->chromaList, NUM_CHROMA_LIST_MODE, uint8_t( PLANAR_IDX ) );
+      m_gpuParsedChroma[&pu] = pu.intraDir[CHANNEL_TYPE_CHROMA];
     }
 #endif
     pu.intraDir[1] = pu.cu->chromaList[chromaIdx];
@@ -1353,7 +1404,12 @@ void DecCu::xIntraRecBlk( TransformUnit& tu, const ComponentID compID )
   }
 #endif
 #if JVET_AE0100_BVGCCCM
+#if ECM_VULKAN
+  // (the GPU path takes no BVG-CCCM block: the CPU's candidates of samples it has not reconstructed need none)
+  if (pu.bvgCccmFlag && compID == COMPONENT_Cb && !m_gpuDeriveOnly)
+#else
   if (pu.bvgCccmFlag && compID == COMPONENT_Cb)
+#endif
   {
     bool validBv = false;
     PU::getBvgCccmCands(pu, validBv);
@@ -1432,6 +1488,53 @@ void DecCu::xIntraRecBlk( TransformUnit& tu, const ComponentID compID )
 #if ECM_VULKAN
   if( m_gpuDeriveOnly )   // the GPU reconstructs the picture: the block's parameters only
   {
+    // the modes of DIMDs of predictions the CPU does not compute here (EIP's, IntraTMP's, NN's, MIP's, regression SGPM's,
+    // DIMD's of a prediction from a block vector, BVG-DIMD's) hold the last value or none (-1): the host's choice of
+    // the transforms (getFinalIntraModeForTransform) and the CPU's later lists read them, so a placeholder keeps them
+    // in range (the GPU derives them and the transforms, Tu::derive)
+    if( compID == COMPONENT_Y )
+    {
+      CodingUnit& cu    = *tu.cu;
+      auto        valid = []( auto& mode )
+      {
+        if( int( mode ) < 0 || int( mode ) >= NUM_LUMA_MODE )
+        {
+          mode = PLANAR_IDX;
+        }
+      };
+      valid( cu.dimdDerivedIntraDir );
+      valid( cu.dimdDerivedIntraDir2nd );
+      valid( cu.mipDimdMode );
+#if JVET_AB0155_SGPM && JVET_AJ0112_REGRESSION_SGPM
+      valid( cu.sgpmDimdMode );
+#endif
+#if JVET_AG0058_EIP
+      valid( cu.eipModel.eipDimdMode );
+      valid( cu.eipModel.eipDimdMode2nd );
+#endif
+#if JVET_V0130_INTRA_TMP
+      valid( cu.intraTmpDimdMode );
+#endif
+#if JVET_AL0108_BVG_DIMD
+      for( auto& mode: cu.bvgDimdMode )
+      {
+        valid( mode );
+      }
+#endif
+#if JVET_AJ0249_NEURAL_NETWORK_BASED
+      for( auto& reps: cu.indicesRepresentationPnn )
+      {
+        for( auto& mode: reps )
+        {
+          valid( mode );
+        }
+      }
+#endif
+      for( auto& mode: cu.candModeListForTransform )
+      {
+        valid( mode );
+      }
+    }
 #if JVET_AK0064_CCP_LFNST_NSPT
     // a CCLM CU with LFNST / NSPT: their mode is a DIMD of its predictions (deriveChromaIpmForTransform), which the GPU
     // derives; the host's choice of the transforms reads a placeholder in range instead of the unset mode
@@ -1442,6 +1545,19 @@ void DecCu::xIntraRecBlk( TransformUnit& tu, const ComponentID compID )
 #endif
     m_gpuIntraRec->prepareSignPred( tu, compID );   // the GPU decides the predicted signs
     m_gpuIntraRec->record( tu, compID, m_pcIntraPred->ipaSnapshot(), QpParam( tu, compID ), nullptr, nullptr );
+#if JVET_AB0061_ITMP_BV_FOR_IBC && JVET_AK0076_EXTENDED_OBMC_IBC
+    // an IntraTMP CU's motion as its prediction spans it (a vector of list 0 the GPU finds; the CPU's placeholder 0):
+    // the later CUs' OBMC records and lists read its kind and direction from the motion field
+    if( compID == COMPONENT_Y && tu.cu->tmpFlag )
+    {
+      PredictionUnit& tmpPu        = const_cast<PredictionUnit&>( pu );
+      tmpPu.interDir               = 1;
+      tmpPu.refIdx[REF_PIC_LIST_0] = MAX_NUM_REF;
+      tmpPu.mv[REF_PIC_LIST_0].setZero();
+      tmpPu.bv.setZero();
+      PU::spanMotionInfo( tmpPu );
+    }
+#endif
     // as below: an ISP CU's luma is marked decoded as a whole at its first sub-partition
     if( !tu.cu->ispMode || !isLuma( compID ) )
     {

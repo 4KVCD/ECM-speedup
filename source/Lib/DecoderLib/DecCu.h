@@ -99,7 +99,15 @@ public:
   /// the GPU reconstruction (verification) recording this decoder's intra blocks, or nullptr
   void setGpuIntraRec( GpuIntraRec* rec ) { m_gpuIntraRec = rec; }
   /// decompressCtu() derives the intra modes and records the blocks for the GPU, without any sample work
-  void setGpuDeriveOnly( bool b ) { m_gpuDeriveOnly = b; m_pcIntraPred->setParamsOnly( b ); }
+  void setGpuDeriveOnly( bool b )
+  {
+    m_gpuDeriveOnly = b;
+    m_pcIntraPred->setParamsOnly( b );
+    if( b )
+    {
+      m_gpuParsedChroma.clear();
+    }
+  }
   GpuIntraRec* getGpuIntraRec() const { return m_gpuIntraRec; }
 private:
   // Don't put these members under #if ECM_VULKAN: EncCu derives from DecCu, and EncoderLib is compiled without
@@ -107,6 +115,9 @@ private:
   // disagree on the layout of DecCu, EncCu and EncLib, and the encoder of a Vulkan build crashes.
   GpuIntraRec*      m_gpuIntraRec = nullptr;
   bool              m_gpuDeriveOnly = false;
+  // a derive-only pass's chroma reordering PUs: their chroma mode as parsed (DM, DIMD, DBV or a candidate's index),
+  // which the pass's placeholder replaced, for the CPU's pass after it (a picture the GPU cannot reconstruct)
+  std::unordered_map<const PredictionUnit*, uint32_t> m_gpuParsedChroma;
 private:
   TrQuant*          m_pcTrQuant;
   IntraPrediction*  m_pcIntraPred;
