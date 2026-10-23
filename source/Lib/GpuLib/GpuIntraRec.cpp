@@ -977,7 +977,7 @@ static_assert( SP_TEMPLATES == 2 + SIGN_PRED_MAX_NUM, "signPred layout" );
 constexpr int LMCS_BF_INVERSE  = 1;   // the intra bilateral filter works on inverse-mapped samples
 constexpr int LMCS_CHROMA_SCALE = 2;   // the chroma residual is scaled by the CU's neighbouring luma
 constexpr int LMCS_INTER_FWD    = 4;   // an inter block's prediction is forward-mapped (luma)
-constexpr int CIIP_ON = 1, CIIP_UNIFORM = 0, CIIP_BY_X = 2, CIIP_BY_Y = 4, CIIP_W = 3, CIIP_FWD = 32;   // (Tu::ciip)
+constexpr int CIIP_ON = 1, CIIP_UNIFORM = 0, CIIP_BY_X = 2, CIIP_BY_Y = 4, CIIP_EDGE = 6, CIIP_W = 3, CIIP_FWD = 32;   // (Tu::ciip)
 
 // Tu::quant
 constexpr int QUANT_DEP = 1;   // dependent quantization: the coefficients are quantization indices (DepQuant)
@@ -7681,9 +7681,18 @@ static const char* ciipWhy( const CodingUnit& cu )
 {
   const PredictionUnit& pu = *cu.firstPU;
 #if CIIP_PDPC
-  if( pu.ciipPDPC )
+  // (CIIP-PDPC's blend clips to the slice's range: the bit depth's)
+  for( int c = 0; pu.ciipPDPC && c < MAX_NUM_COMPONENT; c++ )
   {
-    return "CIIP-PDPC";
+    const ClpRng& r = cu.slice->clpRng( ComponentID( c ) );
+    if( r.min != 0 || r.max != ( 1 << r.bd ) - 1 )
+    {
+      return "CIIP-PDPC with a clipping range not the bit depth's";
+    }
+  }
+  if( pu.ciipPDPC && PU::getFinalIntraMode( pu, CHANNEL_TYPE_LUMA ) > DC_IDX )
+  {
+    return "CIIP-PDPC with an angular mode";
   }
 #endif
   if( cu.firstTU != cu.lastTU )
@@ -7736,8 +7745,8 @@ static void ciipFields( GpuIntraRec::Impl& m, const CodingUnit& cu, const Compon
   t.qp               = cu.qp;
   t.mrl              = ipa.multiRefIndex;
 #if JVET_AH0209_PDP
-  const int pdp = pdpSize( cu, pu, compID, ipa );
-  t.pdp         = pdp >= 0 && pdp < PDP_SIZES ? pdp | ipa.pdpPadW << 8 | ipa.pdpPadH << 16 : -1;
+  const int pdp = pdpSize( cu, pu, compID, ipa );   // (predIntraAng: none for CIIP-PDPC)
+  t.pdp         = pdp >= 0 && pdp < PDP_SIZES && !pu.ciipPDPC ? pdp | ipa.pdpPadW << 8 | ipa.pdpPadH << 16 : -1;
 #endif
   // geneWeightedPred: the neighbours' weights (the PUs left of the bottom-left and above the top-right sample, intra or
   // not), or with TIMD (JVET-X0141) an angular mode's of a block of 4 x 4 and up by the quarter of the columns (modes
@@ -7753,6 +7762,9 @@ static void ciipFields( GpuIntraRec::Impl& m, const CodingUnit& cu, const Compon
   {
     kind = dirMode < DIA_IDX ? CIIP_BY_X : CIIP_BY_Y;
   }
+#endif
+#if CIIP_PDPC
+  kind = pu.ciipPDPC ? CIIP_EDGE : kind;   // (predIntraAng: its PDPC term, planar and DC only: ciipWhy)
 #endif
   const bool fwd = isLuma( compID ) && cu.slice->getLmcsEnabledFlag() && m.reshape->getCTUFlag();
   t.ciip         = CIIP_ON | kind | wIntra << CIIP_W | ( fwd ? CIIP_FWD : 0 );

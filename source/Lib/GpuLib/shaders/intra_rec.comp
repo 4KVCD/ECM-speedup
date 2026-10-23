@@ -494,6 +494,12 @@ int ciipBlend( Tu t, int x, int y, int intra )
   int inter = int( CBufI16( P.interPred ).v[t.dbgOffset + y * t.w + x] );
   inter     = ( t.ciip & CIIP_FWD ) != 0 ? fwdLut( inter ) : inter;
   const int kind = t.ciip & CIIP_KIND;
+  if( kind == CIIP_EDGE )
+  {
+    const int scale = ( findMSB( t.w ) - 2 + findMSB( t.h ) - 2 + 2 ) >> 2;
+    const int wT = 32 >> min( 31, ( y << 1 ) >> scale ), wL = 32 >> min( 31, ( x << 1 ) >> scale );
+    return clamp( ( ( intra << 6 ) + ( 64 - wT - wL ) * inter + 32 ) >> 6, 0, ( 1 << t.bitDepth ) - 1 );
+  }
   if( kind == CIIP_UNIFORM )
   {
     const int wIntra = ( t.ciip >> CIIP_W ) & 3;
@@ -3092,7 +3098,13 @@ void main()
             else                    v = ( ( horPred << log2H ) + ( vertPred << log2W ) + offset ) >> finalShift;
           }
           v = asPel( v );
-          if( t.applyPDPC != 0 )   // xIntraPredPlanarDcPdpc
+          if( ( t.ciip & CIIP_KIND ) == CIIP_EDGE )   // (CIIP-PDPC: the references' term alone)
+          {
+            const int wT = 32 >> min( 31, ( y << 1 ) >> pdpcScale );
+            const int wL = 32 >> min( 31, ( x << 1 ) >> pdpcScale );
+            v = ( wL * L + wT * T + 32 ) >> 6;
+          }
+          else if( t.applyPDPC != 0 )   // xIntraPredPlanarDcPdpc
           {
             const int wT = 32 >> min( 31, ( y << 1 ) >> pdpcScale );
             const int wL = 32 >> min( 31, ( x << 1 ) >> pdpcScale );

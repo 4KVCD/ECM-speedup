@@ -449,7 +449,7 @@ wall-clock gains with threads are "the easy baseline". Decoder status: single-th
 (`--GpuLoopFilter=1`: ALF, SAO, BIF, CCSAO, LF-CCCM, offset refinement on Vulkan). The user then asked for **a full
 GPU decoder in Vulkan, optimized until nothing is left** ("The GPU decoder needs to fully decode the frame on the
 GPU"; "Your first Vulkan version is going to be slow. That's OK"). That work is branch `dec-gpurecon`: intra
-reconstruction on the GPU (`--GpuRecon`), tool levels M1-M107 done and verified bit-exact (M19: DIMD, M20: OBIC, M21:
+reconstruction on the GPU (`--GpuRecon`), tool levels M1-M108 done and verified bit-exact (M19: DIMD, M20: OBIC, M21:
 intra merge, M22: the transforms of DIMD CUs, M23: LFNST of MIP, M24: TIMD, M25: OBIC and intra merge with TIMD
 neighbours, M26: TIMD-SAD, M27: OBIC and intra merge with TIMD-SAD neighbours, M28: TIMD merge, M29: TMRL of luma,
 M30: chroma TMRL, M31: CCLM, M32: LFNST / NSPT of CCLM, M33: GLM's gradient patterns, M34: CCCM, M35: GL-CCCM, M36:
@@ -2618,6 +2618,14 @@ regression-based blending, intra / IBC / affine / bi-prediction / DMVR parts, LI
 Results (50 streams, build gpm1): every picture identical (ra_wpp_q32 skipped as before); GPM 50 CUs predicted by the
 GPU; from the CPU: GPM (separate OBMC) 761, (an affine part) 610, (an intra part) 449, (regression-based blending)
 314, (a bi-prediction part) 45, (LIC) 18, (its OBMC) 9.
+M108 (2026-10-23): CIIP-PDPC on the GPU (planar / DC CIIP CUs whose slice clips to the bit depth). predIntraAng with
+ciipPDPC replaces the intra prediction by PDPC's term of the references alone - (wL left + wT top + 32) >> 6,
+xIntraPredPlanarDcPdpc - and skips PDP; geneWeightedPred blends ((intra << 6) + (64 - wT - wL) inter + 32) >> 6,
+clipped. Tu::ciip's new kind CIIP_EDGE: intra_rec's planar / DC branch computes the term, ciipBlend the blend;
+ciipFields sets no PDP for it (found on the way, ld_foreman_q32 and three more: with PDP the prediction differed).
+Results (50 streams, build gpm2, with M107): every picture identical (ra_wpp_q32 skipped as before; ai_foreman352_q22
+lost the device in the parallel run and passed alone); CIIP 200 CUs predicted by the GPU (+101); from the CPU: CIIP
+with LFNST / NSPT 117, with LIC 66, OBMC with an intra neighbour 47, OBMC 13, with inter CCCM 1.
 
 
 ## 8. Numbers (i7-10700 8C/16T, Win11, GCC 16.2, RTX 3070 driver 616.92)
