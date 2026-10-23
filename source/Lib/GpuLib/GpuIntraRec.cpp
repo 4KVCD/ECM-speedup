@@ -2442,9 +2442,9 @@ bool GpuIntraRec::failed() const
 
 bool GpuIntraRec::supported( const Slice& slice, std::string& why, bool partial )
 {
-  // every tool whose mode derivation or prediction reads reconstructed samples, or that the kernels do not implement,
-  // must be off: with the GPU reconstruction on, the CPU reconstructs nothing the derivations could read. Partial
-  // verification takes the CUs of such tools from the CPU (record) and checks the tool families below per CU
+  // the sequence-level conditions of the GPU path; the tools' cases it lacks are rejected per CU by record() (ON mode:
+  // the picture is the CPU's), as partial verification takes such CUs from the CPU. With the GPU reconstruction on, the
+  // CPU reconstructs nothing its derivations could read: every derivation from reconstructed samples is the GPU's
   const SPS& sps = *slice.getSPS();
   why.clear();
   // (partial verification takes inter slices too: their inter CUs come from the CPU, cpuCu)
@@ -2474,7 +2474,6 @@ bool GpuIntraRec::supported( const Slice& slice, std::string& why, bool partial 
   else if( partial )                                                                      return true;
   // chroma reordering and DBV: the GPU's per CU (CU_CHROMA_REORDER, CU_CHROMA_DBV), what it lacks rejected by record()
   else if( ( sps.getUseChromaReordering() || sps.getUseIntraDBV() ) && !GPU_CHROMA_REORDER ) why = "chroma reordering / DBV";
-  else if( slice.getPnnMode() )                                                           why = "NN intra prediction";
   return why.empty();
 }
 

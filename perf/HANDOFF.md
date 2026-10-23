@@ -2564,6 +2564,14 @@ record() (the picture the CPU's, through 44e11ef88's fallback; its side informat
 PC, agst50, --GpuRecon=3 against the build's CPU decode, the 50 streams): 50 of 50 identical; intra pictures on the GPU
 1 -> 1 of 331 pictures; the CPU's intra pictures by their first reason: NN intra prediction 51; CCLM with LFNST / NSPT
 without DIMD 2; wavefronts 1.
+ON mode without supported()'s NN intra prediction gate (2026-10-22, agent st): the sequence-level rejection of NN intra
+prediction is gone; NN intra prediction (intra_nn.glsl; record() rejects the shapes without a model) are the GPU's per
+CU, what the GPU lacks rejected by record() (the picture the CPU's, through 44e11ef88's fallback; its side information
+through 7882788d3). Results (Intel PC, agst51, --GpuRecon=3 against the build's CPU decode, the 50 streams): 50 of 50
+identical; intra pictures on the GPU 1 -> 17 of 331 pictures; the CPU's intra pictures by their first reason: inter /
+IBC / palette CU 16; DBV with LM chroma fusion 10; CCLM with LFNST / NSPT without DIMD 2; BVG-CCCM 2; IntraTMP OBMC with
+a neighbour of two vectors or inter 2; IntraTMP above 1024 samples 1; IntraTMP fusion / FLM above 10 bits 1; DBV with LM
+chroma fusion, LIC or a flip 1.
 
 
 ## 8. Numbers (i7-10700 8C/16T, Win11, GCC 16.2, RTX 3070 driver 616.92)
