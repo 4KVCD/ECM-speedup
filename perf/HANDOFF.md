@@ -449,7 +449,7 @@ wall-clock gains with threads are "the easy baseline". Decoder status: single-th
 (`--GpuLoopFilter=1`: ALF, SAO, BIF, CCSAO, LF-CCCM, offset refinement on Vulkan). The user then asked for **a full
 GPU decoder in Vulkan, optimized until nothing is left** ("The GPU decoder needs to fully decode the frame on the
 GPU"; "Your first Vulkan version is going to be slow. That's OK"). That work is branch `dec-gpurecon`: intra
-reconstruction on the GPU (`--GpuRecon`), tool levels M1-M102 done and verified bit-exact (M19: DIMD, M20: OBIC, M21:
+reconstruction on the GPU (`--GpuRecon`), tool levels M1-M103 done and verified bit-exact (M19: DIMD, M20: OBIC, M21:
 intra merge, M22: the transforms of DIMD CUs, M23: LFNST of MIP, M24: TIMD, M25: OBIC and intra merge with TIMD
 neighbours, M26: TIMD-SAD, M27: OBIC and intra merge with TIMD-SAD neighbours, M28: TIMD merge, M29: TMRL of luma,
 M30: chroma TMRL, M31: CCLM, M32: LFNST / NSPT of CCLM, M33: GLM's gradient patterns, M34: CCCM, M35: GL-CCCM, M36:
@@ -2392,6 +2392,18 @@ neighbours of OBMC. Results (50 streams, build gpu52): every picture identical (
 wavefronts); affine 1028 CUs predicted by the GPU; from the CPU: affine (sub-block merge) 810, (with LIC) 663, (OBMC
 of sub-block motion: affine BDOF) 663, (CIIP) 197, (OBMC with an intra neighbour) 132, (other: affineGpu's remaining
 conditions) 97, (OBMC with an IBC neighbour) 4.
+M103 (2026-10-23): LIC CUs on the GPU (kind "LIC" without non-local LIC, BDOF, DMVR or reference picture resampling).
+The CPU keeps the models it applied on the CU (DecCu's setLicParam after a derivation, JVET-AH0314's inherited ones
+otherwise; the shift is always 5, xUpdateLicModel's slope adjustment keeps it), so the host appends them to the affine
+records' buffer and a block job with MC_LIC applies them in mcSample: uni-prediction on the final samples (list 1's
+model for list 1, MC_L1), bi-prediction per list on the 14-bit intermediate as xLicCompAdj does (mcLicBi), before
+BCW's average and the out-of-boundary samples. With OBMC: selectOBMCmode predicts the template of the CU's own motion
+while the CU still holds its own LIC flag and models (the neighbour's replace them for the neighbour's template and
+band only), so an OBMC job of a LIC CU carries the CU's models too (OBMC_J_CLIC, OBMC_CLIC); found on the way
+(ra_foreman_q22, ra_parkjoy832_q32): without them the TM mode differed. Partial verification names why a LIC CU stays
+the CPU's. Results (50 streams, build gpu53): every picture identical (ra_wpp_q32 skipped as before); LIC 539 CUs
+predicted by the GPU; from the CPU: LIC (OBMC with an intra neighbour) 149, (with DMVR) 87, (resampling) 42, (with
+BDOF) 33, (other) 23, (OBMC with an IBC neighbour) 1.
 
 
 ## 8. Numbers (i7-10700 8C/16T, Win11, GCC 16.2, RTX 3070 driver 616.92)

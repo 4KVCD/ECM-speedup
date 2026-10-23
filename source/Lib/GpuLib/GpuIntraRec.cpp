@@ -1354,8 +1354,9 @@ constexpr int OBMC_I_AVAIL = 15, OBMC_I_NB = 32, OBMC_I = OBMC_I_NB + 4 * MC_JOB
 constexpr int OBMC_SEG_DIR = 0, OBMC_SEG_START = 1, OBMC_SEG_LEN = 2, OBMC_SEG_DATA = 3, OBMC_SEG = 4;
 constexpr int OBMC_REC_TM = 1, OBMC_REC_TOP = 2, OBMC_REC_LEFT = 4, OBMC_REC_INV_LMCS = 8;
 constexpr int OBMC_J_DIR = 32, OBMC_J_FLAGS = 33, OBMC_J_BASE = 34, OBMC_J_THRESHOLD = 37, OBMC_J_INT_MV = 39;
-constexpr int OBMC_J_INT_DIR = 43, OBMC_J_TPL = 44, OBMC_J_TPL_MOTION = 9, OBMC_J_LIC = 64, OBMC_J_NLIC = 76, OBMC_J = 88;
-constexpr int OBMC_LIC = 2, OBMC_NLIC = 4, MC_L1 = 64, MC_AFFINE = 128;   // (a (non-local) LIC neighbour's models; uni-prediction from list 1)
+constexpr int OBMC_J_INT_DIR = 43, OBMC_J_TPL = 44, OBMC_J_TPL_MOTION = 9, OBMC_J_LIC = 64, OBMC_J_NLIC = 76;
+constexpr int OBMC_J_CLIC = 88, OBMC_J = 100;
+constexpr int OBMC_LIC = 2, OBMC_NLIC = 4, OBMC_CLIC = 8, MC_L1 = 64, MC_AFFINE = 128, MC_LIC = 256;   // (a (non-local) LIC neighbour's models; uni-prediction from list 1)
 constexpr int OBMC_T_MV0 = 0, OBMC_T_MV1 = 2, OBMC_T_REF0 = 4, OBMC_T_REF1 = 5, OBMC_T_KIND = 6, OBMC_T_W0 = 7, OBMC_T_W1 = 8;
 constexpr int OBMC_TM = 1;
 constexpr int OBMC_D_TPL = 3;
@@ -2251,9 +2252,9 @@ struct GpuIntraRec::Impl
   int32_t                                                      cuJob[MAX_NUM_COMPONENT] = { -1, -1, -1 };
   gpu::Buffer                                                  mcObmcJobBuf, mcInnerJobBuf;
   // affine: the PUs' records (AF_*: their sub-block geometry per list, the stored luma motion chroma reads) and
-  // where each CU's is
+  // where each CU's is; LIC: the CUs' models (per list and component scale, offset) in the same data
   std::vector<int32_t>                                         affineData;
-  std::unordered_map<const CodingUnit*, int32_t>               affineRec;
+  std::unordered_map<const CodingUnit*, int32_t>               affineRec, licRec;
   gpu::Buffer                                                  mcAffineBuf;
   std::vector<const Picture*>                                  mcRefs;
   std::map<std::string, int>                                   mcKinds;
@@ -2556,6 +2557,7 @@ void GpuIntraRec::beginPicture( const CodingStructure& cs )
   m.obmcInnerJobs.clear();
   m.affineData.clear();
   m.affineRec.clear();
+  m.licRec.clear();
   m.obmcData = 0;
   m.mcRefs.clear();
   m.interSign.clear();
@@ -7551,8 +7553,12 @@ static bool interMcGpu( const CodingUnit& cu )
     return affineGpu( cu );
   }
   const bool            obmc  = !strcmp( kind, "OBMC" );   // (its base prediction; OBMC: obmcPlan)
-  const bool            uni   = !strcmp( kind, "uni-prediction" ) || ( obmc && pu.interDir != 3 );
-  const bool            bi    = !strcmp( kind, "bi-prediction" ) || ( obmc && pu.interDir == 3 );
+  // (LIC: the CU's stored models - the ones applied, derived or inherited -, not with non-local LIC, BDOF, DMVR or
+  // reference picture resampling)
+  const bool            lic   = !strcmp( kind, "LIC" ) && !cu.altLMFlag && !pu.bdmvrRefine && !sps.getRprEnabledFlag()
+                       && ( pu.interDir != 3 || mcIdentical( pu ) || ( !mcDmvr( pu ) && !mcBdof( pu ) ) );
+  const bool            uni   = !strcmp( kind, "uni-prediction" ) || ( ( obmc || lic ) && pu.interDir != 3 );
+  const bool            bi    = !strcmp( kind, "bi-prediction" ) || ( ( obmc || lic ) && pu.interDir == 3 );
   if( getenv( "ECM_GPU_NO_MC" ) || ( !uni && !bi ) || cu.chromaFormat != CHROMA_420 || pps.getWrapAroundEnabledFlag()
       || ( pps.getUseWP() && slice.getSliceType() == P_SLICE ) || ( pps.getWPBiPred() && slice.getSliceType() == B_SLICE ) )
   {
@@ -8029,6 +8035,23 @@ static bool recordInterBlock( GpuIntraRec::Impl& m, const TransformUnit& tu, con
       j[MC_FLAGS] |= MC_BDOF;
       j[MC_BDOF_OUT] = out->second;
     }
+    if( cu.licFlag )   // (LIC: the CU's models, at its first block; uni-prediction from list 1 reads list 1's)
+    {
+      auto rec = m.licRec.find( &cu );
+      if( rec == m.licRec.end() )
+      {
+        rec = m.licRec.emplace( &cu, (int32_t) m.affineData.size() ).first;
+        for( int l = 0; l < 2; l++ )
+        {
+          for( int c = 0; c < MAX_NUM_COMPONENT; c++ )
+          {
+            m.affineData.insert( m.affineData.end(), { cu.licScale[l][c], cu.licOffset[l][c] } );
+          }
+        }
+      }
+      j[MC_FLAGS] |= MC_LIC | ( !bi && list == 1 ? MC_L1 : 0 );
+      j[MC_BDOF_OUT] = rec->second;
+    }
     if( cu.affine )   // (affine: the PU's record, at its first block)
     {
       auto rec = m.affineRec.find( &cu );
@@ -8222,6 +8245,16 @@ void GpuIntraRec::recordInterCu( const CodingUnit& cu )
                 : affineGpu( cu ) && cu.obmcFlag && ( why = obmcPlan( cu, s, in ) ) != nullptr ? std::string( " (" ) + why + ")"
                 : " (other)";
       }
+      if( kind == "LIC" && !m.mcCus.count( &cu ) )   // (LIC from the CPU: why)
+      {
+        std::vector<ObmcSeg> s;
+        bool                 in  = false;
+        const char*          why = nullptr;
+        kind += interMcGpu( cu ) && cu.obmcFlag && ( why = obmcPlan( cu, s, in ) ) != nullptr ? std::string( " (" ) + why + ")"
+                : cu.altLMFlag ? " (with non-local LIC)" : pu.bdmvrRefine || ( pu.interDir == 3 && mcDmvr( pu ) ) ? " (with DMVR)"
+                : pu.interDir == 3 && mcBdof( pu ) ? " (with BDOF)" : cu.cs->sps->getRprEnabledFlag() ? " (resampling)"
+                : " (other)";
+      }
       if( kind == "OBMC" && !m.mcCus.count( &cu ) )   // (OBMC from the CPU: why)
       {
         std::vector<ObmcSeg> s;
@@ -8323,7 +8356,19 @@ static void obmcJobs( GpuIntraRec::Impl& m, const CodingUnit& cu, const std::vec
     // vectors (each list of the neighbour's motion clipped at the band, rounded to integer samples)
     j[OBMC_J_DIR]   = s.dir;
     j[OBMC_J_FLAGS] = ( tm && ( r[OBMC_REC_FLAGS] & ( s.dir == 0 ? OBMC_REC_TOP : OBMC_REC_LEFT ) ) ? OBMC_TM : 0 )
-                      | ( s.nb->cu->licFlag ? OBMC_LIC : 0 ) | ( s.nb->cu->altLMFlag ? OBMC_NLIC : 0 );
+                      | ( s.nb->cu->licFlag ? OBMC_LIC : 0 ) | ( s.nb->cu->altLMFlag ? OBMC_NLIC : 0 )
+                      | ( cu.licFlag ? OBMC_CLIC : 0 );
+    if( cu.licFlag )   // (the CU's own models: its template in selectOBMCmode)
+    {
+      for( int l = 0; l < 2; l++ )
+      {
+        for( int c = 0; c < MAX_NUM_COMPONENT; c++ )
+        {
+          j[OBMC_J_CLIC + ( l * 3 + c ) * 2]     = cu.licScale[l][c];
+          j[OBMC_J_CLIC + ( l * 3 + c ) * 2 + 1] = cu.licOffset[l][c];
+        }
+      }
+    }
     if( s.nb->cu->altLMFlag )   // (JVET-AG0276: the neighbour's secAltLMParaUnit on the final prediction)
     {
       for( int c = 0; c < MAX_NUM_COMPONENT; c++ )
