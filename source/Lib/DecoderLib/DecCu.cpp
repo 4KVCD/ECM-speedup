@@ -3939,6 +3939,12 @@ void DecCu::xDecodeInterTexture(CodingUnit &cu)
       m_pcIntraPred->xAddOnTheFlyCalcCCPCands4InterBlk(*cu.firstPU, cu.blocks[COMPONENT_Cb], interCcpMergeList, validNum);
       PelBuf bufCb = cs.getPredBuf( cu.blocks[COMPONENT_Cb] );
       PelBuf bufCr = cs.getPredBuf( cu.blocks[COMPONENT_Cr] );
+#if ECM_VULKAN
+      if( m_gpuIntraRec )   // (partial verification: the inter prediction the GPU blends itself)
+      {
+        m_gpuIntraRec->interChromaPred( *cu.firstTU );
+      }
+#endif
       const bool valid = m_pcInterPred->deriveInterCcpMergePrediction(cu.firstTU, cs.getRecoBuf(cu.blocks[COMPONENT_Y]), bufCb, bufCr, bufCb, bufCr, interCcpMergeList, validNum);
       CHECK( !valid, "invalid inter ccp merge for rootCbf = 0" );
 #if NNVC_USE_PRED
@@ -4076,7 +4082,7 @@ void DecCu::xDecodeInterTexture(CodingUnit &cu)
 #if ECM_VULKAN
         if( m_gpuIntraRec )   // (partial verification: the inter prediction the GPU blends itself)
         {
-          m_gpuIntraRec->interCccmPred( currTU );
+          m_gpuIntraRec->interChromaPred( currTU );
         }
 #endif
 
@@ -4095,6 +4101,12 @@ void DecCu::xDecodeInterTexture(CodingUnit &cu)
       {
         PelBuf bufCb = cs.getPredBuf( currTU.blocks[COMPONENT_Cb] );
         PelBuf bufCr = cs.getPredBuf( currTU.blocks[COMPONENT_Cr] );
+#if ECM_VULKAN
+        if( m_gpuIntraRec )   // (partial verification: the inter prediction the GPU blends itself)
+        {
+          m_gpuIntraRec->interChromaPred( currTU );
+        }
+#endif
 
         CCPModelCandidate interCcpMergeList[MAX_CCP_CAND_LIST_SIZE];
         int validNum = 0;

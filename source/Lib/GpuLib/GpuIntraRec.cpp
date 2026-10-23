@@ -194,6 +194,11 @@ constexpr int IBC_REC_MV2 = 7, IBC_REC_WEIGHTS = 9, IBC_REC_LIC = 10, IBC_REC = 
 // block's position and size, its prediction's offset in Params::interPred, whether that is forward-mapped by LMCS, the
 // SPS's collocated chroma (CclmCollocatedChromaFlag: five luma taps, else six)
 constexpr int DERIVE_INTER_CCCM = INT32_MIN;
+// without DERIVE_INTER the same bit marks an inter CU's chroma block of inter CCP merge (JVET-AF0073), predicted on the
+// intra path as a CCP merge block whose prediction storeRegion blends with the inter one; its record at Tu::ibc: the
+// CCP prediction's weight (of 4), the record of its on-the-fly CCCM candidate (else -1)
+constexpr int DERIVE_INTER_BLEND = DERIVE_INTER_CCCM;
+constexpr int ICCP_REC_W = 0, ICCP_REC_FLY = 1, ICCP_REC = 2;
 constexpr int ICCCM_REC_X = 0, ICCCM_REC_Y = 1, ICCCM_REC_W = 2, ICCCM_REC_H = 3, ICCCM_REC_PRED = 4,
               ICCCM_REC_FWD = 5, ICCCM_REC_COLLOC = 6, ICCCM_REC = 7;
 
@@ -2241,7 +2246,11 @@ struct GpuIntraRec::Impl
   int                                                          ibcCus = 0;   // IBC CUs the GPU predicts
   int                                                          ibcGpmCus = 0;   // ... of them IBC GPM CUs
   std::unordered_map<const CodingUnit*, std::pair<Mv, Mv>>     ibcGpmMvs;   // IBC GPM CUs' parts' vectors (DecCu)
-  std::unordered_map<const TransformUnit*, std::vector<Pel>>   interCccmPreds;   // inter CCCM TUs' Cb, Cr predictions
+  // inter CCCM / inter CCP merge TUs: their Cb and Cr predictions before the blend (DecCu, interChromaPred)
+  std::unordered_map<const TransformUnit*, std::vector<Pel>>   interChromaPreds;
+  // inter CCP merge CUs: the CTU row's CCP history (its start, its length) before the CU (interCu: the CPU then adds
+  // the CU's own model)
+  std::unordered_map<const CodingUnit*, std::pair<int32_t, int32_t>> interCcpHist;
   int                                                          pltCus = 0;   // palette CUs the GPU writes
   std::vector<int16_t>                                         interPred;
   // motion compensation on the GPU (inter_mc.comp): the inter CUs whose prediction it makes, their blocks' jobs
@@ -2555,7 +2564,8 @@ void GpuIntraRec::beginPicture( const CodingStructure& cs )
   m.cuTus.clear();
   m.cpuCus.clear();
   m.ibcGpmMvs.clear();
-  m.interCccmPreds.clear();
+  m.interChromaPreds.clear();
+  m.interCcpHist.clear();
   m.cpuDummyCu = -1;
   m.mpmModeCus.clear();
   m.bvLists.clear();
@@ -5664,6 +5674,32 @@ static void ccpMergeSources( GpuIntraRec::Impl& m, const PredictionUnit& pu, std
       }
     }
   };
+#if JVET_AF0073_INTER_CCP_MERGE
+  // an inter CU's own (getCCPModelCandidateList's second type): first the candidates moved by the CU's vector to the
+  // collocated picture (its first list that refers to it; none: no shift), in partial verification the CPU's motion
+  if( temporal && CU::isInter( *pu.cu ) )
+  {
+    Mv               own( 0, 0 );
+    const MotionInfo mi = pu.getMotionInfo();
+#if JVET_Y0065_GPM_INTRA
+    const bool       avail = mi.isInter;
+#else
+    const bool       avail = true;
+#endif
+    for( int l = 0; l < 2 && avail; l++ )
+    {
+      if( mi.refIdx[l] != -1 && slice.getRefPic( RefPicList( l ), mi.refIdx[l] )->getPOC() == colPic->getPOC() )
+      {
+        own = mi.mv[l];
+        own.changePrecision( MV_PRECISION_INTERNAL, MV_PRECISION_INT );
+        own.hor >>= sx;
+        own.ver >>= sy;
+        break;
+      }
+    }
+    temporalAt( own );
+  }
+#endif
   if( temporal )
   {
     temporalAt( Mv( 0, 0 ) );
@@ -7309,14 +7345,14 @@ static const char* interCccmWhy( const CodingUnit& cu, const TransformUnit& tu )
 }
 
 // chroma block compID of inter CCCM TU tu, recorded by recordInterBlock (the last record): its inter prediction before
-// the blend (DecCu's, interCccmPred: the CPU's buffer then holds the blend, which verification compares), the record of
-// the TU's luma block; it waits for every block before it (DERIVE_PREFIX: the luma reconstruction it reads)
+// the blend (DecCu's, interChromaPred: the CPU's buffer then holds the blend, which verification compares), the record
+// of the TU's luma block; it waits for every block before it (DERIVE_PREFIX: the luma reconstruction it reads)
 static void interCccmRecord( GpuIntraRec::Impl& m, const TransformUnit& tu, const ComponentID compID )
 {
   Tu&             t    = m.rec.back();
   const CompArea& area = tu.blocks[compID];
-  const auto      pred = m.interCccmPreds.find( &tu );
-  CHECK( pred == m.interCccmPreds.end(), "an inter CCCM TU without its prediction" );
+  const auto      pred = m.interChromaPreds.find( &tu );
+  CHECK( pred == m.interChromaPreds.end(), "an inter CCCM TU without its prediction" );
   const size_t first = compID == COMPONENT_Cb ? 0 : tu.blocks[COMPONENT_Cb].area();
   std::copy_n( pred->second.begin() + first, area.area(), m.interPred.begin() + t.dbgOffset );
   const Tu* luma = nullptr;   // (the TU's luma record, before its chroma ones)
@@ -7339,14 +7375,14 @@ static void interCccmRecord( GpuIntraRec::Impl& m, const TransformUnit& tu, cons
   m.timdData.insert( m.timdData.end(), rec, rec + ICCCM_REC );
 }
 
-void GpuIntraRec::interCccmPred( const TransformUnit& tu )
+void GpuIntraRec::interChromaPred( const TransformUnit& tu )
 {
   Impl& m = *m_impl;
   if( !m.interPending.count( tu.cu ) )
   {
     return;
   }
-  std::vector<Pel>& p = m.interCccmPreds[&tu];
+  std::vector<Pel>& p = m.interChromaPreds[&tu];
   p.clear();
   for( const ComponentID c: { COMPONENT_Cb, COMPONENT_Cr } )
   {
@@ -7356,6 +7392,159 @@ void GpuIntraRec::interCccmPred( const TransformUnit& tu )
       p.insert( p.end(), b.bufAt( 0, y ), b.bufAt( 0, y ) + b.width );
     }
   }
+}
+
+// ----- inter CCP merge (JVET-AF0073, partial verification): a TU's chroma prediction blended with the prediction of
+// the CCP merge candidate of the lowest template cost (InterPrediction::deriveInterCcpMergePrediction,
+// IntraPrediction::selectCcpMergeCand, combineCcpAndInter), also of a CU without residual (JVET-AH0066's
+// interCcpMergeZeroRootCbfIdc): its chroma blocks take intra_rec's intra path as CCP merge blocks
+
+// whether TU tu's chroma blends a CCP merge prediction (tu.interCcpMerge, or its CU's interCcpMergeZeroRootCbfIdc)
+static bool isInterCcp( const TransformUnit& tu )
+{
+  bool r = false;
+#if JVET_AF0073_INTER_CCP_MERGE
+  r = r || tu.interCcpMerge;
+#endif
+#if JVET_AH0066_JVET_AH0202_CCP_MERGE_LUMACBF0
+  r = r || tu.cu->interCcpMergeZeroRootCbfIdc;
+#endif
+  return r;
+}
+
+// why inter CCP merge CU cu is the CPU's, nullptr where the GPU predicts it
+static const char* interCcpWhy( const CodingUnit& cu )
+{
+  const PredictionUnit& pu = *cu.firstPU;
+  if( CU::isIBC( cu ) )
+  {
+    return "inter CCP merge of an IBC CU";
+  }
+  if( cu.chromaFormat != CHROMA_420 )
+  {
+    return "inter CCP merge of another chroma format";
+  }
+  if( cu.firstTU != cu.lastTU )   // (its candidates' predictions are the PU's: combineCcpAndInter)
+  {
+    return "inter CCP merge of a CU of several TUs";
+  }
+#if JVET_AL0181_ASBT
+  for( int c = COMPONENT_Cb; c <= COMPONENT_Cr; c++ )
+  {
+    if( cu.firstTU->asbtDecimW[c] || cu.firstTU->asbtDecimH[c] )
+    {
+      return "inter CCP merge with ASBT";
+    }
+  }
+#endif
+#if JVET_AL0126_CCP_MERGE_WITH_ADJUST
+  if( pu.ccpMergeAdjustFlag )
+  {
+    return "inter CCP merge with adjustment";
+  }
+#endif
+#if JVET_AG0154_DECODER_DERIVED_CCP_FUSION
+  if( pu.ddNonLocalCCPFusion )
+  {
+    return "inter CCP merge with decoder-derived fusion";
+  }
+#endif
+  return nullptr;
+}
+
+// inter CCP merge CU cu, kept for the GPU (interCu, before the CPU decodes it): the CTU row's CCP history as its list
+// reads it (cpuCcpHistory's row logic; the CPU adds the CU's own model after its prediction)
+static void interCcpHistory( GpuIntraRec::Impl& m, const CodingUnit& cu )
+{
+  bool ccp = false;
+  for( const TransformUnit& tu: CU::traverseTUs( cu ) )
+  {
+    ccp = ccp || isInterCcp( tu );
+  }
+  if( !ccp )
+  {
+    return;
+  }
+  const int row = ( cu.blocks[COMPONENT_Cb].y << getComponentScaleY( COMPONENT_Cb, cu.chromaFormat ) )
+                  / (int) cu.cs->sps->getMaxCUHeight();
+  if( row != m.ccpHistRow )
+  {
+    m.ccpHistRow      = row;
+    m.ccpHistRowStart = m.ccpHist.size();
+  }
+  m.interCcpHist[&cu] = std::make_pair( (int32_t) m.ccpHistRowStart,
+                                        (int32_t)( m.ccpHist.size() - m.ccpHistRowStart ) );
+}
+
+// the CCP merge entry of inter CCP merge PU pu (as ccpMergeEntry's): the history before its CU, the candidate of the
+// lowest cost (index 0 of the ranked list: selectCcpMergeCand takes the first of the lowest), no adjustment, the
+// sources of getCCPModelCandidateList for an inter CU (ccpMergeSources)
+static int32_t interCcpEntry( GpuIntraRec::Impl& m, const PredictionUnit& pu )
+{
+  std::vector<int32_t>& d    = m.ccpMerge;
+  const int32_t         e    = (int32_t) d.size();
+  const auto            hist = m.interCcpHist.find( pu.cu );
+  CHECK( hist == m.interCcpHist.end(), "an inter CCP merge CU without its history" );
+  d.push_back( hist->second.first );
+  d.push_back( ccpMergeHistory( pu ) ? hist->second.second : 0 );
+  d.push_back( 0 );
+  d.push_back( m.numCcpMerge++ );
+  d.push_back( 0 );
+  std::vector<int32_t> sources;
+  int                  numBefore = 0;
+  ccpMergeSources( m, pu, sources, numBefore );
+  d.push_back( numBefore );
+  d.push_back( (int32_t) sources.size() - numBefore );
+  d.insert( d.end(), sources.begin(), sources.end() );
+  return e;
+}
+
+// chroma block compID of inter CCP merge TU tu, recorded by recordInterBlock (the last record): its inter prediction
+// before the blend (interChromaPred), and the record of an intra CCP merge block of LM_CHROMA_IDX (its residual, its
+// clipping and its chroma residual scaling the inter block's) whose prediction storeRegion blends with it (wCc of 4:
+// combineCcpAndInter's); its list starts with the on-the-fly CCCM candidate in a slice of low delay
+// (xAddOnTheFlyCalcCCPCands4InterBlk: intra_ccp.glsl fits it into a record of its own); it waits for every block before
+// it (DERIVE_PREFIX: its CU's OBMC templates, the luma, its sources' records)
+static void interCcpRecord( GpuIntraRec::Impl& m, const TransformUnit& tu, const ComponentID compID )
+{
+  const CodingUnit&     cu   = *tu.cu;
+  const PredictionUnit& pu   = *cu.firstPU;
+  Tu&                   t    = m.rec.back();
+  const CompArea&       area = tu.blocks[compID];
+  const auto            pred = m.interChromaPreds.find( &tu );
+  CHECK( pred == m.interChromaPreds.end(), "an inter CCP merge TU without its prediction" );
+  const size_t first = compID == COMPONENT_Cb ? 0 : tu.blocks[COMPONENT_Cb].area();
+  std::copy_n( pred->second.begin() + first, area.area(), m.interPred.begin() + t.dbgOffset );
+  if( !m.ccpMergeIndex.count( &pu ) )
+  {
+    m.ccpMergeIndex[&pu] = interCcpEntry( m, pu );
+  }
+  int wCc = 3;
+#if JVET_AH0066_JVET_AH0202_CCP_MERGE_LUMACBF0
+  const int ccpWeighting[5] = { 0, 3, 4, 1, 2 };
+  wCc = tu.interCcpMerge ? ( TU::getCbf( tu, COMPONENT_Y ) || MAX_CCP_MERGE_WEIGHT_IDX == 1 ? 3 : 4 )
+                         : ccpWeighting[cu.interCcpMergeZeroRootCbfIdc];
+#endif
+  int32_t fly = -1;
+  if( cu.cs->slice->getCheckLDC() )
+  {
+    fly = (int32_t) m.numCcp++;   // (a record of no PU: written by the block, compared through its prediction)
+    m.ccpPu.push_back( nullptr );
+    m.ccpWriters.insert( m.ccpWriters.end(), CCP_WRITERS, -1 );
+  }
+  t.ibc = (int32_t) m.timdData.size();
+  m.timdData.insert( m.timdData.end(), { wCc, fly } );
+  t.derive    = ( t.derive & ~DERIVE_INTER ) | DERIVE_INTER_BLEND | DERIVE_PREFIX;
+  t.ccpMerge  = m.ccpMergeIndex.at( &pu );
+  t.ccp       = -1;
+  t.lm        = 0;
+  t.dirMode   = LM_CHROMA_IDX;
+  t.isModeVer = t.intraPredAngle = t.absInvAngle = t.angularScale = t.useCubic = 0;
+  t.refFilter = t.applyPDPC = t.gradPDPC = t.fusion = t.bf = t.plIdx = t.mrl = 0;
+  t.isp       = 0;
+  // (its luma buffers and prediction in the workgroup's CCCM scratch, as an intra merge block's)
+  const int lumaWords = std::max( 4 * cccmLumaArea( area, false ), cccmLumaArea( area, true ) );
+  m.cccmScratchWords  = std::max( m.cccmScratchWords, lumaWords + (int) area.area() );
 }
 
 // why non-intra CU cu is taken from the CPU, nullptr for an inter CU whose blocks the GPU reconstructs: what the GPU
@@ -7404,9 +7593,9 @@ static const char* interWhy( const GpuIntraRec::Impl& m, const CodingUnit& cu )
   }
 #endif
 #if JVET_AH0066_JVET_AH0202_CCP_MERGE_LUMACBF0
-  if( cu.interCcpMergeZeroRootCbfIdc )
+  if( cu.interCcpMergeZeroRootCbfIdc && interCcpWhy( cu ) )
   {
-    return "inter CCP merge";
+    return interCcpWhy( cu );
   }
 #endif
   for( const TransformUnit& tu: CU::traverseTUs( cu ) )
@@ -7418,9 +7607,9 @@ static const char* interWhy( const GpuIntraRec::Impl& m, const CodingUnit& cu )
     }
 #endif
 #if JVET_AF0073_INTER_CCP_MERGE
-    if( tu.interCcpMerge )
+    if( tu.interCcpMerge && interCcpWhy( cu ) )
     {
-      return "inter CCP merge";
+      return interCcpWhy( cu );
     }
 #endif
     for( int c = 0; c < MAX_NUM_COMPONENT; c++ )
@@ -7982,6 +8171,7 @@ void GpuIntraRec::interCu( const CodingUnit& cu )
     return;
   }
   m.interPending.insert( &cu );
+  interCcpHistory( m, cu );
 }
 
 // sign prediction of an inter block above 32 x 32 (intra_rec's signPredictionLarge, in the workgroup's scratch)
@@ -8757,6 +8947,10 @@ void GpuIntraRec::recordInterCu( const CodingUnit& cu )
         interCccmRecord( m, tu, comp );
       }
 #endif
+      if( isInterCcp( tu ) && isChroma( comp ) && !m.cpuCus.count( &cu ) )
+      {
+        interCcpRecord( m, tu, comp );
+      }
     }
   }
   if( m.obmcRec >= 0 && !m.cpuCus.count( &cu ) )   // (OBMC: its segments' jobs, after its blocks')

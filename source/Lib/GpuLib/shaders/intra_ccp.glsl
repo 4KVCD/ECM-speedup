@@ -256,7 +256,28 @@ void ccpMergeDefaults( Tu t, int lid, int NT )
   cccmSync();
 }
 
-// the list of merge block t (invocation 0, after the history and the defaults): the spatial (and an inter slice's first
+// ----- inter CCP merge (an inter CU's chroma block, DERIVE_INTER_BLEND without DERIVE_INTER; partial verification)
+
+// its list's first entry (invocation 0): the on-the-fly CCCM candidate (xAddOnTheFlyCalcCCPCands4InterBlk) where its
+// slice has one and the fit found a model (a type); the number of entries so far
+int ccpInterFlyFirst( Tu t )
+{
+  if( ( t.derive & DERIVE_INTER_BLEND ) == 0 )
+  {
+    return 0;
+  }
+  const int fly = BufI32( P.timdData ).v[t.ibc + ICCP_REC_FLY];
+  if( fly < 0 || ccpWord( fly, CCP_OUT_TYPE ) == 0 )
+  {
+    return 0;
+  }
+  s_ccp[CCP_LIST]        = fly;
+  s_ccp[CCP_LIST_INSIDE] = 0;
+  return 1;
+}
+
+// the list of merge block t (invocation 0, after the history and the defaults): an inter CCP merge block's on-the-fly
+// candidate (ccpInterFlyFirst), the spatial (and an inter slice's first
 // temporal) sources in order, the history, the sources after it (an inter slice's second temporal ones), the defaults, each unless equal to one before it (the CPU compares a default with each the other way
 // round, the same for a CCLM model), at most CCP_MAX_CANDS. With adjustment the CCCM models alone (of a type above
 // CCP_TYPE_GLM4567's), at most CCP_MAX_LIST, no defaults (the on-the-fly models follow: ccpFitModels)
@@ -268,7 +289,7 @@ void ccpMergeList( Tu t )
   const int  kind = d.v[e + CCP_MERGE_KIND];
   const bool adjust = kind != 0 && kind < CCP_KIND_DERIVED;
   const int  maxNum = adjust ? CCP_MAX_LIST : CCP_MAX_CANDS, numDefaults = adjust ? 0 : CCP_MAX_CANDS;
-  int        num = 0;
+  int        num = ccpInterFlyFirst( t );
   for( int s = 0; s < numSources + numDefaults && num < maxNum; s++ )
   {
     const int r = s < numSources ? ccpMergeSource( e, s, numSpatial, numLut ) : ccpDefaultRecords( t ) + s - numSources;
@@ -1025,6 +1046,64 @@ void ccpMergeAdjust( Tu t, int x, int flag, int lid, int NT )
   }
 }
 
+// an inter CCP merge block's on-the-fly CCCM candidate into record `rec` (all invocations, ending with a barrier):
+// xCccmCalcModels' one plain model of the reference samples alone (useRefSampOnly) over the whole template of the
+// block's own luma buffer - ccpFitModels' fourth fit -, its type 0 where no coefficient but the bias is set (the CPU
+// adds none then)
+void ccpInterFly( Tu t, int rec, int lid, int NT )
+{
+  g_cccmGl         = false;
+  g_cccmMdf        = 0;
+  g_cccmNoSub      = false;
+  g_cccmInterNs    = false;
+  g_cccmGlmLuma    = false;
+  g_cccmFusion     = false;
+  g_cccmCflm       = false;
+  g_cccmBoth       = false;
+  g_cccmSet        = 0;
+  g_cccmShift      = 0;
+  g_cccmParams     = 7;
+  g_cccmLocDX      = 0;
+  g_cccmLocDY      = 0;
+  cccmLoadArea();
+  cccmBuildLuma( t, 0, lid, NT );
+  if( g_cccmSharedLuma )
+  {
+    g_ccpAngUsed = max( g_ccpAngUsed, ( cccmBufferSize() + 3 ) >> 2 );
+  }
+  g_ccpFlyTwoLines = false;
+  g_ccpFlyRefOnly  = true;
+  cccmAccumulate( t, 0, false, lid, NT );
+  cccmSolve( t, 0, lid );
+  if( lid < 2 )
+  {
+    s_cclm[CCCM_MODEL_RANGE + 2 * lid]     = s_cclm[CCCM_RANGE + 2 * lid];
+    s_cclm[CCCM_MODEL_RANGE + 2 * lid + 1] = s_cclm[CCCM_RANGE + 2 * lid + 1];
+  }
+  SYNC();
+  bool valid = false;
+  for( int i = 0; i < 12 && !valid; i++ )   // (component, coefficient but the bias)
+  {
+    valid = cccmLoad( cccmParamWord( 0, i / 6, i % 6 ) ) != int64_t( 0 );
+  }
+  for( int w = lid; w < CCP_OUT; w += NT )
+  {
+    CBufI32( P.ccpOut ).v[rec * CCP_OUT + w] = valid ? ccpFlyWord( w, false ) : 0;
+  }
+  g_ccpFlyRefOnly = false;
+  cccmSync();
+}
+
+// an inter CCP merge block's prediction at (x, y), pr the candidate's, blended with its inter prediction (OBMC's done,
+// coherent: intra_rec blended its band in place) by the record's weight (combineCcpAndInter: (wCc ccp + (4 - wCc)
+// inter + 2) >> 2, clipped)
+int interCcpBlend( Tu t, int x, int y, int pr )
+{
+  const int w  = BufI32( P.timdData ).v[t.ibc + ICCP_REC_W];
+  const int ip = int( CBufI16( P.interPred ).v[t.dbgOffset + y * t.w + x] );
+  return clamp( ( w * pr + ( 4 - w ) * ip + 2 ) >> 2, t.recMin, t.recMax );
+}
+
 // merge block t's prediction (all invocations, ending with a barrier): the list, then per step first each candidate's
 // template cost (xGetOneCCPCandCost: Cb's and Cr's SADs of the row above the block and the column left of it, each
 // where the block has a CU there), then the choice (the sorted list's entry at idxNonLocalCCP - 1) and the prediction.
@@ -1079,6 +1158,10 @@ void ccpMergePrediction( inout Tu t, int predStride, int lid, int NT )
     ccpMergeHistory( t );   // (a derived block's entry has neither sources nor a history)
   }
   SYNC();
+  if( ( t.derive & DERIVE_INTER_BLEND ) != 0 && BufI32( P.timdData ).v[t.ibc + ICCP_REC_FLY] >= 0 )
+  {
+    ccpInterFly( t, BufI32( P.timdData ).v[t.ibc + ICCP_REC_FLY], lid, NT );
+  }
   if( !derived && adjust == 0 )
   {
     ccpMergeDefaults( t, lid, NT );
@@ -1187,7 +1270,7 @@ void ccpMergePrediction( inout Tu t, int predStride, int lid, int NT )
       g_cccmLocDX = mdf ? 0 : g_cccmLocDX;
       g_cccmLocDY = mdf ? 0 : g_cccmLocDY;
     }
-    if( last && !g_ccpOther )
+    if( last && !g_ccpOther && t.ccp >= 0 )   // (an inter CCP merge block has no record of its own)
     {
       // the CU's record: the candidate's (with its inside filter flag both as the CU's and as the history's; a derived
       // block's 0), written by the Cb block; an adjusted model's coefficients of each component by its own block

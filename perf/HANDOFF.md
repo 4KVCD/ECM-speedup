@@ -2633,6 +2633,28 @@ branch's step for the block), so the model fits and the blend takes the OBMC'd c
 block's, OBMC'd before by DERIVE_PREFIX). Found on the way (dec-gr-ccpmerge's 50-stream run on 2de8ee5a9):
 ld_parkjoy_q27, ldp_crowdrun_q27, ra_foreman_q22, ra_parkjoy832_q32 and ra_parkjoy_q37 differed at inter CCCM chroma
 blocks of OBMC CUs, by 1 to 3.
+Inter CCP merge on the GPU (2026-10-23, agent lf; partial verification): an inter TU's chroma prediction blended with
+the CCP merge candidate of the lowest template cost (JVET-AF0073: InterPrediction::deriveInterCcpMergePrediction,
+IntraPrediction::selectCcpMergeCand, combineCcpAndInter; also JVET-AH0066's CU without residual,
+interCcpMergeZeroRootCbfIdc). recordInterCu records the chroma blocks as inter blocks, then interCcpRecord turns each
+into an intra CCP merge block of LM_CHROMA_IDX on the intra path (DERIVE_INTER cleared; the residual, its clipping and
+chroma residual scaling the inter block's), marked DERIVE_INTER_BLEND (bit 31, DERIVE_INTER_CCCM's, without
+DERIVE_INTER), waiting for every block before it (DERIVE_PREFIX). Its entry (interCcpEntry) is an intra merge entry's
+with the index 0 (selectCcpMergeCand's first of the lowest cost is the stable sort's first), the CTU row's history as it
+was before the CU (interCu snapshots it: the CPU adds the CU's own model after its prediction), and
+getCCPModelCandidateList's sources for an inter CU: ccpMergeSources now puts, for an inter CU, the temporal candidates
+moved by the CU's own vector to the collocated picture (its first list referring to it, else none) after the adjacent
+positions and before the unshifted ones. In a low-delay slice its list starts with xAddOnTheFlyCalcCCPCands4InterBlk's
+on-the-fly CCCM candidate: the block fits it into a record of its own (ccpInterFly: ccpFitModels' one model of the
+reference samples alone; type 0 where every coefficient but the bias is 0, which the list then skips: ccpInterFlyFirst).
+Before the merge it applies its CU's OBMC band to its inter prediction (interObmcBand), and storeRegion blends each
+predicted sample with it ((wCc ccp + (4 - wCc) inter + 2) >> 2, clipped; wCc combineCcpAndInter's: 3, or 4 for
+interCcpMerge without luma residual, or interCcpMergeZeroRootCbfIdc's weight), the inter prediction being the one before
+the CPU's blend (DecCu's interChromaPred, also inter CCCM's, renamed from interCccmPred). The block writes no CCP
+record: its TU's model stays the CPU's (cpuCuModels) for the later merges. Still the CPU's: inter CCP merge of an IBC
+CU, of a CU of several TUs, with ASBT, with adjustment or decoder-derived fusion, other chroma formats (none in the 50
+streams). Results (50 streams, builds aglcc1 and aglcc2): "inter CCP merge" 161 -> 0, every verified picture identical
+(with the previous paragraph's fix; ra_wpp_q32 skipped as before).
 
 
 ## 8. Numbers (i7-10700 8C/16T, Win11, GCC 16.2, RTX 3070 driver 616.92)

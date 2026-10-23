@@ -125,8 +125,9 @@ public:
   /// GPM CU cu, which the CPU has predicted (motionCompensationGeo): whether it took the plain blend, the split
   /// direction, the blending index and each part's motion (InterPrediction::m_gpuGeoPart), recordInterCu's
   void gpmParts( const CodingUnit& cu, bool plain, int splitDir, int bldIdx, const int32_t parts[2][22] );
-  /// TU tu of an inter CCCM CU, before DecCu blends its chroma prediction (deriveInterCccmPrediction): the inter one
-  void interCccmPred( const TransformUnit& tu );
+  /// TU tu of an inter CCCM or inter CCP merge CU, before DecCu blends its chroma prediction
+  /// (deriveInterCccmPrediction, deriveInterCcpMergePrediction): the inter one
+  void interChromaPred( const TransformUnit& tu );
   /// chroma reordering (JVET-AH0136): the index of PU pu's chroma mode in its reordered list as DecCu parsed it
   /// (chromaIdx), which the GPU's derivation of the list takes
   void chromaReorderIndex( const PredictionUnit& pu, int idx );

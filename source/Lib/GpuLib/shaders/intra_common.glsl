@@ -277,6 +277,10 @@ const int IBC_REC_X = 0, IBC_REC_Y = 1, IBC_REC_W = 2, IBC_REC_H = 3, IBC_REC_MV
 const int IBC_REC_MV2 = 7, IBC_REC_WEIGHTS = 9, IBC_REC_LIC = 10;
 // with DERIVE_INTER a chroma block of inter CCCM (intra_intercccm.glsl; its record at Tu::ibc)
 const int DERIVE_INTER_CCCM = int( 0x80000000 );
+// without DERIVE_INTER the same bit: an inter CU's chroma block of inter CCP merge, predicted on the intra path as a
+// CCP merge block whose prediction storeRegion blends with the inter one (its record at Tu::ibc: ICCP_REC_*)
+const int DERIVE_INTER_BLEND = DERIVE_INTER_CCCM;
+const int ICCP_REC_W = 0, ICCP_REC_FLY = 1;
 // Tu::lmcs (1: the bilateral filter on inverse-mapped samples, 2: chroma residual scaling): an inter block's
 // prediction forward-mapped (luma)
 const int LMCS_INTER_FWD = 4;
