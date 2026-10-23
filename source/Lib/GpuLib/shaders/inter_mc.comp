@@ -4,9 +4,14 @@
 // written where intra_rec reads an inter block's prediction (Params::interPred, at the block's samples). The reference
 // pictures are the CPU's (partial verification), uploaded with their margins (Picture::margin: the motion-compensated
 // boundary padding of JVET-AA0096 / JVET-AK0085 lies there, so the reads beyond the picture are not a replication).
-// Kinds of job (McJob::flags):
+// Kinds of job (McJob's flags):
 // - uni-prediction (InterPrediction::xPredInterUni with bi off, then xWeightedAverage's copyClip): the filters' last
 //   stage rounded to the sample and clipped to the slice's range
+// - bi-prediction (MC_BI: xPredInterBi without BDOF / DMVR, then xWeightedAverage's addWeightedAvg): each list at the
+//   14-bit intermediate precision - JVET-AI0094's sharp luma filter where the pass's block is above 4 x 4 -, averaged
+//   with BCW's weights; JVET-Z0136: where one list's reference sample lies more than half a sample outside the
+//   picture (isMvOOB at the unclipped vector, per luma sample; chroma takes the luma sample at twice its position) the
+//   other list alone
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_GOOGLE_include_directive : require
@@ -18,7 +23,7 @@ layout( local_size_x = 64 ) in;
 layout( push_constant ) uniform PushMc
 {
   uint64_t jobs;      // McJob (MC_JOB int32 each)
-  uint64_t refs;      // per reference slot and component: MC_REF int32 (the plane's origin, stride, size, margin)
+  uint64_t refs;      // per reference slot and component: MC_REF_COMP int32 (the plane's origin, stride, size, margin)
   uint64_t planes;    // the reference planes (int16), where McRef's origins point
   uint64_t filters;   // InterpolationFilter's tables (MC_FILT_*: int32 taps)
   uint64_t outPred;   // Params::interPred (int16)
@@ -27,12 +32,17 @@ layout( push_constant ) uniform PushMc
 } pc;
 
 // McJob (int32): the block (component, position and size in the component's samples), where its prediction goes in
-// Params::interPred, the PU's size in the component's samples (the filter choice), the motion vector (1/16 luma
-// samples, clipped by the host: clipMvInl), the reference slot, the flags, the bit depth and the clipping range
+// Params::interPred, the PU's size in the component's samples (the filter choice), list 0's (or the one list's)
+// motion vector (1/16 luma samples, clipped by the host: clipMvInl) and reference slot, the flags, the bit depth and
+// the clipping range; with MC_BI list 1's vector and slot, BCW's weights, which lists are out of boundary somewhere
+// (MC_OOB: bit 0 list 0, bit 1 list 1), the unclipped vectors, the PU's luma position and the picture's luma size
 const int MC_COMP = 0, MC_X = 1, MC_Y = 2, MC_W = 3, MC_H = 4, MC_DST = 5, MC_PU_W = 6, MC_PU_H = 7, MC_MVX = 8;
 const int MC_MVY = 9, MC_REF = 10, MC_FLAGS = 11, MC_BD = 12, MC_CLIP_MIN = 13, MC_CLIP_MAX = 14;
-const int MC_JOB = 16;
+const int MC_MV1X = 16, MC_MV1Y = 17, MC_REF1 = 18, MC_W0 = 19, MC_W1 = 20, MC_OOB = 21, MC_RAW0X = 22, MC_RAW0Y = 23;
+const int MC_RAW1X = 24, MC_RAW1Y = 25, MC_PU_X = 26, MC_PU_Y = 27, MC_PIC_W = 28, MC_PIC_H = 29;
+const int MC_JOB = 32;
 const int MC_ALT_HPEL = 1;   // AMVR's half-sample precision: the alternative half-sample luma filter (8 taps)
+const int MC_BI       = 2;   // two lists, averaged
 // McRef (int32) per slot and component: the index of sample (0, 0) in pc.planes, the stride, the size, the margin
 const int MC_REF_ORIGIN = 0, MC_REF_STRIDE = 1, MC_REF_W = 2, MC_REF_H = 3, MC_REF_MARGIN = 4;
 const int MC_REF_COMP = 5;
@@ -41,6 +51,7 @@ const int MC_REF_COMP = 5;
 const int MC_FILT_LUMA = 0, MC_FILT_LUMA_BI = 16 * 12, MC_FILT_ALT = 2 * 16 * 12, MC_FILT_CHROMA = MC_FILT_ALT + 8;
 
 const int IF_INTERNAL_PREC = 14, IF_FILTER_PREC = 8, IF_INTERNAL_OFFS = 1 << ( IF_INTERNAL_PREC - 1 );
+const int BCW_LOG2_WEIGHT_BASE = 3;   // g_bcwLog2WeightBase
 
 int refAt( int slot, int comp, int x, int y )
 {
@@ -49,8 +60,9 @@ int refAt( int slot, int comp, int x, int y )
   return int( BufI16( pc.planes ).v[r.v[b + MC_REF_ORIGIN] + y * r.v[b + MC_REF_STRIDE] + x] );
 }
 
-// the taps of one direction: the table's start and the tap count (filterHor / filterVer's choice for this fraction)
-ivec2 mcTaps( bool luma, int frac, bool altHpel )
+// the taps of one pass: the table's start and the tap count (filterHor / filterVer's choice for this fraction; the
+// sharp bi-prediction filter where the pass's block is above 4 x 4)
+ivec2 mcTaps( bool luma, int frac, bool altHpel, bool sharp )
 {
   if( !luma )
   {
@@ -60,21 +72,75 @@ ivec2 mcTaps( bool luma, int frac, bool altHpel )
   {
     return ivec2( MC_FILT_ALT, 8 );
   }
-  return ivec2( MC_FILT_LUMA + frac * 12, 12 );
+  return ivec2( ( sharp ? MC_FILT_LUMA_BI : MC_FILT_LUMA ) + frac * 12, 12 );
 }
 
 // InterpolationFilter::filter's sum of n taps at (x, y) along the direction (dx, dy), from the first sample n / 2 - 1
 // before it
 int mcSum( int slot, int comp, int x, int y, int dx, int dy, ivec2 taps )
 {
-  BufI32 f   = BufI32( pc.filters );
-  int    sum = 0;
+  BufI32    f    = BufI32( pc.filters );
+  int       sum  = 0;
   const int back = taps.y / 2 - 1;
   for( int k = 0; k < taps.y; k++ )
   {
     sum += refAt( slot, comp, x + ( k - back ) * dx, y + ( k - back ) * dy ) * f.v[taps.x + k];
   }
   return sum;
+}
+
+// the prediction of one list at sample (x, y) of the reference (the block's position moved by the vector's integer
+// part): the last stage rounded to the sample and clipped (uni-prediction), or the 14-bit intermediate (bi: rndRes
+// off); each stage's result a 16-bit Pel. W, H: the PU's size in the component (the sharp filter's condition)
+int mcPredict( int slot, int comp, int x, int y, int xFrac, int yFrac, bool alt, bool bi, int W, int H, int bd,
+               int clipMin, int clipMax )
+{
+  const bool luma     = comp == 0;
+  const int  headRoom = max( 2, IF_INTERNAL_PREC - bd );   // IF_INTERNAL_FRAC_BITS
+  if( xFrac == 0 && yFrac == 0 )   // m_filterCopy: the samples, for bi shifted to the intermediate
+  {
+    const int s = refAt( slot, comp, x, y );
+    return bi ? int( int16_t( ( s << headRoom ) - IF_INTERNAL_OFFS ) ) : s;
+  }
+  if( yFrac == 0 || xFrac == 0 )   // one pass, the first: the last one too without bi
+  {
+    const ivec2 taps = mcTaps( luma, yFrac == 0 ? xFrac : yFrac, alt, bi && W > 4 && H > 4 );
+    const int   sum  = yFrac == 0 ? mcSum( slot, comp, x, y, 1, 0, taps ) : mcSum( slot, comp, x, y, 0, 1, taps );
+    if( bi )
+    {
+      const int shift = IF_FILTER_PREC - headRoom, offset = -IF_INTERNAL_OFFS << shift;
+      return int( int16_t( ( sum + offset ) >> shift ) );
+    }
+    return clamp( int( int16_t( ( sum + ( 1 << ( IF_FILTER_PREC - 1 ) ) ) >> IF_FILTER_PREC ) ), clipMin, clipMax );
+  }
+  // horizontal (first, not last; its block H + the vertical taps - 1 rows high: the sharp filter where W > 4) into
+  // 16-bit rows, then vertical (last without bi)
+  const ivec2 tapsH = mcTaps( luma, xFrac, alt, bi && W > 4 );
+  const ivec2 tapsV = mcTaps( luma, yFrac, alt, bi && W > 4 && H > 4 );
+  const int   shift1 = IF_FILTER_PREC - headRoom, offset1 = -IF_INTERNAL_OFFS << shift1;
+  BufI32      f    = BufI32( pc.filters );
+  const int   back = tapsV.y / 2 - 1;
+  int         sum  = 0;
+  for( int k = 0; k < tapsV.y; k++ )
+  {
+    const int h = int( int16_t( ( mcSum( slot, comp, x, y + k - back, 1, 0, tapsH ) + offset1 ) >> shift1 ) );
+    sum += h * f.v[tapsV.x + k];
+  }
+  if( bi )
+  {
+    return int( int16_t( sum >> IF_FILTER_PREC ) );
+  }
+  const int shift2 = IF_FILTER_PREC + headRoom, offset2 = ( 1 << ( shift2 - 1 ) ) + ( IF_INTERNAL_OFFS << IF_FILTER_PREC );
+  return clamp( int( int16_t( ( sum + offset2 ) >> shift2 ) ), clipMin, clipMax );
+}
+
+// isMvOOB's mask at luma sample (px, py) of the PU (relative to it) for an unclipped vector: more than half a sample
+// outside the picture
+bool mcOutOfBoundary( BufI32 jb, int o, int px, int py, int rawX, int rawY )
+{
+  const int offsetX = ( ( jb.v[o + MC_PU_X] + px ) << 4 ) + rawX, offsetY = ( ( jb.v[o + MC_PU_Y] + py ) << 4 ) + rawY;
+  const int horMax = ( ( jb.v[o + MC_PIC_W] - 1 ) << 4 ) + 8, verMax = ( ( jb.v[o + MC_PIC_H] - 1 ) << 4 ) + 8;
+  return offsetX <= -8 || offsetX >= horMax || offsetY <= -8 || offsetY >= verMax;
 }
 
 void main()
@@ -85,45 +151,49 @@ void main()
     BufI32    jb   = BufI32( pc.jobs );
     const int o    = j * MC_JOB;
     const int comp = jb.v[o + MC_COMP], bx = jb.v[o + MC_X], by = jb.v[o + MC_Y], W = jb.v[o + MC_W], H = jb.v[o + MC_H];
-    const int dst = jb.v[o + MC_DST], slot = jb.v[o + MC_REF], flags = jb.v[o + MC_FLAGS], bd = jb.v[o + MC_BD];
+    const int dst = jb.v[o + MC_DST], flags = jb.v[o + MC_FLAGS], bd = jb.v[o + MC_BD];
     const int clipMin = jb.v[o + MC_CLIP_MIN], clipMax = jb.v[o + MC_CLIP_MAX];
-    const bool luma = comp == 0;
+    const int puW = jb.v[o + MC_PU_W], puH = jb.v[o + MC_PU_H];
+    const bool luma = comp == 0, alt = ( flags & MC_ALT_HPEL ) != 0, bi = ( flags & MC_BI ) != 0;
     const int  cs   = luma ? 0 : 1;   // (4:2:0)
-    const int  mvx = jb.v[o + MC_MVX], mvy = jb.v[o + MC_MVY];
-    const int  shiftHor = 4 + cs, shiftVer = 4 + cs;
-    const int  xFrac = mvx & ( ( 1 << shiftHor ) - 1 ), yFrac = mvy & ( ( 1 << shiftVer ) - 1 );
-    // (chroma's filter index: the fraction << ( 1 - csx ), 1/32 in 4:2:0)
-    const bool  alt   = ( flags & MC_ALT_HPEL ) != 0;
-    const ivec2 tapsH = mcTaps( luma, xFrac, alt ), tapsV = mcTaps( luma, yFrac, alt );
-    const int   ox = bx + ( mvx >> shiftHor ), oy = by + ( mvy >> shiftVer );
-    const int   headRoom = max( 2, IF_INTERNAL_PREC - bd );   // IF_INTERNAL_FRAC_BITS
+    const int  shift = 4 + cs, mask = ( 1 << shift ) - 1;
+    const ivec2 mv0 = ivec2( jb.v[o + MC_MVX], jb.v[o + MC_MVY] ), mv1 = ivec2( jb.v[o + MC_MV1X], jb.v[o + MC_MV1Y] );
+    const int   slot0 = jb.v[o + MC_REF], slot1 = jb.v[o + MC_REF1];
+    const int   headRoom = max( 2, IF_INTERNAL_PREC - bd );
     for( int i = lid; i < W * H; i += 64 )
     {
-      const int x = ox + i % W, y = oy + i / W;
+      const int x = bx + i % W, y = by + i / W;
       int       v;
-      if( xFrac == 0 && yFrac == 0 )   // m_filterCopy[true][true]: the samples
+      if( !bi )
       {
-        v = refAt( slot, comp, x, y );
+        v = mcPredict( slot0, comp, x + ( mv0.x >> shift ), y + ( mv0.y >> shift ), mv0.x & mask, mv0.y & mask, alt, false,
+                       puW, puH, bd, clipMin, clipMax );
       }
-      else if( yFrac == 0 || xFrac == 0 )   // one pass, first and last: rounded by IF_FILTER_PREC, clipped
+      else
       {
-        const int sum = yFrac == 0 ? mcSum( slot, comp, x, y, 1, 0, tapsH ) : mcSum( slot, comp, x, y, 0, 1, tapsV );
-        v = clamp( int( int16_t( ( sum + ( 1 << ( IF_FILTER_PREC - 1 ) ) ) >> IF_FILTER_PREC ) ), clipMin, clipMax );
-      }
-      else   // horizontal (first, not last) into int16 rows, then vertical (last)
-      {
-        const int shift1 = IF_FILTER_PREC - headRoom, offset1 = -IF_INTERNAL_OFFS << shift1;
-        const int shift2 = IF_FILTER_PREC + headRoom;
-        const int offset2 = ( 1 << ( shift2 - 1 ) ) + ( IF_INTERNAL_OFFS << IF_FILTER_PREC );
-        BufI32    f    = BufI32( pc.filters );
-        const int back = tapsV.y / 2 - 1;
-        int       sum  = 0;
-        for( int k = 0; k < tapsV.y; k++ )
+        const int p0 = mcPredict( slot0, comp, x + ( mv0.x >> shift ), y + ( mv0.y >> shift ), mv0.x & mask, mv0.y & mask,
+                                  alt, true, puW, puH, bd, clipMin, clipMax );
+        const int p1 = mcPredict( slot1, comp, x + ( mv1.x >> shift ), y + ( mv1.y >> shift ), mv1.x & mask, mv1.y & mask,
+                                  alt, true, puW, puH, bd, clipMin, clipMax );
+        const int oob = jb.v[o + MC_OOB];
+        bool      o0 = false, o1 = false;
+        if( oob != 0 )   // (the PU's luma sample of this sample: chroma's at twice its position)
         {
-          const int h = int( int16_t( ( mcSum( slot, comp, x, y + k - back, 1, 0, tapsH ) + offset1 ) >> shift1 ) );
-          sum += h * f.v[tapsV.x + k];
+          const int px = ( x - ( jb.v[o + MC_PU_X] >> cs ) ) << cs, py = ( y - ( jb.v[o + MC_PU_Y] >> cs ) ) << cs;
+          o0 = ( oob & 1 ) != 0 && mcOutOfBoundary( jb, o, px, py, jb.v[o + MC_RAW0X], jb.v[o + MC_RAW0Y] );
+          o1 = ( oob & 2 ) != 0 && mcOutOfBoundary( jb, o, px, py, jb.v[o + MC_RAW1X], jb.v[o + MC_RAW1Y] );
         }
-        v = clamp( int( int16_t( ( sum + offset2 ) >> shift2 ) ), clipMin, clipMax );
+        if( o0 != o1 )   // one list alone: rounded from the intermediate
+        {
+          const int shift2 = headRoom, offset2 = ( 1 << ( shift2 - 1 ) ) + IF_INTERNAL_OFFS;
+          v = clamp( ( ( o0 ? p1 : p0 ) + offset2 ) >> shift2, clipMin, clipMax );
+        }
+        else   // addWeightedAvg (weightedAvg's formula; BCW_DEFAULT's weights 4 and 4)
+        {
+          const int shiftNum = headRoom + BCW_LOG2_WEIGHT_BASE;
+          const int offset   = ( 1 << ( shiftNum - 1 ) ) + ( IF_INTERNAL_OFFS << BCW_LOG2_WEIGHT_BASE );
+          v = clamp( ( p0 * jb.v[o + MC_W0] + p1 * jb.v[o + MC_W1] + offset ) >> shiftNum, clipMin, clipMax );
+        }
       }
       BufI16( pc.outPred ).v[dst + i] = int16_t( v );
     }

@@ -1329,8 +1329,11 @@ struct PushMc
   int32_t  numJobs, pad;
 };
 constexpr int MC_COMP = 0, MC_X = 1, MC_Y = 2, MC_W = 3, MC_H = 4, MC_DST = 5, MC_PU_W = 6, MC_PU_H = 7, MC_MVX = 8;
-constexpr int MC_MVY = 9, MC_REF = 10, MC_FLAGS = 11, MC_BD = 12, MC_CLIP_MIN = 13, MC_CLIP_MAX = 14, MC_JOB = 16;
-constexpr int MC_ALT_HPEL = 1;
+constexpr int MC_MVY = 9, MC_REF = 10, MC_FLAGS = 11, MC_BD = 12, MC_CLIP_MIN = 13, MC_CLIP_MAX = 14;
+constexpr int MC_MV1X = 16, MC_MV1Y = 17, MC_REF1 = 18, MC_W0 = 19, MC_W1 = 20, MC_OOB = 21, MC_RAW0X = 22;
+constexpr int MC_RAW0Y = 23, MC_RAW1X = 24, MC_RAW1Y = 25, MC_PU_X = 26, MC_PU_Y = 27, MC_PIC_W = 28, MC_PIC_H = 29;
+constexpr int MC_JOB = 32;
+constexpr int MC_ALT_HPEL = 1, MC_BI = 2;
 constexpr int MC_REF_COMP = 5;   // per reference slot and component: origin, stride, width, height, margin
 
 struct PushScan
@@ -7245,21 +7248,74 @@ void GpuIntraRec::prepareInterSignPred( TransformUnit& tu, const ComponentID com
   }
 }
 
-// whether the GPU makes the prediction of inter CU cu (inter_mc.comp): uni-prediction without other tools
-// (InterPrediction::xPredInterUni without bi or BDOF, then xWeightedAverage's copyClip), 4:2:0, without weighted
-// prediction, a scaled reference (RPR's xPredInterBlkRPR) or wrap-around; ECM_GPU_NO_MC=1 leaves every prediction
-// the CPU's
+// whether bi-prediction PU pu may take DMVR or BDOF, which the GPU lacks (xPredInterBi's conditions, conservatively:
+// DMVR's bdmvrRefine / mvRefine with checkDMVRCondition; BDOF's switches, BCW's default weights, no SMVD, equal
+// distances in different directions or JVET-AJ0097's same direction, at least 8 x 8 and 128 samples unless
+// BDOF_RM_CONSTRAINTS removes the size limits)
+static bool mcRefines( const PredictionUnit& pu )
+{
+  const CodingUnit& cu = *pu.cu;
+#if MULTI_PASS_DMVR
+  if( pu.bdmvrRefine )
+  {
+    return true;
+  }
+#endif
+  if( pu.mvRefine && PU::checkDMVRCondition( pu ) )
+  {
+    return true;
+  }
+  if( !cu.cs->sps->getBDOFEnabledFlag() || cu.cs->picHeader->getDisBdofFlag() || cu.bcwIdx != BCW_DEFAULT || cu.smvdMode )
+  {
+    return false;
+  }
+  const bool dist = PU::isBiPredFromDifferentDirEqDistPoc( pu )
+#if JVET_AJ0097_BDOF_LDB
+                    || PU::isBiPredFromSameDirUnEqDistPoc( pu )
+#endif
+    ;
+#if BDOF_RM_CONSTRAINTS
+  return dist;
+#else
+  return dist && pu.lwidth() >= 8 && pu.lheight() >= 8 && pu.lwidth() * pu.lheight() >= 128;
+#endif
+}
+
+// xCheckIdenticalMotion: a B slice's bi-prediction of one reference picture and one vector, which motionCompensation
+// predicts as uni-prediction from list 0
+static bool mcIdentical( const PredictionUnit& pu )
+{
+  const Slice& slice = *pu.cs->slice;
+  return slice.isInterB() && !pu.cs->pps->getWPBiPred() && pu.refIdx[0] >= 0 && pu.refIdx[1] >= 0
+         && slice.getRefPic( REF_PIC_LIST_0, pu.refIdx[0] )->getPOC() == slice.getRefPic( REF_PIC_LIST_1, pu.refIdx[1] )->getPOC()
+         && pu.mv[0] == pu.mv[1];
+}
+
+// whether the GPU makes the prediction of inter CU cu (inter_mc.comp): uni-prediction (xPredInterUni without bi, then
+// xWeightedAverage's copyClip) or bi-prediction without DMVR or BDOF (xPredInterBi, xWeightedAverage's
+// addWeightedAvg) - each without other tools -, 4:2:0, without weighted prediction, a scaled reference (RPR's
+// xPredInterBlkRPR) or wrap-around; ECM_GPU_NO_MC=1 leaves every prediction the CPU's
 static bool interMcGpu( const CodingUnit& cu )
 {
   const PredictionUnit& pu    = *cu.firstPU;
   const Slice&          slice = *cu.slice;
   const PPS&            pps   = *cu.cs->pps;
   const SPS&            sps   = *cu.cs->sps;
-  return !getenv( "ECM_GPU_NO_MC" ) && !strcmp( interKind( cu ), "uni-prediction" ) && ( pu.interDir == 1 || pu.interDir == 2 )
-         && cu.chromaFormat == CHROMA_420 && !( pps.getUseWP() && slice.getSliceType() == P_SLICE )
-         && !( pps.getWPBiPred() && slice.getSliceType() == B_SLICE )
-         && !( sps.getRprEnabledFlag() && slice.getRefPic( RefPicList( pu.interDir - 1 ), pu.refIdx[pu.interDir - 1] )->isRefScaled( &pps ) )
-         && !pps.getWrapAroundEnabledFlag();
+  const char*           kind  = interKind( cu );
+  const bool            uni   = !strcmp( kind, "uni-prediction" ), bi = !strcmp( kind, "bi-prediction" );
+  if( getenv( "ECM_GPU_NO_MC" ) || ( !uni && !bi ) || cu.chromaFormat != CHROMA_420 || pps.getWrapAroundEnabledFlag()
+      || ( pps.getUseWP() && slice.getSliceType() == P_SLICE ) || ( pps.getWPBiPred() && slice.getSliceType() == B_SLICE ) )
+  {
+    return false;
+  }
+  for( int l = 0; l < 2; l++ )
+  {
+    if( pu.refIdx[l] >= 0 && sps.getRprEnabledFlag() && slice.getRefPic( RefPicList( l ), pu.refIdx[l] )->isRefScaled( &pps ) )
+    {
+      return false;
+    }
+  }
+  return uni ? pu.interDir == 1 || pu.interDir == 2 : pu.interDir == 3 && ( mcIdentical( pu ) || !mcRefines( pu ) );
 }
 
 void GpuIntraRec::interCu( const CodingUnit& cu )
@@ -7454,17 +7510,24 @@ static bool recordInterBlock( GpuIntraRec::Impl& m, const TransformUnit& tu, con
   // xPredInterUni clips it (clipMv, the PU's position and size), the reference picture's slot
   if( m.mcCus.count( &cu ) )
   {
-    const int  list = pu.interDir == 1 ? 0 : 1;
-    Mv         mv   = pu.mv[list];
-    clipMv( mv, pu.lumaPos(), pu.lumaSize(), sps, *cs.pps );
-    const Picture* ref  = slice.getRefPic( RefPicList( list ), pu.refIdx[list] )->unscaledPic;
-    auto           it   = std::find( m.mcRefs.begin(), m.mcRefs.end(), ref );
-    const int      slot = (int) ( it - m.mcRefs.begin() );
-    if( it == m.mcRefs.end() )
+    // (identical motion: list 0 alone)
+    const bool bi   = pu.interDir == 3 && !mcIdentical( pu );
+    const int  list = pu.interDir == 2 ? 1 : 0;
+    auto slotOf = [&]( int l )
     {
-      m.mcRefs.push_back( ref );
-    }
-    const ClpRng& clp = slice.clpRng( compID );
+      const Picture* ref = slice.getRefPic( RefPicList( l ), pu.refIdx[l] )->unscaledPic;
+      auto           it  = std::find( m.mcRefs.begin(), m.mcRefs.end(), ref );
+      if( it == m.mcRefs.end() )
+      {
+        m.mcRefs.push_back( ref );
+        return (int) m.mcRefs.size() - 1;
+      }
+      return (int) ( it - m.mcRefs.begin() );
+    };
+    Mv mv = pu.mv[list];
+    clipMv( mv, pu.lumaPos(), pu.lumaSize(), sps, *cs.pps );
+    const int     slot = slotOf( list );
+    const ClpRng& clp  = slice.clpRng( compID );
     int32_t       j[MC_JOB] = {};
     j[MC_COMP]     = compID;
     j[MC_X]        = area.x;
@@ -7481,6 +7544,38 @@ static bool recordInterBlock( GpuIntraRec::Impl& m, const TransformUnit& tu, con
     j[MC_BD]       = t.bitDepth;
     j[MC_CLIP_MIN] = clp.min;
     j[MC_CLIP_MAX] = clp.max;
+    if( bi )   // list 1, BCW's weights, the lists out of boundary (isMvOOB at the unclipped vectors)
+    {
+      Mv mv1 = pu.mv[1];
+      clipMv( mv1, pu.lumaPos(), pu.lumaSize(), sps, *cs.pps );
+      j[MC_FLAGS] |= MC_BI;
+      j[MC_MV1X]   = mv1.getHor();
+      j[MC_MV1Y]   = mv1.getVer();
+      j[MC_REF1]   = slotOf( 1 );
+      j[MC_W0]     = getBcwWeight( cu.bcwIdx, REF_PIC_LIST_0 );
+      j[MC_W1]     = getBcwWeight( cu.bcwIdx, REF_PIC_LIST_1 );
+      for( int l = 0; l < 2; l++ )
+      {
+        const int horMax = ( ( (int) cs.pps->getPicWidthInLumaSamples() - 1 ) << 4 ) + 8;
+        const int verMax = ( ( (int) cs.pps->getPicHeightInLumaSamples() - 1 ) << 4 ) + 8;
+        const int ox     = ( pu.lumaPos().x << 4 ) + pu.mv[l].getHor(), oy = ( pu.lumaPos().y << 4 ) + pu.mv[l].getVer();
+        const bool oob   = ox <= -8 || ox + ( ( (int) pu.lwidth() - 1 ) << 4 ) >= horMax || oy <= -8
+                         || oy + ( ( (int) pu.lheight() - 1 ) << 4 ) >= verMax;
+#if JVET_AA0146_WRAP_AROUND_FIX
+        j[MC_OOB] |= oob && !slice.getRefPic( RefPicList( l ), pu.refIdx[l] )->isWrapAroundEnabled( cs.pps ) ? 1 << l : 0;
+#else
+        j[MC_OOB] |= oob ? 1 << l : 0;
+#endif
+      }
+      j[MC_RAW0X]  = pu.mv[0].getHor();
+      j[MC_RAW0Y]  = pu.mv[0].getVer();
+      j[MC_RAW1X]  = pu.mv[1].getHor();
+      j[MC_RAW1Y]  = pu.mv[1].getVer();
+      j[MC_PU_X]   = pu.lumaPos().x;
+      j[MC_PU_Y]   = pu.lumaPos().y;
+      j[MC_PIC_W]  = (int) cs.pps->getPicWidthInLumaSamples();
+      j[MC_PIC_H]  = (int) cs.pps->getPicHeightInLumaSamples();
+    }
     m.mcJobs.insert( m.mcJobs.end(), j, j + MC_JOB );
   }
   m.cuTus[&cu].push_back( (int32_t) m.rec.size() );

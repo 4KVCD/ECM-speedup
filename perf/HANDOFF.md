@@ -449,7 +449,7 @@ wall-clock gains with threads are "the easy baseline". Decoder status: single-th
 (`--GpuLoopFilter=1`: ALF, SAO, BIF, CCSAO, LF-CCCM, offset refinement on Vulkan). The user then asked for **a full
 GPU decoder in Vulkan, optimized until nothing is left** ("The GPU decoder needs to fully decode the frame on the
 GPU"; "Your first Vulkan version is going to be slow. That's OK"). That work is branch `dec-gpurecon`: intra
-reconstruction on the GPU (`--GpuRecon`), tool levels M1-M95 done and verified bit-exact (M19: DIMD, M20: OBIC, M21:
+reconstruction on the GPU (`--GpuRecon`), tool levels M1-M96 done and verified bit-exact (M19: DIMD, M20: OBIC, M21:
 intra merge, M22: the transforms of DIMD CUs, M23: LFNST of MIP, M24: TIMD, M25: OBIC and intra merge with TIMD
 neighbours, M26: TIMD-SAD, M27: OBIC and intra merge with TIMD-SAD neighbours, M28: TIMD merge, M29: TMRL of luma,
 M30: chroma TMRL, M31: CCLM, M32: LFNST / NSPT of CCLM, M33: GLM's gradient patterns, M34: CCCM, M35: GL-CCCM, M36:
@@ -2287,6 +2287,19 @@ prediction (M90 lets inter blocks keep it) is reconstructed by signPrediction in
 stay the CPU's; IBC / palette CUs take no inter_mc job (their refIdx is not a reference picture's); chroma reordering's
 NN rule (an NN block derives the DIMD of its prediction for the DM mode) only with DIMD in the SPS, as M86 has it
 (ra_off4_q32).
+M96 (2026-10-22): bi-prediction on the GPU (inter_mc.comp's MC_BI): bi-prediction CUs without DMVR or BDOF and without
+other tools (xPredInterBi, then xWeightedAverage's addWeightedAvg). A bi job carries list 1's vector (clipped as list
+0's) and slot, BCW's weights (getBcwWeight), which lists are out of boundary somewhere (isMvOOB at the unclipped vectors)
+with the unclipped vectors, the PU's luma position and the picture's size. Each list is predicted at the 14-bit
+intermediate precision (rndRes off: the last stage's int16 sum >> IF_FILTER_PREC), with JVET-AI0094's sharp luma
+filter (m_lumaFilter12bi) where the pass's block is above 4 x 4 (filterHor / filterVer's width > 4 && height > 4; the
+horizontal pass of a 2-D block covers H + 11 rows, so there W > 4 alone), then averaged with the weights; JVET-Z0136:
+a sample whose reference lies more than half a sample outside the picture in one list (per luma sample, chroma at
+twice its position) takes the other list alone, rounded from the intermediate. Bi-prediction of one reference and one
+vector (xCheckIdenticalMotion) is list 0's uni-prediction. The host rejects DMVR (bdmvrRefine, mvRefine with
+checkDMVRCondition) and BDOF; found on the way (ra_crowdrun_q32): BDOF_RM_CONSTRAINTS removes BDOF's 8 x 8 / 128-sample
+limit, so a 4 x 4 BDOF CU had passed. Results (50 streams, build gpu35): every picture identical; 79 bi-prediction CUs
+predicted by the GPU (uni-prediction 585 as before); 56 bi-prediction CUs remain the CPU's (DMVR or BDOF).
 
 
 ## 8. Numbers (i7-10700 8C/16T, Win11, GCC 16.2, RTX 3070 driver 616.92)
