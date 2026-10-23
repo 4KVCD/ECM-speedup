@@ -2558,6 +2558,12 @@ GPU's per CU, what the GPU lacks rejected by record() (the picture the CPU's, th
 information through 7882788d3). Results (Intel PC, agst49, --GpuRecon=3 against the build's CPU decode, the 50 streams):
 50 of 50 identical; intra pictures on the GPU 0 -> 1 of 331 pictures; the CPU's intra pictures by their first reason:
 PDP 47; NN intra prediction 4; CCLM with LFNST / NSPT without DIMD 2; wavefronts 1.
+ON mode without supported()'s PDP gate (2026-10-22, agent st): the sequence-level rejection of PDP is gone; PDP (its MPM
+lists and filters on the GPU; record() rejects what it lacks) are the GPU's per CU, what the GPU lacks rejected by
+record() (the picture the CPU's, through 44e11ef88's fallback; its side information through 7882788d3). Results (Intel
+PC, agst50, --GpuRecon=3 against the build's CPU decode, the 50 streams): 50 of 50 identical; intra pictures on the GPU
+1 -> 1 of 331 pictures; the CPU's intra pictures by their first reason: NN intra prediction 51; CCLM with LFNST / NSPT
+without DIMD 2; wavefronts 1.
 
 
 ## 8. Numbers (i7-10700 8C/16T, Win11, GCC 16.2, RTX 3070 driver 616.92)

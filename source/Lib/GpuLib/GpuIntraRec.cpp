@@ -2474,7 +2474,6 @@ bool GpuIntraRec::supported( const Slice& slice, std::string& why, bool partial 
   else if( partial )                                                                      return true;
   // chroma reordering and DBV: the GPU's per CU (CU_CHROMA_REORDER, CU_CHROMA_DBV), what it lacks rejected by record()
   else if( ( sps.getUseChromaReordering() || sps.getUseIntraDBV() ) && !GPU_CHROMA_REORDER ) why = "chroma reordering / DBV";
-  else if( sps.getUsePDP() )                                                              why = "PDP";
   else if( slice.getPnnMode() )                                                           why = "NN intra prediction";
   return why.empty();
 }
