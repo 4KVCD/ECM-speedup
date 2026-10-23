@@ -449,7 +449,7 @@ wall-clock gains with threads are "the easy baseline". Decoder status: single-th
 (`--GpuLoopFilter=1`: ALF, SAO, BIF, CCSAO, LF-CCCM, offset refinement on Vulkan). The user then asked for **a full
 GPU decoder in Vulkan, optimized until nothing is left** ("The GPU decoder needs to fully decode the frame on the
 GPU"; "Your first Vulkan version is going to be slow. That's OK"). That work is branch `dec-gpurecon`: intra
-reconstruction on the GPU (`--GpuRecon`), tool levels M1-M106 done and verified bit-exact (M19: DIMD, M20: OBIC, M21:
+reconstruction on the GPU (`--GpuRecon`), tool levels M1-M107 done and verified bit-exact (M19: DIMD, M20: OBIC, M21:
 intra merge, M22: the transforms of DIMD CUs, M23: LFNST of MIP, M24: TIMD, M25: OBIC and intra merge with TIMD
 neighbours, M26: TIMD-SAD, M27: OBIC and intra merge with TIMD-SAD neighbours, M28: TIMD merge, M29: TMRL of luma,
 M30: chroma TMRL, M31: CCLM, M32: LFNST / NSPT of CCLM, M33: GLM's gradient patterns, M34: CCCM, M35: GL-CCCM, M36:
@@ -2603,6 +2603,21 @@ whose storeRecon blends (ciipBlend) before the residual (as an inter block's); i
 it the intra prediction's references besides the inter block's dependencies. Results (50 streams, build gpu59): every
 picture identical (ra_wpp_q32 skipped as before); CIIP 99 CUs predicted by the GPU; from the CPU: CIIP-PDPC 231, with
 LFNST / NSPT 53, with LIC 32, OBMC with an intra neighbour 20, OBMC 8, with inter CCCM 1.
+M107 (2026-10-23): GPM of two uni-prediction inter parts on the GPU (motionCompensationGeo's plain path:
+weightedGeoBlk). CommonLib records what motionCompensationGeo did - the plain blend taken, split direction, blending
+index, each part's motion, its LIC flag and models as its merge candidate set them, its non-local LIC flag
+(InterPrediction::m_gpuGeoPlain / m_gpuGeoPart, gpuGeoPart; unconditional and at the end of the class: CommonLib is
+built without ECM_VULKAN, so code or members under it there vanish or give the class two layouts - a first version
+did, xSubPuMC faulted) - and DecCu hands it over (gpmParts). A GPM CU's block jobs carry MC_GPM, both parts' motion
+and the component's weights (gpmWeights: xWeightedGeoBlk's walk of g_geoWeights); mcSampleBase predicts each part at
+the 14-bit intermediate, applies a part's inherited LIC model where it is not the identity (the geo branch of
+xPredInterBlk; found on the way, ld_parkjoy_q27: the CU no longer shows its parts' LIC after the prediction, and the
+CPU skips an identity model, whose round trip rounds), and blends (w p0 + (32 - w) p1 + offset) >> shift; OBMC of the
+CU follows as for any CU. Still the CPU's (gpmWhy): separate OBMC per part (JVET-AK0212, every slice but low-delay B),
+regression-based blending, intra / IBC / affine / bi-prediction / DMVR parts, LIC of the CU, non-local LIC parts.
+Results (50 streams, build gpm1): every picture identical (ra_wpp_q32 skipped as before); GPM 50 CUs predicted by the
+GPU; from the CPU: GPM (separate OBMC) 761, (an affine part) 610, (an intra part) 449, (regression-based blending)
+314, (a bi-prediction part) 45, (LIC) 18, (its OBMC) 9.
 
 
 ## 8. Numbers (i7-10700 8C/16T, Win11, GCC 16.2, RTX 3070 driver 616.92)

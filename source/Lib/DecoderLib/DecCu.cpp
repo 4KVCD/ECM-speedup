@@ -554,6 +554,11 @@ void DecCu::decompressCtu( CodingStructure& cs, const UnitArea& ctuArea )
             m_gpuIntraRec->dmvrVectors( currCU, m_pcInterPred->getBdmvrSubPuMvBuf( 0 ), m_pcInterPred->getBdmvrSubPuMvBuf( 1 ) );
           }
 #endif
+          if( currCU.geoFlag )   // (GPM: how its prediction was made)
+          {
+            m_gpuIntraRec->gpmParts( currCU, m_pcInterPred->m_gpuGeoPlain, m_pcInterPred->m_gpuGeoSplit,
+                                     m_pcInterPred->m_gpuGeoBld, m_pcInterPred->m_gpuGeoPart );
+          }
           m_gpuIntraRec->recordInterCu( currCU );
         }
 #endif

@@ -1835,6 +1835,25 @@ public:
 #if ECM_VULKAN
   const Mv* getBdmvrSubPuMvBuf( int list ) const { return m_bdmvrSubPuMvBuf[list]; }
 #endif
+  // the last motionCompensationGeo's part k, for the GPU reconstruction (m_gpuGeoPart, at the end of the class; not
+  // under ECM_VULKAN, which only DecoderLib defines: CommonLib's objects must see the same class)
+  void    gpuGeoPart( int k, const PredictionUnit& pu )
+  {
+    const int32_t v[8] = { pu.mv[0].getHor(), pu.mv[0].getVer(), pu.mv[1].getHor(), pu.mv[1].getVer(), pu.refIdx[0],
+                           pu.refIdx[1],      pu.interDir,       pu.bdmvrRefine ? 1 : 0 };
+    std::copy( v, v + 8, m_gpuGeoPart[k] );
+    // (the part's LIC as its merge candidate gave it, which xPredInterBlk's geo branch applies, and non-local LIC)
+    m_gpuGeoPart[k][8] = pu.cu->licFlag ? 1 : 0;
+    for( int l = 0; l < 2; l++ )
+    {
+      for( int c = 0; c < MAX_NUM_COMPONENT; c++ )
+      {
+        m_gpuGeoPart[k][9 + ( l * 3 + c ) * 2]     = pu.cu->licScale[l][c];
+        m_gpuGeoPart[k][9 + ( l * 3 + c ) * 2 + 1] = pu.cu->licOffset[l][c];
+      }
+    }
+    m_gpuGeoPart[k][21] = pu.cu->altLMFlag ? 1 : 0;
+  }
 #if JVET_AA0093_REFINED_MOTION_FOR_ARMC
 #if JVET_AI0185_ADAPTIVE_COST_IN_MERGE_MODE
   bool      processBDMVR              (PredictionUnit& pu, int step = 0, Distortion* tmCost = NULL, int mergeIdx = -1);
@@ -2067,6 +2086,14 @@ public:
   void subBlockIntraForOBMC                  (PredictionUnit &subPu, const int iSub, const bool isAbove, PelUnitBuf &cTmp, IntraPrediction *pcIntraPred);
 #endif
 #endif
+public:
+  // the last motionCompensationGeo, for the GPU reconstruction: whether it blended two predictions with
+  // weightedGeoBlk (its plain path), the split direction and blending index, and per part the motion it predicted
+  // with (the vectors of both lists, both reference indices, interDir, bdmvrRefine; interDir 0: another part), its
+  // LIC flag and models (per list and component scale, offset) and its non-local LIC flag
+  bool    m_gpuGeoPlain = false;
+  int     m_gpuGeoSplit = 0, m_gpuGeoBld = 0;
+  int32_t m_gpuGeoPart[2][22] = {};
 };
 
 #if TM_AMVP || TM_MRG || JVET_Z0084_IBC_TM

@@ -12675,6 +12675,8 @@ void InterPrediction::motionCompensationGeo( CodingUnit &cu, MergeCtx &geoMrgCtx
 #endif
 #endif
 {
+  m_gpuGeoPlain = false;
+  m_gpuGeoPart[0][6] = m_gpuGeoPart[1][6] = 0;
 #if JVET_AI0082_GPM_WITH_INTER_IBC
   if (cu.firstPU->gpmInterIbcFlag)
   {
@@ -12991,6 +12993,7 @@ void InterPrediction::motionCompensationGeo( CodingUnit &cu, MergeCtx &geoMrgCtx
 #if JVET_AK0212_GPM_OBMC_MODIFICATION
     m_pixelRefine = false;
 #endif
+    gpuGeoPart( 0, pu );
     motionCompensation(pu, tmpGeoBuf0, REF_PIC_LIST_X, true, isChromaEnabled(pu.chromaFormat)); // TODO: check 4:0:0 interaction with weighted prediction.
 
 #if JVET_AG0164_AFFINE_GPM
@@ -13257,6 +13260,7 @@ void InterPrediction::motionCompensationGeo( CodingUnit &cu, MergeCtx &geoMrgCtx
     m_pixelRefine = false;
 #endif
 
+    gpuGeoPart( 1, pu );
     motionCompensation(pu, tmpGeoBuf1, REF_PIC_LIST_X, true, isChromaEnabled(pu.chromaFormat)); // TODO: check 4:0:0 interaction with weighted prediction.
 
 #if JVET_AG0164_AFFINE_GPM
@@ -13413,7 +13417,12 @@ void InterPrediction::motionCompensationGeo( CodingUnit &cu, MergeCtx &geoMrgCtx
     else
 #endif
 #if JVET_AA0058_GPM_ADAPTIVE_BLENDING
-    weightedGeoBlk(pu, splitDir, bldIdx, isChromaEnabled(pu.chromaFormat) ? MAX_NUM_CHANNEL_TYPE : CHANNEL_TYPE_LUMA, predBuf, tmpGeoBuf0, tmpGeoBuf1);
+    {
+      m_gpuGeoPlain = true;
+      m_gpuGeoSplit = splitDir;
+      m_gpuGeoBld   = bldIdx;
+      weightedGeoBlk(pu, splitDir, bldIdx, isChromaEnabled(pu.chromaFormat) ? MAX_NUM_CHANNEL_TYPE : CHANNEL_TYPE_LUMA, predBuf, tmpGeoBuf0, tmpGeoBuf1);
+    }
 #else
     weightedGeoBlk(pu, splitDir, isChromaEnabled(pu.chromaFormat)? MAX_NUM_CHANNEL_TYPE : CHANNEL_TYPE_LUMA, predBuf, tmpGeoBuf0, tmpGeoBuf1);
 #endif

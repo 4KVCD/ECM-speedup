@@ -73,6 +73,8 @@ const int MC_LIC      = 256; // a LIC CU's block: its models at MC_BDOF_OUT in p
 const int MC_NLIC     = 512; // a non-local LIC CU's block: its model at MC_NLIC_AT in pc.affine (per component), on
                              // the final prediction (xPredInterBi's altLMParaUnit)
 const int MC_NLIC_AT  = 31;
+const int MC_GPM      = 1024; // a GPM CU's block (weightedGeoBlk): part 0 at MC_MVX / MC_REF, part 1 at MC_MV1X /
+                              // MC_REF1 (each uni-prediction), the PU's weights at MC_BDOF_OUT in pc.affine
 // McRef (int32) per slot and component: the index of sample (0, 0) in pc.planes, the stride, the size, the margin
 const int MC_REF_ORIGIN = 0, MC_REF_STRIDE = 1, MC_REF_W = 2, MC_REF_H = 3, MC_REF_MARGIN = 4;
 const int MC_REF_COMP = 5;
@@ -1116,6 +1118,26 @@ int mcSampleBase( BufI32 jb, int o, int comp, int x, int y, int puW, int puH, in
   {
     return int( BufI16( pc.bdofOut )
                   .v[jb.v[o + MC_BDOF_OUT] + ( y - ( jb.v[o + MC_PU_Y] >> cs ) ) * puW + x - ( jb.v[o + MC_PU_X] >> cs )] );
+  }
+  if( ( flags & MC_GPM ) != 0 )   // GPM: both parts' 14-bit predictions weighed by the host's weights (of 32)
+  {
+    int q0 = mcPredict( slot0, comp, x + ( mv0.x >> shift ), y + ( mv0.y >> shift ), mv0.x & mask, mv0.y & mask, alt,
+                        true, puW, puH, bd, clipMin, clipMax );
+    int q1 = mcPredict( slot1, comp, x + ( mv1.x >> shift ), y + ( mv1.y >> shift ), mv1.x & mask, mv1.y & mask, alt,
+                        true, puW, puH, bd, clipMin, clipMax );
+    // (a part's LIC, inherited from its merge candidate: xPredInterBlk's geo branch on the intermediate, where the
+    // component's model is not the identity)
+    const int lo = jb.v[o + MC_NLIC_AT], lists = jb.v[o + MC_OOB];
+    const int m0 = lo + ( ( lists & 1 ) * 3 + comp ) * 2, m1 = lo + 12 + ( ( ( lists >> 1 ) & 1 ) * 3 + comp ) * 2;
+    BufI32    lb = BufI32( pc.affine );
+    q0 = jb.v[o + MC_W0] == 0 || ( lb.v[m0] == 32 && lb.v[m0 + 1] == 0 ) ? q0
+         : mcLicBi( lb, lo, lists & 1, comp, q0, bd, clipMin, clipMax );
+    q1 = jb.v[o + MC_W1] == 0 || ( lb.v[m1] == 32 && lb.v[m1 + 1] == 0 ) ? q1
+         : mcLicBi( lb, lo + 12, ( lists >> 1 ) & 1, comp, q1, bd, clipMin, clipMax );
+    const int w  = BufI32( pc.affine ).v[jb.v[o + MC_BDOF_OUT] + ( y - ( jb.v[o + MC_PU_Y] >> cs ) ) * puW + x
+                                        - ( jb.v[o + MC_PU_X] >> cs )];
+    const int shiftW = headRoom + 5, offsetW = ( 1 << ( shiftW - 1 ) ) + ( IF_INTERNAL_OFFS << 5 );
+    return clamp( ( w * q0 + ( 32 - w ) * q1 + offsetW ) >> shiftW, clipMin, clipMax );
   }
   if( !bi )
   {
