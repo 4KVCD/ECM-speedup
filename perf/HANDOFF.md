@@ -2655,6 +2655,13 @@ record: its TU's model stays the CPU's (cpuCuModels) for the later merges. Still
 CU, of a CU of several TUs, with ASBT, with adjustment or decoder-derived fusion, other chroma formats (none in the 50
 streams). Results (50 streams, builds aglcc1 and aglcc2): "inter CCP merge" 161 -> 0, every verified picture identical
 (with the previous paragraph's fix; ra_wpp_q32 skipped as before).
+Integration of lf's two commits with M106-M108 (2026-10-23): with the inter CCCM fix above, 5d1f0277a's exception
+(interMcGpu left inter CCCM CUs to the CPU's prediction) goes. The 50-stream run of that (build int2) found
+ld_foreman_q32, ldp_crowdrun_q27, ldp_foreman_q32 and ra_parkjoy832_q32 differing at inter CCP merge chroma blocks of
+CIIP CUs (M106 and the inter CCP merge port were verified apart): the CPU blends the CCP prediction with the CIIP one,
+intra_rec blends it with the inter prediction in storeRegion, before storeRecon's CIIP blend. ciipWhy now leaves CIIP
+with inter CCP merge to the CPU (14 CUs in those four streams). Results: int2 every other picture identical
+(ra_wpp_q32 skipped as before); the four streams identical with the fix (build int3, the commit's tree).
 
 
 ## 8. Numbers (i7-10700 8C/16T, Win11, GCC 16.2, RTX 3070 driver 616.92)

@@ -7904,6 +7904,10 @@ static const char* ciipWhy( const CodingUnit& cu )
       return "CIIP with inter CCCM";
     }
 #endif
+    if( isInterCcp( tu ) )   // (its blend takes the CIIP prediction: intra_rec blends the CCP one before CIIP's)
+    {
+      return "CIIP with inter CCP merge";
+    }
   }
   if( cu.chromaFormat != CHROMA_420 )
   {
@@ -8089,17 +8093,6 @@ static void gpmWeights( const PredictionUnit& pu, const ComponentID compID, int 
 // CPU's
 static bool interMcGpu( const CodingUnit& cu )
 {
-#if JVET_AE0059_INTER_CCCM
-  // (an inter CCCM CU: intra_intercccm.glsl blends its chroma blocks' prediction - the CPU's final one, DecCu's - in
-  // the inter CCCM branch, before the inter branch's OBMC and the other steps of a prediction the GPU makes)
-  for( const TransformUnit& tu: CU::traverseTUs( cu ) )
-  {
-    if( tu.interCccm )
-    {
-      return false;
-    }
-  }
-#endif
   const PredictionUnit& pu    = *cu.firstPU;
   const Slice&          slice = *cu.slice;
   const PPS&            pps   = *cu.cs->pps;
