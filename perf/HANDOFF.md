@@ -449,7 +449,7 @@ wall-clock gains with threads are "the easy baseline". Decoder status: single-th
 (`--GpuLoopFilter=1`: ALF, SAO, BIF, CCSAO, LF-CCCM, offset refinement on Vulkan). The user then asked for **a full
 GPU decoder in Vulkan, optimized until nothing is left** ("The GPU decoder needs to fully decode the frame on the
 GPU"; "Your first Vulkan version is going to be slow. That's OK"). That work is branch `dec-gpurecon`: intra
-reconstruction on the GPU (`--GpuRecon`), tool levels M1-M105 done and verified bit-exact (M19: DIMD, M20: OBIC, M21:
+reconstruction on the GPU (`--GpuRecon`), tool levels M1-M106 done and verified bit-exact (M19: DIMD, M20: OBIC, M21:
 intra merge, M22: the transforms of DIMD CUs, M23: LFNST of MIP, M24: TIMD, M25: OBIC and intra merge with TIMD
 neighbours, M26: TIMD-SAD, M27: OBIC and intra merge with TIMD-SAD neighbours, M28: TIMD merge, M29: TMRL of luma,
 M30: chroma TMRL, M31: CCLM, M32: LFNST / NSPT of CCLM, M33: GLM's gradient patterns, M34: CCCM, M35: GL-CCCM, M36:
@@ -2589,6 +2589,20 @@ branch blends the block's prediction before the inter branch applies OBMC to it,
 final prediction and with M96-M105 is the GPU's without OBMC yet. 3af02cfde: an inter CCCM CU keeps the CPU's
 prediction (interMcGpu); with it those streams are identical (build gpu58). ON mode (--GpuRecon=3, md5 against the
 build's CPU decoding, build gpu56): 50 of 50 identical, 17 intra pictures reconstructed on the GPU.
+M106 (2026-10-23): CIIP on the GPU (not CIIP-PDPC, CIIP with LFNST / NSPT, LIC or inter CCCM, CUs of several transform
+units; affine CIIP stays rejected). The inter prediction is the kind beneath CIIP (interKindBase) made by inter_mc,
+with what CIIP changes in it: no BDOF (xPredInterBi's bioApplied) and the plain average whatever the BCW index
+(xWeightedAverage without LIC) - found on the way (ra_foreman_q22: predictions off by 1-3 at angular CIIP CUs); OBMC
+applies in intra_rec as for any CU. The intra prediction is the CPU's parameters of geneIntrainterPred's predIntraAng
+(IntraPrediction::ciipSnapshot, new, per component; partial verification: the CPU's mode, CIIP-TIMD's included) put in
+the inter block's Tu (ciipFields: the mode, its angle, filters, PDPC, fusion, PDP); Tu::ciip (new) carries
+geneWeightedPred's blend: the neighbours' weights (the PUs left of the bottom-left and above the top-right sample,
+intra or not) or TIMD's angular weights 6, 5, 3, 2 / 8 by quarter of the columns or rows, and LMCS's forward mapping
+of the inter prediction. intra_rec: a CIIP block applies OBMC in the inter branch, then goes on to the intra path,
+whose storeRecon blends (ciipBlend) before the residual (as an inter block's); intra_deps and the host's mirror give
+it the intra prediction's references besides the inter block's dependencies. Results (50 streams, build gpu59): every
+picture identical (ra_wpp_q32 skipped as before); CIIP 99 CUs predicted by the GPU; from the CPU: CIIP-PDPC 231, with
+LFNST / NSPT 53, with LIC 32, OBMC with an intra neighbour 20, OBMC 8, with inter CCCM 1.
 
 
 ## 8. Numbers (i7-10700 8C/16T, Win11, GCC 16.2, RTX 3070 driver 616.92)

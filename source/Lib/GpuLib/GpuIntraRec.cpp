@@ -125,8 +125,9 @@ struct Tu
   int32_t pnn;        // a block of NN intra prediction: its record in Params::timdData (PNN_REC_*; -1: none)
   int32_t ibc;        // an IBC CU's block (DERIVE_IBC): its record in Params::timdData (IBC_REC_*; read with it only)
   int32_t obmc;       // an OBMC CU's block on its top / left band: the CU's OBMC record in Params::timdData + 1 (0: none)
+  int32_t ciip;       // a CIIP CU's block: CIIP_* (intra_common.glsl; 0: none)
 };
-static_assert( sizeof( Tu ) == 107 * 4, "Tu layout" );
+static_assert( sizeof( Tu ) == 108 * 4, "Tu layout" );
 
 // a block of NN intra prediction's record in Params::timdData (intra_common.glsl's PNN_REC_*)
 constexpr int PNN_REC_AVAIL = 12, PNN_REC_TARGET = 16, PNN_REC_TOP_BOUNDARY = 19;
@@ -976,6 +977,7 @@ static_assert( SP_TEMPLATES == 2 + SIGN_PRED_MAX_NUM, "signPred layout" );
 constexpr int LMCS_BF_INVERSE  = 1;   // the intra bilateral filter works on inverse-mapped samples
 constexpr int LMCS_CHROMA_SCALE = 2;   // the chroma residual is scaled by the CU's neighbouring luma
 constexpr int LMCS_INTER_FWD    = 4;   // an inter block's prediction is forward-mapped (luma)
+constexpr int CIIP_ON = 1, CIIP_UNIFORM = 0, CIIP_BY_X = 2, CIIP_BY_Y = 4, CIIP_W = 3, CIIP_FWD = 32;   // (Tu::ciip)
 
 // Tu::quant
 constexpr int QUANT_DEP = 1;   // dependent quantization: the coefficients are quantization indices (DepQuant)
@@ -6991,6 +6993,8 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
 
 // the kind of inter CU cu's prediction, for the report of what the port of inter prediction has left: the first of
 // multi-hypothesis, GPM, affine, CIIP, sub-block motion, LIC, non-local LIC, OBMC, bi- and uni-prediction
+static const char* interKindBase( const CodingUnit& cu );
+
 static const char* interKind( const CodingUnit& cu )
 {
   const PredictionUnit& pu = *cu.firstPU;
@@ -7012,6 +7016,13 @@ static const char* interKind( const CodingUnit& cu )
   {
     return "CIIP";
   }
+  return interKindBase( cu );
+}
+
+// interKind's kind of inter CU cu without CIIP (CIIP's inter prediction)
+static const char* interKindBase( const CodingUnit& cu )
+{
+  const PredictionUnit& pu = *cu.firstPU;
   // (motionCompensation's xSubPuMC: a merge type of sub-blocks, AMVP with SbTMVP - JVET-AG0098, which keeps the PU's
   // own motion beside its sub-blocks' -, affine sub-block BDOF's refined vectors)
   if( pu.mergeType != MRG_TYPE_DEFAULT_N
@@ -7463,12 +7474,12 @@ static bool mcDmvrBio( const PredictionUnit& pu )
 }
 
 // xPredInterBi's bioApplied for a bi-prediction PU of the kinds interMcGpu takes (not affine, LIC, non-local LIC,
-// CIIP, GPM, sub-block motion; no weighted prediction, no scaled reference): BDOF's switches, equal distances in
-// different directions or JVET-AJ0097's same direction with the merge index's condition, no SMVD, BCW's default weight
+// GPM, sub-block motion; no weighted prediction, no scaled reference): BDOF's switches, equal distances in different
+// directions or JVET-AJ0097's same direction with the merge index's condition, no SMVD, no CIIP, BCW's default weight
 static bool mcBdof( const PredictionUnit& pu )
 {
   const CodingUnit& cu = *pu.cu;
-  if( !cu.cs->sps->getBDOFEnabledFlag() || cu.cs->picHeader->getDisBdofFlag() || cu.smvdMode
+  if( !cu.cs->sps->getBDOFEnabledFlag() || cu.cs->picHeader->getDisBdofFlag() || cu.smvdMode || pu.ciipFlag
       || ( cu.cs->sps->getUseBcw() && cu.bcwIdx != BCW_DEFAULT ) )
   {
     return false;
@@ -7654,6 +7665,93 @@ static void affineRecord( GpuIntraRec::Impl& m, const CodingUnit& cu )
   }
 }
 
+// ----- CIIP (M106): the inter prediction as the CU's kind beneath it gives it (inter_mc), OBMC (intra_rec), then the
+// CU's intra prediction - predIntraAng with the CPU's parameters (IntraPrediction::ciipSnapshot; partial verification:
+// the CPU's mode, CIIP-TIMD's included) - blended with it in intra_rec's storeRecon (geneWeightedPred), then the
+// residual as an inter block's
+
+// why the GPU does not predict CIIP CU cu (nullptr: it does, where its inter prediction's kind allows)
+static const char* ciipWhy( const CodingUnit& cu )
+{
+  const PredictionUnit& pu = *cu.firstPU;
+#if CIIP_PDPC
+  if( pu.ciipPDPC )
+  {
+    return "CIIP-PDPC";
+  }
+#endif
+  if( cu.firstTU != cu.lastTU )
+  {
+    return "CIIP of several transform units";
+  }
+  if( cu.lfnstIdx )
+  {
+    return "CIIP with LFNST / NSPT";
+  }
+  if( cu.licFlag || cu.altLMFlag )
+  {
+    return "CIIP with LIC";
+  }
+  for( const TransformUnit& tu: CU::traverseTUs( cu ) )
+  {
+#if JVET_AE0059_INTER_CCCM
+    if( tu.interCccm )
+    {
+      return "CIIP with inter CCCM";
+    }
+#endif
+  }
+  if( cu.chromaFormat != CHROMA_420 )
+  {
+    return "CIIP not 4:2:0";
+  }
+  return nullptr;
+}
+
+// the intra fields and Tu::ciip of block compID (area) of CIIP CU cu, as geneIntrainterPred and geneWeightedPred do it
+static void ciipFields( GpuIntraRec::Impl& m, const CodingUnit& cu, const ComponentID compID, const CompArea& area, Tu& t )
+{
+  const PredictionUnit&               pu  = *cu.firstPU;
+  const SPS&                          sps = *cu.cs->sps;
+  const IntraPrediction::IpaSnapshot& ipa = m.intraPred->ciipSnapshot( compID );
+  const int                           dirMode = PU::getFinalIntraMode( pu, toChannelType( compID ) );
+  t.dirMode          = dirMode;
+  t.isModeVer        = ipa.isModeVer;
+  t.intraPredAngle   = ipa.intraPredAngle;
+  t.absInvAngle      = ipa.absInvAngle;
+  t.useCubic         = !ipa.interpolationFlag;
+  t.plIdx            = isLuma( compID ) && dirMode == PLANAR_IDX ? cu.plIdx : 0;
+  t.refFilter        = ipa.refFilterFlag;
+  t.applyPDPC        = ipa.applyPDPC;
+  t.gradPDPC         = ipa.useGradPDPC;
+  t.angularScale     = ipa.angularScale;
+  t.fusion           = ipa.applyFusion;
+  t.disableRefFilter = sps.getDisableRefFilter();
+  t.qp               = cu.qp;
+  t.mrl              = ipa.multiRefIndex;
+#if JVET_AH0209_PDP
+  const int pdp = pdpSize( cu, pu, compID, ipa );
+  t.pdp         = pdp >= 0 && pdp < PDP_SIZES ? pdp | ipa.pdpPadW << 8 | ipa.pdpPadH << 16 : -1;
+#endif
+  // geneWeightedPred: the neighbours' weights (the PUs left of the bottom-left and above the top-right sample, intra or
+  // not), or with TIMD (JVET-X0141) an angular mode's of a block of 4 x 4 and up by the quarter of the columns (modes
+  // below DIA_IDX) or rows
+  const Position        posBL  = pu.Y().bottomLeft(), posTR = pu.Y().topRight();
+  const PredictionUnit* neigh0 = pu.cs->getPURestricted( posBL.offset( -1, 0 ), pu, CHANNEL_TYPE_LUMA );
+  const PredictionUnit* neigh1 = pu.cs->getPURestricted( posTR.offset( 0, -1 ), pu, CHANNEL_TYPE_LUMA );
+  const bool            intra0 = neigh0 && CU::isIntra( *neigh0->cu ), intra1 = neigh1 && CU::isIntra( *neigh1->cu );
+  const int             wIntra = intra0 && intra1 ? 3 : !intra0 && !intra1 ? 1 : 2;
+  int                   kind   = CIIP_UNIFORM;
+#if JVET_X0141_CIIP_TIMD_TM && JVET_W0123_TIMD_FUSION
+  if( !( dirMode == PLANAR_IDX || dirMode == DC_IDX || area.width < 4 || area.height < 4 ) )
+  {
+    kind = dirMode < DIA_IDX ? CIIP_BY_X : CIIP_BY_Y;
+  }
+#endif
+  const bool fwd = isLuma( compID ) && cu.slice->getLmcsEnabledFlag() && m.reshape->getCTUFlag();
+  t.ciip         = CIIP_ON | kind | wIntra << CIIP_W | ( fwd ? CIIP_FWD : 0 );
+}
+
 // whether the GPU makes the prediction of inter CU cu (inter_mc.comp): uni-prediction (xPredInterUni without bi, then
 // xWeightedAverage's copyClip) or bi-prediction without DMVR (xPredInterBi, xWeightedAverage's addWeightedAvg or
 // BDOF's applyBiOptFlow) - each without other tools -, 4:2:0, without weighted prediction, a scaled reference (RPR's
@@ -7680,6 +7778,14 @@ static bool interMcGpu( const CodingUnit& cu )
   if( !strcmp( kind, "affine" ) )
   {
     return affineGpu( cu );
+  }
+  if( !strcmp( kind, "CIIP" ) )   // (CIIP, M106: ciipWhy; its inter prediction's kind)
+  {
+    if( ciipWhy( cu ) )
+    {
+      return false;
+    }
+    kind = interKindBase( cu );
   }
   const bool            obmc  = !strcmp( kind, "OBMC" );   // (its base prediction; OBMC: obmcPlan)
   // (LIC: the CU's stored models - the ones applied, derived or inherited -, not with non-local LIC, BDOF, DMVR or
@@ -8043,6 +8149,10 @@ static bool recordInterBlock( GpuIntraRec::Impl& m, const TransformUnit& tu, con
     }
     m.lmcsUsed |= t.lmcs != 0;
   }
+  if( pu.ciipFlag && m.mcCus.count( &cu ) )   // (CIIP whose inter prediction the GPU makes: the intra one too)
+  {
+    ciipFields( m, cu, compID, area, t );
+  }
   if( !coefficientFields( m, tu, resiComp, area, t, signPred ? sp->second.coef.data() : nullptr, why ) )
   {
     return false;
@@ -8116,8 +8226,9 @@ static bool recordInterBlock( GpuIntraRec::Impl& m, const TransformUnit& tu, con
       j[MC_MV1X]   = mv1.getHor();
       j[MC_MV1Y]   = mv1.getVer();
       j[MC_REF1]   = slotOf( 1 );
-      j[MC_W0]     = getBcwWeight( cu.bcwIdx, REF_PIC_LIST_0 );
-      j[MC_W1]     = getBcwWeight( cu.bcwIdx, REF_PIC_LIST_1 );
+      // (CIIP: xWeightedAverage's plain average, whatever the BCW index - without LIC)
+      j[MC_W0]     = getBcwWeight( pu.ciipFlag ? BCW_DEFAULT : cu.bcwIdx, REF_PIC_LIST_0 );
+      j[MC_W1]     = getBcwWeight( pu.ciipFlag ? BCW_DEFAULT : cu.bcwIdx, REF_PIC_LIST_1 );
       for( int l = 0; l < 2; l++ )
       {
         const int horMax = ( ( (int) cs.pps->getPicWidthInLumaSamples() - 1 ) << 4 ) + 8;
@@ -8501,6 +8612,14 @@ void GpuIntraRec::recordInterCu( const CodingUnit& cu )
                     || pu.availableBdofRefinedMv == AFFINE_SUBPU_BDOF_APPLY_WITHOUT_STORE_MV ? " (with BDOF)"
                 : affineGpu( cu ) && cu.obmcFlag && ( why = obmcPlan( cu, s, in ) ) != nullptr ? std::string( " (" ) + why + ")"
                 : " (other)";
+      }
+      if( kind == "CIIP" && !m.mcCus.count( &cu ) )   // (CIIP from the CPU: why)
+      {
+        std::vector<ObmcSeg> s;
+        bool                 in  = false;
+        const char*          why = ciipWhy( cu );
+        why = why ? why : interMcGpu( cu ) && cu.obmcFlag ? obmcPlan( cu, s, in ) : nullptr;
+        kind += std::string( " (" ) + ( why ? why : interKindBase( cu ) ) + ")";
       }
       if( kind == "non-local LIC" && !m.mcCus.count( &cu ) )   // (non-local LIC from the CPU: why)
       {
@@ -9552,8 +9671,11 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
             addLumaArea( r[OBMC_REC_X] - 1, r[OBMC_REC_Y], r[OBMC_REC_X] - 1, r[OBMC_REC_Y] + r[OBMC_REC_H] - 1 );
           }
         }
-        residualDeps();
-        continue;
+        if( !t.ciip )   // (a CIIP block: its intra prediction's references and the residual's, below)
+        {
+          residualDeps();
+          continue;
+        }
       }
       // the area the references are filled for: the block with arms of 8x its size, for ISP the CU with arms of twice
       // its size; the prediction's arm lengths (m_topRefLength / m_leftRefLength): 8x the block, for ISP the CU's

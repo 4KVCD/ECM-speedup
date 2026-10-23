@@ -85,6 +85,9 @@ struct Tu
   // an OBMC CU's block on the CU's top or left band: its CU's OBMC record in Params::timdData + 1 (intra_rec's
   // OBMC_REC_*; 0: none)
   int obmc;
+  // a CIIP CU's block (with DERIVE_INTER; CIIP_*, 0: none): its prediction blended with its intra prediction, which the
+  // intra fields above describe (geneWeightedPred)
+  int ciip;
 };
 layout( buffer_reference, std430, buffer_reference_align = 4 ) buffer BufTu { Tu v[]; };
 
@@ -277,6 +280,11 @@ const int DERIVE_INTER_CCCM = int( 0x80000000 );
 // Tu::lmcs (1: the bilateral filter on inverse-mapped samples, 2: chroma residual scaling): an inter block's
 // prediction forward-mapped (luma)
 const int LMCS_INTER_FWD = 4;
+
+// Tu::ciip: CIIP_ON, the blend (geneWeightedPred: CIIP_UNIFORM wIntra / 4 everywhere, CIIP_BY_X / CIIP_BY_Y TIMD's
+// angular weights 6, 5, 3, 2 / 8 of the intra prediction over the quarters of the columns / rows), wIntra << CIIP_W,
+// CIIP_FWD: the inter prediction is forward-mapped by LMCS first
+const int CIIP_ON = 1, CIIP_UNIFORM = 0, CIIP_BY_X = 2, CIIP_BY_Y = 4, CIIP_KIND = 6, CIIP_W = 3, CIIP_FWD = 32;
 
 // a CU's block vectors as the lists of later CUs take them (Params::bvOut per luma CU, by its index in the
 // CodingStructure: getNeighBv's vectors of the CU in its order, which getArBvMergeCandidate cascades), written by the

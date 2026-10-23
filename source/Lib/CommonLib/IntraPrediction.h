@@ -714,6 +714,9 @@ public:
   /// inter neighbour), for the GPU reconstruction
   static int obicNeighbours( const CodingUnit& cu, const CodingUnit* nbrs[NUM_OBIC_CUS], int numSamples[NUM_OBIC_CUS] );
 #endif
+  /// the parameters of CIIP's intra prediction of component compID (geneIntrainterPred's predIntraAng), for the GPU
+  /// reconstruction
+  const IpaSnapshot& ciipSnapshot( int compID ) const { return m_ciipIpa[compID]; }
   IpaSnapshot ipaSnapshot() const
   {
     return { m_ipaParam.isModeVer,
@@ -747,6 +750,7 @@ public:
   }
 private:
   bool m_paramsOnly = false;
+  IpaSnapshot m_ciipIpa[MAX_NUM_COMPONENT];   // (ciipSnapshot)
 
 #if JVET_AN0158_INTRA_LONGTAP
   int m_dimdCurrentPredIdx = 0;

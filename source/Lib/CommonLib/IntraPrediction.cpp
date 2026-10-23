@@ -9055,6 +9055,7 @@ void IntraPrediction::geneIntrainterPred(const CodingUnit &cu, PelStorage& pred)
   const UnitArea localUnitArea(pu->cs->area.chromaFormat, Area(0, 0, pu->Y().width, pu->Y().height));
   PelBuf ciipBuff = pred.getBuf(localUnitArea.Y());
   predIntraAng(COMPONENT_Y, ciipBuff, *pu);
+  m_ciipIpa[COMPONENT_Y] = ipaSnapshot();
 #if JVET_AC0112_IBC_CIIP
 #if INTRA_RM_SMALL_BLOCK_SIZE_CONSTRAINTS
 #if JVET_AI0136_ADAPTIVE_DUAL_TREE
@@ -9080,10 +9081,12 @@ void IntraPrediction::geneIntrainterPred(const CodingUnit &cu, PelStorage& pred)
     initIntraPatternChType(cu, pu->Cb());
     PelBuf ciipBuffCb = pred.getBuf(localUnitArea.Cb());
     predIntraAng(COMPONENT_Cb, ciipBuffCb, *pu);
+    m_ciipIpa[COMPONENT_Cb] = ipaSnapshot();
 
     initIntraPatternChType(cu, pu->Cr());
     PelBuf ciipBuffCr = pred.getBuf(localUnitArea.Cr());
     predIntraAng(COMPONENT_Cr, ciipBuffCr, *pu);
+    m_ciipIpa[COMPONENT_Cr] = ipaSnapshot();
 #if !INTRA_RM_SMALL_BLOCK_SIZE_CONSTRAINTS
   }
 #endif

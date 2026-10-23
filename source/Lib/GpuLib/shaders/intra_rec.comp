@@ -485,6 +485,24 @@ int asPel( int v )   // the int16 Pel the CPU stores
 
 // LMCS: the forward and inverse luma mappings (Reshape's LUTs)
 int fwdLut( int v ) { return BufI32( P.lmcs ).v[v]; }
+
+// CIIP (IntraPrediction::geneWeightedPred): sample (x, y) of block t's intra prediction blended with its inter one
+// (Params::interPred, after OBMC; with CIIP_FWD forward-mapped by LMCS): uniformly by the neighbours' weights, or for
+// TIMD's angular modes by the quarter of the columns / rows the sample lies in
+int ciipBlend( Tu t, int x, int y, int intra )
+{
+  int inter = int( CBufI16( P.interPred ).v[t.dbgOffset + y * t.w + x] );
+  inter     = ( t.ciip & CIIP_FWD ) != 0 ? fwdLut( inter ) : inter;
+  const int kind = t.ciip & CIIP_KIND;
+  if( kind == CIIP_UNIFORM )
+  {
+    const int wIntra = ( t.ciip >> CIIP_W ) & 3;
+    return ( ( 4 - wIntra ) * inter + wIntra * intra + 2 ) >> 2;
+  }
+  const int pos = kind == CIIP_BY_X ? x : y, interval = ( kind == CIIP_BY_X ? t.w : t.h ) >> 2;
+  const int wInter = pos < interval ? 2 : pos < 2 * interval ? 3 : pos < 3 * interval ? 5 : 6;
+  return ( wInter * inter + ( 8 - wInter ) * intra + 4 ) >> 3;
+}
 int invLut( int v ) { return BufI32( P.lmcs ).v[P.lmcsLutSize + v]; }
 
 // Reshape::scalePel: the residual scaled by scale / 2^11 (CSCALE_FP_PREC), magnitude rounded; scale is an int16_t there
@@ -563,8 +581,14 @@ void splSync()
 // (Tu::resiFrom, read device-coherent): with joint CbCr by the pair's other block (sign prediction's decision, or the
 // Cb block whose transforms depend on a derived mode), or by this block (inChainResidual, which sets its local copy's
 // resiFrom to itself); with sign prediction kept until the signs are decided (signPrediction)
+int ciipBlend( Tu t, int x, int y, int intra );
+
 void storeRecon( Tu t, int x, int y, int pr )
 {
+  if( t.ciip != 0 )   // (CIIP: the inter prediction blended in first)
+  {
+    pr = ciipBlend( t, x, y, pr );
+  }
   if( t.spCoded >= 0 || g_deferRecon )
   {
     if( t.w > 32 || t.h > 32 )   // (sign prediction of an inter block above 32 x 32: signPredictionLarge)
@@ -2474,6 +2498,9 @@ void main()
         }
         SYNC();
       }
+      // (CIIP, M106: on to the intra prediction below, which storeRecon blends with this one)
+      if( t.ciip == 0 )
+      {
       // (LFNST / NSPT: their mode from a DIMD of the prediction, the residual computed here: inChainResidual)
       if( WITH_DERIVED_TRANSFORMS && ( t.derive & DERIVE_TRANSFORM ) != 0 )
       {
@@ -2502,6 +2529,7 @@ void main()
       }
       releaseDependents( d0, d1, lid, NT );
       continue;
+      }
     }
     // ----- a block of a CU whose mode its node derived: the parameters for the mode
     if( ( t.derive & DERIVE_MODE ) != 0 )

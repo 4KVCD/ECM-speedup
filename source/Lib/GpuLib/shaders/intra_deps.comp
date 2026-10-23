@@ -553,10 +553,13 @@ void dependencies( int comp )
         addAreaDeps( 0, x - 1, y, x - 1, y + h - 1 );
       }
     }
-    signDeps( t, comp );
-    addEdge( t.resiFrom );
-    crsDeps( t );
-    return;
+    if( t.ciip == 0 )   // (a CIIP block: its intra prediction's references and the residual's, below)
+    {
+      signDeps( t, comp );
+      addEdge( t.resiFrom );
+      crsDeps( t );
+      return;
+    }
   }
   const int availComp = t.comp == 0 ? 0 : 1;
   for( int ln = 0; ln < 2; ln++ )
