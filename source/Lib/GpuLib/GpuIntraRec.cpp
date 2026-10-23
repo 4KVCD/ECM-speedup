@@ -7397,7 +7397,8 @@ static bool affineGpu( const CodingUnit& cu )
   const Slice&          slice = *cu.slice;
   const PPS&            pps   = *cu.cs->pps;
   const SPS&            sps   = *cu.cs->sps;
-  if( getenv( "ECM_GPU_NO_MC" ) || cu.licFlag || cu.altLMFlag || pu.ciipFlag || pu.mergeType != MRG_TYPE_DEFAULT_N
+  if( getenv( "ECM_GPU_NO_MC" ) || ( cu.licFlag && ( cu.licInheritPara || sps.getRprEnabledFlag() ) ) || cu.altLMFlag
+      || pu.ciipFlag || pu.mergeType != MRG_TYPE_DEFAULT_N
       || pu.amvpSbTmvpFlag || pu.bdmvrRefine || pu.availableBdofRefinedMv == AFFINE_SUBPU_BDOF_APPLY_AND_STORE_MV
       || pu.availableBdofRefinedMv == AFFINE_SUBPU_BDOF_APPLY_WITHOUT_STORE_MV || cu.chromaFormat != CHROMA_420
       || pps.getWrapAroundEnabledFlag() || pps.getUseWP() || pps.getWPBiPred() || clipMv != clipMvInPic
@@ -7427,7 +7428,7 @@ static void affineRecord( GpuIntraRec::Impl& m, const CodingUnit& cu )
   const SPS&            sps   = *cu.cs->sps;
   constexpr int AF_X = 0, AF_Y = 1, AF_W = 2, AF_H = 3, AF_BI = 4, AF_LIST = 5, AF_SHIFT = 6, AF_W0 = 7, AF_W1 = 8;
   constexpr int AF_HMAX = 9, AF_HMIN = 10, AF_VMAX = 11, AF_VMIN = 12, AF_PIC_W = 13, AF_PIC_H = 14, AF_BD = 15;
-  constexpr int AF_CLIP_MIN = 16, AF_CLIP_MAX = 17, AF_MVF = 18, AF_C0 = 20;
+  constexpr int AF_CLIP_MIN = 16, AF_CLIP_MAX = 17, AF_MVF = 18, AF_LIC = 19, AF_C0 = 20;
   constexpr int AF_MVH = 0, AF_MVV = 1, AF_DHX = 2, AF_DHY = 3, AF_DVX = 4, AF_DVY = 5, AF_BW = 6, AF_BH = 7, AF_1X1 = 8;
   constexpr int AF_PROF = 9, AF_SLOT = 10, AF_C = 12;
   const int    width = (int) pu.lwidth(), height = (int) pu.lheight(), iBit = MAX_CU_DEPTH;
@@ -7461,6 +7462,7 @@ static void affineRecord( GpuIntraRec::Impl& m, const CodingUnit& cu )
   a[AF_BD]       = slice.clpRng( COMPONENT_Y ).bd;
   a[AF_CLIP_MIN] = slice.clpRng( COMPONENT_Y ).min;
   a[AF_CLIP_MAX] = slice.clpRng( COMPONENT_Y ).max;
+  a[AF_LIC]      = -1;
   for( int l = 0; l < 2; l++ )
   {
     if( pu.refIdx[l] < 0 )
@@ -7522,6 +7524,17 @@ static void affineRecord( GpuIntraRec::Impl& m, const CodingUnit& cu )
       c[AF_1X1]  = px ? 1 : 0;
       c[AF_PROF] = prof ? 1 : 0;
       c[AF_SLOT] = mcSlot( m, slice, l, pu.refIdx[l] );
+    }
+  }
+  if( cu.licFlag )   // (LIC: the CU's models per list and component, scale and offset)
+  {
+    m.affineData[r + AF_LIC] = (int32_t) m.affineData.size();
+    for( int l = 0; l < 2; l++ )
+    {
+      for( int c = 0; c < MAX_NUM_COMPONENT; c++ )
+      {
+        m.affineData.insert( m.affineData.end(), { cu.licScale[l][c], cu.licOffset[l][c] } );
+      }
     }
   }
   // the stored luma motion per 4 x 4 unit (both lists), which chroma's sub-blocks average
@@ -8237,7 +8250,8 @@ void GpuIntraRec::recordInterCu( const CodingUnit& cu )
         std::vector<ObmcSeg> s;
         bool                 in  = false;
         const char*          why = nullptr;
-        kind += pu.ciipFlag ? " (CIIP)" : cu.licFlag || cu.altLMFlag ? " (with LIC)"
+        kind += pu.ciipFlag ? " (CIIP)" : cu.altLMFlag ? " (with non-local LIC)"
+                : cu.licFlag && ( cu.licInheritPara || cu.cs->sps->getRprEnabledFlag() ) ? " (with inherited LIC or resampling)"
                 : pu.mergeType != MRG_TYPE_DEFAULT_N || pu.amvpSbTmvpFlag ? " (sub-block merge)"
                 : pu.bdmvrRefine ? " (with DMVR)"
                 : pu.availableBdofRefinedMv == AFFINE_SUBPU_BDOF_APPLY_AND_STORE_MV

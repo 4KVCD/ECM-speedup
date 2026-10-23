@@ -449,7 +449,7 @@ wall-clock gains with threads are "the easy baseline". Decoder status: single-th
 (`--GpuLoopFilter=1`: ALF, SAO, BIF, CCSAO, LF-CCCM, offset refinement on Vulkan). The user then asked for **a full
 GPU decoder in Vulkan, optimized until nothing is left** ("The GPU decoder needs to fully decode the frame on the
 GPU"; "Your first Vulkan version is going to be slow. That's OK"). That work is branch `dec-gpurecon`: intra
-reconstruction on the GPU (`--GpuRecon`), tool levels M1-M103 done and verified bit-exact (M19: DIMD, M20: OBIC, M21:
+reconstruction on the GPU (`--GpuRecon`), tool levels M1-M104 done and verified bit-exact (M19: DIMD, M20: OBIC, M21:
 intra merge, M22: the transforms of DIMD CUs, M23: LFNST of MIP, M24: TIMD, M25: OBIC and intra merge with TIMD
 neighbours, M26: TIMD-SAD, M27: OBIC and intra merge with TIMD-SAD neighbours, M28: TIMD merge, M29: TMRL of luma,
 M30: chroma TMRL, M31: CCLM, M32: LFNST / NSPT of CCLM, M33: GLM's gradient patterns, M34: CCCM, M35: GL-CCCM, M36:
@@ -2404,6 +2404,16 @@ band only), so an OBMC job of a LIC CU carries the CU's models too (OBMC_J_CLIC,
 the CPU's. Results (50 streams, build gpu53): every picture identical (ra_wpp_q32 skipped as before); LIC 539 CUs
 predicted by the GPU; from the CPU: LIC (OBMC with an intra neighbour) 149, (with DMVR) 87, (resampling) 42, (with
 BDOF) 33, (other) 23, (OBMC with an IBC neighbour) 1.
+M104 (2026-10-23): affine CUs with LIC on the GPU. xPredAffineBlk derives a uni-prediction's model from its
+sub-blocks' templates and applies it to the final prediction, bi-prediction's go through xLicCompAdj per list on the
+intermediate; the CU keeps them (setLicParam), so the affine record points at the CU's 12 models (AF_LIC) and afSample
+applies them as M103's mcLic / mcLicBi do. An inherited model (licInheritPara) stays the CPU's: affine uni-prediction
+derives anew while the CU keeps the inherited one. Results (50 streams, build gpu54): every picture identical
+(ai_foreman352_q22 lost the device in the parallel run and its solo rerun - also with gpu53, M103 - and passed in two
+later runs alone: a device loss on that all-intra stream that does not depend on the inter work, to look at with the
+dispatch sizes; ra_wpp_q32 skipped as before); affine 1408 CUs predicted by the GPU (+380); from the CPU: affine
+(sub-block merge) 810, (OBMC of sub-block motion) 663, (OBMC with an intra neighbour) 209, (CIIP) 197, (with non-local
+LIC) 150, (other) 105, (with inherited LIC or resampling) 48, (OBMC with an IBC neighbour) 4.
 
 
 ## 8. Numbers (i7-10700 8C/16T, Win11, GCC 16.2, RTX 3070 driver 616.92)

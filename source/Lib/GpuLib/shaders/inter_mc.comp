@@ -893,7 +893,7 @@ void dmvrJob( int o )
 // sub-block
 const int AF_X = 0, AF_Y = 1, AF_W = 2, AF_H = 3, AF_BI = 4, AF_LIST = 5, AF_SHIFT = 6, AF_W0 = 7, AF_W1 = 8;
 const int AF_HMAX = 9, AF_HMIN = 10, AF_VMAX = 11, AF_VMIN = 12, AF_PIC_W = 13, AF_PIC_H = 14, AF_BD = 15;
-const int AF_CLIP_MIN = 16, AF_CLIP_MAX = 17, AF_MVF = 18, AF_C0 = 20;
+const int AF_CLIP_MIN = 16, AF_CLIP_MAX = 17, AF_MVF = 18, AF_LIC = 19, AF_C0 = 20;
 // per list and component class (luma, chroma): the base vector (mvLT << iBit), the deltas, the sub-block size, pixel
 // blocks, PROF, the slot
 const int AF_MVH = 0, AF_MVV = 1, AF_DHX = 2, AF_DHY = 3, AF_DVX = 4, AF_DVY = 5, AF_BW = 6, AF_BH = 7, AF_1X1 = 8;
@@ -1034,19 +1034,31 @@ bool afOob( int r, int l, int lx, int ly )
   return ox <= -8 || ox >= ( ( afJ( r, AF_PIC_W ) - 1 ) << 4 ) + 8 || oy <= -8 || oy >= ( ( afJ( r, AF_PIC_H ) - 1 ) << 4 ) + 8;
 }
 
-// an affine PU's sample of component comp at (x, y) (the component's coordinates)
+int mcLic( BufI32 jb, int lo, int l, int comp, int v, int clipMin, int clipMax );
+int mcLicBi( BufI32 jb, int lo, int l, int comp, int p, int bd, int clipMin, int clipMax );
+
+// an affine PU's sample of component comp at (x, y) (the component's coordinates); with LIC (AF_LIC: where the CU's
+// models are) xPredAffineBlk's model on uni-prediction's final samples, xLicCompAdj's per list on bi-prediction's
+// intermediate
 int afSample( int r, int comp, int x, int y )
 {
   const int cs = comp == 0 ? 0 : 1;
   const int px = x - ( afJ( r, AF_X ) >> cs ), py = y - ( afJ( r, AF_Y ) >> cs );
+  const int bd = afJ( r, AF_BD ), clipMin = afJ( r, AF_CLIP_MIN ), clipMax = afJ( r, AF_CLIP_MAX );
+  const int lic = afJ( r, AF_LIC );
   if( afJ( r, AF_BI ) == 0 )
   {
-    return afList( r, afJ( r, AF_LIST ), comp, px, py, false );
+    const int l = afJ( r, AF_LIST ), v = afList( r, l, comp, px, py, false );
+    return lic < 0 ? v : mcLic( BufI32( pc.affine ), lic, l, comp, v, clipMin, clipMax );
   }
-  const int  p0 = afList( r, 0, comp, px, py, true ), p1 = afList( r, 1, comp, px, py, true );
+  int        p0 = afList( r, 0, comp, px, py, true ), p1 = afList( r, 1, comp, px, py, true );
   const bool o0 = afOob( r, 0, px << cs, py << cs ), o1 = afOob( r, 1, px << cs, py << cs );
-  const int  bd = afJ( r, AF_BD ), headRoom = max( 2, IF_INTERNAL_PREC - bd );
-  const int  clipMin = afJ( r, AF_CLIP_MIN ), clipMax = afJ( r, AF_CLIP_MAX );
+  const int  headRoom = max( 2, IF_INTERNAL_PREC - bd );
+  if( lic >= 0 )
+  {
+    p0 = mcLicBi( BufI32( pc.affine ), lic, 0, comp, p0, bd, clipMin, clipMax );
+    p1 = mcLicBi( BufI32( pc.affine ), lic, 1, comp, p1, bd, clipMin, clipMax );
+  }
   if( o0 != o1 )
   {
     return clamp( ( ( o0 ? p1 : p0 ) + ( 1 << ( headRoom - 1 ) ) + IF_INTERNAL_OFFS ) >> headRoom, clipMin, clipMax );
