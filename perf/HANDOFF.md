@@ -2680,6 +2680,15 @@ templates' dependencies). Still the CPU's: parts with LIC, DMVR or sub-block mot
 gpmWhy names. Results (50 streams, build gsep2): every picture identical (ra_wpp_q32 skipped as before); GPM 406 CUs
 predicted by the GPU (+355); from the CPU: GPM (an affine part) 613, (an intra part) 467, (regression-based blending)
 324, (a bi-prediction part) 303, (LIC) 82, (OBMC with an intra neighbour) 47, (separate OBMC with a LIC part) 45.
+CIIP's chroma residual scaling once (2026-10-23, agent lf; fixes M106): a CIIP chroma block with LMCS chroma residual
+scaling ran crsSetup twice, in the DERIVE_INTER branch and in the intra path's preamble, and the second workgroup sum
+(wgSum2 into s_red) added to the first: twice the luma average, another scale; the DERIVE_INTER branch now leaves a
+CIIP block's to the preamble (found once OBMC with intra neighbours put a CIIP CU of coded chroma residual on the GPU:
+ldp_foreman_q32 POC 8, a Cr block's residual 1 off). lf's commit also left an inter CCP merge CIIP CU to the CPU in
+interCcpWhy, the same fix as the integration paragraph's ciipWhy one, which stays.
+Hardware of M99-M109 (correction, 2026-10-23): their verification ran on this PC, a Core Ultra 7 265K with its Intel
+Graphics iGPU (driver 32.0.101.8991); the commit messages 86e6c59f3 .. 30744a6ab name an i7-10700 with an RTX 3070,
+copied from older messages. Re-check on NVIDIA and AMD.
 
 
 ## 8. Numbers (i7-10700 8C/16T, Win11, GCC 16.2, RTX 3070 driver 616.92)

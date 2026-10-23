@@ -2545,7 +2545,10 @@ void main()
     // prediction), the chroma residual scaled as an intra block's; with sign prediction after the signs are decided
     if( ( t.derive & DERIVE_INTER ) != 0 )
     {
-      crsSetup( t, lid, NT );
+      if( t.ciip == 0 )   // (a CIIP block's in the intra path's preamble: once, its workgroup sum adds up)
+      {
+        crsSetup( t, lid, NT );
+      }
       interObmcBand( t, lid, NT );   // (OBMC on the CU's top / left band; GPM's separate OBMC and blend)
       // (CIIP, M106: on to the intra prediction below, which storeRecon blends with this one)
       if( t.ciip == 0 )
