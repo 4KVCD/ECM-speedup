@@ -1682,6 +1682,76 @@ void signPredDataLarge( Tu c, int n, int lid, int NT )
   splSync();
 }
 
+// sign prediction's border (TU::predBorderResi) of block t (its coefficients block c's, n predicted) at the block's
+// sample (x, y) on its left column (left) or top row: the value the neighbours predict there, twice the reconstructed
+// sample next to the block minus the one beyond it (the mid-level value at the picture's left / top edge). An ASBT
+// sub-block's (SP_ASBT; InterPrediction::asbtBorderResi / asbtBorderResiH) along the side its TU block holds more of:
+// twice the prediction next to it minus the one beyond (one of them the reconstruction next to the block where the
+// sub-block is one sample in), and bitDepth - 1 at the picture's edge
+int spPredicted( Tu t, Tu c, int n, bool left, int x, int y )
+{
+  BufI32 sp = BufI32( P.signPred );
+  if( ( sp.v[c.spOffset + SP_SIGNS] & SP_ASBT ) == 0 )
+  {
+    int predicted = 1 << ( t.bitDepth - 1 );
+    if( left ? t.x != 0 : t.y != 0 )
+    {
+      const int nextTo = left ? recoAt( t.comp, t.x - 1, t.y + y ) : recoAt( t.comp, t.x + x, t.y - 1 );
+      const int beyond = left ? recoAt( t.comp, t.x - 2, t.y + y ) : recoAt( t.comp, t.x + x, t.y - 2 );
+      predicted = asPel( 2 * nextTo - beyond );
+    }
+    return predicted;
+  }
+  const int  a    = c.spOffset + SP_TEMPLATES + n * ( t.w + t.h );
+  const int  bx   = sp.v[a + SP_ASBT_X], by = sp.v[a + SP_ASBT_Y], pos = sp.v[a + SP_ASBT_POS];
+  const bool rows = sp.v[a + SP_ASBT_ROWS] != 0;
+  const bool edge = left ? bx == 0 : by == 0;   // (the TU block's)
+  const int  dv   = t.bitDepth - 1;
+  if( rows == left || pos == 0 )   // (the sub-block's own edge is the block's: as other blocks, but at the picture's)
+  {
+    if( edge )
+    {
+      return dv;
+    }
+    const int nextTo = left ? recoAt( t.comp, t.x - 1, t.y + y ) : recoAt( t.comp, t.x + x, t.y - 1 );
+    const int beyond = left ? recoAt( t.comp, t.x - 2, t.y + y ) : recoAt( t.comp, t.x + x, t.y - 2 );
+    return asPel( 2 * nextTo - beyond );
+  }
+  // (the prediction of the part before the sub-block, k samples into the block across its line: unmapped as the CPU
+  // keeps it, forward-mapped as xDecodeInterTU maps the luma it predicts signs with)
+  BufI16    ip = BufI16( P.interPred );
+  const int bp = sp.v[a + SP_ASBT_PRED];
+  const int p1 = int( ip.v[bp + ( rows ? ( pos - 1 ) * t.w + x : y * pos + pos - 1 )] );
+  const int q1 = ( t.lmcs & LMCS_INTER_FWD ) != 0 ? fwdLut( p1 ) : p1;
+  int       q2;
+  if( pos == 1 )
+  {
+    q2 = edge ? dv : left ? recoAt( t.comp, bx - 1, t.y + y ) : recoAt( t.comp, t.x + x, by - 1 );
+  }
+  else
+  {
+    const int p2 = int( ip.v[bp + ( rows ? ( pos - 2 ) * t.w + x : y * pos + pos - 2 )] );
+    q2 = ( t.lmcs & LMCS_INTER_FWD ) != 0 ? fwdLut( p2 ) : p2;
+  }
+  return asPel( 2 * q1 - q2 );
+}
+
+// whether sign prediction's border of block t (its coefficients block c's, n predicted) takes the left column and the
+// top row (TU::predBorderResi: not the left column at the picture's top edge but at its corner, nor the top row at
+// its left edge), an ASBT sub-block's by its TU block's position
+bvec2 spUse( Tu t, Tu c, int n )
+{
+  BufI32 sp = BufI32( P.signPred );
+  int    x = t.x, y = t.y;
+  if( ( sp.v[c.spOffset + SP_SIGNS] & SP_ASBT ) != 0 )
+  {
+    const int a = c.spOffset + SP_TEMPLATES + n * ( t.w + t.h );
+    x = sp.v[a + SP_ASBT_X];
+    y = sp.v[a + SP_ASBT_Y];
+  }
+  return bvec2( x != 0 || y == 0, y != 0 || x == 0 );
+}
+
 // signPrediction of an inter block above 32 x 32 (up to SIGN_PRED_MAX_BS_INTER, 128 x 128), its arrays in the
 // workgroup's scratch (SPL_*; the values as the CPU's Pel, as signPrediction's 16-bit arrays keep them), the first
 // stages in chunks of rows that fit s_spStage1 (as inChainResidual): with LFNST / NSPT (a derived mode's transforms,
@@ -1700,7 +1770,8 @@ void signPredictionLarge( Tu t, int lid, int NT )
   BufI32    sp   = BufI32( P.signPred );
   BufI16    resi = BufI16( P.dbgResi );
   const int n = sp.v[c.spOffset + SP_NUM], codedSigns = sp.v[c.spOffset + SP_SIGNS];
-  const bool useLeft = t.x != 0 || t.y == 0, useTop = t.y != 0 || t.x == 0;
+  const bvec2 use     = spUse( t, c, n );
+  const bool  useLeft = use.x, useTop = use.y;
   const int  first = useLeft ? 0 : H, last = useTop ? len : H;
   if( inChain )
   {
@@ -1710,13 +1781,7 @@ void signPredictionLarge( Tu t, int lid, int NT )
   {
     const bool left = j < H;
     const int  x = left ? 0 : j - H, y = left ? H - 1 - j : 0;
-    int predicted = 1 << ( t.bitDepth - 1 );
-    if( left ? t.x != 0 : t.y != 0 )
-    {
-      const int nextTo = left ? recoAt( t.comp, t.x - 1, t.y + y ) : recoAt( t.comp, t.x + x, t.y - 1 );
-      const int beyond = left ? recoAt( t.comp, t.x - 2, t.y + y ) : recoAt( t.comp, t.x + x, t.y - 2 );
-      predicted = asPel( 2 * nextTo - beyond );
-    }
+    const int predicted = spPredicted( t, c, n, left, x, y );
     splSet( SPL_BORDER + j, int( int16_t( predicted - splGet( SPL_PRED + y * W + x ) ) ) );
     if( !inChain )
     {
@@ -1875,7 +1940,8 @@ void signPrediction( Tu t, int lid, int NT )
   BufI32    sp   = BufI32( P.signPred );
   BufI16    resi = BufI16( P.dbgResi );
   const int n = sp.v[c.spOffset + SP_NUM], codedSigns = sp.v[c.spOffset + SP_SIGNS];
-  const bool useLeft = t.x != 0 || t.y == 0, useTop = t.y != 0 || t.x == 0;
+  const bvec2 use     = spUse( t, c, n );
+  const bool  useLeft = use.x, useTop = use.y;
   const int  first = useLeft ? 0 : H, last = useTop ? len : H;
   if( inChain )
   {
@@ -1885,13 +1951,7 @@ void signPrediction( Tu t, int lid, int NT )
   {
     const bool left = j < H;
     const int  x = left ? 0 : j - H, y = left ? H - 1 - j : 0;   // the block's sample at border entry j
-    int predicted = 1 << ( t.bitDepth - 1 );
-    if( left ? t.x != 0 : t.y != 0 )
-    {
-      const int nextTo = left ? recoAt( t.comp, t.x - 1, t.y + y ) : recoAt( t.comp, t.x + x, t.y - 1 );
-      const int beyond = left ? recoAt( t.comp, t.x - 2, t.y + y ) : recoAt( t.comp, t.x + x, t.y - 2 );
-      predicted = asPel( 2 * nextTo - beyond );
-    }
+    const int predicted = spPredicted( t, c, n, left, x, y );
     s_spBorder[j] = int16_t( predicted - int( s_spPred[y * W + x] ) );
     if( !inChain )
     {

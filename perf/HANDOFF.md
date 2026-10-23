@@ -2433,6 +2433,24 @@ that fit s_spStage1 (as inChainResidual): the residual with the decided signs (w
 dequantized on the fly) and, with LFNST / NSPT (DERIVE_TRANSFORM: their mode a DIMD of the prediction), the base border
 and the templates (signPredDataLarge). The intra path is unchanged: blocks up to 32 x 32 take signPrediction as before
 (storeRecon has one more branch, taken only where sign prediction keeps the prediction).
+ASBT on the GPU (2026-10-23, agent lf; partial verification): JVET-AL0181's inter blocks code their residual at half the
+width or height (TransformUnit::blocksResidual) and place it as a sub-block at the position the prediction's gradient
+energy chose (InterPrediction::asbtCoordPred / asbtCoord; upsampleOneBlock(H): the other samples' residual 0).
+recordAsbtBlock records such a block as up to three records: the parts before and after the sub-block (prediction only,
+no residual) and the sub-block (its residual as a block of the residual's size: transforms, dequantization, sign
+prediction as other inter blocks'), which waits for every block before it (DERIVE_PREFIX: the units it shares with the
+other parts are its own in the owner maps). The sub-block's position and direction are the CPU's (tu.asbtPosx /
+asbtPosy, chroma luma's halved: derived from the prediction, as the vectors are, so taken like them in partial
+verification), its levels in the CPU's layout after invTransposeTransform. Sign prediction's border of a sub-block is
+asbtBorderResi's / asbtBorderResiH's (SP_ASBT in its signPred data with the TU block's position, the direction, the
+sub-block's position and the offset of the part before's prediction; intra_rec's spPredicted / spUse in both
+signPrediction paths): on the side inside the block twice the prediction next to the sub-block minus the one beyond it
+(with the reconstruction next to the block where the sub-block is one sample in), bitDepth - 1 at the picture's edge
+(the CPU passes bitDepth - 1, not the mid level), useLeft / useTop by the TU block's position. prepareSignPred takes the
+levels in blocksResidual's layout; chroma residual scaling's size test takes the TU block's size (a 2 x 2 sub-block of a
+larger block is scaled: ldp_crowdrun_q27). Still the CPU's: ASBT of an IBC CU, decimated both ways, with joint CbCr,
+with LFNST / NSPT, other chroma formats (none in the 50 streams). Results: "ASBT" 101 -> 0, every verified picture
+identical (builds aglft9 and, with the scaling's size test, aglft10).
 
 
 ## 8. Numbers (i7-10700 8C/16T, Win11, GCC 16.2, RTX 3070 driver 616.92)

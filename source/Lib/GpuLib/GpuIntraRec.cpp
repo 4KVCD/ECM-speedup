@@ -2971,7 +2971,11 @@ void GpuIntraRec::prepareSignPred( TransformUnit& tu, const ComponentID compID )
   // DepQuant::getPredictedSigns gives the coded signs to the levels in the decoder's order (in place) and lists the
   // predicted ones; the TU gets its levels back, as the CPU calls it again where it reconstructs the block
   CoeffBuf            levels = tu.getCoeffs( resiComp );
+#if JVET_AL0181_ASBT
+  const CompArea&     area   = tu.blocksResidual[resiComp];   // (ASBT's decimated residual; else the block)
+#else
   const CompArea&     area   = tu.blocks[resiComp];
+#endif
   std::vector<TCoeff> saved( area.area() );
   for( int y = 0; y < (int) area.height; y++ )
   {
@@ -7299,12 +7303,6 @@ static const char* interWhy( const GpuIntraRec::Impl& m, const CodingUnit& cu )
 #endif
     for( int c = 0; c < MAX_NUM_COMPONENT; c++ )
     {
-#if JVET_AL0181_ASBT
-      if( tu.asbtDecimW[c] || tu.asbtDecimH[c] )
-      {
-        return "ASBT";
-      }
-#endif
     }
   }
   return nullptr;
@@ -7629,7 +7627,8 @@ static void signPredLarge( GpuIntraRec::Impl& m )
 // block's samples; luma forward-mapped by LMCS on the GPU where DecCu::xDecodeInterTU maps it) and the GPU's residual
 // as an intra block's (joint CbCr, sign prediction, transforms, dequantization, levels), reconstructed as xDecodeInterTU does: clipped to
 // the slice's range (luma's adaptive, mapped with LMCS), the chroma residual scaled by the CU's neighbouring luma (also
-// where the CTU has no LMCS). False with why set where the GPU lacks something
+// where the CTU has no LMCS). False with why set where the GPU lacks something. part: a part of the block instead
+// (recordAsbtBlock), with its residual or without any
 // ----- OBMC (subBlockOBMC) of a CU whose base prediction the GPU makes: the host lays out the boundary segments of one
 // neighbouring motion as PU::getSameNeigMotion gives them (partial verification: the CPU's motion), inter_mc's mode 3
 // predicts what does not read the current picture, intra_rec chooses (TM OBMC) and blends in the dependency chain
@@ -7789,14 +7788,15 @@ static int mcSlot( GpuIntraRec::Impl& m, const Slice& slice, int l, int refIdx )
 
 static void obmcJobs( GpuIntraRec::Impl& m, const CodingUnit& cu, const std::vector<ObmcSeg>& segs );
 
-static bool recordInterBlock( GpuIntraRec::Impl& m, const TransformUnit& tu, const ComponentID compID, const char*& why )
+static bool recordInterBlock( GpuIntraRec::Impl& m, const TransformUnit& tu, const ComponentID compID, const char*& why,
+                              const CompArea* part = nullptr, bool partResidual = true )
 {
   const CodingUnit&      cu    = *tu.cu;
   const PredictionUnit&  pu    = *cu.firstPU;
   const CodingStructure& cs    = *tu.cs;
   const SPS&             sps   = *cs.sps;
   const Slice&           slice = *cs.slice;
-  const CompArea&        area  = tu.blocks[compID];
+  const CompArea&        area  = part ? *part : tu.blocks[compID];
   if( m.cpuDummyCu < 0 )
   {
     m.cpuDummyCu = knownCuRecord( m, CompArea(), -1 );
@@ -7852,12 +7852,12 @@ static bool recordInterBlock( GpuIntraRec::Impl& m, const TransformUnit& tu, con
   }
   // (a CU without residual has none in any block: xDecodeInterTexture's rootCbf)
   const QpParam resiQp( tu, resiComp );
-  t.cbf           = cu.rootCbf && t.jccr != JCCR_DERIVED && TU::getCbf( tu, resiComp ) ? 1 : 0;
+  t.cbf           = cu.rootCbf && t.jccr != JCCR_DERIVED && TU::getCbf( tu, resiComp ) && partResidual ? 1 : 0;
   t.transformSkip = tu.mtsIdx[resiComp] == MTS_SKIP ? 1 : 0;
   // sign prediction (TrQuant::predCoeffSigns in xDecodeInterTU): prepareInterSignPred took the predicted levels of the
   // coded component (at the Cb block with joint CbCr)
   const auto sp       = m.interSign.find( std::make_pair( &tu, (int) compID ) );
-  const bool signPred = sp != m.interSign.end() && t.jccr != JCCR_DERIVED;
+  const bool signPred = sp != m.interSign.end() && t.jccr != JCCR_DERIVED && partResidual;
   if( signPred && ( sp->second.comp != resiComp || sp->second.pos != tu.blocks[resiComp].pos() || !t.cbf
                     || t.transformSkip || area.width < 4 || area.height < 4 ) )
   {
@@ -7911,8 +7911,9 @@ static bool recordInterBlock( GpuIntraRec::Impl& m, const TransformUnit& tu, con
   if( sps.getUseLmcs() )
   {
     t.lmcs |= fwd ? LMCS_INTER_FWD : 0;
+    // (the TU block's size, also for a part of it: recordAsbtBlock)
     if( slice.getLmcsEnabledFlag() && isChroma( compID ) && cu.rootCbf && ( TU::getCbf( tu, compID ) || tu.jointCbCr )
-        && cs.picHeader->getLmcsChromaResidualScaleFlag() && area.width * area.height > 4 )
+        && cs.picHeader->getLmcsChromaResidualScaleFlag() && tu.blocks[compID].area() > 4 )
     {
       t.lmcs |= LMCS_CHROMA_SCALE;
       const Area         areaY = cu.Y();
@@ -8168,6 +8169,100 @@ static bool recordInterBlock( GpuIntraRec::Impl& m, const TransformUnit& tu, con
   return true;
 }
 
+// ----- ASBT (JVET-AL0181): an inter block's residual coded at half its width or height (TransformUnit::blocksResidual)
+// and placed as a sub-block at a position the prediction's gradient energy chose (InterPrediction::asbtCoordPred /
+// asbtCoord, then upsampleOneBlock / upsampleOneBlockH: the other samples' residual 0)
+
+// whether block compID of TU tu has ASBT's decimated residual (DecCu::xDecodeInterTU's condition)
+static bool isAsbt( const TransformUnit& tu, const ComponentID compID )
+{
+#if JVET_AL0181_ASBT
+  return ( tu.asbtDecimW[compID] || tu.asbtDecimH[compID] ) && TU::getCbf( tu, compID );
+#else
+  return false;
+#endif
+}
+
+// SP_SIGNS' bit of an ASBT block's sign prediction, whose data then end with its TU block's geometry (SP_ASBT_*:
+// asbtBorderResi / asbtBorderResiH's border); intra_common.glsl's
+constexpr int SP_ASBT = 1 << 16;
+constexpr int SP_ASBT_X = 0, SP_ASBT_Y = 1, SP_ASBT_ROWS = 2, SP_ASBT_POS = 3, SP_ASBT_PRED = 4, SP_ASBT_NUM = 5;
+
+// ASBT block compID of TU tu (partial verification: the sub-block's position and direction the CPU's, which it chose
+// from the prediction, as the vectors): the records of the parts of the block before and after the sub-block (no
+// residual) and of the sub-block (its residual as a block of its own; it waits for all before it, DERIVE_PREFIX, as
+// the units it shares with the others are its own in the owner maps); with sign prediction its border as
+// asbtBorderResi / asbtBorderResiH take it (SP_ASBT). False with why set where the GPU lacks something
+static bool recordAsbtBlock( GpuIntraRec::Impl& m, const TransformUnit& tu, const ComponentID compID, const char*& why )
+{
+#if JVET_AL0181_ASBT
+  const CodingUnit& cu = *tu.cu;
+  const CompArea&   b  = tu.blocks[compID];
+  const CompArea&   r  = tu.blocksResidual[compID];
+  const bool        cols = tu.asbtDecimW[compID] != 0;   // (the residual's columns: upsampleOneBlock; rows: ...H)
+  why = CU::isIBC( cu )                                          ? "ASBT of an IBC CU"
+        : tu.asbtDecimW[compID] && tu.asbtDecimH[compID]         ? "ASBT decimated both ways"
+        : isChroma( compID ) && tu.jointCbCr                     ? "ASBT with joint CbCr"
+        : cu.lfnstIdx                                            ? "ASBT with LFNST / NSPT"
+        : cu.chromaFormat != CHROMA_420 && isChroma( compID )    ? "ASBT of another chroma format"
+        : nullptr;
+  if( why )
+  {
+    return false;
+  }
+  // (chroma: luma's position halved, InterPrediction::asbtCoordPred / asbtCoord)
+  const int pos = ( cols ? tu.asbtPosx : tu.asbtPosy ) >> ( isChroma( compID ) ? 1 : 0 );
+  CompArea  sub = b, before = b, after = b;
+  if( cols )
+  {
+    CHECK( r.height != b.height || pos + r.width > b.width, "an ASBT sub-block outside its block" );
+    sub.x        = b.x + pos;
+    sub.width    = r.width;
+    before.width = pos;
+    after.x      = sub.x + sub.width;
+    after.width  = b.width - pos - r.width;
+  }
+  else
+  {
+    CHECK( r.width != b.width || pos + r.height > b.height, "an ASBT sub-block outside its block" );
+    sub.y         = b.y + pos;
+    sub.height    = r.height;
+    before.height = pos;
+    after.y       = sub.y + sub.height;
+    after.height  = b.height - pos - r.height;
+  }
+  int32_t beforePred = -1;   // (the prediction of the part before the sub-block, which its border may read)
+  if( before.width > 0 && before.height > 0 )
+  {
+    if( !recordInterBlock( m, tu, compID, why, &before, false ) )
+    {
+      return false;
+    }
+    beforePred = m.rec.back().dbgOffset;
+  }
+  if( after.width > 0 && after.height > 0 && !recordInterBlock( m, tu, compID, why, &after, false ) )
+  {
+    return false;
+  }
+  if( !recordInterBlock( m, tu, compID, why, &sub, true ) )
+  {
+    return false;
+  }
+  Tu& t = m.rec.back();
+  t.derive |= DERIVE_PREFIX;
+  if( t.spOffset >= 0 )
+  {
+    m.signPred[t.spOffset + 1] |= SP_ASBT;   // (SP_SIGNS)
+    const int32_t info[SP_ASBT_NUM] = { b.x, b.y, cols ? 0 : 1, pos, beforePred };
+    m.signPred.insert( m.signPred.end(), info, info + SP_ASBT_NUM );
+  }
+  return true;
+#else
+  why = "ASBT";
+  return false;
+#endif
+}
+
 void GpuIntraRec::recordInterCu( const CodingUnit& cu )
 {
   Impl& m = *m_impl;
@@ -8235,7 +8330,7 @@ void GpuIntraRec::recordInterCu( const CodingUnit& cu )
       {
         cpuFillBlock( m, comp, tu.blocks[comp] );
       }
-      else if( why || !recordInterBlock( m, tu, comp, why ) )
+      else if( why || !( isAsbt( tu, comp ) ? recordAsbtBlock( m, tu, comp, why ) : recordInterBlock( m, tu, comp, why ) ) )
       {
         cpuFillCu( m, cu, why );
         cpuFillBlock( m, comp, tu.blocks[comp] );

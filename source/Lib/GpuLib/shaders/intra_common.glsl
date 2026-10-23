@@ -695,6 +695,11 @@ const int SP_NUM       = 0;
 const int SP_SIGNS     = 1;
 const int SP_POS       = 2;
 const int SP_TEMPLATES = 10;
+// an ASBT sub-block's sign prediction (GpuIntraRec.cpp's recordAsbtBlock): SP_SIGNS' bit, its data then ending with
+// its TU block's position, whether the residual is rows (else columns), its position in the block, the offset of the
+// prediction of the block's part before it in Params::interPred (-1: none)
+const int SP_ASBT = 1 << 16;
+const int SP_ASBT_X = 0, SP_ASBT_Y = 1, SP_ASBT_ROWS = 2, SP_ASBT_POS = 3, SP_ASBT_PRED = 4;
 
 // xFillReferenceSamples' rule (GpuIntraRec.cpp's fillSource): the reconstructed sample (sx, sy) whose value entry idx
 // of the top or left arm of a reference line takes, for the area (fx, fy, fw, fh) filled with arms of predSize /
