@@ -449,7 +449,7 @@ wall-clock gains with threads are "the easy baseline". Decoder status: single-th
 (`--GpuLoopFilter=1`: ALF, SAO, BIF, CCSAO, LF-CCCM, offset refinement on Vulkan). The user then asked for **a full
 GPU decoder in Vulkan, optimized until nothing is left** ("The GPU decoder needs to fully decode the frame on the
 GPU"; "Your first Vulkan version is going to be slow. That's OK"). That work is branch `dec-gpurecon`: intra
-reconstruction on the GPU (`--GpuRecon`), tool levels M1-M113 done and verified bit-exact (M19: DIMD, M20: OBIC, M21:
+reconstruction on the GPU (`--GpuRecon`), tool levels M1-M114 done and verified bit-exact (M19: DIMD, M20: OBIC, M21:
 intra merge, M22: the transforms of DIMD CUs, M23: LFNST of MIP, M24: TIMD, M25: OBIC and intra merge with TIMD
 neighbours, M26: TIMD-SAD, M27: OBIC and intra merge with TIMD-SAD neighbours, M28: TIMD merge, M29: TMRL of luma,
 M30: chroma TMRL, M31: CCLM, M32: LFNST / NSPT of CCLM, M33: GLM's gradient patterns, M34: CCCM, M35: GL-CCCM, M36:
@@ -2758,6 +2758,15 @@ record's AF_WP points at wpRecord's record and afSample applies M112's weightUni
 intermediates (PROF in them), without the out-of-boundary masks. Not with LIC or non-local LIC. Results (50 streams,
 build wp2): every picture identical (ra_wpp_q32 skipped; ai_crowdrun832_q27 lost the device in the parallel run and
 passed alone); affine 1876 CUs predicted by the GPU (+83).
+M114 (2026-10-23): affine CIIP on the GPU (JVET-AG0135: DecCu blends an affine CIIP CU with
+geneWeightedCIIPAffinePred, the neighbours' weights alone - (wMerge inter + wIntra intra + 2) >> 2, luma's inter
+forward-mapped -, whatever the intra mode). affineGpu takes a CIIP CU where ciipAffine holds and ciipWhy finds nothing
+(not with CIIP-PDPC); ciipFields gives it CIIP_UNIFORM (M106's blend of those weights); the affine record's BCW
+weights are the default for CIIP (xWeightedAverage's plain average). The CPU-reason tally names an affine CIIP CU's
+blocker ("affine (CIIP: ...)"). Results (50 streams, build aciip1): every picture identical (ra_wpp_q32 skipped);
+affine 1927 CUs predicted by the GPU (+51); "affine (CIIP)" 212 -> CIIP with LIC 60, with LFNST / NSPT 54, OBMC of
+sub-block motion 13, inter CCP merge 4, inter CCCM 1, others 28 (non-affine CIIP, CIIP-PDPC, DMVR, weighted
+prediction with LIC neighbours).
 
 
 ## 8. Numbers (i7-10700 8C/16T, Win11, GCC 16.2, RTX 3070 driver 616.92)

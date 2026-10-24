@@ -7729,6 +7729,8 @@ static bool mcIdentical( const PredictionUnit& pu )
 
 static int mcSlot( GpuIntraRec::Impl& m, const Slice& slice, int l, int refIdx );
 
+static const char* ciipWhy( const CodingUnit& cu );
+
 // whether the GPU predicts affine CU cu (its OBMC: obmcPlan): without LIC / non-local LIC, sub-block merge or AMVP-SbTMVP, affine
 // sub-block BDOF or affine DMVR, 4:2:0, no weighted prediction, wrap-around, scaled reference, one clipping range
 static bool affineGpu( const CodingUnit& cu )
@@ -7738,7 +7740,12 @@ static bool affineGpu( const CodingUnit& cu )
   const PPS&            pps   = *cu.cs->pps;
   const SPS&            sps   = *cu.cs->sps;
   if( getenv( "ECM_GPU_NO_MC" ) || ( cu.licFlag && ( cu.licInheritPara || sps.getRprEnabledFlag() ) )
-      || ( cu.altLMFlag && sps.getRprEnabledFlag() ) || pu.ciipFlag || pu.mergeType != MRG_TYPE_DEFAULT_N
+      || ( cu.altLMFlag && sps.getRprEnabledFlag() ) || pu.mergeType != MRG_TYPE_DEFAULT_N
+#if JVET_AG0135_AFFINE_CIIP
+      || ( pu.ciipFlag && ( !pu.ciipAffine || pu.ciipPDPC || ciipWhy( cu ) ) )   // (affine CIIP, M114: ciipWhy's)
+#else
+      || pu.ciipFlag
+#endif
       || pu.amvpSbTmvpFlag || pu.bdmvrRefine || pu.availableBdofRefinedMv == AFFINE_SUBPU_BDOF_APPLY_AND_STORE_MV
       || pu.availableBdofRefinedMv == AFFINE_SUBPU_BDOF_APPLY_WITHOUT_STORE_MV || cu.chromaFormat != CHROMA_420
       || pps.getWrapAroundEnabledFlag() || clipMv != clipMvInPic
@@ -7795,8 +7802,8 @@ static void affineRecord( GpuIntraRec::Impl& m, const CodingUnit& cu )
   a[AF_BI]       = pu.interDir == 3 && !same ? 1 : 0;
   a[AF_LIST]     = pu.interDir == 2 ? 1 : 0;
   a[AF_SHIFT]    = iBit - 4 + MV_FRACTIONAL_BITS_INTERNAL;
-  a[AF_W0]       = getBcwWeight( cu.bcwIdx, REF_PIC_LIST_0 );
-  a[AF_W1]       = getBcwWeight( cu.bcwIdx, REF_PIC_LIST_1 );
+  a[AF_W0]       = getBcwWeight( pu.ciipFlag ? BCW_DEFAULT : cu.bcwIdx, REF_PIC_LIST_0 );   // (CIIP: the plain average)
+  a[AF_W1]       = getBcwWeight( pu.ciipFlag ? BCW_DEFAULT : cu.bcwIdx, REF_PIC_LIST_1 );
   a[AF_HMAX]     = (int) pps.getPicWidthInLumaSamples() + off - 1;
   a[AF_HMIN]     = -(int) sps.getMaxCUWidth() - off + 1;
   a[AF_VMAX]     = (int) pps.getPicHeightInLumaSamples() + off - 1;
@@ -7995,6 +8002,9 @@ static void ciipFields( GpuIntraRec::Impl& m, const CodingUnit& cu, const Compon
 #endif
 #if CIIP_PDPC
   kind = pu.ciipPDPC ? CIIP_EDGE : kind;   // (predIntraAng: its PDPC term, planar and DC only: ciipWhy)
+#endif
+#if JVET_AG0135_AFFINE_CIIP
+  kind = pu.ciipAffine ? CIIP_UNIFORM : kind;   // (geneWeightedCIIPAffinePred: the neighbours' weights alone)
 #endif
   const bool fwd = isLuma( compID ) && cu.slice->getLmcsEnabledFlag() && m.reshape->getCTUFlag();
   t.ciip         = CIIP_ON | kind | wIntra << CIIP_W | ( fwd ? CIIP_FWD : 0 );
@@ -9317,7 +9327,14 @@ void GpuIntraRec::recordInterCu( const CodingUnit& cu )
         std::vector<ObmcSeg> s;
         bool                 in  = false;
         const char*          why = nullptr;
-        kind += pu.ciipFlag ? " (CIIP)"
+        const char* cw = !pu.ciipFlag ? nullptr : ciipWhy( cu ) ? ciipWhy( cu )
+#if JVET_AG0135_AFFINE_CIIP
+                       : !pu.ciipAffine ? "not affine CIIP" : pu.ciipPDPC ? "CIIP-PDPC"
+#endif
+                       : pu.bdmvrRefine ? "with DMVR" : nullptr;
+        kind += pu.ciipFlag && ( cw || !affineGpu( cu ) || !cu.obmcFlag || !( why = obmcPlan( cu, s, in ) ) )
+                  ? std::string( " (CIIP" ) + ( cw ? std::string( ": " ) + cw : "" ) + ")"
+                : pu.ciipFlag ? std::string( " (CIIP: " ) + why + ")"
                 : ( cu.licFlag && cu.licInheritPara ) || ( ( cu.licFlag || cu.altLMFlag ) && cu.cs->sps->getRprEnabledFlag() )
                     ? " (with inherited LIC or resampling)"
                 : pu.mergeType != MRG_TYPE_DEFAULT_N || pu.amvpSbTmvpFlag ? " (sub-block merge)"
