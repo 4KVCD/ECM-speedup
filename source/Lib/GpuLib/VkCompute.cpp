@@ -786,7 +786,8 @@ void Kernel::create( Context& ctx, const uint32_t* spirv, size_t bytes, uint32_t
     pipelineInfo.stage.pName  = "main";
     pipelineInfo.stage.pSpecializationInfo = specialization.empty() ? nullptr : &spec;
     pipelineInfo.layout       = m_layout;
-    // (ECM_GPU_PIPELINE_TIMES: each pipeline's creation time on stderr; a cold intra_rec pipeline takes minutes, and
+    // (ECM_GPU_PIPELINE_TIMES: each pipeline's name before a compile and its creation time after, on stderr; a cold
+    // intra_rec pipeline takes minutes, and
     // VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT does not shorten it on NVIDIA's driver)
     const auto        start     = std::chrono::steady_clock::now();
     const std::string cachePath = pipelineCachePath( ctx, spirv, bytes, name, specialization );
@@ -802,6 +803,11 @@ void Kernel::create( Context& ctx, const uint32_t* spirv, size_t bytes, uint32_t
       {
         cache = VK_NULL_HANDLE;
       }
+    }
+    if( getenv( "ECM_GPU_PIPELINE_TIMES" ) && cached.empty() )   // (which one a long compile is)
+    {
+      fprintf( stderr, "[gpu] pipeline %s: compiling\n", name );
+      fflush( stderr );
     }
     res = vk.CreateComputePipelines( dev, cache, 1, &pipelineInfo, nullptr, &m_pipeline );
     if( cache != VK_NULL_HANDLE )

@@ -22,7 +22,9 @@ file( GLOB SHADER_INCLUDES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/shader
 # the kernels run up to 18 % slower); -O gives the speed and cold pipeline compile of -Os with half the SPIR-V IDs
 # (intra_rec 1.96M against 3.72M of the 4.19M a module may have: -Os inlines every call site). With ECM_SPIRV_OPT (the
 # Vulkan SDK's spirv-opt) glslang compiles without its optimizer and spirv-opt runs the same passes with a raised ID
-# limit and compacts the IDs (spv_build.cmake): no ID budget any more (intra_rec 0.28M IDs), ~5x faster
+# limit and compacts the IDs (spv_build.cmake): no ID budget any more (intra_rec 0.28M IDs), ~5x faster. glslang -O
+# passes the 4.19M IDs on intra_rec ("ID overflow", no module): without the SDK, perf/gpu/slangopt.cmd stands in for
+# spirv-opt with the SPIRV-Tools of NVIDIA Nsight Graphics (Slang's pass list, inlining as ECM_SPIRV_INLINE says)
 option( ECM_SPIRV_INLINE "with ECM_SPIRV_OPT: inline every call (glslang -O's pass list)" ON )
 set( GLSLANG_OPT -O CACHE STRING "glslang's optimization option for the shaders (-O; empty: none)" )
 set( SPV_DIR "${CMAKE_CURRENT_BINARY_DIR}/spv" )

@@ -449,7 +449,7 @@ wall-clock gains with threads are "the easy baseline". Decoder status: single-th
 (`--GpuLoopFilter=1`: ALF, SAO, BIF, CCSAO, LF-CCCM, offset refinement on Vulkan). The user then asked for **a full
 GPU decoder in Vulkan, optimized until nothing is left** ("The GPU decoder needs to fully decode the frame on the
 GPU"; "Your first Vulkan version is going to be slow. That's OK"). That work is branch `dec-gpurecon`: intra
-reconstruction on the GPU (`--GpuRecon`), tool levels M1-M116 done (M117, GPM affine parts, in progress) and verified bit-exact (M19: DIMD, M20: OBIC, M21:
+reconstruction on the GPU (`--GpuRecon`), tool levels M1-M117 done and verified bit-exact (M19: DIMD, M20: OBIC, M21:
 intra merge, M22: the transforms of DIMD CUs, M23: LFNST of MIP, M24: TIMD, M25: OBIC and intra merge with TIMD
 neighbours, M26: TIMD-SAD, M27: OBIC and intra merge with TIMD-SAD neighbours, M28: TIMD merge, M29: TMRL of luma,
 M30: chroma TMRL, M31: CCLM, M32: LFNST / NSPT of CCLM, M33: GLM's gradient patterns, M34: CCCM, M35: GL-CCCM, M36:
@@ -593,6 +593,13 @@ copy-only with the user's OK to C:\Code\tools\vksdk: `vulkansdk-windows-X64-1.4.
 passed as `-DECM_SPIRV_OPT=C:/Code/tools/vksdk/Bin/spirv-opt.exe`. The GPU must support Vulkan 1.3 compute with buffer device address and
 the **vulkanMemoryModel** feature (GpuIntraRec::create returns null otherwise); tested only on an RTX 3070 (driver
 616.92).
+Without the Vulkan SDK (the RTX 3070 PC): glslang -O cannot build intra_rec any more ("ID overflow", no module), and
+glslang without -O gives SPIR-V the driver compiles far slower. `-DECM_SPIRV_OPT=C:/Code/ECM/wt-gr/perf/gpu/slangopt.cmd
+-DECM_SPIRV_INLINE=OFF` stands in for spirv-opt with the SPIRV-Tools inside NVIDIA Nsight Graphics 2026.3.1
+(slang-glslang.dll, Slang's pass list with a raised ID limit, its inlining pass left out; slangopt.py says how). On
+this PC a cold intra_rec pipeline takes 1-10 minutes and 7-20+ GB, and a decoding process keeps 3-5 GB per pipeline
+it compiled: run `precompile.py` with `ECM_GPU_SLOTS=1` (two at a time pass the 60 GB budget) before partial
+verification, and partial.py with -j 1 or 2 once the pipelines are in runs/pipecache.
 
 Builds (from a worktree, e.g. `C:\Code\ECM\wt-gr` on branch dec-gpurecon):
 ```
@@ -694,7 +701,10 @@ commands that combine `Remove-Item` with `//` text. `perf\gpu\crlf.ps1 <worktree
 
 | script | use |
 |---|---|
-| `partial.py <build> [-j N] [streams]` | partial verification of the 19 regular streams (C:\Code\ECM\streams): per stream the pictures verified / differing and the first difference, then the CUs taken from the CPU by reason; logs in runs/partial. The test gate of every step since M57 |
+| `partial.py <build> [-j N] [streams]` | partial verification of the 19 regular streams (C:\Code\ECM\streams): per stream the pictures verified / differing and the first difference, then the CUs taken from the CPU by reason; logs in runs/partial. The test gate of every step since M57. A stream given as a path (`C:/Code/ECM/streams_ld/ld_foreman_q32.bin`) runs from there: the RTX 3070 PC's inter streams (LD-B, LD-P, RA of foreman / ParkJoy / FourPeople, made with grn's EncoderApp and the ECM cfgs) are in C:\Code\ECM\streams_ld |
+| `inline_size.py <module.spv> [N]` | a shader's size with every call inlined (what the drivers compile) and the functions that make it; check inter_mc / intra_rec after adding a call to a large function |
+| `slangopt.cmd` / `slangopt.py` | spirv-opt's stand-in from Nsight Graphics' SPIRV-Tools (section 4's build without the SDK); `ECM_GPU_INTRA_REC_SPV=<file.spv>` / `ECM_GPU_INTER_MC_SPV=<file.spv>` make a decoder take that module for intra_rec's first module / inter_mc (an experiment on a changed shader, e.g. the driver's compile, without a rebuild) |
+| development switches | `ECM_GPU_NO_CCP_LFNST=1`: partial verification leaves the pictures that need LEVEL_CCP_LFNST's pipeline (intra_rec's second module) unverified - on the 3070 PC its cold compile needs over 35 GB, past the budget, and most intra pictures need it. `ECM_GPU_CPU_KINDS=GPM,affine,...`: those inter CU kinds (interKind's names) keep the CPU's prediction (which kind a difference is in). `ECM_GPU_PIPELINE_TIMES=1` also names a pipeline before it compiles |
 | `precompile.py <build> [-j N] [variant:level ...]` | compiles intra_rec's pipelines into runs/nvcache and runs/pipecache (see 1a: after a shader change `8:0` .. `8:6`) |
 | `verify_all.py [-j N] <build> [streams]` | the full regression: `--GpuRecon=2` over the 444 GPU test streams (C:\Code\ECM\streams_gpu); M66 baseline 1565 verified, 8 skipped, 0 differences |
 | `cpu_cus.py <build> ...` | sums partial.py's "CUs taken from the CPU" per reason over the logs: what to port next |
@@ -2854,20 +2864,58 @@ reaches every block where it has inner OBMC. Results (50 streams, build gpmd1): 
 skipped); GPM 849 CUs predicted by the GPU (+237), regression-based blending 192 (+91); "a DMVR part" 240 and
 regression's 90 -> 0.
 
-M117 (2026-10-24, work in progress, committed unfinished on request): GPM affine parts on the GPU (affineGPM[0/1]).
+M117 (2026-10-24): GPM affine parts on the GPU (affineGPM[0/1]).
 gpuGeoBio records the affine part's fields and motion buffer (m_gpuGeoAff[2][17]); each affine part gets an affine
 record (affineRecord on the CU with the part's motion, inside withPartMotion), which gpmPart reads (MC_AFFINE, record
 index in MC_BDOF_OUT). The kind-2 blend takes gpmPartFinal: with separate OBMC the part as it is, else (MC_GPM_RBD, the
 low-delay case) roundBD of its intermediate, as roundToOutputBitdepth. Inner sub-block OBMC of an affine part is luma
 only (OBMC_REC_SUB_LUMA, innerObmcSkipChroma via m_gpuSubMotion / gpuGeoSub); obmcJob's skip test of part 1 reads
-part 1 (OBMC_P1). Status (build gpma1): ra_crowdrun_q32 and ra_foreman_q22 identical; ld_foreman_q32 differs in 1
-picture (POC 1, CU 128,128 32x16) and ld_parkjoy_q27 in 2. Not yet run on all 50 streams. Finding so far: in that CU
-part 1 is the affine part (uni L0) and part 0 a plain uni-L0 part; the GPU is +1 over the whole region of part 0
-(the non-affine part), uniformly, so the cause is a rounding or filter choice of part 0 on the MC_GPM_RBD path, not
-its motion or OBMC (affine part 1 matches; computing part 1 at the final precision changed nothing). Next: check
-the CPU's useBiFilter / m_geoOBMC for part 0's xPredInterBlk (the sharp bi filter of the intermediate, mcTaps' bi &&
-W > 4 && H > 4) against gpmPart's mcPredict( ..., !fin ), fix, run the 50 streams. Until then low-delay GPM with an
-affine part is not bit-exact on the GPU.
+part 1 (OBMC_P1). Status (build gpma1, Intel PC): ra_crowdrun_q32 and ra_foreman_q22 identical; ld_foreman_q32
+differed in 1 picture (POC 1, CU 128,128 32x16: the GPU +1 over all of part 0, a plain uni-L0 part, beside affine part
+1) and ld_parkjoy_q27 in 2.
+Continued on the RTX 3070 PC (2026-10-24), two causes:
+- The +1: MC_GPM_RBD's rounded part left out the LIC model the part inherits from its merge candidate, which the geo
+  blend (MC_GPM) applies on the intermediate (mcLicBi) - a model of scale 32 and offset -1 is a uniform +1.
+  gpmPartAt now gives a part at the final precision (GPM_FINAL), at the intermediate with its LIC (GPM_INTER) or that
+  rounded (GPM_ROUNDED, roundToOutputBitdepth) for every GPM path: the geo blend, the rounded blend's two parts, the
+  inter part beside an intra part (that one had the same omission without separate OBMC).
+- NVIDIA's driver could not compile inter_mc any more: M117's affine parts put afSample / afList (~100k SPIR-V
+  instructions) into gpmPart, which had 34 inlined copies (gpmPartLic, gpmPartFinal, mcSampleBase's five callers);
+  inter_mc grew from 0.70M instructions fully inlined (M116) to 3.88M, and the 3070's driver took over 40 GB and
+  15 minutes for it (the decoder was stopped at the 60 GB budget; every pipeline creation after scan's waits for
+  it). gpmPart now has one call site (gpmPartAt, called once in mcSampleBase in a loop over the parts with
+  [[dont_unroll]]), and mcSample four (main takes the block's and GPM part 1's predictions in such a loop;
+  obmcInnerJob's luma and chroma calls are one): 0.84M, compiled in ~4-7 minutes and ~11 GB (obmcJob's two calls in
+  such a loop too would make 0.65M; dropped as a suspect of the device losses below, which turned out to be older).
+  perf/gpu/inline_size.py shows a module's inlined size and the functions that make it.
+Found on the way, on the 3070 PC's new streams (C:\Code\ECM\streams_ld):
+- A GPM part's own OBMC (the rounded blend: each part's subBlockOBMC) runs on the CPU with the part's LIC in the CU
+  (motionCompensationGeo's setMergeInfo for the part), and selectOBMCmode predicts the template of the CU's motion
+  with it; obmcJobs took the CU's final LIC (the last part's). withPartMotion now puts the part's LIC flag and models
+  (its record's GPM_LIC_MODELS) into the CU beside its motion (ld_parkjoy_q27 POC 1 and 2: a plain part with LIC beside
+  an affine part, the GPU 1 low in the OBMC band).
+- The host's temporal CCP merge candidates (temporalAt) read the collocated picture at positions the CPU never reads:
+  the CPU stops at a full list, the host goes on, and a vector shift can move a later position above or left of the
+  picture, where getCcpmIdxInfo's CHECK ends the decoder (ldp_parkjoy_q27, ra_parkjoy_q32, ra720_pj17 at M116). Such
+  positions are skipped.
+Results (RTX 3070 PC, build grn4 = slangopt without inlining, ECM_GPU_NO_CCP_LFNST=1, partial.py -j 2; M116 built the
+same way as m116 from a detached worktree, C:\Code\ECM\wt-m116, its intra_rec module byte for byte the same):
+- the 19 regular streams: no new difference. The ones that differ do at M116 too (intra: ai_long POC 5 NN's
+  indicesRepresentationPnn, ld_md5 POC 0 scheduling data and POC 40 an SGPM CU's DIMD mode, ra_ip64_md5 an SGPM CU's
+  MTSS LFNST mode); ra720_pj17 differs in 5 pictures, which M116 never reached (it ended at POC 0 on the CCP CHECK, as
+  on ra_long; ld_cif33 lost the device under M116). Over the 16 streams both decoded whole: inter CUs predicted by the
+  GPU 7155 -> 7484 (GPM 493 -> 822), by the CPU 995 -> 666 ("GPM (an affine part)" 431 -> 0; 44 with an intra part
+  stay the CPU's).
+- the inter streams of streams_ld: ld_foreman_q32, ldp_foreman_q32, ld_four_q32, ra_foreman_q32 identical;
+  ld_parkjoy_q27 POC 1 and 2 identical now, POC 7 and 8 differ as at M116 (POC 7: an affine sub-block merge CU with
+  OBMC, 128 x 128, GPU 104 for 98 - gone with OBMC or LIC CUs on the CPU; POC 8: a 4 x 4 AMVP-SbTMVP CU of a uni-L0
+  run, the GPU exactly twice the CPU's value, and an OBMC CU with DMVR); ldp_parkjoy_q27 (3 pictures, the first an
+  inter block 1 low) and ra_parkjoy_q32 (2) differ as at M116 (with the CCP fix in the m116 worktree);
+  ld_foreman_q22 identical when it runs through.
+- Device losses (VK_ERROR_DEVICE_LOST ~6 s into the decode, i.e. a hang reaching Windows' 2 s timeout) come and go:
+  ld_foreman_q22 alone lost it in 2 of 5 runs with this build and 1 of 5 with M116; ld_cif33 under parallel load
+  (with M116 too). Not yet found; a dependency wait that never resolves in a persistent kernel would look like this.
+- Intra pictures: most need LEVEL_CCP_LFNST's pipeline and stay unverified on this PC (ECM_GPU_NO_CCP_LFNST).
 
 ## 8. Numbers (i7-10700 8C/16T, Win11, GCC 16.2, RTX 3070 driver 616.92)
 
@@ -2888,7 +2936,31 @@ Profile of a GPU-on decode (non-LTO, m2_park16, share of all samples): parsing ~
 
 ## 9. Next steps (in the order I would take them)
 
-0. Now (2026-10-15, the intra phase; the user's order: all intra first, then inter), by the CPU CUs they free:
+00. Now (2026-10-24, the inter phase, after M117; on the RTX 3070 PC):
+   a. Open differences of the 3070 PC's streams, all older than M117 (M116 the same), each with what is known:
+      - ld_parkjoy_q27 POC 8, the 4 x 4 AMVP-SbTMVP CU at 232,16 (its one xSubPuMC run: bi with identical lists,
+        (32, -8) on reference 0, a DM_UNI run): the CPU's run output is the CPU's prediction (163 100 169 372 ...),
+        the run's recorded motion, the host's job (DM_X, DM_REF0, DM_MVS) and sbRun agree with it, yet the GPU's
+        block is the CPU's two columns to the left (as if the 2 integer samples of x were lost, or stale data in
+        pc.bdofOut). Next: read the GPU's bdofOut at that job's DM_DST after the dispatch.
+      - ld_parkjoy_q27 POC 7 (an affine sub-block merge CU 128 x 128 at 0,128 with OBMC, GPU 104 for 98; gone with
+        the OBMC or the LIC CUs on the CPU - a neighbour's OBMC?) and POC 8's OBMC CU with DMVR at 128,0;
+        ldp_parkjoy_q27 (an inter block 1 low at 36,76, derive 0x10000040), ra_parkjoy_q32 (an OBIC mode after
+        inter differences).
+      - intra: ai_long POC 5 (NN's indicesRepresentationPnn), ld_md5 POC 0 (scheduling data) and POC 40 (an SGPM
+        CU's DIMD mode), ra_ip64_md5 (an SGPM CU's MTSS LFNST mode), ra720_pj17 (5 pictures).
+      - the intermittent device losses (section 7's M117 results).
+      ECM_GPU_CPU_KINDS narrows a difference to a kind (sub-PU CUs go their own way, not through it).
+   b. intra_rec's second module (LEVEL_CCP_LFNST) cannot compile on the 3070 within the 60 GB budget (>35 GB), and
+      most intra pictures need it; the first module's pipelines take 1-15 minutes and 7-30 GB each. Its inlined size
+      (inline_size.py: 1.19M, 1.0M for the first module) comes mostly from small helpers in hand-unrolled taps
+      (recoAt x7097, cccmLumaOf, glmGradient, cclmLumaInner): loops over the taps would cut it - a speed trade to
+      time, and every intra test after it.
+   c. Then the CPU's inter CUs by count (19 regular streams, grn4): GPM separate OBMC with an intra neighbour 500,
+      LIC with DMVR 429, GPM LIC 260, GPM an intra part of SGPM 251, CIIP with LFNST / NSPT 202, CIIP with LIC 197,
+      GPM separate OBMC with a LIC part 194, GPM an affine part with an intra part 138, CIIP with inter CCP merge 137.
+
+0. Earlier (2026-10-15, the intra phase; the user's order: all intra first, then inter), by the CPU CUs they free:
    a. Done (2026-10-16): M67, committed on dec-gpurecon from the WIP commit's diff (the branch
       dec-gpurecon-m67-wip keeps the WIP commit as it was pushed).
    a2. Done (2026-10-22, M77; found 2026-10-16): the two single-tree intra

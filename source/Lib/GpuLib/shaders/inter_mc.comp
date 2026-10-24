@@ -32,6 +32,7 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_control_flow_attributes : require
 
 #include "common.glsl"
 
@@ -1273,19 +1274,41 @@ int gpmPart( BufI32 jb, int o, int k, int comp, int x, int y, int puW, int puH, 
                     mv.y & mask, false, !fin, puW, puH, bd, clipMin, clipMax );
 }
 
-// GPM part k at the final precision for the rounded blend: as it is with separate OBMC, else (MC_GPM_RBD) roundBD of
-// its intermediate (roundToOutputBitdepth)
-int gpmPartFinal( BufI32 jb, int o, int k, int comp, int x, int y, int puW, int puH, int bd, int clipMin, int clipMax )
+// how gpmPartAt gives a GPM part
+const int GPM_FINAL   = 0;   // at the final precision, as it is (gpmPart's fin)
+const int GPM_INTER   = 1;   // at the 14-bit intermediate with the LIC model the part inherits from its merge candidate
+                             // (xPredInterBlk's geo branch on the intermediate, where the component's model is not the
+                             // identity; MC_W0 / MC_W1 its LIC flag, MC_OOB's bit k its list, the models at MC_NLIC_AT)
+const int GPM_ROUNDED = 2;   // GPM_INTER's rounded to the final precision (roundToOutputBitdepth's roundBD)
+
+// GPM part k of job o at component sample (x, y), as how says. gpmPart has this one call site, and mcSampleBase calls
+// this once: the driver inlines every call, and an affine part's prediction makes gpmPart ~100k SPIR-V instructions
+// (NVIDIA's compiler took over 40 GB and 15 minutes for inter_mc where each call site had its copy)
+int gpmPartAt( BufI32 jb, int o, int k, int comp, int x, int y, int puW, int puH, int bd, int clipMin, int clipMax,
+               int how )
 {
-  if( ( jb.v[o + MC_FLAGS] & MC_GPM_RBD ) == 0 )
+  const int q = gpmPart( jb, o, k, comp, x, y, puW, puH, bd, clipMin, clipMax, how == GPM_FINAL );
+  if( how == GPM_FINAL )
   {
-    return gpmPart( jb, o, k, comp, x, y, puW, puH, bd, clipMin, clipMax, true );
+    return q;
   }
-  const int q = gpmPart( jb, o, k, comp, x, y, puW, puH, bd, clipMin, clipMax, false ), headRoom = max( 2, IF_INTERNAL_PREC - bd );
-  return clamp( ( q + ( 1 << ( headRoom - 1 ) ) + IF_INTERNAL_OFFS ) >> headRoom, clipMin, clipMax );
+  const int l = ( jb.v[o + MC_OOB] >> k ) & 1, lo = jb.v[o + MC_NLIC_AT] + 12 * k, m = lo + ( l * 3 + comp ) * 2;
+  BufI32    lb = BufI32( pc.affine );
+  const int ql = jb.v[o + ( k == 0 ? MC_W0 : MC_W1 )] == 0 || ( lb.v[m] == 32 && lb.v[m + 1] == 0 )
+                   ? q
+                   : mcLicBi( lb, lo, l, comp, q, bd, clipMin, clipMax );
+  if( how == GPM_INTER )
+  {
+    return ql;
+  }
+  const int headRoom = max( 2, IF_INTERNAL_PREC - bd );
+  return clamp( ( ql + ( 1 << ( headRoom - 1 ) ) + IF_INTERNAL_OFFS ) >> headRoom, clipMin, clipMax );
 }
 
-int mcSampleBase( BufI32 jb, int o, int comp, int x, int y, int puW, int puH, int bd, int clipMin, int clipMax, int lo )
+// job o's prediction at component sample (x, y) (with part1, a GPM job's: its part 1's at the final precision, which
+// separate OBMC and the rounded blend take apart)
+int mcSampleBase( BufI32 jb, int o, int comp, int x, int y, int puW, int puH, int bd, int clipMin, int clipMax, int lo,
+                  bool part1 )
 {
   const int   flags = jb.v[o + MC_FLAGS];
   BufI32      lb    = jb;   // (where the models are)
@@ -1309,37 +1332,42 @@ int mcSampleBase( BufI32 jb, int o, int comp, int x, int y, int puW, int puH, in
     return int( BufI16( pc.bdofOut )
                   .v[jb.v[o + MC_BDOF_OUT] + ( y - ( jb.v[o + MC_PU_Y] >> cs ) ) * puW + x - ( jb.v[o + MC_PU_X] >> cs )] );
   }
-  if( ( flags & MC_GPM_INTRA ) != 0 )   // GPM with an intra part: the inter part's final prediction
+  if( ( flags & ( MC_GPM_INTRA | MC_GPM_SEP | MC_GPM ) ) != 0 )
   {
-    const int k = ( flags & MC_GPM_I1 ) != 0 ? 1 : 0;
-    if( ( flags & MC_GPM_FIN ) != 0 )
+    // the GPM parts the job takes, through gpmPartAt's one call site (a loop the compiler is asked not to unroll):
+    // - with an intra part (MC_GPM_INTRA) the inter part's (MC_GPM_I1: part 1) final prediction: as it is with
+    //   separate OBMC (MC_GPM_FIN), else rounded
+    // - the rounded blend after each part's OBMC (MC_GPM_SEP): part 0's (part1: part 1's) final prediction, rounded
+    //   without separate OBMC (MC_GPM_RBD: an affine part's blend in low delay), else as it is
+    // - the geo blend (MC_GPM): both parts' 14-bit predictions, weighed by the host's weights (of 32)
+    int k0 = 0, n = 1, how = GPM_INTER;
+    if( ( flags & MC_GPM_INTRA ) != 0 )
     {
-      return gpmPart( jb, o, k, comp, x, y, puW, puH, bd, clipMin, clipMax, true );
+      k0  = ( flags & MC_GPM_I1 ) != 0 ? 1 : 0;
+      how = ( flags & MC_GPM_FIN ) != 0 ? GPM_FINAL : GPM_ROUNDED;
     }
-    const int q = gpmPart( jb, o, k, comp, x, y, puW, puH, bd, clipMin, clipMax, false );
-    return clamp( ( q + ( 1 << ( headRoom - 1 ) ) + IF_INTERNAL_OFFS ) >> headRoom, clipMin, clipMax );   // (roundBD)
-  }
-  if( ( flags & MC_GPM_SEP ) != 0 )   // GPM with separate OBMC: part 0's final prediction (part 1's: main)
-  {
-    return gpmPartFinal( jb, o, 0, comp, x, y, puW, puH, bd, clipMin, clipMax );
-  }
-  if( ( flags & MC_GPM ) != 0 )   // GPM: both parts' 14-bit predictions weighed by the host's weights (of 32)
-  {
-    int q0 = gpmPart( jb, o, 0, comp, x, y, puW, puH, bd, clipMin, clipMax, false );
-    int q1 = gpmPart( jb, o, 1, comp, x, y, puW, puH, bd, clipMin, clipMax, false );
-    // (a part's LIC, inherited from its merge candidate: xPredInterBlk's geo branch on the intermediate, where the
-    // component's model is not the identity)
-    const int lo = jb.v[o + MC_NLIC_AT], lists = jb.v[o + MC_OOB];
-    const int m0 = lo + ( ( lists & 1 ) * 3 + comp ) * 2, m1 = lo + 12 + ( ( ( lists >> 1 ) & 1 ) * 3 + comp ) * 2;
-    BufI32    lb = BufI32( pc.affine );
-    q0 = jb.v[o + MC_W0] == 0 || ( lb.v[m0] == 32 && lb.v[m0 + 1] == 0 ) ? q0
-         : mcLicBi( lb, lo, lists & 1, comp, q0, bd, clipMin, clipMax );
-    q1 = jb.v[o + MC_W1] == 0 || ( lb.v[m1] == 32 && lb.v[m1 + 1] == 0 ) ? q1
-         : mcLicBi( lb, lo + 12, ( lists >> 1 ) & 1, comp, q1, bd, clipMin, clipMax );
-    const int w  = BufI32( pc.affine ).v[jb.v[o + MC_BDOF_OUT] + ( y - ( jb.v[o + MC_PU_Y] >> cs ) ) * puW + x
-                                        - ( jb.v[o + MC_PU_X] >> cs )];
+    else if( ( flags & MC_GPM_SEP ) != 0 )
+    {
+      k0  = part1 ? 1 : 0;
+      how = ( flags & MC_GPM_RBD ) != 0 ? GPM_ROUNDED : GPM_FINAL;
+    }
+    else
+    {
+      n = 2;
+    }
+    int q[2];
+    [[dont_unroll]] for( int i = 0; i < n; i++ )
+    {
+      q[i] = gpmPartAt( jb, o, k0 + i, comp, x, y, puW, puH, bd, clipMin, clipMax, how );
+    }
+    if( n == 1 )
+    {
+      return q[0];
+    }
+    const int w = BufI32( pc.affine ).v[jb.v[o + MC_BDOF_OUT] + ( y - ( jb.v[o + MC_PU_Y] >> cs ) ) * puW + x
+                                       - ( jb.v[o + MC_PU_X] >> cs )];
     const int shiftW = headRoom + 5, offsetW = ( 1 << ( shiftW - 1 ) ) + ( IF_INTERNAL_OFFS << 5 );
-    return clamp( ( w * q0 + ( 32 - w ) * q1 + offsetW ) >> shiftW, clipMin, clipMax );
+    return clamp( ( w * q[0] + ( 32 - w ) * q[1] + offsetW ) >> shiftW, clipMin, clipMax );
   }
   return mcPlain( jb, o, lb, comp, x, y, puW, puH, bd, clipMin, clipMax, lo );
 }
@@ -1406,10 +1434,12 @@ int mcPlain( BufI32 jb, int o, BufI32 lb, int comp, int x, int y, int puW, int p
   return clamp( ( p0 * jb.v[o + MC_W0] + p1 * jb.v[o + MC_W1] + offset ) >> shiftNum, clipMin, clipMax );
 }
 
-// mcSampleBase's sample, with MC_NLIC the CU's non-local LIC model on it
-int mcSample( BufI32 jb, int o, int comp, int x, int y, int puW, int puH, int bd, int clipMin, int clipMax, int lo )
+// mcSampleBase's sample, with MC_NLIC the CU's non-local LIC model on it (never a GPM job's: gpmWhy leaves such CUs to
+// the CPU). Called from four places (main, obmcJob's two, obmcInnerJob), as the driver inlines it whole at each
+int mcSample( BufI32 jb, int o, int comp, int x, int y, int puW, int puH, int bd, int clipMin, int clipMax, int lo,
+              bool part1 )
 {
-  const int v = mcSampleBase( jb, o, comp, x, y, puW, puH, bd, clipMin, clipMax, lo );
+  const int v = mcSampleBase( jb, o, comp, x, y, puW, puH, bd, clipMin, clipMax, lo, part1 );
   return ( jb.v[o + MC_FLAGS] & MC_NLIC ) == 0 ? v
          : mcLic( BufI32( pc.affine ), jb.v[o + MC_NLIC_AT], 0, comp, v, clipMin, clipMax );
 }
@@ -1507,16 +1537,16 @@ void obmcJob( int o, int lid )
     {
       const int x = cx + i % cw, y = cy + i / cw;
       mcNoSharp = ( jb.v[o + MC_FLAGS] & MC_NO_SHARP ) != 0;
-      int nbv = mcSample( jb, o, comp, x, y, cw, ch, bd, clipMin, clipMax, lic );
+      int nbv = mcSample( jb, o, comp, x, y, cw, ch, bd, clipMin, clipMax, lic, false );
       mcNoSharp = false;
       nbv     = nlic < 0 ? nbv : mcLic( jb, nlic, 0, comp, nbv, clipMin, clipMax );
       od.v[predOff[comp] + i] = int16_t( nbv );
       // skipObmcConditionByPixel: each list of the neighbour's motion at its integer vector, uni-prediction of the band
-      // (no lists: no test - GPM's separate OBMC, m_geoOBMC)
+      // (no lists: no test - GPM's separate OBMC, m_geoOBMC), against the CU's prediction there (a GPM CU's part 1:
+      // part 1's, OBMC_P1)
       const int before = jb.v[o + OBMC_J_INT_DIR] == 0 ? 0
-                         : ( jb.v[o + OBMC_J_FLAGS] & OBMC_P1 ) != 0   // (a GPM CU's part 1: its own prediction)
-                           ? gpmPartFinal( base, bj, 1, comp, x, y, base.v[bj + MC_PU_W], base.v[bj + MC_PU_H], bd, clipMin, clipMax )
-                           : mcSample( base, bj, comp, x, y, base.v[bj + MC_PU_W], base.v[bj + MC_PU_H], bd, clipMin, clipMax, -1 );
+                         : mcSample( base, bj, comp, x, y, base.v[bj + MC_PU_W], base.v[bj + MC_PU_H], bd, clipMin,
+                                     clipMax, -1, ( jb.v[o + OBMC_J_FLAGS] & OBMC_P1 ) != 0 );
       for( int l = 0; l < 2; l++ )
       {
         if( ( jb.v[o + OBMC_J_INT_DIR] & ( 1 << l ) ) != 0 )
@@ -1584,17 +1614,11 @@ void obmcInnerJob( int o, int lid )
     {
       continue;
     }
-    int v;
-    if( s < 16 )
-    {
-      v = mcSample( jb, o + OBMC_I_NB + k * MC_JOB, 0, sx + ( s & 3 ), sy + ( s >> 2 ), 4, 4, bd, clipMin, clipMax, -1 );
-    }
-    else
-    {
-      const int c = s - 16, comp = 1 + c / 4;
-      v = mcSample( jb, o + OBMC_I_NB + k * MC_JOB, comp, ( sx >> 1 ) + ( c & 1 ), ( sy >> 1 ) + ( ( c >> 1 ) & 1 ), 2, 2, bd,
-                    clipMin, clipMax, -1 );
-    }
+    // (16 luma samples, then 4 of Cb and 4 of Cr)
+    const int c = s - 16, comp = s < 16 ? 0 : 1 + c / 4, size = s < 16 ? 4 : 2;
+    const int x = s < 16 ? sx + ( s & 3 ) : ( sx >> 1 ) + ( c & 1 );
+    const int y = s < 16 ? sy + ( s >> 2 ) : ( sy >> 1 ) + ( ( c >> 1 ) & 1 );
+    const int v = mcSample( jb, o + OBMC_I_NB + k * MC_JOB, comp, x, y, size, size, bd, clipMin, clipMax, -1, false );
     od.v[dst + 1 + i] = int16_t( v );
   }
 }
@@ -1628,16 +1652,15 @@ void main()
     const int o    = j * MC_JOB;
     const int comp = jb.v[o + MC_COMP], bx = jb.v[o + MC_X], by = jb.v[o + MC_Y], W = jb.v[o + MC_W], H = jb.v[o + MC_H];
     const int dst = jb.v[o + MC_DST], bd = jb.v[o + MC_BD];
+    // (GPM's rounded blend, MC_GPM_SEP: part 1's final prediction too, at MC_BDOF_TH; one call site)
+    const int parts = ( jb.v[o + MC_FLAGS] & MC_GPM_SEP ) != 0 ? 2 : 1;
     for( int i = lid; i < W * H; i += 64 )
     {
-      const int v = mcSample( jb, o, comp, bx + i % W, by + i / W, jb.v[o + MC_PU_W], jb.v[o + MC_PU_H], bd,
-                              jb.v[o + MC_CLIP_MIN], jb.v[o + MC_CLIP_MAX], -1 );
-      BufI16( pc.outPred ).v[dst + i] = int16_t( v );
-      if( ( jb.v[o + MC_FLAGS] & MC_GPM_SEP ) != 0 )   // (GPM with separate OBMC: part 1's final prediction)
+      [[dont_unroll]] for( int part = 0; part < parts; part++ )
       {
-        BufI16( pc.outPred ).v[jb.v[o + MC_BDOF_TH] + i] =
-          int16_t( gpmPartFinal( jb, o, 1, comp, bx + i % W, by + i / W, jb.v[o + MC_PU_W], jb.v[o + MC_PU_H], bd,
-                                 jb.v[o + MC_CLIP_MIN], jb.v[o + MC_CLIP_MAX] ) );
+        const int v = mcSample( jb, o, comp, bx + i % W, by + i / W, jb.v[o + MC_PU_W], jb.v[o + MC_PU_H], bd,
+                                jb.v[o + MC_CLIP_MIN], jb.v[o + MC_CLIP_MAX], -1, part == 1 );
+        BufI16( pc.outPred ).v[( part == 0 ? dst : jb.v[o + MC_BDOF_TH] ) + i] = int16_t( v );
       }
     }
   }

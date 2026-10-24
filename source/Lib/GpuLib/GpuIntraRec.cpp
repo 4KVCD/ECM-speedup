@@ -73,6 +73,7 @@
 #include <cstddef>
 #include <cstdio>
 #include <cstring>
+#include <fstream>
 
 namespace
 {
@@ -1501,6 +1502,25 @@ struct Shared
   }
 };
 
+// development: where the environment variable var names a SPIR-V file, that module (read into storage) replaces the
+// built-in one (code, size in bytes) - an experiment on a changed shader, e.g. on the driver's compile, without
+// rebuilding the decoder (ECM_GPU_INTRA_REC_SPV: intra_rec's first module; ECM_GPU_INTER_MC_SPV: inter_mc)
+void replacedModule( const char* var, std::vector<uint32_t>& storage, const uint32_t*& code, size_t& size )
+{
+  const char* file = getenv( var );
+  if( !file )
+  {
+    return;
+  }
+  std::ifstream in( file, std::ios::binary | std::ios::ate );
+  storage.resize( in ? size_t( in.tellg() ) / 4 : 0 );
+  in.seekg( 0 );
+  in.read( reinterpret_cast<char*>( storage.data() ), storage.size() * 4 );
+  CHECK( !in || storage.empty(), std::string( var ) + ": cannot read " + file );
+  code = storage.data();
+  size = storage.size() * 4;
+}
+
 // intra_rec's pipeline of a variant, compiled the first time a picture needs it (by any thread: the decoder contexts
 // share it). Compiling all of them up front cost ~11 s each where the driver's shader cache misses (a new build), and a
 // stream rarely needs more than two. Not while the caller's stream is recording: creating a pipeline waits until no
@@ -1560,10 +1580,15 @@ gpu::Kernel& intraRecKernel( const Shared& sh, gpu::Context& ctx, IntraRecVarian
     constants.push_back( lm >= LEVEL_CCP_MERGE ? 1 : 0 );
     constants.push_back( lm >= LEVEL_CCP_DERIVED ? 1 : 0 );
     constants.push_back( variant == VARIANT_MPM ? 1 : 0 );   // WITH_MPM
-    const bool lfnst = lm == LEVEL_CCP_LFNST;
-    sh.kernel[variant][lm].create( ctx, lfnst ? spv_intra_rec_lfnst : spv_intra_rec,
-                                   lfnst ? sizeof( spv_intra_rec_lfnst ) : sizeof( spv_intra_rec ), sizeof( Push ),
-                                   NAMES[variant][lm], constants );
+    const bool            lfnst = lm == LEVEL_CCP_LFNST;
+    std::vector<uint32_t> replacement;
+    const uint32_t*       code = lfnst ? spv_intra_rec_lfnst : spv_intra_rec;
+    size_t                size = lfnst ? sizeof( spv_intra_rec_lfnst ) : sizeof( spv_intra_rec );
+    if( !lfnst )
+    {
+      replacedModule( "ECM_GPU_INTRA_REC_SPV", replacement, code, size );
+    }
+    sh.kernel[variant][lm].create( ctx, code, size, sizeof( Push ), NAMES[variant][lm], constants );
   } );
   return sh.kernel[variant][lm];
 }
@@ -1750,7 +1775,11 @@ Shared* createShared( gpu::Context& ctx )
   sh->kernelResi.create( ctx, spv_intra_resi, sizeof( spv_intra_resi ), sizeof( Push ), "intra_resi" );
   sh->kernelDeps.create( ctx, spv_intra_deps, sizeof( spv_intra_deps ), sizeof( Push ), "intra_deps" );
   sh->kernelScan.create( ctx, spv_scan, sizeof( spv_scan ), sizeof( PushScan ), "scan" );
-  sh->kernelMc.create( ctx, spv_inter_mc, sizeof( spv_inter_mc ), sizeof( PushMc ), "inter_mc" );
+  std::vector<uint32_t> mcModule;
+  const uint32_t*       mcCode = spv_inter_mc;
+  size_t                mcSize = sizeof( spv_inter_mc );
+  replacedModule( "ECM_GPU_INTER_MC_SPV", mcModule, mcCode, mcSize );
+  sh->kernelMc.create( ctx, mcCode, mcSize, sizeof( PushMc ), "inter_mc" );
 
   // tables, from the C++ tables themselves
   sh->bif.reset( new BilateralFilter );   // BilateralFilter::create derives the LUTs
@@ -5651,10 +5680,16 @@ static void ccpMergeSources( GpuIntraRec::Impl& m, const PredictionUnit& pu, std
     CHECK( !m.partial, "temporal CCP merge candidates outside partial verification" );
     const SubPic&  subPic = slice.getPPS()->getSubPicFromPos( pu.lumaPos() );
     const Position posRB = cb.bottomRight().offset( -1, -1 ), posCenter = cb.center();
+    // (the CPU tests the right / bottom bounds alone, but stops at a full list; this goes on, and a vector shift can
+    // move a later position above or left of the picture, which getCcpmIdxInfo refuses - the CPU never reads one there)
     auto inside = [&]( const Position& p, int dx, int dy )
     {
       dx += shift.hor;
       dy += shift.ver;
+      if( p.x + dx < 0 || p.y + dy < 0 )
+      {
+        return false;
+      }
       return subPic.getTreatedAsPicFlag()
                ? p.x + dx <= int( subPic.getSubPicRight() >> sx ) && p.y + dy <= int( subPic.getSubPicBottom() >> sy )
                : p.x + dx < int( cs.pcv->lumaWidth >> sx ) && p.y + dy < int( cs.pcv->lumaHeight >> sy );
@@ -8239,6 +8274,15 @@ static bool interMcGpu( const CodingUnit& cu )
   const PPS&            pps   = *cu.cs->pps;
   const SPS&            sps   = *cu.cs->sps;
   const char*           kind  = interKind( cu );
+  // development: ECM_GPU_CPU_KINDS (kinds separated by commas, e.g. "GPM,affine") leaves the prediction of those CUs to
+  // the CPU (which kind a difference is in)
+  if( const char* cpuKinds = getenv( "ECM_GPU_CPU_KINDS" ) )
+  {
+    if( ( "," + std::string( cpuKinds ) + "," ).find( "," + std::string( kind ) + "," ) != std::string::npos )
+    {
+      return false;
+    }
+  }
   if( !strcmp( kind, "affine" ) )
   {
     return affineGpu( cu );
@@ -8677,11 +8721,16 @@ template<typename F> static void withPartMotion( const GpuIntraRec::Impl& m, con
     mb.fill( m.gpmMi.at( &cu )[k] );
   }
   PredictionUnit&  pu   = const_cast<PredictionUnit&>( *cu.firstPU );
+  CodingUnit&      c    = const_cast<CodingUnit&>( cu );
   const MotionInfo mi   = m.gpmMi.at( &cu )[k];
   const bool       bdmvr = pu.bdmvrRefine;
   const uint8_t    dir  = pu.interDir;
   const Mv         mv0 = pu.mv[0], mv1 = pu.mv[1];
   const int        r0 = pu.refIdx[0], r1 = pu.refIdx[1];
+  const bool       lic = c.licFlag;
+  int              licScale[2][3], licOffset[2][3];
+  std::memcpy( licScale, c.licScale, sizeof( licScale ) );
+  std::memcpy( licOffset, c.licOffset, sizeof( licOffset ) );
   const auto       g = m.gpmInfo.find( &cu );
   pu.bdmvrRefine = g != m.gpmInfo.end() && ( g->second[3 + 2 * GPM_PART + k] & 2 ) != 0;
   pu.interDir    = mi.interDir;
@@ -8689,7 +8738,25 @@ template<typename F> static void withPartMotion( const GpuIntraRec::Impl& m, con
   pu.mv[1]       = mi.mv[1];
   pu.refIdx[0]   = mi.refIdx[0];
   pu.refIdx[1]   = mi.refIdx[1];
+  // (and the part's LIC, which the CU has while the CPU makes the part's OBMC - motionCompensationGeo's setMergeInfo
+  // for the part -: selectOBMCmode predicts the template of the CU's motion with it, OBMC_CLIC)
+  if( g != m.gpmInfo.end() )
+  {
+    const int32_t* p = &g->second[3 + GPM_PART * k];
+    c.licFlag        = p[GPM_LIC] != 0;
+    for( int l = 0; l < 2; l++ )
+    {
+      for( int comp = 0; comp < MAX_NUM_COMPONENT; comp++ )
+      {
+        c.licScale[l][comp]  = p[GPM_LIC_MODELS + ( l * 3 + comp ) * 2];
+        c.licOffset[l][comp] = p[GPM_LIC_MODELS + ( l * 3 + comp ) * 2 + 1];
+      }
+    }
+  }
   fn();
+  c.licFlag = lic;
+  std::memcpy( c.licScale, licScale, sizeof( licScale ) );
+  std::memcpy( c.licOffset, licOffset, sizeof( licOffset ) );
   pu.bdmvrRefine = bdmvr;
   pu.interDir    = dir;
   pu.mv[0]       = mv0;
@@ -10543,6 +10610,12 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
 {
   Impl& m = *m_impl;
   m.numPictures++;
+  // development: ECM_GPU_NO_CCP_LFNST leaves the pictures that need LEVEL_CCP_LFNST's pipeline unverified in partial
+  // verification, where the GPU cannot compile it within the memory at hand (NVIDIA's driver needs over 35 GB)
+  if( m.partial && m.numCcpLfnst > 0 && m.unsupportedWhy.empty() && getenv( "ECM_GPU_NO_CCP_LFNST" ) )
+  {
+    m.unsupportedWhy = "CCP merge / derived CCP fusion with LFNST / NSPT (ECM_GPU_NO_CCP_LFNST)";
+  }
   if( m.on && !m.unsupportedWhy.empty() )
   {
     m.numFallback++;

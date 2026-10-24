@@ -1,8 +1,9 @@
-# partial.py <build> [-j N] [stream...]: partial verification (ECM_GPU_PARTIAL=1 with --GpuRecon=2) of the regular
-# streams in C:/Code/ECM/streams (default: all), in parallel: the CUs of tools the GPU path lacks come from the CPU's
-# reconstruction, everything else is verified. Per stream the pictures verified / with differences, the first
-# difference (the first block in decoding order whose prediction or residual differs is in the log), and the CUs taken
-# from the CPU by reason (what to port next); then the reasons summed over all streams. Logs in runs/partial.
+# partial.py <build> [-j N] [stream or path.bin...]: partial verification (ECM_GPU_PARTIAL=1 with --GpuRecon=2) of
+# the regular streams in C:/Code/ECM/streams (default: all), in parallel: the CUs of tools the GPU path lacks come
+# from the CPU's reconstruction, everything else is verified. Per stream the pictures verified / with differences,
+# the first difference (the first block in decoding order whose prediction or residual differs is in the log), and
+# the CUs taken from the CPU by reason (what to port next); then the reasons summed over all streams. Logs in
+# runs/partial.
 # The NVIDIA driver's shader cache: runs/nvcache, a cache of its own (the shared one stops storing at 1 GB); the
 # pipelines' own files (VkCompute's ECM_GPU_PIPELINE_CACHE, which precompile.py fills): runs/pipecache.
 import os, re, subprocess, sys
@@ -32,8 +33,10 @@ mcTotal = Counter()      # and those from the GPU's
 
 
 def run(name):
-    rc, out, err = gpuslot.run([f'C:/Code/ECM/bin/{build}/DecoderApp.exe', '-b', f'C:/Code/ECM/streams/{name}.bin', '-o',
-                                '', '--GpuRecon=2'], env)
+    # (a stream given as a path, e.g. C:/Code/ECM/streams_gpu/m53_fore32.bin, runs from there under its file name)
+    path = name if name.endswith('.bin') else f'C:/Code/ECM/streams/{name}.bin'
+    name = os.path.basename(path)[:-4]
+    rc, out, err = gpuslot.run([f'C:/Code/ECM/bin/{build}/DecoderApp.exe', '-b', path, '-o', '', '--GpuRecon=2'], env)
     if rc != 0:   # (a decoder that failed: its exit code and error output, in the log and the report)
         out += f'\n[exit code {rc}] ' + ' | '.join(err.strip()[-500:].splitlines()) + '\n'
     os.makedirs('C:/Code/ECM/runs/partial', exist_ok=True)
@@ -74,9 +77,9 @@ def report(name, s, first, reasons, failure):
 # alone after the others
 lost = []
 with ThreadPoolExecutor(jobs) as ex:
-    for result in ex.map(run, streams):
+    for stream, result in zip(streams, ex.map(run, streams)):
         if 'VkResult -4' in result[4]:
-            lost.append(result[0])
+            lost.append(stream)
             print(f'{result[0]:16s} GPU device lost under the parallel load: run again alone below', flush=True)
             continue
         report(*result)
