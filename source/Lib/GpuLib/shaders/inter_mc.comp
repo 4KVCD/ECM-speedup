@@ -1099,6 +1099,25 @@ int mcLicBi( BufI32 jb, int lo, int l, int comp, int p, int bd, int clipMin, int
 // luma position, MC_PIC_W / MC_PIC_H, MC_BDOF_OUT), its PU of puW x puH samples in the component (the sharp filter),
 // clipped to [clipMin, clipMax]; with lo >= 0 each list's LIC model (mcLic: uni-prediction's list MC_L1 or 0), with
 // MC_LIC the CU's own
+int mcPlain( BufI32 jb, int o, BufI32 lb, int comp, int x, int y, int puW, int puH, int bd, int clipMin, int clipMax, int lo );
+
+// GPM part k of job o at component sample (x, y): a uni-prediction part's list at the 14-bit intermediate (fin: at the
+// final precision), a bi-prediction part's (JVET-AE0046) its record's plain bi-prediction (at MC_NLIC_AT + 24 + k in
+// pc.affine), back at the intermediate as convert2HighPrec takes it (fin: as it is)
+int gpmPart( BufI32 jb, int o, int k, int comp, int x, int y, int puW, int puH, int bd, int clipMin, int clipMax, bool fin )
+{
+  const int r = BufI32( pc.affine ).v[jb.v[o + MC_NLIC_AT] + 24 + k];
+  if( r >= 0 )
+  {
+    const int v = mcPlain( BufI32( pc.affine ), r, BufI32( pc.affine ), comp, x, y, puW, puH, bd, clipMin, clipMax, -1 );
+    return fin ? v : ( v << ( IF_INTERNAL_PREC - bd ) ) - IF_INTERNAL_OFFS;
+  }
+  const int   shift = comp == 0 ? 4 : 5, mask = ( 1 << shift ) - 1;
+  const ivec2 mv = ivec2( jb.v[o + ( k == 0 ? MC_MVX : MC_MV1X )], jb.v[o + ( k == 0 ? MC_MVY : MC_MV1Y )] );
+  return mcPredict( jb.v[o + ( k == 0 ? MC_REF : MC_REF1 )], comp, x + ( mv.x >> shift ), y + ( mv.y >> shift ), mv.x & mask,
+                    mv.y & mask, false, !fin, puW, puH, bd, clipMin, clipMax );
+}
+
 int mcSampleBase( BufI32 jb, int o, int comp, int x, int y, int puW, int puH, int bd, int clipMin, int clipMax, int lo )
 {
   const int   flags = jb.v[o + MC_FLAGS];
@@ -1125,15 +1144,12 @@ int mcSampleBase( BufI32 jb, int o, int comp, int x, int y, int puW, int puH, in
   }
   if( ( flags & MC_GPM_SEP ) != 0 )   // GPM with separate OBMC: part 0's final prediction (part 1's: main)
   {
-    return mcPredict( slot0, comp, x + ( mv0.x >> shift ), y + ( mv0.y >> shift ), mv0.x & mask, mv0.y & mask, alt, false,
-                      puW, puH, bd, clipMin, clipMax );
+    return gpmPart( jb, o, 0, comp, x, y, puW, puH, bd, clipMin, clipMax, true );
   }
   if( ( flags & MC_GPM ) != 0 )   // GPM: both parts' 14-bit predictions weighed by the host's weights (of 32)
   {
-    int q0 = mcPredict( slot0, comp, x + ( mv0.x >> shift ), y + ( mv0.y >> shift ), mv0.x & mask, mv0.y & mask, alt,
-                        true, puW, puH, bd, clipMin, clipMax );
-    int q1 = mcPredict( slot1, comp, x + ( mv1.x >> shift ), y + ( mv1.y >> shift ), mv1.x & mask, mv1.y & mask, alt,
-                        true, puW, puH, bd, clipMin, clipMax );
+    int q0 = gpmPart( jb, o, 0, comp, x, y, puW, puH, bd, clipMin, clipMax, false );
+    int q1 = gpmPart( jb, o, 1, comp, x, y, puW, puH, bd, clipMin, clipMax, false );
     // (a part's LIC, inherited from its merge candidate: xPredInterBlk's geo branch on the intermediate, where the
     // component's model is not the identity)
     const int lo = jb.v[o + MC_NLIC_AT], lists = jb.v[o + MC_OOB];
@@ -1148,6 +1164,20 @@ int mcSampleBase( BufI32 jb, int o, int comp, int x, int y, int puW, int puH, in
     const int shiftW = headRoom + 5, offsetW = ( 1 << ( shiftW - 1 ) ) + ( IF_INTERNAL_OFFS << 5 );
     return clamp( ( w * q0 + ( 32 - w ) * q1 + offsetW ) >> shiftW, clipMin, clipMax );
   }
+  return mcPlain( jb, o, lb, comp, x, y, puW, puH, bd, clipMin, clipMax, lo );
+}
+
+// job o's plain prediction at component sample (x, y): uni-prediction (with LIC: the models at lo in lb), or
+// bi-prediction's average with BCW (xWeightedAverage: the out-of-boundary samples one list's)
+int mcPlain( BufI32 jb, int o, BufI32 lb, int comp, int x, int y, int puW, int puH, int bd, int clipMin, int clipMax, int lo )
+{
+  const int   flags = jb.v[o + MC_FLAGS];
+  const bool  alt = ( flags & MC_ALT_HPEL ) != 0, bi = ( flags & MC_BI ) != 0;
+  const int   cs = comp == 0 ? 0 : 1;   // (4:2:0)
+  const int   shift = 4 + cs, mask = ( 1 << shift ) - 1;
+  const ivec2 mv0 = ivec2( jb.v[o + MC_MVX], jb.v[o + MC_MVY] ), mv1 = ivec2( jb.v[o + MC_MV1X], jb.v[o + MC_MV1Y] );
+  const int   slot0 = jb.v[o + MC_REF], slot1 = jb.v[o + MC_REF1];
+  const int   headRoom = max( 2, IF_INTERNAL_PREC - bd );
   if( !bi )
   {
     const int v = mcPredict( slot0, comp, x + ( mv0.x >> shift ), y + ( mv0.y >> shift ), mv0.x & mask, mv0.y & mask, alt,
@@ -1408,12 +1438,9 @@ void main()
       BufI16( pc.outPred ).v[dst + i] = int16_t( v );
       if( ( jb.v[o + MC_FLAGS] & MC_GPM_SEP ) != 0 )   // (GPM with separate OBMC: part 1's final prediction)
       {
-        const int   sh = comp == 0 ? 4 : 5, mk = ( 1 << sh ) - 1;
-        const ivec2 mv1 = ivec2( jb.v[o + MC_MV1X], jb.v[o + MC_MV1Y] );
-        BufI16( pc.outPred ).v[jb.v[o + MC_BDOF_TH] + i] = int16_t(
-          mcPredict( jb.v[o + MC_REF1], comp, bx + i % W + ( mv1.x >> sh ), by + i / W + ( mv1.y >> sh ), mv1.x & mk,
-                     mv1.y & mk, false, false, jb.v[o + MC_PU_W], jb.v[o + MC_PU_H], bd, jb.v[o + MC_CLIP_MIN],
-                     jb.v[o + MC_CLIP_MAX] ) );
+        BufI16( pc.outPred ).v[jb.v[o + MC_BDOF_TH] + i] =
+          int16_t( gpmPart( jb, o, 1, comp, bx + i % W, by + i / W, jb.v[o + MC_PU_W], jb.v[o + MC_PU_H], bd,
+                            jb.v[o + MC_CLIP_MIN], jb.v[o + MC_CLIP_MAX], true ) );
       }
     }
   }

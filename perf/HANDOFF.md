@@ -449,7 +449,7 @@ wall-clock gains with threads are "the easy baseline". Decoder status: single-th
 (`--GpuLoopFilter=1`: ALF, SAO, BIF, CCSAO, LF-CCCM, offset refinement on Vulkan). The user then asked for **a full
 GPU decoder in Vulkan, optimized until nothing is left** ("The GPU decoder needs to fully decode the frame on the
 GPU"; "Your first Vulkan version is going to be slow. That's OK"). That work is branch `dec-gpurecon`: intra
-reconstruction on the GPU (`--GpuRecon`), tool levels M1-M110 done and verified bit-exact (M19: DIMD, M20: OBIC, M21:
+reconstruction on the GPU (`--GpuRecon`), tool levels M1-M111 done and verified bit-exact (M19: DIMD, M20: OBIC, M21:
 intra merge, M22: the transforms of DIMD CUs, M23: LFNST of MIP, M24: TIMD, M25: OBIC and intra merge with TIMD
 neighbours, M26: TIMD-SAD, M27: OBIC and intra merge with TIMD-SAD neighbours, M28: TIMD merge, M29: TMRL of luma,
 M30: chroma TMRL, M31: CCLM, M32: LFNST / NSPT of CCLM, M33: GLM's gradient patterns, M34: CCCM, M35: GL-CCCM, M36:
@@ -2729,6 +2729,17 @@ checkDoAffineBdofRefine holds without the BDOF having run (luma alone, innerObmc
 no CU of the 50 streams reaches it, so it stays rejected, unported. Results (50 streams, build aob3): every picture
 identical (ra_wpp_q32 skipped); the GPU's counts unchanged; "affine (OBMC of sub-block motion)" 697 and 12 of
 "affine (other)" are now "affine (with BDOF)" 709 - the sub-PU BDOF port is what they need.
+M111 (2026-10-23): GPM parts of bi-prediction on the GPU (JVET-AE0046) without BDOF, DMVR or LIC. CommonLib records
+per part whether xPredInterBi applied BDOF (m_gpuBio, read by gpuGeoBio after the part's motionCompensation) and its BCW
+index (m_gpuGeoPart grows to 24 ints). A bi-prediction part gets its own job record in pc.affine (MC_NLIC_AT + 24 + k:
+the vectors clipped at the PU, BCW's weights, the lists out of boundary at the unclipped vectors, list 0 alone where
+xCheckIdenticalMotion holds); inter_mc's gpmPart predicts it with mcPlain - mcSampleBase's uni / bi-prediction tail,
+now a function of its own (GLSL has no recursion) - and, for the plain blend, takes it back to the intermediate as
+convert2HighPrec does ((v << (14 - bd)) - 8192, unclipped); with separate OBMC it stays at its final precision. Results
+(50 streams, build gpmb1): every picture identical (ra_wpp_q32 skipped; ai_foreman352_q22 alone after a device loss in
+the parallel run); GPM 486 CUs predicted by the GPU (+71); the former "a bi-prediction part" 303 are now mostly "a DMVR
+part" 224 (all in RA streams: their separate OBMC runs the inner sub-block OBMC over the part's DMVR motion) and "a
+bi-prediction part with LIC" 4.
 
 
 ## 8. Numbers (i7-10700 8C/16T, Win11, GCC 16.2, RTX 3070 driver 616.92)

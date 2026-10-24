@@ -1853,6 +1853,14 @@ public:
       }
     }
     m_gpuGeoPart[k][21] = pu.cu->altLMFlag ? 1 : 0;
+    m_gpuGeoPart[k][22] = 0;   // (gpuGeoBio after the part's prediction)
+    m_gpuGeoPart[k][23] = pu.cu->bcwIdx;
+    m_gpuBio            = false;
+  }
+  // ... after part k's prediction: whether xPredInterBi applied BDOF
+  void    gpuGeoBio( int k )
+  {
+    m_gpuGeoPart[k][22] = m_gpuBio ? 1 : 0;
   }
   // ... part k's motion as its OBMC sees it (spanned over the CU) and whether its sub-block motion's inner OBMC applies
   void    gpuGeoObmc( int k, const PredictionUnit& pu )
@@ -2096,13 +2104,14 @@ public:
   // the last motionCompensationGeo, for the GPU reconstruction: whether it blended two predictions with
   // weightedGeoBlk (its plain path), the split direction and blending index, and per part the motion it predicted
   // with (the vectors of both lists, both reference indices, interDir, bdmvrRefine; interDir 0: another part), its
-  // LIC flag and models (per list and component scale, offset) and its non-local LIC flag; whether it blended them
-  // with weightedGeoBlkRounded after each part's own OBMC (JVET-AK0212, two inter parts), each part's motion at its OBMC
-  // and whether that ran (1), with sub-block motion (2)
+  // LIC flag and models (per list and component scale, offset), its non-local LIC flag, BDOF, its BCW index; whether
+  // it blended them with weightedGeoBlkRounded after each part's own OBMC (JVET-AK0212, two inter parts), each part's
+  // motion at its OBMC and whether that ran (1), with sub-block motion (2)
   bool       m_gpuGeoPlain = false;
   bool       m_gpuGeoSep   = false;
   int        m_gpuGeoSplit = 0, m_gpuGeoBld = 0;
-  int32_t    m_gpuGeoPart[2][22] = {};
+  int32_t    m_gpuGeoPart[2][24] = {};
+  bool       m_gpuBio = false;   // (the last xPredInterBi's bioApplied, for gpuGeoBio)
   MotionInfo m_gpuGeoMi[2];
   int32_t    m_gpuGeoObmc[2] = {};
 };

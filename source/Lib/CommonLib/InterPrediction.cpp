@@ -3617,6 +3617,7 @@ void InterPrediction::xPredInterBi(PredictionUnit &pu, PelUnitBuf &pcYuvPred, co
   const bool refIsScaled = isResamplingPossible && ( ( refIdx0 < 0 ? false : pu.cu->slice->getRefPic( REF_PIC_LIST_0, refIdx0 )->isRefScaled( pu.cs->pps ) ) || ( refIdx1 < 0 ? false : pu.cu->slice->getRefPic( REF_PIC_LIST_1, refIdx1 )->isRefScaled( pu.cs->pps ) ) );
   dmvrApplied = dmvrApplied && !refIsScaled;
   bioApplied = bioApplied && !refIsScaled;
+  m_gpuBio   = bioApplied;
 
 #if MULTI_PASS_DMVR
   if (yuvPredTmp && bioApplied && (pu.lwidth() > BDOF_SUBPU_DIM || pu.lheight() > BDOF_SUBPU_DIM)) // pre-do MC for yuvPredTmp to avoid MC for yuvPredTmp within the subblock loop
@@ -12997,6 +12998,7 @@ void InterPrediction::motionCompensationGeo( CodingUnit &cu, MergeCtx &geoMrgCtx
 #endif
     gpuGeoPart( 0, pu );
     motionCompensation(pu, tmpGeoBuf0, REF_PIC_LIST_X, true, isChromaEnabled(pu.chromaFormat)); // TODO: check 4:0:0 interaction with weighted prediction.
+    gpuGeoBio( 0 );
 
 #if JVET_AG0164_AFFINE_GPM
     pu.cu->affine = false;
@@ -13265,6 +13267,7 @@ void InterPrediction::motionCompensationGeo( CodingUnit &cu, MergeCtx &geoMrgCtx
 
     gpuGeoPart( 1, pu );
     motionCompensation(pu, tmpGeoBuf1, REF_PIC_LIST_X, true, isChromaEnabled(pu.chromaFormat)); // TODO: check 4:0:0 interaction with weighted prediction.
+    gpuGeoBio( 1 );
 
 #if JVET_AG0164_AFFINE_GPM
     pu.cu->affine = false;

@@ -7986,7 +7986,7 @@ static void ciipFields( GpuIntraRec::Impl& m, const CodingUnit& cu, const Compon
 // (DecCu's gpmParts, InterPrediction::m_gpuGeoPart); OBMC of the CU after it as of any CU
 
 // a part's record (InterPrediction::m_gpuGeoPart): motion (8), LIC (flag, models), non-local LIC
-constexpr int GPM_LIC = 8, GPM_LIC_MODELS = 9, GPM_NLIC = 21, GPM_PART = 22;
+constexpr int GPM_LIC = 8, GPM_LIC_MODELS = 9, GPM_NLIC = 21, GPM_BIO = 22, GPM_BCW = 23, GPM_PART = 24;
 
 // why the GPU does not predict GPM CU cu (nullptr: it does)
 struct ObmcSeg;
@@ -8051,18 +8051,24 @@ static const char* gpmWhy( const GpuIntraRec::Impl& m, const CodingUnit& cu )
     {
       return "separate OBMC with a LIC part";
     }
-    if( p[6] != 1 && p[6] != 2 )
+    if( p[6] < 1 || p[6] > 3 )
     {
-      return p[6] == 3 ? "a bi-prediction part" : "another part";
+      return "another part";
+    }
+    if( p[6] == 3 && ( p[GPM_BIO] || p[GPM_LIC] ) )   // (M111: bi-prediction parts without BDOF or LIC)
+    {
+      return p[GPM_BIO] ? "a bi-prediction part with BDOF" : "a bi-prediction part with LIC";
     }
     if( p[7] )
     {
       return "a DMVR part";
     }
-    const int l = p[6] == 2 ? 1 : 0;
-    if( sps.getRprEnabledFlag() && slice.getRefPic( RefPicList( l ), p[4 + l] )->isRefScaled( &pps ) )
+    for( int l = 0; l < 2; l++ )
     {
-      return "a scaled reference";
+      if( ( p[6] & ( 1 << l ) ) && sps.getRprEnabledFlag() && slice.getRefPic( RefPicList( l ), p[4 + l] )->isRefScaled( &pps ) )
+      {
+        return "a scaled reference";
+      }
     }
   }
   return slice.getCheckUseSepOBMC() ? gpmSepPlan( m, cu, nullptr ) : nullptr;
@@ -8806,6 +8812,11 @@ static bool recordInterBlock( GpuIntraRec::Impl& m, const TransformUnit& tu, con
         j[k == 0 ? MC_W0 : MC_W1] = p[GPM_LIC];
         j[MC_OOB] |= ( p[6] == 2 ? 1 : 0 ) << k;
       }
+      // (JVET-AE0046: a bi-prediction part's own job record - a plain bi-prediction, or list 0 alone where
+      // xCheckIdenticalMotion holds - at MC_NLIC_AT + 24 + k in pc.affine; -1: a uni-prediction part, at the job's
+      // vectors)
+      const size_t pr = m.affineData.size();
+      m.affineData.insert( m.affineData.end(), { -1, -1 } );
       for( int k = 0; k < 2; k++ )
       {
         const int32_t* p = &g[3 + GPM_PART * k];
@@ -8815,6 +8826,50 @@ static bool recordInterBlock( GpuIntraRec::Impl& m, const TransformUnit& tu, con
         j[k == 0 ? MC_MVX : MC_MV1X] = v.getHor();
         j[k == 0 ? MC_MVY : MC_MV1Y] = v.getVer();
         j[k == 0 ? MC_REF : MC_REF1] = mcSlot( m, slice, l, p[4 + l] );
+        if( p[6] != 3 )
+        {
+          continue;
+        }
+        int32_t    r[MC_JOB] = {};
+        const PPS& pps  = *cs.pps;
+        const bool same = slice.isInterB() && !pps.getWPBiPred()
+                          && slice.getRefPic( REF_PIC_LIST_0, p[4] )->getPOC() == slice.getRefPic( REF_PIC_LIST_1, p[5] )->getPOC()
+                          && p[0] == p[2] && p[1] == p[3];
+        for( int ll = 0; ll < ( same ? 1 : 2 ); ll++ )
+        {
+          Mv w( p[2 * ll], p[2 * ll + 1] );
+          clipMv( w, pu.lumaPos(), pu.lumaSize(), sps, pps );
+          r[ll == 0 ? MC_MVX : MC_MV1X] = w.getHor();
+          r[ll == 0 ? MC_MVY : MC_MV1Y] = w.getVer();
+          r[ll == 0 ? MC_REF : MC_REF1] = mcSlot( m, slice, ll, p[4 + ll] );
+          const int  horMax = ( ( (int) pps.getPicWidthInLumaSamples() - 1 ) << 4 ) + 8;
+          const int  verMax = ( ( (int) pps.getPicHeightInLumaSamples() - 1 ) << 4 ) + 8;
+          const int  ox = ( pu.lumaPos().x << 4 ) + p[2 * ll], oy = ( pu.lumaPos().y << 4 ) + p[2 * ll + 1];
+          const bool oob = ox <= -8 || ox + ( ( (int) pu.lwidth() - 1 ) << 4 ) >= horMax || oy <= -8
+                           || oy + ( ( (int) pu.lheight() - 1 ) << 4 ) >= verMax;
+#if JVET_AA0146_WRAP_AROUND_FIX
+          r[MC_OOB] |= oob && !slice.getRefPic( RefPicList( ll ), p[4 + ll] )->isWrapAroundEnabled( &pps ) ? 1 << ll : 0;
+#else
+          r[MC_OOB] |= oob ? 1 << ll : 0;
+#endif
+        }
+        if( !same )
+        {
+          r[MC_FLAGS] = MC_BI;
+          r[MC_W0]    = getBcwWeight( p[GPM_BCW], REF_PIC_LIST_0 );
+          r[MC_W1]    = getBcwWeight( p[GPM_BCW], REF_PIC_LIST_1 );
+          r[MC_RAW0X] = p[0];
+          r[MC_RAW0Y] = p[1];
+          r[MC_RAW1X] = p[2];
+          r[MC_RAW1Y] = p[3];
+        }
+        r[MC_OOB]   = same ? 0 : r[MC_OOB];
+        r[MC_PU_X]  = pu.lumaPos().x;
+        r[MC_PU_Y]  = pu.lumaPos().y;
+        r[MC_PIC_W] = (int) pps.getPicWidthInLumaSamples();
+        r[MC_PIC_H] = (int) pps.getPicHeightInLumaSamples();
+        m.affineData[pr + k] = (int32_t) m.affineData.size();
+        m.affineData.insert( m.affineData.end(), r, r + MC_JOB );
       }
       j[MC_PU_X] = pu.lumaPos().x;
       j[MC_PU_Y] = pu.lumaPos().y;
@@ -9526,7 +9581,7 @@ void GpuIntraRec::subPuBdof( const CodingUnit& cu )
   }
 }
 
-void GpuIntraRec::gpmParts( const CodingUnit& cu, int kind, int splitDir, int bldIdx, const int32_t parts[2][22],
+void GpuIntraRec::gpmParts( const CodingUnit& cu, int kind, int splitDir, int bldIdx, const int32_t parts[2][24],
                             const MotionInfo partMi[2], const int32_t partObmc[2] )
 {
   Impl& m = *m_impl;
