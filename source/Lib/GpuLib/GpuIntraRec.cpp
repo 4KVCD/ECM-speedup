@@ -986,7 +986,8 @@ constexpr int LMCS_CHROMA_SCALE = 2;   // the chroma residual is scaled by the C
 constexpr int LMCS_INTER_FWD    = 4;   // an inter block's prediction is forward-mapped (luma)
 constexpr int CIIP_ON = 1, CIIP_UNIFORM = 0, CIIP_BY_X = 2, CIIP_BY_Y = 4, CIIP_EDGE = 6, CIIP_W = 3, CIIP_FWD = 32;   // (Tu::ciip)
 constexpr int CIIP_GPM = 64, CIIP_GPM_I1 = 128;   // (M115: GPM with an intra part, the intra part part 1)
-constexpr int MC_GPM_INTRA = 16384, MC_GPM_I1 = 32768, MC_GPM_FIN = 65536;
+constexpr int MC_GPM_INTRA = 16384, MC_GPM_I1 = 32768, MC_GPM_FIN = 65536, MC_GPM_RBD = 131072;
+constexpr int OBMC_P1 = 64;   // (OBMC_J_FLAGS: a GPM CU's part 1 - its prediction for skipObmcConditionByPixel)
 
 // Tu::quant
 constexpr int QUANT_DEP = 1;   // dependent quantization: the coefficients are quantization indices (DepQuant)
@@ -2294,6 +2295,9 @@ struct GpuIntraRec::Impl
   std::unordered_map<const CodingUnit*, std::array<std::vector<MotionInfo>, 2>> gpmMb;
   std::unordered_map<const CodingUnit*, std::array<std::vector<int32_t>, 2>>    gpmDmvr;
   std::map<std::pair<const CodingUnit*, int>, int32_t>                         gpmDmvrRec;
+  // (an affine part's motion - InterPrediction::m_gpuGeoAff - and its affine record, M117)
+  std::unordered_map<const CodingUnit*, std::array<std::array<int32_t, 17>, 2>> gpmAff;
+  std::map<std::pair<const CodingUnit*, int>, int32_t>                         gpmAffRec;
   std::vector<int32_t>                                         gpmSepRecs;   // (Tu::gpm records: GPMR_P1 to patch)
   int32_t                                                      obmcRec1 = -1;   // (GPM's part 1's OBMC record)
   std::vector<int32_t>                                         dmvrJobs, dmvrJobMvs;
@@ -2614,6 +2618,8 @@ void GpuIntraRec::beginPicture( const CodingStructure& cs )
   m.gpmMb.clear();
   m.gpmDmvr.clear();
   m.gpmDmvrRec.clear();
+  m.gpmAff.clear();
+  m.gpmAffRec.clear();
   m.gpmSepRecs.clear();
   m.dmvrJobs.clear();
   m.dmvrJobMvs.clear();
@@ -8039,7 +8045,7 @@ constexpr int GPM_BLEND = 3 + 2 * GPM_PART + 2, GPM_BLEND_N = 8;
 // why the GPU does not predict GPM CU cu (nullptr: it does)
 struct ObmcSeg;
 static const char* gpmSepPlan( const GpuIntraRec::Impl& m, const CodingUnit& cu, std::vector<ObmcSeg>* segs,
-                               bool* inners = nullptr );
+                               int* inners = nullptr );
 static const char* ciipWhy( const CodingUnit& cu );
 
 static const char* gpmWhy( const GpuIntraRec::Impl& m, const CodingUnit& cu )
@@ -8085,9 +8091,10 @@ static const char* gpmWhy( const GpuIntraRec::Impl& m, const CodingUnit& cu )
   }
 #endif
 #if JVET_AG0164_AFFINE_GPM
-  if( pu.affineGPM[0] || pu.affineGPM[1] )
+  // (affine parts, M117: not with an intra part, nor through xSubPuMC)
+  if( ( pu.affineGPM[0] || pu.affineGPM[1] ) && ( pu.gpmIntraFlag || m.subPuItems.count( &cu ) ) )
   {
-    return "an affine part";
+    return pu.gpmIntraFlag ? "an affine part with an intra part" : "an affine part of sub-PU motion";
   }
 #endif
 #if JVET_AI0082_GPM_WITH_INTER_IBC
@@ -8106,7 +8113,12 @@ static const char* gpmWhy( const GpuIntraRec::Impl& m, const CodingUnit& cu )
     return "other";
   }
   const auto g = m.gpmInfo.find( &cu );
-  if( g == m.gpmInfo.end() || g->second[0] != ( pu.gpmIntraFlag ? 3 : slice.getCheckUseSepOBMC() ? 2 : 1 ) )
+#if JVET_AG0164_AFFINE_GPM
+  const bool affinePart = pu.affineGPM[0] || pu.affineGPM[1];
+#else
+  const bool affinePart = false;
+#endif
+  if( g == m.gpmInfo.end() || g->second[0] != ( pu.gpmIntraFlag ? 3 : slice.getCheckUseSepOBMC() || affinePart ? 2 : 1 ) )
   {
     return "not the plain blend";
   }
@@ -8133,6 +8145,10 @@ static const char* gpmWhy( const GpuIntraRec::Impl& m, const CodingUnit& cu )
     {
       return "another part";
     }
+    if( p[GPM_LIC] && m.gpmAff.count( &cu ) && m.gpmAff.at( &cu )[k][0] )   // (M117)
+    {
+      return "an affine part with LIC";
+    }
     if( p[6] == 3 && !p[7] && ( p[GPM_BIO] || p[GPM_LIC] ) )   // (M111: bi-prediction parts without BDOF or LIC)
     {
       return p[GPM_BIO] ? "a bi-prediction part with BDOF" : "a bi-prediction part with LIC";
@@ -8149,7 +8165,7 @@ static const char* gpmWhy( const GpuIntraRec::Impl& m, const CodingUnit& cu )
       }
     }
   }
-  return slice.getCheckUseSepOBMC() || pu.gpmIntraFlag ? gpmSepPlan( m, cu, nullptr ) : nullptr;
+  return slice.getCheckUseSepOBMC() || pu.gpmIntraFlag || affinePart ? gpmSepPlan( m, cu, nullptr ) : nullptr;
 }
 
 // the weights of part 0 (of 32) over component compID of GPM PU pu, xWeightedGeoBlk's walk, appended to out
@@ -8690,7 +8706,7 @@ template<typename F> static void withPartMotion( const GpuIntraRec::Impl& m, con
 // getSameNeigMotion's against the part's motion, which is the same over the CU): each part's segments (segs[k], when
 // given), its plan with its motion; nullptr where the GPU can do both, else the reason
 static const char* gpmSepPlan( const GpuIntraRec::Impl& m, const CodingUnit& cu, std::vector<ObmcSeg>* segs,
-                               bool* inners )
+                               int* inners )
 {
   const auto g = m.gpmInfo.find( &cu );
   if( g == m.gpmInfo.end() || !m.gpmMi.count( &cu ) )
@@ -8709,17 +8725,17 @@ static const char* gpmSepPlan( const GpuIntraRec::Impl& m, const CodingUnit& cu,
       continue;
     }
     const int32_t ran = g->second[3 + 2 * GPM_PART + k];
-    if( ( ran & 1 ) == 0 )
+    if( ( ran & 1 ) == 0 )   // (no OBMC of the part: GPM's TM without separate OBMC)
     {
-      return "separate OBMC not run";
+      continue;
     }
     std::vector<ObmcSeg> s, intra;   // (JVET-AJ0161's intra neighbours: not with separate OBMC here)
     bool                 inner = false;
     withPartMotion( m, cu, k, [&]() { why = obmcPlan( cu, segs ? segs[k] : s, inner, &intra ); } );
     why = why ? why : !intra.empty() ? "separate OBMC with an intra neighbour" : nullptr;
-    if( inners )   // (a DMVR part's sub-PU motion: the inner sub-block OBMC, M116)
+    if( inners )   // (the inner sub-block OBMC as subBlockOBMC decided it - bSubMotion, luma alone: gpuGeoSub)
     {
-      inners[k] = inner;
+      inners[k] = ( ran & 4 ) != 0 ? 1 | ( ( ran & 8 ) != 0 ? 2 : 0 ) : 0;
     }
   }
   return why;
@@ -8841,7 +8857,7 @@ static int32_t wpRecord( GpuIntraRec::Impl& m, const Slice& slice, int ref0, int
   return r;
 }
 
-static void obmcJobs( GpuIntraRec::Impl& m, const CodingUnit& cu, const std::vector<ObmcSeg>& segs );
+static void obmcJobs( GpuIntraRec::Impl& m, const CodingUnit& cu, const std::vector<ObmcSeg>& segs, int part = 0 );
 
 static bool recordInterBlock( GpuIntraRec::Impl& m, const TransformUnit& tu, const ComponentID compID, const char*& why,
                               const CompArea* part = nullptr, bool partResidual = true )
@@ -9187,6 +9203,56 @@ static bool recordInterBlock( GpuIntraRec::Impl& m, const TransformUnit& tu, con
         j[k == 0 ? MC_MVX : MC_MV1X] = v.getHor();
         j[k == 0 ? MC_MVY : MC_MV1Y] = v.getVer();
         j[k == 0 ? MC_REF : MC_REF1] = mcSlot( m, slice, l, p[4 + l] );
+        const std::array<int32_t, 17>* af = m.gpmAff.count( &cu ) && m.gpmAff.at( &cu )[k][0] ? &m.gpmAff.at( &cu )[k] : nullptr;
+        if( af )   // (an affine part, M117: affineRecord of the part's control points and motion; its record MC_AFFINE)
+        {
+          const auto key = std::make_pair( &cu, k );
+          auto       ar  = m.gpmAffRec.find( key );
+          if( ar == m.gpmAffRec.end() )
+          {
+            CodingUnit&           cc = const_cast<CodingUnit&>( cu );
+            PredictionUnit&       pp = const_cast<PredictionUnit&>( pu );
+            const bool            affine = cc.affine;
+            const int8_t          type   = cc.affineType;
+            const int             bcw    = cc.bcwIdx;
+            const uint8_t         dir    = pp.interDir;
+            const int             r0 = pp.refIdx[0], r1 = pp.refIdx[1];
+            Mv                    cp[2][3];
+            std::copy( &pp.mvAffi[0][0], &pp.mvAffi[0][0] + 6, &cp[0][0] );
+            int32_t rec = 0;
+            withPartMotion( m, cu, k, [&]() {
+              cc.affine     = true;
+              cc.affineType = (int8_t) ( *af )[1];
+              cc.bcwIdx     = p[GPM_BCW];
+              pp.interDir   = (uint8_t) ( *af )[2];
+              pp.refIdx[0]  = ( *af )[3];
+              pp.refIdx[1]  = ( *af )[4];
+              for( int l = 0; l < 2; l++ )
+              {
+                for( int c = 0; c < 3; c++ )
+                {
+                  pp.mvAffi[l][c] = Mv( ( *af )[5 + ( l * 3 + c ) * 2], ( *af )[5 + ( l * 3 + c ) * 2 + 1] );
+                }
+              }
+              rec = (int32_t) m.affineData.size();
+              affineRecord( m, cu );
+            } );
+            cc.affine     = affine;
+            cc.affineType = type;
+            cc.bcwIdx     = bcw;
+            pp.interDir   = dir;
+            pp.refIdx[0]  = r0;
+            pp.refIdx[1]  = r1;
+            std::copy( &cp[0][0], &cp[0][0] + 6, &pp.mvAffi[0][0] );
+            int32_t rr[MC_JOB] = {};
+            rr[MC_FLAGS]    = MC_AFFINE;
+            rr[MC_BDOF_OUT] = rec;
+            ar = m.gpmAffRec.emplace( key, (int32_t) m.affineData.size() ).first;
+            m.affineData.insert( m.affineData.end(), rr, rr + MC_JOB );
+          }
+          m.affineData[pr + k] = ar->second;
+          continue;
+        }
         if( p[6] != 3 )
         {
           continue;
@@ -9322,11 +9388,11 @@ static bool recordInterBlock( GpuIntraRec::Impl& m, const TransformUnit& tu, con
         ciipFields( m, cu, compID, area, t, g[3 + GPM_PART * kIntra + GPM_INTRA] - 1 );
         t.ciip = CIIP_ON | CIIP_GPM | ( kIntra == 1 ? CIIP_GPM_I1 : 0 ) | ( t.ciip & CIIP_FWD );
       }
-      else if( slice.getCheckUseSepOBMC() )   // (separate OBMC: part 1's final prediction and the block's record, Tu::gpm)
-      {
+      else if( g[0] == 2 )   // (the rounded blend after each part's OBMC: part 1's final prediction, Tu::gpm's record;
+      {                      // without separate OBMC - an affine part, M117 - by roundBD of the intermediates)
         const int  sc   = compID == COMPONENT_Y ? 0 : 1;
         const bool band = (int) area.y - ( cu.ly() >> sc ) < ( 4 >> sc ) || (int) area.x - ( cu.lx() >> sc ) < ( 4 >> sc );
-        j[MC_FLAGS] |= MC_GPM_SEP;
+        j[MC_FLAGS] |= MC_GPM_SEP | ( slice.getCheckUseSepOBMC() ? 0 : MC_GPM_RBD );
         j[MC_BDOF_TH] = m.obmcData;   // (relative to the OBMC data; made absolute at the upload)
         m.obmcData += (int32_t) ( area.width * area.height );
         t.gpm = (int32_t) m.timdData.size() + 1;
@@ -9556,12 +9622,17 @@ void GpuIntraRec::recordInterCu( const CodingUnit& cu )
   // prediction, ibcRecord / pltRecord)
   // (GPM with separate OBMC: each part's segments, part 1's in segs1; JVET-AJ0161: the intra neighbours' runs)
   std::vector<ObmcSeg> segs, segs1, geoSegs[2], intraRuns;
-  bool                 geoInner[2] = { false, false };   // (GPM's parts: the inner sub-block OBMC, M116)
+  int                  geoInner[2] = { 0, 0 };   // (GPM's parts: the inner sub-block OBMC, | 2 luma alone - M116, M117)
   bool                 inner  = false;
   const bool           geoSep = cu.geoFlag && cu.slice->getCheckUseSepOBMC();
   // (GPM with an intra part, M115: its inter part's OBMC, with that part's motion; kInter the inter part)
   const bool           geoIntra = cu.geoFlag && cu.firstPU->gpmIntraFlag;
-  const bool           geoParts = geoSep || geoIntra;
+#if JVET_AG0164_AFFINE_GPM
+  const bool           geoAff   = cu.geoFlag && ( cu.firstPU->affineGPM[0] || cu.firstPU->affineGPM[1] );   // (M117)
+#else
+  const bool           geoAff   = false;
+#endif
+  const bool           geoParts = geoSep || geoIntra || geoAff;
   const int            kInter   = geoIntra && m.gpmInfo.count( &cu ) && m.gpmInfo.at( &cu )[3 + GPM_INTRA] ? 1 : 0;
   m.obmcRec = m.obmcRec1 = -1;
   for( int c = 0; c < MAX_NUM_COMPONENT; c++ )
@@ -9617,9 +9688,18 @@ void GpuIntraRec::recordInterCu( const CodingUnit& cu )
       obmcIntraRecord( m, is );   // (after the motion segments, which obmcJobs numbers)
       return r;
     };
-    inner      = geoParts ? geoInner[kInter] : inner;
+    inner      = geoParts ? geoInner[kInter] != 0 : inner;
     m.obmcRec  = !segs.empty() || inner || !intraSegs.empty() ? obmcRecord( segs, inner, intraSegs ) : -1;
     m.obmcRec1 = !segs1.empty() || ( geoParts && geoInner[1 - kInter] ) ? obmcRecord( segs1, geoParts && geoInner[1 - kInter], {} ) : -1;
+    // (an affine part's inner sub-block OBMC of luma alone: innerObmcSkipChroma)
+    if( geoParts && m.obmcRec >= 0 && ( geoInner[kInter] & 2 ) )
+    {
+      m.timdData[m.obmcRec + OBMC_REC_FLAGS] |= OBMC_REC_SUB_LUMA;
+    }
+    if( geoParts && m.obmcRec1 >= 0 && ( geoInner[1 - kInter] & 2 ) )
+    {
+      m.timdData[m.obmcRec1 + OBMC_REC_FLAGS] |= OBMC_REC_SUB_LUMA;
+    }
   }
   const int numComp = cu.chromaFormat == CHROMA_400 ? 1 : MAX_NUM_COMPONENT;
   // (an IBC merge CU's motion and flags, which its merge candidate gives, are known only now)
@@ -9679,7 +9759,7 @@ void GpuIntraRec::recordInterCu( const CodingUnit& cu )
   if( rec1 >= 0 && !m.cpuCus.count( &cu ) )
   {
     m.obmcRec = rec1;
-    withPartMotion( m, cu, 1, [&]() { obmcJobs( m, cu, segs1 ); } );
+    withPartMotion( m, cu, 1, [&]() { obmcJobs( m, cu, segs1, 1 ); } );
   }
   m.obmcRec = m.obmcRec1 = -1;
   if( !m.cpuCus.count( &cu ) )
@@ -9814,7 +9894,7 @@ static void obmcIntraRecord( GpuIntraRec::Impl& m, const std::vector<std::array<
 }
 
 // OBMC CU cu's segment jobs (inter_mc's mode 3, OBMC_J_*), after its blocks' jobs (OBMC_J_BASE: one per component)
-static void obmcJobs( GpuIntraRec::Impl& m, const CodingUnit& cu, const std::vector<ObmcSeg>& segs )
+static void obmcJobs( GpuIntraRec::Impl& m, const CodingUnit& cu, const std::vector<ObmcSeg>& segs, int part )
 {
   const PredictionUnit& pu    = *cu.firstPU;
   const Slice&          slice = *cu.slice;
@@ -9911,7 +9991,7 @@ static void obmcJobs( GpuIntraRec::Impl& m, const CodingUnit& cu, const std::vec
     j[OBMC_J_DIR]   = s.dir;
     j[OBMC_J_FLAGS] = ( tm && ( r[OBMC_REC_FLAGS] & ( s.dir == 0 ? OBMC_REC_TOP : OBMC_REC_LEFT ) ) ? OBMC_TM : 0 )
                       | ( s.nb->cu->licFlag ? OBMC_LIC : 0 ) | ( s.nb->cu->altLMFlag ? OBMC_NLIC : 0 )
-                      | ( cu.licFlag ? OBMC_CLIC : 0 ) | ( cu.altLMFlag ? OBMC_CNLIC : 0 );
+                      | ( cu.licFlag ? OBMC_CLIC : 0 ) | ( cu.altLMFlag ? OBMC_CNLIC : 0 ) | ( part == 1 ? OBMC_P1 : 0 );
     if( cu.altLMFlag )   // (the CU's own non-local LIC model - secAltLMParaUnit now -: its template in selectOBMCmode)
     {
       for( int c = 0; c < MAX_NUM_COMPONENT; c++ )
@@ -10096,7 +10176,8 @@ void GpuIntraRec::subPuMotion( const CodingUnit& cu, const std::vector<int32_t>&
 
 void GpuIntraRec::gpmParts( const CodingUnit& cu, int kind, int splitDir, int bldIdx, const int32_t parts[2][25],
                             const MotionInfo partMi[2], const int32_t partObmc[2], const int32_t blend[8],
-                            const std::vector<MotionInfo> partMb[2], const std::vector<int32_t> partDmvr[2] )
+                            const std::vector<MotionInfo> partMb[2], const std::vector<int32_t> partDmvr[2],
+                            const int32_t partAff[2][17] )
 {
   Impl& m = *m_impl;
   if( !m.partial || !m.interPending.count( &cu ) )
@@ -10112,6 +10193,11 @@ void GpuIntraRec::gpmParts( const CodingUnit& cu, int kind, int splitDir, int bl
   m.gpmMi[&cu] = { partMi[0], partMi[1] };
   m.gpmMb[&cu]   = { partMb[0], partMb[1] };
   m.gpmDmvr[&cu] = { partDmvr[0], partDmvr[1] };
+  std::array<std::array<int32_t, 17>, 2>& a = m.gpmAff[&cu];
+  for( int k = 0; k < 2; k++ )
+  {
+    std::copy( partAff[k], partAff[k] + 17, a[k].begin() );
+  }
 }
 
 void GpuIntraRec::dmvrVectors( const CodingUnit& cu, const Mv* list0, const Mv* list1 )

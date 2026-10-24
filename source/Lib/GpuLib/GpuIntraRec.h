@@ -129,10 +129,12 @@ public:
   /// one after each part's own OBMC, 3 the rounded one with an intra part, 0 another), the split direction, the
   /// blending index, each part's motion (InterPrediction::m_gpuGeoPart) and its motion and flags at its OBMC (m_gpuGeoMi, m_gpuGeoObmc), and with
   /// regression-based blending (motionCompensationGeoBlend) its kind and blend model (m_gpuGeoBlend), each part's
-  /// motion buffer at its OBMC and a DMVR part's refined vectors (m_gpuGeoMb, m_gpuGeoDmvr), recordInterCu's
+  /// motion buffer at its OBMC, a DMVR part's refined vectors and an affine part's motion (m_gpuGeoMb, m_gpuGeoDmvr,
+  /// m_gpuGeoAff), recordInterCu's
   void gpmParts( const CodingUnit& cu, int kind, int splitDir, int bldIdx, const int32_t parts[2][25],
                  const MotionInfo partMi[2], const int32_t partObmc[2], const int32_t blend[8],
-                 const std::vector<MotionInfo> partMb[2], const std::vector<int32_t> partDmvr[2] );
+                 const std::vector<MotionInfo> partMb[2], const std::vector<int32_t> partDmvr[2],
+                 const int32_t partAff[2][17] );
   /// TU tu of an inter CCCM or inter CCP merge CU, before DecCu blends its chroma prediction
   /// (deriveInterCccmPrediction, deriveInterCcpMergePrediction): the inter one
   void interChromaPred( const TransformUnit& tu );

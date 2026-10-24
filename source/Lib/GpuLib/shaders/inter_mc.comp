@@ -84,6 +84,8 @@ const int MC_NO_SHARP = 4096; // without JVET-AI0094's sharp bi-prediction filte
 const int MC_GPM_INTRA = 16384; // GPM with an intra part (M115): the inter part alone, part 1 with MC_GPM_I1, at the
 const int MC_GPM_I1    = 32768; // final precision (MC_GPM_FIN: as it is, separate OBMC; else roundToOutputBitdepth of
 const int MC_GPM_FIN   = 65536; // the intermediate)
+const int MC_GPM_RBD   = 131072; // with MC_GPM_SEP the rounded blend without separate OBMC (an affine part, M117): each part
+                                 // at the final precision by roundBD of the intermediate
 const int MC_WP       = 8192; // explicit weighted prediction: per component its WP_* record at MC_BDOF_OUT in pc.affine
 // (WP_KIND 0: addWeightUni, 1: addWeightBi; the weights, the offset and the shift as they take them)
 const int WP_KIND = 0, WP_W0 = 1, WP_W1 = 2, WP_OFFSET = 3, WP_SHIFT = 4, WP_REC = 5;
@@ -1243,6 +1245,16 @@ int mcPlain( BufI32 jb, int o, BufI32 lb, int comp, int x, int y, int puW, int p
 int gpmPart( BufI32 jb, int o, int k, int comp, int x, int y, int puW, int puH, int bd, int clipMin, int clipMax, bool fin )
 {
   const int r = BufI32( pc.affine ).v[jb.v[o + MC_NLIC_AT] + 24 + k];
+  if( r >= 0 && ( BufI32( pc.affine ).v[r + MC_FLAGS] & MC_AFFINE ) != 0 )   // an affine part (M117): its affine record
+  {
+    const int a = BufI32( pc.affine ).v[r + MC_BDOF_OUT], cs = comp == 0 ? 0 : 1;
+    if( fin || afJ( a, AF_BI ) != 0 )   // (bi-prediction: the average at the final precision, convert2HighPrec's)
+    {
+      const int v = afSample( a, comp, x, y );
+      return fin ? v : ( v << ( IF_INTERNAL_PREC - bd ) ) - IF_INTERNAL_OFFS;
+    }
+    return afList( a, afJ( a, AF_LIST ), comp, x - ( afJ( a, AF_X ) >> cs ), y - ( afJ( a, AF_Y ) >> cs ), true );
+  }
   if( r >= 0 && ( BufI32( pc.affine ).v[r + MC_FLAGS] & MC_BDOF ) != 0 )   // a DMVR part (M116): its DMVR job's prediction
   {
     const int cs = comp == 0 ? 0 : 1, area = ( puW << cs ) * ( puH << cs );
@@ -1259,6 +1271,18 @@ int gpmPart( BufI32 jb, int o, int k, int comp, int x, int y, int puW, int puH, 
   const ivec2 mv = ivec2( jb.v[o + ( k == 0 ? MC_MVX : MC_MV1X )], jb.v[o + ( k == 0 ? MC_MVY : MC_MV1Y )] );
   return mcPredict( jb.v[o + ( k == 0 ? MC_REF : MC_REF1 )], comp, x + ( mv.x >> shift ), y + ( mv.y >> shift ), mv.x & mask,
                     mv.y & mask, false, !fin, puW, puH, bd, clipMin, clipMax );
+}
+
+// GPM part k at the final precision for the rounded blend: as it is with separate OBMC, else (MC_GPM_RBD) roundBD of
+// its intermediate (roundToOutputBitdepth)
+int gpmPartFinal( BufI32 jb, int o, int k, int comp, int x, int y, int puW, int puH, int bd, int clipMin, int clipMax )
+{
+  if( ( jb.v[o + MC_FLAGS] & MC_GPM_RBD ) == 0 )
+  {
+    return gpmPart( jb, o, k, comp, x, y, puW, puH, bd, clipMin, clipMax, true );
+  }
+  const int q = gpmPart( jb, o, k, comp, x, y, puW, puH, bd, clipMin, clipMax, false ), headRoom = max( 2, IF_INTERNAL_PREC - bd );
+  return clamp( ( q + ( 1 << ( headRoom - 1 ) ) + IF_INTERNAL_OFFS ) >> headRoom, clipMin, clipMax );
 }
 
 int mcSampleBase( BufI32 jb, int o, int comp, int x, int y, int puW, int puH, int bd, int clipMin, int clipMax, int lo )
@@ -1297,7 +1321,7 @@ int mcSampleBase( BufI32 jb, int o, int comp, int x, int y, int puW, int puH, in
   }
   if( ( flags & MC_GPM_SEP ) != 0 )   // GPM with separate OBMC: part 0's final prediction (part 1's: main)
   {
-    return gpmPart( jb, o, 0, comp, x, y, puW, puH, bd, clipMin, clipMax, true );
+    return gpmPartFinal( jb, o, 0, comp, x, y, puW, puH, bd, clipMin, clipMax );
   }
   if( ( flags & MC_GPM ) != 0 )   // GPM: both parts' 14-bit predictions weighed by the host's weights (of 32)
   {
@@ -1417,6 +1441,7 @@ const int OBMC_CNLIC = 16; // ... its own non-local LIC model (altLMParaUnit) at
 // the BCW weights
 const int OBMC_T_MV0 = 0, OBMC_T_MV1 = 2, OBMC_T_REF0 = 4, OBMC_T_REF1 = 5, OBMC_T_KIND = 6, OBMC_T_W0 = 7, OBMC_T_W1 = 8;
 const int OBMC_TM = 1;   // OBMC_J_FLAGS: the templates
+const int OBMC_P1 = 64;  // ... a GPM CU's part 1 (M117): skipObmcConditionByPixel against part 1's prediction
 // a segment's data (int16): the skip flags (Y, Cb, Cr), the templates with the CU's and the neighbour's motion (L each),
 // the band's luma prediction (W x H), Cb's, Cr's (W / 2 x H / 2)
 const int OBMC_D_SKIP = 0, OBMC_D_TPL = 3;
@@ -1489,7 +1514,9 @@ void obmcJob( int o, int lid )
       // skipObmcConditionByPixel: each list of the neighbour's motion at its integer vector, uni-prediction of the band
       // (no lists: no test - GPM's separate OBMC, m_geoOBMC)
       const int before = jb.v[o + OBMC_J_INT_DIR] == 0 ? 0
-                         : mcSample( base, bj, comp, x, y, base.v[bj + MC_PU_W], base.v[bj + MC_PU_H], bd, clipMin, clipMax, -1 );
+                         : ( jb.v[o + OBMC_J_FLAGS] & OBMC_P1 ) != 0   // (a GPM CU's part 1: its own prediction)
+                           ? gpmPartFinal( base, bj, 1, comp, x, y, base.v[bj + MC_PU_W], base.v[bj + MC_PU_H], bd, clipMin, clipMax )
+                           : mcSample( base, bj, comp, x, y, base.v[bj + MC_PU_W], base.v[bj + MC_PU_H], bd, clipMin, clipMax, -1 );
       for( int l = 0; l < 2; l++ )
       {
         if( ( jb.v[o + OBMC_J_INT_DIR] & ( 1 << l ) ) != 0 )
@@ -1609,8 +1636,8 @@ void main()
       if( ( jb.v[o + MC_FLAGS] & MC_GPM_SEP ) != 0 )   // (GPM with separate OBMC: part 1's final prediction)
       {
         BufI16( pc.outPred ).v[jb.v[o + MC_BDOF_TH] + i] =
-          int16_t( gpmPart( jb, o, 1, comp, bx + i % W, by + i / W, jb.v[o + MC_PU_W], jb.v[o + MC_PU_H], bd,
-                            jb.v[o + MC_CLIP_MIN], jb.v[o + MC_CLIP_MAX], true ) );
+          int16_t( gpmPartFinal( jb, o, 1, comp, bx + i % W, by + i / W, jb.v[o + MC_PU_W], jb.v[o + MC_PU_H], bd,
+                                 jb.v[o + MC_CLIP_MIN], jb.v[o + MC_CLIP_MAX] ) );
       }
     }
   }

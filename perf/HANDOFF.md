@@ -449,7 +449,7 @@ wall-clock gains with threads are "the easy baseline". Decoder status: single-th
 (`--GpuLoopFilter=1`: ALF, SAO, BIF, CCSAO, LF-CCCM, offset refinement on Vulkan). The user then asked for **a full
 GPU decoder in Vulkan, optimized until nothing is left** ("The GPU decoder needs to fully decode the frame on the
 GPU"; "Your first Vulkan version is going to be slow. That's OK"). That work is branch `dec-gpurecon`: intra
-reconstruction on the GPU (`--GpuRecon`), tool levels M1-M116 done and verified bit-exact (M19: DIMD, M20: OBIC, M21:
+reconstruction on the GPU (`--GpuRecon`), tool levels M1-M116 done (M117, GPM affine parts, in progress) and verified bit-exact (M19: DIMD, M20: OBIC, M21:
 intra merge, M22: the transforms of DIMD CUs, M23: LFNST of MIP, M24: TIMD, M25: OBIC and intra merge with TIMD
 neighbours, M26: TIMD-SAD, M27: OBIC and intra merge with TIMD-SAD neighbours, M28: TIMD merge, M29: TMRL of luma,
 M30: chroma TMRL, M31: CCLM, M32: LFNST / NSPT of CCLM, M33: GLM's gradient patterns, M34: CCCM, M35: GL-CCCM, M36:
@@ -2853,6 +2853,21 @@ sub-block OBMC (M100's mode-4 jobs, the half-sample threshold of the same direct
 reaches every block where it has inner OBMC. Results (50 streams, build gpmd1): every picture identical (ra_wpp_q32
 skipped); GPM 849 CUs predicted by the GPU (+237), regression-based blending 192 (+91); "a DMVR part" 240 and
 regression's 90 -> 0.
+
+M117 (2026-10-24, work in progress, committed unfinished on request): GPM affine parts on the GPU (affineGPM[0/1]).
+gpuGeoBio records the affine part's fields and motion buffer (m_gpuGeoAff[2][17]); each affine part gets an affine
+record (affineRecord on the CU with the part's motion, inside withPartMotion), which gpmPart reads (MC_AFFINE, record
+index in MC_BDOF_OUT). The kind-2 blend takes gpmPartFinal: with separate OBMC the part as it is, else (MC_GPM_RBD, the
+low-delay case) roundBD of its intermediate, as roundToOutputBitdepth. Inner sub-block OBMC of an affine part is luma
+only (OBMC_REC_SUB_LUMA, innerObmcSkipChroma via m_gpuSubMotion / gpuGeoSub); obmcJob's skip test of part 1 reads
+part 1 (OBMC_P1). Status (build gpma1): ra_crowdrun_q32 and ra_foreman_q22 identical; ld_foreman_q32 differs in 1
+picture (POC 1, CU 128,128 32x16) and ld_parkjoy_q27 in 2. Not yet run on all 50 streams. Finding so far: in that CU
+part 1 is the affine part (uni L0) and part 0 a plain uni-L0 part; the GPU is +1 over the whole region of part 0
+(the non-affine part), uniformly, so the cause is a rounding or filter choice of part 0 on the MC_GPM_RBD path, not
+its motion or OBMC (affine part 1 matches; computing part 1 at the final precision changed nothing). Next: check
+the CPU's useBiFilter / m_geoOBMC for part 0's xPredInterBlk (the sharp bi filter of the intermediate, mcTaps' bi &&
+W > 4 && H > 4) against gpmPart's mcPredict( ..., !fin ), fix, run the 50 streams. Until then low-delay GPM with an
+affine part is not bit-exact on the GPU.
 
 ## 8. Numbers (i7-10700 8C/16T, Win11, GCC 16.2, RTX 3070 driver 616.92)
 

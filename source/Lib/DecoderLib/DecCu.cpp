@@ -559,7 +559,7 @@ void DecCu::decompressCtu( CodingStructure& cs, const UnitArea& ctuArea )
             m_gpuIntraRec->gpmParts( currCU, m_pcInterPred->m_gpuGeoPlain ? 1 : m_pcInterPred->m_gpuGeoSep ? 2 : m_pcInterPred->m_gpuGeoIntra ? 3 : 0,
                                      m_pcInterPred->m_gpuGeoSplit, m_pcInterPred->m_gpuGeoBld, m_pcInterPred->m_gpuGeoPart,
                                      m_pcInterPred->m_gpuGeoMi, m_pcInterPred->m_gpuGeoObmc, m_pcInterPred->m_gpuGeoBlend,
-                                     m_pcInterPred->m_gpuGeoMb, m_pcInterPred->m_gpuGeoDmvr );
+                                     m_pcInterPred->m_gpuGeoMb, m_pcInterPred->m_gpuGeoDmvr, m_pcInterPred->m_gpuGeoAff );
           }
           m_gpuIntraRec->recordInterCu( currCU );
         }

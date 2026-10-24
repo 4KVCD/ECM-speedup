@@ -10233,6 +10233,11 @@ void InterPrediction::subBlockOBMC(PredictionUnit  &pu, PelUnitBuf* pDst)
   }
 #endif
 
+#if JVET_AL0079_AFFINE_MC
+  m_gpuSubMotion = bSubMotion ? 1 | ( innerObmcSkipChroma ? 2 : 0 ) : 0;   // (the GPU reconstruction: gpuGeoSub)
+#else
+  m_gpuSubMotion = bSubMotion ? 1 : 0;
+#endif
 #if JVET_AD0213_LIC_IMP
 #if JVET_AK0076_EXTENDED_OBMC_IBC
   if (!bSubMotion || licFlag || ibcLicFlag)
@@ -12355,6 +12360,7 @@ void InterPrediction::motionCompensationGeoBlend( CodingUnit& cu, MergeCtx& geoM
         pu.bdmvrRefine = refinePossible0;
         gpuGeoObmc( 0, pu );
         subBlockOBMC(pu, &tmpGeoBuf0, pcIntraPred);
+        gpuGeoSub( 0 );
         cu.isobmcMC = false;
         pu.bdmvrRefine = false;
         m_pixelRefine = false;
@@ -12477,6 +12483,7 @@ void InterPrediction::motionCompensationGeoBlend( CodingUnit& cu, MergeCtx& geoM
         pu.bdmvrRefine = refinePossible1;
         gpuGeoObmc( 1, pu );
         subBlockOBMC(pu, &tmpGeoBuf1, pcIntraPred);
+        gpuGeoSub( 1 );
         cu.isobmcMC = false;
         pu.bdmvrRefine = false;
         m_pixelRefine = false;
@@ -13124,6 +13131,7 @@ void InterPrediction::motionCompensationGeo( CodingUnit &cu, MergeCtx &geoMrgCtx
 #if JVET_AK0212_GPM_OBMC_MODIFICATION
       gpuGeoObmc( 0, pu );
       subBlockOBMC(pu, &tmpGeoBuf0, pcIntraPred, false, false, !pu.cu->slice->getCheckUseSepOBMC() ? false : pu.geoMMVDFlag0);
+      gpuGeoSub( 0 );
 #else
       subBlockOBMC(pu, &tmpGeoBuf0, pcIntraPred);
 #endif
@@ -13396,6 +13404,7 @@ void InterPrediction::motionCompensationGeo( CodingUnit &cu, MergeCtx &geoMrgCtx
 #if JVET_AK0212_GPM_OBMC_MODIFICATION
       gpuGeoObmc( 1, pu );
       subBlockOBMC(pu, &tmpGeoBuf1, pcIntraPred, false, false, !pu.cu->slice->getCheckUseSepOBMC() ? false : pu.geoMMVDFlag1);
+      gpuGeoSub( 1 );
 #else
       subBlockOBMC(pu, &tmpGeoBuf1, pcIntraPred);
 #endif
@@ -13450,7 +13459,7 @@ void InterPrediction::motionCompensationGeo( CodingUnit &cu, MergeCtx &geoMrgCtx
     else if(pu.affineGPM[0] || pu.affineGPM[1])
 #endif
     {
-      m_gpuGeoSep   = !pu.affineGPM[0] && !pu.affineGPM[1];
+      m_gpuGeoSep   = true;   // (the rounded blend after each part's own OBMC: separate OBMC, or an affine part)
       m_gpuGeoSplit = splitDir;
       m_gpuGeoBld   = bldIdx;
 #if JVET_AA0058_GPM_ADAPTIVE_BLENDING

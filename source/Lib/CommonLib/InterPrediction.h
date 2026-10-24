@@ -1856,12 +1856,36 @@ public:
     m_gpuGeoPart[k][22] = 0;   // (gpuGeoBio after the part's prediction)
     m_gpuGeoPart[k][23] = pu.cu->bcwIdx;
     m_gpuBio            = false;
+    m_gpuGeoMb[k].clear();   // (gpuGeoBio / gpuGeoObmc fill it)
   }
   // ... after part k's prediction: whether xPredInterBi (or xPredInterBiBDMVR) applied BDOF; with DMVR its refined
   // vectors per 16 x 16 sub-PU (both lists', as GpuIntraRec::dmvrVectors takes them)
   void    gpuGeoBio( int k, const PredictionUnit& pu )
   {
     m_gpuGeoPart[k][22] = m_gpuBio ? 1 : 0;
+    // (an affine part, M117: its type, lists and control points as its prediction took them)
+    m_gpuGeoAff[k][0] = pu.cu->affine ? 1 : 0;
+    if( pu.cu->affine )   // (its sub-block motion, which its chroma averages: also where no OBMC follows)
+    {
+      const CMotionBuf mb = pu.cs->getMotionBuf( pu );
+      m_gpuGeoMb[k].clear();
+      for( int y = 0; y < (int) mb.height; y++ )
+      {
+        m_gpuGeoMb[k].insert( m_gpuGeoMb[k].end(), &mb.at( 0, y ), &mb.at( 0, y ) + mb.width );
+      }
+    }
+    m_gpuGeoAff[k][1] = (int32_t) pu.cu->affineType;
+    m_gpuGeoAff[k][2] = pu.interDir;
+    m_gpuGeoAff[k][3] = pu.refIdx[0];
+    m_gpuGeoAff[k][4] = pu.refIdx[1];
+    for( int l = 0; l < 2; l++ )
+    {
+      for( int c = 0; c < 3; c++ )
+      {
+        m_gpuGeoAff[k][5 + ( l * 3 + c ) * 2]     = pu.mvAffi[l][c].getHor();
+        m_gpuGeoAff[k][5 + ( l * 3 + c ) * 2 + 1] = pu.mvAffi[l][c].getVer();
+      }
+    }
     m_gpuGeoDmvr[k].clear();
     for( int uy = 0; m_gpuGeoPart[k][7] && uy < ( (int) pu.lheight() + 15 ) >> 4; uy++ )
     {
@@ -1876,6 +1900,7 @@ public:
   // ... part k's motion as its OBMC sees it (spanned over the CU) and whether its sub-block motion's inner OBMC applies
   void    gpuGeoObmc( int k, const PredictionUnit& pu )
   {
+    m_gpuSubMotion  = 0;
     m_gpuGeoMi[k]   = pu.getMotionInfo();
     m_gpuGeoObmc[k] = 1 | ( pu.bdmvrRefine ? 2 : 0 );
     const CMotionBuf mb = pu.cs->getMotionBuf( pu );   // (the CU's motion buffer: a DMVR part's sub-PU motion)
@@ -1884,6 +1909,11 @@ public:
     {
       m_gpuGeoMb[k].insert( m_gpuGeoMb[k].end(), &mb.at( 0, y ), &mb.at( 0, y ) + mb.width );
     }
+  }
+  // ... after part k's subBlockOBMC: its bSubMotion (4) and innerObmcSkipChroma (8), m_gpuSubMotion's
+  void    gpuGeoSub( int k )
+  {
+    m_gpuGeoObmc[k] |= m_gpuSubMotion << 2;
   }
   // ... motionCompensationGeoBlend's (JVET-AG0112) blend: its kind (1, | 2 with an intra part, | 4 with TM), the CU's
   // blend model as weightedBlend takes it (params, shift, offset, min, max); the plain blend (at the intermediate
@@ -2145,6 +2175,8 @@ public:
   bool       m_gpuBio = false;   // (the last xPredInterBi's bioApplied, for gpuGeoBio)
   MotionInfo m_gpuGeoMi[2];
   std::vector<MotionInfo> m_gpuGeoMb[2];   // (each part's motion buffer at its OBMC, gpuGeoObmc)
+  int32_t    m_gpuGeoAff[2][17] = {};    // (an affine part's: gpuGeoBio)
+  int32_t    m_gpuSubMotion     = 0;     // (subBlockOBMC's last bSubMotion, | 2 luma alone: gpuGeoSub)
   std::vector<int32_t>    m_gpuGeoDmvr[2]; // (each DMVR part's refined vectors, gpuGeoBio)
   int32_t    m_gpuGeoObmc[2] = {};
   int32_t    m_gpuGeoBlend[8] = {};   // (gpuGeoBlend; [0] 0: not motionCompensationGeoBlend's)
