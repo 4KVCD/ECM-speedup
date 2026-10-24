@@ -449,7 +449,7 @@ wall-clock gains with threads are "the easy baseline". Decoder status: single-th
 (`--GpuLoopFilter=1`: ALF, SAO, BIF, CCSAO, LF-CCCM, offset refinement on Vulkan). The user then asked for **a full
 GPU decoder in Vulkan, optimized until nothing is left** ("The GPU decoder needs to fully decode the frame on the
 GPU"; "Your first Vulkan version is going to be slow. That's OK"). That work is branch `dec-gpurecon`: intra
-reconstruction on the GPU (`--GpuRecon`), tool levels M1-M115 done and verified bit-exact (M19: DIMD, M20: OBIC, M21:
+reconstruction on the GPU (`--GpuRecon`), tool levels M1-M116 done and verified bit-exact (M19: DIMD, M20: OBIC, M21:
 intra merge, M22: the transforms of DIMD CUs, M23: LFNST of MIP, M24: TIMD, M25: OBIC and intra merge with TIMD
 neighbours, M26: TIMD-SAD, M27: OBIC and intra merge with TIMD-SAD neighbours, M28: TIMD merge, M29: TMRL of luma,
 M30: chroma TMRL, M31: CCLM, M32: LFNST / NSPT of CCLM, M33: GLM's gradient patterns, M34: CCCM, M35: GL-CCCM, M36:
@@ -2841,6 +2841,18 @@ after the tally's TM split); from the CPU: a DMVR part 92, an intra part 47, LIC
 separate OBMC with an intra neighbour 12, a bi-prediction part with LIC 3, a LIC part with resampling 2. Every other
 count as int5's.
 
+M116 (2026-10-24): GPM DMVR parts on the GPU (bi-prediction parts with multi-pass DMVR - gpmDmvrRefinePart -, all in RA
+streams, also in regression-based blending). CommonLib records after the part's prediction its refined vectors per
+16 x 16 sub-PU (m_gpuGeoDmvr, gpuGeoBio; BDOF from xPredInterBiBDMVR too) and at its OBMC the CU's whole motion buffer
+(m_gpuGeoMb, gpuGeoObmc). Each DMVR part gets an M98 DMVR job of its own (the part's lists, BCW, BDOF; DM_NOMR:
+applyBiOptFlow takes noMR for every GPM CU, no mean removal in the refinement - without it ra_crowdrun_q32 and
+ra_parkjoy832_q32 differed by a few levels), its record in pc.affine flagged MC_BDOF, which gpmPart reads at the final
+precision (or as convert2HighPrec takes it). withPartMotion restores the part's motion buffer and puts the part's
+motion and bdmvrRefine into the PU as subBlockOBMC sees them, so separate OBMC plans and makes the part's inner
+sub-block OBMC (M100's mode-4 jobs, the half-sample threshold of the same direction) like the CPU; part 1's record
+reaches every block where it has inner OBMC. Results (50 streams, build gpmd1): every picture identical (ra_wpp_q32
+skipped); GPM 849 CUs predicted by the GPU (+237), regression-based blending 192 (+91); "a DMVR part" 240 and
+regression's 90 -> 0.
 
 ## 8. Numbers (i7-10700 8C/16T, Win11, GCC 16.2, RTX 3070 driver 616.92)
 

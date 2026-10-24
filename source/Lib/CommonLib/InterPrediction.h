@@ -1857,16 +1857,33 @@ public:
     m_gpuGeoPart[k][23] = pu.cu->bcwIdx;
     m_gpuBio            = false;
   }
-  // ... after part k's prediction: whether xPredInterBi applied BDOF
-  void    gpuGeoBio( int k )
+  // ... after part k's prediction: whether xPredInterBi (or xPredInterBiBDMVR) applied BDOF; with DMVR its refined
+  // vectors per 16 x 16 sub-PU (both lists', as GpuIntraRec::dmvrVectors takes them)
+  void    gpuGeoBio( int k, const PredictionUnit& pu )
   {
     m_gpuGeoPart[k][22] = m_gpuBio ? 1 : 0;
+    m_gpuGeoDmvr[k].clear();
+    for( int uy = 0; m_gpuGeoPart[k][7] && uy < ( (int) pu.lheight() + 15 ) >> 4; uy++ )
+    {
+      for( int ux = 0; ux < ( (int) pu.lwidth() + 15 ) >> 4; ux++ )
+      {
+        const Mv* l0 = m_bdmvrSubPuMvBuf[0], *l1 = m_bdmvrSubPuMvBuf[1];
+        const int i  = uy * DMVR_SUBPU_STRIDE + ux;
+        m_gpuGeoDmvr[k].insert( m_gpuGeoDmvr[k].end(), { l0[i].getHor(), l0[i].getVer(), l1[i].getHor(), l1[i].getVer() } );
+      }
+    }
   }
   // ... part k's motion as its OBMC sees it (spanned over the CU) and whether its sub-block motion's inner OBMC applies
   void    gpuGeoObmc( int k, const PredictionUnit& pu )
   {
     m_gpuGeoMi[k]   = pu.getMotionInfo();
     m_gpuGeoObmc[k] = 1 | ( pu.bdmvrRefine ? 2 : 0 );
+    const CMotionBuf mb = pu.cs->getMotionBuf( pu );   // (the CU's motion buffer: a DMVR part's sub-PU motion)
+    m_gpuGeoMb[k].clear();
+    for( int y = 0; y < (int) mb.height; y++ )
+    {
+      m_gpuGeoMb[k].insert( m_gpuGeoMb[k].end(), &mb.at( 0, y ), &mb.at( 0, y ) + mb.width );
+    }
   }
   // ... motionCompensationGeoBlend's (JVET-AG0112) blend: its kind (1, | 2 with an intra part, | 4 with TM), the CU's
   // blend model as weightedBlend takes it (params, shift, offset, min, max); the plain blend (at the intermediate
@@ -2127,6 +2144,8 @@ public:
   bool       m_gpuGeoIntra = false;      // (an intra part: weightedGeoBlkRounded with it, the inter part mapped)
   bool       m_gpuBio = false;   // (the last xPredInterBi's bioApplied, for gpuGeoBio)
   MotionInfo m_gpuGeoMi[2];
+  std::vector<MotionInfo> m_gpuGeoMb[2];   // (each part's motion buffer at its OBMC, gpuGeoObmc)
+  std::vector<int32_t>    m_gpuGeoDmvr[2]; // (each DMVR part's refined vectors, gpuGeoBio)
   int32_t    m_gpuGeoObmc[2] = {};
   int32_t    m_gpuGeoBlend[8] = {};   // (gpuGeoBlend; [0] 0: not motionCompensationGeoBlend's)
   // xSubPuMC's predictions of the last PU it predicted, for the GPU reconstruction: the PU's luma position and size, then

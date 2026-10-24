@@ -2519,6 +2519,7 @@ void InterPrediction::xPredInterBiBDMVR(PredictionUnit &pu, PelUnitBuf &pcYuvPre
   const bool refIsScaled = isResamplingPossible && ( ( refIdx0 < 0 ? false : pu.cu->slice->getRefPic( REF_PIC_LIST_0, refIdx0 )->isRefScaled( pu.cs->pps ) ) || ( refIdx1 < 0 ? false : pu.cu->slice->getRefPic( REF_PIC_LIST_1, refIdx1 )->isRefScaled( pu.cs->pps ) ) );
   dmvrApplied = dmvrApplied && !refIsScaled;
   bioApplied = bioApplied && !refIsScaled;
+  m_gpuBio   = bioApplied;   // (GPM's DMVR parts: gpuGeoBio)
 #if JVET_AG0067_DMVR_EXTENSIONS
   if (!m_subPuMC)
   {
@@ -12337,7 +12338,7 @@ void InterPrediction::motionCompensationGeoBlend( CodingUnit& cu, MergeCtx& geoM
 #endif
       gpuGeoPart( 0, pu );
       motionCompensation( pu, tmpGeoBuf0, REF_PIC_LIST_X, true, isChromaEnabled(pu.chromaFormat) );
-      gpuGeoBio( 0 );
+      gpuGeoBio( 0, pu );
 
 #if JVET_AE0046_BI_GPM
       pu.bdmvrRefine = false;
@@ -12459,7 +12460,7 @@ void InterPrediction::motionCompensationGeoBlend( CodingUnit& cu, MergeCtx& geoM
 
       gpuGeoPart( 1, pu );
       motionCompensation( pu, tmpGeoBuf1, REF_PIC_LIST_X, true, isChromaEnabled(pu.chromaFormat) );
-      gpuGeoBio( 1 );
+      gpuGeoBio( 1, pu );
 
 #if JVET_AE0046_BI_GPM
       pu.bdmvrRefine = false;
@@ -13026,7 +13027,7 @@ void InterPrediction::motionCompensationGeo( CodingUnit &cu, MergeCtx &geoMrgCtx
 #endif
     gpuGeoPart( 0, pu );
     motionCompensation(pu, tmpGeoBuf0, REF_PIC_LIST_X, true, isChromaEnabled(pu.chromaFormat)); // TODO: check 4:0:0 interaction with weighted prediction.
-    gpuGeoBio( 0 );
+    gpuGeoBio( 0, pu );
 
 #if JVET_AG0164_AFFINE_GPM
     pu.cu->affine = false;
@@ -13299,7 +13300,7 @@ void InterPrediction::motionCompensationGeo( CodingUnit &cu, MergeCtx &geoMrgCtx
 
     gpuGeoPart( 1, pu );
     motionCompensation(pu, tmpGeoBuf1, REF_PIC_LIST_X, true, isChromaEnabled(pu.chromaFormat)); // TODO: check 4:0:0 interaction with weighted prediction.
-    gpuGeoBio( 1 );
+    gpuGeoBio( 1, pu );
 
 #if JVET_AG0164_AFFINE_GPM
     pu.cu->affine = false;

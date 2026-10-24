@@ -424,6 +424,7 @@ const int DM_RUN      = 512;   // ... a run of sub-PUs of one motion (motionComp
 const int DM_UNI      = 1024;  // ... the run's uni-prediction (or xCheckIdenticalMotion's)
 const int DM_ZERO     = 2048;
 const int DM_NLIC     = 4096;  // ... a group of a non-local LIC CU: no refinement (applyBiOptFlow's altLMFlag)
+const int DM_NOMR     = 8192;  // a GPM part's (M116): the refinement without the mean removal (applyBiOptFlow's noMR)
 
 int  dmO, dmX, dmY, dmW, dmH, dmFlags, dmBd, dmClipMin, dmClipMax, dmSlot0, dmSlot1, dmS, dmNux, dmDst;
 int  dmOX, dmOY, dmOW, dmOH;   // (the block's place in its PU's prediction, the PU's size)
@@ -732,7 +733,7 @@ void dmRefine( int bx, int by, int bw, int bh, ivec2 mv0, ivec2 mv1, int iter )
         {
           md = dmGetMean( sAcc[7] + ( ( ww * wh ) >> 1 ), ww * wh );
         }
-        else if( !sameDir )
+        else if( !sameDir && ( dmFlags & DM_NOMR ) == 0 )
         {
           const int mean = sAcc[8] > 2 * abs( sAcc[7] ) ? 0 : sAcc[7];
           md             = dmGetMean( mean + ww * wh, ( ww * wh ) << 1 );
@@ -1242,6 +1243,13 @@ int mcPlain( BufI32 jb, int o, BufI32 lb, int comp, int x, int y, int puW, int p
 int gpmPart( BufI32 jb, int o, int k, int comp, int x, int y, int puW, int puH, int bd, int clipMin, int clipMax, bool fin )
 {
   const int r = BufI32( pc.affine ).v[jb.v[o + MC_NLIC_AT] + 24 + k];
+  if( r >= 0 && ( BufI32( pc.affine ).v[r + MC_FLAGS] & MC_BDOF ) != 0 )   // a DMVR part (M116): its DMVR job's prediction
+  {
+    const int cs = comp == 0 ? 0 : 1, area = ( puW << cs ) * ( puH << cs );
+    const int base = BufI32( pc.affine ).v[r + MC_BDOF_OUT] + ( comp == 0 ? 0 : area + ( comp - 1 ) * ( area >> 2 ) );
+    const int v = int( BufI16( pc.bdofOut ).v[base + ( y - ( jb.v[o + MC_PU_Y] >> cs ) ) * puW + x - ( jb.v[o + MC_PU_X] >> cs )] );
+    return fin ? v : ( v << ( IF_INTERNAL_PREC - bd ) ) - IF_INTERNAL_OFFS;
+  }
   if( r >= 0 )
   {
     const int v = mcPlain( BufI32( pc.affine ), r, BufI32( pc.affine ), comp, x, y, puW, puH, bd, clipMin, clipMax, -1 );
