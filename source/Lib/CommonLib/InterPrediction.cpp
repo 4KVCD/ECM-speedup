@@ -12685,7 +12685,9 @@ void InterPrediction::motionCompensationGeo( CodingUnit &cu, MergeCtx &geoMrgCtx
 {
   m_gpuGeoPlain = false;
   m_gpuGeoSep   = false;
+  m_gpuGeoIntra = false;
   m_gpuGeoPart[0][6] = m_gpuGeoPart[1][6] = 0;
+  m_gpuGeoPart[0][24] = m_gpuGeoPart[1][24] = 0;
   m_gpuGeoObmc[0] = m_gpuGeoObmc[1] = 0;
 #if JVET_AI0082_GPM_WITH_INTER_IBC
   if (cu.firstPU->gpmInterIbcFlag)
@@ -12923,13 +12925,17 @@ void InterPrediction::motionCompensationGeo( CodingUnit &cu, MergeCtx &geoMrgCtx
 #endif
       pcIntraPred->initIntraPatternChType(cu, pu.Y());
       pcIntraPred->predIntraAng(COMPONENT_Y, tmpGeoBuf0.Y(), pu);
+      pcIntraPred->gpmSnapshotSave( COMPONENT_Y );
+      m_gpuGeoPart[0][24] = pu.intraDir[0] + 1;
       if (isChromaEnabled(pu.chromaFormat))
       {
         pu.intraDir[1] = pu.intraDir[0];
         pcIntraPred->initIntraPatternChType(cu, pu.Cb());
         pcIntraPred->predIntraAng(COMPONENT_Cb, tmpGeoBuf0.Cb(), pu);
+        pcIntraPred->gpmSnapshotSave( COMPONENT_Cb );
         pcIntraPred->initIntraPatternChType(cu, pu.Cr());
         pcIntraPred->predIntraAng(COMPONENT_Cr, tmpGeoBuf0.Cr(), pu);
+        pcIntraPred->gpmSnapshotSave( COMPONENT_Cr );
       }
     }
     else
@@ -13191,13 +13197,17 @@ void InterPrediction::motionCompensationGeo( CodingUnit &cu, MergeCtx &geoMrgCtx
 
       pcIntraPred->initIntraPatternChType(cu, pu.Y());
       pcIntraPred->predIntraAng(COMPONENT_Y, tmpGeoBuf1.Y(), pu);
+      pcIntraPred->gpmSnapshotSave( COMPONENT_Y );
+      m_gpuGeoPart[1][24] = pu.intraDir[0] + 1;
       if (isChromaEnabled(pu.chromaFormat))
       {
         pu.intraDir[1] = pu.intraDir[0];
         pcIntraPred->initIntraPatternChType(cu, pu.Cb());
         pcIntraPred->predIntraAng(COMPONENT_Cb, tmpGeoBuf1.Cb(), pu);
+        pcIntraPred->gpmSnapshotSave( COMPONENT_Cb );
         pcIntraPred->initIntraPatternChType(cu, pu.Cr());
         pcIntraPred->predIntraAng(COMPONENT_Cr, tmpGeoBuf1.Cr(), pu);
+        pcIntraPred->gpmSnapshotSave( COMPONENT_Cr );
       }
     }
     else
@@ -13397,6 +13407,9 @@ void InterPrediction::motionCompensationGeo( CodingUnit &cu, MergeCtx &geoMrgCtx
     }
     if (pu.gpmIntraFlag)
     {
+      m_gpuGeoIntra = true;
+      m_gpuGeoSplit = splitDir;
+      m_gpuGeoBld   = bldIdx;
       if (reshapeLUT)
       {
         if (!isIntra1)

@@ -2110,7 +2110,8 @@ public:
   bool       m_gpuGeoPlain = false;
   bool       m_gpuGeoSep   = false;
   int        m_gpuGeoSplit = 0, m_gpuGeoBld = 0;
-  int32_t    m_gpuGeoPart[2][24] = {};
+  int32_t    m_gpuGeoPart[2][25] = {};   // ([24]: an intra part's mode + 1)
+  bool       m_gpuGeoIntra = false;      // (an intra part: weightedGeoBlkRounded with it, the inter part mapped)
   bool       m_gpuBio = false;   // (the last xPredInterBi's bioApplied, for gpuGeoBio)
   MotionInfo m_gpuGeoMi[2];
   int32_t    m_gpuGeoObmc[2] = {};

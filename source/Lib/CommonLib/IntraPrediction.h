@@ -717,6 +717,9 @@ public:
   /// the parameters of CIIP's intra prediction of component compID (geneIntrainterPred's predIntraAng), for the GPU
   /// reconstruction
   const IpaSnapshot& ciipSnapshot( int compID ) const { return m_ciipIpa[compID]; }
+  /// ... of a GPM CU's intra part (motionCompensationGeo's predIntraAng; gpmSnapshotSave after it)
+  const IpaSnapshot& gpmSnapshot( int compID ) const { return m_gpmIpa[compID]; }
+  void               gpmSnapshotSave( int compID ) { m_gpmIpa[compID] = ipaSnapshot(); }
   IpaSnapshot ipaSnapshot() const
   {
     return { m_ipaParam.isModeVer,
@@ -751,6 +754,7 @@ public:
 private:
   bool m_paramsOnly = false;
   IpaSnapshot m_ciipIpa[MAX_NUM_COMPONENT];   // (ciipSnapshot)
+  IpaSnapshot m_gpmIpa[MAX_NUM_COMPONENT];    // (gpmSnapshot)
 
 #if JVET_AN0158_INTRA_LONGTAP
   int m_dimdCurrentPredIdx = 0;

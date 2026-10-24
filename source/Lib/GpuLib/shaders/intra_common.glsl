@@ -298,6 +298,9 @@ const int LMCS_INTER_FWD = 4;
 // the inter one weighed by the rest of 64, clipped), wIntra << CIIP_W, CIIP_FWD: the inter prediction is
 // forward-mapped by LMCS first
 const int CIIP_ON = 1, CIIP_UNIFORM = 0, CIIP_BY_X = 2, CIIP_BY_Y = 4, CIIP_EDGE = 6, CIIP_KIND = 6, CIIP_W = 3;
+// (CIIP_GPM: a GPM block with an intra part, M115 - weightedGeoBlkRounded of the parts with Tu::gpm's weights of part
+// 0, the intra prediction part 1's with CIIP_GPM_I1, else part 0's)
+const int CIIP_GPM = 64, CIIP_GPM_I1 = 128;
 const int CIIP_FWD = 32;
 
 // a CU's block vectors as the lists of later CUs take them (Params::bvOut per luma CU, by its index in the

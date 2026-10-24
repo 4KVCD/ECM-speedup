@@ -126,9 +126,9 @@ public:
   /// predictions (InterPrediction::m_gpuSubPu), recordInterCu's
   void subPuMotion( const CodingUnit& cu, const std::vector<int32_t>& items );
   /// GPM CU cu, which the CPU has predicted (motionCompensationGeo): the blend it took (1 the plain one, 2 the rounded
-  /// one after each part's own OBMC, 0 another), the split direction, the blending index, each part's motion
+  /// one after each part's own OBMC, 3 the rounded one with an intra part, 0 another), the split direction, the blending index, each part's motion
   /// (InterPrediction::m_gpuGeoPart) and its motion and flags at its OBMC (m_gpuGeoMi, m_gpuGeoObmc), recordInterCu's
-  void gpmParts( const CodingUnit& cu, int kind, int splitDir, int bldIdx, const int32_t parts[2][24],
+  void gpmParts( const CodingUnit& cu, int kind, int splitDir, int bldIdx, const int32_t parts[2][25],
                  const MotionInfo partMi[2], const int32_t partObmc[2] );
   /// TU tu of an inter CCCM or inter CCP merge CU, before DecCu blends its chroma prediction
   /// (deriveInterCccmPrediction, deriveInterCcpMergePrediction): the inter one

@@ -449,7 +449,7 @@ wall-clock gains with threads are "the easy baseline". Decoder status: single-th
 (`--GpuLoopFilter=1`: ALF, SAO, BIF, CCSAO, LF-CCCM, offset refinement on Vulkan). The user then asked for **a full
 GPU decoder in Vulkan, optimized until nothing is left** ("The GPU decoder needs to fully decode the frame on the
 GPU"; "Your first Vulkan version is going to be slow. That's OK"). That work is branch `dec-gpurecon`: intra
-reconstruction on the GPU (`--GpuRecon`), tool levels M1-M114 done and verified bit-exact (M19: DIMD, M20: OBIC, M21:
+reconstruction on the GPU (`--GpuRecon`), tool levels M1-M115 done and verified bit-exact (M19: DIMD, M20: OBIC, M21:
 intra merge, M22: the transforms of DIMD CUs, M23: LFNST of MIP, M24: TIMD, M25: OBIC and intra merge with TIMD
 neighbours, M26: TIMD-SAD, M27: OBIC and intra merge with TIMD-SAD neighbours, M28: TIMD merge, M29: TMRL of luma,
 M30: chroma TMRL, M31: CCLM, M32: LFNST / NSPT of CCLM, M33: GLM's gradient patterns, M34: CCCM, M35: GL-CCCM, M36:
@@ -2767,6 +2767,23 @@ blocker ("affine (CIIP: ...)"). Results (50 streams, build aciip1): every pictur
 affine 1927 CUs predicted by the GPU (+51); "affine (CIIP)" 212 -> CIIP with LIC 60, with LFNST / NSPT 54, OBMC of
 sub-block motion 13, inter CCP merge 4, inter CCCM 1, others 28 (non-affine CIIP, CIIP-PDPC, DMVR, weighted
 prediction with LIC neighbours).
+M115 (2026-10-23): GPM with an intra part on the GPU (JVET-Y0065, motionCompensationGeo's gpmIntraFlag path: the intra
+part predIntraAng of a geometric MPM, chroma at the same mode; the inter part at its final precision -
+roundToOutputBitdepth's roundBD of the intermediate, or as it is with separate OBMC -, after its own subBlockOBMC with
+its motion, forward-mapped by LMCS; weightedGeoBlkRounded of the two). It is a CIIP variant on the GPU: CommonLib
+saves the intra part's parameters (IntraPrediction::gpmSnapshot after each predIntraAng) and its mode (the part's
+record's word 24, m_gpuGeoPart now 25 ints), and the blend taken (kind 3); a block's job (MC_GPM_INTRA, MC_GPM_I1 for
+part 1, MC_GPM_FIN with separate OBMC) predicts the inter part; ciipFields fills the intra fields from the snapshot and
+Tu::ciip gets CIIP_GPM (CIIP_GPM_I1 where the intra part is part 1) with Tu::gpm's record of the weights, so intra_rec
+applies the inter part's OBMC (its record as the CU's, made with its motion: withPartMotion; the normal rules -
+skipObmcConditionByPixel, TM - without separate OBMC) in the DERIVE_INTER branch, goes on to the intra path, and
+ciipBlend weighs (w a + (32 - w) b + 16) >> 5 with the inter part forward-mapped (CIIP_FWD). gpmWhy applies ciipWhy's
+limits (one TU, no LFNST / NSPT, LIC, inter CCCM / CCP) and leaves SGPM's intra parts to the CPU. Found on the way:
+the GPM job's loop took a slot for the intra part's stale reference index (getRefPic's CHECK). Results (50 streams,
+build gpmi1): every picture identical (ra_wpp_q32 skipped; ai_foreman352_q22 lost the device twice and passed alone);
+GPM 612 CUs predicted by the GPU (+126); "an intra part" 467 -> SGPM 78, CIIP's limits 136 (LFNST 49, LIC 48, several
+TUs 31, inter CCP 8), and CUs that now show their next reason (an affine part 613 -> 671, separate OBMC with an intra
+neighbour 51 -> 100).
 Sub-PU motion compensation on the GPU (2026-10-23, agent sb; motionCompensation's xSubPuMC: sub-block merge - SbTMVP
 -, AMVP-SbTMVP and JVET-AF0159's affine / SbTMVP sub-PU BDOF refinement). CommonLib records xSubPuMC's predictions of
 its last PU (InterPrediction::m_gpuSubPu through gpuSubPu, at the end of the class): per group of xGetSubPuGroupArea2D
