@@ -905,7 +905,7 @@ void dmvrJob( int o )
 // sub-block
 const int AF_X = 0, AF_Y = 1, AF_W = 2, AF_H = 3, AF_BI = 4, AF_LIST = 5, AF_SHIFT = 6, AF_W0 = 7, AF_W1 = 8;
 const int AF_HMAX = 9, AF_HMIN = 10, AF_VMAX = 11, AF_VMIN = 12, AF_PIC_W = 13, AF_PIC_H = 14, AF_BD = 15;
-const int AF_CLIP_MIN = 16, AF_CLIP_MAX = 17, AF_MVF = 18, AF_LIC = 19, AF_C0 = 20;
+const int AF_CLIP_MIN = 16, AF_CLIP_MAX = 17, AF_MVF = 18, AF_LIC = 19, AF_WP = 20, AF_C0 = 21;   // (AF_WP: MC_WP's record)
 // per list and component class (luma, chroma): the base vector (mvLT << iBit), the deltas, the sub-block size, pixel
 // blocks, PROF, the slot
 const int AF_MVH = 0, AF_MVV = 1, AF_DHX = 2, AF_DHY = 3, AF_DVX = 4, AF_DVY = 5, AF_BW = 6, AF_BH = 7, AF_1X1 = 8;
@@ -1058,6 +1058,21 @@ int afSample( int r, int comp, int x, int y )
   const int px = x - ( afJ( r, AF_X ) >> cs ), py = y - ( afJ( r, AF_Y ) >> cs );
   const int bd = afJ( r, AF_BD ), clipMin = afJ( r, AF_CLIP_MIN ), clipMax = afJ( r, AF_CLIP_MAX );
   const int lic = afJ( r, AF_LIC );
+  if( afJ( r, AF_WP ) >= 0 )   // explicit weighted prediction on the lists' intermediates (M113, as mcPlain's)
+  {
+    BufI32    wb = BufI32( pc.affine );
+    const int w = afJ( r, AF_WP ) + comp * WP_REC, sh = wb.v[w + WP_SHIFT];
+    const int q0 = afList( r, afJ( r, AF_BI ) == 0 ? afJ( r, AF_LIST ) : 0, comp, px, py, true );
+    if( wb.v[w + WP_KIND] == 0 )
+    {
+      return clamp( ( ( wb.v[w + WP_W0] * ( q0 + IF_INTERNAL_OFFS ) + ( sh > 0 ? 1 << ( sh - 1 ) : 0 ) ) >> sh ) + wb.v[w + WP_OFFSET],
+                    clipMin, clipMax );
+    }
+    const int q1 = afList( r, 1, comp, px, py, true );
+    return clamp( ( wb.v[w + WP_W0] * ( q0 + IF_INTERNAL_OFFS ) + wb.v[w + WP_W1] * ( q1 + IF_INTERNAL_OFFS ) + ( 1 << ( sh - 1 ) )
+                    + ( wb.v[w + WP_OFFSET] << ( sh - 1 ) ) ) >> sh,
+                  clipMin, clipMax );
+  }
   if( afJ( r, AF_BI ) == 0 )
   {
     const int l = afJ( r, AF_LIST ), v = afList( r, l, comp, px, py, false );

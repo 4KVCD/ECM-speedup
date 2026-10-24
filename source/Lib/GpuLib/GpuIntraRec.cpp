@@ -7741,7 +7741,9 @@ static bool affineGpu( const CodingUnit& cu )
       || ( cu.altLMFlag && sps.getRprEnabledFlag() ) || pu.ciipFlag || pu.mergeType != MRG_TYPE_DEFAULT_N
       || pu.amvpSbTmvpFlag || pu.bdmvrRefine || pu.availableBdofRefinedMv == AFFINE_SUBPU_BDOF_APPLY_AND_STORE_MV
       || pu.availableBdofRefinedMv == AFFINE_SUBPU_BDOF_APPLY_WITHOUT_STORE_MV || cu.chromaFormat != CHROMA_420
-      || pps.getWrapAroundEnabledFlag() || pps.getUseWP() || pps.getWPBiPred() || clipMv != clipMvInPic
+      || pps.getWrapAroundEnabledFlag() || clipMv != clipMvInPic
+      || ( ( ( pps.getUseWP() && slice.getSliceType() == P_SLICE ) || ( pps.getWPBiPred() && slice.getSliceType() == B_SLICE ) )
+           && ( cu.licFlag || cu.altLMFlag ) )   // (weighted prediction, M113: not with LIC or non-local LIC)
       || pu.interDir < 1 || pu.interDir > 3
       || slice.clpRng( COMPONENT_Y ).max != slice.clpRng( COMPONENT_Cb ).max
       || slice.clpRng( COMPONENT_Y ).min != slice.clpRng( COMPONENT_Cb ).min
@@ -7759,6 +7761,8 @@ static bool affineGpu( const CodingUnit& cu )
   return true;
 }
 
+static int32_t wpRecord( GpuIntraRec::Impl& m, const Slice& slice, int ref0, int ref1, int bcw );
+
 // the record of affine CU cu (inter_mc.comp's AF_*), appended to m.affineData
 static void affineRecord( GpuIntraRec::Impl& m, const CodingUnit& cu )
 {
@@ -7768,7 +7772,7 @@ static void affineRecord( GpuIntraRec::Impl& m, const CodingUnit& cu )
   const SPS&            sps   = *cu.cs->sps;
   constexpr int AF_X = 0, AF_Y = 1, AF_W = 2, AF_H = 3, AF_BI = 4, AF_LIST = 5, AF_SHIFT = 6, AF_W0 = 7, AF_W1 = 8;
   constexpr int AF_HMAX = 9, AF_HMIN = 10, AF_VMAX = 11, AF_VMIN = 12, AF_PIC_W = 13, AF_PIC_H = 14, AF_BD = 15;
-  constexpr int AF_CLIP_MIN = 16, AF_CLIP_MAX = 17, AF_MVF = 18, AF_LIC = 19, AF_C0 = 20;
+  constexpr int AF_CLIP_MIN = 16, AF_CLIP_MAX = 17, AF_MVF = 18, AF_LIC = 19, AF_WP = 20, AF_C0 = 21;
   constexpr int AF_MVH = 0, AF_MVV = 1, AF_DHX = 2, AF_DHY = 3, AF_DVX = 4, AF_DVY = 5, AF_BW = 6, AF_BH = 7, AF_1X1 = 8;
   constexpr int AF_PROF = 9, AF_SLOT = 10, AF_C = 12;
   const int    width = (int) pu.lwidth(), height = (int) pu.lheight(), iBit = MAX_CU_DEPTH;
@@ -7803,6 +7807,7 @@ static void affineRecord( GpuIntraRec::Impl& m, const CodingUnit& cu )
   a[AF_CLIP_MIN] = slice.clpRng( COMPONENT_Y ).min;
   a[AF_CLIP_MAX] = slice.clpRng( COMPONENT_Y ).max;
   a[AF_LIC]      = -1;
+  a[AF_WP]       = -1;
   for( int l = 0; l < 2; l++ )
   {
     if( pu.refIdx[l] < 0 )
@@ -7877,6 +7882,9 @@ static void affineRecord( GpuIntraRec::Impl& m, const CodingUnit& cu )
       }
     }
   }
+  // (explicit weighted prediction, M113: its record)
+  const int32_t wp = wpRecord( m, slice, pu.refIdx[0], pu.refIdx[1], cu.bcwIdx );
+  m.affineData[r + AF_WP] = wp;
   // the stored luma motion per 4 x 4 unit (both lists), which chroma's sub-blocks average
   m.affineData[r + AF_MVF] = (int32_t) m.affineData.size();
   for( int uy = 0; uy < height >> 2; uy++ )
