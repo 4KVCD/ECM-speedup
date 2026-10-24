@@ -2916,6 +2916,11 @@ same way as m116 from a detached worktree, C:\Code\ECM\wt-m116, its intra_rec mo
   ld_foreman_q22 alone lost it in 2 of 5 runs with this build and 1 of 5 with M116; ld_cif33 under parallel load
   (with M116 too). Not yet found; a dependency wait that never resolves in a persistent kernel would look like this.
 - Intra pictures: most need LEVEL_CCP_LFNST's pipeline and stay unverified on this PC (ECM_GPU_NO_CCP_LFNST).
+Fix after M117 (2026-10-24): endPicture runs a picture again when its dependency edges pass the scheduling buffer's
+room, and the DMVR / xSubPuMC jobs' vector offsets (DM_MVS) were made absolute inside that loop - the second pass
+added the job array's size again, and every DMVR / sub-PU job read other data as its vectors (ld_parkjoy_q27 POC 7
+and 8: the 4 x 4 AMVP-SbTMVP CU at 232,16 had the right bdofOut after the first pass, other samples after the second).
+They are made absolute once, before the loop: ld_parkjoy_q27 identical.
 
 ## 8. Numbers (i7-10700 8C/16T, Win11, GCC 16.2, RTX 3070 driver 616.92)
 
@@ -2938,19 +2943,18 @@ Profile of a GPU-on decode (non-LTO, m2_park16, share of all samples): parsing ~
 
 00. Now (2026-10-24, the inter phase, after M117; on the RTX 3070 PC):
    a. Open differences of the 3070 PC's streams, all older than M117 (M116 the same), each with what is known:
-      - ld_parkjoy_q27 POC 8, the 4 x 4 AMVP-SbTMVP CU at 232,16 (its one xSubPuMC run: bi with identical lists,
-        (32, -8) on reference 0, a DM_UNI run): the CPU's run output is the CPU's prediction (163 100 169 372 ...),
-        the run's recorded motion, the host's job (DM_X, DM_REF0, DM_MVS) and sbRun agree with it, yet the GPU's
-        block is the CPU's two columns to the left (as if the 2 integer samples of x were lost, or stale data in
-        pc.bdofOut). Next: read the GPU's bdofOut at that job's DM_DST after the dispatch.
-      - ld_parkjoy_q27 POC 7 (an affine sub-block merge CU 128 x 128 at 0,128 with OBMC, GPU 104 for 98; gone with
-        the OBMC or the LIC CUs on the CPU - a neighbour's OBMC?) and POC 8's OBMC CU with DMVR at 128,0;
-        ldp_parkjoy_q27 (an inter block 1 low at 36,76, derive 0x10000040), ra_parkjoy_q32 (an OBIC mode after
-        inter differences).
+      - ldp_parkjoy_q27 POC 2 (an inter block 1 low at 36,76, derive 0x10000040) and POC 6 / 8 (SGPM CUs' DIMD);
+        ra_parkjoy_q32 POC 2 (an inter block 2 low at 80,176) and POC 16 (an OBIC mode after inter differences).
       - intra: ai_long POC 5 (NN's indicesRepresentationPnn), ld_md5 POC 0 (scheduling data) and POC 40 (an SGPM
         CU's DIMD mode), ra_ip64_md5 (an SGPM CU's MTSS LFNST mode), ra720_pj17 (5 pictures).
-      - the intermittent device losses (section 7's M117 results).
-      ECM_GPU_CPU_KINDS narrows a difference to a kind (sub-PU CUs go their own way, not through it).
+      - Intermittent VK_ERROR_DEVICE_LOST, e.g. ld_foreman_q22 alone in 2-6 of 10 runs (M116 too), always in POC 1's
+        first pass (the first inter picture). Never with ECM_GPU_NO_MC or ECM_GPU_NO_INTER (8 of 8 each); every kind
+        left to the CPU alone still loses it; four times the dependency room (edgeCap) and refAt clamped to the
+        planes' margins (an inter_mc variant through ECM_GPU_INTER_MC_SPV) still lose it. Next: other inter_mc
+        accesses (pc.affine records, pc.outPred / pc.bdofOut offsets), or intra_rec's scheduling with inter blocks
+        whose timing inter_mc's work changes.
+      ECM_GPU_CPU_KINDS narrows a difference to a kind (sub-PU CUs go their own way, not through it). A bdofOut /
+      buffer read-back beside verification's download (endPicture) shows what a job wrote.
    b. intra_rec's second module (LEVEL_CCP_LFNST) cannot compile on the 3070 within the 60 GB budget (>35 GB), and
       most intra pictures need it; the first module's pipelines take 1-15 minutes and 7-30 GB each. Its inlined size
       (inline_size.py: 1.19M, 1.0M for the first module) comes mostly from small helpers in hand-unrolled taps

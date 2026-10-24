@@ -11821,6 +11821,12 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
     return;
   }
 
+  // the DMVR / sub-PU jobs' vectors follow the jobs in their buffer: their offsets made absolute once, before the loop
+  // (its second pass, with more room for the dependencies, uploads the same jobs)
+  for( size_t d = 0; d < m.dmvrJobs.size(); d += MC_JOB )
+  {
+    m.dmvrJobs[d + DM_MVS] += (int32_t) m.dmvrJobs.size();
+  }
   for( ;; )   // once, again with more room when the dependencies do not fit
   {
     const size_t cap = m.edgeCap;
@@ -11871,10 +11877,6 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
     mcPlanes.resize( ( mcPlanes.size() + 1 ) & ~size_t( 1 ), 0 );
     const size_t mcJobBytes = m.mcJobs.size() * 4, mcRefBytes = mcRefTab.size() * 4, mcPlaneBytes = mcPlanes.size() * 2;
     const size_t bdofJobBytes = m.bdofJobs.size() * 4, bdofBytes = ( size_t( m.bdofSamples ) * 2 + 3 ) & ~size_t( 3 );
-    for( size_t d = 0; d < m.dmvrJobs.size(); d += MC_JOB )   // (the vectors after the jobs)
-    {
-      m.dmvrJobs[d + DM_MVS] += (int32_t) m.dmvrJobs.size();
-    }
     const size_t dmvrJobBytes = ( m.dmvrJobs.size() + m.dmvrJobMvs.size() ) * 4, obmcJobBytes = m.obmcJobs.size() * 4;
     const size_t innerJobBytes = m.obmcInnerJobs.size() * 4, affineBytes = m.affineData.size() * 4;
     const size_t upInter = upCcp + ccpUp, upMc = upInter + interBytes;
