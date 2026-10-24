@@ -449,7 +449,7 @@ wall-clock gains with threads are "the easy baseline". Decoder status: single-th
 (`--GpuLoopFilter=1`: ALF, SAO, BIF, CCSAO, LF-CCCM, offset refinement on Vulkan). The user then asked for **a full
 GPU decoder in Vulkan, optimized until nothing is left** ("The GPU decoder needs to fully decode the frame on the
 GPU"; "Your first Vulkan version is going to be slow. That's OK"). That work is branch `dec-gpurecon`: intra
-reconstruction on the GPU (`--GpuRecon`), tool levels M1-M109 done and verified bit-exact (M19: DIMD, M20: OBIC, M21:
+reconstruction on the GPU (`--GpuRecon`), tool levels M1-M110 done and verified bit-exact (M19: DIMD, M20: OBIC, M21:
 intra merge, M22: the transforms of DIMD CUs, M23: LFNST of MIP, M24: TIMD, M25: OBIC and intra merge with TIMD
 neighbours, M26: TIMD-SAD, M27: OBIC and intra merge with TIMD-SAD neighbours, M28: TIMD merge, M29: TMRL of luma,
 M30: chroma TMRL, M31: CCLM, M32: LFNST / NSPT of CCLM, M33: GLM's gradient patterns, M34: CCCM, M35: GL-CCCM, M36:
@@ -2720,6 +2720,15 @@ Integration with M109 (2026-10-23): GPM with separate OBMC next to an intra neig
 "separate OBMC with an intra neighbour", 45 CUs) - obmcPlan without its intra list no longer rejects intra runs, and
 the first integration build took such CUs to the GPU without their strips (12 RA streams differed); with the fix the
 50 streams are identical (build int4; ra_wpp_q32 skipped).
+M110 (2026-10-23): the affine / SbTMVP sub-PU BDOF refinement (JVET-AF0159) is told to the host: DecCu's xReconInter
+resets availableBdofRefinedMv right after the prediction, so affineGpu's test of it never held at record time (the
+CUs it meant were caught by obmcPlan's "OBMC of sub-block motion" alone, as checkDoAffineBdofRefine forces their OBMC
+flag); DecCu now calls subPuBdof where getDoAffineSubPuBdof holds, before the reset, and recordInterCu leaves those CUs
+to the CPU ("affine (with BDOF)"). A first version also ported the inner sub-block OBMC of affine CUs where
+checkDoAffineBdofRefine holds without the BDOF having run (luma alone, innerObmcSkipChroma; mvDiffTH only with DMVR):
+no CU of the 50 streams reaches it, so it stays rejected, unported. Results (50 streams, build aob3): every picture
+identical (ra_wpp_q32 skipped); the GPU's counts unchanged; "affine (OBMC of sub-block motion)" 697 and 12 of
+"affine (other)" are now "affine (with BDOF)" 709 - the sub-PU BDOF port is what they need.
 
 
 ## 8. Numbers (i7-10700 8C/16T, Win11, GCC 16.2, RTX 3070 driver 616.92)

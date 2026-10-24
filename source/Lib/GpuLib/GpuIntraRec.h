@@ -125,6 +125,9 @@ public:
   /// GPM CU cu, which the CPU has predicted (motionCompensationGeo): the blend it took (1 the plain one, 2 the rounded
   /// one after each part's own OBMC, 0 another), the split direction, the blending index, each part's motion
   /// (InterPrediction::m_gpuGeoPart) and its motion and flags at its OBMC (m_gpuGeoMi, m_gpuGeoObmc), recordInterCu's
+  /// inter CU cu, whose prediction the CPU made with the affine / SbTMVP sub-PU BDOF refinement (JVET-AF0159:
+  /// DecCu's getDoAffineSubPuBdof, before it resets availableBdofRefinedMv), recordInterCu's
+  void subPuBdof( const CodingUnit& cu );
   void gpmParts( const CodingUnit& cu, int kind, int splitDir, int bldIdx, const int32_t parts[2][22],
                  const MotionInfo partMi[2], const int32_t partObmc[2] );
   /// TU tu of an inter CCCM or inter CCP merge CU, before DecCu blends its chroma prediction

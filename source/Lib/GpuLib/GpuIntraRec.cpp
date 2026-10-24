@@ -2267,6 +2267,7 @@ struct GpuIntraRec::Impl
   // motion compensation on the GPU (inter_mc.comp): the inter CUs whose prediction it makes, their blocks' jobs
   // (MC_JOB each), the reference pictures they read (their slots), the CUs by kind (interKind, totals)
   std::unordered_set<const CodingUnit*>                        mcCus;
+  std::unordered_set<const CodingUnit*>                        subPuBdofCus;   // (subPuBdof: affine / SbTMVP BDOF)
   std::vector<int32_t>                                         mcJobs;
   // BDOF: its PUs' luma predictions (where in mcBdofBuf, int16) and the sub-blocks' jobs (inter_mc's mode 1)
   std::unordered_map<const CodingUnit*, int32_t>               bdofOut;
@@ -2589,6 +2590,7 @@ void GpuIntraRec::beginPicture( const CodingStructure& cs )
   m.interPending.clear();
   m.interPred.clear();
   m.mcCus.clear();
+  m.subPuBdofCus.clear();
   m.mcJobs.clear();
   m.bdofOut.clear();
   m.bdofJobs.clear();
@@ -9051,6 +9053,7 @@ void GpuIntraRec::recordInterCu( const CodingUnit& cu )
     m.cuJob[c] = -1;
   }
   if( !CU::isIBC( cu ) && !CU::isPLT( cu ) && interMcGpu( cu ) && ( !cu.geoFlag || !gpmWhy( m, cu ) )
+      && !m.subPuBdofCus.count( &cu )
       && ( !cu.firstPU->bdmvrRefine || mcIdentical( *cu.firstPU ) || m.dmvrMvs.count( &cu ) )
       && ( !cu.obmcFlag || ( geoSep ? !gpmSepPlan( m, cu, geoSegs ) : !obmcPlan( cu, segs, inner, &intraRuns ) ) ) )
   {
@@ -9184,8 +9187,7 @@ void GpuIntraRec::recordInterCu( const CodingUnit& cu )
                     ? " (with inherited LIC or resampling)"
                 : pu.mergeType != MRG_TYPE_DEFAULT_N || pu.amvpSbTmvpFlag ? " (sub-block merge)"
                 : pu.bdmvrRefine ? " (with DMVR)"
-                : pu.availableBdofRefinedMv == AFFINE_SUBPU_BDOF_APPLY_AND_STORE_MV
-                    || pu.availableBdofRefinedMv == AFFINE_SUBPU_BDOF_APPLY_WITHOUT_STORE_MV ? " (with BDOF)"
+                : m.subPuBdofCus.count( &cu ) ? " (with BDOF)"
                 : affineGpu( cu ) && cu.obmcFlag && ( why = obmcPlan( cu, s, in ) ) != nullptr ? std::string( " (" ) + why + ")"
                 : " (other)";
       }
@@ -9513,6 +9515,15 @@ static int mcSlot( GpuIntraRec::Impl& m, const Slice& slice, int l, int refIdx )
 void GpuIntraRec::ibcGpmVectors( const CodingUnit& cu, const Mv& mv0, const Mv& mv1 )
 {
   m_impl->ibcGpmMvs[&cu] = std::make_pair( mv0, mv1 );
+}
+
+void GpuIntraRec::subPuBdof( const CodingUnit& cu )
+{
+  Impl& m = *m_impl;
+  if( m.partial && m.interPending.count( &cu ) )
+  {
+    m.subPuBdofCus.insert( &cu );
+  }
 }
 
 void GpuIntraRec::gpmParts( const CodingUnit& cu, int kind, int splitDir, int bldIdx, const int32_t parts[2][22],

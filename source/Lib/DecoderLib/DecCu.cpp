@@ -3241,6 +3241,12 @@ void DecCu::xReconInter(CodingUnit &cu)
     cu.firstPU->availableBdofRefinedMv = AFFINE_SUBPU_BDOF_NOT_APPLY;
     if (m_pcInterPred->getDoAffineSubPuBdof() == true)
     {
+#if ECM_VULKAN
+      if( m_gpuIntraRec )   // (partial verification: the GPU lacks it)
+      {
+        m_gpuIntraRec->subPuBdof( cu );
+      }
+#endif
       PU::setAffineBdofRefinedMotion(*cu.firstPU, m_mvBufDecAffineBDOF);
       m_pcInterPred->setDoAffineSubPuBdof(false);
     }
