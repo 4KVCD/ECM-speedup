@@ -3225,6 +3225,9 @@ void DecCu::xReconInter(CodingUnit &cu)
     CHECK(CU::isIBC(cu) && cu.firstPU->mmvdMergeFlag, "IBC and MMVD cannot be used together");
     const bool luma = cu.Y().valid();
     const bool chroma = isChromaEnabled(cu.chromaFormat) && cu.Cb().valid();
+#if ECM_VULKAN
+    m_pcInterPred->m_gpuSubPu.clear();
+#endif
     if (luma && (chroma || !isChromaEnabled(cu.chromaFormat)))
     {
       m_pcInterPred->motionCompensation(cu);
@@ -3237,16 +3240,16 @@ void DecCu::xReconInter(CodingUnit &cu)
       m_pcInterPred->motionCompensation(cu, REF_PIC_LIST_0, luma, chroma);
 #endif
     }
+#if ECM_VULKAN
+    if( m_gpuIntraRec && !m_pcInterPred->m_gpuSubPu.empty() )   // (partial verification: xSubPuMC's predictions)
+    {
+      m_gpuIntraRec->subPuMotion( cu, m_pcInterPred->m_gpuSubPu );
+    }
+#endif
 #if JVET_AF0159_AFFINE_SUBPU_BDOF_REFINEMENT
     cu.firstPU->availableBdofRefinedMv = AFFINE_SUBPU_BDOF_NOT_APPLY;
     if (m_pcInterPred->getDoAffineSubPuBdof() == true)
     {
-#if ECM_VULKAN
-      if( m_gpuIntraRec )   // (partial verification: the GPU lacks it)
-      {
-        m_gpuIntraRec->subPuBdof( cu );
-      }
-#endif
       PU::setAffineBdofRefinedMotion(*cu.firstPU, m_mvBufDecAffineBDOF);
       m_pcInterPred->setDoAffineSubPuBdof(false);
     }

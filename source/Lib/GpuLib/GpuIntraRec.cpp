@@ -1361,12 +1361,16 @@ constexpr int DM_X = 1, DM_Y = 2, DM_W = 3, DM_H = 4, DM_DST = 5, DM_HMAX = 6, D
 constexpr int DM_REF0 = 10, DM_FLAGS = 11, DM_BD = 12, DM_CLIP_MIN = 13, DM_CLIP_MAX = 14, DM_QP = 15, DM_REF1 = 18;
 constexpr int DM_W0 = 19, DM_W1 = 20, DM_PIC_W = 28, DM_PIC_H = 29, DM_SCRATCH = 30, DM_MVS = 31;
 constexpr int DM_BIO = 16, DM_SAME_DIR = 32, DM_LDB = 64, DM_SKIP_A = 128;
+// (xSubPuMC's jobs: the block's place in its PU, the PU's size; a group or a run, the run's uni-prediction, bdofCond off)
+constexpr int DM_OX = 21, DM_OY = 22, DM_OW = 23, DM_OH = 24;
+constexpr int DM_SUB = 256, DM_RUN = 512, DM_UNI = 1024, DM_ZERO = 2048, DM_NLIC = 4096;
 // OBMC: a CU's record in Params::timdData (intra_rec's OBMC_REC_*; per segment OBMC_SEG_*), a segment's job (inter_mc's
 // mode 3: an McJob of the neighbour's motion over the band, then OBMC_J_*; a template motion OBMC_T_*), a segment's
 // data in Params::interPred (OBMC_D_*: the skip flags, the two templates, the band's predictions)
 constexpr int OBMC_REC_X = 0, OBMC_REC_Y = 1, OBMC_REC_W = 2, OBMC_REC_H = 3, OBMC_REC_FLAGS = 4, OBMC_REC_NUM = 5;
 constexpr int OBMC_REC_BD = 6, OBMC_REC_BASE = 7, OBMC_REC_INNER = 8, OBMC_REC_SEG = 10;
 constexpr int OBMC_REC_SUB = 16, OBMC_INNER = 1 + 4 * 24;   // (sub-block motion: the inner sub-blocks' entries)
+constexpr int OBMC_REC_SUB_LUMA = 64;   // (... of luma alone: affine's innerObmcSkipChroma)
 constexpr int OBMC_I_X = 1, OBMC_I_Y = 2, OBMC_I_DST = 5, OBMC_I_BD = 12, OBMC_I_CLIP_MIN = 13, OBMC_I_CLIP_MAX = 14;
 constexpr int OBMC_I_AVAIL = 15, OBMC_I_NB = 32, OBMC_I = OBMC_I_NB + 4 * MC_JOB;
 constexpr int OBMC_SEG_DIR = 0, OBMC_SEG_START = 1, OBMC_SEG_LEN = 2, OBMC_SEG_DATA = 3, OBMC_SEG = 4;
@@ -2268,7 +2272,8 @@ struct GpuIntraRec::Impl
   // motion compensation on the GPU (inter_mc.comp): the inter CUs whose prediction it makes, their blocks' jobs
   // (MC_JOB each), the reference pictures they read (their slots), the CUs by kind (interKind, totals)
   std::unordered_set<const CodingUnit*>                        mcCus;
-  std::unordered_set<const CodingUnit*>                        subPuBdofCus;   // (subPuBdof: affine / SbTMVP BDOF)
+  // xSubPuMC's CUs (subPuMotion): per CU InterPrediction::m_gpuSubPu (the PU, then its groups and runs)
+  std::unordered_map<const CodingUnit*, std::vector<int32_t>>  subPuItems;
   std::vector<int32_t>                                         mcJobs;
   // BDOF: its PUs' luma predictions (where in mcBdofBuf, int16) and the sub-blocks' jobs (inter_mc's mode 1)
   std::unordered_map<const CodingUnit*, int32_t>               bdofOut;
@@ -2591,7 +2596,7 @@ void GpuIntraRec::beginPicture( const CodingStructure& cs )
   m.interPending.clear();
   m.interPred.clear();
   m.mcCus.clear();
-  m.subPuBdofCus.clear();
+  m.subPuItems.clear();
   m.mcJobs.clear();
   m.bdofOut.clear();
   m.bdofJobs.clear();
@@ -8210,6 +8215,148 @@ static bool interMcGpu( const CodingUnit& cu )
   return mcIdentical( pu ) || !mcBdof( pu ) || ( pu.lwidth() % sw == 0 && pu.lheight() % sh == 0 );
 }
 
+// ----- xSubPuMC's CUs (sub-block merge - SbTMVP -, AMVP-SbTMVP, JVET-AF0159's affine sub-PU BDOF): the predictions the
+// CPU made (subPuMotion: InterPrediction::m_gpuSubPu, the groups of xGetSubPuGroupArea2D - xPredInterBi with m_subPuMC
+// and bdmvrRefine, xPredInterBiSubPuBDOF - and the runs of sub-PUs of one motion - motionCompensation -), one inter_mc
+// mode-2 job each into the PU's prediction (pc.bdofOut), which its blocks' jobs copy
+
+constexpr int SUBPU_ITEM = 13;   // (InterPrediction::GPU_SUBPU: kind, x, y, w, h, interDir, refIdx 0 / 1, the vectors,
+                                 // the flags)
+
+// why the GPU does not predict CU cu of xSubPuMC (nullptr: it does): what the jobs lack
+static const char* subPuWhy( const GpuIntraRec::Impl& m, const CodingUnit& cu )
+{
+  const PredictionUnit& pu    = *cu.firstPU;
+  const Slice&          slice = *cu.slice;
+  const PPS&            pps   = *cu.cs->pps;
+  const SPS&            sps   = *cu.cs->sps;
+  const auto            it    = m.subPuItems.find( &cu );
+  if( it == m.subPuItems.end() || it->second.size() < 4 || it->second[0] != pu.lx() || it->second[1] != pu.ly()
+      || it->second[2] != (int) pu.lwidth() || it->second[3] != (int) pu.lheight() )
+  {
+    return "xSubPuMC of another PU";
+  }
+  if( getenv( "ECM_GPU_NO_MC" ) )
+  {
+    return "no motion compensation";
+  }
+#if MULTI_HYP_PRED
+  if( !pu.addHypData.empty() )
+  {
+    return "multi-hypothesis";
+  }
+#endif
+  if( cu.licFlag )
+  {
+    return "LIC";
+  }
+  // (non-local LIC: affine sub-PU BDOF's - no refinement, the model on the PU's prediction -, not SbTMVP's - on its
+  // runs alone)
+  if( cu.altLMFlag && ( pu.mergeType != MRG_TYPE_DEFAULT_N || pu.amvpSbTmvpFlag || sps.getRprEnabledFlag() ) )
+  {
+    return "non-local LIC";
+  }
+  if( pu.ciipFlag )
+  {
+    return "CIIP";
+  }
+  if( pu.bdmvrRefine || cu.geoFlag )
+  {
+    return "DMVR or GPM";
+  }
+  if( pps.getUseWP() || pps.getWPBiPred() )
+  {
+    return "weighted prediction";
+  }
+  if( cu.chromaFormat != CHROMA_420 || !cu.Cb().valid() || pps.getWrapAroundEnabledFlag() || clipMv != clipMvInPic
+      || slice.clpRng( COMPONENT_Y ).max != slice.clpRng( COMPONENT_Cb ).max
+      || slice.clpRng( COMPONENT_Y ).min != slice.clpRng( COMPONENT_Cb ).min
+      || slice.clpRng( COMPONENT_Y ).bd != slice.clpRng( COMPONENT_Cb ).bd )
+  {
+    return "other";
+  }
+  const std::vector<int32_t>& v    = it->second;
+  int                         area = 0;   // (the predictions cover the PU)
+  for( size_t i = 4; i + SUBPU_ITEM <= v.size(); i += SUBPU_ITEM )
+  {
+    const int32_t* e = &v[i];
+    area += e[3] * e[4];
+    if( e[0] == 0 && e[5] != 3 )
+    {
+      return "a group of uni-prediction";
+    }
+    for( int l = 0; l < 2; l++ )
+    {
+      if( e[6 + l] >= 0 && sps.getRprEnabledFlag() && slice.getRefPic( RefPicList( l ), e[6 + l] )->isRefScaled( &pps ) )
+      {
+        return "resampling";
+      }
+    }
+  }
+  if( area != (int) ( pu.lwidth() * pu.lheight() ) )
+  {
+    return "xSubPuMC of another PU";
+  }
+  return nullptr;
+}
+
+// the jobs of CU cu of xSubPuMC (inter_mc's mode 2 with DM_SUB), its PU's prediction at dst in pc.bdofOut
+static void subPuJobs( GpuIntraRec::Impl& m, const CodingUnit& cu, int32_t dst )
+{
+  const PredictionUnit&       pu    = *cu.firstPU;
+  const Slice&                slice = *cu.slice;
+  const SPS&                  sps   = *cu.cs->sps;
+  const PPS&                  pps   = *cu.cs->pps;
+  const std::vector<int32_t>& v     = m.subPuItems.at( &cu );
+  int                         off   = 8;
+#if JVET_AA0096_MC_BOUNDARY_PADDING
+  off += MC_PAD_SIZE;
+#endif
+  for( size_t i = 4; i + SUBPU_ITEM <= v.size(); i += SUBPU_ITEM )
+  {
+    const int32_t* e     = &v[i];
+    const bool     group = e[0] == 0;
+    // (a run's uni-prediction: of its one list, or of list 0 where xCheckIdenticalMotion holds)
+    const bool     uni   = !group && ( e[5] != 3 || ( e[12] & 1 ) != 0 );
+    const int      l     = uni && e[5] == 2 ? 1 : 0;
+    const int      w = e[3], h = e[4];
+    int32_t        d[MC_JOB] = {};
+    d[DM_X]        = pu.lx() + e[1];
+    d[DM_Y]        = pu.ly() + e[2];
+    d[DM_W]        = w;
+    d[DM_H]        = h;
+    d[DM_DST]      = dst;
+    d[DM_OX]       = e[1];
+    d[DM_OY]       = e[2];
+    d[DM_OW]       = (int) pu.lwidth();
+    d[DM_OH]       = (int) pu.lheight();
+    d[DM_HMAX]     = (int) pps.getPicWidthInLumaSamples() + off - 1;
+    d[DM_HMIN]     = -(int) sps.getMaxCUWidth() - off + 1;
+    d[DM_VMAX]     = (int) pps.getPicHeightInLumaSamples() + off - 1;
+    d[DM_VMIN]     = -(int) sps.getMaxCUHeight() - off + 1;
+    d[DM_REF0]     = mcSlot( m, slice, l, e[6 + l] );
+    d[DM_REF1]     = uni ? 0 : mcSlot( m, slice, 1, e[7] );
+    d[DM_FLAGS]    = ( cu.imv == IMV_HPEL ? MC_ALT_HPEL : 0 ) | DM_SUB
+                  | ( group ? ( ( e[12] & 1 ) ? DM_BIO : 0 ) | ( ( e[12] & 2 ) ? DM_ZERO : 0 ) | ( cu.altLMFlag ? DM_NLIC : 0 )
+                            : DM_RUN | ( uni ? DM_UNI : 0 ) );
+    d[DM_BD]       = slice.clpRng( COMPONENT_Y ).bd;
+    d[DM_CLIP_MIN] = slice.clpRng( COMPONENT_Y ).min;
+    d[DM_CLIP_MAX] = slice.clpRng( COMPONENT_Y ).max;
+    d[DM_W0]       = getBcwWeight( cu.bcwIdx, REF_PIC_LIST_0 );
+    d[DM_W1]       = getBcwWeight( cu.bcwIdx, REF_PIC_LIST_1 );
+    d[DM_PIC_W]    = (int) pps.getPicWidthInLumaSamples();
+    d[DM_PIC_H]    = (int) pps.getPicHeightInLumaSamples();
+    d[DM_SCRATCH]  = m.dmvrScratch;
+    d[DM_MVS]      = (int32_t) m.dmvrJobMvs.size();   // (made absolute at the upload)
+    if( group )   // (the offsets, two tiles)
+    {
+      m.dmvrScratch += 4 * ( w >> 2 ) * ( h >> 2 ) + 2 * ( w + 6 ) * ( h + 6 );
+    }
+    m.dmvrJobMvs.insert( m.dmvrJobMvs.end(), { e[8 + 2 * l], e[9 + 2 * l], e[10], e[11] } );
+    m.dmvrJobs.insert( m.dmvrJobs.end(), d, d + MC_JOB );
+  }
+}
+
 void GpuIntraRec::interCu( const CodingUnit& cu )
 {
   Impl&             m   = *m_impl;
@@ -8316,7 +8463,7 @@ static bool obmcScc( const PredictionUnit& pu )
 // sub-block motion), with intra its runs of intra neighbours where the SPS has DIMD (JVET-AJ0161: obmcIntraSegs makes
 // their segments); nullptr where the GPU can do it, else the reason
 static const char* obmcPlan( const CodingUnit& cu, std::vector<ObmcSeg>& segs, bool& inner,
-                             std::vector<ObmcSeg>* intra = nullptr )
+                             std::vector<ObmcSeg>* intra = nullptr, bool subPuMc = false )
 {
   segs.clear();
   inner = false;
@@ -8336,12 +8483,21 @@ static const char* obmcPlan( const CodingUnit& cu, std::vector<ObmcSeg>& segs, b
   {
     return nullptr;   // (JVET-AD0193: no OBMC next to screen content)
   }
-  // (affine without affine BDOF: bSubMotion off - JVET-AL0079 -, the boundaries alone, at the stored sub-block motion)
-  if( pu.amvpSbTmvpFlag || ( cu.affine && ( pu.mergeType != MRG_TYPE_DEFAULT_N || PU::checkDoAffineBdofRefine( pu, nullptr ) ) ) )
+  // (affine without affine BDOF: bSubMotion off - JVET-AL0079 -, the boundaries alone, at the stored sub-block motion;
+  // xSubPuMC's CUs - subPuMc -: bSubMotion as subBlockOBMC has it, the inner sub-blocks at the stored motion)
+  if( subPuMc )
+  {
+    inner = ( cu.affine || pu.bdmvrRefine || pu.amvpSbTmvpFlag )
+            && !( cu.affine && pu.mergeType == MRG_TYPE_DEFAULT_N && !PU::checkDoAffineBdofRefine( pu, nullptr ) );
+  }
+  else if( pu.amvpSbTmvpFlag || ( cu.affine && ( pu.mergeType != MRG_TYPE_DEFAULT_N || PU::checkDoAffineBdofRefine( pu, nullptr ) ) ) )
   {
     return "OBMC of sub-block motion";
   }
-  inner = pu.bdmvrRefine;   // (bSubMotion: the inner sub-blocks too)
+  else
+  {
+    inner = pu.bdmvrRefine;   // (bSubMotion: the inner sub-blocks too)
+  }
   const int minCUW = (int) cu.cs->pcv->minCUWidth;
   for( int b = 0; b < 2; b++ )
   {
@@ -8762,9 +8918,11 @@ static bool recordInterBlock( GpuIntraRec::Impl& m, const TransformUnit& tu, con
   {
     // (identical motion: list 0 alone; BDOF: xPredInterUni clips the vectors at the position grown by
     // BIO_EXTEND_SIZE + 1, also chroma's in xPredInterBiSubPuBDOF)
+    // (xSubPuMC's CUs: their PU's prediction by its groups' and runs' jobs, subPuJobs)
+    const bool     sub  = m.subPuItems.count( &cu ) != 0;
     const bool     bi   = !cu.geoFlag && pu.interDir == 3 && !mcIdentical( pu );
-    const bool     dmvr = bi && pu.bdmvrRefine;
-    const bool     bdof = bi && !dmvr && !cu.affine && mcBdof( pu );
+    const bool     dmvr = bi && pu.bdmvrRefine && !sub;
+    const bool     bdof = bi && !dmvr && !cu.affine && !sub && mcBdof( pu );
     const int      list = pu.interDir == 2 ? 1 : 0;
     const Position clipPos = bdof ? pu.lumaPos().offset( -( BIO_EXTEND_SIZE + 1 ), -( BIO_EXTEND_SIZE + 1 ) ) : pu.lumaPos();
     auto slotOf = [&]( int l ) { return mcSlot( m, slice, l, pu.refIdx[l] ); };
@@ -9007,7 +9165,7 @@ static bool recordInterBlock( GpuIntraRec::Impl& m, const TransformUnit& tu, con
       j[MC_FLAGS] |= MC_NLIC;
       j[MC_NLIC_AT] = rec->second;
     }
-    if( cu.affine )   // (affine: the PU's record, at its first block)
+    if( cu.affine && !sub )   // (affine: the PU's record, at its first block)
     {
       auto rec = m.affineRec.find( &cu );
       if( rec == m.affineRec.end() )
@@ -9064,6 +9222,21 @@ static bool recordInterBlock( GpuIntraRec::Impl& m, const TransformUnit& tu, con
       }
       const int area = (int) ( pu.lwidth() * pu.lheight() );
       j[MC_FLAGS] |= MC_BDOF;
+      j[MC_BDOF_OUT] = out->second + ( compID == COMPONENT_Y ? 0 : area + ( compID - 1 ) * ( area >> 2 ) );
+    }
+    if( sub )   // the PU's prediction by xSubPuMC's jobs (first block: the jobs)
+    {
+      auto out = m.bdofOut.find( &cu );
+      if( out == m.bdofOut.end() )
+      {
+        out            = m.bdofOut.emplace( &cu, m.bdofSamples ).first;
+        m.bdofSamples += (int32_t) ( pu.lwidth() * pu.lheight() * 3 / 2 );
+        subPuJobs( m, cu, out->second );
+      }
+      const int area = (int) ( pu.lwidth() * pu.lheight() );
+      j[MC_FLAGS]    = MC_BDOF | ( j[MC_FLAGS] & MC_NLIC );   // (non-local LIC: on the PU's prediction, xSubPuMC's)
+      j[MC_PU_X]     = pu.lumaPos().x;
+      j[MC_PU_Y]     = pu.lumaPos().y;
       j[MC_BDOF_OUT] = out->second + ( compID == COMPONENT_Y ? 0 : area + ( compID - 1 ) * ( area >> 2 ) );
     }
     if( m.cuJob[compID] < 0 )
@@ -9197,10 +9370,12 @@ void GpuIntraRec::recordInterCu( const CodingUnit& cu )
   {
     m.cuJob[c] = -1;
   }
-  if( !CU::isIBC( cu ) && !CU::isPLT( cu ) && interMcGpu( cu ) && ( !cu.geoFlag || !gpmWhy( m, cu ) )
-      && !m.subPuBdofCus.count( &cu )
+  // (xSubPuMC's CUs: subPuWhy, their OBMC with bSubMotion)
+  const bool sub = m.subPuItems.count( &cu ) != 0;
+  if( !CU::isIBC( cu ) && !CU::isPLT( cu ) && ( sub ? !subPuWhy( m, cu ) : interMcGpu( cu ) )
+      && ( !cu.geoFlag || !gpmWhy( m, cu ) )
       && ( !cu.firstPU->bdmvrRefine || mcIdentical( *cu.firstPU ) || m.dmvrMvs.count( &cu ) )
-      && ( !cu.obmcFlag || ( geoSep ? !gpmSepPlan( m, cu, geoSegs ) : !obmcPlan( cu, segs, inner, &intraRuns ) ) ) )
+      && ( !cu.obmcFlag || ( geoSep ? !gpmSepPlan( m, cu, geoSegs ) : !obmcPlan( cu, segs, inner, &intraRuns, sub ) ) ) )
   {
     m.mcCus.insert( &cu );
     if( geoSep )
@@ -9227,6 +9402,7 @@ void GpuIntraRec::recordInterCu( const CodingUnit& cu )
       m.timdData.insert( m.timdData.end(), { cu.lx(), cu.ly(), (int32_t) cu.lwidth(), (int32_t) cu.lheight(),
                                              ( tm ? OBMC_REC_TM : 0 ) | ( top ? OBMC_REC_TOP : 0 ) | ( left ? OBMC_REC_LEFT : 0 )
                                                | ( inv ? OBMC_REC_INV_LMCS : 0 ) | ( in ? OBMC_REC_SUB : 0 )
+                                               | ( in && cu.affine && pu.mergeType == MRG_TYPE_DEFAULT_N ? OBMC_REC_SUB_LUMA : 0 )
                                                | ( geoSep ? OBMC_REC_GEO : 0 ) | obmcIntraFlags( m, cu, is ),
                                              (int32_t) ( sg.size() + is.size() ), cu.slice->clpRng( COMPONENT_Y ).bd, 0,
                                              m.obmcData, 0 } );
@@ -9322,6 +9498,31 @@ void GpuIntraRec::recordInterCu( const CodingUnit& cu )
       {
         kind += mcDmvr( pu ) ? " with DMVR" : mcBdof( pu ) ? " with BDOF" : "";
       }
+      // (xSubPuMC's: sub-block merge, affine sub-PU BDOF or AMVP-SbTMVP; from the CPU: why - CIIP's as before, below)
+      if( sub && ( kind == "affine" || kind == "sub-block motion" ) && !pu.ciipFlag )
+      {
+        if( kind == "affine" )
+        {
+          kind += pu.mergeType != MRG_TYPE_DEFAULT_N || pu.amvpSbTmvpFlag ? " (sub-block merge" : " (with BDOF";
+        }
+        else
+        {
+          kind += " (";
+        }
+        if( !m.mcCus.count( &cu ) )
+        {
+          std::vector<ObmcSeg> s;
+          bool                 in  = false;
+          const char*          why = subPuWhy( m, cu );
+          why = why ? why : cu.obmcFlag ? obmcPlan( cu, s, in, nullptr, true ) : nullptr;
+          kind += std::string( kind.back() == '(' ? "" : ": " ) + ( why ? why : "other" );
+        }
+        kind += ")";
+        if( kind.size() >= 3 && kind.compare( kind.size() - 3, 3, " ()" ) == 0 )
+        {
+          kind.erase( kind.size() - 3 );
+        }
+      }
       if( kind == "affine" && !m.mcCus.count( &cu ) )   // (affine from the CPU: why)
       {
         std::vector<ObmcSeg> s;
@@ -9339,7 +9540,6 @@ void GpuIntraRec::recordInterCu( const CodingUnit& cu )
                     ? " (with inherited LIC or resampling)"
                 : pu.mergeType != MRG_TYPE_DEFAULT_N || pu.amvpSbTmvpFlag ? " (sub-block merge)"
                 : pu.bdmvrRefine ? " (with DMVR)"
-                : m.subPuBdofCus.count( &cu ) ? " (with BDOF)"
                 : affineGpu( cu ) && cu.obmcFlag && ( why = obmcPlan( cu, s, in ) ) != nullptr ? std::string( " (" ) + why + ")"
                 : " (other)";
       }
@@ -9593,7 +9793,7 @@ static void obmcJobs( GpuIntraRec::Impl& m, const CodingUnit& cu, const std::vec
   // the inner sub-blocks (subBlockOBMC's bSubMotion loop): per 4 x 4 sub-block the neighbours in the CU whose motion
   // differs (getNeighborMotion with JVET-AL0081's threshold) predicting it
   PredictionUnit& pv   = const_cast<PredictionUnit&>( pu );
-  const int       mvTH = PU::isBiPredFromSameDirUnEqDistPoc( pu ) ? ( 1 << MV_FRACTIONAL_BITS_INTERNAL ) >> 1 : 1;
+  const int       mvTH = pu.bdmvrRefine && PU::isBiPredFromSameDirUnEqDistPoc( pu ) ? ( 1 << MV_FRACTIONAL_BITS_INTERNAL ) >> 1 : 1;
   const int       sw = (int) pu.lwidth() >> 2, sh = (int) pu.lheight() >> 2;
   for( int sy = 0; sy < sh; sy++ )
   {
@@ -9628,6 +9828,11 @@ static void obmcJobs( GpuIntraRec::Impl& m, const CodingUnit& cu, const std::vec
         n[MC_MVY]   = mv.getVer();
         n[MC_REF]   = mcSlot( m, slice, l0, mi.refIdx[l0] );
         n[MC_FLAGS] = ( cu.imv == IMV_HPEL ? MC_ALT_HPEL : 0 ) | ( bi ? MC_BI : 0 );
+        if( cu.altLMFlag )   // (the CU's own non-local LIC model, which subBlockOBMC keeps for the inner sub-blocks)
+        {
+          n[MC_FLAGS] |= MC_NLIC;
+          n[MC_NLIC_AT] = m.nlicRec.at( &cu );
+        }
         if( bi )
         {
           Mv mv1 = mi.mv[1];
@@ -9677,12 +9882,12 @@ void GpuIntraRec::ibcGpmVectors( const CodingUnit& cu, const Mv& mv0, const Mv& 
   m_impl->ibcGpmMvs[&cu] = std::make_pair( mv0, mv1 );
 }
 
-void GpuIntraRec::subPuBdof( const CodingUnit& cu )
+void GpuIntraRec::subPuMotion( const CodingUnit& cu, const std::vector<int32_t>& items )
 {
   Impl& m = *m_impl;
   if( m.partial && m.interPending.count( &cu ) )
   {
-    m.subPuBdofCus.insert( &cu );
+    m.subPuItems[&cu] = items;
   }
 }
 

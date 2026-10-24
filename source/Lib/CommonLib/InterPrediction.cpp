@@ -1256,6 +1256,7 @@ void InterPrediction::xSubPuMC( PredictionUnit& pu, PelUnitBuf& predBuf, const R
   // compute the location of the current PU
   Position puPos    = pu.lumaPos();
   Size puSize       = pu.lumaSize();
+  m_gpuSubPu.assign( { puPos.x, puPos.y, (int32_t) puSize.width, (int32_t) puSize.height } );   // (the GPU's)
 
   int numPartLine, numPartCol, puHeight, puWidth;
   {
@@ -1317,6 +1318,11 @@ void InterPrediction::xSubPuMC( PredictionUnit& pu, PelUnitBuf& predBuf, const R
           }
         }
 #endif
+        gpuSubPu( 0, pu, subPu, ( m_bdofMvRefined ? 1 : 0 )
+#if JVET_AJ0097_BDOF_LDB
+                                  | ( bdofCond ? 0 : 2 )
+#endif
+        );
         if( m_bdofMvRefined )
         {
           xPredInterBiSubPuBDOF( subPu, subPredBuf, luma, chroma );  // do not change the predBufWOBIO
@@ -1467,6 +1473,7 @@ void InterPrediction::xSubPuMC( PredictionUnit& pu, PelUnitBuf& predBuf, const R
       PelUnitBuf subPredBuf = predBuf.subBuf(UnitAreaRelative(pu, subPu));
       subPu.mmvdEncOptMode = 0;
       subPu.mvRefine = false;
+      gpuSubPu( 1, pu, subPu, xCheckIdenticalMotion( subPu ) ? 1 : 0 );
       motionCompensation(subPu, subPredBuf, eRefPicList, luma, chroma);
       secDim = later - secStep;
     }

@@ -2767,6 +2767,37 @@ blocker ("affine (CIIP: ...)"). Results (50 streams, build aciip1): every pictur
 affine 1927 CUs predicted by the GPU (+51); "affine (CIIP)" 212 -> CIIP with LIC 60, with LFNST / NSPT 54, OBMC of
 sub-block motion 13, inter CCP merge 4, inter CCCM 1, others 28 (non-affine CIIP, CIIP-PDPC, DMVR, weighted
 prediction with LIC neighbours).
+Sub-PU motion compensation on the GPU (2026-10-23, agent sb; motionCompensation's xSubPuMC: sub-block merge - SbTMVP
+-, AMVP-SbTMVP and JVET-AF0159's affine / SbTMVP sub-PU BDOF refinement). CommonLib records xSubPuMC's predictions of
+its last PU (InterPrediction::m_gpuSubPu through gpuSubPu, at the end of the class): per group of xGetSubPuGroupArea2D
+its area, motion, m_bdofMvRefined after its xPredInterBi and whether bdofCond is off; per run of sub-PUs of one motion
+its area, motion and xCheckIdenticalMotion. DecCu clears it before the CU's motionCompensation and hands it over after
+(subPuMotion; partial verification: the CPU's motion, groups and runs); recordInterCu takes such a CU where subPuWhy
+finds nothing missing (the record's PU and the predictions' areas covering it, no LIC, CIIP, DMVR, multi-hypothesis,
+weighted prediction, resampling or SbTMVP with non-local LIC). M110's subPuBdof goes (the record says it). Each group
+and run is an inter_mc.comp mode-2 job (DM_SUB) written at its place in the PU's prediction (dmOut with the PU's
+stride: DM_OX, DM_OY, DM_OW, DM_OH), which the CU's blocks copy (MC_BDOF). A group replays xPredInterBi with m_subPuMC
+and bdmvrRefine at its one vector pair through M98's functions with the m_subPuMC branches (dmSub): a side 4 modulo 8
+(m_skipAffineFirstIterBdof) skips the first pass, its one iteration then predicting and refining the whole group;
+else one prediction of the group, with BDOF where the CPU's bioApplied held (DM_BIO), else bi-prediction with BCW's
+weights and nothing more. applyBiOptFlow with m_subPuMC: scaleBDOF 1 where a side of the block is 4 modulo 8 (not 4),
+else 2; bioBlockDistTh without the QP term; the first pass writes the luma of the blocks it leaves in place (addAvg,
+subBlockBiOptFlow); its offsets halved only from 256 samples; calcBIOParamSumHighPrecision_SSE's isSub mean (getMean of
+the window's dI sum plus half its size, without the magnitude test); no noMeanRm4Sample / noMR; with non-local LIC no
+offset at all (DM_NLIC; the model then on the PU's prediction, MC_NLIC, and on the inner OBMC's neighbour predictions,
+as subBlockOBMC keeps the CU's altLM flag). xPredInterBiBDMVR2 runs once (i > 1 skipped), joins blocks by equal offsets
+alone and skips those whose last offset is 0; xSubPuMC zeroes the offsets (not the last ones) before
+xPredInterBiSubPuBDOF where bdofCond is off (DM_ZERO); xPredInterBiSubPuBDOF's scaleBDOF is 1 below 256 samples or
+where a side is 4 modulo 8, and subBlockBiOptFlow's blocks follow both sides. A run is uni-prediction (DM_UNI; list 0
+where xCheckIdenticalMotion holds) or bi-prediction with BCW's weights, clipped at the run. OBMC of these CUs:
+obmcPlan's "OBMC of sub-block motion" goes for them, bSubMotion as subBlockOBMC has it (the inner sub-blocks at the
+stored motion, the refined one where APPLY_AND_STORE), affine's innerObmcSkipChroma a record flag (OBMC_REC_SUB_LUMA:
+intra_rec blends the inner sub-blocks of luma alone), and obmcJobs' inner motion threshold the half sample of JVET-AL0081
+only with DMVR (subBlockOBMC's mvDiffTH). Results (50 streams, build agsb3; agsb4 only renames a reason, rerun on 5
+streams): every picture identical (ra_wpp_q32 skipped as before); the GPU predicts "affine (sub-block merge)" 807 of
+850, "affine (with BDOF)" 696 of 709, "sub-block motion" 123 of 130; from the CPU: weighted prediction 61 (ldp_wp_q32,
+ra_wp_q32), non-local LIC with resampling 2 (counted as "affine (with inherited LIC or resampling)" before), OBMC with an
+IBC neighbour 2.
 
 
 ## 8. Numbers (i7-10700 8C/16T, Win11, GCC 16.2, RTX 3070 driver 616.92)

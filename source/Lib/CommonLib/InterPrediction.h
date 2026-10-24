@@ -2114,6 +2114,20 @@ public:
   bool       m_gpuBio = false;   // (the last xPredInterBi's bioApplied, for gpuGeoBio)
   MotionInfo m_gpuGeoMi[2];
   int32_t    m_gpuGeoObmc[2] = {};
+  // xSubPuMC's predictions of the last PU it predicted, for the GPU reconstruction: the PU's luma position and size, then
+  // per prediction in their order GPU_SUBPU int32 (gpuSubPu): a group of xGetSubPuGroupArea2D (kind 0: xPredInterBi
+  // with m_subPuMC and bdmvrRefine, xPredInterBiSubPuBDOF) or a run of sub-PUs of one motion (kind 1:
+  // motionCompensation), its luma area relative to the PU, its motion (interDir, both reference indices and vectors),
+  // its flags (a group: 1 m_bdofMvRefined after its xPredInterBi, 2 bdofCond off - the offsets zeroed before
+  // xPredInterBiSubPuBDOF -; a run: 1 xCheckIdenticalMotion)
+  static constexpr int GPU_SUBPU = 13;
+  std::vector<int32_t> m_gpuSubPu;
+  void gpuSubPu( int kind, const PredictionUnit& pu, const PredictionUnit& sub, int flags )
+  {
+    m_gpuSubPu.insert( m_gpuSubPu.end(), { kind, sub.lx() - pu.lx(), sub.ly() - pu.ly(), (int32_t) sub.lwidth(),
+                                           (int32_t) sub.lheight(), (int32_t) sub.interDir, sub.refIdx[0], sub.refIdx[1],
+                                           sub.mv[0].hor, sub.mv[0].ver, sub.mv[1].hor, sub.mv[1].ver, flags } );
+  }
 };
 
 #if TM_AMVP || TM_MRG || JVET_Z0084_IBC_TM

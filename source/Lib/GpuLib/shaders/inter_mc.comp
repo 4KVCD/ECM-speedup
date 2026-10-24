@@ -24,6 +24,9 @@
 //   a sample out of boundary in either list (JVET-Z0136: those samples one list alone)
 // - multi-pass DMVR (bdmvrRefine): one workgroup per PU (mode 2, dmvrJob) replays xPredInterBi's DMVR branch from the
 //   CPU's sub-PU vectors into pc.bdofOut (luma and chroma), which all its blocks' jobs copy
+// - xSubPuMC (sub-block merge, AMVP-SbTMVP, JVET-AF0159's affine sub-PU BDOF): one workgroup (mode 2) per group of one
+//   bi motion (xPredInterBi with m_subPuMC and bdmvrRefine, xPredInterBiSubPuBDOF) and per run of sub-PUs of one
+//   motion (uni- or bi-prediction), each at its place in the PU's prediction in pc.bdofOut, which its blocks copy
 // - OBMC (mode 3, after the blocks' jobs): per boundary segment of an OBMC CU what its blending needs that does not
 //   read the current picture (obmcJob), for intra_rec, which chooses and blends in the dependency chain
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
@@ -408,9 +411,20 @@ const int DM_BIO      = 16;    // bioApplied
 const int DM_SAME_DIR = 32;    // isBiPredFromSameDirUnEqDistPoc (JVET-AJ0097)
 const int DM_LDB      = 64;    // the SPS's MvLdbRefineSwitch (getLdbMvRefineMode 2)
 const int DM_SKIP_A   = 128;   // no first pass (JVET-AL0081's same direction, JVET-AG0067's small PU): offsets 0
+// xSubPuMC's jobs (DM_SUB): the block (DM_X..DM_H: a group or a run, luma, in the picture) at (DM_OX, DM_OY) in its PU
+// of DM_OW x DM_OH luma samples, whose prediction starts at DM_DST; one vector pair at DM_MVS (uni-prediction: the
+// list's in the first, its slot DM_REF0); a group's DM_BIO: m_bdofMvRefined after its first pass, DM_ZERO: bdofCond off
+// (xSubPuMC zeroes the offsets before xPredInterBiSubPuBDOF)
+const int DM_OX = 21, DM_OY = 22, DM_OW = 23, DM_OH = 24;
+const int DM_SUB      = 256;   // m_subPuMC: one of xSubPuMC's predictions
+const int DM_RUN      = 512;   // ... a run of sub-PUs of one motion (motionCompensation), not a group
+const int DM_UNI      = 1024;  // ... the run's uni-prediction (or xCheckIdenticalMotion's)
+const int DM_ZERO     = 2048;
+const int DM_NLIC     = 4096;  // ... a group of a non-local LIC CU: no refinement (applyBiOptFlow's altLMFlag)
 
 int  dmO, dmX, dmY, dmW, dmH, dmFlags, dmBd, dmClipMin, dmClipMax, dmSlot0, dmSlot1, dmS, dmNux, dmDst;
-bool dmAlt;
+int  dmOX, dmOY, dmOW, dmOH;   // (the block's place in its PU's prediction, the PU's size)
+bool dmAlt, dmSub;
 
 int dmJ( int f )
 {
@@ -428,7 +442,7 @@ ivec2 dmClip( ivec2 mv, int x, int y )
 ivec2 dmMv( int l, int x, int y )
 {
   BufI32    jb = BufI32( pc.jobs );
-  const int i  = dmJ( DM_MVS ) + ( ( y >> 4 ) * dmNux + ( x >> 4 ) ) * 4 + l * 2;
+  const int i  = dmJ( DM_MVS ) + ( dmSub ? 0 : ( ( y >> 4 ) * dmNux + ( x >> 4 ) ) * 4 ) + l * 2;   // (xSubPuMC's: one pair)
   return ivec2( jb.v[i], jb.v[i + 1] );
 }
 
@@ -511,8 +525,10 @@ void dmSync()
 
 void dmOut( int comp, int x, int y, int v )
 {
-  const int base = dmDst + ( comp == 0 ? 0 : dmW * dmH + ( comp - 1 ) * ( dmW >> 1 ) * ( dmH >> 1 ) );
-  BufC16( pc.bdofOut ).v[base + y * ( comp == 0 ? dmW : dmW >> 1 ) + x] = int16_t( clamp( v, dmClipMin, dmClipMax ) );
+  const int cs   = comp == 0 ? 0 : 1;
+  const int base = dmDst + ( comp == 0 ? 0 : dmOW * dmOH + ( comp - 1 ) * ( dmOW >> 1 ) * ( dmOH >> 1 ) );
+  BufC16( pc.bdofOut ).v[base + ( y + ( dmOY >> cs ) ) * ( dmOW >> cs ) + x + ( dmOX >> cs )] =
+    int16_t( clamp( v, dmClipMin, dmClipMax ) );
 }
 
 // a block's luma tile (xPredInterBlk with bioApplied: the vectors clipped at the position grown by BIO_EXTEND_SIZE + 1,
@@ -643,14 +659,18 @@ void dmBlockOut( int x0, int y0, int w, int h, ivec2 mv0, ivec2 mv1, bool avg, b
 // (g_bdofWeight's tables: per window width 8 / 12 / 20 and height 8 / 12 / 20)
 const int DM_WEIGHT_OFFSET[9] = int[]( 0, 64, 160, 320, 416, 560, 800, 960, 1200 );
 
-// applyBiOptFlow with isBdofMvRefine (iteration iter) on the tile's block (bx, by, bw, bh) at vectors mv0 / mv1
+// applyBiOptFlow with isBdofMvRefine (iteration iter) on the tile's block (bx, by, bw, bh) at vectors mv0 / mv1;
+// m_subPuMC (dmSub): scaleBDOF 1 where a side is 4 modulo 8 (not 4), else 2, the SAD threshold without the QP term,
+// the first pass writes the luma of the blocks it does not move, its offsets halved only from 256 samples, the mean
+// removal of calcBIOParamSumHighPrecision_SSE's isSub
 void dmRefine( int bx, int by, int bw, int bh, ivec2 mv0, ivec2 mv1, int iter )
 {
   const int  lid     = int( gl_LocalInvocationID.x );
   const int  area    = dmW * dmH;
-  const int  scale   = iter == 0 ? 4 : iter == 1 ? ( area < 256 ? 1 : 2 ) : ( area < 2048 ? 1 : 2 );
+  const int  scale   = dmSub ? ( ( bw % 8 == 4 && bw != 4 ) || ( bh % 8 == 4 && bh != 4 ) ? 1 : 2 )
+                             : iter == 0 ? 4 : iter == 1 ? ( area < 256 ? 1 : 2 ) : ( area < 2048 ? 1 : 2 );
   const int  bioDx   = min( bw, 4 * scale ), bioDy = min( bh, 4 * scale );
-  const int  th      = ( bioDx * bioDy ) << ( 2 + ( iter == 2 ? 0 : dmJ( DM_QP ) ) );
+  const int  th      = ( bioDx * bioDy ) << ( 2 + ( iter == 2 || dmSub ? 0 : dmJ( DM_QP ) ) );
   const bool sameDir = ( dmFlags & DM_SAME_DIR ) != 0;
   const bool noMean  = sameDir && !( bw * bh >= 2048 && dmLdbMode( bw * bh ) == 2 );
   const int  ww = bioDx + 4, wh = bioDy + 4;
@@ -664,15 +684,15 @@ void dmRefine( int bx, int by, int bw, int bh, ivec2 mv0, ivec2 mv1, int iter )
       const bool below = sSad < th;
       if( below )
       {
-        if( iter != 0 )
+        if( iter != 0 && lid == 0 )
         {
-          if( lid == 0 )
+          for( int u = 0; u < max( 1, bioDy >> 2 ) * max( 1, bioDx >> 2 ); u++ )
           {
-            for( int u = 0; u < max( 1, bioDy >> 2 ) * max( 1, bioDx >> 2 ); u++ )
-            {
-              dmSetOff( true, x0 + 4 * ( u % max( 1, bioDx >> 2 ) ), y0 + 4 * ( u / max( 1, bioDx >> 2 ) ), ivec2( 0 ) );
-            }
+            dmSetOff( true, x0 + 4 * ( u % max( 1, bioDx >> 2 ) ), y0 + 4 * ( u / max( 1, bioDx >> 2 ) ), ivec2( 0 ) );
           }
+        }
+        if( iter != 0 || dmSub )
+        {
           dmBlockOut( x0, y0, bioDx, bioDy, mv0, mv1, true, noMean );
         }
         dmSync();
@@ -705,7 +725,11 @@ void dmRefine( int bx, int by, int bw, int bh, ivec2 mv0, ivec2 mv1, int iter )
       if( lid == 0 )
       {
         int md = 0;   // (noMR: JVET-AL0081's same direction keeps the mean)
-        if( !sameDir )
+        if( dmSub )   // (isSub: the mean without the test against the mean of the magnitudes)
+        {
+          md = dmGetMean( sAcc[7] + ( ( ww * wh ) >> 1 ), ww * wh );
+        }
+        else if( !sameDir )
         {
           const int mean = sAcc[8] > 2 * abs( sAcc[7] ) ? 0 : sAcc[7];
           md             = dmGetMean( mean + ww * wh, ( ww * wh ) << 1 );
@@ -736,7 +760,11 @@ void dmRefine( int bx, int by, int bw, int bh, ivec2 mv0, ivec2 mv1, int iter )
         tx = clamp( tx, -256, 256 );
         ty = clamp( ty, -256, 256 );
         ivec2 bioMv = ivec2( tx >= 0 ? ( tx + 2 ) >> 2 : -( ( -tx + 2 ) >> 2 ), ty >= 0 ? ( ty + 2 ) >> 2 : -( ( -ty + 2 ) >> 2 ) );
-        if( iter == 0 || ( iter == 1 && ( area >= 2048 || area < 256 ) ) )
+        if( ( dmFlags & DM_NLIC ) != 0 )   // (m_subPuMC with non-local LIC: no offset)
+        {
+          bioMv = ivec2( 0 );
+        }
+        if( dmSub ? iter == 0 && area >= 256 : iter == 0 || ( iter == 1 && ( area >= 2048 || area < 256 ) ) )
         {
           bioMv = dmHalf( bioMv );
         }
@@ -746,7 +774,7 @@ void dmRefine( int bx, int by, int bw, int bh, ivec2 mv0, ivec2 mv1, int iter )
           dmSetOff( false, ux, uy, ( iter == 0 ? ivec2( 0 ) : dmOff( false, ux, uy ) ) + bioMv );
           dmSetOff( true, ux, uy, bioMv );
         }
-        sFlag = iter != 0 && bioMv == ivec2( 0 ) ? 1 : 0;
+        sFlag = ( iter != 0 || dmSub ) && bioMv == ivec2( 0 ) ? 1 : 0;
       }
       dmSync();
       if( sFlag != 0 )
@@ -759,9 +787,12 @@ void dmRefine( int bx, int by, int bw, int bh, ivec2 mv0, ivec2 mv1, int iter )
 }
 
 // xPredInterBiBDMVR2's iteration iter (1, 2): the blocks of equal offsets again at their vectors with the offset
+// (m_subPuMC: its one iteration, scaleBDOF 1 where a side is 4 modulo 8 - not 4 -, blocks joined by their offsets alone,
+// those the first pass left in place skipped)
 void dmIter( int iter )
 {
-  const int scale = iter == 1 ? 4 : dmW * dmH < 256 ? 1 : 2;
+  const int scale = dmSub ? ( ( dmW % 8 == 4 && dmW != 4 ) || ( dmH % 8 == 4 && dmH != 4 ) ? 1 : 2 )
+                          : iter == 1 ? 4 : dmW * dmH < 256 ? 1 : 2;
   const int dx = min( dmW, 4 * scale ), dy = min( dmH, 4 * scale );
   for( int y = 0; y < dmH; y += dy )
   {
@@ -769,13 +800,14 @@ void dmIter( int iter )
     for( int x = 0; x < dmW; x += dx2 )
     {
       dx2 = dx;
-      while( x + dx2 < dmW && dmOff( false, x, y ) == dmOff( false, x + dx2, y ) && dmOff( true, x, y ) == dmOff( true, x + dx2, y )
-             && ( ( x >> 4 ) == ( ( x + dx2 ) >> 4 ) || dmMvSame( x, y, x + dx2, y ) ) )
+      while( x + dx2 < dmW && dmOff( false, x, y ) == dmOff( false, x + dx2, y )
+             && ( dmSub || ( dmOff( true, x, y ) == dmOff( true, x + dx2, y )
+                             && ( ( x >> 4 ) == ( ( x + dx2 ) >> 4 ) || dmMvSame( x, y, x + dx2, y ) ) ) ) )
       {
         dx2 += dx;
       }
       dx2 = dx2 == 4 ? 4 : ( dx2 >> 3 ) << 3;
-      if( iter == 2 && dmOff( true, x, y ) == ivec2( 0 ) )
+      if( ( iter == 2 || dmSub ) && dmOff( true, x, y ) == ivec2( 0 ) )
       {
         continue;
       }
@@ -788,10 +820,13 @@ void dmIter( int iter )
 }
 
 // xPredInterBiSubPuBDOF: per block of equal offsets the luma again where the last iteration moved it
-// (applyBiOptFlow without isBdofMvRefine: subBlockBiOptFlow everywhere), the chroma of all
+// (applyBiOptFlow without isBdofMvRefine: subBlockBiOptFlow everywhere), the chroma of all (m_subPuMC: scaleBDOF 1 below
+// 256 samples or where a side is 4 modulo 8, not 4; subBlockBiOptFlow's blocks by both sides)
 void dmFinal()
 {
-  const int scale = dmW * dmH < 2048 ? 1 : 2;
+  const int area  = dmW * dmH;
+  const int scale = dmSub ? ( area < 256 || ( dmW % 8 == 4 && dmW != 4 ) || ( dmH % 8 == 4 && dmH != 4 ) ? 1 : 2 )
+                          : area < 2048 ? 1 : 2;
   const int bioDx = min( dmW, 4 * scale ), bioDy = min( dmH, 4 * scale );
   for( int y = 0; y < dmH; y += bioDy )
   {
@@ -809,7 +844,7 @@ void dmFinal()
       if( dmOff( true, x, y ) != ivec2( 0 ) )
       {
         dmTile( x, y, dx2, bioDy, mv0, mv1 );
-        const int  sc     = dx2 % 8 == 4 && dx2 != 4 ? 1 : 2;
+        const int  sc     = ( dx2 % 8 == 4 && dx2 != 4 ) || ( dmSub && bioDy % 8 == 4 && bioDy != 4 ) ? 1 : 2;
         const int  bdx    = min( dx2, 4 * sc ), bdy = min( bioDy, 4 * sc );
         const bool noMean = ( dmFlags & DM_SAME_DIR ) != 0 && !( dx2 * bioDy >= 2048 && dmLdbMode( dx2 * bioDy ) == 2 );
         for( int yb = 0; yb < bioDy; yb += bdy )
@@ -826,6 +861,68 @@ void dmFinal()
       dmSync();
     }
   }
+}
+
+// xSubPuMC's run (DM_RUN): motionCompensation of the run's motion with m_subPuMC (no BDOF, no DMVR) - uni-prediction
+// (DM_UNI) at the final precision, else bi-prediction with BCW's weights; its vectors clipped at the run
+void sbRun()
+{
+  const int   lid = int( gl_LocalInvocationID.x );
+  const ivec2 mv0 = dmMv( 0, 0, 0 ), mv1 = dmMv( 1, 0, 0 );
+  if( ( dmFlags & DM_UNI ) == 0 )
+  {
+    dmLuma( 0, 0, dmW, dmH, mv0, mv1 );
+    dmChroma( 0, 0, dmW, dmH, mv0, mv1, false );
+    return;
+  }
+  const ivec2 c = dmClip( mv0, dmX, dmY );
+  for( int i = lid; i < dmW * dmH; i += 64 )
+  {
+    const int x = i % dmW, y = i / dmW;
+    dmOut( 0, x, y, mcPredict( dmSlot0, 0, dmX + x + ( c.x >> 4 ), dmY + y + ( c.y >> 4 ), c.x & 15, c.y & 15, dmAlt, false,
+                               dmW, dmH, dmBd, dmClipMin, dmClipMax ) );
+  }
+  const int cw = dmW >> 1, ch = dmH >> 1;
+  for( int i = lid; i < 2 * cw * ch; i += 64 )
+  {
+    const int comp = 1 + i / ( cw * ch ), x = i % cw, y = ( i / cw ) % ch;
+    dmOut( comp, x, y, mcPredict( dmSlot0, comp, ( dmX >> 1 ) + x + ( c.x >> 5 ), ( dmY >> 1 ) + y + ( c.y >> 5 ), c.x & 31,
+                                  c.y & 31, dmAlt, false, cw, ch, dmBd, dmClipMin, dmClipMax ) );
+  }
+}
+
+// xSubPuMC's group: xPredInterBi with m_subPuMC and bdmvrRefine at its one motion - xPredInterBiBDMVR's first pass
+// (none where a side is 4 modulo 8: m_skipAffineFirstIterBdof, whose one iteration predicts the whole group with BDOF;
+// else one prediction of the group, with BDOF where bioApplied - DM_BIO, m_bdofMvRefined -, without it bi-prediction
+// with BCW's weights, the group's prediction), the one iteration of xPredInterBiBDMVR2, then xPredInterBiSubPuBDOF
+void sbGroup()
+{
+  const int   lid   = int( gl_LocalInvocationID.x );
+  const ivec2 mv0   = dmMv( 0, 0, 0 ), mv1 = dmMv( 1, 0, 0 );
+  const bool  skipA = dmW % 8 == 4 || dmH % 8 == 4;
+  if( !skipA && ( dmFlags & DM_BIO ) == 0 )
+  {
+    dmLuma( 0, 0, dmW, dmH, mv0, mv1 );
+    dmChroma( 0, 0, dmW, dmH, mv0, mv1, false );
+    return;
+  }
+  dmTile( 0, 0, dmW, dmH, mv0, mv1 );
+  dmRefine( 0, 0, dmW, dmH, mv0, mv1, skipA ? 1 : 0 );
+  if( !skipA )
+  {
+    dmIter( 1 );
+  }
+  if( ( dmFlags & DM_ZERO ) != 0 )   // (bdofCond off: xSubPuMC zeroes the offsets, not the last ones)
+  {
+    dmSync();
+    for( int i = lid; i < ( dmW >> 2 ) * ( dmH >> 2 ); i += 64 )
+    {
+      BufC32( pc.scratch ).v[dmS + 2 * i]     = 0;
+      BufC32( pc.scratch ).v[dmS + 2 * i + 1] = 0;
+    }
+  }
+  dmSync();
+  dmFinal();
 }
 
 void dmvrJob( int o )
@@ -846,12 +943,29 @@ void dmvrJob( int o )
   dmDst     = dmJ( DM_DST );
   dmNux     = ( dmW + 15 ) >> 4;
   dmAlt     = ( dmFlags & MC_ALT_HPEL ) != 0;
+  dmSub     = ( dmFlags & DM_SUB ) != 0;
+  dmOX      = dmSub ? dmJ( DM_OX ) : 0;
+  dmOY      = dmSub ? dmJ( DM_OY ) : 0;
+  dmOW      = dmSub ? dmJ( DM_OW ) : dmW;
+  dmOH      = dmSub ? dmJ( DM_OH ) : dmH;
+  if( dmSub && ( dmFlags & DM_RUN ) != 0 )
+  {
+    sbRun();
+    return;
+  }
   const bool bio = ( dmFlags & DM_BIO ) != 0;
   for( int i = lid; i < 4 * ( dmW >> 2 ) * ( dmH >> 2 ); i += 64 )   // the offsets 0
   {
     BufC32( pc.scratch ).v[dmS + i] = 0;
   }
   dmSync();
+  if( dmSub )
+  {
+    sbGroup();
+    dmSync();
+    bdofGlobal = false;
+    return;
+  }
   // the runs of DMVR's sub-PUs (columns where H > W): without BDOF their prediction, with it the first pass
   if( !bio || ( dmFlags & DM_SKIP_A ) == 0 )
   {

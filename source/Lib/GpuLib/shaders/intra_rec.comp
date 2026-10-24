@@ -807,6 +807,7 @@ const int OBMC_REC_X = 0, OBMC_REC_Y = 1, OBMC_REC_W = 2, OBMC_REC_H = 3, OBMC_R
 const int OBMC_REC_BD = 6, OBMC_REC_BASE = 7, OBMC_REC_INNER = 8, OBMC_REC_SEG = 10;   // (BASE: where the data start)
 const int OBMC_SEG_DIR = 0, OBMC_SEG_START = 1, OBMC_SEG_LEN = 2, OBMC_SEG_DATA = 3, OBMC_SEG = 4;
 const int OBMC_REC_TM = 1, OBMC_REC_TOP = 2, OBMC_REC_LEFT = 4, OBMC_REC_INV_LMCS = 8, OBMC_REC_SUB = 16;
+const int OBMC_REC_SUB_LUMA = 64;   // (the inner sub-block OBMC of luma alone: affine's innerObmcSkipChroma)
 // JVET-AJ0161 (intra_obmc.glsl's obmcInterIntra): a segment of an intra neighbour (its head: the boundary, OBMC_SEG_INTRA,
 // its mode << OBMC_SEG_MODE; its data the band's predictions alone); the record's flags: intra segments, their luma
 // mapped back by LMCS's inverse, the SPS's DisablePdpc and DisableRefFilter
@@ -957,8 +958,9 @@ int obmcSample( Tu t, int r, int x, int y, int p )
       break;
     }
   }
-  if( ( rec.v[r + OBMC_REC_FLAGS] & OBMC_REC_SUB ) != 0 )   // the inner sub-block OBMC (xSubblockOBMCBlending)
-  {
+  if( ( rec.v[r + OBMC_REC_FLAGS] & OBMC_REC_SUB ) != 0
+      && ( comp == 0 || ( rec.v[r + OBMC_REC_FLAGS] & OBMC_REC_SUB_LUMA ) == 0 ) )   // the inner sub-block OBMC
+  {                                                                                   // (xSubblockOBMCBlending)
     const int sw = rec.v[r + OBMC_REC_W] >> 2, sx = cx >> ( 2 - cs ), sy = cy >> ( 2 - cs );
     const int e  = rec.v[r + OBMC_REC_BASE] + rec.v[r + OBMC_REC_INNER] + ( sy * sw + sx ) * OBMC_INNER;
     const int av = int( data.v[e] );
