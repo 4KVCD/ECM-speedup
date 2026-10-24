@@ -1868,6 +1868,19 @@ public:
     m_gpuGeoMi[k]   = pu.getMotionInfo();
     m_gpuGeoObmc[k] = 1 | ( pu.bdmvrRefine ? 2 : 0 );
   }
+  // ... motionCompensationGeoBlend's (JVET-AG0112) blend: its kind (1, | 2 with an intra part, | 4 with TM), the CU's
+  // blend model as weightedBlend takes it (params, shift, offset, min, max); the plain blend (at the intermediate
+  // precision) or the separate OBMC one (weightedBlend's roundOutputBD off) where both parts are inter
+  void    gpuGeoBlend( const PredictionUnit& pu )
+  {
+    const AffineBlendingModel& b = pu.cu->blendModel;
+    const int32_t v[8] = { 1 | ( pu.geoBlendIntraFlag ? 2 : 0 ) | ( pu.geoBlendTmFlag ? 4 : 0 ), b.params[0], b.params[1],
+                           b.params[2], b.shift, b.offset, b.min, b.max };
+    std::copy( v, v + 8, m_gpuGeoBlend );
+    m_gpuGeoPlain = !pu.geoBlendIntraFlag && !pu.cu->slice->getCheckUseSepOBMC();
+    m_gpuGeoSep   = !pu.geoBlendIntraFlag && pu.cu->slice->getCheckUseSepOBMC();
+    m_gpuGeoSplit = m_gpuGeoBld = 0;
+  }
 #if JVET_AA0093_REFINED_MOTION_FOR_ARMC
 #if JVET_AI0185_ADAPTIVE_COST_IN_MERGE_MODE
   bool      processBDMVR              (PredictionUnit& pu, int step = 0, Distortion* tmCost = NULL, int mergeIdx = -1);
@@ -2115,6 +2128,7 @@ public:
   bool       m_gpuBio = false;   // (the last xPredInterBi's bioApplied, for gpuGeoBio)
   MotionInfo m_gpuGeoMi[2];
   int32_t    m_gpuGeoObmc[2] = {};
+  int32_t    m_gpuGeoBlend[8] = {};   // (gpuGeoBlend; [0] 0: not motionCompensationGeoBlend's)
   // xSubPuMC's predictions of the last PU it predicted, for the GPU reconstruction: the PU's luma position and size, then
   // per prediction in their order GPU_SUBPU int32 (gpuSubPu): a group of xGetSubPuGroupArea2D (kind 0: xPredInterBi
   // with m_subPuMC and bdmvrRefine, xPredInterBiSubPuBDOF) or a run of sub-PUs of one motion (kind 1:

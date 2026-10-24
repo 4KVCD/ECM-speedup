@@ -8025,6 +8025,9 @@ static void ciipFields( GpuIntraRec::Impl& m, const CodingUnit& cu, const Compon
 
 // a part's record (InterPrediction::m_gpuGeoPart): motion (8), LIC (flag, models), non-local LIC
 constexpr int GPM_LIC = 8, GPM_LIC_MODELS = 9, GPM_NLIC = 21, GPM_BIO = 22, GPM_BCW = 23, GPM_INTRA = 24, GPM_PART = 25;
+// regression-based blending (InterPrediction::m_gpuGeoBlend, after both parts' records and OBMC flags in gpmInfo): its
+// kind (0 none, | 1, | 2 an intra part, | 4 TM), the blend model's params (3), shift, offset, min, max
+constexpr int GPM_BLEND = 3 + 2 * GPM_PART + 2, GPM_BLEND_N = 8;
 
 // why the GPU does not predict GPM CU cu (nullptr: it does)
 struct ObmcSeg;
@@ -8038,9 +8041,22 @@ static const char* gpmWhy( const GpuIntraRec::Impl& m, const CodingUnit& cu )
   const PPS&            pps   = *cu.cs->pps;
   const SPS&            sps   = *cu.cs->sps;
 #if JVET_AG0112_REGRESSION_BASED_GPM_BLENDING
-  if( cu.geoBlendFlag )   // (motionCompensationGeoBlend, which DecCu calls instead)
+  if( cu.geoBlendFlag )   // (motionCompensationGeoBlend, which DecCu calls instead: its record)
   {
-    return "regression-based blending";
+    const auto     g = m.gpmInfo.find( &cu );
+    const int32_t* b = g == m.gpmInfo.end() ? nullptr : &g->second[GPM_BLEND];
+    if( !b || !( b[0] & 1 ) )
+    {
+      return "unrecorded";
+    }
+    if( b[0] & 2 )   // (JVET-AK0101: one part intra, getGeoBlendIntraCand)
+    {
+      return "an intra part";
+    }
+    if( b[6] < 0 || b[6] > b[7] || b[7] > 32 )   // (weightedBlendBlk's clip, which the geo blends do not have)
+    {
+      return "weights beyond 0 .. 32";
+    }
   }
 #endif
 #if JVET_Y0065_GPM_INTRA
@@ -8162,6 +8178,28 @@ static void gpmWeights( const PredictionUnit& pu, const ComponentID compID, int 
       weight += stepX;
     }
     weight += stepY;
+  }
+}
+
+// ... of regression-based blending (JVET-AG0112: weightedBlend) by blend model b (params, shift, offset, min, max): 32 less
+// xWeightAffineBlk_SSE's weight of part 1 at the component's sample's luma position - p0 x + p1 y + p2 + offset in 32
+// bits, shifted, saturated to 16 bits and clipped as min( max, max( w, min ) ) -, which weightedBlendBlk blends as
+// ( 32 - w ) p0 + w p1, as the geo blends do with part 0's weight
+static void gpmBlendWeights( const PredictionUnit& pu, const ComponentID compID, const int32_t* b, std::vector<int32_t>& out )
+{
+  const int     scaleX = getComponentScaleX( compID, pu.chromaFormat ), scaleY = getComponentScaleY( compID, pu.chromaFormat );
+  const int     shift  = (uint32_t) b[3] > 31 ? 31 : b[3];
+  const int16_t lo = (int16_t) b[5], hi = (int16_t) b[6];
+  for( int y = 0; y < (int) pu.blocks[compID].height; y++ )
+  {
+    for( int x = 0; x < (int) pu.blocks[compID].width; x++ )
+    {
+      const uint32_t s = (uint32_t) b[0] * (uint32_t) ( x << scaleX ) + (uint32_t) b[1] * (uint32_t) ( y << scaleY )
+                         + ( (uint32_t) b[2] + (uint32_t) b[4] );
+      const int32_t  w = (int32_t) s >> shift;
+      const int16_t  v = (int16_t) std::min( 32767, std::max( -32768, w ) );
+      out.push_back( 32 - std::min<int>( hi, std::max<int>( v, lo ) ) );
+    }
   }
 }
 
@@ -8952,7 +8990,9 @@ static bool recordInterBlock( GpuIntraRec::Impl& m, const TransformUnit& tu, con
     auto slotOf = [&]( int l ) { return mcSlot( m, slice, l, pu.refIdx[l] ); };
     Mv mv = pu.mv[list];
     clipMv( mv, clipPos, pu.lumaSize(), sps, *cs.pps );
-    const int     slot = slotOf( list );
+    // (GPM: the parts' references below; a regression-based blending CU's PU has interDir 3 with the last part's
+    // motion, motionCompensationGeoBlend's, whose list 0 may be unused)
+    const int     slot = cu.geoFlag ? 0 : slotOf( list );
     const ClpRng& clp  = slice.clpRng( compID );
     int32_t       j[MC_JOB] = {};
     j[MC_COMP]     = compID;
@@ -9154,7 +9194,14 @@ static bool recordInterBlock( GpuIntraRec::Impl& m, const TransformUnit& tu, con
       if( rec == m.gpmRec.end() )
       {
         rec = m.gpmRec.emplace( key, (int32_t) m.affineData.size() ).first;
-        gpmWeights( pu, compID, g[1], g[2], m.affineData );
+        if( g[GPM_BLEND] & 1 )
+        {
+          gpmBlendWeights( pu, compID, &g[GPM_BLEND + 1], m.affineData );
+        }
+        else
+        {
+          gpmWeights( pu, compID, g[1], g[2], m.affineData );
+        }
       }
       j[MC_BDOF_OUT] = rec->second;
       if( pu.gpmIntraFlag )   // (an intra part, M115: the inter part's prediction; intra_rec's CIIP_GPM the rest)
@@ -9595,7 +9642,11 @@ void GpuIntraRec::recordInterCu( const CodingUnit& cu )
       if( kind == "GPM" && !m.mcCus.count( &cu ) )   // (GPM from the CPU: why)
       {
         const char* why = gpmWhy( m, cu );
-        kind += std::string( " (" ) + ( why ? why : "its OBMC" ) + ")";
+        kind += std::string( cu.geoBlendFlag ? " (regression-based blending: " : " (" ) + ( why ? why : "its OBMC" ) + ")";
+      }
+      else if( kind == "GPM" && cu.geoBlendFlag )   // (JVET-AJ0274's TM candidates apart)
+      {
+        kind += ( m.gpmInfo.at( &cu )[GPM_BLEND] & 4 ) ? " (regression-based blending with TM)" : " (regression-based blending)";
       }
       if( kind == "CIIP" && !m.mcCus.count( &cu ) )   // (CIIP from the CPU: why)
       {
@@ -9941,7 +9992,7 @@ void GpuIntraRec::subPuMotion( const CodingUnit& cu, const std::vector<int32_t>&
 }
 
 void GpuIntraRec::gpmParts( const CodingUnit& cu, int kind, int splitDir, int bldIdx, const int32_t parts[2][25],
-                            const MotionInfo partMi[2], const int32_t partObmc[2] )
+                            const MotionInfo partMi[2], const int32_t partObmc[2], const int32_t blend[8] )
 {
   Impl& m = *m_impl;
   if( !m.partial || !m.interPending.count( &cu ) )
@@ -9953,6 +10004,7 @@ void GpuIntraRec::gpmParts( const CodingUnit& cu, int kind, int splitDir, int bl
   v.insert( v.end(), parts[0], parts[0] + GPM_PART );
   v.insert( v.end(), parts[1], parts[1] + GPM_PART );
   v.insert( v.end(), partObmc, partObmc + 2 );
+  v.insert( v.end(), blend, blend + GPM_BLEND_N );
   m.gpmMi[&cu] = { partMi[0], partMi[1] };
 }
 

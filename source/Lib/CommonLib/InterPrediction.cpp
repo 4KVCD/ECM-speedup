@@ -12079,6 +12079,13 @@ void InterPrediction::motionCompensationGeoBlend( CodingUnit& cu, MergeCtx& geoM
 #endif
   )
 {
+  m_gpuGeoPlain = false;
+  m_gpuGeoSep   = false;
+  m_gpuGeoPart[0][6] = m_gpuGeoPart[1][6] = 0;
+  m_gpuGeoIntra = false;
+  m_gpuGeoPart[0][24] = m_gpuGeoPart[1][24] = 0;
+  m_gpuGeoObmc[0] = m_gpuGeoObmc[1] = 0;
+  m_gpuGeoBlend[0] = 0;
 #if JVET_AJ0274_REGRESSION_GPM_TM
   MergeCtx geoBlendTmCtx;
 
@@ -12328,7 +12335,9 @@ void InterPrediction::motionCompensationGeoBlend( CodingUnit& cu, MergeCtx& geoM
 #if JVET_AK0212_GPM_OBMC_MODIFICATION
       m_pixelRefine = false;
 #endif
+      gpuGeoPart( 0, pu );
       motionCompensation( pu, tmpGeoBuf0, REF_PIC_LIST_X, true, isChromaEnabled(pu.chromaFormat) );
+      gpuGeoBio( 0 );
 
 #if JVET_AE0046_BI_GPM
       pu.bdmvrRefine = false;
@@ -12343,6 +12352,7 @@ void InterPrediction::motionCompensationGeoBlend( CodingUnit& cu, MergeCtx& geoM
         PU::spanMotionInfo2(pu, MergeCtx(), 0, nullptr, nullptr, subBdofBuf[geoBI.mergeCand[0]]);
         cu.isobmcMC = true;
         pu.bdmvrRefine = refinePossible0;
+        gpuGeoObmc( 0, pu );
         subBlockOBMC(pu, &tmpGeoBuf0, pcIntraPred);
         cu.isobmcMC = false;
         pu.bdmvrRefine = false;
@@ -12447,7 +12457,9 @@ void InterPrediction::motionCompensationGeoBlend( CodingUnit& cu, MergeCtx& geoM
       }
 #endif
 
+      gpuGeoPart( 1, pu );
       motionCompensation( pu, tmpGeoBuf1, REF_PIC_LIST_X, true, isChromaEnabled(pu.chromaFormat) );
+      gpuGeoBio( 1 );
 
 #if JVET_AE0046_BI_GPM
       pu.bdmvrRefine = false;
@@ -12462,6 +12474,7 @@ void InterPrediction::motionCompensationGeoBlend( CodingUnit& cu, MergeCtx& geoM
         PU::spanMotionInfo2(pu, MergeCtx(), 0, nullptr, nullptr, subBdofBuf[geoBI.mergeCand[1]]);
         cu.isobmcMC = true;
         pu.bdmvrRefine = refinePossible1;
+        gpuGeoObmc( 1, pu );
         subBlockOBMC(pu, &tmpGeoBuf1, pcIntraPred);
         cu.isobmcMC = false;
         pu.bdmvrRefine = false;
@@ -12522,6 +12535,7 @@ void InterPrediction::motionCompensationGeoBlend( CodingUnit& cu, MergeCtx& geoM
     pu.interDir = pu.geoBlendIntraFlag ? pu.interDir : 3;
 
     cu.blendModel.copy( geoBI.blendModel );
+    gpuGeoBlend( pu );
 
 #if JVET_AK0101_REGRESSION_GPM_INTRA
 #if JVET_AK0212_GPM_OBMC_MODIFICATION
@@ -12689,6 +12703,7 @@ void InterPrediction::motionCompensationGeo( CodingUnit &cu, MergeCtx &geoMrgCtx
   m_gpuGeoPart[0][6] = m_gpuGeoPart[1][6] = 0;
   m_gpuGeoPart[0][24] = m_gpuGeoPart[1][24] = 0;
   m_gpuGeoObmc[0] = m_gpuGeoObmc[1] = 0;
+  m_gpuGeoBlend[0] = 0;
 #if JVET_AI0082_GPM_WITH_INTER_IBC
   if (cu.firstPU->gpmInterIbcFlag)
   {

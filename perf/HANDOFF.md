@@ -2815,6 +2815,31 @@ streams): every picture identical (ra_wpp_q32 skipped as before); the GPU predic
 850, "affine (with BDOF)" 696 of 709, "sub-block motion" 123 of 130; from the CPU: weighted prediction 61 (ldp_wp_q32,
 ra_wp_q32), non-local LIC with resampling 2 (counted as "affine (with inherited LIC or resampling)" before), OBMC with an
 IBC neighbour 2.
+Regression-based GPM blending on the GPU (2026-10-23, agent rg; JVET-AG0112, JVET-AJ0274; partial verification: the
+CPU's parts and blend model): DecCu predicts a CU of geoBlendFlag by motionCompensationGeoBlend - a pair of the merge
+list's candidates (getGeoBlendCand; with geoBlendTmFlag the candidates refined by deriveTMMv first) and a blend model
+fitted to their templates (deriveBcwBlendingBiDir), each part predicted alone as motionCompensationGeo does (at the
+intermediate precision; with separate OBMC, JVET-AK0212, at its final one after its own subBlockOBMC), blended by
+weightedBlend: part 1's weight w at each luma position from the model (xWeightAffineBlk_SSE: p0 x + p1 y + p2 + offset
+in 32 bits, shifted, saturated to 16 bits, clipped as min( max, max( w, min ) ); chroma takes the even luma positions),
+((32 - w) p0 + w p1 + offset) >> shift, clipped (weightedBlendBlk, roundOutputBD as the geo blends). That is
+xWeightedGeoBlk's / xWeightedGeoBlkRounded's blend with part 0's weight 32 - w (weightedBlendBlk's clip changes nothing
+for weights within 0 .. 32 of predictions within range; gpmWhy checks min and max). motionCompensationGeoBlend now
+calls M107 / M109 / M111's hooks (gpuGeoPart, gpuGeoBio, gpuGeoObmc; it resets their records first) and records its
+blend (gpuGeoBlend: its kind - intra part, TM - and cu.blendModel as weightedBlend takes it, InterPrediction::
+m_gpuGeoBlend, unconditional and at the end of the class; m_gpuGeoPlain / m_gpuGeoSep set as for the geo blends;
+motionCompensationGeo clears it); DecCu's gpmParts hands it over and recordInterBlock writes those weights where
+gpmWeights wrote the split's (gpmBlendWeights); no shader change, the rest is M107-M111's path and gpmWhy's checks.
+Found on the way (ld_parkjoy_q27, getRefPic's CHECK): such a CU's PU keeps interDir 3 with the last part's motion, so
+recordInterBlock's slot of the PU's own list 0 took reference index -1; a GPM block now takes no slot of the PU's motion
+(the parts' replace it). Still the CPU's (gpmWhy, "GPM (regression-based blending: ...)"): an intra part (JVET-AK0101),
+DMVR parts, LIC of the CU (the last part's flag, which OBMC's TM templates of the CU's motion take), separate OBMC with
+a LIC part or an intra neighbour, bi-prediction parts with LIC, LIC parts with resampling. Results (50 streams, build
+agrg1): every picture identical (ra_wpp_q32 skipped; ai_foreman352_q22 lost the device in the parallel run and passed
+alone); "GPM (regression-based blending)" 324 -> GPU 101 (31 of them with TM, a rerun of the 26 streams with these CUs
+after the tally's TM split); from the CPU: a DMVR part 92, an intra part 47, LIC 45, separate OBMC with a LIC part 22,
+separate OBMC with an intra neighbour 12, a bi-prediction part with LIC 3, a LIC part with resampling 2. Every other
+count as int5's.
 
 
 ## 8. Numbers (i7-10700 8C/16T, Win11, GCC 16.2, RTX 3070 driver 616.92)
