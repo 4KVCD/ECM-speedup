@@ -1382,7 +1382,8 @@ constexpr int OBMC_J_CLIC = 88, OBMC_J_CNLIC = 100, OBMC_J = 106;
 // (OBMC_*: a (non-local) LIC neighbour's models, the CU's own; MC_*: uni-prediction from list 1, affine, LIC, non-local
 // LIC and the place of its model, GPM, GPM with separate OBMC, no sharp bi filter)
 constexpr int OBMC_LIC = 2, OBMC_NLIC = 4, OBMC_CLIC = 8, OBMC_CNLIC = 16, MC_L1 = 64, MC_AFFINE = 128, MC_LIC = 256;
-constexpr int MC_NLIC = 512, MC_NLIC_AT = 31, MC_GPM = 1024, MC_GPM_SEP = 2048, MC_NO_SHARP = 4096;
+constexpr int MC_NLIC = 512, MC_NLIC_AT = 31, MC_GPM = 1024, MC_GPM_SEP = 2048, MC_NO_SHARP = 4096, MC_WP = 8192;
+constexpr int WP_KIND = 0, WP_W0 = 1, WP_W1 = 2, WP_OFFSET = 3, WP_SHIFT = 4;   // (MC_WP's record per component)
 constexpr int GPMR_P1 = 0, GPMR_OBMC1 = 1, GPMR_W = 2;   // (Tu::gpm's record)
 constexpr int OBMC_REC_GEO = 32;   // (GPM's separate OBMC - m_geoOBMC -: no skipObmcConditionByPixel, no sharp bi filter)
 constexpr int OBMC_T_MV0 = 0, OBMC_T_MV1 = 2, OBMC_T_REF0 = 4, OBMC_T_REF1 = 5, OBMC_T_KIND = 6, OBMC_T_W0 = 7, OBMC_T_W1 = 8;
@@ -2296,7 +2297,7 @@ struct GpuIntraRec::Impl
   // affine: the PUs' records (AF_*: their sub-block geometry per list, the stored luma motion chroma reads) and
   // where each CU's is; LIC: the CUs' models (per list and component scale, offset) in the same data
   std::vector<int32_t>                                         affineData;
-  std::unordered_map<const CodingUnit*, int32_t>               affineRec, licRec, nlicRec;
+  std::unordered_map<const CodingUnit*, int32_t>               affineRec, licRec, nlicRec, wpRec;
   gpu::Buffer                                                  mcAffineBuf;
   std::vector<const Picture*>                                  mcRefs;
   std::map<std::string, int>                                   mcKinds;
@@ -2609,6 +2610,7 @@ void GpuIntraRec::beginPicture( const CodingStructure& cs )
   m.affineData.clear();
   m.affineRec.clear();
   m.licRec.clear();
+  m.wpRec.clear();
   m.nlicRec.clear();
   m.obmcData = 0;
   m.mcRefs.clear();
@@ -7691,9 +7693,18 @@ static bool mcDmvrBio( const PredictionUnit& pu )
 // directions or JVET-AJ0097's same direction with the merge index's condition, no SMVD, no CIIP, BCW's default weight
 static bool mcBdof( const PredictionUnit& pu )
 {
-  const CodingUnit& cu = *pu.cu;
+  const CodingUnit& cu    = *pu.cu;
+  const Slice&      slice = *cu.slice;
   if( !cu.cs->sps->getBDOFEnabledFlag() || cu.cs->picHeader->getDisBdofFlag() || cu.smvdMode || pu.ciipFlag
       || ( cu.cs->sps->getUseBcw() && cu.bcwIdx != BCW_DEFAULT ) )
+  {
+    return false;
+  }
+  // (biocheck0 / biocheck1: no weighted reference of a B slice, no weighted prediction of a P slice)
+  if( ( slice.getSliceType() == B_SLICE
+        && ( ( pu.refIdx[0] >= 0 && WPScalingParam::isWeighted( slice.getWpScaling( REF_PIC_LIST_0, pu.refIdx[0] ) ) )
+             || ( pu.refIdx[1] >= 0 && WPScalingParam::isWeighted( slice.getWpScaling( REF_PIC_LIST_1, pu.refIdx[1] ) ) ) ) )
+      || ( cu.cs->pps->getUseWP() && slice.getSliceType() == P_SLICE ) )
   {
     return false;
   }
@@ -8149,8 +8160,10 @@ static bool interMcGpu( const CodingUnit& cu )
                        && ( pu.interDir != 3 || mcIdentical( pu ) || ( !mcDmvr( pu ) && !mcBdof( pu ) ) );
   const bool            uni   = !strcmp( kind, "uni-prediction" ) || ( ( obmc || lic || nlic ) && pu.interDir != 3 );
   const bool            bi    = !strcmp( kind, "bi-prediction" ) || ( ( obmc || lic || nlic ) && pu.interDir == 3 );
+  // (weighted prediction, M112: not with LIC, non-local LIC or DMVR)
+  const bool wp = ( pps.getUseWP() && slice.getSliceType() == P_SLICE ) || ( pps.getWPBiPred() && slice.getSliceType() == B_SLICE );
   if( getenv( "ECM_GPU_NO_MC" ) || ( !uni && !bi ) || cu.chromaFormat != CHROMA_420 || pps.getWrapAroundEnabledFlag()
-      || ( pps.getUseWP() && slice.getSliceType() == P_SLICE ) || ( pps.getWPBiPred() && slice.getSliceType() == B_SLICE ) )
+      || ( wp && ( lic || nlic || cu.licFlag || cu.altLMFlag || pu.bdmvrRefine || pu.mvRefine ) ) )
   {
     return false;
   }
@@ -8330,6 +8343,12 @@ static const char* obmcPlan( const CodingUnit& cu, std::vector<ObmcSeg>& segs, b
         {
           return "OBMC with an IBC neighbour";
         }
+        if( nb && ( nb->cu->licFlag || nb->cu->altLMFlag )
+            && ( ( cu.cs->pps->getUseWP() && slice.getSliceType() == P_SLICE )
+                 || ( cu.cs->pps->getWPBiPred() && slice.getSliceType() == B_SLICE ) ) )
+        {
+          return "OBMC with a LIC neighbour and weighted prediction";
+        }
         if( !nb )
         {
           return "OBMC without a neighbour PU";
@@ -8501,6 +8520,45 @@ static void obmcIntraRecord( GpuIntraRec::Impl& m, const std::vector<std::array<
 
 // the reference slot of list l's picture refIdx
 static int mcSlot( GpuIntraRec::Impl& m, const Slice& slice, int l, int refIdx );
+
+// explicit weighted prediction of a PU of reference indices ref0 / ref1 and BCW index bcw without BDOF or DMVR
+// (xPredInterBi: xWeightedPredictionBi in a B slice of weighted bi-prediction where BCW is the default -
+// addWeightBi, or addWeightUni with one list -, xWeightedPredictionUni in a P slice of weighted prediction): its
+// record in m.affineData (per component WP_*: getWpScaling's weights, offset and shift, the shift with the
+// intermediate's), -1 where none applies
+static int32_t wpRecord( GpuIntraRec::Impl& m, const Slice& slice, int ref0, int ref1, int bcw )
+{
+  const PPS& pps = *slice.getPPS();
+  const SPS& sps = *slice.getSPS();
+  const bool b   = slice.getSliceType() == B_SLICE && pps.getWPBiPred() && bcw == BCW_DEFAULT;
+  if( !b && !( slice.getSliceType() == P_SLICE && pps.getUseWP() ) )
+  {
+    return -1;
+  }
+  const bool    bi = ref0 >= 0 && ref1 >= 0;
+  const bool    hp = sps.getSpsRangeExtension().getHighPrecisionOffsetsEnabledFlag();
+  const int32_t r  = (int32_t) m.affineData.size();
+  for( int c = 0; c < MAX_NUM_COMPONENT; c++ )
+  {
+    const int osf      = hp ? 1 : 1 << ( sps.getBitDepth( toChannelType( ComponentID( c ) ) ) - 8 );
+    const int shiftNum = std::max<int>( 2, IF_INTERNAL_PREC - slice.clpRng( ComponentID( c ) ).bd );
+    if( bi )
+    {
+      const WPScalingParam* w0 = slice.getWpScaling( REF_PIC_LIST_0, ref0 );
+      const WPScalingParam* w1 = slice.getWpScaling( REF_PIC_LIST_1, ref1 );
+      m.affineData.insert( m.affineData.end(), { 1, w0[c].codedWeight, w1[c].codedWeight,
+                                                 ( w0[c].codedOffset + w1[c].codedOffset ) * osf,
+                                                 (int32_t) w0[c].log2WeightDenom + 1 + shiftNum } );
+    }
+    else
+    {
+      const WPScalingParam* w = slice.getWpScaling( ref0 >= 0 ? REF_PIC_LIST_0 : REF_PIC_LIST_1, ref0 >= 0 ? ref0 : ref1 );
+      m.affineData.insert( m.affineData.end(),
+                           { 0, w[c].codedWeight, 0, w[c].codedOffset * osf, (int32_t) w[c].log2WeightDenom + shiftNum } );
+    }
+  }
+  return r;
+}
 
 static void obmcJobs( GpuIntraRec::Impl& m, const CodingUnit& cu, const std::vector<ObmcSeg>& segs );
 
@@ -8779,6 +8837,20 @@ static bool recordInterBlock( GpuIntraRec::Impl& m, const TransformUnit& tu, con
       }
       j[MC_FLAGS] |= MC_BDOF;
       j[MC_BDOF_OUT] = out->second;
+    }
+    // (explicit weighted prediction, M112, not with BDOF or DMVR: its record at MC_BDOF_OUT; the CU's first block's)
+    if( !bdof && !dmvr && !cu.geoFlag && !cu.affine && !cu.licFlag )
+    {
+      auto wp = m.wpRec.find( &cu );
+      if( wp == m.wpRec.end() )
+      {
+        wp = m.wpRec.emplace( &cu, wpRecord( m, slice, pu.refIdx[0], pu.refIdx[1], cu.bcwIdx ) ).first;
+      }
+      if( wp->second >= 0 )
+      {
+        j[MC_FLAGS] |= MC_WP;
+        j[MC_BDOF_OUT] = wp->second;
+      }
     }
     if( cu.licFlag )   // (LIC: the CU's models, at its first block; uni-prediction from list 1 reads list 1's)
     {
@@ -9353,6 +9425,14 @@ static void obmcJobs( GpuIntraRec::Impl& m, const CodingUnit& cu, const std::vec
     j[MC_FLAGS]    = ( cu.imv == IMV_HPEL ? MC_ALT_HPEL : 0 ) | ( bi ? MC_BI : 0 )   // (the CU's AMVR flag)
                   | ( ( r[OBMC_REC_FLAGS] & OBMC_REC_GEO ) ? MC_NO_SHARP : 0 )   // (m_geoOBMC: no sharp bi filter)
                   | ( !bi && l0 == 1 ? MC_L1 : 0 );
+    // (explicit weighted prediction of the band, M112: the neighbour's lists and BCW index - obmcPlan rejects LIC
+    // neighbours there)
+    const int32_t wp = wpRecord( m, slice, s.mi.refIdx[0], same ? -1 : s.mi.refIdx[1], s.nb->cu->bcwIdx );
+    if( wp >= 0 )
+    {
+      j[MC_FLAGS] |= MC_WP;
+      j[MC_BDOF_OUT] = wp;
+    }
     if( s.nb->cu->licFlag )   // (JVET-AD0213: the neighbour's stored models, a list it lacks 32 / 0)
     {
       for( int l = 0; l < 2; l++ )

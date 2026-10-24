@@ -78,6 +78,9 @@ const int MC_GPM      = 1024; // a GPM CU's block (weightedGeoBlk): part 0 at MC
 const int MC_GPM_SEP  = 2048; // ... with separate OBMC: each part's final prediction, part 0's at MC_DST, part 1's at
                               // MC_BDOF_TH (intra_rec's OBMC and weightedGeoBlkRounded)
 const int MC_NO_SHARP = 4096; // without JVET-AI0094's sharp bi-prediction filter (GPM's separate OBMC: m_geoOBMC)
+const int MC_WP       = 8192; // explicit weighted prediction: per component its WP_* record at MC_BDOF_OUT in pc.affine
+// (WP_KIND 0: addWeightUni, 1: addWeightBi; the weights, the offset and the shift as they take them)
+const int WP_KIND = 0, WP_W0 = 1, WP_W1 = 2, WP_OFFSET = 3, WP_SHIFT = 4, WP_REC = 5;
 // McRef (int32) per slot and component: the index of sample (0, 0) in pc.planes, the stride, the size, the margin
 const int MC_REF_ORIGIN = 0, MC_REF_STRIDE = 1, MC_REF_W = 2, MC_REF_H = 3, MC_REF_MARGIN = 4;
 const int MC_REF_COMP = 5;
@@ -1178,6 +1181,23 @@ int mcPlain( BufI32 jb, int o, BufI32 lb, int comp, int x, int y, int puW, int p
   const ivec2 mv0 = ivec2( jb.v[o + MC_MVX], jb.v[o + MC_MVY] ), mv1 = ivec2( jb.v[o + MC_MV1X], jb.v[o + MC_MV1Y] );
   const int   slot0 = jb.v[o + MC_REF], slot1 = jb.v[o + MC_REF1];
   const int   headRoom = max( 2, IF_INTERNAL_PREC - bd );
+  if( ( flags & MC_WP ) != 0 )   // explicit weighted prediction on the lists' intermediates (xPredInterUni with bi)
+  {
+    BufI32    wb = BufI32( pc.affine );
+    const int w = jb.v[o + MC_BDOF_OUT] + comp * WP_REC, sh = wb.v[w + WP_SHIFT];
+    const int q0 = mcPredict( slot0, comp, x + ( mv0.x >> shift ), y + ( mv0.y >> shift ), mv0.x & mask, mv0.y & mask, alt,
+                              true, puW, puH, bd, clipMin, clipMax );
+    if( wb.v[w + WP_KIND] == 0 )   // (weightUnidir; with the weight 1 << log2WeightDenom the same as noWeightUnidir)
+    {
+      return clamp( ( ( wb.v[w + WP_W0] * ( q0 + IF_INTERNAL_OFFS ) + ( sh > 0 ? 1 << ( sh - 1 ) : 0 ) ) >> sh ) + wb.v[w + WP_OFFSET],
+                    clipMin, clipMax );
+    }
+    const int q1 = mcPredict( slot1, comp, x + ( mv1.x >> shift ), y + ( mv1.y >> shift ), mv1.x & mask, mv1.y & mask, alt,
+                              true, puW, puH, bd, clipMin, clipMax );
+    return clamp( ( wb.v[w + WP_W0] * ( q0 + IF_INTERNAL_OFFS ) + wb.v[w + WP_W1] * ( q1 + IF_INTERNAL_OFFS ) + ( 1 << ( sh - 1 ) )
+                    + ( wb.v[w + WP_OFFSET] << ( sh - 1 ) ) ) >> sh,
+                  clipMin, clipMax );   // (weightBidir)
+  }
   if( !bi )
   {
     const int v = mcPredict( slot0, comp, x + ( mv0.x >> shift ), y + ( mv0.y >> shift ), mv0.x & mask, mv0.y & mask, alt,

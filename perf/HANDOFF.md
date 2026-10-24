@@ -449,7 +449,7 @@ wall-clock gains with threads are "the easy baseline". Decoder status: single-th
 (`--GpuLoopFilter=1`: ALF, SAO, BIF, CCSAO, LF-CCCM, offset refinement on Vulkan). The user then asked for **a full
 GPU decoder in Vulkan, optimized until nothing is left** ("The GPU decoder needs to fully decode the frame on the
 GPU"; "Your first Vulkan version is going to be slow. That's OK"). That work is branch `dec-gpurecon`: intra
-reconstruction on the GPU (`--GpuRecon`), tool levels M1-M111 done and verified bit-exact (M19: DIMD, M20: OBIC, M21:
+reconstruction on the GPU (`--GpuRecon`), tool levels M1-M112 done and verified bit-exact (M19: DIMD, M20: OBIC, M21:
 intra merge, M22: the transforms of DIMD CUs, M23: LFNST of MIP, M24: TIMD, M25: OBIC and intra merge with TIMD
 neighbours, M26: TIMD-SAD, M27: OBIC and intra merge with TIMD-SAD neighbours, M28: TIMD merge, M29: TMRL of luma,
 M30: chroma TMRL, M31: CCLM, M32: LFNST / NSPT of CCLM, M33: GLM's gradient patterns, M34: CCCM, M35: GL-CCCM, M36:
@@ -2740,6 +2740,18 @@ convert2HighPrec does ((v << (14 - bd)) - 8192, unclipped); with separate OBMC i
 the parallel run); GPM 486 CUs predicted by the GPU (+71); the former "a bi-prediction part" 303 are now mostly "a DMVR
 part" 224 (all in RA streams: their separate OBMC runs the inner sub-block OBMC over the part's DMVR motion) and "a
 bi-prediction part with LIC" 4.
+M112 (2026-10-23): explicit weighted prediction on the GPU for uni- / bi-prediction CUs and their OBMC (xPredInterBi:
+xWeightedPredictionBi in a B slice of weighted bi-prediction where BCW is the default and neither BDOF nor DMVR applies -
+addWeightBi, addWeightUni with one list -, xWeightedPredictionUni in a P slice of weighted prediction). wpRecord writes
+per component getWpScaling's weights, offset and shift (with the intermediate's shiftNum) into pc.affine; a job with
+MC_WP reads it at MC_BDOF_OUT, and mcPlain weighs the lists' 14-bit intermediates (mcPredict with bi, the sharp filter
+too, as xPredInterUni with bi): weightUnidir (also for the weight 1 << log2WeightDenom, where noWeightUnidir gives the
+same) or weightBidir, clipped, without the out-of-boundary masks. OBMC's neighbour bands get the neighbour's (its lists
+and BCW index; xSubBlockMCFast leaves weighted prediction to xPredInterBi); the TM templates and the pixel test stay
+unweighted as on the CPU. mcBdof gains xPredInterBi's biocheck0 / biocheck1. Still the CPU's with weighted prediction:
+LIC, non-local LIC, DMVR, LIC or non-local LIC neighbours of OBMC, affine and GPM CUs. Results (50 streams, build wp1):
+every picture identical (ra_wpp_q32 skipped; ai_foreman352_q22 lost the device twice and passed alone on a third run);
+OBMC 6972 (+98) and CIIP 257 (+10) CUs predicted by the GPU, "OBMC (its base prediction)" 128 -> 19.
 
 
 ## 8. Numbers (i7-10700 8C/16T, Win11, GCC 16.2, RTX 3070 driver 616.92)
