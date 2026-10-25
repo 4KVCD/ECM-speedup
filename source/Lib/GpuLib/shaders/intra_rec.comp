@@ -603,7 +603,9 @@ void storeRecon( Tu t, int x, int y, int pr )
   }
   if( t.spCoded >= 0 || g_deferRecon )
   {
-    if( t.w > 32 || t.h > 32 )   // (sign prediction of an inter block above 32 x 32: signPredictionLarge)
+    // (sign prediction of an inter block above 32 x 32: signPredictionLarge; a deferred block of a 64-sample side - an
+    // SGPM block of 16 x 64 - still fits s_spPred, where the DIMD of its prediction reads it)
+    if( t.spCoded >= 0 && ( t.w > 32 || t.h > 32 ) )
     {
       splSet( SPL_PRED + y * t.w + x, pr );
     }
@@ -1004,11 +1006,14 @@ int obmcSample( Tu t, int r, int x, int y, int p )
   return p;
 }
 
-int interPredAt( Tu t, int x, int y )
+// sample (x, y) of inter block t's prediction: its inter prediction, or with sp a CIIP block's blended one, which the
+// intra path keeps in s_spPred (g_deferRecon)
+int interPredAt( Tu t, int x, int y, bool sp )
 {
-  return int( CBufI16( P.interPred ).v[t.dbgOffset + y * t.w + x] );   // (coherent: OBMC wrote it)
+  return sp ? int( s_spPred[y * t.w + x] )
+            : int( CBufI16( P.interPred ).v[t.dbgOffset + y * t.w + x] );   // (coherent: OBMC wrote it)
 }
-void interTransformMode( Tu t, int lid, int NT )
+void interTransformMode( Tu t, bool sp, int lid, int NT )
 {
   const int W = t.w, H = t.h;
   for( int i = lid; i < NUM_LUMA_MODE; i += NT )
@@ -1025,15 +1030,16 @@ void interTransformMode( Tu t, int lid, int NT )
     ivec2     g;
     if( small )
     {
-      const int a = interPredAt( t, x - 1, y - 1 ), b = interPredAt( t, x, y - 1 ), c = interPredAt( t, x - 1, y );
-      const int d = interPredAt( t, x, y );
+      const int a = interPredAt( t, x - 1, y - 1, sp ), b = interPredAt( t, x, y - 1, sp );
+      const int c = interPredAt( t, x - 1, y, sp ), d = interPredAt( t, x, y, sp );
       g = ivec2( c + d - a - b, a + c - b - d );
     }
     else
     {
-      g = sobel3x3( interPredAt( t, x - 1, y - 1 ), interPredAt( t, x, y - 1 ), interPredAt( t, x + 1, y - 1 ),
-                    interPredAt( t, x - 1, y ), interPredAt( t, x + 1, y ),
-                    interPredAt( t, x - 1, y + 1 ), interPredAt( t, x, y + 1 ), interPredAt( t, x + 1, y + 1 ) );
+      g = sobel3x3( interPredAt( t, x - 1, y - 1, sp ), interPredAt( t, x, y - 1, sp ),
+                    interPredAt( t, x + 1, y - 1, sp ), interPredAt( t, x - 1, y, sp ), interPredAt( t, x + 1, y, sp ),
+                    interPredAt( t, x - 1, y + 1, sp ), interPredAt( t, x, y + 1, sp ),
+                    interPredAt( t, x + 1, y + 1, sp ) );
     }
     if( g.x != 0 || g.y != 0 )
     {
@@ -1359,6 +1365,7 @@ void interObmcBand( Tu t, int lid, int NT )
       const int r = part == 0 ? t.obmc - 1 : gr.v[g + GPMR_OBMC1] - 1, at = part == 0 ? t.dbgOffset : p1;
       if( r >= 0 )
       {
+        obmcInterIntra( t, r, lid, NT );   // (the part's subBlockOBMC blends the intra neighbours' strips too)
         obmcModes( r, gr.v[r + OBMC_REC_BD], lid, NT );
         for( int i = lid; i < t.w * t.h; i += NT )
         {
@@ -1382,7 +1389,7 @@ void interObmcBand( Tu t, int lid, int NT )
     return;
   }
   const int r = t.obmc - 1;
-  obmcInterIntra( t, lid, NT );   // (intra neighbours' strips: intra_obmc.glsl)
+  obmcInterIntra( t, r, lid, NT );   // (intra neighbours' strips: intra_obmc.glsl)
   obmcModes( r, BufI32( P.timdData ).v[r + OBMC_REC_BD], lid, NT );
   for( int i = lid; i < t.w * t.h; i += NT )
   {
@@ -2304,8 +2311,11 @@ void main()
       break;
     }
     Tu t = BufTu( P.tus ).v[g_ti];
+    // (a CIIP block with LFNST / NSPT, DERIVE_INTER with DERIVE_TRANSFORM: their mode from a DIMD of its blended
+    // prediction)
+    const bool ciipDimd = WITH_DERIVED_TRANSFORMS && t.ciip != 0 && ( t.derive & DERIVE_TRANSFORM ) != 0;
     g_deferRecon = WITH_DERIVED_TRANSFORMS
-                   && ( t.derive & ( DERIVE_PNN_DIMD | DERIVE_EIP | DERIVE_TMP | DERIVE_SGPM ) ) != 0;
+                   && ( ( t.derive & ( DERIVE_PNN_DIMD | DERIVE_EIP | DERIVE_TMP | DERIVE_SGPM ) ) != 0 || ciipDimd );
     g_secMode    = -1;
     g_pnnLarge   = t.pnn >= 0 && t.w * t.h > 32 * 32 ? t.pnn : -1;
     g_bvSubs     = 0;
@@ -2573,7 +2583,7 @@ void main()
       // (LFNST / NSPT: their mode from a DIMD of the prediction, the residual computed here: inChainResidual)
       if( WITH_DERIVED_TRANSFORMS && ( t.derive & DERIVE_TRANSFORM ) != 0 )
       {
-        interTransformMode( t, lid, NT );
+        interTransformMode( t, false, lid, NT );
         selectTransform( t, s_predDimdMode, 0 );
         if( pc.verify != 0 && lid == 0 )
         {
@@ -3576,7 +3586,14 @@ void main()
         s_dimdHist[i] = 0;
       }
       SYNC();
-      mipTransformMode( t, W, H, mipPs, mipUpH, mipUpV, predStride, true, lid, NT );
+      if( ciipDimd )   // (xDecodeInterTexture's deriveIpmForTransform, the inter block's operators)
+      {
+        interTransformMode( t, true, lid, NT );
+      }
+      else
+      {
+        mipTransformMode( t, W, H, mipPs, mipUpH, mipUpV, predStride, true, lid, NT );
+      }
       // (an IntraTMP block's LIC and OBMC after the DIMD of its prediction: intra_tmp.glsl, intra_obmc.glsl)
       if( WITH_MPM && ( t.derive & DERIVE_TMP ) != 0 )
       {
@@ -3630,6 +3647,7 @@ void main()
         }
       }
       g_deferRecon = false;
+      t.ciip       = 0;   // (a CIIP block's kept prediction is the blended one)
       for( int i = lid; i < N && t.spCoded < 0; i += NT )
       {
         storeRecon( t, i % W, i / W, g_pnnLarge >= 0 ? pnnSample( t.pnn, W, H, i % W, i / W ) : int( s_spPred[i] ) );

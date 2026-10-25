@@ -564,6 +564,10 @@ void dependencies( int comp )
   {
     obmcIntraDeps( t, t.obmc - 1 );
   }
+  if( t.gpm != 0 && BufI32( P.timdData ).v[t.gpm - 1 + GPMR_OBMC1] != 0 )   // (... a GPM block's part 1's)
+  {
+    obmcIntraDeps( t, BufI32( P.timdData ).v[t.gpm - 1 + GPMR_OBMC1] - 1 );
+  }
   if( ( t.derive & DERIVE_INTER ) != 0 )   // an inter CU's block: its prediction given, it reads what its residual needs
   {
     // (OBMC's TM: the CU's one-sample templates, intra_rec's obmcModes; record: OBMC_REC_*, part 1's of a GPM CU with

@@ -1287,16 +1287,16 @@ const int GPM_ROUNDED = 2;   // GPM_INTER's rounded to the final precision (roun
 int gpmPartAt( BufI32 jb, int o, int k, int comp, int x, int y, int puW, int puH, int bd, int clipMin, int clipMax,
                int how )
 {
-  const int q = gpmPart( jb, o, k, comp, x, y, puW, puH, bd, clipMin, clipMax, how == GPM_FINAL );
-  if( how == GPM_FINAL )
+  const int  q   = gpmPart( jb, o, k, comp, x, y, puW, puH, bd, clipMin, clipMax, how == GPM_FINAL );
+  const int  l   = ( jb.v[o + MC_OOB] >> k ) & 1, lo = jb.v[o + MC_NLIC_AT] + 12 * k, m = lo + ( l * 3 + comp ) * 2;
+  const bool lic = jb.v[o + ( k == 0 ? MC_W0 : MC_W1 )] != 0;
+  BufI32     lb  = BufI32( pc.affine );
+  if( how == GPM_FINAL )   // (a uni-prediction part predicted on its own: xPredInterBlk's model on the final sample)
   {
-    return q;
+    return lic ? mcLic( lb, lo, l, comp, q, clipMin, clipMax ) : q;
   }
-  const int l = ( jb.v[o + MC_OOB] >> k ) & 1, lo = jb.v[o + MC_NLIC_AT] + 12 * k, m = lo + ( l * 3 + comp ) * 2;
-  BufI32    lb = BufI32( pc.affine );
-  const int ql = jb.v[o + ( k == 0 ? MC_W0 : MC_W1 )] == 0 || ( lb.v[m] == 32 && lb.v[m + 1] == 0 )
-                   ? q
-                   : mcLicBi( lb, lo, l, comp, q, bd, clipMin, clipMax );
+  const bool identity = lb.v[m] == 32 && lb.v[m + 1] == 0;
+  const int  ql       = !lic || identity ? q : mcLicBi( lb, lo, l, comp, q, bd, clipMin, clipMax );
   if( how == GPM_INTER )
   {
     return ql;

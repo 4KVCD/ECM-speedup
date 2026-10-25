@@ -765,17 +765,17 @@ void tmpObmc( Tu t, Cu c, int rec, int lid, int NT )
 
 // ----- an inter CU's OBMC with intra neighbours (JVET-AJ0161: subBlockOBMC's iState 1 segments)
 
-// the strips of OBMC record r (intra_rec.comp's OBMC_REC_*) whose segments are intra ones (OBMC_SEG_INTRA, their mode
-// - getGradForOBMC's, partial verification: the CPU's - in the head; the host's obmcIntraSegs), of block t's component,
-// where they overlap block t: predicted (subBlockIntraForOBMC, obmcStripPredict; with OBMC_REC_INTRA_INV luma mapped
-// back by LMCS's inverse) into the segment's data in Params::interPred (the band's predictions, as inter_mc's mode 3
-// leaves a motion segment's), the part of block t; obmcSample blends them (weightObmcBoundary's mode -1). All
-// invocations, uniform control flow; the scratch's start (strip, prepareRef's buffer) and the angular arrays are used
+// the strips of OBMC record r (intra_rec.comp's OBMC_REC_*: block t's, or a GPM block's part 1's) whose segments are
+// intra ones (OBMC_SEG_INTRA, their mode - getGradForOBMC's, partial verification: the CPU's - in the head; the host's
+// obmcIntraSegs), of block t's component, where they overlap block t: predicted (subBlockIntraForOBMC,
+// obmcStripPredict; with OBMC_REC_INTRA_INV luma mapped back by LMCS's inverse) into the segment's data in
+// Params::interPred (the band's predictions, as inter_mc's mode 3 leaves a motion segment's), the part of block t;
+// obmcSample blends them (weightObmcBoundary's mode -1). All invocations, uniform control flow; the scratch's start
+// (strip, prepareRef's buffer) and the angular arrays are used
 const int OBMC_INTER_STRIP = 0, OBMC_INTER_PREP = 128 * 4;
-void obmcInterIntra( Tu t, int lid, int NT )
+void obmcInterIntra( Tu t, int r, int lid, int NT )
 {
   BufI32    rec   = BufI32( P.timdData );
-  const int r     = t.obmc - 1;
   const int flags = rec.v[r + OBMC_REC_FLAGS], num = rec.v[r + OBMC_REC_NUM];
   if( ( flags & OBMC_REC_INTRA ) == 0 )
   {
