@@ -62,8 +62,52 @@
 namespace gpu
 {
 
+// development (ECM_GPU_FAULT=1): VK_EXT_device_fault's report of a lost device - the faulting addresses, which the
+// buffers' address ranges (logged at their creation) name
+static VkDevice                    s_faultDevice = VK_NULL_HANDLE;
+static PFN_vkGetDeviceFaultInfoEXT s_getFaultInfo = nullptr;
+
+static void reportDeviceFault()
+{
+  if( !s_getFaultInfo )
+  {
+    return;
+  }
+  VkDeviceFaultCountsEXT counts{};
+  counts.sType = VK_STRUCTURE_TYPE_DEVICE_FAULT_COUNTS_EXT;
+  if( s_getFaultInfo( s_faultDevice, &counts, nullptr ) != VK_SUCCESS )
+  {
+    fprintf( stderr, "[gpu] device fault: no report\n" );
+    return;
+  }
+  std::vector<VkDeviceFaultAddressInfoEXT> addrs( counts.addressInfoCount );
+  std::vector<VkDeviceFaultVendorInfoEXT>  vendor( counts.vendorInfoCount );
+  VkDeviceFaultInfoEXT                     info{};
+  info.sType             = VK_STRUCTURE_TYPE_DEVICE_FAULT_INFO_EXT;
+  info.pAddressInfos     = addrs.data();
+  info.pVendorInfos      = vendor.data();
+  counts.vendorBinarySize = 0;
+  s_getFaultInfo( s_faultDevice, &counts, &info );
+  fprintf( stderr, "[gpu] device fault: %s\n", info.description );
+  for( const auto& a: addrs )
+  {
+    fprintf( stderr, "[gpu] device fault address: type %d at 0x%llx (precision 0x%llx)\n", (int) a.addressType,
+             (unsigned long long) a.reportedAddress, (unsigned long long) a.addressPrecision );
+  }
+  for( const auto& v: vendor )
+  {
+    fprintf( stderr, "[gpu] device fault vendor: %s code 0x%llx data 0x%llx\n", v.description,
+             (unsigned long long) v.vendorFaultCode, (unsigned long long) v.vendorFaultData );
+  }
+  fflush( stderr );
+}
+
 static void check( VkResult res, const char* what )
 {
+  if( res == VK_ERROR_DEVICE_LOST )
+  {
+    reportDeviceFault();
+  }
   if( res != VK_SUCCESS )
   {
     char text[256];
@@ -322,10 +366,16 @@ GPU_LOAD_INSTANCE( EnumerateDeviceExtensionProperties )
   m_vk.EnumerateDeviceExtensionProperties( m_physical, nullptr, &numExt, nullptr );
   std::vector<VkExtensionProperties> exts( numExt );
   m_vk.EnumerateDeviceExtensionProperties( m_physical, nullptr, &numExt, exts.data() );
-  bool hasClockExt = false;
+  bool hasClockExt = false, hasFaultExt = false;
   for( const auto& e: exts )
   {
     hasClockExt |= strcmp( e.extensionName, VK_KHR_SHADER_CLOCK_EXTENSION_NAME ) == 0;
+    hasFaultExt |= strcmp( e.extensionName, VK_EXT_DEVICE_FAULT_EXTENSION_NAME ) == 0;
+  }
+  const bool wantFault = hasFaultExt && getenv( "ECM_GPU_FAULT" ) != nullptr;
+  if( getenv( "ECM_GPU_FAULT" ) && !hasFaultExt )
+  {
+    fprintf( stderr, "[gpu] ECM_GPU_FAULT: the device lacks VK_EXT_device_fault\n" );
   }
   VkPhysicalDeviceShaderClockFeaturesKHR hasClock{};
   hasClock.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_CLOCK_FEATURES_KHR;
@@ -369,9 +419,13 @@ GPU_LOAD_INSTANCE( EnumerateDeviceExtensionProperties )
   use11.sType                    = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES;
   use11.pNext                    = &use12;
   use11.storageBuffer16BitAccess = VK_TRUE;
+  VkPhysicalDeviceFaultFeaturesEXT useFault{};
+  useFault.sType       = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT;
+  useFault.deviceFault = VK_TRUE;
+  useFault.pNext       = &use11;
   VkPhysicalDeviceFeatures2 use{};
   use.sType                = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
-  use.pNext                = &use11;
+  use.pNext                = wantFault ? (void*) &useFault : (void*) &use11;
   use.features.shaderInt16 = VK_TRUE;
   use.features.shaderInt64 = VK_TRUE;
 
@@ -419,13 +473,23 @@ GPU_LOAD_INSTANCE( EnumerateDeviceExtensionProperties )
   deviceInfo.pNext                = &use;
   deviceInfo.queueCreateInfoCount = 1;
   deviceInfo.pQueueCreateInfos    = &queueInfo;
-  const char* extNames[] = { VK_KHR_SHADER_CLOCK_EXTENSION_NAME };
+  std::vector<const char*> extNames;
   if( hasClockExt )
   {
-    deviceInfo.enabledExtensionCount   = 1;
-    deviceInfo.ppEnabledExtensionNames = extNames;
+    extNames.push_back( VK_KHR_SHADER_CLOCK_EXTENSION_NAME );
   }
+  if( wantFault )
+  {
+    extNames.push_back( VK_EXT_DEVICE_FAULT_EXTENSION_NAME );
+  }
+  deviceInfo.enabledExtensionCount   = (uint32_t) extNames.size();
+  deviceInfo.ppEnabledExtensionNames = extNames.empty() ? nullptr : extNames.data();
   check( m_vk.CreateDevice( m_physical, &deviceInfo, nullptr, &m_device ), "vkCreateDevice" );
+  if( wantFault )
+  {
+    s_faultDevice  = m_device;
+    s_getFaultInfo = (PFN_vkGetDeviceFaultInfoEXT) m_vk.GetDeviceProcAddr( m_device, "vkGetDeviceFaultInfoEXT" );
+  }
 
   auto deviceFn = [this]( const char* name ) {
     PFN_vkVoidFunction fn = m_vk.GetDeviceProcAddr( m_device, name );
@@ -616,6 +680,11 @@ void Buffer::create( Context& ctx, VkDeviceSize bytes, Kind kind )
   addrInfo.sType  = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO;
   addrInfo.buffer = buf;
   addr            = vk.GetBufferDeviceAddress( dev, &addrInfo );
+  if( s_getFaultInfo )   // (ECM_GPU_FAULT: the ranges a fault address may fall in)
+  {
+    fprintf( stderr, "[gpu] buffer 0x%llx .. 0x%llx (%llu bytes)\n", (unsigned long long) addr,
+             (unsigned long long) ( addr + size ), (unsigned long long) size );
+  }
 }
 
 void Buffer::destroy( Context& ctx )

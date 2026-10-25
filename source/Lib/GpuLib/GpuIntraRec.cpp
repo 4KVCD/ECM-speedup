@@ -9952,6 +9952,7 @@ static int32_t obmcIntraFlags( GpuIntraRec::Impl& m, const CodingUnit& cu, const
 
 static void obmcIntraRecord( GpuIntraRec::Impl& m, const std::vector<std::array<int32_t, 3>>& segs )
 {
+  m.blendBlocks = m.blendBlocks || !segs.empty();   // (obmcInterIntra predicts the strips in the workgroup's scratch)
   for( const std::array<int32_t, 3>& s: segs )
   {
     const int len = s[2], bw = ( s[0] & 1 ) == 0 ? len : 4, bh = ( s[0] & 1 ) == 0 ? 4 : len;

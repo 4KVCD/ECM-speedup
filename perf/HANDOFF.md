@@ -704,7 +704,7 @@ commands that combine `Remove-Item` with `//` text. `perf\gpu\crlf.ps1 <worktree
 | `partial.py <build> [-j N] [streams]` | partial verification of the 19 regular streams (C:\Code\ECM\streams): per stream the pictures verified / differing and the first difference, then the CUs taken from the CPU by reason; logs in runs/partial. The test gate of every step since M57. A stream given as a path (`C:/Code/ECM/streams_ld/ld_foreman_q32.bin`) runs from there: the RTX 3070 PC's inter streams (LD-B, LD-P, RA of foreman / ParkJoy / FourPeople, made with grn's EncoderApp and the ECM cfgs) are in C:\Code\ECM\streams_ld |
 | `inline_size.py <module.spv> [N]` | a shader's size with every call inlined (what the drivers compile) and the functions that make it; check inter_mc / intra_rec after adding a call to a large function |
 | `slangopt.cmd` / `slangopt.py` | spirv-opt's stand-in from Nsight Graphics' SPIRV-Tools (section 4's build without the SDK); `ECM_GPU_INTRA_REC_SPV=<file.spv>` / `ECM_GPU_INTER_MC_SPV=<file.spv>` make a decoder take that module for intra_rec's first module / inter_mc (an experiment on a changed shader, e.g. the driver's compile, without a rebuild) |
-| development switches | `ECM_GPU_NO_CCP_LFNST=1`: partial verification leaves the pictures that need LEVEL_CCP_LFNST's pipeline (intra_rec's second module) unverified - on the 3070 PC its cold compile needs over 35 GB, past the budget, and most intra pictures need it. `ECM_GPU_CPU_KINDS=GPM,affine,...`: those inter CU kinds (interKind's names) keep the CPU's prediction (which kind a difference is in). `ECM_GPU_PIPELINE_TIMES=1` also names a pipeline before it compiles |
+| development switches | `ECM_GPU_NO_CCP_LFNST=1`: partial verification leaves the pictures that need LEVEL_CCP_LFNST's pipeline (intra_rec's second module) unverified - on the 3070 PC its cold compile needs over 35 GB, past the budget, and most intra pictures need it. `ECM_GPU_CPU_KINDS=GPM,affine,...`: those inter CU kinds (interKind's names) keep the CPU's prediction (which kind a difference is in). `ECM_GPU_PIPELINE_TIMES=1` also names a pipeline before it compiles. `ECM_GPU_FAULT=1` enables VK_EXT_device_fault: a lost device prints the faulting addresses, and every buffer prints its address range at its creation |
 | `precompile.py <build> [-j N] [variant:level ...]` | compiles intra_rec's pipelines into runs/nvcache and runs/pipecache (see 1a: after a shader change `8:0` .. `8:6`) |
 | `verify_all.py [-j N] <build> [streams]` | the full regression: `--GpuRecon=2` over the 444 GPU test streams (C:\Code\ECM\streams_gpu); M66 baseline 1565 verified, 8 skipped, 0 differences |
 | `cpu_cus.py <build> ...` | sums partial.py's "CUs taken from the CPU" per reason over the logs: what to port next |
@@ -2914,13 +2914,20 @@ same way as m116 from a detached worktree, C:\Code\ECM\wt-m116, its intra_rec mo
   ld_foreman_q22 identical when it runs through.
 - Device losses (VK_ERROR_DEVICE_LOST ~6 s into the decode, i.e. a hang reaching Windows' 2 s timeout) come and go:
   ld_foreman_q22 alone lost it in 2 of 5 runs with this build and 1 of 5 with M116; ld_cif33 under parallel load
-  (with M116 too). Not yet found; a dependency wait that never resolves in a persistent kernel would look like this.
+  (with M116 too). Not a hang but a memory fault: fixed, see below.
 - Intra pictures: most need LEVEL_CCP_LFNST's pipeline and stay unverified on this PC (ECM_GPU_NO_CCP_LFNST).
 Fix after M117 (2026-10-24): endPicture runs a picture again when its dependency edges pass the scheduling buffer's
 room, and the DMVR / xSubPuMC jobs' vector offsets (DM_MVS) were made absolute inside that loop - the second pass
 added the job array's size again, and every DMVR / sub-PU job read other data as its vectors (ld_parkjoy_q27 POC 7
 and 8: the 4 x 4 AMVP-SbTMVP CU at 232,16 had the right bdofOut after the first pass, other samples after the second).
 They are made absolute once, before the loop: ld_parkjoy_q27 identical.
+Fix (2026-10-25), the intermittent device losses above: OBMC's intra strips of an inter CU (intra_obmc.glsl's
+obmcInterIntra) predict in the workgroup's scratch (tsBase, BLEND_ACC words per workgroup), which endPicture
+allocates only when a recorded block needs it (blendBlocks). obmcIntraRecord did not set it, so a picture whose only
+users were such strips wrote past the buffer (nvlddmkm event 153, a memory fault, not a timeout). It sets it now:
+ld_foreman_q22 ran through 20 of 20 times (2-6 of 10 lost before). Found with VK_EXT_device_fault (ECM_GPU_FAULT=1:
+the faulting address, and every buffer's address range at its creation) and a spin limit in intra_rec's queue wait
+that ruled a hang out.
 
 ## 8. Numbers (i7-10700 8C/16T, Win11, GCC 16.2, RTX 3070 driver 616.92)
 
@@ -2947,12 +2954,7 @@ Profile of a GPU-on decode (non-LTO, m2_park16, share of all samples): parsing ~
         ra_parkjoy_q32 POC 2 (an inter block 2 low at 80,176) and POC 16 (an OBIC mode after inter differences).
       - intra: ai_long POC 5 (NN's indicesRepresentationPnn), ld_md5 POC 0 (scheduling data) and POC 40 (an SGPM
         CU's DIMD mode), ra_ip64_md5 (an SGPM CU's MTSS LFNST mode), ra720_pj17 (5 pictures).
-      - Intermittent VK_ERROR_DEVICE_LOST, e.g. ld_foreman_q22 alone in 2-6 of 10 runs (M116 too), always in POC 1's
-        first pass (the first inter picture). Never with ECM_GPU_NO_MC or ECM_GPU_NO_INTER (8 of 8 each); every kind
-        left to the CPU alone still loses it; four times the dependency room (edgeCap) and refAt clamped to the
-        planes' margins (an inter_mc variant through ECM_GPU_INTER_MC_SPV) still lose it. Next: other inter_mc
-        accesses (pc.affine records, pc.outPred / pc.bdofOut offsets), or intra_rec's scheduling with inter blocks
-        whose timing inter_mc's work changes.
+      - (The intermittent VK_ERROR_DEVICE_LOST: fixed, section 7's last paragraph.)
       ECM_GPU_CPU_KINDS narrows a difference to a kind (sub-PU CUs go their own way, not through it). A bdofOut /
       buffer read-back beside verification's download (endPicture) shows what a job wrote.
    b. intra_rec's second module (LEVEL_CCP_LFNST) cannot compile on the 3070 within the 60 GB budget (>35 GB), and
