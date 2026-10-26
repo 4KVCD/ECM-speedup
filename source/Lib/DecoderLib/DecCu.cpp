@@ -3269,6 +3269,22 @@ void DecCu::xReconInter(CodingUnit &cu)
 #else
       bool disCond = cu.firstPU->ciipFlag && !(((slice->getPOC() - slice->getRefPOC(REF_PIC_LIST_0, 0)) == 1) && slice->getCheckLDC());
 #endif
+#if ECM_VULKAN
+      // (partial verification: a model CIIP's condition leaves unstored though the prediction applied it - affine
+      // uni-prediction's, which xPredAffineBlk derives and applies regardless -, for the GPU)
+      if( m_gpuIntraRec && disCond && cu.licFlag && !cu.licInheritPara && !CU::isIBC( cu ) )
+      {
+        int models[12];
+        for( int l = 0; l < 2; l++ )
+        {
+          for( int c = 0; c < MAX_NUM_COMPONENT; c++ )
+          {
+            m_pcInterPred->setLicParam( l, c, models[( l * 3 + c ) * 2], models[( l * 3 + c ) * 2 + 1] );
+          }
+        }
+        m_gpuIntraRec->derivedLic( cu, models );
+      }
+#endif
       for (int list = 0; list < 2; list++)
       {
         if (cu.firstPU->refIdx[list] >= 0)

@@ -122,6 +122,9 @@ public:
   /// inter CU cu of multi-pass DMVR (bdmvrRefine), which the CPU has predicted: DMVR's refined vectors per 16 x 16
   /// sub-PU (InterPrediction's m_bdmvrSubPuMvBuf, stride DMVR_SUBPU_STRIDE), recordInterCu's
   void dmvrVectors( const CodingUnit& cu, const Mv* list0, const Mv* list1 );
+  /// inter CU cu with LIC whose models CIIP's condition leaves unstored (DecCu): the models its prediction applied
+  /// (InterPrediction's, per list and component scale and offset), recordInterCu's
+  void derivedLic( const CodingUnit& cu, const int models[12] );
   /// inter CU cu, which the CPU has predicted by xSubPuMC (sub-block merge, AMVP-SbTMVP, affine sub-PU BDOF): its
   /// predictions (InterPrediction::m_gpuSubPu), recordInterCu's
   void subPuMotion( const CodingUnit& cu, const std::vector<int32_t>& items );

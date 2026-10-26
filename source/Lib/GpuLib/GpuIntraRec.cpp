@@ -2353,6 +2353,8 @@ struct GpuIntraRec::Impl
   // multi-pass DMVR: the CPU's sub-PU vectors per CU (dmvrVectors: per 16 x 16 sub-PU list 0's and list 1's), the PUs'
   // jobs (inter_mc's mode 2) and their vectors, their scratch (int32)
   std::unordered_map<const CodingUnit*, std::vector<int32_t>>  dmvrMvs;
+  // the LIC models of CUs whose prediction applied models CIIP's condition leaves unstored (derivedLic)
+  std::unordered_map<const CodingUnit*, std::array<int32_t, 12>> derivedLic;
   // GPM CUs' predictions (DecCu's gpmParts): plain, split direction, blending index, the parts' motion (8 each); the
   // weights of each CU's components in affineData
   std::unordered_map<const CodingUnit*, std::vector<int32_t>>  gpmInfo;
@@ -2683,6 +2685,7 @@ void GpuIntraRec::beginPicture( const CodingStructure& cs )
   m.bdofJobs.clear();
   m.bdofSamples = 0;
   m.dmvrMvs.clear();
+  m.derivedLic.clear();
   m.gpmInfo.clear();
   m.gpmRec.clear();
   m.gpmMi.clear();
@@ -8008,7 +8011,7 @@ static bool affineIdentical( const PredictionUnit& pu )
 // why the GPU does not predict affine CU cu (nullptr: it does; its OBMC: obmcPlan): it takes it without LIC /
 // non-local LIC with resampling, sub-block merge or AMVP-SbTMVP, affine sub-block BDOF or affine DMVR, 4:2:0, without
 // weighted prediction with LIC, wrap-around, a scaled reference, with one clipping range
-static const char* affineWhy( const CodingUnit& cu )
+static const char* affineWhy( const GpuIntraRec::Impl& m, const CodingUnit& cu )
 {
   const PredictionUnit& pu    = *cu.firstPU;
   const Slice&          slice = *cu.slice;
@@ -8041,7 +8044,7 @@ static const char* affineWhy( const CodingUnit& cu )
   {
     const bool uni = pu.interDir != 3 || affineIdentical( pu );
     why = !pu.ciipAffine ? "CIIP not affine CIIP" : pu.ciipPDPC ? "CIIP-PDPC" : ciipWhy( cu ) ? ciipWhy( cu )
-          : cu.licFlag && !cu.licInheritPara && !licApplied( cu ) && uni
+          : cu.licFlag && !cu.licInheritPara && !licApplied( cu ) && uni && !m.derivedLic.count( &cu )
             ? "CIIP with LIC of uni-prediction, its model not stored"
             : nullptr;
   }
@@ -8058,9 +8061,9 @@ static const char* affineWhy( const CodingUnit& cu )
   return why;
 }
 
-static bool affineGpu( const CodingUnit& cu )
+static bool affineGpu( const GpuIntraRec::Impl& m, const CodingUnit& cu )
 {
-  return affineWhy( cu ) == nullptr;
+  return affineWhy( m, cu ) == nullptr;
 }
 
 static int32_t wpRecord( GpuIntraRec::Impl& m, const Slice& slice, int ref0, int ref1, int bcw );
@@ -8174,6 +8177,9 @@ static void affineRecord( GpuIntraRec::Impl& m, const CodingUnit& cu )
   // (LIC: the CU's models per list and component, scale and offset; not inherited ones: xPredInterUni's affine branch
   // turns licFlag off for xPredAffineBlk and tests the model against it while it is off, so it never applies one, and
   // xLicCompAdj leaves inherited models to xPredInterBlk)
+  // (affine CIIP's uni-prediction where CIIP's condition leaves LIC out: the models xPredAffineBlk derived and applied
+  // anyway, derivedLic's)
+  const auto derived = m.derivedLic.find( &cu );
   if( licApplied( cu ) && !cu.licInheritPara )
   {
     m.affineData[r + AF_LIC] = (int32_t) m.affineData.size();
@@ -8184,6 +8190,11 @@ static void affineRecord( GpuIntraRec::Impl& m, const CodingUnit& cu )
         m.affineData.insert( m.affineData.end(), { cu.licScale[l][c], cu.licOffset[l][c] } );
       }
     }
+  }
+  else if( cu.licFlag && !cu.licInheritPara && m.affineData[r + AF_BI] == 0 && derived != m.derivedLic.end() )
+  {
+    m.affineData[r + AF_LIC] = (int32_t) m.affineData.size();
+    m.affineData.insert( m.affineData.end(), derived->second.begin(), derived->second.end() );
   }
   // (explicit weighted prediction, M113: its record)
   const int32_t wp = wpRecord( m, slice, pu.refIdx[0], pu.refIdx[1], cu.bcwIdx );
@@ -8556,7 +8567,7 @@ static int32_t mhpRecord( GpuIntraRec::Impl& m, const CodingUnit& cu )
 // BDOF's applyBiOptFlow) - each without other tools -, 4:2:0, without weighted prediction, a scaled reference (RPR's
 // xPredInterBlkRPR) or wrap-around; BDOF in sub-blocks that tile the PU; ECM_GPU_NO_MC=1 leaves every prediction the
 // CPU's
-static bool interMcGpu( const CodingUnit& cu )
+static bool interMcGpu( const GpuIntraRec::Impl& m, const CodingUnit& cu )
 {
   const PredictionUnit& pu    = *cu.firstPU;
   const Slice&          slice = *cu.slice;
@@ -8584,7 +8595,7 @@ static bool interMcGpu( const CodingUnit& cu )
 #endif
   if( !strcmp( kind, "affine" ) )
   {
-    return affineGpu( cu );
+    return affineGpu( m, cu );
   }
   if( !strcmp( kind, "GPM" ) )   // (GPM, M107: gpmWhy where the CU is recorded)
   {
@@ -10162,7 +10173,7 @@ void GpuIntraRec::recordInterCu( const CodingUnit& cu )
   }
   // (xSubPuMC's CUs: subPuWhy, their OBMC with bSubMotion)
   const bool sub = m.subPuItems.count( &cu ) != 0;
-  if( !CU::isIBC( cu ) && !CU::isPLT( cu ) && ( sub ? !subPuWhy( m, cu ) : interMcGpu( cu ) )
+  if( !CU::isIBC( cu ) && !CU::isPLT( cu ) && ( sub ? !subPuWhy( m, cu ) : interMcGpu( m, cu ) )
       && ( !cu.geoFlag || !gpmWhy( m, cu ) )
       && ( !cu.firstPU->bdmvrRefine || mcIdentical( *cu.firstPU ) || m.dmvrMvs.count( &cu ) )
       && ( !cu.obmcFlag
@@ -10358,7 +10369,7 @@ void GpuIntraRec::recordInterCu( const CodingUnit& cu )
       {
         std::vector<ObmcSeg> s;
         bool                 in  = false;
-        const char*          why = affineWhy( cu );
+        const char*          why = affineWhy( m, cu );
         why = why ? why : cu.obmcFlag ? obmcPlan( cu, s, in ) : nullptr;
         kind += std::string( pu.ciipFlag ? " (CIIP: " : " (" ) + ( why ? why : "other" ) + ")";
       }
@@ -10376,7 +10387,7 @@ void GpuIntraRec::recordInterCu( const CodingUnit& cu )
         std::vector<ObmcSeg> s;
         bool                 in  = false;
         const char*          why = ciipWhy( cu );
-        why = why ? why : interMcGpu( cu ) && cu.obmcFlag ? obmcPlan( cu, s, in ) : nullptr;
+        why = why ? why : interMcGpu( m, cu ) && cu.obmcFlag ? obmcPlan( cu, s, in ) : nullptr;
         kind += std::string( " (" ) + ( why ? why : interKindBase( cu ) ) + ")";
       }
       if( kind == "non-local LIC" && !m.mcCus.count( &cu ) )   // (non-local LIC from the CPU: why)
@@ -10384,7 +10395,8 @@ void GpuIntraRec::recordInterCu( const CodingUnit& cu )
         std::vector<ObmcSeg> s;
         bool                 in  = false;
         const char*          why = nullptr;
-        kind += interMcGpu( cu ) && cu.obmcFlag && ( why = obmcPlan( cu, s, in ) ) != nullptr ? std::string( " (" ) + why + ")"
+        const bool           obmc = interMcGpu( m, cu ) && cu.obmcFlag && ( why = obmcPlan( cu, s, in ) ) != nullptr;
+        kind += obmc ? std::string( " (" ) + why + ")"
                 : pu.bdmvrRefine || ( pu.interDir == 3 && mcDmvr( pu ) ) ? " (with DMVR)"
                 : pu.interDir == 3 && mcBdof( pu ) ? " (with BDOF)" : cu.cs->sps->getRprEnabledFlag() ? " (resampling)"
                 : " (other)";
@@ -10394,7 +10406,8 @@ void GpuIntraRec::recordInterCu( const CodingUnit& cu )
         std::vector<ObmcSeg> s;
         bool                 in  = false;
         const char*          why = nullptr;
-        kind += interMcGpu( cu ) && cu.obmcFlag && ( why = obmcPlan( cu, s, in ) ) != nullptr ? std::string( " (" ) + why + ")"
+        const bool           obmc = interMcGpu( m, cu ) && cu.obmcFlag && ( why = obmcPlan( cu, s, in ) ) != nullptr;
+        kind += obmc ? std::string( " (" ) + why + ")"
                 : cu.altLMFlag ? " (with non-local LIC)" : pu.bdmvrRefine || ( pu.interDir == 3 && mcDmvr( pu ) ) ? " (with DMVR)"
                 : pu.interDir == 3 && mcBdof( pu ) ? " (with BDOF)" : cu.cs->sps->getRprEnabledFlag() ? " (resampling)"
                 : " (other)";
@@ -10403,7 +10416,7 @@ void GpuIntraRec::recordInterCu( const CodingUnit& cu )
       {
         std::vector<ObmcSeg> s;
         bool                 in  = false;
-        const char* const    why = interMcGpu( cu ) ? obmcPlan( cu, s, in ) : nullptr;
+        const char* const    why = interMcGpu( m, cu ) ? obmcPlan( cu, s, in ) : nullptr;
         kind += why ? std::string( " (" ) + why + ")" : " (its base prediction)";
       }
 #if MULTI_HYP_PRED
@@ -10749,6 +10762,15 @@ void GpuIntraRec::gpmParts( const CodingUnit& cu, int kind, int splitDir, int bl
   for( int k = 0; k < 2; k++ )
   {
     std::copy( partAff[k], partAff[k] + 17, a[k].begin() );
+  }
+}
+
+void GpuIntraRec::derivedLic( const CodingUnit& cu, const int models[12] )
+{
+  Impl& m = *m_impl;
+  if( m.partial && m.interPending.count( &cu ) )
+  {
+    std::copy( models, models + 12, m.derivedLic[&cu].begin() );
   }
 }
 

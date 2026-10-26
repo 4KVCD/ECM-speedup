@@ -3147,6 +3147,11 @@ no models; affineWhy's inherited LIC, affine CIIP's uni-prediction with inherite
 inherited models go (gpuGeoBio records the part's licInheritPara as m_gpuGeoAff[k][0]'s second bit; a part with a model
 of its own stays on the CPU). Results (build grn72): as M123's (ldp_parkjoy_q27's race at another block). Inter CUs
 predicted by the CPU 636 -> 517.
+M125 (2026-10-26): affine CIIP's uni-prediction with LIC where CIIP's condition (disCond) leaves LIC out: xPredAffineBlk
+derives the model from its templates and applies it anyway, DecCu stores identity models. DecCu hands the GPU the
+models InterPrediction holds after the prediction (GpuIntraRec::derivedLic, before it overwrites the CU's);
+affineRecord gives the PU those. Results (grn73 / grn74): identical but ra_ip64_md5 1 and ra720_pj17 4 (section 9).
+Inter CUs predicted by the CPU 517 -> 402.
 
 ## 8. Numbers (i7-10700 8C/16T, Win11, GCC 16.2, RTX 3070 driver 616.92)
 
