@@ -143,6 +143,9 @@ const int LM_FUSION       = 1 << 30;
 const int LM_FUSION_W_SHIFT    = 0;   // 2 bits
 const int LM_FUSION_TYPE_SHIFT = 4;   // 2 bits
 const int LM_FUSION_FIELDS = LM_FUSION | ( 3 << LM_FUSION_TYPE_SHIFT ) | ( 3 << LM_FUSION_W_SHIFT );
+// an LM block whose CU's record keeps the inside filter flag 0 (CU::saveCcInsideFilterFlagInCCP leaves a single
+// tree's CU with luma ISP as it is); the sign bit, beyond every field
+const int LM_RECORD_NO_INSIDE = int( 0x80000000 );
 
 // the type of a block of LM chroma fusion (PredictionUnit::isChromaFusion: 1 the blend with CCCM, 2 / 3 CFLM of one /
 // two models; a CCP merge fusion block's 1), 0 for other blocks
@@ -281,7 +284,7 @@ const int DERIVE_IBC   = 1073741824;   // with DERIVE_INTER: an IBC CU's block, 
 // component's samples, its block vector in 1/16 luma samples, its RR-IBC flip, IBC GPM's second vector and the first
 // part's weights (their offset, else -1), with IBC LIC its ibcLicIdx + 1 (else 0), a luma block's OBMC record
 // (intra_obmc.glsl's OBMC_*, else -1), the CU's own LIC scale and offset (getSameNeigMotion's comparison), with
-// bi-prediction 1 (its second vector IBC_REC_MV2's)
+// bi-prediction list 0's BCW weight of 8 (its second vector IBC_REC_MV2's; else 0)
 const int IBC_REC_X = 0, IBC_REC_Y = 1, IBC_REC_W = 2, IBC_REC_H = 3, IBC_REC_MV = 4, IBC_REC_FLIP = 6;
 const int IBC_REC_MV2 = 7, IBC_REC_WEIGHTS = 9, IBC_REC_LIC = 10, IBC_REC_OBMC = 11, IBC_REC_OWN_LIC = 12;
 const int IBC_REC_BI = 14;

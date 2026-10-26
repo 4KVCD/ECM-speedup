@@ -89,13 +89,13 @@ void ibcBlock( Tu t, int lid, int NT )
     {
       p = tmpLicSample( p, licModel, maxPel );
     }
-    if( weights >= 0 || bi )   // (IBC GPM's blend; bi-prediction's average, addAvg's: 15 - bitDepth bits down)
+    if( weights >= 0 || bi )   // (IBC GPM's blend; bi-prediction's average with BCW's weights, addWeightedAvg's)
     {
       const int p1 = t.comp == 0
                        ? ibcPredict( px, py, w, h, mv2, false, ox + x, oy + y, g_ti, t.bitDepth, ivec2( 0 ), bi )
                        : ibcChromaPredict( t.comp, px, py, w, h, mv2, ox + x, oy + y, g_ti, t.bitDepth, bi );
-      const int sh = 15 - t.bitDepth, wt = bi ? 0 : d.v[weights + ( oy + y ) * w + ox + x];
-      p = bi ? clamp( ( p + p1 + ( 1 << ( sh - 1 ) ) + 2 * 8192 ) >> sh, 0, maxPel )
+      const int sh = 17 - t.bitDepth, w0 = d.v[r + IBC_REC_BI], wt = bi ? 0 : d.v[weights + ( oy + y ) * w + ox + x];
+      p = bi ? clamp( ( w0 * p + ( 8 - w0 ) * p1 + ( 1 << ( sh - 1 ) ) + 8 * 8192 ) >> sh, 0, maxPel )
              : ( wt * p + ( 32 - wt ) * p1 + 16 ) >> 5;
     }
     if( obmc )

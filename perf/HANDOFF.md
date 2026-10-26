@@ -3092,6 +3092,34 @@ M120 (2026-10-26): four fixes of older differences.
 Results (RTX 3070, build grn55, partial.py -j 1, every picture of the 27 streams): identical but ra_ip64_md5 1 of 257
 (decoder-derived CCP fusion, section 9), ra720_pj17 5 of 17 and ra_parkjoy_q32 1 of 17 (a CCP record's inside filter
 flag) and ldp_parkjoy_q27 1 of 9 (a CCCM model of 2-row chroma blocks; its first difference moves between runs).
+M121 (2026-10-26): six inter / IBC ports and a CCP record fix.
+- LIC with BDOF (JVET-AG0276's xLicCompAdjBdof): the CU's LIC models on both lists' 14-bit intermediates of BDOF's
+  grown block (mcLicBi in inter_mc.comp's bdofJob, the job's MC_LIC and its models at MC_BDOF_OUT), a LIC CU's
+  sub-blocks min(8, W) x min(8, H) (applyBiOptFlow's scaleBDOF 2 with LIC) with a SAD threshold without the QP's term,
+  the grown block's outer ring interpolated (xPredInterBlk's LIC branch predicts the PU grown by 3; without LIC the ring
+  is a replication: the first build replicated it, and 1 - 3 samples on the CU's border rows and columns differed in
+  9 streams). With multi-pass DMVR a LIC CU takes xPredInterBi's plain branch at the refined vectors, so "LIC with
+  DMVR" is this case too. The luma block's job copies the BDOF prediction (no MC_LIC of its own); chroma is LIC
+  bi-prediction.
+- Non-local LIC with BDOF: motionCompensation applies the model after xPredInterBiSubPuBDOF, on the final prediction,
+  as mcSample does on top of the BDOF copy.
+- Affine CIIP with LIC: the models where licApplied (CIIP's condition), BCW's weights then (xWeightedAverage's alwCond),
+  in affineRecord; uni-prediction where CIIP's condition leaves LIC out stays on the CPU (xPredAffineBlk applies the
+  model it derives regardless, DecCu stores identity models).
+- Multi-hypothesis prediction (xAddHypMC): the base prediction as its kind's (affine or interKindBase's), then each
+  hypothesis a uni-prediction at its clipped vector (mhpRecord: slot, vector, half-sample flag, weight) added as
+  addHypothesisAndClip adds it, in mcSample after non-local LIC (OBMC's skip test reads the same prediction); the
+  record at the block job's MC_BDOF_TH, which only BDOF's and GPM's jobs use otherwise. Hypotheses with LIC and weighted
+  prediction stay on the CPU.
+- GPM bi-prediction parts with BDOF (gpuGeoBio): the part's luma by BDOF's sub-block jobs into pc.bdofOut (the part's
+  record MC_BI | MC_BDOF: gpmPart reads its luma there, its chroma plainly), the vectors clipped at the grown position;
+  not with the part's LIC.
+- IBC bi-prediction with BCW: list 0's weight in IBC_REC_BI, the average addWeightedAvg's (addAvg's at 4 / 4).
+- Fix: CU::saveCcInsideFilterFlagInCCP leaves a single tree's CU with luma ISP as it is, so its CCP record's inside
+  filter flag stays 0 (LM_RECORD_NO_INSIDE, Tu::lm's sign bit; ra720_pj17, ra_parkjoy_q32).
+Results (RTX 3070, build grn62, partial.py -j 1, every picture of the 27 streams): identical but ra_ip64_md5 1 of 257
+(decoder-derived CCP fusion, section 9) and ra720_pj17 4 of 17 (CCP records whose first difference moves between
+runs, section 9). Inter CUs predicted by the CPU (all streams' counts) 1,083 -> 716, by the GPU 42,423 -> 42,790.
 
 ## 8. Numbers (i7-10700 8C/16T, Win11, GCC 16.2, RTX 3070 driver 616.92)
 
@@ -3132,23 +3160,27 @@ within the budget (M118's 3070 runs skipped those pictures with ECM_GPU_NO_CCP_L
 
 ## 9. Next steps (in the order I would take them)
 
-000. Now (2026-10-26, after M120; RTX 3070 PC): every picture verifies (no ECM_GPU_NO_* switch needed). Open
+000. Now (2026-10-26, after M121; RTX 3070 PC): every picture verifies (no ECM_GPU_NO_* switch needed). Open
    differences, all of them older (pictures the switches skipped before):
-   a. Decoder-derived CCP fusion in an inter picture (ra_ip64_md5 POC 8, chroma 4,32 4x16: CPU type 16, GPU 1): the
-      CPU's mode costs (decoderDerivedCcp) 250 for CCLM, 83 / 82 for CCCM without / with the inside filter, 237 / 251
-      for MMLM, 285 for GL-CCCM, then the CCCM pair (cost 79); the GPU's CCLM cost agrees (250) but its CCCM modes'
-      are 461, 468, 479, 455 and 820, so its CCCM probe predictions differ (ccpFitModels' models or their luma).
-   b. A CCP record's inside filter flag (ra720_pj17, ra_parkjoy_q32: CPU 0, GPU 1): CU::saveCcInsideFilterFlagInCCP
-      leaves a single tree's CU with luma ISP as it is; fixed for M121 (LM_RECORD_NO_INSIDE).
-   c. CCCM models of 2-row chroma blocks (ldp_parkjoy_q27 POC 8: no subsampling at chroma 104,64 4x2, Cb's first
-      parameter CPU -2702 GPU 399 - the CPU's area 14 x 10 chroma from 98,58, 108 samples -, or GL-CCCM at 96,26 8x4
-      in another run): the first difference moves between runs, so look for a race first.
+   a. Decoder-derived CCP fusion in an inter picture (ra_ip64_md5 POC 8, chroma 4,32 4x16: CPU type 16, GPU 1; also
+      4x16 blocks of ra720_pj17 POC 4): the CPU's mode costs (decoderDerivedCcp) 250 for CCLM, 83 / 82 for CCCM
+      without / with the inside filter, 237 / 251 for MMLM, 285 for GL-CCCM, then the CCCM pair (cost 79); the GPU's
+      CCLM cost agrees (250) but its CCCM modes' are 461, 468, 479, 455 and 820. Its first fitted model (the two
+      lines') equals the CPU's (all 7 parameters, area 12 x 22, 52 samples), yet its probes of that model's step are
+      smoother (Cb above 472 472 472 471, left 470 .. 469 against the CPU's 468 .. and 466 .. 478): the model as the
+      step reloads it from its record or the luma the step rebuilds differs.
+   b. (Fixed by M121: a CCP record's inside filter flag.)
+   c. CCP records whose first difference moves between runs: ldp_parkjoy_q27 POC 8 (a CCCM model of a 2-row chroma
+      block, no subsampling at 104,64 4x2, or GL-CCCM at 96,26 8x4; identical in M121's run), ra720_pj17 POCs 4, 8,
+      10 and 12 (a CCCM / MDF-CCCM record's parameters or type, a CCP merge block): look for a race or for luma
+      samples a block reads before it writes them (the shared luma buffer in the angular arrays) first.
    d. Performance (section 8): IntraTMP's enumeration of positions in parallel (57 ms of aiodd), CCCM's features once
       per template sample (its accumulation 23 ms), then the blocks of a known mode (luma 130-190 us each, chroma
       ~0.6 ms): profile their phases as IntraTMP's were.
-   e. Ports by count: affine CIIP (affineWhy now names each reason), LIC with DMVR / BDOF (JVET-AG0276:
-      xLicCompAdjBdof applies the models to BDOF's extended intermediates), GPM CIIP of several TUs, IBC bi-prediction
-      with LIC / flip / BCW / OBMC, BVG-CCCM, GPM bi-prediction parts with BDOF.
+   e. Ports by count (M121's run): GPM CIIP of several TUs 130, GPM affine parts with LIC 118, affine CIIP with LIC
+      of uni-prediction 115, affine CIIP of sub-block merge 90, GPM bi-prediction parts with BDOF and LIC 82 (as
+      M121's LIC with BDOF, the part's inherited models), GPM regression blending with an intra part 60; intra: IBC
+      bi-prediction with LIC / flip / OBMC 158, BVG-CCCM 89, IntraTMP OBMC with an inter neighbour 69.
 00. (2026-10-24, the inter phase, after M117; on the RTX 3070 PC):
    a. Open differences of the 3070 PC's streams: ai_long POC 5 (NN's indicesRepresentationPnn). The others of
       M117's time are gone with M118 (the non-local LIC OBMC plan, SGPM CUs of a 64-sample side) and the device

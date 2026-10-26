@@ -190,8 +190,8 @@ constexpr int DERIVE_IBC          = 1073741824; // with DERIVE_INTER an IBC CU's
 // checkValidBv and the padding take), its vector (1/16 luma samples; x, y), its RR-IBC flip (rribcFlipType: 1 horizontal, 2 vertical); IBC GPM's second part's vector and the
 // first part's weights (of 32) per sample of the region, row-major in Params::timdData (else -1); with IBC LIC its
 // ibcLicIdx + 1 (else 0); a luma block's OBMC record (intra_obmc.glsl's OBMC_*, else -1) and the CU's own LIC scale and
-// offset getSameNeigMotion compares (its licScale / licOffset of list 0's luma); with bi-prediction 1 (the second
-// vector in IBC_REC_MV2; else 0)
+// offset getSameNeigMotion compares (its licScale / licOffset of list 0's luma); with bi-prediction list 0's BCW weight
+// (of 8; the second vector in IBC_REC_MV2; else 0)
 constexpr int IBC_REC_X = 0, IBC_REC_Y = 1, IBC_REC_W = 2, IBC_REC_H = 3, IBC_REC_MV = 4, IBC_REC_FLIP = 6;
 constexpr int IBC_REC_MV2 = 7, IBC_REC_WEIGHTS = 9, IBC_REC_LIC = 10, IBC_REC_OBMC = 11, IBC_REC_OWN_LIC = 12;
 constexpr int IBC_REC_BI = 14, IBC_REC = 15;
@@ -223,6 +223,9 @@ constexpr int LM_CCCM_GLM_LUMA = 65536;
 // (isChromaFusion) in the second slope adjustment's field and the first type's weight in the first's, which a fusion
 // block does not have)
 constexpr int LM_FUSION = 1 << 30, LM_FUSION_W_SHIFT = 0, LM_FUSION_TYPE_SHIFT = 4;
+// (an LM block whose CU's record keeps the inside filter flag 0: CU::saveCcInsideFilterFlagInCCP leaves a single tree's
+// CU with luma ISP as it is; the sign bit)
+constexpr int32_t LM_RECORD_NO_INSIDE = INT32_MIN;
 
 // the CCP model record of an LM CU or an LM chroma fusion CU (intra_common.glsl's CCP_OUT_*, int32): the
 // CCPModelCandidate fields predIntraChromaLM / predIntraCCCM / geneChromaFusionPred set (CCP merge's curCand) and the
@@ -1369,7 +1372,8 @@ constexpr int MC_MV1X = 16, MC_MV1Y = 17, MC_REF1 = 18, MC_W0 = 19, MC_W1 = 20, 
 constexpr int MC_RAW0Y = 23, MC_RAW1X = 24, MC_RAW1Y = 25, MC_PU_X = 26, MC_PU_Y = 27, MC_PIC_W = 28, MC_PIC_H = 29;
 constexpr int MC_BDOF_OUT = 30, MC_JOB = 32;
 constexpr int MC_ALT_HPEL = 1, MC_BI = 2, MC_BDOF = 4, MC_NO_MEAN = 8;
-constexpr int MC_BDOF_SUB = 16;   // BDOF's sub-blocks: at most 16 x 16 (JVET-AG0067's scaleBDOF 4)
+constexpr int MC_BDOF_SUB = 16;   // BDOF's sub-blocks: at most 16 x 16 (JVET-AG0067's scaleBDOF 4), a LIC CU's at
+constexpr int MC_BDOF_SUB_LIC = 8;   // most 8 x 8 (JVET-AG0276: applyBiOptFlow keeps scaleBDOF 2 with LIC)
 // a DMVR job (inter_mc's mode 2, DM_*): the PU, its prediction's place in mcBdofBuf, clipMvInl's bounds, the slots,
 // the flags, the bit depth and clipping range, BCW's weights, bioBlockDistTh's QP shift, the picture's size, its
 // scratch, its sub-PU vectors (after the jobs)
@@ -1407,6 +1411,8 @@ constexpr int OBMC_J_CLIC = 88, OBMC_J_CNLIC = 100, OBMC_J = 106;
 // LIC and the place of its model, GPM, GPM with separate OBMC, no sharp bi filter)
 constexpr int OBMC_LIC = 2, OBMC_NLIC = 4, OBMC_CLIC = 8, OBMC_CNLIC = 16, MC_L1 = 64, MC_AFFINE = 128, MC_LIC = 256;
 constexpr int MC_NLIC = 512, MC_NLIC_AT = 31, MC_GPM = 1024, MC_GPM_SEP = 2048, MC_NO_SHARP = 4096, MC_WP = 8192;
+// (multi-hypothesis: the hypotheses' record at MC_BDOF_TH, which a block's job of another kind than GPM leaves unused)
+constexpr int MC_MHP = 262144;
 constexpr int WP_KIND = 0, WP_W0 = 1, WP_W1 = 2, WP_OFFSET = 3, WP_SHIFT = 4;   // (MC_WP's record per component)
 constexpr int GPMR_P1 = 0, GPMR_OBMC1 = 1, GPMR_W = 2;   // (Tu::gpm's record)
 constexpr int OBMC_REC_GEO = 32;   // (GPM's separate OBMC - m_geoOBMC -: no skipObmcConditionByPixel, no sharp bi filter)
@@ -2343,6 +2349,7 @@ struct GpuIntraRec::Impl
   std::unordered_map<const CodingUnit*, std::array<std::vector<MotionInfo>, 2>> gpmMb;
   std::unordered_map<const CodingUnit*, std::array<std::vector<int32_t>, 2>>    gpmDmvr;
   std::map<std::pair<const CodingUnit*, int>, int32_t>                         gpmDmvrRec;
+  std::map<std::pair<const CodingUnit*, int>, int32_t>                         gpmBdofOut;   // (a BDOF part's luma)
   // (an affine part's motion - InterPrediction::m_gpuGeoAff - and its affine record, M117)
   std::unordered_map<const CodingUnit*, std::array<std::array<int32_t, 17>, 2>> gpmAff;
   std::map<std::pair<const CodingUnit*, int>, int32_t>                         gpmAffRec;
@@ -2358,9 +2365,10 @@ struct GpuIntraRec::Impl
   int32_t                                                      cuJob[MAX_NUM_COMPONENT] = { -1, -1, -1 };
   gpu::Buffer                                                  mcObmcJobBuf, mcInnerJobBuf;
   // affine: the PUs' records (AF_*: their sub-block geometry per list, the stored luma motion chroma reads) and
-  // where each CU's is; LIC: the CUs' models (per list and component scale, offset) in the same data
+  // where each CU's is; LIC: the CUs' models (per list and component scale, offset) in the same data, also the
+  // multi-hypothesis CUs' hypotheses (mhpRecord)
   std::vector<int32_t>                                         affineData;
-  std::unordered_map<const CodingUnit*, int32_t>               affineRec, licRec, nlicRec, wpRec;
+  std::unordered_map<const CodingUnit*, int32_t>               affineRec, licRec, nlicRec, wpRec, mhpRec;
   gpu::Buffer                                                  mcAffineBuf;
   std::vector<const Picture*>                                  mcRefs;
   std::map<std::string, int>                                   mcKinds;
@@ -2668,6 +2676,7 @@ void GpuIntraRec::beginPicture( const CodingStructure& cs )
   m.gpmMb.clear();
   m.gpmDmvr.clear();
   m.gpmDmvrRec.clear();
+  m.gpmBdofOut.clear();
   m.gpmAff.clear();
   m.gpmAffRec.clear();
   m.gpmSepRecs.clear();
@@ -2682,6 +2691,7 @@ void GpuIntraRec::beginPicture( const CodingStructure& cs )
   m.licRec.clear();
   m.wpRec.clear();
   m.nlicRec.clear();
+  m.mhpRec.clear();
   m.obmcData = 0;
   m.mcRefs.clear();
   m.interSign.clear();
@@ -6700,6 +6710,10 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
         t.lm |= pu.glmIdc.getIdc( other, 0 ) << LM_OTHER_GLM_SHIFT;
       }
     }
+    if( !CS::isDualITree( *cu.cs ) && cu.ispMode )   // (CU::saveCcInsideFilterFlagInCCP skips a luma ISP CU)
+    {
+      t.lm |= LM_RECORD_NO_INSIDE;
+    }
     // the LM prediction reads the unfiltered references (initPredIntraParams: no reference filter or fusion for a
     // chroma LM mode) and none of the angular and PDPC parameters, whose angles initPredIntraParams leaves as the
     // previous block's
@@ -7358,16 +7372,17 @@ static const char* ibcWhy( const GpuIntraRec::Impl& m, const CodingUnit& cu )
   {
     return "IBC CIIP";
   }
-  // (bi-prediction, JVET-AE0169: xPredInterBi's two copies of the picture at the intermediate precision, averaged)
+  // (bi-prediction, JVET-AE0169: xPredInterBi's two copies of the picture at the intermediate precision, averaged with
+  // BCW's weights)
   if( pu.interDir != 1 )
   {
     const Slice& s  = *cu.slice;
     const bool   wp = ( s.getSliceType() == B_SLICE && cu.cs->pps->getWPBiPred() )
                       || ( s.getSliceType() == P_SLICE && cu.cs->pps->getUseWP() );
-    if( cu.ibcLicFlag || cu.rribcFlipType || cu.bcwIdx != BCW_DEFAULT || wp || cu.ibcFilterFlag
+    if( cu.ibcLicFlag || cu.rribcFlipType || wp || cu.ibcFilterFlag
         || ( cu.cs->sps->getUseOBMC() && cu.obmcFlag && pu.lwidth() * pu.lheight() >= 32 ) )
     {
-      return "IBC bi-prediction with LIC, a flip, BCW, weighted prediction, the IBC filter or OBMC";
+      return "IBC bi-prediction with LIC, a flip, weighted prediction, the IBC filter or OBMC";
     }
   }
   if( cu.ibcFilterFlag )
@@ -7422,7 +7437,7 @@ static void ibcRecord( GpuIntraRec::Impl& m, const CodingUnit& cu, const Compone
   {
     rec[IBC_REC_MV2]     = pu.mv[1].hor;
     rec[IBC_REC_MV2 + 1] = pu.mv[1].ver;
-    rec[IBC_REC_BI]      = 1;
+    rec[IBC_REC_BI]      = getBcwWeight( cu.bcwIdx, REF_PIC_LIST_0 );   // (never 0)
   }
 #endif
   m.blendBlocks = m.blendBlocks || cu.ibcLicFlag;   // (its model's templates take the workgroup's scratch)
@@ -7963,6 +7978,19 @@ static int mcSlot( GpuIntraRec::Impl& m, const Slice& slice, int l, int refIdx )
 
 static const char* ciipWhy( const CodingUnit& cu );
 
+static bool licApplied( const CodingUnit& cu );
+
+// xCheckIdenticalMotion of affine PU pu: the control points of both lists equal, from one picture (list 0 alone)
+static bool affineIdentical( const PredictionUnit& pu )
+{
+  const Slice& slice = *pu.cs->slice;
+  return slice.isInterB() && !pu.cs->pps->getWPBiPred() && pu.refIdx[0] >= 0 && pu.refIdx[1] >= 0
+         && slice.getRefPic( REF_PIC_LIST_0, pu.refIdx[0] )->getPOC()
+              == slice.getRefPic( REF_PIC_LIST_1, pu.refIdx[1] )->getPOC()
+         && pu.mvAffi[0][0] == pu.mvAffi[1][0] && pu.mvAffi[0][1] == pu.mvAffi[1][1]
+         && ( pu.cu->affineType == AFFINEMODEL_4PARAM || pu.mvAffi[0][2] == pu.mvAffi[1][2] );
+}
+
 // why the GPU does not predict affine CU cu (nullptr: it does; its OBMC: obmcPlan): it takes it without LIC /
 // non-local LIC with resampling or inherited LIC, sub-block merge or AMVP-SbTMVP, affine sub-block BDOF or affine DMVR,
 // 4:2:0, without weighted prediction with LIC, wrap-around, a scaled reference, with one clipping range
@@ -7993,10 +8021,13 @@ static const char* affineWhy( const CodingUnit& cu )
                     : !oneClip                                                ? "clipping ranges per component"
                                                                               : nullptr;
 #if JVET_AG0135_AFFINE_CIIP
-  if( !why && pu.ciipFlag )   // (affine CIIP, M114: ciipWhy's limits, without LIC)
+  // (affine CIIP, M114: ciipWhy's limits; with LIC as licApplied says, but xPredAffineBlk's uni-prediction applies the
+  // model it derives also where CIIP's condition leaves LIC out, and DecCu stores identity models there)
+  if( !why && pu.ciipFlag )
   {
+    const bool uni = pu.interDir != 3 || affineIdentical( pu );
     why = !pu.ciipAffine ? "CIIP not affine CIIP" : pu.ciipPDPC ? "CIIP-PDPC" : ciipWhy( cu ) ? ciipWhy( cu )
-          : cu.licFlag ? "CIIP with LIC" : nullptr;
+          : cu.licFlag && !licApplied( cu ) && uni ? "CIIP with LIC of uni-prediction, its model not stored" : nullptr;
   }
 #else
   why = !why && pu.ciipFlag ? "CIIP" : why;
@@ -8034,11 +8065,7 @@ static void affineRecord( GpuIntraRec::Impl& m, const CodingUnit& cu )
   const size_t r     = m.affineData.size();
   m.affineData.resize( r + AF_C0 + 4 * AF_C, 0 );
   int32_t* a = &m.affineData[r];
-  // (xCheckIdenticalMotion: the control points of both lists equal, from one picture - list 0 alone)
-  bool same = slice.isInterB() && !pps.getWPBiPred() && pu.refIdx[0] >= 0 && pu.refIdx[1] >= 0
-              && slice.getRefPic( REF_PIC_LIST_0, pu.refIdx[0] )->getPOC() == slice.getRefPic( REF_PIC_LIST_1, pu.refIdx[1] )->getPOC()
-              && pu.mvAffi[0][0] == pu.mvAffi[1][0] && pu.mvAffi[0][1] == pu.mvAffi[1][1]
-              && ( cu.affineType == AFFINEMODEL_4PARAM || pu.mvAffi[0][2] == pu.mvAffi[1][2] );
+  const bool same = affineIdentical( pu );
   int off = 8;
 #if JVET_AA0096_MC_BOUNDARY_PADDING
   off += MC_PAD_SIZE;
@@ -8050,8 +8077,10 @@ static void affineRecord( GpuIntraRec::Impl& m, const CodingUnit& cu )
   a[AF_BI]       = pu.interDir == 3 && !same ? 1 : 0;
   a[AF_LIST]     = pu.interDir == 2 ? 1 : 0;
   a[AF_SHIFT]    = iBit - 4 + MV_FRACTIONAL_BITS_INTERNAL;
-  a[AF_W0]       = getBcwWeight( pu.ciipFlag ? BCW_DEFAULT : cu.bcwIdx, REF_PIC_LIST_0 );   // (CIIP: the plain average)
-  a[AF_W1]       = getBcwWeight( pu.ciipFlag ? BCW_DEFAULT : cu.bcwIdx, REF_PIC_LIST_1 );
+  // (CIIP: xWeightedAverage's plain average, but BCW's weights where its LIC applies, alwCond)
+  const int bcw  = pu.ciipFlag && !licApplied( cu ) ? BCW_DEFAULT : cu.bcwIdx;
+  a[AF_W0]       = getBcwWeight( bcw, REF_PIC_LIST_0 );
+  a[AF_W1]       = getBcwWeight( bcw, REF_PIC_LIST_1 );
   a[AF_HMAX]     = (int) pps.getPicWidthInLumaSamples() + off - 1;
   a[AF_HMIN]     = -(int) sps.getMaxCUWidth() - off + 1;
   a[AF_VMAX]     = (int) pps.getPicHeightInLumaSamples() + off - 1;
@@ -8126,7 +8155,7 @@ static void affineRecord( GpuIntraRec::Impl& m, const CodingUnit& cu )
       c[AF_SLOT] = mcSlot( m, slice, l, pu.refIdx[l] );
     }
   }
-  if( cu.licFlag )   // (LIC: the CU's models per list and component, scale and offset)
+  if( licApplied( cu ) )   // (LIC: the CU's models per list and component, scale and offset)
   {
     m.affineData[r + AF_LIC] = (int32_t) m.affineData.size();
     for( int l = 0; l < 2; l++ )
@@ -8367,9 +8396,9 @@ static const char* gpmWhy( const GpuIntraRec::Impl& m, const CodingUnit& cu )
     {
       return "an affine part with LIC";
     }
-    if( p[6] == 3 && !p[7] && p[GPM_BIO] )   // (M111: bi-prediction parts without BDOF)
+    if( p[6] == 3 && !p[7] && p[GPM_BIO] && p[GPM_LIC] )   // (M111: bi-prediction parts; BDOF without LIC)
     {
-      return "a bi-prediction part with BDOF";
+      return "a bi-prediction part with BDOF and LIC";
     }
     if( p[7] && ( p[6] != 3 || p[GPM_LIC] || !m.gpmDmvr.count( &cu ) || m.gpmDmvr.at( &cu )[k].empty() ) )   // (M116)
     {
@@ -8445,6 +8474,68 @@ static void gpmBlendWeights( const PredictionUnit& pu, const ComponentID compID,
   }
 }
 
+#if MULTI_HYP_PRED
+// ----- multi-hypothesis prediction (xAddHypMC): the base prediction as its kind's, then per additional hypothesis a
+// uni-prediction at its vector (xPredInterUni without bi: the filters' last stage rounded and clipped; AMVR's
+// half-sample filter by its imv), added by addHypothesisAndClip: ((8 - w) P + w H + 4) >> 3 clipped, w its weight
+// (g_addHypWeight)
+
+// hypothesis h's reference list and index (xAddHypMC's: a merge hypothesis its own, else the slice's list of them)
+static std::pair<int, int> mhpRef( const Slice& slice, const MultiHypPredictionData& h )
+{
+  if( h.isMrg )
+  {
+    return { h.refList, h.refIdx };
+  }
+  const auto& r = slice.getMultiHypRefPicList()[h.refIdx];
+  return { (int) r.refList, (int) r.refIdx };
+}
+
+// why the GPU does not add the hypotheses of CU cu (nullptr: it does): a hypothesis with LIC (the model it derives from
+// its templates is not stored), weighted prediction, a scaled reference
+static const char* mhpWhy( const CodingUnit& cu )
+{
+  const Slice& slice = *cu.slice;
+  const PPS&   pps   = *cu.cs->pps;
+  if( pps.getUseWP() || pps.getWPBiPred() )
+  {
+    return "weighted prediction";
+  }
+  for( const MultiHypPredictionData& h: cu.firstPU->addHypData )
+  {
+    if( h.licFlag )
+    {
+      return "a hypothesis with LIC";
+    }
+    const std::pair<int, int> r = mhpRef( slice, h );
+    if( cu.cs->sps->getRprEnabledFlag() && slice.getRefPic( RefPicList( r.first ), r.second )->isRefScaled( &pps ) )
+    {
+      return "a scaled reference";
+    }
+  }
+  return nullptr;
+}
+
+// CU cu's hypotheses (inter_mc.comp's mcHypotheses): their count, then per hypothesis its reference slot, its vector
+// (clipped as xPredInterUni clips it), its half-sample filter flag and its weight
+static int32_t mhpRecord( GpuIntraRec::Impl& m, const CodingUnit& cu )
+{
+  const PredictionUnit& pu    = *cu.firstPU;
+  const Slice&          slice = *cu.slice;
+  const int32_t         r     = (int32_t) m.affineData.size();
+  m.affineData.push_back( (int32_t) pu.addHypData.size() );
+  for( const MultiHypPredictionData& h: pu.addHypData )
+  {
+    const std::pair<int, int> ref = mhpRef( slice, h );
+    Mv                        mv  = h.mv;
+    clipMv( mv, pu.lumaPos(), pu.lumaSize(), *cu.cs->sps, *cu.cs->pps );
+    m.affineData.insert( m.affineData.end(), { mcSlot( m, slice, ref.first, ref.second ), mv.getHor(), mv.getVer(),
+                                               h.imv == IMV_HPEL ? 1 : 0, g_addHypWeight[h.weightIdx] } );
+  }
+  return r;
+}
+#endif
+
 // whether the GPU makes the prediction of inter CU cu (inter_mc.comp): uni-prediction (xPredInterUni without bi, then
 // xWeightedAverage's copyClip) or bi-prediction without DMVR (xPredInterBi, xWeightedAverage's addWeightedAvg or
 // BDOF's applyBiOptFlow) - each without other tools -, 4:2:0, without weighted prediction, a scaled reference (RPR's
@@ -8466,6 +8557,16 @@ static bool interMcGpu( const CodingUnit& cu )
       return false;
     }
   }
+#if MULTI_HYP_PRED
+  if( !strcmp( kind, "multi-hypothesis" ) )   // (its base prediction as its kind's, the hypotheses added: mhpRecord)
+  {
+    if( mhpWhy( cu ) )
+    {
+      return false;
+    }
+    kind = cu.affine ? "affine" : interKindBase( cu );
+  }
+#endif
   if( !strcmp( kind, "affine" ) )
   {
     return affineGpu( cu );
@@ -8483,14 +8584,15 @@ static bool interMcGpu( const CodingUnit& cu )
     kind = interKindBase( cu );
   }
   const bool            obmc  = !strcmp( kind, "OBMC" );   // (its base prediction; OBMC: obmcPlan)
-  // (LIC: the CU's stored models - the ones applied, derived or inherited -, not with non-local LIC, BDOF or reference
-  // picture resampling; with multi-pass DMVR xPredInterBi predicts plainly at the PU's vectors, which it set to the
-  // refined ones - JVET-AG0276's LIC with DMVR -, not with VVC's DMVR)
+  // (LIC: the CU's stored models - the ones applied, derived or inherited -, not with non-local LIC or reference
+  // picture resampling; with multi-pass DMVR xPredInterBi predicts at the PU's vectors, which it set to the refined
+  // ones, with BDOF where it applies - JVET-AG0276's LIC with DMVR and BDOF, xLicCompAdjBdof -, not with VVC's DMVR)
   const bool            lic   = !strcmp( kind, "LIC" ) && !cu.altLMFlag && !sps.getRprEnabledFlag()
-                       && ( pu.interDir != 3 || mcIdentical( pu ) || ( !mcVvcDmvr( pu ) && !mcBdof( pu ) ) );
-  // (non-local LIC: the CU's model on the final prediction, not with BDOF or DMVR - applied after them)
+                       && ( pu.interDir != 3 || mcIdentical( pu ) || !mcVvcDmvr( pu ) );
+  // (non-local LIC: the CU's model on the final prediction - with BDOF on the refined one, as motionCompensation
+  // applies it after xPredInterBiSubPuBDOF -, not with DMVR)
   const bool            nlic  = !strcmp( kind, "non-local LIC" ) && !pu.bdmvrRefine && !sps.getRprEnabledFlag()
-                       && ( pu.interDir != 3 || mcIdentical( pu ) || ( !mcDmvr( pu ) && !mcBdof( pu ) ) );
+                       && ( pu.interDir != 3 || mcIdentical( pu ) || !mcDmvr( pu ) );
   const bool            uni   = !strcmp( kind, "uni-prediction" ) || ( ( obmc || lic || nlic ) && pu.interDir != 3 );
   const bool            bi    = !strcmp( kind, "bi-prediction" ) || ( ( obmc || lic || nlic ) && pu.interDir == 3 );
   // (weighted prediction, M112: not with LIC, non-local LIC or DMVR)
@@ -8521,7 +8623,8 @@ static bool interMcGpu( const CodingUnit& cu )
            && slice.clpRng( COMPONENT_Y ).max == slice.clpRng( COMPONENT_Cb ).max
            && slice.clpRng( COMPONENT_Y ).bd == slice.clpRng( COMPONENT_Cb ).bd;
   }
-  const int sw = std::min<int>( pu.lwidth(), MC_BDOF_SUB ), sh = std::min<int>( pu.lheight(), MC_BDOF_SUB );
+  const int sub = cu.licFlag ? MC_BDOF_SUB_LIC : MC_BDOF_SUB;
+  const int sw = std::min<int>( pu.lwidth(), sub ), sh = std::min<int>( pu.lheight(), sub );
   return mcIdentical( pu ) || !mcBdof( pu ) || ( pu.lwidth() % sw == 0 && pu.lheight() % sh == 0 );
 }
 
@@ -9387,6 +9490,24 @@ static bool recordInterBlock( GpuIntraRec::Impl& m, const TransformUnit& tu, con
       j[MC_PIC_W]  = (int) cs.pps->getPicWidthInLumaSamples();
       j[MC_PIC_H]  = (int) cs.pps->getPicHeightInLumaSamples();
     }
+    // (LIC: the CU's models, at its first block - uni-prediction from list 1 reads list 1's -, also its BDOF jobs')
+    int32_t licRec = -1;
+    if( licApplied( cu ) )
+    {
+      auto rec = m.licRec.find( &cu );
+      if( rec == m.licRec.end() )
+      {
+        rec = m.licRec.emplace( &cu, (int32_t) m.affineData.size() ).first;
+        for( int l = 0; l < 2; l++ )
+        {
+          for( int c = 0; c < MAX_NUM_COMPONENT; c++ )
+          {
+            m.affineData.insert( m.affineData.end(), { cu.licScale[l][c], cu.licOffset[l][c] } );
+          }
+        }
+      }
+      licRec = rec->second;
+    }
     if( bdof && compID == COMPONENT_Y )   // the PU's luma prediction refined by sub-blocks (first block: their jobs)
     {
       auto out = m.bdofOut.find( &cu );
@@ -9394,9 +9515,11 @@ static bool recordInterBlock( GpuIntraRec::Impl& m, const TransformUnit& tu, con
       {
         out = m.bdofOut.emplace( &cu, m.bdofSamples ).first;
         m.bdofSamples += (int32_t) ( pu.lwidth() * pu.lheight() );
-        // applyBiOptFlow: bioDx x bioDy (scaleBDOF 4), the SAD threshold bioBlockDistTh (not sub-PU MC, iteration 0),
-        // JVET-AL0081's noMeanRm4Sample
-        const int sw = std::min<int>( pu.lwidth(), MC_BDOF_SUB ), sh = std::min<int>( pu.lheight(), MC_BDOF_SUB );
+        // applyBiOptFlow: bioDx x bioDy (scaleBDOF 4; with LIC 2), the SAD threshold bioBlockDistTh (not sub-PU MC,
+        // iteration 0; with LIC without the QP's term), JVET-AL0081's noMeanRm4Sample; with LIC xLicCompAdjBdof's
+        // models on the lists' intermediates (MC_LIC, the models at MC_BDOF_OUT)
+        const int sub = cu.licFlag ? MC_BDOF_SUB_LIC : MC_BDOF_SUB;
+        const int sw = std::min<int>( pu.lwidth(), sub ), sh = std::min<int>( pu.lheight(), sub );
         bool      noMean = PU::isBiPredFromSameDirUnEqDistPoc( pu ) && cu.bcwIdx == BCW_DEFAULT;
         if( noMean && pu.lwidth() * pu.lheight() >= BDOF_SUBPU_AREA_THRESHOLD1 && PU::getLdbMvRefineMode( pu ) == 2 )
         {
@@ -9405,8 +9528,13 @@ static bool recordInterBlock( GpuIntraRec::Impl& m, const TransformUnit& tu, con
         int32_t b[MC_JOB];
         std::copy( j, j + MC_JOB, b );
         b[MC_DST]     = out->second;
-        b[MC_BDOF_TH] = ( sw * sh ) << ( 6 - 4 + ( ( cs.pps->getPicInitQPMinus26() + 26 ) >> 5 ) );
+        b[MC_BDOF_TH] = ( sw * sh ) << ( 6 - 4 + ( cu.licFlag ? 0 : ( cs.pps->getPicInitQPMinus26() + 26 ) >> 5 ) );
         b[MC_FLAGS] |= noMean ? MC_NO_MEAN : 0;
+        if( licRec >= 0 )
+        {
+          b[MC_FLAGS] |= MC_LIC;
+          b[MC_BDOF_OUT] = licRec;
+        }
         for( int y = 0; y < (int) pu.lheight(); y += sh )
         {
           for( int x = 0; x < (int) pu.lwidth(); x += sw )
@@ -9436,22 +9564,10 @@ static bool recordInterBlock( GpuIntraRec::Impl& m, const TransformUnit& tu, con
         j[MC_BDOF_OUT] = wp->second;
       }
     }
-    if( licApplied( cu ) )   // (LIC: the CU's models, at its first block; uni-prediction from list 1 reads list 1's)
+    if( licRec >= 0 && !( j[MC_FLAGS] & MC_BDOF ) )   // (a BDOF block's prediction has its LIC from its jobs)
     {
-      auto rec = m.licRec.find( &cu );
-      if( rec == m.licRec.end() )
-      {
-        rec = m.licRec.emplace( &cu, (int32_t) m.affineData.size() ).first;
-        for( int l = 0; l < 2; l++ )
-        {
-          for( int c = 0; c < MAX_NUM_COMPONENT; c++ )
-          {
-            m.affineData.insert( m.affineData.end(), { cu.licScale[l][c], cu.licOffset[l][c] } );
-          }
-        }
-      }
       j[MC_FLAGS] |= MC_LIC | ( !bi && list == 1 ? MC_L1 : 0 );
-      j[MC_BDOF_OUT] = rec->second;
+      j[MC_BDOF_OUT] = licRec;
     }
     if( cu.geoFlag )   // (GPM: the parts' motion, the component's weights at its first block)
     {
@@ -9601,10 +9717,15 @@ static bool recordInterBlock( GpuIntraRec::Impl& m, const TransformUnit& tu, con
         const bool same = slice.isInterB() && !pps.getWPBiPred()
                           && slice.getRefPic( REF_PIC_LIST_0, p[4] )->getPOC() == slice.getRefPic( REF_PIC_LIST_1, p[5] )->getPOC()
                           && p[0] == p[2] && p[1] == p[3];
+        // (with BDOF - p[GPM_BIO], the part's bioApplied - xPredInterUni clips the vectors at the position grown by
+        // BIO_EXTEND_SIZE + 1, chroma's too)
+        const bool     bio     = p[GPM_BIO] != 0 && !same;
+        const Position clipPos =
+          bio ? pu.lumaPos().offset( -( BIO_EXTEND_SIZE + 1 ), -( BIO_EXTEND_SIZE + 1 ) ) : pu.lumaPos();
         for( int ll = 0; ll < ( same ? 1 : 2 ); ll++ )
         {
           Mv w( p[2 * ll], p[2 * ll + 1] );
-          clipMv( w, pu.lumaPos(), pu.lumaSize(), sps, pps );
+          clipMv( w, clipPos, pu.lumaSize(), sps, pps );
           r[ll == 0 ? MC_MVX : MC_MV1X] = w.getHor();
           r[ll == 0 ? MC_MVY : MC_MV1Y] = w.getVer();
           r[ll == 0 ? MC_REF : MC_REF1] = mcSlot( m, slice, ll, p[4 + ll] );
@@ -9634,6 +9755,43 @@ static bool recordInterBlock( GpuIntraRec::Impl& m, const TransformUnit& tu, con
         r[MC_PU_Y]  = pu.lumaPos().y;
         r[MC_PIC_W] = (int) pps.getPicWidthInLumaSamples();
         r[MC_PIC_H] = (int) pps.getPicHeightInLumaSamples();
+        if( bio )   // (a BDOF part: its luma refined by BDOF's sub-block jobs into pc.bdofOut, MC_BDOF; chroma plainly)
+        {
+          const auto key = std::make_pair( &cu, k );
+          auto       out = m.gpmBdofOut.find( key );
+          if( out == m.gpmBdofOut.end() )
+          {
+            out = m.gpmBdofOut.emplace( key, m.bdofSamples ).first;
+            const int pw = (int) pu.lwidth(), ph = (int) pu.lheight();
+            m.bdofSamples += pw * ph;
+            // (applyBiOptFlow as for a CU's BDOF - see the block's jobs -; with GPM BDOF needs equal distances in
+            // different directions, so never JVET-AL0081's noMeanRm4Sample)
+            const int sw = std::min( pw, MC_BDOF_SUB ), sh = std::min( ph, MC_BDOF_SUB );
+            int32_t   b[MC_JOB];
+            std::copy( r, r + MC_JOB, b );
+            b[MC_COMP]     = COMPONENT_Y;
+            b[MC_DST]      = out->second;
+            b[MC_PU_W]     = pw;
+            b[MC_PU_H]     = ph;
+            b[MC_BD]       = slice.clpRng( COMPONENT_Y ).bd;
+            b[MC_CLIP_MIN] = slice.clpRng( COMPONENT_Y ).min;
+            b[MC_CLIP_MAX] = slice.clpRng( COMPONENT_Y ).max;
+            b[MC_BDOF_TH]  = ( sw * sh ) << ( 6 - 4 + ( ( pps.getPicInitQPMinus26() + 26 ) >> 5 ) );
+            for( int y = 0; y < ph; y += sh )
+            {
+              for( int x = 0; x < pw; x += sw )
+              {
+                b[MC_X] = x;
+                b[MC_Y] = y;
+                b[MC_W] = sw;
+                b[MC_H] = sh;
+                m.bdofJobs.insert( m.bdofJobs.end(), b, b + MC_JOB );
+              }
+            }
+          }
+          r[MC_FLAGS] |= MC_BDOF;
+          r[MC_BDOF_OUT] = out->second;
+        }
         m.affineData[pr + k] = (int32_t) m.affineData.size();
         m.affineData.insert( m.affineData.end(), r, r + MC_JOB );
       }
@@ -9781,6 +9939,18 @@ static bool recordInterBlock( GpuIntraRec::Impl& m, const TransformUnit& tu, con
       j[MC_PU_Y]     = pu.lumaPos().y;
       j[MC_BDOF_OUT] = out->second + ( compID == COMPONENT_Y ? 0 : area + ( compID - 1 ) * ( area >> 2 ) );
     }
+#if MULTI_HYP_PRED
+    if( !pu.addHypData.empty() )   // (multi-hypothesis: its hypotheses' record, at its first block)
+    {
+      auto rec = m.mhpRec.find( &cu );
+      if( rec == m.mhpRec.end() )
+      {
+        rec = m.mhpRec.emplace( &cu, mhpRecord( m, cu ) ).first;
+      }
+      j[MC_FLAGS] |= MC_MHP;
+      j[MC_BDOF_TH] = rec->second;
+    }
+#endif
     if( m.cuJob[compID] < 0 )
     {
       m.cuJob[compID] = (int32_t) ( m.mcJobs.size() / MC_JOB );
@@ -10208,6 +10378,13 @@ void GpuIntraRec::recordInterCu( const CodingUnit& cu )
         const char* const    why = interMcGpu( cu ) ? obmcPlan( cu, s, in ) : nullptr;
         kind += why ? std::string( " (" ) + why + ")" : " (its base prediction)";
       }
+#if MULTI_HYP_PRED
+      if( kind == "multi-hypothesis" && !m.mcCus.count( &cu ) )   // (multi-hypothesis from the CPU: why)
+      {
+        const char* const why = mhpWhy( cu );
+        kind += std::string( " (" ) + ( why ? why : sub ? "sub-block motion" : "its base prediction" ) + ")";
+      }
+#endif
       ( m.mcCus.count( &cu ) ? m.mcKinds : m.interKinds )[kind]++;
     }
     m.ibcGpmCus += CU::isIBC( cu ) && cu.firstPU->ibcGpmFlag ? 1 : 0;

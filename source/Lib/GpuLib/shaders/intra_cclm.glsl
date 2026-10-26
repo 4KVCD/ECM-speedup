@@ -436,11 +436,12 @@ void ccpStoreRange( int base, bool second, int c, int lo, int hi )
   CBufI32( P.ccpOut ).v[o + 2] = hi > lo ? 1 : 0;
 }
 
-// the CCP record's inside filter flags of block t's CU, an LM CU's: its curCand's after the CU its LBCCP flag, the
-// history's copy without it
+// the CCP record's inside filter flags of block t's CU, an LM CU's: its curCand's after the CU its LBCCP flag (but with
+// LM_RECORD_NO_INSIDE), the history's copy without it
 void ccpStoreInside( Tu t, int base )
 {
-  CBufI32( P.ccpOut ).v[base + CCP_OUT_INSIDE]      = ( t.lm & LM_INSIDE ) != 0 ? 1 : 0;
+  CBufI32( P.ccpOut ).v[base + CCP_OUT_INSIDE] =
+    ( t.lm & ( LM_INSIDE | LM_RECORD_NO_INSIDE ) ) == LM_INSIDE ? 1 : 0;
   CBufI32( P.ccpOut ).v[base + CCP_OUT_INSIDE_HIST] = 0;
 }
 
