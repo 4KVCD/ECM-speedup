@@ -766,7 +766,8 @@ void mipTransformMode( Tu t, int W, int H, int ps, int upH, int upV, int predStr
   SYNC();
   if( lid == 0 )
   {
-    int firstAmp = 0, secondAmp = 0, first = 0, second = 0;
+    // (the second mode as its caller starts it, kept where no gradient counts: xPredIntraPnn's DC, the others' 0)
+    int firstAmp = 0, secondAmp = 0, first = 0, second = t.pnn >= 0 ? DC_IDX : 0;
     for( int i = 0; i < NUM_LUMA_MODE; i++ )
     {
       const int amp = s_dimdHist[i];

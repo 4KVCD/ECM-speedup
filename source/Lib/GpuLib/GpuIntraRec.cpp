@@ -3084,7 +3084,22 @@ void GpuIntraRec::cpuCuModels( const CodingUnit& cu, bool history )
     if( m.cpuChromaPending.erase( &cu ) )
     {
       cpuKnownRecord( m, cu, 1 );
+      return;
     }
+#if JVET_AD0188_CCP_MERGE
+    // a CU from the CPU whose CCP model its chroma prediction sets (LM chroma fusion's CCCM model, also beside DBV),
+    // which cpuKnownRecord found unset: its record now, for the merge CUs after it (and the history, an LM mode's)
+    const PredictionUnit& pu = *cu.firstPU;
+    if( pu.curCand.type != CCP_TYPE_NONE && !m.ccpIndex.count( &pu ) )
+    {
+      const int32_t r = ccpRecord( m, pu, nullptr );
+      m.cpuCcp.push_back( { r, &pu.curCand, pu.idxNonLocalCCP != 0 } );
+      if( PU::isLMCMode( pu.intraDir[CHANNEL_TYPE_CHROMA] ) )
+      {
+        cpuCcpHistory( m, cu, r );
+      }
+    }
+#endif
     return;
   }
 #if JVET_AD0188_CCP_MERGE && JVET_AF0073_INTER_CCP_MERGE
@@ -3320,6 +3335,14 @@ static bool addObicNeighbours( GpuIntraRec::Impl& m, const CodingUnit& cu, Cu& c
     if( nbrs[n]->firstPU->intraDir[CHANNEL_TYPE_LUMA] == PNN_IDX )
     {
       why = "OBIC with an NN neighbour";
+      return false;
+    }
+    // (in an inter slice deriveObicMode counts an IntraTMP or MIP neighbour's DIMD of its prediction, which the
+    // GPU's blocks of such CUs do not publish for OBIC; in an intra slice an IntraTMP neighbour counts nothing, and its
+    // mode as its node publishes it is planar - getIntraDirLuma's -, which OBIC never selects)
+    if( !cu.slice->isIntra() && ( nbrs[n]->tmpFlag || nbrs[n]->mipFlag ) )
+    {
+      why = "OBIC with an IntraTMP or MIP neighbour in an inter slice";
       return false;
     }
     if( nbrs[n]->mipFlag || ( nbrs[n]->eipFlag && cu.slice->isIntra() ) )

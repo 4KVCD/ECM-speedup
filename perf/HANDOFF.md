@@ -3077,6 +3077,21 @@ mode). Inter CUs on the GPU 42,423, on the CPU ~1,060 (top: LIC with DMVR 151, a
 several TUs 130, GPM with an affine part with LIC 118, LIC with BDOF 109, multi-hypothesis 96, affine CIIP of
 sub-block merge 90); intra CUs from the CPU ~600 (IBC bi-prediction with LIC / flip / BCW / OBMC 158, BVG-CCCM 89,
 IntraTMP OBMC with an inter neighbour 69, an intra merge neighbour of a kind the GPU lacks 47).
+M120 (2026-10-26): four fixes of older differences.
+- Fix: regression SGPM's MTSS (intra_sgpm.glsl's sgpmMtss) skips the angular branch, as the CPU's does: a regression
+  CU's prediction is its blend model's, not its angle's (ra_cif33 POC 32 CU 199, fp720_ai).
+- Fix: an NN CU's LFNST / NSPT mode (mipTransformMode) starts its second mode at DC where no gradient counts, as
+  xPredIntraPnn does (indicesRepresentationPnn of ai_long POC 5, ra720, fp720_ai).
+- Fix: in an inter slice the CPU's OBIC counts an IntraTMP or MIP neighbour (a MIP one by its mipDimdMode), which the
+  GPU's OBIC does not see: such CUs go to the CPU (ra_parkjoy_q32 POC 16 CU 8: obicMode[1] CPU 10 GPU 0).
+- Fix: a chroma CU from the CPU whose CCP model its prediction sets (LM chroma fusion's, also beside DBV:
+  DBV_CHROMA_IDX with isChromaFusion) had no record, as cpuKnownRecord ran before the model existed, so the CCP merge
+  CUs after it lacked that neighbour (fp720_ai POC 2's merge fusion block at chroma 208,128: its non-adjacent
+  candidate 9 from 264,72, so another pair won; the chroma reordering DIMD differences of fp720_ai and ra720 followed).
+  cpuCuModels gives such a CU its record after the CPU's reconstruction (and the history entry, for an LM mode).
+Results (RTX 3070, build grn55, partial.py -j 1, every picture of the 27 streams): identical but ra_ip64_md5 1 of 257
+(decoder-derived CCP fusion, section 9), ra720_pj17 5 of 17 and ra_parkjoy_q32 1 of 17 (a CCP record's inside filter
+flag) and ldp_parkjoy_q27 1 of 9 (a CCCM model of 2-row chroma blocks; its first difference moves between runs).
 
 ## 8. Numbers (i7-10700 8C/16T, Win11, GCC 16.2, RTX 3070 driver 616.92)
 
@@ -3117,22 +3132,21 @@ within the budget (M118's 3070 runs skipped those pictures with ECM_GPU_NO_CCP_L
 
 ## 9. Next steps (in the order I would take them)
 
-000. Now (2026-10-25, after M119; RTX 3070 PC): every picture verifies (no ECM_GPU_NO_* switch needed). Open
+000. Now (2026-10-26, after M120; RTX 3070 PC): every picture verifies (no ECM_GPU_NO_* switch needed). Open
    differences, all of them older (pictures the switches skipped before):
-   a. An SGPM CU's MTSS LFNST / NSPT mode (ra_cif33 POC 32 CU 199, ra_ip64_md5, fp720_ai): CU 32x32, its LFNST mode
-      without MTSS 50, the prediction's DIMD 50 / 57, MTSS's list 46 54 60; the CPU takes 57 (LFNST set other than
-      50's), the GPU the list's last, 60 - every DimdOut field it reads agrees, so trace sgpmMtss's inputs on the GPU
-      (its call, the DIMD of the prediction it reads, mtssChoice's second).
-   b. NN's indicesRepresentationPnn (ai_long POC 5, ra720, fp720_ai).
-   c. Chroma reordering's fifth strongest DIMD mode (fp720_ai: dimdBlendModeChroma[4], CPU 7 GPU 10): the top four
-      agree, so the histogram (dimdChromaHistogramCalls against deriveDimdChromaMode) differs a little.
-   d. CCP merge models of inter pictures (type, params, a, ccInsideFilter: ra720_pj17, ra_ip64_md5, ldp_parkjoy_q27,
-      ld_parkjoy_q27; in ra720_pj17 the first difference moves between runs in two pictures: a missing dependency?).
-      grn4 shows them alike. And an OBIC CU's second mode (ra_parkjoy_q32 POC 16 CU 8: obicMode[1] CPU 10 GPU 0).
-   e. Performance (section 8): IntraTMP's enumeration of positions in parallel (57 ms of aiodd), CCCM's features once
+   a. Decoder-derived CCP fusion in an inter picture (ra_ip64_md5 POC 8, chroma 4,32 4x16: CPU type 16, GPU 1): the
+      CPU's mode costs (decoderDerivedCcp) 250 for CCLM, 83 / 82 for CCCM without / with the inside filter, 237 / 251
+      for MMLM, 285 for GL-CCCM, then the CCCM pair (cost 79); the GPU's CCLM cost agrees (250) but its CCCM modes'
+      are 461, 468, 479, 455 and 820, so its CCCM probe predictions differ (ccpFitModels' models or their luma).
+   b. A CCP record's inside filter flag (ra720_pj17, ra_parkjoy_q32: CPU 0, GPU 1): CU::saveCcInsideFilterFlagInCCP
+      leaves a single tree's CU with luma ISP as it is; fixed for M121 (LM_RECORD_NO_INSIDE).
+   c. CCCM models of 2-row chroma blocks (ldp_parkjoy_q27 POC 8: no subsampling at chroma 104,64 4x2, Cb's first
+      parameter CPU -2702 GPU 399 - the CPU's area 14 x 10 chroma from 98,58, 108 samples -, or GL-CCCM at 96,26 8x4
+      in another run): the first difference moves between runs, so look for a race first.
+   d. Performance (section 8): IntraTMP's enumeration of positions in parallel (57 ms of aiodd), CCCM's features once
       per template sample (its accumulation 23 ms), then the blocks of a known mode (luma 130-190 us each, chroma
       ~0.6 ms): profile their phases as IntraTMP's were.
-   f. Ports by count: affine CIIP (affineWhy now names each reason), LIC with DMVR / BDOF (JVET-AG0276:
+   e. Ports by count: affine CIIP (affineWhy now names each reason), LIC with DMVR / BDOF (JVET-AG0276:
       xLicCompAdjBdof applies the models to BDOF's extended intermediates), GPM CIIP of several TUs, IBC bi-prediction
       with LIC / flip / BCW / OBMC, BVG-CCCM, GPM bi-prediction parts with BDOF.
 00. (2026-10-24, the inter phase, after M117; on the RTX 3070 PC):
