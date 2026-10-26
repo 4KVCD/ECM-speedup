@@ -8410,10 +8410,6 @@ static const char* gpmWhy( const GpuIntraRec::Impl& m, const CodingUnit& cu )
     {
       return "an affine part with LIC";
     }
-    if( p[6] == 3 && !p[7] && p[GPM_BIO] && p[GPM_LIC] )   // (M111: bi-prediction parts; BDOF without LIC)
-    {
-      return "a bi-prediction part with BDOF and LIC";
-    }
     if( p[7] && ( p[6] != 3 || p[GPM_LIC] || !m.gpmDmvr.count( &cu ) || m.gpmDmvr.at( &cu )[k].empty() ) )   // (M116)
     {
       return "a DMVR part";
@@ -9754,9 +9750,11 @@ static bool recordInterBlock( GpuIntraRec::Impl& m, const TransformUnit& tu, con
           r[MC_OOB] |= oob ? 1 << ll : 0;
 #endif
         }
-        if( !same )   // (with the part's LIC MC_GPM: mcPlain leaves a list of an identity model as it is)
+        // (with the part's LIC MC_GPM: mcPlain leaves a list of an identity model as it is, as xPredInterBlk's geo
+        // branch does; with BDOF xLicCompAdjBdof applies every list's model, identities too)
+        if( !same )
         {
-          r[MC_FLAGS] = MC_BI | ( p[GPM_LIC] ? MC_GPM : 0 );
+          r[MC_FLAGS] = MC_BI | ( p[GPM_LIC] && !bio ? MC_GPM : 0 );
           r[MC_W0]    = getBcwWeight( p[GPM_BCW], REF_PIC_LIST_0 );
           r[MC_W1]    = getBcwWeight( p[GPM_BCW], REF_PIC_LIST_1 );
           r[MC_RAW0X] = p[0];
@@ -9779,8 +9777,11 @@ static bool recordInterBlock( GpuIntraRec::Impl& m, const TransformUnit& tu, con
             const int pw = (int) pu.lwidth(), ph = (int) pu.lheight();
             m.bdofSamples += pw * ph;
             // (applyBiOptFlow as for a CU's BDOF - see the block's jobs -; with GPM BDOF needs equal distances in
-            // different directions, so never JVET-AL0081's noMeanRm4Sample)
-            const int sw = std::min( pw, MC_BDOF_SUB ), sh = std::min( ph, MC_BDOF_SUB );
+            // different directions, so never JVET-AL0081's noMeanRm4Sample; with the part's LIC as a LIC CU's, the
+            // models xLicCompAdjBdof inherits the part's)
+            const bool lic = p[GPM_LIC] != 0;
+            const int  sub = lic ? MC_BDOF_SUB_LIC : MC_BDOF_SUB;
+            const int  sw = std::min( pw, sub ), sh = std::min( ph, sub );
             int32_t   b[MC_JOB];
             std::copy( r, r + MC_JOB, b );
             b[MC_COMP]     = COMPONENT_Y;
@@ -9790,7 +9791,13 @@ static bool recordInterBlock( GpuIntraRec::Impl& m, const TransformUnit& tu, con
             b[MC_BD]       = slice.clpRng( COMPONENT_Y ).bd;
             b[MC_CLIP_MIN] = slice.clpRng( COMPONENT_Y ).min;
             b[MC_CLIP_MAX] = slice.clpRng( COMPONENT_Y ).max;
-            b[MC_BDOF_TH]  = ( sw * sh ) << ( 6 - 4 + ( ( pps.getPicInitQPMinus26() + 26 ) >> 5 ) );
+            b[MC_BDOF_TH]  = ( sw * sh ) << ( 6 - 4 + ( lic ? 0 : ( pps.getPicInitQPMinus26() + 26 ) >> 5 ) );
+            if( lic )
+            {
+              b[MC_FLAGS] |= MC_LIC;
+              b[MC_BDOF_OUT] = (int32_t) m.affineData.size();
+              m.affineData.insert( m.affineData.end(), p + GPM_LIC_MODELS, p + GPM_LIC_MODELS + 12 );
+            }
             for( int y = 0; y < ph; y += sh )
             {
               for( int x = 0; x < pw; x += sw )

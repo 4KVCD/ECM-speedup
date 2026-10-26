@@ -3133,6 +3133,13 @@ M122 (2026-10-26): CCCM's sums from features computed once per template sample, 
   in an inter picture (Params::dualTree).
 Results (RTX 3070, build grn67, partial.py -j 1, every picture of the 27 streams): as M121's, identical but
 ra_ip64_md5 1 of 257 and ra720_pj17 4 of 17 (section 9).
+M123 (2026-10-26): GPM bi-prediction parts with BDOF and LIC. The part's luma as M121's LIC CUs with BDOF: the models
+xLicCompAdjBdof inherits (useInheritedMode: the part's) on both lists' intermediates of BDOF's grown block, sub-blocks
+of at most 8 x 8, the SAD threshold without the QP's term (the part's BDOF jobs: MC_LIC, the models in pc.affine); its
+chroma every list's model, identities too (xLicCompAdjBdof transforms each list, where xPredInterBlk's geo branch leaves
+an identity model out: no MC_GPM in the part's record). Results (build grn71): as M122's, and ldp_parkjoy_q27 1 of 9
+again (its stream has no such part; the same shaders had it identical in M122's run: a race, section 9). Inter CUs
+predicted by the CPU 716 -> 636.
 
 ## 8. Numbers (i7-10700 8C/16T, Win11, GCC 16.2, RTX 3070 driver 616.92)
 
