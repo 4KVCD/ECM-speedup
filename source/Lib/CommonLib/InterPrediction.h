@@ -1863,8 +1863,9 @@ public:
   void    gpuGeoBio( int k, const PredictionUnit& pu )
   {
     m_gpuGeoPart[k][22] = m_gpuBio ? 1 : 0;
-    // (an affine part, M117: its type, lists and control points as its prediction took them)
-    m_gpuGeoAff[k][0] = pu.cu->affine ? 1 : 0;
+    // (an affine part, M117: its type, lists and control points as its prediction took them; | 2 its LIC models
+    // inherited)
+    m_gpuGeoAff[k][0] = pu.cu->affine ? 1 | ( pu.cu->licInheritPara ? 2 : 0 ) : 0;
     if( pu.cu->affine )   // (its sub-block motion, which its chroma averages: also where no OBMC follows)
     {
       const CMotionBuf mb = pu.cs->getMotionBuf( pu );

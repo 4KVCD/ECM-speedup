@@ -8006,8 +8006,8 @@ static bool affineIdentical( const PredictionUnit& pu )
 }
 
 // why the GPU does not predict affine CU cu (nullptr: it does; its OBMC: obmcPlan): it takes it without LIC /
-// non-local LIC with resampling or inherited LIC, sub-block merge or AMVP-SbTMVP, affine sub-block BDOF or affine DMVR,
-// 4:2:0, without weighted prediction with LIC, wrap-around, a scaled reference, with one clipping range
+// non-local LIC with resampling, sub-block merge or AMVP-SbTMVP, affine sub-block BDOF or affine DMVR, 4:2:0, without
+// weighted prediction with LIC, wrap-around, a scaled reference, with one clipping range
 static const char* affineWhy( const CodingUnit& cu )
 {
   const PredictionUnit& pu    = *cu.firstPU;
@@ -8022,7 +8022,7 @@ static const char* affineWhy( const CodingUnit& cu )
                        && slice.clpRng( COMPONENT_Y ).min == slice.clpRng( COMPONENT_Cb ).min
                        && slice.clpRng( COMPONENT_Y ).bd == slice.clpRng( COMPONENT_Cb ).bd;
   const char* why = getenv( "ECM_GPU_NO_MC" ) ? "ECM_GPU_NO_MC"
-                    : cu.licFlag && ( cu.licInheritPara || sps.getRprEnabledFlag() ) ? "inherited LIC or resampling"
+                    : cu.licFlag && sps.getRprEnabledFlag()                   ? "LIC with resampling"
                     : cu.altLMFlag && sps.getRprEnabledFlag()                 ? "non-local LIC with resampling"
                     : pu.mergeType != MRG_TYPE_DEFAULT_N                      ? "sub-block merge"
                     : pu.amvpSbTmvpFlag                                       ? "AMVP-SbTMVP"
@@ -8041,7 +8041,9 @@ static const char* affineWhy( const CodingUnit& cu )
   {
     const bool uni = pu.interDir != 3 || affineIdentical( pu );
     why = !pu.ciipAffine ? "CIIP not affine CIIP" : pu.ciipPDPC ? "CIIP-PDPC" : ciipWhy( cu ) ? ciipWhy( cu )
-          : cu.licFlag && !licApplied( cu ) && uni ? "CIIP with LIC of uni-prediction, its model not stored" : nullptr;
+          : cu.licFlag && !cu.licInheritPara && !licApplied( cu ) && uni
+            ? "CIIP with LIC of uni-prediction, its model not stored"
+            : nullptr;
   }
 #else
   why = !why && pu.ciipFlag ? "CIIP" : why;
@@ -8169,7 +8171,10 @@ static void affineRecord( GpuIntraRec::Impl& m, const CodingUnit& cu )
       c[AF_SLOT] = mcSlot( m, slice, l, pu.refIdx[l] );
     }
   }
-  if( licApplied( cu ) )   // (LIC: the CU's models per list and component, scale and offset)
+  // (LIC: the CU's models per list and component, scale and offset; not inherited ones: xPredInterUni's affine branch
+  // turns licFlag off for xPredAffineBlk and tests the model against it while it is off, so it never applies one, and
+  // xLicCompAdj leaves inherited models to xPredInterBlk)
+  if( licApplied( cu ) && !cu.licInheritPara )
   {
     m.affineData[r + AF_LIC] = (int32_t) m.affineData.size();
     for( int l = 0; l < 2; l++ )
@@ -8406,9 +8411,9 @@ static const char* gpmWhy( const GpuIntraRec::Impl& m, const CodingUnit& cu )
     {
       return "another part";
     }
-    if( p[GPM_LIC] && m.gpmAff.count( &cu ) && m.gpmAff.at( &cu )[k][0] )   // (M117)
+    if( p[GPM_LIC] && m.gpmAff.count( &cu ) && m.gpmAff.at( &cu )[k][0] == 1 )   // (M117; inherited models: none)
     {
-      return "an affine part with LIC";
+      return "an affine part with LIC of its own";
     }
     if( p[7] && ( p[6] != 3 || p[GPM_LIC] || !m.gpmDmvr.count( &cu ) || m.gpmDmvr.at( &cu )[k].empty() ) )   // (M116)
     {
@@ -9621,7 +9626,7 @@ static bool recordInterBlock( GpuIntraRec::Impl& m, const TransformUnit& tu, con
           {
             CodingUnit&           cc = const_cast<CodingUnit&>( cu );
             PredictionUnit&       pp = const_cast<PredictionUnit&>( pu );
-            const bool            affine = cc.affine;
+            const bool            affine = cc.affine, inherit = cc.licInheritPara;
             const int8_t          type   = cc.affineType;
             const int             bcw    = cc.bcwIdx;
             const uint8_t         dir    = pp.interDir;
@@ -9630,8 +9635,9 @@ static bool recordInterBlock( GpuIntraRec::Impl& m, const TransformUnit& tu, con
             std::copy( &pp.mvAffi[0][0], &pp.mvAffi[0][0] + 6, &cp[0][0] );
             int32_t rec = 0;
             withPartMotion( m, cu, k, [&]() {
-              cc.affine     = true;
-              cc.affineType = (int8_t) ( *af )[1];
+              cc.affine         = true;
+              cc.licInheritPara = ( ( *af )[0] & 2 ) != 0;
+              cc.affineType     = (int8_t) ( *af )[1];
               cc.bcwIdx     = p[GPM_BCW];
               pp.interDir   = (uint8_t) ( *af )[2];
               pp.refIdx[0]  = ( *af )[3];
@@ -9646,9 +9652,10 @@ static bool recordInterBlock( GpuIntraRec::Impl& m, const TransformUnit& tu, con
               rec = (int32_t) m.affineData.size();
               affineRecord( m, cu );
             } );
-            cc.affine     = affine;
-            cc.affineType = type;
-            cc.bcwIdx     = bcw;
+            cc.affine         = affine;
+            cc.licInheritPara = inherit;
+            cc.affineType     = type;
+            cc.bcwIdx         = bcw;
             pp.interDir   = dir;
             pp.refIdx[0]  = r0;
             pp.refIdx[1]  = r1;
