@@ -342,7 +342,9 @@ int cccmFetch( int x, int y, int fi )
 // the padding right of them; in a dual tree, where the luma right of / below a part lies in its CTU and the picture
 // (the column right of the part left and the row below the part right of the block need only the picture), the luma
 // there over the padding (every padding column / row the one next to the part), right of the parts first. The CTU
-// checks take the chroma CTU size also for luma positions, as the CPU does
+// checks take the chroma CTU size also for luma positions, as the CPU does. (With subsampling the intra picture's dual
+// tree; without it the CU's separate trees - cu.separateTree, also an inter slice's CU of JVET-AI0136's adaptive dual
+// tree -, LM_SEPARATE_TREE)
 void cccmBuildLuma( Tu t, int b, int lid, int NT )
 {
   const int s = g_cccmShift, pad = 1 << s, f = cccmFilterOf( b );
@@ -381,7 +383,7 @@ void cccmBuildLuma( Tu t, int b, int lid, int NT )
       cccmSetLuma( b, x, sy + r, cccmLumaOf( b, x, sy - 1 ) );
     }
   }
-  if( P.dualTree != 0 )
+  if( g_cccmNoSub ? ( t.lm & LM_SEPARATE_TREE ) != 0 : P.dualTree != 0 )
   {
     cccmSync();
     const ivec2 maxPos = cccmPictureMax();
@@ -647,8 +649,14 @@ int cccmFeature( int f, int x, int y, int c, int bitDepth )
 // template samples - of a single model's set 1 the two lines next to the block, else all (predIntraCCCM's LBCCP: a
 // second set of two models differs in its threshold alone) - with two models only those of its class (0: the luma at
 // most the set's threshold, 1: above it), into s_tmp's slots CCCM_SUMS .. (64-bit: products reach 2^28), the range of
-// their chroma into CCCM_RANGE (all invocations, ending with a barrier). Each sum's lanes (as many as the workgroup
-// holds: 6, 3 or 2) add their partial sums in their own slots first
+// their chroma into CCCM_RANGE (all invocations, ending with a barrier). The samples go in chunks of CCCM_CHUNK: one
+// invocation per sample computes its features (the model's, then Cb and Cr; a Pel each, as the CPU's vectors hold
+// them) once, into s_spCoef (free while a block predicts), with whether the sample is of the model's class; then each
+// sum's lanes (as many as the workgroup holds: 6, 3 or 2) add their share of the chunk's products, and in the end
+// their partial sums in their own slots
+// (the features of 64 samples, up to 11 + 2 each and the class flag: 896 of s_spCoef's 1024)
+const int CCCM_CHUNK = 64;
+
 void cccmAccumulate( Tu t, int k, bool twoModels, int lid, int NT )
 {
   if( lid < 2 )
@@ -657,38 +665,56 @@ void cccmAccumulate( Tu t, int k, bool twoModels, int lid, int NT )
     s_cclm[CCCM_RANGE + 2 * lid + 1] = -32768;
   }
   SYNC();
-  const int   M = g_cccmParams, entries = cccmNumEntries( M ), lanes = NT / entries;
+  const int   M = g_cccmParams, F = M + 2, entries = cccmNumEntries( M ), lanes = NT / entries;
   const int   set = k >> 1, cls = k & 1, bitDepth = t.bitDepth;
   const ivec4 r = cccmTemplate( t, ( set == 1 && !twoModels ) || ( WITH_CCP_MERGE && g_ccpFlyTwoLines ) );
   const ivec2 counts = cccmTemplateCounts( r );
+  const int   total = counts.x + counts.y, thr = s_cclm[CCCM_THRESHOLD + set];
   const int   e = lid % entries, lane = lid / entries;
+  int i = 0, j = 0;
   if( lane < lanes )
   {
-    int i, j;
     cccmEntry( e, M, i, j );
-    const bool range = i == 0 && j >= M;   // (one sum per component also finds its chroma's range)
-    const int  thr = s_cclm[CCCM_THRESHOLD + set];
-    int64_t sum = 0;
-    int     lo = 32767, hi = -32768;
-    for( int s = lane; s < counts.x + counts.y; s += lanes )
+  }
+  const bool range = lane < lanes && i == 0 && j >= M;   // (one sum per component also finds its chroma's range)
+  int64_t sum = 0;
+  int     lo = 32767, hi = -32768;
+  for( int base = 0; base < total; base += CCCM_CHUNK )
+  {
+    const int n = min( CCCM_CHUNK, total - base );
+    if( lid < n )
     {
-      const ivec2 p = cccmTemplateSample( r, counts, s );
-      const int   c = cccmColocated( p.x, p.y );
-      if( twoModels && ( cls == 0 ? c > thr : c <= thr ) )
+      const ivec2 p    = cccmTemplateSample( r, counts, base + lid );
+      const int   c    = cccmColocated( p.x, p.y );
+      const bool  used = !twoModels || ( cls == 0 ? c <= thr : c > thr );
+      for( int f = 0; f < F; f++ )
       {
-        continue;
+        s_spCoef[lid * ( F + 1 ) + f] = int16_t( used ? cccmFeature( f, p.x, p.y, c, bitDepth ) : 0 );
       }
-      const int fj = cccmFeature( j, p.x, p.y, c, bitDepth );
-      sum += int64_t( cccmFeature( i, p.x, p.y, c, bitDepth ) * fj );
-      lo = min( lo, fj );
-      hi = max( hi, fj );
+      s_spCoef[lid * ( F + 1 ) + F] = int16_t( used ? 1 : 0 );
     }
-    cccmTmpStore( e * lanes + lane, sum );
-    if( range )
+    SYNC();
+    for( int q = lane; lane < lanes && q < n; q += lanes )
     {
-      atomicMin( s_cclm[CCCM_RANGE + 2 * ( j - M )], lo );
-      atomicMax( s_cclm[CCCM_RANGE + 2 * ( j - M ) + 1], hi );
+      const int at = q * ( F + 1 );
+      if( s_spCoef[at + F] != int16_t( 0 ) )
+      {
+        const int fj = int( s_spCoef[at + j] );
+        sum += int64_t( int( s_spCoef[at + i] ) * fj );
+        lo = min( lo, fj );
+        hi = max( hi, fj );
+      }
     }
+    SYNC();   // (the chunk's features read before the next chunk's are written)
+  }
+  if( lane < lanes )
+  {
+    cccmTmpStore( e * lanes + lane, sum );
+  }
+  if( range )
+  {
+    atomicMin( s_cclm[CCCM_RANGE + 2 * ( j - M )], lo );
+    atomicMax( s_cclm[CCCM_RANGE + 2 * ( j - M ) + 1], hi );
   }
   SYNC();
   if( lid < entries )

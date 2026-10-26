@@ -226,6 +226,19 @@ constexpr int LM_FUSION = 1 << 30, LM_FUSION_W_SHIFT = 0, LM_FUSION_TYPE_SHIFT =
 // (an LM block whose CU's record keeps the inside filter flag 0: CU::saveCcInsideFilterFlagInCCP leaves a single tree's
 // CU with luma ISP as it is; the sign bit)
 constexpr int32_t LM_RECORD_NO_INSIDE = INT32_MIN;
+// (a CCCM or CCP merge block whose CU has separate trees: without subsampling its luma reaches right of / below it,
+// xCccmCreateLumaNoSubRef's condition - also an inter slice's CU of JVET-AI0136's adaptive dual tree -; in a CCCM
+// block's field of a CCLM block's other slope adjustments)
+constexpr int LM_SEPARATE_TREE = 1 << 17;
+
+static int cccmSeparateTree( const CodingUnit& cu )
+{
+#if JVET_AI0136_ADAPTIVE_DUAL_TREE
+  return cu.separateTree ? LM_SEPARATE_TREE : 0;
+#else
+  return CS::isDualITree( *cu.cs ) ? LM_SEPARATE_TREE : 0;
+#endif
+}
 
 // the CCP model record of an LM CU or an LM chroma fusion CU (intra_common.glsl's CCP_OUT_*, int32): the
 // CCPModelCandidate fields predIntraChromaLM / predIntraCCCM / geneChromaFusionPred set (CCP merge's curCand) and the
@@ -6677,7 +6690,7 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
       const int templateFlag = glmLuma ? ( dirMode == MDLM_L_IDX ? 2 : dirMode == MDLM_T_IDX ? 3 : 1 ) : pu.cccmFlag;
       t.lm = LM_ACTIVE | ( pu.ccInsideFilter ? LM_INSIDE : 0 ) | ( templateFlag << LM_CCCM_SHIFT )
              | ( pu.glCccmFlag ? LM_CCCM_GL : 0 ) | ( pu.cccmMultiFilterIdx << LM_CCCM_MDF_SHIFT )
-             | ( pu.cccmNoSubFlag ? LM_CCCM_NOSUB : 0 )
+             | ( pu.cccmNoSubFlag ? LM_CCCM_NOSUB : 0 ) | cccmSeparateTree( cu )
              | ( glmLuma ? LM_CCCM_GLM_LUMA | ( pu.glmIdc.getIdc( compID, 0 ) << LM_GLM_SHIFT ) : 0 );
       // the luma buffers of several filters or of GLM with luma, a larger one or predictions beyond the shared ones
       // take the workgroup's CCCM scratch: room for the largest reference area's buffers and the predictions (with
@@ -6754,9 +6767,10 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
       // weight 2, the plain CCCM models of MMLM_CHROMA_IDX averaged in, by a blend model the weight 0 that stands for
       // it (with DIMD chroma: DERIVE_CCP_DIMD, below)
       const int w0 = ccpFusionBlend( pu ) ? 0 : 2;
-      t.lm       = pu.ccpMergeFusionFlag && pu.ccpMergeFusionType == 0
-                   ? ( 1 << LM_CCCM_SHIFT ) | LM_FUSION | ( 1 << LM_FUSION_TYPE_SHIFT ) | ( w0 << LM_FUSION_W_SHIFT )
-                   : 0;
+      t.lm       = ( pu.ccpMergeFusionFlag && pu.ccpMergeFusionType == 0
+                     ? ( 1 << LM_CCCM_SHIFT ) | LM_FUSION | ( 1 << LM_FUSION_TYPE_SHIFT ) | ( w0 << LM_FUSION_W_SHIFT )
+                     : 0 )
+                   | cccmSeparateTree( cu );   // (its candidates without subsampling)
       // with LFNST / NSPT the predictions their mode's DIMD reads, as an LM block's (intra_ccp.glsl's
       // ccpMergeTransformMode)
       t.lm      |= cu.lfnstIdx ? ( tu.jointCbCr != 2 ? LM_HIST_CB : 0 ) | ( tu.jointCbCr != 1 ? LM_HIST_CR : 0 ) : 0;
@@ -11954,9 +11968,11 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
   // 5-tap cross with it both ways, else 1 2 1 over two rows (intra_cclm.glsl's CCLM_FILTER_*)
   const bool cclmVer = cs.sps->getCclmVerCollocatedChromaFlag(), cclmHor = cs.sps->getCclmHorCollocatedChromaFlag();
   P.cclmFilter  = !cclmVer && !cclmHor ? 0 : cclmVer && cclmHor ? 1 : 2;
-  // CCCM: in a dual tree its luma reaches right of / below the block (xCccmCreateLumaRef); LBCCP's second set of models
-  // (predIntraCCCM: an intra slice with the TM non-inter tools)
-  P.dualTree  = CS::isDualITree( cs ) ? 1 : 0;
+  // CCCM: in an intra slice's dual tree its luma reaches right of / below the block (xCccmCreateLumaRef: with
+  // JVET-AI0136 not in an inter slice's separate trees; CS::isDualITree reads the slice's state of the region last
+  // decoded, which an inter picture may leave on); LBCCP's second set of models (predIntraCCCM: an intra slice with the
+  // TM non-inter tools)
+  P.dualTree  = cs.slice->isIntra() && CS::isDualITree( cs ) ? 1 : 0;
 #if GPU_CCCM
   P.cccmLbccp = cs.sps->getTMnoninterToolsEnableFlag() && cs.slice->isIntra() ? 1 : 0;
 #else

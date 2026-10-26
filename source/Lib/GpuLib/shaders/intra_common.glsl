@@ -143,6 +143,9 @@ const int LM_FUSION       = 1 << 30;
 const int LM_FUSION_W_SHIFT    = 0;   // 2 bits
 const int LM_FUSION_TYPE_SHIFT = 4;   // 2 bits
 const int LM_FUSION_FIELDS = LM_FUSION | ( 3 << LM_FUSION_TYPE_SHIFT ) | ( 3 << LM_FUSION_W_SHIFT );
+// a CCCM or CCP merge block whose CU has separate trees (cu.separateTree): without subsampling its luma reaches right
+// of / below it (xCccmCreateLumaNoSubRef; in a CCCM block's field of a CCLM block's other slope adjustments)
+const int LM_SEPARATE_TREE = 1 << 17;
 // an LM block whose CU's record keeps the inside filter flag 0 (CU::saveCcInsideFilterFlagInCCP leaves a single
 // tree's CU with luma ISP as it is); the sign bit, beyond every field
 const int LM_RECORD_NO_INSIDE = int( 0x80000000 );
@@ -973,7 +976,7 @@ struct Params
   int      ctuSize;     // the SPS's CTU size (luma samples)
   int      lumaUnitW, lumaUnitH;   // the luma availability units (PreCalcValues::minCUWidth / minCUHeight)
   int      cclmFilter;  // CCLM's luma downsampling filter by the SPS's collocated chroma flags (CCLM_FILTER_*)
-  int      dualTree;    // CS::isDualITree: luma and chroma are separate trees (CCCM reads luma right of / below a block)
+  int      dualTree;    // an intra slice's dual tree (CCCM reads luma right of / below a block: xCccmCreateLumaRef)
   int      cccmLbccp;   // CCCM's two sets of models (LBCCP, JVET-AD0120: an intra slice with the TM non-inter tools)
   // scratch's CCCM part: a CCCM block's luma buffers and prediction beyond shared memory (several filters' buffers,
   // larger blocks), after blending's sums, which keep their constant stride (blending indexing by a stride read from

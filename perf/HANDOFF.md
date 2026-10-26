@@ -3120,6 +3120,19 @@ M121 (2026-10-26): six inter / IBC ports and a CCP record fix.
 Results (RTX 3070, build grn62, partial.py -j 1, every picture of the 27 streams): identical but ra_ip64_md5 1 of 257
 (decoder-derived CCP fusion, section 9) and ra720_pj17 4 of 17 (CCP records whose first difference moves between
 runs, section 9). Inter CUs predicted by the CPU (all streams' counts) 1,083 -> 716, by the GPU 42,423 -> 42,790.
+M122 (2026-10-26): CCCM's sums from features computed once per template sample, two separate-tree fixes.
+- cccmAccumulate: the template's samples in chunks of 64, each invocation computing one sample's M + 2 features and its
+  class into s_spCoef (int16), then the invocations of the matrix's entries summing products from there, instead of
+  every entry's invocations computing the features of every sample again. intra_rec's GPU time (median of 3, idle
+  3070, against M121): aiodd 364.4 -> 355.6 ms (-2.4 %), ai720 2,406 -> 2,358 ms (-2.0 %).
+- Fix: CCCM without subsampling reads the luma right of / below its block where the CU has separate trees
+  (xCccmCreateLumaNoSubRef's cu.separateTree: also an inter slice's CU of JVET-AI0136's adaptive dual tree), not only in
+  an intra picture's dual tree as with subsampling (LM_SEPARATE_TREE in Tu::lm of CCCM and CCP merge blocks).
+- Fix: CCCM with subsampling reads it only in an intra slice's dual tree (xCccmCreateLumaRef's condition); the host
+  took CS::isDualITree once per picture, which reads the slice's state of the region decoded last and so could be on
+  in an inter picture (Params::dualTree).
+Results (RTX 3070, build grn67, partial.py -j 1, every picture of the 27 streams): as M121's, identical but
+ra_ip64_md5 1 of 257 and ra720_pj17 4 of 17 (section 9).
 
 ## 8. Numbers (i7-10700 8C/16T, Win11, GCC 16.2, RTX 3070 driver 616.92)
 
@@ -3174,9 +3187,9 @@ within the budget (M118's 3070 runs skipped those pictures with ECM_GPU_NO_CCP_L
       block, no subsampling at 104,64 4x2, or GL-CCCM at 96,26 8x4; identical in M121's run), ra720_pj17 POCs 4, 8,
       10 and 12 (a CCCM / MDF-CCCM record's parameters or type, a CCP merge block): look for a race or for luma
       samples a block reads before it writes them (the shared luma buffer in the angular arrays) first.
-   d. Performance (section 8): IntraTMP's enumeration of positions in parallel (57 ms of aiodd), CCCM's features once
-      per template sample (its accumulation 23 ms), then the blocks of a known mode (luma 130-190 us each, chroma
-      ~0.6 ms): profile their phases as IntraTMP's were.
+   d. Performance (section 8): IntraTMP's enumeration of positions in parallel (57 ms of aiodd), then the blocks of a
+      known mode (luma 130-190 us each, chroma ~0.6 ms): profile their phases as IntraTMP's were. (CCCM's features
+      once per template sample: M122, -2 %.)
    e. Ports by count (M121's run): GPM CIIP of several TUs 130, GPM affine parts with LIC 118, affine CIIP with LIC
       of uni-prediction 115, affine CIIP of sub-block merge 90, GPM bi-prediction parts with BDOF and LIC 82 (as
       M121's LIC with BDOF, the part's inherited models), GPM regression blending with an intra part 60; intra: IBC
