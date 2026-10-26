@@ -1626,7 +1626,7 @@ void dimdVectorChoice( Cu c, int cuIndex, int bitDepth, bool noPdpc, int lid, in
         }
         order[at] = k;
       }
-      CBufI32   acc   = CBufI32( P.scratch );
+      WBufI32   acc   = WBufI32( P.scratch );
       const int base  = int( gl_WorkGroupID.x ) * BLEND_ACC, num = min( n - 1, MERGE_BVS );
       const int log2A = findMSB( t.th ) + findMSB( c.w ), log2L = findMSB( t.tw ) + findMSB( c.h );
       acc.v[base] = num;

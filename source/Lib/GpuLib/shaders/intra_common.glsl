@@ -279,9 +279,30 @@ const int DERIVE_INTER_SECOND = 536870912;
 const int DERIVE_IBC   = 1073741824;   // with DERIVE_INTER: an IBC CU's block, predicted at its block vector (ibcBlock)
 // an IBC CU's block's record in Params::timdData (Tu::ibc; GpuIntraRec.cpp's IBC_REC_*): the CU's region in the
 // component's samples, its block vector in 1/16 luma samples, its RR-IBC flip, IBC GPM's second vector and the first
-// part's weights (their offset, else -1), with IBC LIC its ibcLicIdx + 1 (else 0)
+// part's weights (their offset, else -1), with IBC LIC its ibcLicIdx + 1 (else 0), a luma block's OBMC record
+// (intra_obmc.glsl's OBMC_*, else -1), the CU's own LIC scale and offset (getSameNeigMotion's comparison), with
+// bi-prediction 1 (its second vector IBC_REC_MV2's)
 const int IBC_REC_X = 0, IBC_REC_Y = 1, IBC_REC_W = 2, IBC_REC_H = 3, IBC_REC_MV = 4, IBC_REC_FLIP = 6;
-const int IBC_REC_MV2 = 7, IBC_REC_WEIGHTS = 9, IBC_REC_LIC = 10;
+const int IBC_REC_MV2 = 7, IBC_REC_WEIGHTS = 9, IBC_REC_LIC = 10, IBC_REC_OBMC = 11, IBC_REC_OWN_LIC = 12;
+const int IBC_REC_BI = 14;
+// an OBMC CU's record in Params::timdData (Tu::obmc - 1; intra_rec's OBMC, intra_deps' obmcIntraDeps): the CU
+// (luma), the flags, the segments (OBMC_SEG_* each: the boundary - 0 top, 1 left -, the first luma sample along it
+// relative to the CU, the length, its data in Params::interPred: inter_mc.comp's OBMC_D_* -, an IBC neighbour's
+// vector)
+const int OBMC_REC_X = 0, OBMC_REC_Y = 1, OBMC_REC_W = 2, OBMC_REC_H = 3, OBMC_REC_FLAGS = 4, OBMC_REC_NUM = 5;
+const int OBMC_REC_BD = 6, OBMC_REC_BASE = 7, OBMC_REC_INNER = 8, OBMC_REC_SEG = 10;   // (BASE: where the data start)
+const int OBMC_SEG_DIR = 0, OBMC_SEG_START = 1, OBMC_SEG_LEN = 2, OBMC_SEG_DATA = 3, OBMC_SEG_MV = 4, OBMC_SEG = 6;
+const int OBMC_REC_TM = 1, OBMC_REC_TOP = 2, OBMC_REC_LEFT = 4, OBMC_REC_INV_LMCS = 8, OBMC_REC_SUB = 16;
+const int OBMC_REC_SUB_LUMA = 64;   // (the inner sub-block OBMC of luma alone: affine's innerObmcSkipChroma)
+const int OBMC_REC_GEO = 32;        // (GPM's separate OBMC - m_geoOBMC -: no skipObmcConditionByPixel)
+// JVET-AJ0161 (intra_obmc.glsl's obmcInterIntra): a segment of an intra neighbour (its head: the boundary,
+// OBMC_SEG_INTRA, its mode << OBMC_SEG_MODE; its data the band's predictions alone); the record's flags: intra
+// segments, their luma mapped back by LMCS's inverse, the SPS's DisablePdpc and DisableRefFilter
+const int OBMC_SEG_INTRA = 2, OBMC_SEG_MODE = 8;
+const int OBMC_REC_INTRA = 256, OBMC_REC_INTRA_INV = 512, OBMC_REC_NO_PDPC = 1024, OBMC_REC_NO_REF_FILTER = 2048;
+// a segment of an IBC neighbour (OBMC_SEG_IBC in its head: its strip intra_obmc.glsl's obmcInterIbc copies from the
+// picture at OBMC_SEG_MV, plainly blended); the record's flag: such segments
+const int OBMC_SEG_IBC = 4, OBMC_REC_IBC = 4096;
 // with DERIVE_INTER a chroma block of inter CCCM (intra_intercccm.glsl; its record at Tu::ibc)
 const int DERIVE_INTER_CCCM = int( 0x80000000 );
 // without DERIVE_INTER the same bit: an inter CU's chroma block of inter CCP merge, predicted on the intra path as a
@@ -302,6 +323,10 @@ const int CIIP_ON = 1, CIIP_UNIFORM = 0, CIIP_BY_X = 2, CIIP_BY_Y = 4, CIIP_EDGE
 // 0, the intra prediction part 1's with CIIP_GPM_I1, else part 0's)
 const int CIIP_GPM = 64, CIIP_GPM_I1 = 128;
 const int CIIP_FWD = 32;
+// (CIIP_TO_PRED: the pre-pass of a chroma block whose inter CCCM / CCP merge blends CIIP's prediction - its blend goes
+// into Params::interPred at Tu::ibc, nothing is reconstructed -; CIIP_KEEP_PRED: the luma block of such a CU with inter
+// CCCM keeps its blend in its own inter prediction, inter CCCM's luma prediction)
+const int CIIP_TO_PRED = 256, CIIP_KEEP_PRED = 512;
 
 // a CU's block vectors as the lists of later CUs take them (Params::bvOut per luma CU, by its index in the
 // CodingStructure: getNeighBv's vectors of the CU in its order, which getArBvMergeCandidate cascades), written by the
@@ -1032,6 +1057,7 @@ layout( push_constant ) uniform Push
   uint64_t params;
   int      numTus;
   int      verify;    // the prediction is copied for the comparison with the CPU
+  int      budget;    // intra_rec: the blocks a slice may start (counter[4])
 } pc;
 
 #endif

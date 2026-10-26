@@ -1242,7 +1242,8 @@ int mcPlain( BufI32 jb, int o, BufI32 lb, int comp, int x, int y, int puW, int p
 
 // GPM part k of job o at component sample (x, y): a uni-prediction part's list at the 14-bit intermediate (fin: at the
 // final precision), a bi-prediction part's (JVET-AE0046) its record's plain bi-prediction (at MC_NLIC_AT + 24 + k in
-// pc.affine), back at the intermediate as convert2HighPrec takes it (fin: as it is)
+// pc.affine; with the part's LIC its models on each list's intermediate, xPredInterBlk's geo branch), back at the
+// intermediate as convert2HighPrec takes it (fin: as it is)
 int gpmPart( BufI32 jb, int o, int k, int comp, int x, int y, int puW, int puH, int bd, int clipMin, int clipMax, bool fin )
 {
   const int r = BufI32( pc.affine ).v[jb.v[o + MC_NLIC_AT] + 24 + k];
@@ -1265,7 +1266,9 @@ int gpmPart( BufI32 jb, int o, int k, int comp, int x, int y, int puW, int puH, 
   }
   if( r >= 0 )
   {
-    const int v = mcPlain( BufI32( pc.affine ), r, BufI32( pc.affine ), comp, x, y, puW, puH, bd, clipMin, clipMax, -1 );
+    const bool lic = jb.v[o + ( k == 0 ? MC_W0 : MC_W1 )] != 0;
+    const int  v   = mcPlain( BufI32( pc.affine ), r, BufI32( pc.affine ), comp, x, y, puW, puH, bd, clipMin, clipMax,
+                              lic ? jb.v[o + MC_NLIC_AT] + 12 * k : -1 );
     return fin ? v : ( v << ( IF_INTERNAL_PREC - bd ) ) - IF_INTERNAL_OFFS;
   }
   const int   shift = comp == 0 ? 4 : 5, mask = ( 1 << shift ) - 1;
@@ -1289,7 +1292,9 @@ int gpmPartAt( BufI32 jb, int o, int k, int comp, int x, int y, int puW, int puH
 {
   const int  q   = gpmPart( jb, o, k, comp, x, y, puW, puH, bd, clipMin, clipMax, how == GPM_FINAL );
   const int  l   = ( jb.v[o + MC_OOB] >> k ) & 1, lo = jb.v[o + MC_NLIC_AT] + 12 * k, m = lo + ( l * 3 + comp ) * 2;
-  const bool lic = jb.v[o + ( k == 0 ? MC_W0 : MC_W1 )] != 0;
+  // (a part of its own record - bi-prediction - has its LIC in gpmPart already)
+  const bool lic = jb.v[o + ( k == 0 ? MC_W0 : MC_W1 )] != 0
+                   && BufI32( pc.affine ).v[jb.v[o + MC_NLIC_AT] + 24 + k] < 0;
   BufI32     lb  = BufI32( pc.affine );
   if( how == GPM_FINAL )   // (a uni-prediction part predicted on its own: xPredInterBlk's model on the final sample)
   {
@@ -1410,10 +1415,12 @@ int mcPlain( BufI32 jb, int o, BufI32 lb, int comp, int x, int y, int puW, int p
                       puW, puH, bd, clipMin, clipMax );
   int p1 = mcPredict( slot1, comp, x + ( mv1.x >> shift ), y + ( mv1.y >> shift ), mv1.x & mask, mv1.y & mask, alt, true,
                       puW, puH, bd, clipMin, clipMax );
-  if( lo >= 0 )
+  if( lo >= 0 )   // (a GPM part's inherited models where not the identity: xPredInterBlk's geo branch, nonTrivialModel)
   {
-    p0 = mcLicBi( lb, lo, 0, comp, p0, bd, clipMin, clipMax );
-    p1 = mcLicBi( lb, lo, 1, comp, p1, bd, clipMin, clipMax );
+    const bool gpm = ( flags & MC_GPM ) != 0;
+    const int  m0 = lo + comp * 2, m1 = lo + ( 3 + comp ) * 2;
+    p0 = gpm && lb.v[m0] == 32 && lb.v[m0 + 1] == 0 ? p0 : mcLicBi( lb, lo, 0, comp, p0, bd, clipMin, clipMax );
+    p1 = gpm && lb.v[m1] == 32 && lb.v[m1 + 1] == 0 ? p1 : mcLicBi( lb, lo, 1, comp, p1, bd, clipMin, clipMax );
   }
   const int oob = jb.v[o + MC_OOB];
   bool      o0 = false, o1 = false;

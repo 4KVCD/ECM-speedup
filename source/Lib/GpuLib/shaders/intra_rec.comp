@@ -19,15 +19,18 @@
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
 #extension GL_KHR_memory_scope_semantics : require
+#extension GL_EXT_control_flow_attributes : require
 #include "common.glsl"
 #include "intra_common.glsl"
 
 layout( local_size_x = 256 ) in;
 
 // Vulkan memory model: the reconstruction and the done flags are written by one workgroup and read by others
-// (device-scope coherent, done flags with release / acquire); the scratch is shared by the invocations of a workgroup
+// (device-scope coherent, done flags with release / acquire); each workgroup's part of the scratch is shared by its
+// invocations alone, so its accesses (WBufI32) need workgroup scope only: they may stay in the SM's cache
 layout( buffer_reference, std430, buffer_reference_align = 2 ) coherent buffer CBufI16 { int16_t v[]; };
 layout( buffer_reference, std430, buffer_reference_align = 4 ) coherent buffer CBufI32 { int v[]; };
+layout( buffer_reference, std430, buffer_reference_align = 4 ) workgroupcoherent buffer WBufI32 { int v[]; };
 
 #define SYNC() barrier()
 
@@ -581,8 +584,8 @@ const int SPL_BASE   = SPL_BORDER + 256;
 const int SPL_TEMPL  = SPL_BASE + 256;
 const int SPL_LOW    = SPL_TEMPL + 8 * 256;
 const int SPL_HIGH   = SPL_LOW + 16 * 256;
-int  splGet( int o )        { return CBufI32( P.scratch ).v[int( gl_WorkGroupID.x ) * BLEND_ACC + o]; }
-void splSet( int o, int v ) { CBufI32( P.scratch ).v[int( gl_WorkGroupID.x ) * BLEND_ACC + o] = v; }
+int  splGet( int o )        { return WBufI32( P.scratch ).v[int( gl_WorkGroupID.x ) * BLEND_ACC + o]; }
+void splSet( int o, int v ) { WBufI32( P.scratch ).v[int( gl_WorkGroupID.x ) * BLEND_ACC + o] = v; }
 void splSync()
 {
   controlBarrier( gl_ScopeWorkgroup, gl_ScopeWorkgroup, gl_StorageSemanticsBuffer | gl_StorageSemanticsShared,
@@ -600,6 +603,15 @@ void storeRecon( Tu t, int x, int y, int pr )
   if( t.ciip != 0 )   // (CIIP: the inter prediction blended in first)
   {
     pr = ciipBlend( t, x, y, pr );
+    if( ( t.ciip & ( CIIP_TO_PRED | CIIP_KEEP_PRED ) ) != 0 )   // (the blend kept for an inter CCCM / CCP merge blend)
+    {
+      const bool pre = ( t.ciip & CIIP_TO_PRED ) != 0;
+      CBufI16( P.interPred ).v[( pre ? t.ibc : t.dbgOffset ) + y * t.w + x] = int16_t( pr );
+      if( pre )
+      {
+        return;
+      }
+    }
   }
   if( t.spCoded >= 0 || g_deferRecon )
   {
@@ -657,7 +669,7 @@ void emitPred( Tu t, int x, int y, int pr, bool bf )
 {
   if( WITH_DIMD && g_blendSum )
   {
-    CBufI32   acc = CBufI32( P.scratch );
+    WBufI32   acc = WBufI32( P.scratch );
     const int o   = int( gl_WorkGroupID.x ) * BLEND_ACC + y * t.regW + x;
     const int N   = t.regW * t.h;
     // (an SGPM block's first prediction weighs its weight, the second the rest)
@@ -808,19 +820,7 @@ void mipTransformMode( Tu t, int W, int H, int ps, int upH, int upV, int predStr
 // it the blending with the neighbour's prediction (weightObmcBoundary: 26/6, 28/4, 30/2, 31/1 from the mode's first
 // row; chroma one row), the top segments first, then the left ones over their result
 
-// an OBMC CU's record in Params::timdData (Tu::obmc - 1): the CU (luma), the flags, the segments (OBMC_SEG_* each: the
-// boundary - 0 top, 1 left -, the first luma sample along it relative to the CU, the length, its data in
-// Params::interPred: inter_mc.comp's OBMC_D_*)
-const int OBMC_REC_X = 0, OBMC_REC_Y = 1, OBMC_REC_W = 2, OBMC_REC_H = 3, OBMC_REC_FLAGS = 4, OBMC_REC_NUM = 5;
-const int OBMC_REC_BD = 6, OBMC_REC_BASE = 7, OBMC_REC_INNER = 8, OBMC_REC_SEG = 10;   // (BASE: where the data start)
-const int OBMC_SEG_DIR = 0, OBMC_SEG_START = 1, OBMC_SEG_LEN = 2, OBMC_SEG_DATA = 3, OBMC_SEG = 4;
-const int OBMC_REC_TM = 1, OBMC_REC_TOP = 2, OBMC_REC_LEFT = 4, OBMC_REC_INV_LMCS = 8, OBMC_REC_SUB = 16;
-const int OBMC_REC_SUB_LUMA = 64;   // (the inner sub-block OBMC of luma alone: affine's innerObmcSkipChroma)
-// JVET-AJ0161 (intra_obmc.glsl's obmcInterIntra): a segment of an intra neighbour (its head: the boundary, OBMC_SEG_INTRA,
-// its mode << OBMC_SEG_MODE; its data the band's predictions alone); the record's flags: intra segments, their luma
-// mapped back by LMCS's inverse, the SPS's DisablePdpc and DisableRefFilter
-const int OBMC_SEG_INTRA = 2, OBMC_SEG_MODE = 8;
-const int OBMC_REC_INTRA = 256, OBMC_REC_INTRA_INV = 512, OBMC_REC_NO_PDPC = 1024, OBMC_REC_NO_REF_FILTER = 2048;
+// (an OBMC CU's record: intra_common.glsl's OBMC_REC_*, OBMC_SEG_*)
 // sub-block motion (DMVR): per 4 x 4 sub-block of the CU (OBMC_REC_INNER: where its entries start) the neighbours
 // (above, left, below, right) whose motion differs (bits) and their predictions of the sub-block (4 x 4 luma, 2 x 2 Cb
 // and Cr each); the inner blend's weights (currWeights per neighbours' set, neigWeights per neighbour)
@@ -864,7 +864,7 @@ void obmcModes( int r, int bd, int lid, int NT )
     const int o = r + OBMC_REC_SEG + s * OBMC_SEG;
     const int dir = rec.v[o + OBMC_SEG_DIR] & 1, start = rec.v[o + OBMC_SEG_START], len = rec.v[o + OBMC_SEG_LEN];
     const int d = rec.v[r + OBMC_REC_BASE] + rec.v[o + OBMC_SEG_DATA];
-    const bool intra = ( rec.v[o + OBMC_SEG_DIR] & OBMC_SEG_INTRA ) != 0;   // (plain blending)
+    const bool intra = ( rec.v[o + OBMC_SEG_DIR] & ( OBMC_SEG_INTRA | OBMC_SEG_IBC ) ) != 0;   // (plain blending)
     if( ( flags & OBMC_REC_TM ) == 0 || ( flags & ( dir == 0 ? OBMC_REC_TOP : OBMC_REC_LEFT ) ) == 0 || intra )
     {
       if( lid == 0 )
@@ -953,14 +953,16 @@ int obmcSample( Tu t, int r, int x, int y, int p )
       {
         continue;
       }
-      const int mode = s_obmcMode[s], d = rec.v[r + OBMC_REC_BASE] + rec.v[o + OBMC_SEG_DATA];
-      if( mode != 1 && data.v[d + OBMC_D_SKIP + comp] == 0 )
+      const int  mode = s_obmcMode[s], d = rec.v[r + OBMC_REC_BASE] + rec.v[o + OBMC_SEG_DATA];
+      const bool here = ( rec.v[o + OBMC_SEG_DIR] & ( OBMC_SEG_INTRA | OBMC_SEG_IBC ) ) != 0;   // (made in this pass)
+      const int  skip = here ? int( CBufI16( P.interPred ).v[d + OBMC_D_SKIP + comp] )
+                             : int( data.v[d + OBMC_D_SKIP + comp] );
+      if( mode != 1 && skip == 0 )
       {
         const int L = rec.v[o + OBMC_SEG_LEN], W = pass == 0 ? L : 4, H = pass == 0 ? 4 : L;
         const int pred = d + OBMC_D_TPL + 2 * L + ( comp == 0 ? 0 : W * H + ( comp - 1 ) * ( W >> 1 ) * ( H >> 1 ) );
         const int bw = W >> cs, i = pass == 0 ? ( along - start ) + cy * bw : cx + ( along - start ) * bw;
-        const int nb = ( rec.v[o + OBMC_SEG_DIR] & OBMC_SEG_INTRA ) != 0 ? int( CBufI16( P.interPred ).v[pred + i] )
-                                                                       : int( data.v[pred + i] );   // (intra: this pass's)
+        const int nb = here ? int( CBufI16( P.interPred ).v[pred + i] ) : int( data.v[pred + i] );
         p = obmcWeight( p, nb, mode, pass == 0 ? cy : cx );
       }
       break;
@@ -1356,25 +1358,29 @@ ivec2 angularArrays( bool isVer, int W, int H, int angle, int absInvAngle, int t
 // OBMC, then weightedGeoBlkRounded
 void interObmcBand( Tu t, int lid, int NT )
 {
-  if( t.gpm != 0 && ( t.ciip & CIIP_GPM ) == 0 )   // (GPM with an intra part: the inter part's OBMC below, CIIP's blend)
+  // (GPM with an intra part: the inter part's OBMC, then CIIP's blend; one call site each of the strips, the modes and
+  // the blend: they are large)
+  const bool parts = t.gpm != 0 && ( t.ciip & CIIP_GPM ) == 0;
+  BufI32     gr    = BufI32( P.timdData );
+  const int  g = t.gpm - 1, p1 = parts ? gr.v[g + GPMR_P1] : 0;
+  for( int part = 0; part < ( parts ? 2 : 1 ); part++ )
   {
-    BufI32    gr = BufI32( P.timdData );
-    const int g = t.gpm - 1, p1 = gr.v[g + GPMR_P1];
-    for( int part = 0; part < 2; part++ )
+    const int r = part == 0 ? t.obmc - 1 : gr.v[g + GPMR_OBMC1] - 1, at = part == 0 ? t.dbgOffset : p1;
+    if( r >= 0 )
     {
-      const int r = part == 0 ? t.obmc - 1 : gr.v[g + GPMR_OBMC1] - 1, at = part == 0 ? t.dbgOffset : p1;
-      if( r >= 0 )
+      // (intra and IBC neighbours' strips, intra_obmc.glsl - a part's subBlockOBMC blends them too)
+      obmcInterIntra( t, r, lid, NT );
+      obmcModes( r, gr.v[r + OBMC_REC_BD], lid, NT );
+      for( int i = lid; i < t.w * t.h; i += NT )
       {
-        obmcInterIntra( t, r, lid, NT );   // (the part's subBlockOBMC blends the intra neighbours' strips too)
-        obmcModes( r, gr.v[r + OBMC_REC_BD], lid, NT );
-        for( int i = lid; i < t.w * t.h; i += NT )
-        {
-          CBufI16( P.interPred ).v[at + i] =
-            int16_t( obmcSample( t, r, i % t.w, i / t.w, int( CBufI16( P.interPred ).v[at + i] ) ) );
-        }
-        SYNC();
+        CBufI16( P.interPred ).v[at + i] =
+          int16_t( obmcSample( t, r, i % t.w, i / t.w, int( CBufI16( P.interPred ).v[at + i] ) ) );
       }
+      SYNC();
     }
+  }
+  if( parts )
+  {
     for( int i = lid; i < t.w * t.h; i += NT )
     {
       const int a = int( CBufI16( P.interPred ).v[t.dbgOffset + i] ), b = int( CBufI16( P.interPred ).v[p1 + i] );
@@ -1382,21 +1388,7 @@ void interObmcBand( Tu t, int lid, int NT )
       CBufI16( P.interPred ).v[t.dbgOffset + i] = int16_t( ( w * a + ( 32 - w ) * b + 16 ) >> 5 );
     }
     SYNC();
-    return;
   }
-  if( t.obmc == 0 )
-  {
-    return;
-  }
-  const int r = t.obmc - 1;
-  obmcInterIntra( t, r, lid, NT );   // (intra neighbours' strips: intra_obmc.glsl)
-  obmcModes( r, BufI32( P.timdData ).v[r + OBMC_REC_BD], lid, NT );
-  for( int i = lid; i < t.w * t.h; i += NT )
-  {
-    CBufI16( P.interPred ).v[t.dbgOffset + i] =
-      int16_t( obmcSample( t, r, i % t.w, i / t.w, int( CBufI16( P.interPred ).v[t.dbgOffset + i] ) ) );
-  }
-  SYNC();
 }
 
 // the EipOut of EIP CU n (intra_eip.glsl)
@@ -2273,32 +2265,42 @@ void main()
     {
       s_red[lid] = 0;
     }
-    // the next block: the dependent this workgroup released last, else a queue position and (once filled) the
-    // block at it; blocks handed over directly never enter the queue, so a position may stay empty: the workgroup
-    // stops when all blocks are reconstructed
+    // the next block: the dependent this workgroup released last, else a queue position producers have taken
+    // (counter[1]; claimed by compare-and-swap of counter[0]) and, once its producer has stored it, the block at it.
+    // The dispatch is a slice of at most pc.budget blocks started (counter[4], which the host zeroes per slice): past
+    // it a block handed over goes back into the queue and the workgroup stops, as when all blocks are reconstructed
+    // (the host dispatches the next slice, which goes on from the queue: a slice of slow blocks stays below the
+    // operating system's GPU timeout)
     SYNC();
     if( lid == 0 )
     {
-      int b = s_next;
+      CBufI32    counter = CBufI32( P.counter ), queue = CBufI32( P.queue );
+      int        b       = s_next;
+      const bool spent   = atomicAdd( counter.v[4], 1 ) >= pc.budget;
       s_next = -1;
+      if( b >= 0 && spent )
+      {
+        const int pos = atomicAdd( counter.v[1], 1 );
+        atomicStore( queue.v[pos], b, gl_ScopeQueueFamily, gl_StorageSemanticsBuffer, gl_SemanticsRelease );
+        b = -1;
+      }
       if( b < 0 )
       {
         b = pc.numTus;
-        const int pos = atomicAdd( CBufI32( P.counter ).v[0], 1 );
-        if( pos < pc.numTus )
+        while( !spent && atomicLoad( counter.v[2], gl_ScopeQueueFamily, 0, gl_SemanticsRelaxed ) < pc.numTus )
         {
-          for( ;; )
+          const int c = atomicLoad( counter.v[0], gl_ScopeQueueFamily, 0, gl_SemanticsRelaxed );
+          if( c < atomicLoad( counter.v[1], gl_ScopeQueueFamily, 0, gl_SemanticsRelaxed )
+              && atomicCompSwap( counter.v[0], c, c + 1, gl_ScopeQueueFamily, 0, gl_SemanticsRelaxed, 0,
+                                 gl_SemanticsRelaxed ) == c )
           {
-            const int q = atomicLoad( CBufI32( P.queue ).v[pos], gl_ScopeQueueFamily, gl_StorageSemanticsBuffer, gl_SemanticsAcquire );
-            if( q >= 0 )
+            int q = -1;
+            while( q < 0 )   // (its producer stores it right after taking the position)
             {
-              b = q;
-              break;
+              q = atomicLoad( queue.v[c], gl_ScopeQueueFamily, gl_StorageSemanticsBuffer, gl_SemanticsAcquire );
             }
-            if( atomicLoad( CBufI32( P.counter ).v[2], gl_ScopeQueueFamily, 0, gl_SemanticsRelaxed ) >= pc.numTus )
-            {
-              break;
-            }
+            b = q;
+            break;
           }
         }
       }
@@ -3052,7 +3054,7 @@ void main()
         {
           emitPred( t, i % W, i / W,
                     ibcChromaPredict( t.comp, c.x, c.y, c.w, c.h, mv, t.x - c.x + i % W, t.y - c.y + i / W, g_ti,
-                                      t.bitDepth ), false );
+                                      t.bitDepth, false ), false );
         }
       }
       else if( ( ( g_bvSubs >> bvSub ) & 1 ) != 0 )
@@ -3068,7 +3070,7 @@ void main()
           const int x = t.x + i % W, y = t.y + i / W;
           const int v = fused ? bvgFusionSample( t.cu, x, y )
                               : sgpmLic( ibcPredict( c.x, c.y, c.w, c.h, mv, false, x - c.x, y - c.y, g_ti,
-                                                     t.bitDepth, ivec2( 0 ) ), lic, maxPel );
+                                                     t.bitDepth, ivec2( 0 ), false ), lic, maxPel );
           emitPred( t, i % W, i / W, v, bf );
         }
       }
@@ -3422,7 +3424,7 @@ void main()
       }
       const bool needClipVer = wVer + rangeVer > clipVer || wVer - rangeVer < 0;
       const bool needClipHor = wHor + rangeHor > clipHor || wHor - rangeHor < 0;
-      CBufI32 acc = CBufI32( P.scratch );
+      WBufI32 acc = WBufI32( P.scratch );
       // (CCP merge fusion with DIMD chroma: (2 P0 + 2 P1 + 2) >> 2; SGPM: ( w P0 + ( 32 - w ) P1 + 16 ) >> 5)
       const int rounding = ccpDimd ? 1 : WITH_MPM && ( t.derive & DERIVE_SGPM ) != 0 ? 16 : 0;
       for( int i = lid; i < N; i += NT )

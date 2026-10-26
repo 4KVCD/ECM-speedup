@@ -705,9 +705,12 @@ public:
   /// size with the available above-right / below-left units
   static void eipReferenceArea( const CodingUnit& cu, int& tplX, int& tplY, int& sizeX, int& sizeY, int& width,
                                 int& height );
-  /// the CUs whose models getNeiEipCands takes in an intra slice, in its order (the adjacent positions, then the two
+  /// the CUs whose models getNeiEipCands takes, in its order (the adjacent positions, numAdjacent of them, then the two
   /// rounds of non-adjacent ones; EIP CUs only, a CU again where several positions find it)
-  static void eipMergeNeighbours( const PredictionUnit& pu, std::vector<const CodingUnit*>& cus );
+  static void eipMergeNeighbours( const PredictionUnit& pu, std::vector<const CodingUnit*>& cus, int& numAdjacent );
+  /// the collocated picture's models getNeiEipCands takes in an inter slice, in its order: after the adjacent CUs'
+  /// (shifted false), after the non-adjacent ones' (shifted true; at positions shifted by a neighbour's motion)
+  static void eipTemporalModels( const PredictionUnit& pu, bool shifted, std::vector<EipModelCandidate>& models );
 #endif
 #if JVET_AH0076_OBIC && JVET_AK0056_WEIGHTED_OBIC
   /// the neighbours deriveObicMode counts the modes of, with the samples each counts; returns their number (-1: an

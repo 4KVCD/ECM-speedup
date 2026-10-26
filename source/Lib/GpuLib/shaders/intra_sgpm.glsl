@@ -59,8 +59,8 @@ const int SC_COPY      = SC_PAIR + SGPM_PARTITIONS * SGPM_LIST_MAX * SGPM_LIST_M
 const int SC_RMODEL    = SC_PAIR + 66;                     // (regression: per pair of 12 entries 4 words; in SC_PAIR's)
 const int SC_RPRED     = SC_COPY + BV_LIST_MAX * 128;      // (regression: per slot its template's W + H)
 
-int  scGet( int o )        { return CBufI32( P.scratch ).v[int( gl_WorkGroupID.x ) * BLEND_ACC + o]; }
-void scSet( int o, int v ) { CBufI32( P.scratch ).v[int( gl_WorkGroupID.x ) * BLEND_ACC + o] = v; }
+int  scGet( int o )        { return WBufI32( P.scratch ).v[int( gl_WorkGroupID.x ) * BLEND_ACC + o]; }
+void scSet( int o, int v ) { WBufI32( P.scratch ).v[int( gl_WorkGroupID.x ) * BLEND_ACC + o] = v; }
 
 int sgpmTable( int i )
 {
@@ -209,7 +209,7 @@ int sgpmCopyAt( Cu c, int k, int s, int bitDepth, int before )
   const bool top = s < c.w;
   const int  v   = ibcPredict( c.x, c.y, top ? c.w : 1, top ? 1 : c.h,
                                sgpmMvAt( k ) + ( top ? ivec2( 0, -16 ) : ivec2( -16, 0 ) ), true, top ? s : 0,
-                               top ? 0 : s - c.w, before, bitDepth, ivec2( 0 ) );
+                               top ? 0 : s - c.w, before, bitDepth, ivec2( 0 ), false );
   return sgpmLic( v, int( s_spCost[SG_LIC + k] ), ( 1 << bitDepth ) - 1 );
 }
 

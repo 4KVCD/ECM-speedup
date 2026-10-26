@@ -350,7 +350,8 @@ void eipNode( Cu c, int cuIndex, int at, int bitDepth, int lid, int NT )
 }
 
 // ----- EIP merge (getNeiEipCands, reorderEipCands): the models of the EIP CUs at the neighbouring positions in order
-// (adjacent, then two rounds of non-adjacent ones; the host lists the EIP CUs found there), then those of the history
+// (adjacent, then two rounds of non-adjacent ones; the host lists the EIP CUs found there, in an inter slice with the
+// collocated picture's models after the adjacent ones and after the non-adjacent ones), then those of the history
 // (the CTU row's EIP CUs so far, newest first, the 6 most recent distinct ones: addEipToLut's LUT), each unless the
 // list has the same model (isTheSameParams), up to 12; with two or more, ranked by the SATD of the template's row
 // above and column left of the block predicted by each (the reconstruction's inputs, the CU's clipping range), the 6

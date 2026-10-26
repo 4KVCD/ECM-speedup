@@ -554,8 +554,8 @@ void ccpDerivedChoice( Tu t, int lid, int NT )
     if( top ? above : left )
     {
       const ivec2 ab = ccpDerivedPair( p, num );
-      const int   pa = CBufI32( P.scratch ).v[ccpProbeBase( t ) + ab.x * 2 * len + s];
-      const int   pb = CBufI32( P.scratch ).v[ccpProbeBase( t ) + ab.y * 2 * len + s];
+      const int   pa = WBufI32( P.scratch ).v[ccpProbeBase( t ) + ab.x * 2 * len + s];
+      const int   pb = WBufI32( P.scratch ).v[ccpProbeBase( t ) + ab.y * 2 * len + s];
       const bool  bFirst = s_ccp[CCP_LIST_COST + ab.y] < s_ccp[CCP_LIST_COST + ab.x];
       const int   v = bFirst ? ( 3 * pb + pa + 2 ) >> 2 : ( 3 * pa + pb + 2 ) >> 2;
       const int   reco = top ? recoAt( c + 1, t.x + q, t.y - 1 ) : recoAt( c + 1, t.x - 1, t.y + q );
@@ -614,7 +614,7 @@ void ccpBlendModel( Tu t, int a, int b, int dst, bool compare )
   const bool above = s_cclm[CCLM_POS_ABOVE] != 0, left = s_cclm[CCLM_POS_LEFT] != 0;
   const int  W = t.w, H = t.h, len = W + H, bitDepth = t.bitDepth;
   const int  pa = ccpProbeBase( t ) + a * 2 * len, pb = ccpProbeBase( t ) + b * 2 * len;
-  CBufI32    s = CBufI32( P.scratch );
+  WBufI32    s = WBufI32( P.scratch );
   int64_t e[3][4];   // the normal equations' upper triangle and right-hand side, then the elimination's rows
   for( int i = 0; i < 12; i++ )
   {
@@ -748,7 +748,7 @@ void ccpDdFusionChoice( Tu t, int lid, int NT )
   cccmSync();
   if( lid == 0 )
   {
-    CBufI32   s = CBufI32( P.scratch );
+    WBufI32   s = WBufI32( P.scratch );
     const int slots = min( P.ccpFusionPairs, CCP_FUSION_SLOTS_MAX );
     int slotPair[CCP_FUSION_SLOTS_MAX], slotCost[CCP_FUSION_SLOTS_MAX];
     for( int m = 0; m < CCP_FUSION_SLOTS_MAX; m++ )
@@ -1239,7 +1239,7 @@ void ccpMergePrediction( inout Tu t, int predStride, int lid, int NT )
               ccpBlendModel( t, s_ccp[CCP_LIST_ORIG + idx], CCP_MAX_CANDS, ccpPairBase( t ), false );
               for( int w = 0; w < CCP_PAIR_WORDS; w++ )
               {
-                s_ccp[CCP_BLEND + w] = CBufI32( P.scratch ).v[ccpPairBase( t ) + w];
+                s_ccp[CCP_BLEND + w] = WBufI32( P.scratch ).v[ccpPairBase( t ) + w];
               }
             }
             SYNC();
@@ -1344,12 +1344,12 @@ void ccpMergePrediction( inout Tu t, int predStride, int lid, int NT )
           sad += abs( ( top ? recoAt( c + 1, t.x + q, t.y - 1 ) : recoAt( c + 1, t.x - 1, t.y + q ) ) - v );
           if( twoSteps || blendFusion )
           {
-            CBufI32( P.scratch ).v[ccpProbeBase( t ) + step * 2 * len + s] = v;
+            WBufI32( P.scratch ).v[ccpProbeBase( t ) + step * 2 * len + s] = v;
           }
         }
         else if( fusionStep && inside == 0 )
         {
-          CBufI32( P.scratch ).v[cccmFusionPredBase( t ) + s] = v;
+          WBufI32( P.scratch ).v[cccmFusionPredBase( t ) + s] = v;
         }
         else if( inTmp )
         {
@@ -1357,7 +1357,7 @@ void ccpMergePrediction( inout Tu t, int predStride, int lid, int NT )
         }
         else
         {
-          CBufI32( P.scratch ).v[cccmScratchPred() + s] = v;
+          WBufI32( P.scratch ).v[cccmScratchPred() + s] = v;
         }
       }
     }
@@ -1368,7 +1368,7 @@ void ccpMergePrediction( inout Tu t, int predStride, int lid, int NT )
       tf.lm = 1 << LM_CCCM_SHIFT;
       for( int s = lid; s < W * H; s += NT )
       {
-        CBufI32( P.scratch ).v[cccmFusionPredBase( t ) + s] = cclmInsideFiltered( tf, t.x << 1, t.y << 1, s % W, s / W,
+        WBufI32( P.scratch ).v[cccmFusionPredBase( t ) + s] = cclmInsideFiltered( tf, t.x << 1, t.y << 1, s % W, s / W,
                                                                                    maxPel, 0 );
       }
     }
@@ -1419,7 +1419,7 @@ int ccpMergeFinalSample( Tu tc, int x, int y, int maxPel )
   const int pr = cclmPrediction( tc, tc.x << 1, tc.y << 1, x, y, maxPel, 0 );
   if( ( tc.derive & DERIVE_CCP_DIMD ) != 0 )
   {
-    return ( pr + CBufI32( P.scratch ).v[cccmFusionPredBase( tc ) + y * tc.w + x] + 1 ) >> 1;
+    return ( pr + WBufI32( P.scratch ).v[cccmFusionPredBase( tc ) + y * tc.w + x] + 1 ) >> 1;
   }
   return lmFusionType( tc ) == 1 ? cccmFusionBlend( tc, x, y, pr ) : pr;
 }
@@ -1472,7 +1472,7 @@ void ccpDimdChromaPrediction( Tu tc, int predStride, int maxPel, int lid, int NT
         const int wL = 32 >> min( 31, ( x << 1 ) >> pdpcScale );
         v = asPel( v + ( ( wL * ( L - v ) + wT * ( T - v ) + 32 ) >> 6 ) );
       }
-      CBufI32( P.scratch ).v[slot + i] = v;
+      WBufI32( P.scratch ).v[slot + i] = v;
     }
   }
   else
@@ -1535,7 +1535,7 @@ void ccpDimdChromaPrediction( Tu tc, int predStride, int maxPel, int lid, int NT
           }
         }
       }
-      CBufI32( P.scratch ).v[slot + ( isVer ? y * W + x : x * W + y )] = asPel( v );
+      WBufI32( P.scratch ).v[slot + ( isVer ? y * W + x : x * W + y )] = asPel( v );
     }
     // (zero again for the next prediction: IntraPrediction's angRefClearEnd)
     const int log2Ratio = findMSB( W ) - findMSB( H );
@@ -1600,7 +1600,7 @@ void ccpMergeTransformMode( Tu t, int predStride, int maxPel, int lid, int NT )
       // whose first blended prediction sets them anew; the host makes the scratch have them), the gradients from
       // there: one inlined copy of the prediction instead of one per tap of the gradient (the module's SPIR-V IDs
       // ~350k fewer)
-      CBufI32   fin  = CBufI32( P.scratch );
+      WBufI32   fin  = WBufI32( P.scratch );
       const int base = int( gl_WorkGroupID.x ) * BLEND_ACC, W = tc.w;
       for( int i = lid; i < W * tc.h; i += NT )
       {

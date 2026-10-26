@@ -450,7 +450,7 @@ int mergeNode( Cu c, int cuIdx, int bitDepth, bool noPdpc, int lid, int NT )
   }
   if( rank && c.bvList >= 0 )
   {
-    CBufI32   acc  = CBufI32( P.scratch );
+    WBufI32   acc  = WBufI32( P.scratch );
     const int base = int( gl_WorkGroupID.x ) * BLEND_ACC;
     for( int i = 0; i < acc.v[base]; i++ )
     {

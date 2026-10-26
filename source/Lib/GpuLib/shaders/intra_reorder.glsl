@@ -92,14 +92,14 @@ int crDbvArm( int comp, Cu c, ivec2 mv, int flip, bool above, int idx, int befor
     {
       m = flip == 2 ? ivec2( mv.x, mv.y + ( ( H - 1 ) << 5 ) ) : mv;
     }
-    return ibcChromaPredict( comp, c.x, c.y, W, 1, m, flip == 1 ? W - 1 - idx : idx, 0, before, bitDepth );
+    return ibcChromaPredict( comp, c.x, c.y, W, 1, m, flip == 1 ? W - 1 - idx : idx, 0, before, bitDepth, false );
   }
   ivec2 m = mv + ivec2( ( flip == 1 ? W : -1 ) << 5, 0 );
   if( !ibcChromaValid( 1, c.x, c.y, 1, H, m, 0, 0, before ) )
   {
     m = flip == 1 ? ivec2( mv.x + ( ( W - 1 ) << 5 ), mv.y ) : mv;
   }
-  return ibcChromaPredict( comp, c.x, c.y, 1, H, m, 0, flip == 2 ? H - 1 - idx : idx, before, bitDepth );
+  return ibcChromaPredict( comp, c.x, c.y, 1, H, m, 0, flip == 2 ? H - 1 - idx : idx, before, bitDepth, false );
 }
 
 // a mode's set (67 bits)

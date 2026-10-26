@@ -73,12 +73,13 @@ const int TS_REFINE = TS_SPARSE + 3 * TS_LIST;        // 3 lists alike
 const int TS_MCOST  = TS_REFINE + 3 * TS_LIST;        // per vector of the list its 3 costs
 const int TS_WIN    = TS_MCOST + 3 * BV_LIST_MAX;     // which lists took vectors (bits), the refinement's 3 thresholds
 
-shared int s_tmpCount;   // the chunk's positions
-shared int s_tmpDone;    // the last chunk
+shared int s_tmpCount;    // the chunk's positions
+shared int s_tmpDone;     // the last chunk
+shared int s_tmpThr[3];   // per list type its threshold at the chunk's start (the lists' costs only fall)
 
 int  tsBase()              { return int( gl_WorkGroupID.x ) * BLEND_ACC; }
-int  tsGet( int o )        { return CBufI32( P.scratch ).v[tsBase() + o]; }
-void tsSet( int o, int v ) { CBufI32( P.scratch ).v[tsBase() + o] = v; }
+int  tsGet( int o )        { return WBufI32( P.scratch ).v[tsBase() + o]; }
+void tsSet( int o, int v ) { WBufI32( P.scratch ).v[tsBase() + o] = v; }
 
 void tsSync()
 {
@@ -88,27 +89,64 @@ void tsSync()
 
 // ----- the template costs
 
+// the CU's own template (its rows above, with the L-shape's corner, then its columns left), which every cost reads, in
+// shared memory during the node: the first stage of sign prediction's transforms (s_spStage1), free in a node - not
+// s_spCoef, which holds the node's vector list (intra_bv.glsl's s_bvList) - (at most 4 x 132 + 4 x 128 samples: 1024)
+int tmpCurIndex( Cu c, int x, int y )
+{
+  return y < 0 ? ( y + TMP_TEMPLATE_SIZE ) * ( c.w + TMP_TEMPLATE_SIZE ) + x + TMP_TEMPLATE_SIZE
+               : TMP_TEMPLATE_SIZE * ( c.w + TMP_TEMPLATE_SIZE ) + y * TMP_TEMPLATE_SIZE + x + TMP_TEMPLATE_SIZE;
+}
+
+int tmpCur( Cu c, int x, int y )
+{
+  return int( s_spStage1[tmpCurIndex( c, x, y )] );
+}
+
+void tmpCurLoad( Cu c, int lid, int NT )
+{
+  const int numTop = TMP_TEMPLATE_SIZE * ( c.w + TMP_TEMPLATE_SIZE ), numLeft = TMP_TEMPLATE_SIZE * c.h;
+  for( int i = lid; i < numTop + numLeft; i += NT )
+  {
+    const int k = i - numTop, rowW = c.w + TMP_TEMPLATE_SIZE;
+    const int x = ( i < numTop ? i % rowW : k % TMP_TEMPLATE_SIZE ) - TMP_TEMPLATE_SIZE;
+    const int y = i < numTop ? i / rowW - TMP_TEMPLATE_SIZE : k / TMP_TEMPLATE_SIZE;
+    // (a sample outside the picture is never compared: its template type has no such part)
+    s_spStage1[i] = int16_t( c.x + x >= 0 && c.y + y >= 0 ? recoAt( 0, c.x + x, c.y + y ) : 0 );
+  }
+  tsSync();
+}
+
 // the search's mean-removed costs (useMR: an IntraTMP CU with LIC) and its template's means (calcTargetMean): the
 // top part's (the rows above the block, without the L-shape's corner) and the left part's (the columns left of it),
 // each sum floored by its size's log2 (both parts are powers of two)
 bool  g_tmpMr   = false;
 ivec2 g_tmpMean = ivec2( 0 );
 
+// The picture's samples come from L2 (the plane is coherent), so these loops read a template in steps of 4 x 4 samples
+// whose loads are independent: one thread per position has 16 loads in flight instead of waiting for each (a CU's
+// sides are multiples of 4)
 ivec2 tmpMeans( Cu c, int tempType, int bx, int by )
 {
   int top = 0, left = 0;
-  for( int y = -TMP_TEMPLATE_SIZE; y < 0 && tempType != TMP_LEFT; y++ )
+  for( int x = 0; x < c.w && tempType != TMP_LEFT; x += 4 )
   {
-    for( int x = 0; x < c.w; x++ )
+    [[unroll]] for( int j = 0; j < 4; j++ )
     {
-      top += recoAt( 0, c.x + bx + x, c.y + by + y );
+      [[unroll]] for( int y = -TMP_TEMPLATE_SIZE; y < 0; y++ )
+      {
+        top += recoAt( 0, c.x + bx + x + j, c.y + by + y );
+      }
     }
   }
-  for( int y = 0; y < c.h && tempType != TMP_ABOVE; y++ )
+  for( int y = 0; y < c.h && tempType != TMP_ABOVE; y += 4 )
   {
-    for( int x = -TMP_TEMPLATE_SIZE; x < 0; x++ )
+    [[unroll]] for( int i = 0; i < 4; i++ )
     {
-      left += recoAt( 0, c.x + bx + x, c.y + by + y );
+      [[unroll]] for( int x = -TMP_TEMPLATE_SIZE; x < 0; x++ )
+      {
+        left += recoAt( 0, c.x + bx + x, c.y + by + y + i );
+      }
     }
   }
   return ivec2( top >> findMSB( TMP_TEMPLATE_SIZE * c.w ), left >> findMSB( TMP_TEMPLATE_SIZE * c.h ) );
@@ -123,49 +161,108 @@ ivec3 tmpCosts( Cu c, int tempType, int bx, int by )
 {
   const ivec2 dm = g_tmpMr ? tmpMeans( c, tempType, bx, by ) - g_tmpMean : ivec2( 0 );
   int sum = 0, top = 0, left = 0;
-  if( tempType != TMP_LEFT )   // the rows above (with the corner of the L-shape)
+  if( tempType != TMP_LEFT )   // the rows above (with the corner of the L-shape: the first 4 columns, x < 0)
   {
-    const int x0 = tempType == TMP_L_SHAPE ? -TMP_TEMPLATE_SIZE : 0;
-    for( int y = -TMP_TEMPLATE_SIZE; y < 0; y++ )
+    int corner = 0, upper = 0, next = 0;   // (next: the row next to the block)
+    for( int x = tempType == TMP_L_SHAPE ? -TMP_TEMPLATE_SIZE : 0; x < c.w; x += 4 )
     {
-      int corner = 0, row = 0;
-      for( int x = x0; x < c.w; x++ )
+      int part = 0, nextPart = 0;
+      [[unroll]] for( int j = 0; j < 4; j++ )
       {
-        const int d = abs( recoAt( 0, c.x + bx + x, c.y + by + y ) - recoAt( 0, c.x + x, c.y + y ) - dm.x );
-        corner += x < 0 ? d : 0;
-        row    += x < 0 ? 0 : d;
+        [[unroll]] for( int y = -TMP_TEMPLATE_SIZE; y < 0; y++ )
+        {
+          const int d = abs( recoAt( 0, c.x + bx + x + j, c.y + by + y ) - tmpCur( c, x + j, y ) - dm.x );
+          part     += y < -1 ? d : 0;
+          nextPart += y < -1 ? 0 : d;
+        }
       }
-      top += row;
-      sum += corner + ( y == -1 ? row << TMP_COST_SHIFT : row );
+      corner += x < 0 ? part + nextPart : 0;
+      upper  += x < 0 ? 0 : part;
+      next   += x < 0 ? 0 : nextPart;
     }
+    top = upper + next;
+    sum = corner + upper + ( next << TMP_COST_SHIFT );
   }
-  if( tempType != TMP_ABOVE )   // the columns left
+  if( tempType != TMP_ABOVE )   // the columns left (the one next to the block, x -1, weighs 2^TMP_COST_SHIFT)
   {
-    for( int y = 0; y < c.h; y++ )
+    int part = 0, next = 0;
+    for( int y = 0; y < c.h; y += 4 )
     {
-      int row = 0, next = 0;
-      for( int x = -TMP_TEMPLATE_SIZE; x < 0; x++ )
+      [[unroll]] for( int i = 0; i < 4; i++ )
       {
-        next = abs( recoAt( 0, c.x + bx + x, c.y + by + y ) - recoAt( 0, c.x + x, c.y + y ) - dm.y );   // (x -1 last)
-        row += next;
+        [[unroll]] for( int x = -TMP_TEMPLATE_SIZE; x < 0; x++ )
+        {
+          const int d = abs( recoAt( 0, c.x + bx + x, c.y + by + y + i ) - tmpCur( c, x, y + i ) - dm.y );
+          part += x < -1 ? d : 0;
+          next += x < -1 ? 0 : d;
+        }
       }
-      left += row;
-      sum += row + next * ( ( 1 << TMP_COST_SHIFT ) - 1 );
     }
+    left = part + next;
+    sum += part + ( next << TMP_COST_SHIFT );
   }
   return ivec3( sum, top, left );
 }
 
-// the costs of the chunk's s_tmpCount positions (all invocations, after a tsSync; positions at TS_POS), into TS_COST
-void tmpChunkCosts( Cu c, int tempType, int lid, int NT )
+// the costs of the chunk's s_tmpCount positions (all invocations, after a tsSync; positions at TS_POS), into TS_COST,
+// and per position whether it may change a list (s_spCost, sign prediction's costs, free in a node), which invocation
+// 0 then walks alone. The refinement's (refine): a cost of its own type (tag & 3; at its candidate's own position that
+// candidate's cost) below the type's threshold at the chunk's start (s_tmpThr), as a list's threshold only falls. The
+// sparse search's (the first numTypes lists, of caps entries): a position that is in a list after the chunk. Such a
+// list keeps the first positions by cost, then by order (updateCandList inserts after equal costs; none enters past
+// the threshold, which is the last entry's once the list is full), so a position below the threshold ends in it
+// exactly where fewer than the list's cap rank before it: the list's entries and the chunk's earlier positions that
+// cost no more, its later ones that cost less. The others leave it again within the chunk if they enter at all. (One
+// position per invocation: TMP_CHUNK is intra_rec's workgroup size)
+void tmpChunkCosts( Cu c, int tempType, int numTypes, ivec3 caps, bool refine, int lid, int NT )
 {
+  bool may = false;
   for( int k = lid; k < s_tmpCount; k += NT )
   {
-    const int   p  = tsGet( TS_POS + 2 * k );
-    const ivec3 cs = tmpCosts( c, tempType, bitfieldExtract( p, 0, 16 ), p >> 16 );
+    const int   p  = tsGet( TS_POS + 2 * k ), px = bitfieldExtract( p, 0, 16 ), py = p >> 16;
+    const ivec3 cs = tmpCosts( c, tempType, px, py );
     tsSet( TS_COST + 3 * k, cs.x );
     tsSet( TS_COST + 3 * k + 1, cs.y );
     tsSet( TS_COST + 3 * k + 2, cs.z );
+    if( refine )
+    {
+      const int tag = tsGet( TS_POS + 2 * k + 1 ), t = tag & 3, ci = tag >> 2, sparse = TS_SPARSE + t * TS_LIST;
+      const bool atCand = px == tsGet( sparse + 1 + ci * TE + TE_X ) && py == tsGet( sparse + 1 + ci * TE + TE_Y );
+      may = ( atCand ? tsGet( sparse + 1 + ci * TE + TE_COST ) : cs[t] ) < s_tmpThr[t];
+    }
+  }
+  tsSync();
+  for( int t = 0; t < numTypes && !refine; t++ )   // (the sparse search's: the chunk's costs of type t in s_spCost)
+  {
+    const int k = lid, cost = k < s_tmpCount ? tsGet( TS_COST + 3 * k + t ) : 0;
+    if( k < s_tmpCount )
+    {
+      s_spCost[k] = uint( cost );
+    }
+    tsSync();
+    if( k < s_tmpCount && cost < s_tmpThr[t] )
+    {
+      const int list = TS_SPARSE + t * TS_LIST;
+      int       lo = 0, hi = tsGet( list );   // (the list's entries costing no more: it rises by cost)
+      while( lo < hi )
+      {
+        const int mid = ( lo + hi ) >> 1;
+        lo = tsGet( list + 1 + mid * TE + TE_COST ) <= cost ? mid + 1 : lo;
+        hi = tsGet( list + 1 + mid * TE + TE_COST ) <= cost ? hi : mid;
+      }
+      int before = lo;
+      for( int j = 0; j < s_tmpCount && before < caps[t]; j++ )
+      {
+        const int cj = int( s_spCost[j] );
+        before += cj < cost || ( cj == cost && j < k ) ? 1 : 0;
+      }
+      may = may || before < caps[t];
+    }
+    tsSync();
+  }
+  if( lid < s_tmpCount )
+  {
+    s_spCost[lid] = may ? 1u : 0u;
   }
   tsSync();
 }
@@ -305,7 +402,7 @@ int[TMP_LIC] tmpLicModel( Cu c, ivec2 mv, ivec2 delta, int licIdx, int req, int 
     {
       const int idx = ( k * ( side == 0 ? W : H ) ) >> dimShift;
       const int rf  = ibcPredict( c.x, c.y, side == 0 ? W : 1, side == 0 ? 1 : H, side == 0 ? mvTop : mvLeft, true,
-                                  side == 0 ? idx : 0, side == 0 ? 0 : idx, g_ti, bitDepth, delta ) >> precShift;
+                                  side == 0 ? idx : 0, side == 0 ? 0 : idx, g_ti, bitDepth, delta, false ) >> precShift;
       const int rc  = ( side == 0 ? recoAt( 0, c.x + idx, c.y - 1 ) : recoAt( 0, c.x - 1, c.y + idx ) ) >> precShift;
       tsSet( REF + n, rf );
       tsSet( REC + n, rc );
@@ -444,9 +541,31 @@ const ivec4 TMP_SUBPEL1[4] = ivec4[4]( ivec4( -16, 144, 144, -16 ), ivec4( -14, 
                                        ivec4( -9, 236, 34, -5 ), ivec4( -16, 179, 107, -14 ) );
 const int   TMP_FRAC_DIST[4] = int[4]( 8, 4, 2, 6 );
 
-// the padded region's sample (bx, by) (relative to the template's top-left at the vector; rows of `stride`)
-int  tfGet( int stride, int bx, int by )        { return tsGet( TS_FBUF + ( by + TMP_PAD ) * stride + bx + TMP_PAD ); }
-void tfSet( int stride, int bx, int by, int v ) { tsSet( TS_FBUF + ( by + TMP_PAD ) * stride + bx + TMP_PAD, v ); }
+// the padded region's sample (bx, by) (relative to the template's top-left at the vector; rows of `stride`), in shared
+// memory: sign prediction's low and high halves and templates (s_spLow, s_spHigh, s_spTempl; 2560 samples, the region
+// of a 128 x 8 CU 2176), free in a node; every candidate's cost reads it 4 to 16 times per sample
+int tfGet( int stride, int bx, int by )
+{
+  const int i = ( by + TMP_PAD ) * stride + bx + TMP_PAD;
+  return int( i < 1024 ? s_spLow[i] : i < 2048 ? s_spHigh[i - 1024] : s_spTempl[i - 2048] );
+}
+
+void tfSet( int stride, int bx, int by, int v )
+{
+  const int i = ( by + TMP_PAD ) * stride + bx + TMP_PAD;
+  if( i < 1024 )
+  {
+    s_spLow[i] = int16_t( v );
+  }
+  else if( i < 2048 )
+  {
+    s_spHigh[i - 1024] = int16_t( v );
+  }
+  else
+  {
+    s_spTempl[i - 2048] = int16_t( v );
+  }
+}
 
 // whether searchFracCandidate's loop takes (fracPrecX fx, fracPrecY fy, direction dir): 3 / 4 in both only the
 // diagonal directions; 1 / 2 in both the straight ones only where equal, without some combinations of 1; others none
@@ -514,7 +633,7 @@ int tmpFracCost( Cu c, int tempType, int req, int stride, int n, int maxPel )
       for( int x = x0; x < c.w; x++ )
       {
         const int p = tmpFracSample( stride, fx, fy, dir, x + extW, y + extH, maxPel );
-        const int d = abs( p - recoAt( 0, c.x + x, c.y + y ) );
+        const int d = abs( p - tmpCur( c, x, y ) );
         corner += x < 0 ? d : 0;
         row    += x < 0 ? 0 : d;
       }
@@ -530,7 +649,7 @@ int tmpFracCost( Cu c, int tempType, int req, int stride, int n, int maxPel )
       for( int x = -TMP_TEMPLATE_SIZE; x < 0; x++ )
       {
         const int p = tmpFracSample( stride, fx, fy, dir, x + extW, y + extH, maxPel );
-        next = abs( p - recoAt( 0, c.x + x, c.y + y ) );   // (x -1 last)
+        next = abs( p - tmpCur( c, x, y ) );   // (x -1 last)
         row += next;
       }
       left += row;
@@ -1283,6 +1402,7 @@ void tmpNode( Cu c, int cuIndex, int bitDepth, int lid, int NT )
 
   g_tmpMr   = mr;
   g_tmpMean = mr ? tmpMeans( c, tempType, 0, 0 ) : ivec2( 0 );
+  tmpCurLoad( c, lid, NT );
 
   // invocation 0's state: the vector list's parts (itmpSize, itmpSize1), the thresholds, the enumeration
   int itmpSize = 0, itmpSize1 = 0, numList = 0;
@@ -1403,15 +1523,23 @@ void tmpNode( Cu c, int cuIndex, int bitDepth, int lid, int NT )
       }
       s_tmpCount = k;
       s_tmpDone  = checkIdx >= 6 ? 1 : 0;
+      for( int t = 0; t < numTypes; t++ )
+      {
+        s_tmpThr[t] = pDiff[t];
+      }
     }
     tsSync();
-    tmpChunkCosts( c, tempType, lid, NT );
+    tmpChunkCosts( c, tempType, numTypes, ivec3( numSparse[0], numSparse[1], numSparse[2] ), false, lid, NT );
     const bool last = s_tmpDone != 0;   // (read before invocation 0 may write the next chunk's)
     if( lid == 0 )
     {
       const int rr = S >> 1;
       for( int k = 0; k < s_tmpCount; k++ )
       {
+        if( s_spCost[k] == 0u )
+        {
+          continue;
+        }
         const int p = tsGet( TS_POS + 2 * k ), px = bitfieldExtract( p, 0, 16 ), py = p >> 16;
         for( int t = 0; t < numTypes; t++ )
         {
@@ -1471,7 +1599,7 @@ void tmpNode( Cu c, int cuIndex, int bitDepth, int lid, int NT )
     }
   }
   tsSync();
-  tmpChunkCosts( c, tempType, lid, NT );   // (at most BV_LIST_MAX)
+  tmpChunkCosts( c, tempType, 0, ivec3( 0 ), false, lid, NT );   // (at most BV_LIST_MAX)
 
   // BVG-DIMD (invocation 0): of the sparse search's best and the neighbours' vectors that cost less than it, in turn,
   // the cheapest alone (bvgCandList of MAX_BVG_ROUGH_NUM 1), a vector's window BVG_REFINE_RANGE around it; the
@@ -1680,14 +1808,22 @@ void tmpNode( Cu c, int cuIndex, int bitDepth, int lid, int NT )
       }
       s_tmpCount = k;
       s_tmpDone  = type >= numTypes ? 1 : 0;
+      for( int t = 0; t < numTypes; t++ )   // (a type not begun yet starts from its own threshold)
+      {
+        s_tmpThr[t] = t == curType ? rDiff[t] : tsGet( TS_WIN + 1 + t );
+      }
     }
     tsSync();
-    tmpChunkCosts( c, tempType, lid, NT );
+    tmpChunkCosts( c, tempType, numTypes, ivec3( 0 ), true, lid, NT );
     const bool last = s_tmpDone != 0;
     if( lid == 0 )
     {
       for( int k = 0; k < s_tmpCount; k++ )
       {
+        if( s_spCost[k] == 0u )   // (a type's first positions skipped: its thresholds are set at its first one kept)
+        {
+          continue;
+        }
         const int p = tsGet( TS_POS + 2 * k ), px = bitfieldExtract( p, 0, 16 ), py = p >> 16;
         const int tag = tsGet( TS_POS + 2 * k + 1 ), t = tag & 3, ci = tag >> 2;
         const int sparse = TS_SPARSE + t * TS_LIST, refine = TS_REFINE + t * TS_LIST;

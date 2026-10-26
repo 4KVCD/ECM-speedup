@@ -44928,6 +44928,126 @@ void IntraPrediction::eipPred(const PredictionUnit& pu, PelBuf& piPred, const Co
   piPred.copyFrom(predBuf);
 }
 
+// getNeiEipCands' temporal candidates of a luma block in an inter slice: the collocated picture's EIP models at the
+// bottom-right and centre positions at five distances (each the first of its two positions inside the picture, where
+// an EIP CU was), shifted by the motion of the first adjacent inter neighbour pointing to the collocated picture when
+// shifted. add( model ) takes each in order and returns whether it takes more.
+template<class Add>
+static void eipColModels( const PredictionUnit& pu, bool shifted, Add add )
+{
+  const CodingStructure& cs    = *pu.cs;
+  const Slice&           slice = *cs.slice;
+  if( slice.isIntra() )
+  {
+    return;
+  }
+  const Picture* const pColPic = slice.getRefPic( RefPicList( slice.isInterB() ? 1 - slice.getColFromL0Flag() : 0 ),
+                                                  slice.getColRefIdx() );
+  const bool isRefScaled = pColPic->isRefScaled( slice.getPPS() );
+  if( !pColPic || isRefScaled )
+  {
+    return;
+  }
+  const CompArea&      area      = pu.blocks[COMPONENT_Y];
+  const PreCalcValues& pcv       = *cs.pcv;
+  const SubPic&        curSubPic = slice.getPPS()->getSubPicFromPos( pu.lumaPos() );
+  Mv                   shiftMv( 0, 0 );
+  if( shifted )
+  {
+    const Position topLeft = area.topLeft();
+    const Position posCand[5] = { topLeft.offset( -1, area.height - 1 ), topLeft.offset( area.width - 1, -1 ),
+                                  topLeft.offset( -1, -1 ), topLeft.offset( area.width, -1 ),
+                                  topLeft.offset( -1, area.height ) };
+    const unsigned plevel = cs.sps->getLog2ParallelMergeLevelMinus2() + 2;
+    const int      colPOC = pColPic->getPOC();
+    MotionInfo     miNeigh;
+    bool           foundNeighMV = false;
+    bool           useL0        = false;
+    for( int posIdx = 0; posIdx < 5 && !foundNeighMV; posIdx++ )
+    {
+      const PredictionUnit* puRef = cs.getPURestricted( posCand[posIdx], pu, pu.chType );
+      if( puRef && PU::isDiffMER( pu.lumaPos(), posCand[posIdx], plevel ) && pu.cu != puRef->cu
+          && CU::isInter( *puRef->cu ) )
+      {
+        miNeigh = puRef->getMotionInfo( posCand[posIdx] );
+        for( int i = 0; i < 2 && !foundNeighMV; i++ )
+        {
+          const int refIdx = miNeigh.refIdx[i];
+#if JVET_AI0082_GPM_WITH_INTER_IBC
+          if( miNeigh.isInter && refIdx != -1 )
+#else
+          if( refIdx != -1 )
+#endif
+          {
+            if( slice.getRefPic( RefPicList( i ), refIdx )->getPOC() == colPOC )
+            {
+              foundNeighMV = true;
+              useL0        = i == 0;
+            }
+          }
+        }
+      }
+    }
+    if( foundNeighMV )
+    {
+      shiftMv = useL0 ? miNeigh.mv[0] : miNeigh.mv[1];
+      shiftMv.changePrecision( MV_PRECISION_INTERNAL, MV_PRECISION_INT );
+    }
+  }
+  const Position posRB     = area.bottomRight().offset( -1, -1 );
+  const Position posCenter = area.center();
+  // (whether a position offset from posRB / posCenter is inside the picture or the subpicture treated as one; one left
+  // of or above the picture is not, as the unsigned comparison of the CPU's conditions has it)
+  auto inside = [&]( const Position& p, int dx, int dy )
+  {
+    const int x = p.x + dx, y = p.y + dy;
+    return x >= 0 && y >= 0
+           && ( curSubPic.getTreatedAsPicFlag()
+                  ? x <= (int) curSubPic.getSubPicRight() && y <= (int) curSubPic.getSubPicBottom()
+                  : x < (int) pcv.lumaWidth && y < (int) pcv.lumaHeight );
+  };
+  int offsetX0 = 0, offsetX1 = 0, offsetX2 = 0, offsetX3 = area.width >> 1;
+  int offsetY0 = 0, offsetY1 = 0, offsetY2 = 0, offsetY3 = area.height >> 1;
+  const int idxMap[5][2] = { { 0, 1 }, { 0, 2 }, { 0, 2 }, { 0, 2 }, { 0, 2 } };
+  for( int iDistanceIndex = 0; iDistanceIndex < 5; iDistanceIndex++ )
+  {
+    const int iNADistanceHor = area.width * iDistanceIndex;
+    const int iNADistanceVer = area.height * iDistanceIndex;
+    for( int naspIdx = 0; naspIdx < 2; naspIdx++ )
+    {
+      switch( idxMap[iDistanceIndex][naspIdx] )
+      {
+      case 0:
+        offsetX0 = offsetX2 = 2 + iNADistanceHor; offsetY0 = offsetY2 = 2 + iNADistanceVer;
+        offsetX1 = iNADistanceHor; offsetY1 = iNADistanceVer;
+        break;
+      case 1: offsetX0 = 2; offsetY0 = 0; offsetX1 = 0; offsetY1 = 2; break;
+      default: offsetX0 = offsetX2; offsetY0 = 2 - offsetY3; offsetX1 = 2 - offsetX3; offsetY1 = offsetY2; break;
+      }
+      const Position c1Base = idxMap[iDistanceIndex][naspIdx] == 0 ? posCenter : posRB;
+      const bool     c0Avail = inside( posRB, shiftMv.hor + offsetX0, shiftMv.ver + offsetY0 );
+      const bool     c1Avail = inside( c1Base, shiftMv.hor + offsetX1, shiftMv.ver + offsetY1 );
+      if( c0Avail || c1Avail )
+      {
+        const Position pos      = c0Avail ? posRB.offset( shiftMv.hor + offsetX0, shiftMv.ver + offsetY0 )
+                                          : c1Base.offset( shiftMv.hor + offsetX1, shiftMv.ver + offsetY1 );
+        const int      modelIdx = pColPic->cs->getEipIdxInfo( pos );
+        if( modelIdx > 0 && !add( pColPic->cs->m_eipModelLUT[modelIdx - 1] ) )
+        {
+          return;
+        }
+      }
+    }
+  }
+}
+
+void IntraPrediction::eipTemporalModels( const PredictionUnit& pu, bool shifted,
+                                         std::vector<EipModelCandidate>& models )
+{
+  models.clear();
+  eipColModels( pu, shifted, [&]( const EipModelCandidate& model ) { models.push_back( model ); return true; } );
+}
+
 void IntraPrediction::getNeiEipCands(const PredictionUnit& pu, static_vector<EipModelCandidate, MAX_MERGE_EIP>& candList, const ComponentID compId)
 {
   if(!getAllowedEipMerge(*pu.cu, compId))
@@ -45002,109 +45122,10 @@ void IntraPrediction::getNeiEipCands(const PredictionUnit& pu, static_vector<Eip
       return;
     }
   };
-  const Slice &slice = *pu.cs->slice;
-  if (!slice.isIntra() && compId == COMPONENT_Y)
+  // the collocated picture's models (luma in an inter slice)
+  if (compId == COMPONENT_Y && numCand < maxCands)
   {
-    const Picture* const pColPic = slice.getRefPic(RefPicList(slice.isInterB() ? 1 - slice.getColFromL0Flag() : 0), slice.getColRefIdx()); 
-    bool isRefScaled = pColPic->isRefScaled(slice.getPPS());
-    if(pColPic && !isRefScaled)
-    {
-      const PreCalcValues& pcv = *cs.pcv;
-      bool c0Avail;
-      bool c1Avail;
-      bool boundaryCond;
-      const SubPic& curSubPic = pu.cs->slice->getPPS()->getSubPicFromPos(pu.lumaPos());
-      int lumaScaleX = getChannelTypeScaleX( channelType, pu.chromaFormat );
-      int lumaScaleY = getChannelTypeScaleY( channelType, pu.chromaFormat );
-      Position posRB = pu.blocks[compId].bottomRight().offset(-1, -1);
-      Position posCenter = pu.blocks[compId].center();
-      Position posC0;
-      Position posC1;
-
-      int offsetX0 = 0, offsetX1 = 0, offsetX2 = 0, offsetX3 = pu.blocks[compId].width >> 1;
-      int offsetY0 = 0, offsetY1 = 0, offsetY2 = 0, offsetY3 = pu.blocks[compId].height >> 1;
-
-      const int numNACandidate[5] = { 2, 2, 2, 2, 2 };
-      const int idxMap[5][2] = { { 0, 1 },{ 0, 2 },{ 0, 2 },{ 0, 2 },{ 0, 2 } };
-
-      for (int iDistanceIndex = 0; iDistanceIndex < 5 && numCand < maxCands; iDistanceIndex++)
-      {
-        const int iNADistanceHor = pu.blocks[compId].width  * iDistanceIndex;
-        const int iNADistanceVer = pu.blocks[compId].height * iDistanceIndex;
-
-        for (int naspIdx = 0; naspIdx < numNACandidate[iDistanceIndex] && numCand < maxCands; naspIdx++)
-        {
-          switch (idxMap[iDistanceIndex][naspIdx])
-          {
-          case 0: offsetX0 = offsetX2 = 2 + iNADistanceHor; offsetY0 = offsetY2 = 2 + iNADistanceVer; offsetX1 = iNADistanceHor; offsetY1 = iNADistanceVer; break;
-          case 1: offsetX0 = 2; offsetY0 = 0; offsetX1 = 0; offsetY1 = 2; break;
-          case 2: offsetX0 = offsetX2; offsetY0 = 2 - offsetY3; offsetX1 = 2 - offsetX3; offsetY1 = offsetY2; break;
-          default: printf("error!"); exit(0); break;
-          }
-        
-          c0Avail = false;
-          if (curSubPic.getTreatedAsPicFlag())
-          {
-            boundaryCond = ((posRB.x + offsetX0) <= (curSubPic.getSubPicRight() >> lumaScaleX)) && ((posRB.y + offsetY0) <= (curSubPic.getSubPicBottom() >> lumaScaleY));
-          }
-          else
-          {
-            boundaryCond = ((posRB.x + offsetX0) < (pcv.lumaWidth >> lumaScaleX)) && ((posRB.y + offsetY0) < (pcv.lumaHeight >> lumaScaleY));
-          }
-          if (boundaryCond)
-          {
-            posC0 = posRB.offset(offsetX0, offsetY0);
-            c0Avail = true;
-          }
-
-          if (idxMap[iDistanceIndex][naspIdx] == 0)
-          {
-            c1Avail = false;
-            if (curSubPic.getTreatedAsPicFlag())
-            {
-              boundaryCond = ((posCenter.x + offsetX1) <= (curSubPic.getSubPicRight() >> lumaScaleX) && (posCenter.y + offsetY1) <= (curSubPic.getSubPicBottom() >> lumaScaleY));
-            }
-            else
-            {
-              boundaryCond = ((posCenter.x + offsetX1) < (pcv.lumaWidth >> lumaScaleX)) && ((posCenter.y + offsetY1) < (pcv.lumaHeight >> lumaScaleY));
-            }
-            if (boundaryCond)
-            {
-              posC1 = posCenter.offset(offsetX1, offsetY1);
-              c1Avail = true;
-            }
-          }
-          else
-          {
-            c1Avail = false;
-            if (curSubPic.getTreatedAsPicFlag())
-            {
-              boundaryCond = ((posRB.x + offsetX1) <= (curSubPic.getSubPicRight() >> lumaScaleX) && (posRB.y + offsetY1) <= (curSubPic.getSubPicBottom() >> lumaScaleY));
-            }
-            else
-            {
-              boundaryCond = ((posRB.x + offsetX1) < (pcv.lumaWidth >> lumaScaleX)) && ((posRB.y + offsetY1) < (pcv.lumaHeight >> lumaScaleY));
-            }
-            if (boundaryCond)
-            {
-              posC1 = posRB.offset(offsetX1, offsetY1);
-              c1Avail = true;
-            }
-          }
-
-          if (c0Avail || c1Avail)
-          {
-            int modelIdx = c0Avail? pColPic->cs->getEipIdxInfo(posC0) 
-                            : pColPic->cs->getEipIdxInfo(posC1);
-            if (modelIdx > 0)
-            {
-              const EipModelCandidate currEipModel = pColPic->cs->m_eipModelLUT[modelIdx-1];
-              tryToAddOneModel(currEipModel);
-            }
-          }
-        }
-      }
-    }
+    eipColModels(pu, false, [&](const EipModelCandidate& cand) { tryToAddOneModel(cand); return numCand < maxCands; });
   }
 
   // Non-adjacent candidates round 1
@@ -45176,161 +45197,9 @@ void IntraPrediction::getNeiEipCands(const PredictionUnit& pu, static_vector<Eip
   }
 
   // Shifted temporal eip models
-  if (!slice.isIntra() && compId == COMPONENT_Y)
+  if (compId == COMPONENT_Y && numCand < maxCands)
   {
-    const Picture* const pColPic = slice.getRefPic(RefPicList(slice.isInterB() ? 1 - slice.getColFromL0Flag() : 0), slice.getColRefIdx()); 
-    bool isRefScaled = pColPic->isRefScaled(slice.getPPS());
-
-    if (pColPic && !isRefScaled)
-    {
-      const PreCalcValues& pcv = *cs.pcv;
-
-      bool c0Avail;
-      bool c1Avail;
-      bool boundaryCond;
-      const SubPic& curSubPic = pu.cs->slice->getPPS()->getSubPicFromPos(pu.lumaPos());
-      int lumaScaleX = getChannelTypeScaleX( channelType, pu.chromaFormat );
-      int lumaScaleY = getChannelTypeScaleY( channelType, pu.chromaFormat );
-      Position posRB = pu.blocks[compId].bottomRight().offset(-1, -1);
-      Position posCenter = pu.blocks[compId].center();
-      
-      Position posC0;
-      Position posC1;
-
-      int offsetX0 = 0, offsetX1 = 0, offsetX2 = 0, offsetX3 = pu.blocks[compId].width >> 1;
-      int offsetY0 = 0, offsetY1 = 0, offsetY2 = 0, offsetY3 = pu.blocks[compId].height >> 1;
-
-      const int numNACandidate[5] = { 2, 2, 2, 2, 2 };
-      const int idxMap[5][2] = { { 0, 1 },{ 0, 2 },{ 0, 2 },{ 0, 2 },{ 0, 2 } };
-
-      const unsigned plevel = pu.cs->sps->getLog2ParallelMergeLevelMinus2() + 2;
-
-      MotionInfo miNeigh;
-      bool foundNeighMV = false;
-      bool useL0;
-      const int colPOC     = pColPic->getPOC();
-
-      for (int posIdx = 0; posIdx < 5 && foundNeighMV == false; posIdx++)
-      {
-        const PredictionUnit *puRef = cs.getPURestricted(posCand[posIdx], pu, pu.chType);
-        bool isAvailableNeigh = puRef && 
-                                PU::isDiffMER(pu.lumaPos(), posCand[posIdx], plevel) && 
-                                pu.cu != puRef->cu && 
-                                CU::isInter(*puRef->cu);
-
-        if (isAvailableNeigh)
-        {
-          miNeigh = puRef->getMotionInfo(posCand[posIdx]);
-          for (int i = 0; i < 2 && foundNeighMV == false; i++)
-          {
-            int refIdx = miNeigh.refIdx[i];
-#if JVET_AI0082_GPM_WITH_INTER_IBC
-            if (miNeigh.isInter && refIdx != -1)
-#else
-            if (refIdx != -1)
-#endif
-            {
-              const int currRefPOC = slice.getRefPic(RefPicList(i), refIdx)->getPOC();
-              if (currRefPOC == colPOC)
-              {
-                foundNeighMV = true;
-                useL0 = i == 0 ? 1 : 0;
-              }
-            }
-          }
-        }
-      }
-      
-      Mv   shiftMv;
-      if (foundNeighMV)
-      {
-        shiftMv = useL0 ? miNeigh.mv[0] : miNeigh.mv[1];
-        shiftMv.changePrecision(MV_PRECISION_INTERNAL, MV_PRECISION_INT);
-        shiftMv.hor = shiftMv.hor >> lumaScaleX;
-        shiftMv.ver = shiftMv.ver >> lumaScaleY;
-      }
-      else
-      {
-        shiftMv.set(0,0);
-      }
-
-      for (int iDistanceIndex = 0; iDistanceIndex < 5 && numCand < maxCands; iDistanceIndex++)
-      {
-        const int iNADistanceHor = pu.blocks[compId].width  * iDistanceIndex;
-        const int iNADistanceVer = pu.blocks[compId].height * iDistanceIndex;
-
-        for (int naspIdx = 0; naspIdx < numNACandidate[iDistanceIndex] && numCand < maxCands; naspIdx++)
-        {
-          switch (idxMap[iDistanceIndex][naspIdx])
-          {
-          case 0: offsetX0 = offsetX2 = 2 + iNADistanceHor; offsetY0 = offsetY2 = 2 + iNADistanceVer; offsetX1 = iNADistanceHor; offsetY1 = iNADistanceVer; break;
-          case 1: offsetX0 = 2; offsetY0 = 0; offsetX1 = 0; offsetY1 = 2; break;
-          case 2: offsetX0 = offsetX2; offsetY0 = 2 - offsetY3; offsetX1 = 2 - offsetX3; offsetY1 = offsetY2; break;
-          default: printf("error!"); exit(0); break;
-          }
-        
-          c0Avail = false;
-          if (curSubPic.getTreatedAsPicFlag())
-          {
-            boundaryCond = ((posRB.x + shiftMv.hor + offsetX0) <= (curSubPic.getSubPicRight() >> lumaScaleX)) && ((posRB.y + shiftMv.ver + offsetY0) <= (curSubPic.getSubPicBottom() >> lumaScaleY));
-          }
-          else
-          {
-            boundaryCond = ((posRB.x + shiftMv.hor + offsetX0) < (pcv.lumaWidth >> lumaScaleX)) && ((posRB.y + shiftMv.ver + offsetY0) < (pcv.lumaHeight >> lumaScaleY));
-          }
-          if (boundaryCond)
-          {
-            posC0 = posRB.offset(shiftMv.hor + offsetX0, shiftMv.ver + offsetY0);
-            c0Avail = true;
-          }
-
-          if (idxMap[iDistanceIndex][naspIdx] == 0)
-          {
-            c1Avail = false;
-            if (curSubPic.getTreatedAsPicFlag())
-            {
-              boundaryCond = ((posCenter.x + shiftMv.hor + offsetX1) <= (curSubPic.getSubPicRight() >> lumaScaleX) && (posCenter.y + shiftMv.ver + offsetY1) <= (curSubPic.getSubPicBottom() >> lumaScaleY));
-            }
-            else
-            {
-              boundaryCond = ((posCenter.x + shiftMv.hor + offsetX1) < (pcv.lumaWidth >> lumaScaleX)) && ((posCenter.y + shiftMv.ver + offsetY1) < (pcv.lumaHeight >> lumaScaleY));
-            }
-            if (boundaryCond)
-            {
-              posC1 = posCenter.offset(shiftMv.hor + offsetX1, shiftMv.ver + offsetY1);
-              c1Avail = true;
-            }
-          }
-          else
-          {
-            c1Avail = false;
-            if (curSubPic.getTreatedAsPicFlag())
-            {
-              boundaryCond = ((posRB.x + shiftMv.hor + offsetX1) <= (curSubPic.getSubPicRight() >> lumaScaleX) && (posRB.y + shiftMv.ver + offsetY1) <= (curSubPic.getSubPicBottom() >> lumaScaleY));
-            }
-            else
-            {
-              boundaryCond = ((posRB.x + shiftMv.hor + offsetX1) < (pcv.lumaWidth >> lumaScaleX)) && ((posRB.y + shiftMv.ver + offsetY1) < (pcv.lumaHeight >> lumaScaleY));
-            }
-            if (boundaryCond)
-            {
-              posC1 = posRB.offset(shiftMv.hor + offsetX1, shiftMv.ver + offsetY1);          
-              c1Avail = true;
-            }
-          }
-          if (c0Avail || c1Avail)
-          {
-            int modelIdx = c0Avail? pColPic->cs->getEipIdxInfo(posC0) 
-                            : pColPic->cs->getEipIdxInfo(posC1);
-            if (modelIdx > 0)
-            {
-              const EipModelCandidate currEipModel = pColPic->cs->m_eipModelLUT[modelIdx-1];
-              tryToAddOneModel(currEipModel);
-            }
-          }
-        }
-      }
-    }
+    eipColModels(pu, true, [&](const EipModelCandidate& cand) { tryToAddOneModel(cand); return numCand < maxCands; });
   }
 
   auto tryHistEip = [&](const static_vector<EipModelCandidate, MAX_NUM_HEIP_CANDS>& lut)-> void
@@ -45523,10 +45392,12 @@ void IntraPrediction::eipReferenceArea( const CodingUnit& cu, int& tplX, int& tp
   height = area.height + sizeY + belowLeft * unitHeight;
 }
 
-// getNeiEipCands' positions in an intra slice (keep in step with it): the EIP CUs found there
-void IntraPrediction::eipMergeNeighbours( const PredictionUnit& pu, std::vector<const CodingUnit*>& cus )
+// getNeiEipCands' spatial positions (keep in step with it): the EIP CUs found there
+void IntraPrediction::eipMergeNeighbours( const PredictionUnit& pu, std::vector<const CodingUnit*>& cus,
+                                          int& numAdjacent )
 {
   cus.clear();
+  numAdjacent = 0;
   if( !getAllowedEipMerge( *pu.cu, COMPONENT_Y ) )
   {
     return;
@@ -45547,6 +45418,7 @@ void IntraPrediction::eipMergeNeighbours( const PredictionUnit& pu, std::vector<
   add( topLeft.offset( -1, -1 ) );
   add( topLeft.offset( area.width, -1 ) );
   add( topLeft.offset( -1, area.height ) );
+  numAdjacent = (int) cus.size();
   int offsetX = 0, offsetY = 0;
   int offsetX0 = 0, offsetX1 = 0, offsetX2 = area.width >> 1;
   int offsetY0 = 0, offsetY1 = 0, offsetY2 = area.height >> 1;

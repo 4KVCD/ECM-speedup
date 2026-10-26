@@ -70,37 +70,43 @@ int glmGradient( int glm, int x, int y, int l, int u )
 {
   const int type = P.cclmFilter == CCLM_FILTER_6TAP ? 0 : P.cclmFilter == CCLM_FILTER_AVERAGE ? 1 : 2;
   const int c    = ( type * NUM_GLM_PATTERN + glm - 1 ) * 9;
-  int g = GLM_PATTERN[c] * recoAt( 0, x - l, y ) + GLM_PATTERN[c + 1] * recoAt( 0, x, y ) + GLM_PATTERN[c + 2] * recoAt( 0, x + 1, y )
-          + GLM_PATTERN[c + 3] * recoAt( 0, x - l, y + 1 ) + GLM_PATTERN[c + 4] * recoAt( 0, x, y + 1 )
-          + GLM_PATTERN[c + 5] * recoAt( 0, x + 1, y + 1 );
-  if( type == 2 )
+  int       g    = 0;
+  // (a loop of one call site: the driver inlines every call of this function's callers - hundreds -, so the taps
+  // written out would make that many copies of each read)
+  [[dont_unroll]] for( int k = 0; k < ( type == 2 ? 9 : 6 ); k++ )
   {
-    g += GLM_PATTERN[c + 6] * recoAt( 0, x - l, y - u ) + GLM_PATTERN[c + 7] * recoAt( 0, x, y - u )
-         + GLM_PATTERN[c + 8] * recoAt( 0, x + 1, y - u );
+    const int col = k % 3, row = k / 3;
+    g += GLM_PATTERN[c + k] * recoAt( 0, col == 0 ? x - l : x + col - 1, row == 2 ? y - u : y + row );
   }
   return int( int16_t( g ) );   // (a Pel)
+}
+
+// xGetLumaRecPixels' downsampling of the co-located luma at the luma sample (x, y) the filter centres on, by
+// Params::cclmFilter: per filter its taps' column (0 the sample's, 1 the one right of it, 2 the one l left), row (0 the
+// sample's, 1 the one below, 2 the one t above; l, t 0 where that side pads) and weight, then the rounding
+const int CCLM_TAPS = 6;
+const int CCLM_DOWNSAMPLE[3 * CCLM_TAPS * 3] = int[](
+  0, 0, 1,  1, 0, 1,  0, 1, 1,  1, 1, 1,  0, 0, 0,  0, 0, 0,     // the mean of 2 x 2
+  0, 2, 1,  0, 0, 4,  2, 0, 1,  1, 0, 1,  0, 1, 1,  0, 0, 0,     // the 5-tap cross
+  0, 0, 2,  1, 0, 1,  2, 0, 1,  0, 1, 2,  1, 1, 1,  2, 1, 1 );   // 1 2 1 over two rows
+int cclmDownsample( int x, int y, int l, int t )
+{
+  const int f   = P.cclmFilter;
+  int       sum = 0;
+  [[dont_unroll]] for( int k = 0; k < CCLM_TAPS; k++ )   // (one call site of recoAt: glmGradient's reason)
+  {
+    const int o = ( f * CCLM_TAPS + k ) * 3, col = CCLM_DOWNSAMPLE[o], row = CCLM_DOWNSAMPLE[o + 1];
+    sum += CCLM_DOWNSAMPLE[o + 2] * recoAt( 0, col == 2 ? x - l : x + col, row == 2 ? y - t : y + row );
+  }
+  return f == CCLM_FILTER_AVERAGE ? ( sum + 2 ) >> 2 : ( sum + 4 ) >> 3;
 }
 
 // the co-located luma block's downsampled sample (i, j) (luma origin (lx, ly)), with GLM pattern glm (0: none) its
 // gradient; the side not available pads the filter
 int cclmLumaInner( int lx, int ly, int i, int j, bool leftAvail, bool aboveAvail, int glm )
 {
-  const int x = lx + 2 * i, y = ly + 2 * j, l = i == 0 && !leftAvail ? 0 : 1;
-  if( glm != 0 )
-  {
-    return glmGradient( glm, x, y, l, j == 0 && !aboveAvail ? 0 : 1 );
-  }
-  if( P.cclmFilter == CCLM_FILTER_AVERAGE )
-  {
-    return ( recoAt( 0, x, y ) + recoAt( 0, x + 1, y ) + recoAt( 0, x, y + 1 ) + recoAt( 0, x + 1, y + 1 ) + 2 ) >> 2;
-  }
-  if( P.cclmFilter == CCLM_FILTER_CROSS )
-  {
-    const int t = j == 0 && !aboveAvail ? 0 : 1;
-    return ( recoAt( 0, x, y - t ) + 4 * recoAt( 0, x, y ) + recoAt( 0, x - l, y ) + recoAt( 0, x + 1, y ) + recoAt( 0, x, y + 1 ) + 4 ) >> 3;
-  }
-  return ( 2 * recoAt( 0, x, y ) + recoAt( 0, x + 1, y ) + recoAt( 0, x - l, y ) + 2 * recoAt( 0, x, y + 1 ) + recoAt( 0, x + 1, y + 1 )
-           + recoAt( 0, x - l, y + 1 ) + 4 ) >> 3;
+  const int x = lx + 2 * i, y = ly + 2 * j, l = i == 0 && !leftAvail ? 0 : 1, t = j == 0 && !aboveAvail ? 0 : 1;
+  return glm != 0 ? glmGradient( glm, x, y, l, t ) : cclmDownsample( x, y, l, t );
 }
 
 // the downsampled sample i of the row above the co-located block: in a CTU's first row from its one luma row above
@@ -118,39 +124,15 @@ int cclmLumaAbove( int lx, int ly, int i, bool leftAvail, int glm )
     return P.cclmFilter == CCLM_FILTER_AVERAGE ? ( recoAt( 0, x, ly - 1 ) + recoAt( 0, x + 1, ly - 1 ) + 1 ) >> 1
                                               : ( 2 * recoAt( 0, x, ly - 1 ) + recoAt( 0, x - l, ly - 1 ) + recoAt( 0, x + 1, ly - 1 ) + 2 ) >> 2;
   }
-  const int y = ly - 2;
-  if( P.cclmFilter == CCLM_FILTER_AVERAGE )
-  {
-    return ( recoAt( 0, x, y ) + recoAt( 0, x + 1, y ) + recoAt( 0, x, y + 1 ) + recoAt( 0, x + 1, y + 1 ) + 2 ) >> 2;
-  }
-  if( P.cclmFilter == CCLM_FILTER_CROSS )
-  {
-    return ( recoAt( 0, x, y - 1 ) + 4 * recoAt( 0, x, y ) + recoAt( 0, x - l, y ) + recoAt( 0, x + 1, y ) + recoAt( 0, x, y + 1 ) + 4 ) >> 3;
-  }
-  return ( 2 * recoAt( 0, x, y ) + recoAt( 0, x + 1, y ) + recoAt( 0, x - l, y ) + 2 * recoAt( 0, x, y + 1 ) + recoAt( 0, x + 1, y + 1 )
-           + recoAt( 0, x - l, y + 1 ) + 4 ) >> 3;
+  return cclmDownsample( x, ly - 2, l, 1 );
 }
 
 // the downsampled sample j of the column left of the co-located block (from the luma columns lx - 3 .. lx - 1), with
 // GLM the gradient
 int cclmLumaLeft( int lx, int ly, int j, bool aboveAvail, int glm )
 {
-  const int x = lx - 2, y = ly + 2 * j;
-  if( glm != 0 )
-  {
-    return glmGradient( glm, x, y, 1, j == 0 && !aboveAvail ? 0 : 1 );
-  }
-  if( P.cclmFilter == CCLM_FILTER_AVERAGE )
-  {
-    return ( recoAt( 0, x, y ) + recoAt( 0, x + 1, y ) + recoAt( 0, x, y + 1 ) + recoAt( 0, x + 1, y + 1 ) + 2 ) >> 2;
-  }
-  if( P.cclmFilter == CCLM_FILTER_CROSS )
-  {
-    const int t = j == 0 && !aboveAvail ? 0 : 1;
-    return ( recoAt( 0, x, y - t ) + 4 * recoAt( 0, x, y ) + recoAt( 0, x - 1, y ) + recoAt( 0, x + 1, y ) + recoAt( 0, x, y + 1 ) + 4 ) >> 3;
-  }
-  return ( 2 * recoAt( 0, x, y ) + recoAt( 0, x + 1, y ) + recoAt( 0, x - 1, y ) + 2 * recoAt( 0, x, y + 1 ) + recoAt( 0, x + 1, y + 1 )
-           + recoAt( 0, x - 1, y + 1 ) + 4 ) >> 3;
+  const int x = lx - 2, y = ly + 2 * j, t = j == 0 && !aboveAvail ? 0 : 1;
+  return glm != 0 ? glmGradient( glm, x, y, 1, t ) : cclmDownsample( x, y, 1, t );
 }
 
 // ----- the model (xGetLMParametersLMS, xLMSampleClassifiedTraining, xCalcLMParametersGeneralized; one invocation)
@@ -507,52 +489,62 @@ int cclmPredSample( Tu t, int lx, int ly, int i, int j, int maxPel, int slot )
   return clamp( v, 0, maxPel );
 }
 
-// filterPredInside's padding above (x = 0 .. W - 1) and left (y = 0 .. H - 1) of the prediction: the reconstruction
-// where that side is available, else the prediction's first row / column
-int cclmInsideAbove( Tu t, int lx, int ly, int x, int maxPel, int slot )
+// filterPredInside's padding above (x = 0 .. W - 1) and left (y = 0 .. H - 1) of the prediction as a source (z 1:
+// the reconstruction at (x, y) of the picture, 0: the prediction at (x, y) of the block): the reconstruction where
+// that side is available, else the prediction's first row / column
+ivec3 cclmInsideAbove( Tu t, int x )
 {
-  return s_cclm[CCLM_POS_ABOVE] != 0 ? recoAt( t.comp, t.x + x, t.y - 1 ) : cclmPredSample( t, lx, ly, x, 0, maxPel, slot );
+  return s_cclm[CCLM_POS_ABOVE] != 0 ? ivec3( t.x + x, t.y - 1, 1 ) : ivec3( x, 0, 0 );
 }
 
-int cclmInsideLeft( Tu t, int lx, int ly, int y, int maxPel, int slot )
+ivec3 cclmInsideLeft( Tu t, int y )
 {
-  return s_cclm[CCLM_POS_LEFT] != 0 ? recoAt( t.comp, t.x - 1, t.y + y ) : cclmPredSample( t, lx, ly, 0, y, maxPel, slot );
+  return s_cclm[CCLM_POS_LEFT] != 0 ? ivec3( t.x - 1, t.y + y, 1 ) : ivec3( 0, y, 0 );
 }
 
 // filterPredInside's padded prediction at (x, y), -1 <= x <= W, -1 <= y <= H: the prediction inside and, right of and
 // below it, its last column / row; above and left cclmInsideAbove / Left; the three corners the reconstruction where
-// available, else the top-left one the mean of its two neighbours, the others the padding next to them
+// available, else the top-left one the mean of its two neighbours, the others the padding next to them. Its one or two
+// sources read in one loop: this function is inlined at each of the filter's taps, and a read of the prediction is a
+// whole CCLM / CCCM prediction of the sample
 int cclmInsideSample( Tu t, int lx, int ly, int x, int y, int maxPel, int slot )
 {
   const int W = t.w, H = t.h;
+  ivec3     a = ivec3( min( x, W - 1 ), min( y, H - 1 ), 0 ), b = a;
+  int       n = 1;
   if( y < 0 && x < 0 )
   {
-    return s_cclm[CCLM_POS_LEFT_ABOVE] != 0 ? recoAt( t.comp, t.x - 1, t.y - 1 )
-         : ( cclmInsideAbove( t, lx, ly, 0, maxPel, slot ) + cclmInsideLeft( t, lx, ly, 0, maxPel, slot ) + 1 ) >> 1;
+    a = s_cclm[CCLM_POS_LEFT_ABOVE] != 0 ? ivec3( t.x - 1, t.y - 1, 1 ) : cclmInsideAbove( t, 0 );
+    b = cclmInsideLeft( t, 0 );
+    n = s_cclm[CCLM_POS_LEFT_ABOVE] != 0 ? 1 : 2;
   }
-  if( y < 0 )
+  else if( y < 0 )
   {
-    return x < W ? cclmInsideAbove( t, lx, ly, x, maxPel, slot )
-         : s_cclm[CCLM_POS_ABOVE_RIGHT] != 0 ? recoAt( t.comp, t.x + W, t.y - 1 ) : cclmInsideAbove( t, lx, ly, W - 1, maxPel, slot );
+    a = x < W ? cclmInsideAbove( t, x )
+      : s_cclm[CCLM_POS_ABOVE_RIGHT] != 0 ? ivec3( t.x + W, t.y - 1, 1 ) : cclmInsideAbove( t, W - 1 );
   }
-  if( x < 0 )
+  else if( x < 0 )
   {
-    return y < H ? cclmInsideLeft( t, lx, ly, y, maxPel, slot )
-         : s_cclm[CCLM_POS_LEFT_BELOW] != 0 ? recoAt( t.comp, t.x - 1, t.y + H ) : cclmInsideLeft( t, lx, ly, H - 1, maxPel, slot );
+    a = y < H ? cclmInsideLeft( t, y )
+      : s_cclm[CCLM_POS_LEFT_BELOW] != 0 ? ivec3( t.x - 1, t.y + H, 1 ) : cclmInsideLeft( t, H - 1 );
   }
-  return cclmPredSample( t, lx, ly, min( x, W - 1 ), min( y, H - 1 ), maxPel, slot );
+  int sum = 0;
+  [[dont_unroll]] for( int k = 0; k < n; k++ )
+  {
+    const ivec3 s = k == 0 ? a : b;
+    sum += s.z != 0 ? recoAt( t.comp, s.x, s.y ) : cclmPredSample( t, lx, ly, s.x, s.y, maxPel, slot );
+  }
+  return n == 2 ? ( sum + 1 ) >> 1 : sum;
 }
 
 // LBCCP's filtered sample (x, y): the padded prediction around it weighed 1, itself 8, the sum over 16
 int cclmInsideFiltered( Tu t, int lx, int ly, int x, int y, int maxPel, int slot )
 {
   int sum = 0;
-  for( int dy = -1; dy <= 1; dy++ )
+  [[dont_unroll]] for( int k = 0; k < 9; k++ )
   {
-    for( int dx = -1; dx <= 1; dx++ )
-    {
-      sum += ( dx == 0 && dy == 0 ? 8 : 1 ) * cclmInsideSample( t, lx, ly, x + dx, y + dy, maxPel, slot );
-    }
+    const int dx = k % 3 - 1, dy = k / 3 - 1;
+    sum += ( dx == 0 && dy == 0 ? 8 : 1 ) * cclmInsideSample( t, lx, ly, x + dx, y + dy, maxPel, slot );
   }
   return ( sum + 8 ) >> 4;
 }

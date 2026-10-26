@@ -702,9 +702,10 @@ commands that combine `Remove-Item` with `//` text. `perf\gpu\crlf.ps1 <worktree
 | script | use |
 |---|---|
 | `partial.py <build> [-j N] [streams]` | partial verification of the 19 regular streams (C:\Code\ECM\streams): per stream the pictures verified / differing and the first difference, then the CUs taken from the CPU by reason; logs in runs/partial. The test gate of every step since M57. A stream given as a path (`C:/Code/ECM/streams_ld/ld_foreman_q32.bin`) runs from there: the RTX 3070 PC's inter streams (LD-B, LD-P, RA of foreman / ParkJoy / FourPeople, made with grn's EncoderApp and the ECM cfgs) are in C:\Code\ECM\streams_ld |
+| `private_globals.py <module.spv>...` | the per-invocation globals one function other than the entry point uses alone, which the optimizer's private-to-local pass breaks without inlining (run it on the build's `spv/*.raw.spv` after adding such a global; each must be used by a second function) |
 | `inline_size.py <module.spv> [N]` | a shader's size with every call inlined (what the drivers compile) and the functions that make it; check inter_mc / intra_rec after adding a call to a large function |
 | `slangopt.cmd` / `slangopt.py` | spirv-opt's stand-in from Nsight Graphics' SPIRV-Tools (section 4's build without the SDK); `ECM_GPU_INTRA_REC_SPV=<file.spv>` / `ECM_GPU_INTER_MC_SPV=<file.spv>` make a decoder take that module for intra_rec's first module / inter_mc (an experiment on a changed shader, e.g. the driver's compile, without a rebuild) |
-| development switches | `ECM_GPU_NO_CCP_LFNST=1`: partial verification leaves the pictures that need LEVEL_CCP_LFNST's pipeline (intra_rec's second module) unverified - on the 3070 PC its cold compile needs over 35 GB, past the budget, and most intra pictures need it. `ECM_GPU_CPU_KINDS=GPM,affine,...`: those inter CU kinds (interKind's names) keep the CPU's prediction (which kind a difference is in). `ECM_GPU_PIPELINE_TIMES=1` also names a pipeline before it compiles. `ECM_GPU_FAULT=1` enables VK_EXT_device_fault: a lost device prints the faulting addresses, and every buffer prints its address range at its creation. `ECM_GPU_NO_DERIVED_CCP=1`: as ECM_GPU_NO_CCP_LFNST for LEVEL_CCP_DERIVED's pipelines (the MPM one did not compile within the budget on 2026-10-25) |
+| development switches | `ECM_GPU_NO_CCP_LFNST=1`: partial verification leaves the pictures that need LEVEL_CCP_LFNST's pipeline (intra_rec's second module) unverified - on the 3070 PC its cold compile needs over 35 GB, past the budget, and most intra pictures need it. `ECM_GPU_CPU_KINDS=GPM,affine,...`: those inter CU kinds (interKind's names) keep the CPU's prediction (which kind a difference is in). `ECM_GPU_PIPELINE_TIMES=1` also names a pipeline before it compiles. `ECM_GPU_FAULT=1` enables VK_EXT_device_fault: a lost device prints the faulting addresses, and every buffer prints its address range at its creation. `ECM_GPU_NO_DERIVED_CCP=1`: as ECM_GPU_NO_CCP_LFNST for LEVEL_CCP_DERIVED's pipelines (the MPM one did not compile within the budget on 2026-10-25). `ECM_GPU_DIFFS=1`: a picture's first differing block also lists its samples, CPU / GPU, prediction and residual. `ECM_GPU_MIN_LEVEL=<n>` runs every intra picture in a pipeline of at least that level (a speed comparison of the pipelines on the same pictures; the output is the same). |
 | `spirv_noinline.py <in.spv> <out.spv> <min> [names]` | marks functions DontInline (the named ones, or those of at least `min` inlined SPIR-V instructions called more than once): an experiment on the driver's compile memory via ECM_GPU_INTRA_REC_SPV. On the 3070 (2026-10-25) it halved intra_rec's but the output was wrong and 20 % slower: not for NVIDIA |
 | `precompile.py <build> [-j N] [variant:level ...]` | compiles intra_rec's pipelines into runs/nvcache and runs/pipecache (see 1a: after a shader change `8:0` .. `8:6`) |
 | `verify_all.py [-j N] <build> [streams]` | the full regression: `--GpuRecon=2` over the 444 GPU test streams (C:\Code\ECM\streams_gpu); M66 baseline 1565 verified, 8 skipped, 0 differences |
@@ -2971,10 +2972,111 @@ intra merge neighbour of a kind the GPU lacks 605 (512 of them a neighbour recor
 the CPU: a cascade), CIIP with inter CCP merge 259 (+ affine 72, GPM 62), GPM CIIP with LIC 198, IntraTMP OBMC with
 inter or two-vector neighbours 182, IBC bi-prediction 180, EIP merge in inter slices 180, LIC with DMVR + BDOF 151,
 affine CIIP 140, CIIP with inter CCCM 126.
+intra_rec's size (2026-10-25): the CCLM / GLM / CCCM luma helpers (cclmDownsample, glmGradient, cccmDownsample,
+cccmFeature, LBCCP's cclmInsideSample) read their taps in loops of one call site ([[dont_unroll]],
+GL_EXT_control_flow_attributes) instead of written-out taps: each is inlined hundreds of times, and every tap was a
+copy of recoAt / cccmLumaOf / cclmPredSample. Inlined size (inline_size.py) 1.00M -> 0.68M for intra_rec's module,
+1.21M -> 0.76M for the CCP-LFNST one; recoAt's copies 9098 -> 1024. The CCP-LFNST pipeline (8:6), which needed more
+than the ~35 GB the budget left, compiles in 818 s and 18.7 GB, so ECM_GPU_NO_CCP_LFNST / NO_DERIVED_CCP are not
+needed on the 3070 any more. Intra merge CUs whose neighbour has no node (a CU from the CPU, recorded CU_KNOWN) of the
+merge's or DIMD's kind: mergeClass gives the CPU's parameters (cpuDimdParams, the values verification compares a
+node's with) and endPicture uploads them into that CU's DimdOut, so the neighbour stays a candidate instead of sending
+the merge CU, and in turn its own merge neighbours, to the CPU (512 of the 605 such CUs were that cascade, most in
+pj720_ai / fp720_ai).
 Also tried (2026-10-25), not kept: intra_rec with its 29 largest functions of several call sites marked DontInline
 (perf/gpu/spirv_noinline.py; ECM_GPU_INTRA_REC_SPV): the MPM + derived CCP pipeline compiled in 19.9 GB instead of
 more than the ~35 GB left under the budget, but the output differed (inter CCP merge chroma blocks) and the GPU time
 grew by 20 %.
+M119 (2026-10-25): the size cut and the merge feed above, three fixes of older bugs, eight ports, intra_rec in
+slices and faster IntraTMP nodes.
+- Fix: a motion run of IntraTMP's OBMC (intra_obmc.glsl's obmcSideOps) took its first unit's IBC LIC for the whole
+  run; getSameNeigMotion ends a run where the LIC flag, scale or offset changes, so a run now extends only over units
+  of the same LIC (ai_foreman / aiodd: an IntraTMP CU at 64,32, 32 x 4, whose units 5 and 6 had other models).
+- EIP merge in inter slices (getNeiEipCands' temporal candidates): the collocated picture's models at the
+  bottom-right / centre positions at five distances after the adjacent CUs' models, and the same shifted by the first
+  adjacent inter neighbour's motion towards the collocated picture after the non-adjacent ones. The CPU's loops are one
+  function now (IntraPrediction.cpp's eipColModels, getNeiEipCands calls it; its subpicture / picture bounds keep the
+  CPU's unsigned comparison, which rules out positions left of or above the picture); eipTemporalModels lists them
+  for the host, which gives each a picture EIP index of the CPU's model (eipModelIndex, uploaded like a CPU CU's) and
+  a source of no CU record (-1: intra_deps waits for no node). The history is empty in an inter slice of separate
+  trees, as tryHistEip has it.
+- IBC with OBMC (subBlockOBMC of an IBC CU of luma alone - an intra slice's dual tree -, up to 32 x 32 and one TU): the
+  IntraTMP OBMC record (bvObmcUnits, which addTmpObmcRecord now calls too), planned with the CU's own vector and
+  LIC flag, scale and offset (licScale / licOffset of list 0's luma, what getSameNeigMotion compares), the block's
+  prediction and its motion runs' copies in one loop, then tmpObmc's blends and the reconstruction (intra_ibccu.glsl's
+  ibcBlock; the MPM pipelines, which hold intra_obmc.glsl, run the picture).
+- IBC bi-prediction (JVET-AE0169): xPredInterBi's two copies of the picture at the intermediate precision (ibcPredict
+  / ibcChromaPredict with hp: a copy shifted up by the headroom, one filter pass shifted down by the filter's
+  precision less it, a second pass by the precision; ibcRound), averaged as xWeightedAverage averages; two equal
+  vectors predict as one (xCheckIdenticalMotion). LIC, RR-IBC, BCW, weighted prediction, the IBC filter and OBMC beside
+  it stay on the CPU.
+- OBMC units of IntraTMP / IBC CUs next to an IBC CU of two vectors: their runs compare both vectors, both must be
+  valid (checkIsIBCCandidateValidBi), the run's two copies are made at the intermediate precision and averaged at the
+  blend; skipObmcConditionByPixel checks the first vector, then the second (an invalid one ends the checks).
+- CIIP (and GPM with an intra part) whose chroma blends inter CCCM or inter CCP merge: DecCu blends CIIP's first
+  (geneWeightedPred before xDecodeInterTexture's TU loop), so those blends read CIIP's prediction. A pre-pass record
+  per chroma block (ciipChromaPrePass: a CIIP block without residual, CIIP_TO_PRED) blends CIIP's intra prediction
+  into the inter one and writes the result where the TU's chroma block reads its inter prediction (Tu::ibc: that
+  block's place in Params::interPred); that block then blends neither CIIP nor OBMC again and waits for the pre-pass
+  (DERIVE_PREFIX, which inter CCCM / CCP merge blocks have). With inter CCCM the luma block keeps its CIIP blend in its
+  inter prediction too (CIIP_KEEP_PRED), the luma prediction inter CCCM fits to (not forward-mapped again, as DecCu
+  maps no CIIP prediction). Verification's first differing block skips the pre-pass records.
+- GPM with an intra part whose CU-level LIC flag is set: as M118 found for GPM without one, the flag is the last
+  part's and the inter part's LIC comes from its record, so gpmWhy no longer rejects it.
+- GPM bi-prediction parts with LIC (not with BDOF or DMVR): xPredInterBlk's geo branch applies the part's inherited
+  model to each list's intermediate where it is not the identity (nonTrivialModel), before BCW's average: the part's
+  record (MC_BI | MC_GPM) goes through mcPlain with the part's models, which leaves an identity list as it is;
+  gpmPartAt applies a part's LIC itself only to a uni-prediction part (one without a record of its own).
+- OBMC of an inter CU next to an IBC neighbour (subBlockOBMC's MODE_IBC strip, xSubblockTMOBMC's mode 2): the segment
+  (OBMC_SEG_IBC, with the neighbour's vector; no inter_mc job) is copied from the picture in intra_rec
+  (intra_obmc.glsl's obmcInterIbc, from interObmcBand: the luma mapped back by LMCS's inverse, subBlockOBMC's lut),
+  with skipObmcConditionByPixel's test at the vector clipped to the strip and rounded (not for GPM's separate OBMC);
+  the CU's blocks wait for every block before them (DERIVE_PREFIX). An IBC neighbour of two vectors or LIC, and a CU
+  of several TUs or ASBT (the test reads the whole strip's prediction before OBMC), stay on the CPU. interObmcBand
+  now has one call site of the strips, the modes and the blend for GPM's parts and the plain case (intra_rec's
+  inlined size 0.699M -> 0.690M with the IBC copies added).
+- intra_rec in slices: a picture of the full intra tool set takes longer than Windows' GPU timeout (2 s, after which
+  the device is lost; section 8), so intra_rec's dispatch ends after a budget of blocks and the host dispatches it
+  again until every block is done. A workgroup counts each block it starts (sched counter 4) and stops when the
+  budget is spent; a block it has taken over from a finished dependency (the chain's next one) goes back into the
+  queue for the next slice. The budget follows the time per block measured so far (SLICE_NS, 250 ms per slice; at
+  least 64 blocks), and a slice that finishes no block is an error.
+- IntraTMP's node keeps the CU's own template (every cost compares it) in shared memory, in sign prediction's first
+  stage buffer (s_spStage1, free during a node), and the sub-sample search's region in sign prediction's other buffers
+  instead of reading the picture for each candidate.
+- IntraTMP's list updates (invocation 0, after each chunk of 256 costs; section 8: most of a node's time) walk only the
+  positions that may change a list, which the workgroup marks with the costs (s_spCost): in the refinement a cost below
+  its type's threshold at the chunk's start (thresholds only fall), in the sparse search a position that is in a list
+  after the chunk - the lists keep the first positions by cost, then order, so it ranks below the list's length among
+  the list's entries and the chunk's positions (earlier ones that cost no more, later ones that cost less).
+- The scratch (each workgroup's own part: IntraTMP's lists, CCCM's buffers, the blending sums, ...) is accessed with
+  workgroup-scope coherence (WBufI32: workgroupcoherent) instead of device scope, so it stays in the SM's cache: the
+  single-invocation loops over the lists no longer wait for L2 at each access.
+- The OBMC record's layout (OBMC_REC_*, OBMC_SEG_*) is in intra_common.glsl for intra_rec and intra_deps: intra_deps
+  read the segments with a stride of 4 words written out, which OBMC_SEG_MV's 6 broke during this work (dependencies
+  of OBMC strips next to intra neighbours went missing).
+- Fix: intra_deps' deduplication of a block's dependencies (g_uniq, used by addEdge alone) was moved into addEdge by
+  the SPIR-V optimizer's private-to-local pass, which assumes inlining (ECM_SPIRV_INLINE=OFF turns it off): every
+  call started with an uninitialized list, which dropped dependencies that matched its garbage and kept duplicates (an
+  ISP sub-partition of ld_md5's first picture without its node, and pictures of fp720_ai / pj720_ai). Its list and
+  count are one variable now, which main resets; perf/gpu/private_globals.py lists such variables of a module.
+- Fix: an intra merge CU's IntraTMP neighbour names its CU in the merge record by the CodingStructure index
+  (MERGE_NBR_TMP), not a CU record: both dependency analyses (the host's, intra_deps') read a record past the end
+  there; such pairs add nothing now (the node waits for all before it, DERIVE_PREFIX).
+- Development: ECM_GPU_DIFFS=1 lists the first differing block's samples (CPU / GPU prediction and residual);
+  ECM_GPU_MIN_LEVEL=<n> runs every intra picture in a pipeline of at least that level. A scheduling mismatch names both
+  blocks of the edge, their dependency counts and both sides' dependencies; the affine CUs from the CPU give the reason
+  (affineWhy, which affineGpu now wraps).
+Results (RTX 3070, build grn39, partial.py -j 1, every picture: no ECM_GPU_NO_* switch): identical ai720, aiodd,
+ai_foreman, ai_md5, ai_parkjoy, pj720_ai, ld_cif33, ld_foreman, ld_md5, raodd, ra_foreman, ra_parkjoy, ra_long (257
+pictures), ldp_foreman_q32, ld_foreman_q22, ld_foreman_q32, ld_four_q32, ra_foreman_q32. Differing, each in pictures
+the switches skipped before (section 9, 000): ai_long 2 of 33 and ra720 1 of 3 (NN), fp720_ai 5 of 8 (chroma
+reordering's DIMD, NN, SGPM's MTSS), ra_cif33 1 of 33 (SGPM's MTSS), CCP merge models in ra_ip64_md5 1 of 257,
+ra720_pj17 5 of 17, ldp_parkjoy_q27 1 of 9, ld_parkjoy_q27 1 of 9, and ra_parkjoy_q32 1 of 17 (an OBIC CU's second
+mode). Inter CUs on the GPU 42,423, on the CPU ~1,060 (top: LIC with DMVR 151, affine CIIP with LIC 142, GPM CIIP of
+several TUs 130, GPM with an affine part with LIC 118, LIC with BDOF 109, multi-hypothesis 96, affine CIIP of
+sub-block merge 90); intra CUs from the CPU ~600 (IBC bi-prediction with LIC / flip / BCW / OBMC 158, BVG-CCCM 89,
+IntraTMP OBMC with an inter neighbour 69, an intra merge neighbour of a kind the GPU lacks 47).
 
 ## 8. Numbers (i7-10700 8C/16T, Win11, GCC 16.2, RTX 3070 driver 616.92)
 
@@ -2993,20 +3095,56 @@ Profile of a GPU-on decode (non-LTO, m2_park16, share of all samples): parsing ~
 (host dependency analysis ~7 % - now moved to the GPU by 180ccabc - and the GPU wait ~5 %), loop filter CPU work
 9 % (even with LoopFilterDisable), Vulkan start-up 17 % (now hidden by background creation).
 
+Intra pictures of the full tool set (2026-10-25, M119's work, RTX 3070): aiodd's one picture (CIF-sized, every
+intra tool), whose whole decode takes the CPU 0.14 s, took 0.94 s of GPU time in intra_rec at M119's start, 761 ms
+with its ports and slices (grn22), now 370 ms (grn39; median of 3, idle GPU); ai720 (720p: 0.45 s on the CPU) 4,427
+-> 2,369 ms. A temporary per-block timer (the device's realtime clock
+at each block's start and end) shows the blocks' durations adding up to the picture's GPU time: the picture runs along
+one chain of dependencies, the other 31 workgroups idle. IntraTMP's nodes took two thirds of it (600 ms of aiodd's
+940); timers of their phases (lid 0, after the barriers) put 470 ms in invocation 0's list updates (the refinement's
+351, the sparse search's 117: per position global loads of the lists and positions, in a single invocation), 57 ms in
+its enumeration of the positions, 26 ms in the clustering, and 3 ms in the costs themselves. The survivor filters and
+the workgroup-scope scratch (section 7, M119) leave (aiodd, with the timers): IntraTMP nodes 147 ms (the enumeration
+57, the list updates 46, the setup 15, the clustering 8), chroma blocks of a known mode (CCLM / CCCM / CCP kinds) 79 ms
+(130 blocks), TIMD nodes 49 ms (190), luma blocks of a known mode 25 ms (193), MPM nodes 17 ms, TMRL nodes 15 ms,
+SGPM nodes 13 ms. The pipeline's size does not matter: ai_md5's 33 pictures took 910 ms in their own pipelines and
+918 ms all in the CCP-LFNST one (ECM_GPU_MIN_LEVEL). Unrolling the costs' loads (16 in flight per invocation) changed
+little (the costs are few per node: ~1,100 positions).
+Such pictures exceeded Windows' GPU timeout (2 s: VK_ERROR_DEVICE_LOST, nvlddmkm event 153, the device fault
+report only instruction pointers): every 720p intra stream was lost on this PC once the CCP-LFNST pipeline compiled
+within the budget (M118's 3070 runs skipped those pictures with ECM_GPU_NO_CCP_LFNST). intra_rec now runs in slices
+(see section 7, M119).
+
 ## 9. Next steps (in the order I would take them)
 
-00. Now (2026-10-24, the inter phase, after M117; on the RTX 3070 PC):
+000. Now (2026-10-25, after M119; RTX 3070 PC): every picture verifies (no ECM_GPU_NO_* switch needed). Open
+   differences, all of them older (pictures the switches skipped before):
+   a. An SGPM CU's MTSS LFNST / NSPT mode (ra_cif33 POC 32 CU 199, ra_ip64_md5, fp720_ai): CU 32x32, its LFNST mode
+      without MTSS 50, the prediction's DIMD 50 / 57, MTSS's list 46 54 60; the CPU takes 57 (LFNST set other than
+      50's), the GPU the list's last, 60 - every DimdOut field it reads agrees, so trace sgpmMtss's inputs on the GPU
+      (its call, the DIMD of the prediction it reads, mtssChoice's second).
+   b. NN's indicesRepresentationPnn (ai_long POC 5, ra720, fp720_ai).
+   c. Chroma reordering's fifth strongest DIMD mode (fp720_ai: dimdBlendModeChroma[4], CPU 7 GPU 10): the top four
+      agree, so the histogram (dimdChromaHistogramCalls against deriveDimdChromaMode) differs a little.
+   d. CCP merge models of inter pictures (type, params, a, ccInsideFilter: ra720_pj17, ra_ip64_md5, ldp_parkjoy_q27,
+      ld_parkjoy_q27; in ra720_pj17 the first difference moves between runs in two pictures: a missing dependency?).
+      grn4 shows them alike. And an OBIC CU's second mode (ra_parkjoy_q32 POC 16 CU 8: obicMode[1] CPU 10 GPU 0).
+   e. Performance (section 8): IntraTMP's enumeration of positions in parallel (57 ms of aiodd), CCCM's features once
+      per template sample (its accumulation 23 ms), then the blocks of a known mode (luma 130-190 us each, chroma
+      ~0.6 ms): profile their phases as IntraTMP's were.
+   f. Ports by count: affine CIIP (affineWhy now names each reason), LIC with DMVR / BDOF (JVET-AG0276:
+      xLicCompAdjBdof applies the models to BDOF's extended intermediates), GPM CIIP of several TUs, IBC bi-prediction
+      with LIC / flip / BCW / OBMC, BVG-CCCM, GPM bi-prediction parts with BDOF.
+00. (2026-10-24, the inter phase, after M117; on the RTX 3070 PC):
    a. Open differences of the 3070 PC's streams: ai_long POC 5 (NN's indicesRepresentationPnn). The others of
       M117's time are gone with M118 (the non-local LIC OBMC plan, SGPM CUs of a 64-sample side) and the device
       losses with the OBMC strips' scratch fix (section 7); the pictures ECM_GPU_NO_DERIVED_CCP / NO_CCP_LFNST skip
       are not verified on this PC.
       ECM_GPU_CPU_KINDS narrows a difference to a kind (sub-PU CUs go their own way, not through it). A bdofOut /
       buffer read-back beside verification's download (endPicture) shows what a job wrote.
-   b. intra_rec's second module (LEVEL_CCP_LFNST) cannot compile on the 3070 within the 60 GB budget (>35 GB), and
-      most intra pictures need it; the first module's pipelines take 1-15 minutes and 7-30 GB each. Its inlined size
-      (inline_size.py: 1.19M, 1.0M for the first module) comes mostly from small helpers in hand-unrolled taps
-      (recoAt x7097, cccmLumaOf, glmGradient, cclmLumaInner): loops over the taps would cut it - a speed trade to
-      time, and every intra test after it.
+   b. Done (2026-10-25): intra_rec's pipelines compile within the budget again (section 7: the luma helpers' taps in
+      loops, 1.21M -> 0.76M inlined). Further cuts, if needed: decodedBefore's 342 copies (refLineAvailability, the
+      IBC validity checks), cccmFeature's 33, glmGradient's 113.
    c. Then the CUs still on the CPU by count (M118's results list them): the intra merge cascade first (give a
       neighbour from the CPU its CPU-made DimdOut - the values verification compares - uploaded, so that it stays a
       candidate), then IBC / IntraTMP OBMC with inter neighbours (their band from inter_mc, the blend in intra_rec),

@@ -111,11 +111,28 @@ int ibcRef( IbcRef g, int x, int y )
   return recoAt( g.comp, g.ox + x, g.oy + y );
 }
 
+// the filters' sum of a sample rounded to the sample (clipped) or, with hp, to the intermediate precision of
+// bi-prediction (IF_INTERNAL_PREC 14 less IF_INTERNAL_OFFS; InterpolationFilter's isLast false): a copy shifted up by
+// the headroom, one pass shifted down by the filter's precision less it, the second of two passes by the precision
+int ibcRound( int sum, bool filtered, bool both, int sh1, int sh2, int bitDepth, bool hp )
+{
+  if( !filtered )
+  {
+    return hp ? ( sum << ( 8 - sh1 ) ) - 8192 : sum;
+  }
+  if( hp )
+  {
+    return both ? sum >> 8 : ( sum - ( 8192 << sh1 ) ) >> sh1;
+  }
+  return clamp( both ? ( sum + ( 1 << ( sh2 - 1 ) ) + ( 8192 << 8 ) ) >> sh2 : ( sum + 128 ) >> 8, 0,
+                ( 1 << bitDepth ) - 1 );
+}
+
 // sample (i, j) of the prediction of the region of w x h at (px, py) at vector mv (1/16 samples) with the luma filter
 // or the bilinear one, for block `before`; delta: the padding's deltaX / deltaY (IbcRef). (Few call sites: ibcRef
 // inlines.)
 int ibcPredict( int px, int py, int w, int h, ivec2 mv, bool bilinear, int i, int j, int before, int bitDepth,
-                ivec2 delta )
+                ivec2 delta, bool hp )
 {
   IbcRef    g;
   const int fx = P.ibcFrac != 0 ? mv.x & 15 : 0, fy = P.ibcFrac != 0 ? mv.y & 15 : 0;
@@ -156,12 +173,7 @@ int ibcPredict( int px, int py, int w, int h, ivec2 mv, bool bilinear, int i, in
       sum += ibcTap( bilinear, fy, k ) * ( ( row - ( 8192 << sh1 ) ) >> sh1 );
     }
   }
-  const int maxPel = ( 1 << bitDepth ) - 1;
-  if( fx == 0 && fy == 0 )
-  {
-    return sum;
-  }
-  return clamp( both ? ( sum + ( 1 << ( sh2 - 1 ) ) + ( 8192 << 8 ) ) >> sh2 : ( sum + 128 ) >> 8, 0, maxPel );
+  return ibcRound( sum, fx != 0 || fy != 0, both, sh1, sh2, bitDepth, hp );
 }
 
 // ----- DBV's chroma (IntraPrediction::predIntraDbv of a single tree: getPredIBCBlk of a chroma component, 4:2:0)
@@ -217,7 +229,8 @@ bool ibcChromaValid( int comp, int px, int py, int w, int h, ivec2 mv, int xTap,
 // vector, the copy at the integer part; else m_chromaFilter in one pass rounded to the sample or in two through the
 // 14-bit intermediate, padded as xPredIBCBlkPadding pads where checkValidBv's reach - 6 chroma taps - is not all
 // decoded: IBC_INT_BV_VALID)
-int ibcChromaPredict( int comp, int px, int py, int w, int h, ivec2 mv, int i, int j, int before, int bitDepth )
+int ibcChromaPredict( int comp, int px, int py, int w, int h, ivec2 mv, int i, int j, int before, int bitDepth,
+                      bool hp )
 {
   IbcRef    g;
   const int fx = P.ibcFrac != 0 ? mv.x & 31 : 0, fy = P.ibcFrac != 0 ? mv.y & 31 : 0;
@@ -254,12 +267,7 @@ int ibcChromaPredict( int comp, int px, int py, int w, int h, ivec2 mv, int i, i
       sum += IBC_CHROMA_FILTER[fy * 6 + k] * ( ( row - ( 8192 << sh1 ) ) >> sh1 );
     }
   }
-  if( fx == 0 && fy == 0 )
-  {
-    return sum;
-  }
-  return clamp( both ? ( sum + ( 1 << ( sh2 - 1 ) ) + ( 8192 << 8 ) ) >> sh2 : ( sum + 128 ) >> 8, 0,
-                ( 1 << bitDepth ) - 1 );
+  return ibcRound( sum, fx != 0 || fy != 0, both, sh1, sh2, bitDepth, hp );
 }
 
 #endif

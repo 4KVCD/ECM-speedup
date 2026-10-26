@@ -219,7 +219,7 @@ int cccmLumaOf( int b, int x, int y )
   const int i = cccmLumaIndex( x, y ), a = i & 3, j = i >> 2;
   if( !g_cccmSharedLuma )
   {
-    return CBufI32( P.scratch ).v[cccmScratchBase() + b * cccmBufferSize() + i];
+    return WBufI32( P.scratch ).v[cccmScratchBase() + b * cccmBufferSize() + i];
   }
   return int( a < 2 ? s_angA[a][j] : s_angL[a - 2][j] );
 }
@@ -235,7 +235,7 @@ void cccmSetLuma( int b, int x, int y, int v )
   const int i = cccmLumaIndex( x, y ), a = i & 3, j = i >> 2;
   if( !g_cccmSharedLuma )
   {
-    CBufI32( P.scratch ).v[cccmScratchBase() + b * cccmBufferSize() + i] = v;
+    WBufI32( P.scratch ).v[cccmScratchBase() + b * cccmBufferSize() + i] = v;
   }
   else if( a < 2 )
   {
@@ -275,37 +275,33 @@ void cccmSync()
 // xCccmGetLumaVal (4:2:0) at chroma sample (cx, cy) of the picture: downsampling filter `fi` of the chroma location
 // type (Params::cclmFilter; 0 the mean, JVET-AD0202's 1 to 3 gradients, negative ones 0), its samples left of / above
 // the picture those of its first column / row (JVET-AP0105), minus the luma offset
+// (per Params::cclmFilter and filter its weights of the 3 x 3 luma samples around (2 cx, 2 cy), row by row from the one
+// above: the mean's or the downsampling's, then the gradients 1 to 3; a loop of one recoAt: cccmDownsample's callers
+// are inlined many times)
+const int CCCM_DOWNSAMPLE[3 * 4 * 9] = int[](
+  // the mean of 2 x 2
+  0, 0, 0,  0, 1, 1,  0, 1, 1,     0, 0, 0,  0, 1, -1,  0, 1, -1,     0, 0, 0,  0, 1, 1,  0, -1, -1,
+  0, 0, 0,  0, 0, 1,  0, -1, 0,
+  // the 5-tap cross
+  0, 1, 0,  1, 4, 1,  0, 1, 0,     1, 0, -1,  2, 0, -2,  1, 0, -1,    1, 2, 1,  0, 0, 0,  -1, -2, -1,
+  0, 1, 2,  -1, 0, 1,  -2, -1, 0,
+  // 1 2 1 over 2 rows
+  0, 0, 0,  1, 2, 1,  1, 2, 1,     0, 0, 0,  1, 0, -1,  1, 0, -1,     0, 0, 0,  1, 2, 1,  -1, -2, -1,
+  0, 0, 0,  -1, 1, 2,  -2, -1, 1 );
 int cccmDownsample( int cx, int cy, int fi )
 {
-  const int x1 = 2 * cx, x0 = max( x1 - 1, 0 ), x2 = x1 + 1, y1 = 2 * cy, y0 = max( y1 - 1, 0 ), y2 = y1 + 1;
-  int v;
-  if( P.cclmFilter == CCLM_FILTER_AVERAGE )
+  const int x1 = 2 * cx, y1 = 2 * cy, c = ( P.cclmFilter * 4 + fi ) * 9;
+  int       v  = 0;
+  [[dont_unroll]] for( int k = 0; k < 9; k++ )
   {
-    v = fi == 0 ? ( recoAt( 0, x1, y1 ) + recoAt( 0, x2, y1 ) + recoAt( 0, x1, y2 ) + recoAt( 0, x2, y2 ) + 2 ) >> 2
-      : fi == 1 ? recoAt( 0, x1, y1 ) - recoAt( 0, x2, y1 ) + recoAt( 0, x1, y2 ) - recoAt( 0, x2, y2 )
-      : fi == 2 ? recoAt( 0, x1, y1 ) + recoAt( 0, x2, y1 ) - recoAt( 0, x1, y2 ) - recoAt( 0, x2, y2 )
-                    : recoAt( 0, x2, y1 ) - recoAt( 0, x1, y2 );
+    // (the column / row left of / above the sample: the picture's first one at its edge)
+    const int col = k % 3, row = k / 3;
+    const int x = col == 0 ? max( x1 - 1, 0 ) : x1 + col - 1, y = row == 0 ? max( y1 - 1, 0 ) : y1 + row - 1;
+    v += CCCM_DOWNSAMPLE[c + k] * recoAt( 0, x, y );
   }
-  else if( P.cclmFilter == CCLM_FILTER_CROSS )
+  if( fi == 0 )
   {
-    v = fi == 0 ? ( 4 * recoAt( 0, x1, y1 ) + recoAt( 0, x0, y1 ) + recoAt( 0, x2, y1 ) + recoAt( 0, x1, y2 )
-                        + recoAt( 0, x1, y0 ) + 4 ) >> 3
-      : fi == 1 ? 2 * recoAt( 0, x0, y1 ) - 2 * recoAt( 0, x2, y1 ) + recoAt( 0, x0, y2 ) - recoAt( 0, x2, y2 )
-                      + recoAt( 0, x0, y0 ) - recoAt( 0, x2, y0 )
-      : fi == 2 ? recoAt( 0, x0, y0 ) + 2 * recoAt( 0, x1, y0 ) + recoAt( 0, x2, y0 ) - recoAt( 0, x0, y2 )
-                      - 2 * recoAt( 0, x1, y2 ) - recoAt( 0, x2, y2 )
-                    : -recoAt( 0, x0, y1 ) + recoAt( 0, x1, y0 ) + 2 * recoAt( 0, x2, y0 ) - 2 * recoAt( 0, x0, y2 )
-                      - recoAt( 0, x1, y2 ) + recoAt( 0, x2, y1 );
-  }
-  else
-  {
-    v = fi == 0 ? ( 2 * recoAt( 0, x1, y1 ) + recoAt( 0, x0, y1 ) + recoAt( 0, x2, y1 ) + 2 * recoAt( 0, x1, y2 )
-                        + recoAt( 0, x0, y2 ) + recoAt( 0, x2, y2 ) + 4 ) >> 3
-      : fi == 1 ? recoAt( 0, x0, y1 ) - recoAt( 0, x2, y1 ) + recoAt( 0, x0, y2 ) - recoAt( 0, x2, y2 )
-      : fi == 2 ? recoAt( 0, x0, y1 ) + 2 * recoAt( 0, x1, y1 ) + recoAt( 0, x2, y1 ) - recoAt( 0, x0, y2 )
-                      - 2 * recoAt( 0, x1, y2 ) - recoAt( 0, x2, y2 )
-                    : -recoAt( 0, x0, y1 ) + recoAt( 0, x1, y1 ) + 2 * recoAt( 0, x2, y1 ) - 2 * recoAt( 0, x0, y2 )
-                      - recoAt( 0, x1, y2 ) + recoAt( 0, x2, y2 );
+    v = P.cclmFilter == CCLM_FILTER_AVERAGE ? ( v + 2 ) >> 2 : ( v + 4 ) >> 3;
   }
   return ( fi == 0 ? v : max( v, 0 ) ) - g_cccmLumaOffset;
 }
@@ -522,14 +518,6 @@ const ivec2 CCCM_NOSUB_TAPS[30]  = ivec2[30](
   ivec2( 0, 0 ), ivec2( -1, 0 ), ivec2( 1, 0 ), ivec2( 0, 1 ), ivec2( -1, 1 ),        // CCLM_FILTER_6TAP
   ivec2( 1, 1 ), ivec2( 0, 0 ), ivec2( 0, 1 ), ivec2( 1, 0 ), ivec2( -1, 0 ) );
 
-// feature f (f < the bias) of chroma position (x, y) of the reference area without subsampling
-int cccmNoSubFeature( int f, int x, int y, int bitDepth )
-{
-  const ivec2 d = CCCM_NOSUB_TAPS[P.cclmFilter * 10 + f];
-  const int   v = cccmLuma( ( x << 1 ) + d.x, ( y << 1 ) + d.y );
-  return f < CCCM_NOSUB_LINEAR[P.cclmFilter] ? v : cccmNonlinear( v, bitDepth );
-}
-
 // feature f of the sample at (x, y) of the reference area (c: its luma in buffer 0) - xCccmCalcModels' / ApplyModel's
 // vectors, the bias last, then the template's chroma (Cb, Cr):
 // - plain: the sample, the ones above, below, left and right of it, its nonlinear term (CccmModel::nonlinear), the bias
@@ -541,13 +529,22 @@ int cccmNoSubFeature( int f, int x, int y, int bitDepth )
 //   the column, the bias; mode 2: the sample, its left and right neighbours of filter 0 and of filter 1, the nonlinear
 //   terms of filter 0's three, the column, the bias; mode 3 as mode 2 with the neighbours above-right and below-left,
 //   filter 3, the row
-// - without subsampling: the luma taps around the co-located luma sample (cccmNoSubFeature), their nonlinear terms,
+// - without subsampling: the luma taps around the co-located luma sample (CCCM_NOSUB_TAPS), their nonlinear terms,
 //   the bias
 // - GLM with luma: the gradient pattern's value (buffer 1), the sample, the bias
 // - CFLM: the sample, the chroma prediction (cflmChroma), the bias; both chroma features its block's component's
 // Each a Pel, as the CPU's vectors hold them (below 2^15 in magnitude up to 10 bits; above, the nonlinear terms of the
 // filters' gradients wrap as the CPU's): their products fit 32 bits
 int cflmChroma( int x, int y );
+
+// GL-CCCM's gradients (cccmFeature's features 1 and 2): per gradient its six taps around the sample (offset, weight)
+const ivec3 CCCM_GL_TAPS[12] = ivec3[12](
+  ivec3( 0, -1, 2 ), ivec3( -1, -1, 1 ), ivec3( 1, -1, 1 ), ivec3( 0, 1, -2 ), ivec3( -1, 1, -1 ), ivec3( 1, 1, -1 ),
+  ivec3( -1, 0, 2 ), ivec3( -1, -1, 1 ), ivec3( -1, 1, 1 ), ivec3( 1, 0, -2 ), ivec3( 1, -1, -1 ), ivec3( 1, 1, -1 ) );
+
+// what cccmFeature makes of its taps' sum: the sum, its nonlinear term, inter CCCM's nonlinear term of the mean of
+// its two taps
+const int CCCM_SUM = 0, CCCM_NONLINEAR = 1, CCCM_MEAN_NONLINEAR = 2;
 
 int cccmFeature( int f, int x, int y, int c, int bitDepth )
 {
@@ -564,64 +561,86 @@ int cccmFeature( int f, int x, int y, int c, int bitDepth )
   {
     return f == 0 ? c : cflmChroma( x, y );
   }
+  // the feature's luma taps - of luma buffer b, the first at p, a second one below it (inter CCCM's mean), GL-CCCM's
+  // gradient's six (gl) -, read in one loop below: this function is inlined at many call sites, and each read written
+  // out would be a copy of cccmLumaOf at each
+  int   b = 0, n = 1, gl = 0, use = CCCM_SUM;
+  ivec2 p = ivec2( x, y );
   if( g_cccmGlmLuma )
   {
-    return f == 0 ? cccmLumaOf( 1, x, y ) : c;
-  }
-  if( g_cccmInterNs )   // (xInterCccmApplyModelOffset's: the six luma taps of rows 2y and 2y + 1, the nonlinear term)
-  {
-    const ivec2 d[6] = ivec2[6]( ivec2( 0, 0 ), ivec2( 0, 1 ), ivec2( -1, 0 ), ivec2( 1, 0 ), ivec2( -1, 1 ), ivec2( 1, 1 ) );
-    if( f == 6 )
+    if( f != 0 )
     {
-      return cccmNonlinear( int( int16_t( ( cccmLuma( x << 1, y << 1 ) + cccmLuma( x << 1, ( y << 1 ) + 1 ) + 1 ) >> 1 ) ),
-                            bitDepth );
+      return c;
     }
-    return cccmLuma( ( x << 1 ) + d[f].x, ( y << 1 ) + d[f].y );
+    b = 1;
   }
-  if( g_cccmNoSub )
-  {
-    return cccmNoSubFeature( f, x, y, bitDepth );
+  else if( g_cccmInterNs )   // (xInterCccmApplyModelOffset's: the six luma taps of rows 2y and 2y + 1, the nonlinear
+  {                          // term)
+    const ivec2 d[6] = ivec2[6]( ivec2( 0, 0 ), ivec2( 0, 1 ), ivec2( -1, 0 ), ivec2( 1, 0 ), ivec2( -1, 1 ), ivec2( 1, 1 ) );
+    p   = ivec2( x << 1, y << 1 ) + ( f == 6 ? ivec2( 0 ) : d[f] );
+    n   = f == 6 ? 2 : 1;
+    use = f == 6 ? CCCM_MEAN_NONLINEAR : CCCM_SUM;
   }
-  if( g_cccmMdf == 1 )
-  {
-    return f < 4 ? cccmLumaOf( f, x, y ) : f < 7 ? cccmNonlinear( cccmLumaOf( f - 4, x, y ), bitDepth )
-         : f == 7 ? ( y + g_cccmLocDY + 8 ) << 3 : ( x + g_cccmLocDX + 8 ) << 3;
+  else if( g_cccmNoSub )   // (the luma tap around the co-located luma sample, from the linear count on its nonlinear
+  {                        // term)
+    p   = ivec2( x << 1, y << 1 ) + CCCM_NOSUB_TAPS[P.cclmFilter * 10 + f];
+    use = f < CCCM_NOSUB_LINEAR[P.cclmFilter] ? CCCM_SUM : CCCM_NONLINEAR;
   }
-  if( g_cccmMdf != 0 )   // the neighbours of mode 2 (left, right), of mode 3 (above-right, below-left)
+  else if( g_cccmMdf == 1 )
   {
+    if( f >= 7 )
+    {
+      return f == 7 ? ( y + g_cccmLocDY + 8 ) << 3 : ( x + g_cccmLocDX + 8 ) << 3;
+    }
+    b   = f < 4 ? f : f - 4;
+    use = f < 4 ? CCCM_SUM : CCCM_NONLINEAR;
+  }
+  else if( g_cccmMdf != 0 )   // the neighbours of mode 2 (left, right), of mode 3 (above-right, below-left)
+  {
+    if( f >= 9 )
+    {
+      return g_cccmMdf == 2 ? ( x + g_cccmLocDX + 8 ) << 3 : ( y + g_cccmLocDY + 8 ) << 3;
+    }
     const ivec2 d = g_cccmMdf == 2 ? ivec2( -1, 0 ) : ivec2( 1, -1 );
     const int   k = f % 3;
-    const ivec2 q = k == 0 ? ivec2( x, y ) : k == 1 ? ivec2( x + d.x, y + d.y ) : ivec2( x - d.x, y - d.y );
-    return f < 3 ? cccmLumaOf( 0, q.x, q.y ) : f < 6 ? cccmLumaOf( 1, q.x, q.y )
-         : f < 9 ? cccmNonlinear( cccmLumaOf( 0, q.x, q.y ), bitDepth )
-                 : g_cccmMdf == 2 ? ( x + g_cccmLocDX + 8 ) << 3 : ( y + g_cccmLocDY + 8 ) << 3;
+    p   = k == 0 ? ivec2( x, y ) : k == 1 ? ivec2( x + d.x, y + d.y ) : ivec2( x - d.x, y - d.y );
+    b   = f >= 3 && f < 6 ? 1 : 0;
+    use = f < 6 ? CCCM_SUM : CCCM_NONLINEAR;
   }
-  if( g_cccmGl && f >= 1 && f <= 4 )
+  else if( g_cccmGl && f >= 1 && f <= 4 )
   {
-    switch( f )
+    if( f >= 3 )
     {
-    case 1:
-      return ( 2 * cccmLuma( x, y - 1 ) + cccmLuma( x - 1, y - 1 ) + cccmLuma( x + 1, y - 1 ) )
-             - ( 2 * cccmLuma( x, y + 1 ) + cccmLuma( x - 1, y + 1 ) + cccmLuma( x + 1, y + 1 ) );
-    case 2:
-      return ( 2 * cccmLuma( x - 1, y ) + cccmLuma( x - 1, y - 1 ) + cccmLuma( x - 1, y + 1 ) )
-             - ( 2 * cccmLuma( x + 1, y ) + cccmLuma( x + 1, y - 1 ) + cccmLuma( x + 1, y + 1 ) );
-    case 3: return ( y + g_cccmLocDY + 8 ) << 3;
-    default: return ( x + g_cccmLocDX + 8 ) << 3;
+      return f == 3 ? ( y + g_cccmLocDY + 8 ) << 3 : ( x + g_cccmLocDX + 8 ) << 3;
     }
+    n  = 6;
+    gl = f;
   }
-  // (an on-the-fly model of the reference samples alone: the sample itself below the row above the block, right of
-  // the column left of it)
-  const bool refOnly = WITH_CCP_MERGE && g_ccpFlyRefOnly;
-  switch( f )
+  else
   {
-  case 0: return c;
-  case 1: return cccmLuma( x, y - 1 );
-  case 2: return refOnly && y == g_cccmSizeY - 1 && x >= g_cccmSizeX ? c : cccmLuma( x, y + 1 );
-  case 3: return cccmLuma( x - 1, y );
-  case 4: return refOnly && x == g_cccmSizeX - 1 && y >= g_cccmSizeY ? c : cccmLuma( x + 1, y );
-  default: return cccmNonlinear( c, bitDepth );
+    // (an on-the-fly model of the reference samples alone: the sample itself below the row above the block, right of
+    // the column left of it)
+    const bool refOnly = WITH_CCP_MERGE && g_ccpFlyRefOnly;
+    if( f == 0 || ( f == 2 && refOnly && y == g_cccmSizeY - 1 && x >= g_cccmSizeX )
+        || ( f == 4 && refOnly && x == g_cccmSizeX - 1 && y >= g_cccmSizeY ) )
+    {
+      return c;
+    }
+    if( f > 4 )
+    {
+      return cccmNonlinear( c, bitDepth );
+    }
+    p = ivec2( x, y ) + ( f == 1 ? ivec2( 0, -1 ) : f == 2 ? ivec2( 0, 1 ) : f == 3 ? ivec2( -1, 0 ) : ivec2( 1, 0 ) );
   }
+  int sum = 0;
+  [[dont_unroll]] for( int k = 0; k < n; k++ )
+  {
+    const ivec3 tap = gl != 0 ? CCCM_GL_TAPS[( gl - 1 ) * 6 + k] : ivec3( 0, k, 1 );   // (else the mean's one below)
+    sum += tap.z * cccmLumaOf( b, ( gl != 0 ? x : p.x ) + tap.x, ( gl != 0 ? y : p.y ) + tap.y );
+  }
+  return use == CCCM_MEAN_NONLINEAR ? cccmNonlinear( int( int16_t( ( sum + 1 ) >> 1 ) ), bitDepth )
+       : use == CCCM_NONLINEAR      ? cccmNonlinear( sum, bitDepth )
+                                    : sum;
 }
 
 // the sums of model k (set k / 2, class k % 2) over its samples (solve2's dot products of xCccmCalcModels' vectors): the
@@ -1103,7 +1122,7 @@ void cccmPrediction( Tu t, bool both, int lid, int NT )
       const int v = cccmPredict( g_cccmSet, comp - 1, x, y, twoModels, bitDepth );
       if( !block )
       {
-        CBufI32( P.scratch ).v[ccpFusionTemplateBase( t ) + k] = v;
+        WBufI32( P.scratch ).v[ccpFusionTemplateBase( t ) + k] = v;
       }
       else if( inTmp )
       {
@@ -1111,7 +1130,7 @@ void cccmPrediction( Tu t, bool both, int lid, int NT )
       }
       else
       {
-        CBufI32( P.scratch ).v[pred + i] = v;
+        WBufI32( P.scratch ).v[pred + i] = v;
       }
     }
   }
@@ -1123,7 +1142,7 @@ void cccmPrediction( Tu t, bool both, int lid, int NT )
 int cccmBlockPrediction( Tu t, int x, int y )
 {
   const int i = cccmPredBase( t, t.comp ) + y * t.w + x;
-  return cccmPredInTmp( t ) ? int( s_tmp[i] ) : CBufI32( P.scratch ).v[cccmScratchPred() + i];
+  return cccmPredInTmp( t ) ? int( s_tmp[i] ) : WBufI32( P.scratch ).v[cccmScratchPred() + i];
 }
 
 // LM chroma fusion's sample (x, y) of block t: its regular prediction pr blended with the CCCM prediction, weighted
@@ -1136,7 +1155,7 @@ int ccpFusionBlend( int x, int y, int p0, int p1 );
 int cccmFusionBlend( Tu t, int x, int y, int pr )
 {
   const int w0    = ( t.lm >> LM_FUSION_W_SHIFT ) & 3;
-  const int other = CBufI32( P.scratch ).v[cccmFusionPredBase( t ) + y * t.w + x];
+  const int other = WBufI32( P.scratch ).v[cccmFusionPredBase( t ) + y * t.w + x];
   if( WITH_CCP_DERIVED && w0 == 0 )
   {
     return ccpFusionBlend( x, y, pr, other );
@@ -1194,13 +1213,13 @@ int cflmChromaIndex( int x, int y ) { return cccmScratchPred() + y * g_cccmAreaW
 // sample (x, y) of block t's regular prediction (storeRegion's: after PDPC, MRL and intra fusion), kept for its models
 void cflmStore( Tu t, int x, int y, int pr )
 {
-  CBufI32( P.scratch ).v[cflmChromaIndex( g_cccmSizeX + x, g_cccmSizeY + y )] = pr;
+  WBufI32( P.scratch ).v[cflmChromaIndex( g_cccmSizeX + x, g_cccmSizeY + y )] = pr;
 }
 
 // the chroma feature at (x, y) of the area: its prediction minus the chroma offset
 int cflmChroma( int x, int y )
 {
-  return CBufI32( P.scratch ).v[cflmChromaIndex( x, y )] - s_cclm[CCCM_CHROMA_OFFSET];
+  return WBufI32( P.scratch ).v[cflmChromaIndex( x, y )] - s_cclm[CCCM_CHROMA_OFFSET];
 }
 
 // CFLM block t's prediction from its regular one in the chroma buffer (visible to the workgroup), reconstructed (all
@@ -1239,7 +1258,7 @@ void cflmPrediction( Tu t, int lid, int NT )
     {
       const bool above = i < sy * W;
       const int  x = above ? sx + i % W : ( i - sy * W ) % sx, y = above ? i / W : sy + ( i - sy * W ) / sx;
-      CBufI32( P.scratch ).v[cflmChromaIndex( x, y )] = timdPredict( t.dirMode, p, x, y, W, H, sx, sy, dc,
+      WBufI32( P.scratch ).v[cflmChromaIndex( x, y )] = timdPredict( t.dirMode, p, x, y, W, H, sx, sy, dc,
                                                                       ( 1 << bitDepth ) - 1 );
     }
   }
