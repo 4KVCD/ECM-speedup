@@ -3186,6 +3186,11 @@ M131 (2026-10-27): DIMD's strongest modes ranked in parallel (dimdRanks: every m
 which invocation 0 inserted one by one (dimdSelect). GPU time (grn100 -> grn98): aiodd 277.7 -> 269.0 ms (median of
 7), ai720 1,862.2 -> 1,825.8 ms. Results (grn115, M131 - M134 together): identical but ra_ip64_md5 1 and ra720_pj17
 4 (section 9).
+M132 (2026-10-27): NN intra prediction's narrow layers (fewer outputs than invocations: the models' last layers) with
+up to 8 lanes per output, partial sums in s_spCost. GPU time (grn98 -> grn99): ai720 1,825.8 -> 1,811.5 ms, aiodd
+unchanged (269.0 / 269.8). aiodd's 163 NN blocks spend ~110 us each in the wide sparse layers 0 and 1 (640 - 1216
+outputs of ~5 packs of 8 weights each): chains of loads; loading 4 packs at once and a path without the partial sums
+there measured slower overall (section 7's ~1 % from structural changes), left out. Results as M131's.
 
 ## 8. Numbers (i7-10700 8C/16T, Win11, GCC 16.2, RTX 3070 driver 616.92)
 

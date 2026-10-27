@@ -172,39 +172,57 @@ void pnnPredict( Tu t, int predStride, int lid, int NT )
     s_ref[1][e] = int16_t( zeroMean ? ( int( s_ref[1][e] ) - mean ) << nb : 0 );
   }
   SYNC();
-  // the layers (MatMul, its saturation, a leaky ReLU), alternating between s_ref[1] and s_tmp
+  // the layers (MatMul, its saturation, a leaky ReLU), alternating between s_ref[1] and s_tmp. An output's sum runs
+  // over its column's packs, each a few dependent loads of its weights: with fewer outputs than invocations, lanes
+  // (a power of two, at most 8) share each output's packs, adding their partial sums in s_spCost (sign prediction's,
+  // which only runs after the prediction), whose lane 0 then finishes the output (integer sums: the same in any order)
   const int layers = m.v[model + PNN_LAYERS];
   for( int l = 0; l < layers; l++ )
   {
     const int  o = model + PNN_LAYER0 + l * PNN_LAYER_WORDS;
     const int  outputs = m.v[o], shift = m.v[o + 1], slope = m.v[o + 2], slopeShift = m.v[o + 3], columns = m.v[o + 4];
     const bool fromRef = ( l & 1 ) == 0;
-    for( int c = lid; c < outputs; c += NT )
+    const int  lanes = clamp( 1 << findMSB( max( NT / max( outputs, 1 ), 1 ) ), 1, 8 ), lane = lid % lanes;
+    for( int base = 0; base < outputs; base += NT / lanes )
     {
-      int x = 0;
-      for( int p = m.v[columns + c]; p < m.v[columns + c + 1]; p += PNN_PACK_WORDS )
+      const int c = base + lid / lanes;
+      if( lane == 0 )
       {
-        const int j = m.v[p];
-        for( int k = 0; k < 4; k++ )
+        s_spCost[lid / lanes] = 0u;
+      }
+      SYNC();
+      if( c < outputs )
+      {
+        int x = 0;
+        for( int p = m.v[columns + c] + lane * PNN_PACK_WORDS; p < m.v[columns + c + 1]; p += lanes * PNN_PACK_WORDS )
         {
-          const int w2 = m.v[p + 1 + k];
-          const int a0 = fromRef ? int( s_ref[1][j + 2 * k] ) : int( s_tmp[j + 2 * k] );
-          const int a1 = fromRef ? int( s_ref[1][j + 2 * k + 1] ) : int( s_tmp[j + 2 * k + 1] );
-          x += a0 * bitfieldExtract( w2, 0, 16 ) + a1 * bitfieldExtract( w2, 16, 16 );
+          const int j = m.v[p];
+          for( int k = 0; k < 4; k++ )
+          {
+            const int w2 = m.v[p + 1 + k];
+            const int a0 = fromRef ? int( s_ref[1][j + 2 * k] ) : int( s_tmp[j + 2 * k] );
+            const int a1 = fromRef ? int( s_ref[1][j + 2 * k + 1] ) : int( s_tmp[j + 2 * k + 1] );
+            x += a0 * bitfieldExtract( w2, 0, 16 ) + a1 * bitfieldExtract( w2, 16, 16 );
+          }
         }
+        atomicAdd( s_spCost[lid / lanes], uint( x ) );
       }
-      x = clamp( x >> shift, -32767, 32767 );   // ComputationType::quantize, SATURATE
-      if( slopeShift >= 0 && x < 0 )            // PReLU (its AVX2 kernel clips to int16)
+      SYNC();
+      if( c < outputs && lane == 0 )
       {
-        x = clamp( ( x * slope ) >> slopeShift, -32768, 32767 );
-      }
-      if( fromRef )
-      {
-        s_tmp[c] = int16_t( x );
-      }
-      else
-      {
-        s_ref[1][c] = int16_t( x );
+        int x = clamp( int( s_spCost[lid / lanes] ) >> shift, -32767, 32767 );   // ComputationType::quantize, SATURATE
+        if( slopeShift >= 0 && x < 0 )   // PReLU (its AVX2 kernel clips to int16)
+        {
+          x = clamp( ( x * slope ) >> slopeShift, -32768, 32767 );
+        }
+        if( fromRef )
+        {
+          s_tmp[c] = int16_t( x );
+        }
+        else
+        {
+          s_ref[1][c] = int16_t( x );
+        }
       }
     }
     SYNC();
