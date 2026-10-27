@@ -1011,6 +1011,9 @@ constexpr int CIIP_GPM = 64, CIIP_GPM_I1 = 128;   // (M115: GPM with an intra pa
 // into Params::interPred at Tu::ibc, nothing is reconstructed -; CIIP_KEEP_PRED: the luma block of such a CU with inter
 // CCCM keeps its blend in its own inter prediction, inter CCCM's luma prediction; ciipChromaPrePass)
 constexpr int CIIP_TO_PRED = 256, CIIP_KEEP_PRED = 512;
+// (a CIIP CU of several TUs: CIIP_PRE_INTRA its pre-pass of the CU's area, which keeps its intra prediction in its own
+// place; CIIP_SPLIT a TU block, which blends that in by the CU's weights; ciipSplitPrePass)
+constexpr int CIIP_PRE_INTRA = 1024, CIIP_SPLIT = 2048;
 constexpr int MC_GPM_INTRA = 16384, MC_GPM_I1 = 32768, MC_GPM_FIN = 65536, MC_GPM_RBD = 131072;
 constexpr int OBMC_P1 = 64;   // (OBMC_J_FLAGS: a GPM CU's part 1 - its prediction for skipObmcConditionByPixel)
 
@@ -8216,6 +8219,8 @@ static void affineRecord( GpuIntraRec::Impl& m, const CodingUnit& cu )
 // the CPU's mode, CIIP-TIMD's included) - blended with it in intra_rec's storeRecon (geneWeightedPred), then the
 // residual as an inter block's
 
+static bool isAsbt( const TransformUnit& tu, const ComponentID compID );
+
 // why the GPU does not predict CIIP CU cu (nullptr: it does, where its inter prediction's kind allows)
 static const char* ciipWhy( const CodingUnit& cu )
 {
@@ -8235,9 +8240,29 @@ static const char* ciipWhy( const CodingUnit& cu )
     return "CIIP-PDPC with an angular mode";
   }
 #endif
-  if( cu.firstTU != cu.lastTU )
+  // (several transform units: the CU's intra prediction by a pre-pass, ciipSplitPrePass, but not where a TU's chroma
+  // blends inter CCCM or CCP merge into it, ciipChromaPrePass, or with ASBT's residual parts)
+  for( const TransformUnit& tu: CU::traverseTUs( cu ) )
   {
-    return "CIIP of several transform units";
+    if( cu.firstTU == cu.lastTU )
+    {
+      break;
+    }
+    bool blend = isInterCcp( tu );
+#if JVET_AE0059_INTER_CCCM
+    blend = blend || tu.interCccm;
+#endif
+    if( blend )
+    {
+      return "CIIP of several TUs with inter CCCM or CCP merge";
+    }
+    for( int c = 0; c < MAX_NUM_COMPONENT; c++ )
+    {
+      if( tu.blocks[c].valid() && isAsbt( tu, ComponentID( c ) ) )
+      {
+        return "CIIP of several TUs with ASBT";
+      }
+    }
   }
   // (LFNST / NSPT: their mode a DIMD of the blended prediction, which intra_rec keeps in s_spPred, 32 x 32 samples)
   if( cu.lfnstIdx && ( cu.lwidth() > 32 || cu.lheight() > 32 ) )
@@ -8359,8 +8384,8 @@ static const char* gpmWhy( const GpuIntraRec::Impl& m, const CodingUnit& cu )
   }
 #endif
 #if JVET_Y0065_GPM_INTRA
-  // (an intra part, M115: as CIIP's intra prediction - ciipWhy's limits -, one transform unit; the inter part's LIC is
-  // its record's, the CU's flag the last part's)
+  // (an intra part, M115: as CIIP's intra prediction - ciipWhy's limits -; the inter part's LIC is its record's, the
+  // CU's flag the last part's)
   if( pu.gpmIntraFlag )
   {
     // (JVET-AN0093's parts of SGPM's list too: the part's mode comes in its record, InterPrediction::m_gpuGeoPart)
@@ -10143,6 +10168,68 @@ static bool ciipChromaPrePass( GpuIntraRec::Impl& m, const TransformUnit& tu, in
   return true;
 }
 
+// the pre-pass of CIIP CU cu (or GPM with an intra part) of several TUs, whose intra prediction the CPU makes once for
+// the CU (geneWeightedPred over the CU, then each TU's residual): per component a CIIP record of the CU's area without
+// residual (CIIP_PRE_INTRA), recorded before the TUs' blocks, which keeps its intra prediction in its own place; the
+// TUs' blocks then blend it in (ciipSplitBlock; ciipWhy leaves out those with inter CCCM / CCP merge or ASBT). Its
+// records into pre; the reason where a record fails (nullptr: none)
+static const char* ciipSplitPrePass( GpuIntraRec::Impl& m, const CodingUnit& cu, int32_t pre[MAX_NUM_COMPONENT] )
+{
+  const int numComp = cu.chromaFormat == CHROMA_400 ? 1 : MAX_NUM_COMPONENT;
+  for( int c = 0; c < numComp; c++ )
+  {
+    const ComponentID comp = ComponentID( c );
+    if( !cu.blocks[comp].valid() )
+    {
+      continue;
+    }
+    // (the record of the CU's area: recordInterBlock's of its first TU, its inter prediction's job undone - the TUs'
+    // blocks make theirs -, no residual, no OBMC)
+    const size_t  jobs = m.mcJobs.size();
+    const int32_t job0 = m.cuJob[comp];
+    const char*   why  = nullptr;
+    if( !recordInterBlock( m, *cu.firstTU, comp, why, &cu.blocks[comp], false ) )
+    {
+      return why;
+    }
+    m.mcJobs.resize( jobs );
+    m.cuJob[comp] = job0;
+    m.cuTus[&cu].pop_back();
+    pre[c] = (int32_t) m.rec.size() - 1;
+  }
+  for( int c = 0; c < numComp; c++ )   // (after all: joint CbCr records the Cr block right after its Cb one)
+  {
+    if( pre[c] < 0 )
+    {
+      continue;
+    }
+    Tu& p = m.rec[pre[c]];
+    p.ciip   |= CIIP_PRE_INTRA;
+    p.cbf     = 0;
+    p.jccr    = 0;
+    p.obmc    = 0;
+    p.derive &= ~DERIVE_PREFIX;
+    p.spCoded = p.spOffset = p.resiFrom = -1;
+  }
+  return nullptr;
+}
+
+// TU block compID of CIIP CU cu of several TUs, just recorded (the last record): it blends the CU's intra prediction
+// of its pre-pass (record pre) into its inter prediction by the CU's weights, then reconstructs as an inter block; it
+// waits for the pre-pass (Tu::ispPrev, which only ISP's chain uses otherwise)
+static void ciipSplitBlock( GpuIntraRec::Impl& m, const CodingUnit& cu, const ComponentID compID, int32_t pre )
+{
+  Tu&             t    = m.rec.back();
+  const CompArea& area = cu.blocks[compID];
+  t.ciip   |= CIIP_SPLIT;
+  t.ibc     = m.rec[pre].dbgOffset;
+  t.cuX     = area.x;
+  t.cuY     = area.y;
+  t.cuW     = area.width;
+  t.cuH     = area.height;
+  t.ispPrev = pre;
+}
+
 void GpuIntraRec::recordInterCu( const CodingUnit& cu )
 {
   Impl& m = *m_impl;
@@ -10246,6 +10333,18 @@ void GpuIntraRec::recordInterCu( const CodingUnit& cu )
   const int numComp = cu.chromaFormat == CHROMA_400 ? 1 : MAX_NUM_COMPONENT;
   // (an IBC merge CU's motion and flags, which its merge candidate gives, are known only now)
   const char* const ibcLate = CU::isIBC( cu ) ? ibcWhy( m, cu ) : nullptr;
+  // (CIIP or GPM with an intra part of several TUs: the CU's intra prediction by a pre-pass per component, which its TU
+  // blocks blend in)
+  int32_t splitPre[MAX_NUM_COMPONENT] = { -1, -1, -1 };
+  if( ( cu.firstPU->ciipFlag || cu.firstPU->gpmIntraFlag ) && cu.firstTU != cu.lastTU && m.mcCus.count( &cu )
+      && !CU::isIBC( cu ) && !m.cpuCus.count( &cu ) && !ibcLate )
+  {
+    const char* why = ciipSplitPrePass( m, cu, splitPre );
+    if( why )
+    {
+      cpuFillCu( m, cu, why );
+    }
+  }
   for( const TransformUnit& tu: CU::traverseTUs( cu ) )
   {
     const bool ciipPre = ciipBeneathChromaBlend( m, tu );
@@ -10278,6 +10377,10 @@ void GpuIntraRec::recordInterCu( const CodingUnit& cu )
       else if( CU::isPLT( cu ) )
       {
         pltRecord( m, cu, comp );
+      }
+      else if( splitPre[comp] >= 0 )
+      {
+        ciipSplitBlock( m, cu, comp, splitPre[comp] );
       }
 #if JVET_AE0059_INTER_CCCM
       if( tu.interCccm && isChroma( comp ) && !m.cpuCus.count( &cu ) )
@@ -13408,8 +13511,9 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
   for( size_t i = 0; i < m.rec.size() && ( first.empty() || m.partial ) && firstBlock.empty(); i++ )
   {
     const Tu& t = m.rec[i];
-    // (a CIIP pre-pass reconstructs nothing: its blend is in the block after it)
-    for( int k = 0; k < t.w * t.h && !( t.derive & DERIVE_NODE ) && !( t.ciip & CIIP_TO_PRED ); k++ )
+    // (a CIIP pre-pass reconstructs nothing: its blend, or intra prediction, is in the blocks after it)
+    const bool noRecon = ( t.derive & DERIVE_NODE ) || ( t.ciip & ( CIIP_TO_PRED | CIIP_PRE_INTRA ) );
+    for( int k = 0; k < t.w * t.h && !noRecon; k++ )
     {
       const int o = t.dbgOffset + k;
       const bool predBad = gPred[o] != m.cpuPred[o], resiBad = gResi[o] != m.cpuResi[o];

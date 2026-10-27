@@ -489,10 +489,11 @@ int asPel( int v )   // the int16 Pel the CPU stores
 // LMCS: the forward and inverse luma mappings (Reshape's LUTs)
 int fwdLut( int v ) { return BufI32( P.lmcs ).v[v]; }
 
-// CIIP (IntraPrediction::geneWeightedPred): sample (x, y) of block t's intra prediction blended with its inter one
-// (Params::interPred, after OBMC; with CIIP_FWD forward-mapped by LMCS): uniformly by the neighbours' weights, or for
-// TIMD's angular modes by the quarter of the columns / rows the sample lies in
-int ciipBlend( Tu t, int x, int y, int intra )
+// CIIP (IntraPrediction::geneWeightedPred): sample (x, y) of block t's intra prediction `intra` blended with its inter
+// one (Params::interPred, after OBMC; with CIIP_FWD forward-mapped by LMCS): uniformly by the neighbours' weights, or
+// for TIMD's angular modes by the quarter of the columns / rows the sample lies in. GPM's weights are the block's at
+// (x, y), the position weights those at (cx, cy) of a CU of cw x ch (the block's own for a CU of one TU)
+int ciipBlendAt( Tu t, int x, int y, int cx, int cy, int cw, int ch, int intra )
 {
   int inter = int( CBufI16( P.interPred ).v[t.dbgOffset + y * t.w + x] );
   inter     = ( t.ciip & CIIP_FWD ) != 0 ? fwdLut( inter ) : inter;
@@ -505,8 +506,8 @@ int ciipBlend( Tu t, int x, int y, int intra )
   const int kind = t.ciip & CIIP_KIND;
   if( kind == CIIP_EDGE )
   {
-    const int scale = ( findMSB( t.w ) - 2 + findMSB( t.h ) - 2 + 2 ) >> 2;
-    const int wT = 32 >> min( 31, ( y << 1 ) >> scale ), wL = 32 >> min( 31, ( x << 1 ) >> scale );
+    const int scale = ( findMSB( cw ) - 2 + findMSB( ch ) - 2 + 2 ) >> 2;
+    const int wT = 32 >> min( 31, ( cy << 1 ) >> scale ), wL = 32 >> min( 31, ( cx << 1 ) >> scale );
     return clamp( ( ( intra << 6 ) + ( 64 - wT - wL ) * inter + 32 ) >> 6, 0, ( 1 << t.bitDepth ) - 1 );
   }
   if( kind == CIIP_UNIFORM )
@@ -514,10 +515,26 @@ int ciipBlend( Tu t, int x, int y, int intra )
     const int wIntra = ( t.ciip >> CIIP_W ) & 3;
     return ( ( 4 - wIntra ) * inter + wIntra * intra + 2 ) >> 2;
   }
-  const int pos = kind == CIIP_BY_X ? x : y, interval = ( kind == CIIP_BY_X ? t.w : t.h ) >> 2;
+  const int pos = kind == CIIP_BY_X ? cx : cy, interval = ( kind == CIIP_BY_X ? cw : ch ) >> 2;
   const int wInter = pos < interval ? 2 : pos < 2 * interval ? 3 : pos < 3 * interval ? 5 : 6;
   return ( wInter * inter + ( 8 - wInter ) * intra + 4 ) >> 3;
 }
+
+int ciipBlend( Tu t, int x, int y, int intra ) { return ciipBlendAt( t, x, y, x, y, t.w, t.h, intra ); }
+
+// a CIIP_SPLIT block's inter prediction (after OBMC's band) blended in place with its CU's intra prediction, which the
+// CU's pre-pass left at Tu::ibc (all invocations, ending with a barrier)
+void ciipSplitBlend( Tu t, int lid, int NT )
+{
+  for( int i = lid; i < t.w * t.h; i += NT )
+  {
+    const int x = i % t.w, y = i / t.w, cx = t.x - t.cuX + x, cy = t.y - t.cuY + y;
+    const int intra = int( CBufI16( P.interPred ).v[t.ibc + cy * t.cuW + cx] );
+    CBufI16( P.interPred ).v[t.dbgOffset + i] = int16_t( ciipBlendAt( t, x, y, cx, cy, t.cuW, t.cuH, intra ) );
+  }
+  controlBarrier( gl_ScopeWorkgroup, gl_ScopeWorkgroup, gl_StorageSemanticsBuffer, gl_SemanticsAcquireRelease );
+}
+
 int invLut( int v ) { return BufI32( P.lmcs ).v[P.lmcsLutSize + v]; }
 
 // Reshape::scalePel: the residual scaled by scale / 2^11 (CSCALE_FP_PREC), magnitude rounded; scale is an int16_t there
@@ -600,6 +617,11 @@ int ciipBlend( Tu t, int x, int y, int intra );
 
 void storeRecon( Tu t, int x, int y, int pr )
 {
+  if( ( t.ciip & CIIP_PRE_INTRA ) != 0 )   // (the pre-pass of a CIIP CU of several TUs: its intra prediction kept)
+  {
+    CBufI16( P.interPred ).v[t.dbgOffset + y * t.w + x] = int16_t( pr );
+    return;
+  }
   if( t.ciip != 0 )   // (CIIP: the inter prediction blended in first)
   {
     pr = ciipBlend( t, x, y, pr );
@@ -2580,11 +2602,18 @@ void main()
     // prediction), the chroma residual scaled as an intra block's; with sign prediction after the signs are decided
     if( ( t.derive & DERIVE_INTER ) != 0 )
     {
-      if( t.ciip == 0 )   // (a CIIP block's in the intra path's preamble: once, its workgroup sum adds up)
+      // (a CIIP block's in the intra path's preamble - once, its workgroup sum adds up -, but a CIIP_SPLIT block
+      // reconstructs here)
+      if( t.ciip == 0 || ( t.ciip & CIIP_SPLIT ) != 0 )
       {
         crsSetup( t, lid, NT );
       }
       interObmcBand( t, lid, NT );   // (OBMC on the CU's top / left band; GPM's separate OBMC and blend)
+      if( ( t.ciip & CIIP_SPLIT ) != 0 )   // (CIIP of a CU of several TUs: the CU's intra prediction blended in here)
+      {
+        ciipSplitBlend( t, lid, NT );
+        t.ciip = 0;
+      }
       // (CIIP, M106: on to the intra prediction below, which storeRecon blends with this one)
       if( t.ciip == 0 )
       {

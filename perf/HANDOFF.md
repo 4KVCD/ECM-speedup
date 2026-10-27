@@ -3200,6 +3200,16 @@ takes both classes in one pass (cccmAccumulatePair), the single model over the s
 (cccmNextClass, cccmBothClasses; CCP_FIT_ORDER). GPU time (grn104 -> grn115): aiodd 268.9 -> 263.8 ms, ai720
 unchanged. Results (grn115): identical but ra_ip64_md5 1 and ra720_pj17 4 (section 9). Since M125 (grn74 -> grn115,
 median of 5, one session): aiodd 365.8 -> 251.9 ms (-31 %), ai720 2,334.9 -> 1,769.8 ms (-24 %).
+M135 (2026-10-27): CIIP and GPM with an intra part of CUs of several TUs. The CPU predicts such a CU's intra part once
+for the CU, then adds each TU's residual; the GPU's inter blocks are TUs. A pre-pass per component (ciipSplitPrePass:
+recordInterBlock's record of the CU's area, its job undone, no residual or OBMC; CIIP_PRE_INTRA) keeps the CU's intra
+prediction in its own place in Params::interPred; each TU block (CIIP_SPLIT: Tu::cuX .. cuH the CU's region, Tu::ibc
+that place, the pre-pass its dependency in Tu::ispPrev) blends it into its inter prediction after OBMC's band by the
+CU's weights at its position (ciipSplitBlend, ciipBlendAt), then reconstructs as an inter block (crsSetup there too).
+Not yet with inter CCCM / CCP merge or ASBT. Results (grn121, with M136, before crsSetup's CIIP_SPLIT case): identical
+but ra_ip64_md5 1 and ra720_pj17 4 (section 9), and in one run ldp_parkjoy_q27 1 of 9 (a CCP merge model of a 2 x 16
+Cb block at 124,64; identical in a second run: section 9c's race). Inter CUs predicted by the CPU: GPM (CIIP of
+several transform units) 130 -> 0 (110 on the GPU; 15 with inter CCCM / CCP merge, 2 with ASBT, 3 other reasons).
 Tried after M125 and left out (idle 3070, median of 5 or 7): the CCP merge history's and list's records read ahead in
 parallel with signatures (neutral); IntraTMP's refinement ranks counting only the windows that overlap no other
 (+3 % aiodd: the weaker filter sends more positions to the walk) or comparing only positions of overlapping windows
@@ -3263,7 +3273,8 @@ within the budget (M118's 3070 runs skipped those pictures with ECM_GPU_NO_CCP_L
       samples a block reads before it writes them (the shared luma buffer in the angular arrays) first. Also
       ld_parkjoy_q27 POC 8 in 1 of 4 runs (2026-10-26/27: M126's, M133's): its first block a Cr CCCM block without
       subsampling of 2 rows (100,46 4x2; 96,24 8x2, then the CCLM record at 96,26 8x4) - the same kind as above,
-      identical in the other runs.
+      identical in the other runs. And ldp_parkjoy_q27 POC 8 in 1 of 2 runs of grn121 (M135): a CCP merge model of a
+      2 x 16 Cb block at 124,64 (CPU 2137, GPU -2995) - again a 2-sample-wide chroma block.
    d. Performance (section 8, M126 - M134): aiodd's GPU time per kind now (phase timers, under load): IntraTMP nodes
       ~90 ms (updates ~23, enumeration ~18, ranks ~10, setup ~10, clustering ~9), CCP merge blocks ~44 (candidates'
       template samples 12, model loads 10, fits ~4), TIMD nodes ~41 (the vector list ~13, the costs ~10), NN blocks ~30

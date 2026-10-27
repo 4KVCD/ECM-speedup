@@ -43,10 +43,11 @@ struct Tu
   int mrl;             // multiRefIdx: the reference line (0, 1, 3, 5, 7, 12; luma)
   int bfAvail[3];       // the bilateral filter's padding: the corner flag, the available above / left units (line 0)
   int isp;              // ISP sub-partition (luma): 1 horizontal split, 2 vertical split (0: none)
-  int cuX, cuY, cuW, cuH;   // ISP: the CU (its references, the bilateral filter's padding origin)
+  int cuX, cuY, cuW, cuH;   // ISP: the CU (its references, the bilateral filter's padding origin); CIIP_SPLIT: the
+                            // CU's region of the component
   int regX, regW;       // the predicted region: the block, or the 4-wide region of ISP sub-partitions 1 or 2 wide
   int ispSide;          // ISP: the side along the split is available (the CU's arm is shifted, not replaced)
-  int ispPrev;          // ISP: the previous sub-partition of the CU (-1: none)
+  int ispPrev;          // ISP: the previous sub-partition of the CU; CIIP_SPLIT: the CU's pre-pass (-1: none)
   // sign prediction (TrQuant::predCoeffSigns): the block whose prediction and neighbours decide the signs holds the
   // block with the coefficients (itself, or with joint CbCr whose Cr is coded the Cb block before it; -1: no sign
   // prediction); that block holds its data in the signPred buffer (spOffset, -1: none); with joint CbCr the other block
@@ -80,7 +81,8 @@ struct Tu
   int pdp;
   // a block of NN intra prediction (intra_nn.glsl): its record in Params::timdData (PNN_REC_*; -1: none)
   int pnn;
-  // an IBC CU's block (DERIVE_IBC): its record in Params::timdData (IBC_REC_*; read with DERIVE_IBC only)
+  // an IBC CU's block (DERIVE_IBC): its record in Params::timdData (IBC_REC_*; read with DERIVE_IBC only); a
+  // CIIP_SPLIT block: its CU's intra prediction in Params::interPred
   int ibc;
   // an OBMC CU's block on the CU's top or left band: its CU's OBMC record in Params::timdData + 1 (intra_rec's
   // OBMC_REC_*; 0: none)
@@ -333,6 +335,11 @@ const int CIIP_FWD = 32;
 // into Params::interPred at Tu::ibc, nothing is reconstructed -; CIIP_KEEP_PRED: the luma block of such a CU with inter
 // CCCM keeps its blend in its own inter prediction, inter CCCM's luma prediction)
 const int CIIP_TO_PRED = 256, CIIP_KEEP_PRED = 512;
+// (a CU of several TUs, whose intra prediction the CPU makes once for the CU: CIIP_PRE_INTRA its pre-pass of the CU's
+// area, which keeps the intra prediction in its own place in Params::interPred, nothing reconstructed; CIIP_SPLIT a TU
+// block of it, which blends that - at Tu::ibc, rows of Tu::cuW, the block at its offset in the CU, Tu::cuX / cuY - into
+// its inter prediction by the CU's weights, then reconstructs as an inter block)
+const int CIIP_PRE_INTRA = 1024, CIIP_SPLIT = 2048;
 
 // a CU's block vectors as the lists of later CUs take them (Params::bvOut per luma CU, by its index in the
 // CodingStructure: getNeighBv's vectors of the CU in its order, which getArBvMergeCandidate cascades), written by the
