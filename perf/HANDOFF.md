@@ -3214,6 +3214,12 @@ M136 (2026-10-27): CIIP of sub-PU motion (xSubPuMC's CUs: affine sub-block merge
 CPU: within ciipWhy's limits they predict as other CIIP CUs - the PU's prediction and its OBMC (with bSubMotion's inner
 sub-blocks), then the blocks' blend with the intra prediction. Results as M135's (grn121). Inter CUs predicted by the
 CPU: affine (CIIP: sub-block merge) 90 -> 2, affine (CIIP: OBMC of sub-block motion) 36 -> 0.
+M137 (2026-10-27): OBMC of IBC CUs of two vectors (JVET-AE0169). The prediction and OBMC's plan were there; what
+differs is getSameNeigMotion's comparison with the CU's own motion (identicalMvOBMC: the same lists and vectors, then
+BCW's index), which now takes the CU's second vector too (IBC_REC_OWN_MV2, obmcPlan's ownMv2: none for a CU of one
+vector, a value no neighbour has where the CU's BCW is not the default). ibcWhy's composite bi-prediction reason is
+split. Results (grn123, the streams with such CUs): fp720_ai and pj720_ai identical; their intra CUs from the CPU 279
+-> 171 ("IBC bi-prediction with OBMC" 109 -> 0, one of them now "above 1024 samples").
 Tried after M125 and left out (idle 3070, median of 5 or 7): the CCP merge history's and list's records read ahead in
 parallel with signatures (neutral); IntraTMP's refinement ranks counting only the windows that overlap no other
 (+3 % aiodd: the weaker filter sends more positions to the walk) or comparing only positions of overlapping windows

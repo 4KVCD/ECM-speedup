@@ -245,7 +245,7 @@ void obmcAddOp( int b, int kind, int u0, int n, int a, int c, ivec3 lic, ivec2 m
   tsSet( TO_OPS, at + 1 );
 }
 
-void obmcSideOps( Cu c, int rec, int b, ivec2 ownMv, ivec3 ownLic, bool modes )
+void obmcSideOps( Cu c, int rec, int b, ivec2 ownMv, ivec2 ownMv2, ivec3 ownLic, bool modes )
 {
   const int numTop = c.w >> 2, total = b == 0 ? numTop : c.h >> 2, k0 = b == 0 ? 0 : numTop;
   int iSub = 0;
@@ -282,8 +282,8 @@ void obmcSideOps( Cu c, int rec, int b, ivec2 ownMv, ivec3 ownLic, bool modes )
     }
     if( valid )
     {
-      // (the CU's own vector and LIC - its flag, with LIC its scale and offset: none; a CU of two vectors differs)
-      if( mv != ownMv || lic != ownLic || bi != OBMC_BI_NONE )
+      // (the CU's own motion - one vector or the same two - and LIC - its flag, with LIC its scale and offset: none)
+      if( mv != ownMv || lic != ownLic || ( bi == OBMC_BI_NONE ? ownMv2 != ivec2( 0x7FFFFFFF ) : mv2 != ownMv2 ) )
       {
         obmcAddOp( b, OBMC_OP_MOTION, iSub, len, mv.x, mv.y, lic, mv2, bi );
       }
@@ -630,9 +630,10 @@ void obmcIntraStrip( Tu t, Cu c, int b, int u0, int n, int mode, int lid, int NT
 // ----- the block
 
 // the operations of the OBMC of CU c (invocation 0; its OBMC record rec): the side modes, then per side its runs; the
-// CU's own vector and LIC ownMv and ownLic, whose runs have no OBMC (getSameNeigMotion's identicalMvOBMC with equal LIC
-// flags and, with LIC, scale and offset; ivec2( 0x7FFFFFFF ) where it compares none)
-void obmcPlan( Cu c, int rec, ivec2 ownMv, ivec3 ownLic )
+// CU's own motion and LIC ownMv, ownMv2 and ownLic, whose runs have no OBMC (getSameNeigMotion's identicalMvOBMC with
+// equal LIC flags and, with LIC, scale and offset): ownMv ivec2( 0x7FFFFFFF ) where it compares none, ownMv2 a CU of
+// two vectors' second, ivec2( 0x7FFFFFFF ) a CU of one's (else no motion equals it)
+void obmcPlan( Cu c, int rec, ivec2 ownMv, ivec2 ownMv2, ivec3 ownLic )
 {
   const int flags = BufI32( P.timdData ).v[rec + OBMC_FLAGS];
   tsSet( TO_OPS, 0 );
@@ -644,7 +645,7 @@ void obmcPlan( Cu c, int rec, ivec2 ownMv, ivec3 ownLic )
     {
       obmcGradModes( c, rec, b );
     }
-    obmcSideOps( c, rec, b, ownMv, ownLic, modes );
+    obmcSideOps( c, rec, b, ownMv, ownMv2, ownLic, modes );
   }
 }
 
@@ -661,7 +662,7 @@ void tmpObmcPlan( Tu t, Cu c, int rec )
   const ivec2 ownMv  = noOwn ? ivec2( 0x7FFFFFFF ) : ivec2( o.v[at + DIMD_OUT_TMP_MV], o.v[at + DIMD_OUT_TMP_MV + 1] );
   const ivec3 ownLic = licIdc != 0 ? ivec3( 1, o.v[at + DIMD_OUT_TMP_LIC + 1], o.v[at + DIMD_OUT_TMP_LIC + 3] )
                                    : ivec3( 0 );
-  obmcPlan( c, rec, ownMv, ownLic );
+  obmcPlan( c, rec, ownMv, ivec2( 0x7FFFFFFF ), ownLic );
 }
 
 // the plan's motion runs (their copies at TO_MCS, TO_MC_TOTAL samples): run op's strip, vector (of an averaged run,

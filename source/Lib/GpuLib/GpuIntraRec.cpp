@@ -187,14 +187,18 @@ constexpr int DERIVE_INTER_SECOND = 536870912; // with DERIVE_TRANSFORM, an inte
 constexpr int DERIVE_IBC          = 1073741824; // with DERIVE_INTER an IBC CU's block: its prediction the GPU's, at its
                                                // record's block vectors (intra_ibccu.glsl's ibcBlock)
 // an IBC CU's block's record in Params::timdData (Tu::ibc): its CU's region of the component (x, y, w, h: the one
-// checkValidBv and the padding take), its vector (1/16 luma samples; x, y), its RR-IBC flip (rribcFlipType: 1 horizontal, 2 vertical); IBC GPM's second part's vector and the
-// first part's weights (of 32) per sample of the region, row-major in Params::timdData (else -1); with IBC LIC its
-// ibcLicIdx + 1 (else 0); a luma block's OBMC record (intra_obmc.glsl's OBMC_*, else -1) and the CU's own LIC scale and
-// offset getSameNeigMotion compares (its licScale / licOffset of list 0's luma); with bi-prediction list 0's BCW weight
-// (of 8; the second vector in IBC_REC_MV2; else 0)
+// checkValidBv and the padding take), its vector (1/16 luma samples; x, y), its RR-IBC flip (rribcFlipType: 1
+// horizontal, 2 vertical); IBC GPM's second part's vector and the first part's weights (of 32) per sample of the
+// region, row-major in Params::timdData (else -1); with IBC LIC its ibcLicIdx + 1 (else 0); a luma block's OBMC record
+// (intra_obmc.glsl's OBMC_*, else -1) and the CU's own LIC scale and offset getSameNeigMotion compares (its licScale /
+// licOffset of list 0's luma); with bi-prediction list 0's BCW weight (of 8; the second vector in IBC_REC_MV2; else 0);
+// the second vector getSameNeigMotion compares (IBC_OWN_MV2_*, or a CU of two vectors its list 1 vector)
 constexpr int IBC_REC_X = 0, IBC_REC_Y = 1, IBC_REC_W = 2, IBC_REC_H = 3, IBC_REC_MV = 4, IBC_REC_FLIP = 6;
 constexpr int IBC_REC_MV2 = 7, IBC_REC_WEIGHTS = 9, IBC_REC_LIC = 10, IBC_REC_OBMC = 11, IBC_REC_OWN_LIC = 12;
-constexpr int IBC_REC_BI = 14, IBC_REC = 15;
+constexpr int IBC_REC_BI = 14, IBC_REC_OWN_MV2 = 15, IBC_REC = 17;
+// IBC_REC_OWN_MV2 of a CU of one vector (its neighbours of one vector compare), of two with BCW's weights other than
+// the default (no neighbour's motion equals it: a neighbour of two vectors with BCW is the CPU's)
+constexpr int IBC_OWN_MV2_NONE = 0x7FFFFFFF, IBC_OWN_MV2_NEVER = 0x7FFFFFFE;
 // with DERIVE_INTER a chroma block of inter CCCM (JVET-AE0059): its prediction blended with the CCCM one of a model its
 // TU's luma and chroma predictions fit (intra_intercccm.glsl); its record in Params::timdData at Tu::ibc: the luma
 // block's position and size, its prediction's offset in Params::interPred, whether that is forward-mapped by LMCS, the
@@ -7399,10 +7403,10 @@ static const char* ibcWhy( const GpuIntraRec::Impl& m, const CodingUnit& cu )
     const Slice& s  = *cu.slice;
     const bool   wp = ( s.getSliceType() == B_SLICE && cu.cs->pps->getWPBiPred() )
                       || ( s.getSliceType() == P_SLICE && cu.cs->pps->getUseWP() );
-    if( cu.ibcLicFlag || cu.rribcFlipType || wp || cu.ibcFilterFlag
-        || ( cu.cs->sps->getUseOBMC() && cu.obmcFlag && pu.lwidth() * pu.lheight() >= 32 ) )
+    if( cu.ibcLicFlag || cu.rribcFlipType || wp || cu.ibcFilterFlag )
     {
-      return "IBC bi-prediction with LIC, a flip, weighted prediction, the IBC filter or OBMC";
+      return cu.ibcLicFlag ? "IBC bi-prediction with LIC" : cu.rribcFlipType ? "IBC bi-prediction with a flip"
+             : wp ? "IBC bi-prediction with weighted prediction" : "IBC bi-prediction with the IBC filter";
     }
   }
   if( cu.ibcFilterFlag )
@@ -7447,8 +7451,16 @@ static void ibcRecord( GpuIntraRec::Impl& m, const CodingUnit& cu, const Compone
   t.derive |= DERIVE_IBC | DERIVE_PREFIX;
   int32_t rec[IBC_REC] = { area.x, area.y, (int32_t) area.width, (int32_t) area.height, pu.mv[0].hor, pu.mv[0].ver,
                            cu.rribcFlipType, 0, 0, -1, cu.ibcLicFlag ? cu.ibcLicIdx + 1 : 0, -1,
-                           cu.licScale[0][COMPONENT_Y], cu.licOffset[0][COMPONENT_Y], 0 };
+                           cu.licScale[0][COMPONENT_Y], cu.licOffset[0][COMPONENT_Y], 0, IBC_OWN_MV2_NONE,
+                           IBC_OWN_MV2_NONE };
 #if JVET_AE0169_BIPREDICTIVE_IBC
+  // the motion OBMC compares a neighbour's with (identicalMvOBMC: the same lists and vectors; then BCW's index)
+  if( pu.interDir == 3 && !pu.ibcGpmFlag )
+  {
+    const bool bcw = cu.bcwIdx != BCW_DEFAULT;
+    rec[IBC_REC_OWN_MV2]     = bcw ? IBC_OWN_MV2_NEVER : pu.mv[1].hor;
+    rec[IBC_REC_OWN_MV2 + 1] = bcw ? IBC_OWN_MV2_NEVER : pu.mv[1].ver;
+  }
   // bi-prediction (xCheckIdenticalMotion: two equal vectors predict as one, xPredInterUni's copy without LIC)
   const Slice& slice = *cu.slice;
   if( pu.interDir == 3 && !pu.ibcGpmFlag

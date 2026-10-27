@@ -54,7 +54,8 @@ void ibcBlock( Tu t, int lid, int NT )
     if( lid == 0 )   // (a two-model LIC CU compares no vector of its own)
     {
       const ivec3 ownLic = lic > 0 ? ivec3( 1, d.v[r + IBC_REC_OWN_LIC], d.v[r + IBC_REC_OWN_LIC + 1] ) : ivec3( 0 );
-      obmcPlan( c, ob, lic == IBC_LIC_IDX_M + 1 ? ivec2( 0x7FFFFFFF ) : mv, ownLic );
+      const ivec2 ownMv2 = ivec2( d.v[r + IBC_REC_OWN_MV2], d.v[r + IBC_REC_OWN_MV2 + 1] );
+      obmcPlan( c, ob, lic == IBC_LIC_IDX_M + 1 ? ivec2( 0x7FFFFFFF ) : mv, ownMv2, ownLic );
     }
     tsSync();
     extra = tsGet( TO_MC_TOTAL );

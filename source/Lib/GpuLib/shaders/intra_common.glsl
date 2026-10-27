@@ -289,10 +289,11 @@ const int DERIVE_IBC   = 1073741824;   // with DERIVE_INTER: an IBC CU's block, 
 // component's samples, its block vector in 1/16 luma samples, its RR-IBC flip, IBC GPM's second vector and the first
 // part's weights (their offset, else -1), with IBC LIC its ibcLicIdx + 1 (else 0), a luma block's OBMC record
 // (intra_obmc.glsl's OBMC_*, else -1), the CU's own LIC scale and offset (getSameNeigMotion's comparison), with
-// bi-prediction list 0's BCW weight of 8 (its second vector IBC_REC_MV2's; else 0)
+// bi-prediction list 0's BCW weight of 8 (its second vector IBC_REC_MV2's; else 0), the second vector
+// getSameNeigMotion compares (obmcPlan's ownMv2)
 const int IBC_REC_X = 0, IBC_REC_Y = 1, IBC_REC_W = 2, IBC_REC_H = 3, IBC_REC_MV = 4, IBC_REC_FLIP = 6;
 const int IBC_REC_MV2 = 7, IBC_REC_WEIGHTS = 9, IBC_REC_LIC = 10, IBC_REC_OBMC = 11, IBC_REC_OWN_LIC = 12;
-const int IBC_REC_BI = 14;
+const int IBC_REC_BI = 14, IBC_REC_OWN_MV2 = 15;
 // an OBMC CU's record in Params::timdData (Tu::obmc - 1; intra_rec's OBMC, intra_deps' obmcIntraDeps): the CU
 // (luma), the flags, the segments (OBMC_SEG_* each: the boundary - 0 top, 1 left -, the first luma sample along it
 // relative to the CU, the length, its data in Params::interPred: inter_mc.comp's OBMC_D_* -, an IBC neighbour's
