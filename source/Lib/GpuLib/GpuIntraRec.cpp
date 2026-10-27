@@ -8720,9 +8720,13 @@ static const char* subPuWhy( const GpuIntraRec::Impl& m, const CodingUnit& cu )
   {
     return "non-local LIC";
   }
-  if( pu.ciipFlag )
+  if( pu.ciipFlag )   // (CIIP: ciipWhy's limits; its blend, after the PU's prediction and OBMC, in the blocks)
   {
-    return "CIIP";
+    const char* const why = ciipWhy( cu );
+    if( why )
+    {
+      return why;
+    }
   }
   if( pu.bdmvrRefine || cu.geoFlag )
   {

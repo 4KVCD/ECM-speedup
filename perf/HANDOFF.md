@@ -3210,6 +3210,10 @@ Not yet with inter CCCM / CCP merge or ASBT. Results (grn121, with M136, before 
 but ra_ip64_md5 1 and ra720_pj17 4 (section 9), and in one run ldp_parkjoy_q27 1 of 9 (a CCP merge model of a 2 x 16
 Cb block at 124,64; identical in a second run: section 9c's race). Inter CUs predicted by the CPU: GPM (CIIP of
 several transform units) 130 -> 0 (110 on the GPU; 15 with inter CCCM / CCP merge, 2 with ASBT, 3 other reasons).
+M136 (2026-10-27): CIIP of sub-PU motion (xSubPuMC's CUs: affine sub-block merge, SbTMVP), which subPuWhy left to the
+CPU: within ciipWhy's limits they predict as other CIIP CUs - the PU's prediction and its OBMC (with bSubMotion's inner
+sub-blocks), then the blocks' blend with the intra prediction. Results as M135's (grn121). Inter CUs predicted by the
+CPU: affine (CIIP: sub-block merge) 90 -> 2, affine (CIIP: OBMC of sub-block motion) 36 -> 0.
 Tried after M125 and left out (idle 3070, median of 5 or 7): the CCP merge history's and list's records read ahead in
 parallel with signatures (neutral); IntraTMP's refinement ranks counting only the windows that overlap no other
 (+3 % aiodd: the weaker filter sends more positions to the walk) or comparing only positions of overlapping windows
