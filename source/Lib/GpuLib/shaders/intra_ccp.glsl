@@ -1183,9 +1183,9 @@ void ccpMergePrediction( inout Tu t, int predStride, int lid, int NT )
     fillReferencePar( o, 0, 1, predStride, lid, NT );
     SYNC();
   }
+  cclmAvailability( t, lid, NT );
   if( lid == 0 )
   {
-    cclmAvailability( t );
     if( derived )
     {
       ccpDerivedLinear( t, predStride );

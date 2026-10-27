@@ -3191,6 +3191,10 @@ up to 8 lanes per output, partial sums in s_spCost. GPU time (grn98 -> grn99): a
 unchanged (269.0 / 269.8). aiodd's 163 NN blocks spend ~110 us each in the wide sparse layers 0 and 1 (640 - 1216
 outputs of ~5 packs of 8 weights each): chains of loads; loading 4 packs at once and a path without the partial sums
 there measured slower overall (section 7's ~1 % from structural changes), left out. Results as M131's.
+M133 (2026-10-27): reference line availability (refLineAvailability's prefix walks) tested by the whole workgroup,
+each unit by an invocation, each arm's prefix by atomicMin (lineAvailability, in intra_tmrl.glsl): TMRL nodes' lines,
+TMRL blocks' lines, LM blocks' templates (cclmAvailability). GPU time (grn101 -> grn104): aiodd 271.6 -> 267.0 ms,
+ai720 1,786.2 -> 1,770.7 ms. Results as M131's.
 
 ## 8. Numbers (i7-10700 8C/16T, Win11, GCC 16.2, RTX 3070 driver 616.92)
 

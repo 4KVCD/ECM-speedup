@@ -25,24 +25,30 @@ const int CCLM_MODEL = 16, CCLM_SLOT = 8;
 const int CCLM_A = 0, CCLM_B = 1, CCLM_SHIFT = 2, CCLM_A2 = 3, CCLM_B2 = 4, CCLM_SHIFT2 = 5, CCLM_THRES = 6;
 
 // the availability of block t's template units (xGetLMParametersLMS: chroma units of 2) and of LBCCP's positions
-// (isPosAvailable) into s_cclm (invocation 0)
-void cclmAvailability( Tu t )
+// (isPosAvailable: one invocation each) into s_cclm (all invocations, ending with a barrier; intra_tmrl.glsl's
+// lineAvailability)
+void cclmAvailability( Tu t, int lid, int NT )
 {
   const int ch = 1;
   OwnerMap  om = OwnerMap( BufI32( P.owner[t.comp] ), P.ownerW[ch], P.ownerH[ch], P.unitLog2X[ch], P.unitLog2Y[ch] );
-  const int unit = 2, tAU = t.w, tLU = t.h;   // the template's arms of 2W / 2H in units of 2
-  int av[7];
-  refLineAvailability( om, g_ti, t.x, t.y, t.w, t.h, tAU, tLU, 0, unit, unit, tAU, tLU, av );
-  const bool above = av[1] == t.w / unit, left = av[3] == t.h / unit;
-  s_cclm[CCLM_ABOVE]    = above ? 1 : 0;
-  s_cclm[CCLM_LEFT]     = left ? 1 : 0;
-  s_cclm[CCLM_AR_UNITS] = above ? av[2] : 0;   // (none where the units above are not all available)
-  s_cclm[CCLM_BL_UNITS] = left ? av[4] : 0;
-  s_cclm[CCLM_POS_ABOVE]       = decodedBefore( om, t.x, t.y - 1, g_ti ) ? 1 : 0;
-  s_cclm[CCLM_POS_LEFT]        = decodedBefore( om, t.x - 1, t.y, g_ti ) ? 1 : 0;
-  s_cclm[CCLM_POS_LEFT_ABOVE]  = decodedBefore( om, t.x - 1, t.y - 1, g_ti ) ? 1 : 0;
-  s_cclm[CCLM_POS_ABOVE_RIGHT] = decodedBefore( om, t.x + t.w, t.y - 1, g_ti ) ? 1 : 0;
-  s_cclm[CCLM_POS_LEFT_BELOW]  = decodedBefore( om, t.x - 1, t.y + t.h, g_ti ) ? 1 : 0;
+  const int unit = 2;   // (the template's arms of 2W / 2H: W and H units of 2)
+  lineAvailability( om, g_ti, t.x, t.y, t.w, t.h, t.w, t.h, 0, unit, unit, lid, NT );
+  if( lid < 5 )   // (above, left, above-left, above-right, below-left)
+  {
+    const ivec2 p = lid == 0 ? ivec2( t.x, t.y - 1 ) : lid == 1 ? ivec2( t.x - 1, t.y )
+                  : lid == 2 ? ivec2( t.x - 1, t.y - 1 ) : lid == 3 ? ivec2( t.x + t.w, t.y - 1 )
+                                                         : ivec2( t.x - 1, t.y + t.h );
+    s_cclm[CCLM_POS_ABOVE + lid] = decodedBefore( om, p.x, p.y, g_ti ) ? 1 : 0;
+  }
+  if( lid == 0 )
+  {
+    const bool above = s_lineAvail[1] == t.w / unit, left = s_lineAvail[3] == t.h / unit;
+    s_cclm[CCLM_ABOVE]    = above ? 1 : 0;
+    s_cclm[CCLM_LEFT]     = left ? 1 : 0;
+    s_cclm[CCLM_AR_UNITS] = above ? s_lineAvail[2] : 0;   // (none where the units above are not all available)
+    s_cclm[CCLM_BL_UNITS] = left ? s_lineAvail[4] : 0;
+  }
+  barrier();
 }
 
 bool cclmMultiModel( int mode ) { return mode == MMLM_CHROMA_IDX || mode == MMLM_L_IDX || mode == MMLM_T_IDX; }
@@ -602,11 +608,7 @@ void cclmTransformMode( Tu t, int predStride, int maxPel, int lid, int NT )
     {
       fillReferencePar( o, 0, 1, predStride, lid, NT );
     }
-    if( lid == 0 )
-    {
-      cclmAvailability( t );
-    }
-    SYNC();
+    cclmAvailability( t, lid, NT );
     if( lid == 0 )   // (cclmModel's samples share s_tmp: one after the other)
     {
       if( own )

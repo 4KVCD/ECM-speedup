@@ -10,10 +10,6 @@
 
 const int TMRL_MODES = 10;   // TMRL_MPM_SIZE
 
-// the availability of the reference line the node fills (lid 0's scan for the workgroup), in MIP's boundary array, which
-// a node does not use: an array of its own would add shared memory to every pipeline
-#define s_tmrlAvail s_mipBdry
-
 // ----- the mode list (getTmrlSearchRange: getSpatialIpm and fillMPMList with extPrecision and isForcedValid)
 
 // a set of modes of the 131-mode set (includedMode)
@@ -196,9 +192,49 @@ int tmrlDc( int W, int H, int mrl, int predStride, int lid, int NT )
 
 // ----- the node
 
+// refLineAvailability of reference line mrl of the area (fx, fy, fw, fh), whose arms have tAU above and tLU left units
+// of uW x uH, on owner map m for block `before` into s_lineAvail (MIP's boundary: TMRL and LM blocks have no MIP; all
+// invocations, ending with a barrier): every unit of the arms tested by an invocation of its own, an arm's available
+// prefix the first unit not decoded (atomicMin), instead of one invocation testing them one after the other
+#define s_lineAvail s_mipBdry
+
+void lineAvailability( OwnerMap m, int before, int fx, int fy, int fw, int fh, int tAU, int tLU, int mrl, int uW,
+                       int uH, int lid, int NT )
+{
+  const int x0 = fx - 1 - mrl, y0 = fy - 1 - mrl, lM = mrl / uH, aM = mrl / uW;
+  const int numAbove = max( fw / uW, 1 ), numLeft = max( fh / uH, 1 );
+  // (the corner, above, above-right, left, below-left, the MRL units left of the corner and above it: as
+  // refLineAvailability's with unitsTop and unitsLeft the arms' tAU and tLU)
+  const int lim[7] = int[7]( 1, max( 1, min( numAbove, tAU ) ), max( 1, tAU - numAbove ), max( 1, min( numLeft, tLU ) ),
+                             max( 1, tLU - numLeft ), lM, aM );
+  if( lid < 7 )
+  {
+    s_lineAvail[lid] = lim[lid];
+  }
+  barrier();
+  for( int i = lid; i < lim[0] + lim[1] + lim[2] + lim[3] + lim[4] + lim[5] + lim[6]; i += NT )
+  {
+    int a = 0, k = i;
+    while( k >= lim[a] )
+    {
+      k -= lim[a];
+      a++;
+    }
+    const ivec2 p = a == 0 ? ivec2( x0, y0 ) : a == 1 ? ivec2( fx + k * uW, y0 )
+                  : a == 2 ? ivec2( fx + fw - 1 + uW + k * uW, y0 ) : a == 3 ? ivec2( x0, fy + k * uH )
+                  : a == 4 ? ivec2( x0, fy + fh - 1 + uH + k * uH ) : a == 5 ? ivec2( x0, fy - lM * uH + k * uH )
+                                                                    : ivec2( fx - aM * uW + k * uW, y0 );
+    if( !decodedBefore( m, p.x, p.y, before ) )
+    {
+      atomicMin( s_lineAvail[a], k );
+    }
+  }
+  barrier();
+}
+
 // CU c's reference line mrl as a block record of its area (fillReferencePar's): the whole arms (8 x its sides) and
-// their availability for the node t (refLineAvailability, invocation 0's scan broadcast through s_tmrlAvail)
-Tu tmrlLineRecord( Tu t, Cu c, int mrl, int lid )
+// their availability for the node t (lineAvailability)
+Tu tmrlLineRecord( Tu t, Cu c, int mrl, int lid, int NT )
 {
   Tu r = t;
   r.comp = 0;
@@ -212,21 +248,12 @@ Tu tmrlLineRecord( Tu t, Cu c, int mrl, int lid )
   r.mrl  = mrl;
   r.readMax[0][0] = ( c.w << 3 ) + mrl;
   r.readMax[0][1] = ( c.h << 3 ) + mrl;
-  if( lid == 0 )
+  OwnerMap om = OwnerMap( BufI32( P.owner[0] ), P.ownerW[0], P.ownerH[0], P.unitLog2X[0], P.unitLog2Y[0] );
+  lineAvailability( om, g_ti, c.x, c.y, c.w, c.h, ( c.w << 3 ) / t.unitW, ( c.h << 3 ) / t.unitH, mrl, t.unitW, t.unitH,
+                    lid, NT );
+  for( int k = 0; k < 7; k++ )   // (read before the references' barrier, after which the next line's are written)
   {
-    OwnerMap om = OwnerMap( BufI32( P.owner[0] ), P.ownerW[0], P.ownerH[0], P.unitLog2X[0], P.unitLog2Y[0] );
-    const int tAU = ( c.w << 3 ) / t.unitW, tLU = ( c.h << 3 ) / t.unitH;
-    int av[7];
-    refLineAvailability( om, g_ti, c.x, c.y, c.w, c.h, tAU, tLU, mrl, t.unitW, t.unitH, tAU, tLU, av );
-    for( int k = 0; k < 7; k++ )
-    {
-      s_tmrlAvail[k] = av[k];
-    }
-  }
-  SYNC();
-  for( int k = 0; k < 7; k++ )
-  {
-    r.avail[0][k] = s_tmrlAvail[k];
+    r.avail[0][k] = s_lineAvail[k];
   }
   return r;
 }
@@ -290,7 +317,7 @@ int tmrlNode( Tu t, Cu c, int dimdModes[3], int bitDepth, int lid, int NT )
   {
     const int mrl        = TMRL_LINES[li];
     const int predStride = ( c.w << 3 ) + 1 + mrl;
-    const Tu  r          = tmrlLineRecord( t, c, mrl, lid );
+    const Tu  r          = tmrlLineRecord( t, c, mrl, lid, NT );
     fillReferencePar( r, 0, 0, predStride, lid, NT );
     SYNC();
     const int dc = tmrlDc( c.w, c.h, mrl, predStride, lid, NT );
@@ -376,28 +403,19 @@ TmrlParams chromaTmrlParams( int mode, int W, int H )
 }
 
 // line mrl of component comp of chroma TMRL CU c as getChromaTmrlList fills it for the templates (xFillReferenceSamples
-// with arms of 2 x (the side + 1), whose last unit may be partial) into s_ref[0], its availability for node t scanned by
-// invocation 0 (refLineAvailability on the component's owner map, Tu::unitW / unitH the CU's units); all invocations,
-// ending with a barrier. Returns the stride
+// with arms of 2 x (the side + 1), whose last unit may be partial) into s_ref[0], its availability for node t
+// (lineAvailability on the component's owner map, Tu::unitW / unitH the CU's units); all invocations, ending with a
+// barrier. Returns the stride
 int chromaTmrlLine( Tu t, Cu c, int comp, int mrl, int lid, int NT )
 {
   const int predSize = ( c.w + 1 ) << 1, predHSize = ( c.h + 1 ) << 1, predStride = predSize + 1 + mrl;
-  if( lid == 0 )
-  {
-    OwnerMap om = OwnerMap( BufI32( P.owner[comp] ), P.ownerW[1], P.ownerH[1], P.unitLog2X[1], P.unitLog2Y[1] );
-    const int tAU = ( predSize + t.unitW - 1 ) / t.unitW, tLU = ( predHSize + t.unitH - 1 ) / t.unitH;
-    int av[7];
-    refLineAvailability( om, g_ti, c.x, c.y, c.w, c.h, tAU, tLU, mrl, t.unitW, t.unitH, tAU, tLU, av );
-    for( int k = 0; k < 7; k++ )
-    {
-      s_tmrlAvail[k] = av[k];
-    }
-  }
-  SYNC();
+  OwnerMap  om = OwnerMap( BufI32( P.owner[comp] ), P.ownerW[1], P.ownerH[1], P.unitLog2X[1], P.unitLog2Y[1] );
+  lineAvailability( om, g_ti, c.x, c.y, c.w, c.h, ( predSize + t.unitW - 1 ) / t.unitW,
+                    ( predHSize + t.unitH - 1 ) / t.unitH, mrl, t.unitW, t.unitH, lid, NT );
   int av[7];
   for( int k = 0; k < 7; k++ )
   {
-    av[k] = s_tmrlAvail[k];
+    av[k] = s_lineAvail[k];
   }
   const int valueDC = 1 << ( t.bitDepth - 1 ), numTop = predSize + mrl + 1;
   for( int e = lid; e < numTop + predHSize + mrl + 1; e += NT )
@@ -990,8 +1008,9 @@ int chromaTmrlNode( Tu t, Cu c, int lumaMode, int dimdModes[3], int lid, int NT 
 // cubic filter, TIMD's 1/64 N-tap ones in intra_rec), fusion where the CU's fetchRef2nd and the slope allow it, the
 // bilateral filter for DC only (xPredIntraAng's MRL rule). Chroma: a regular chroma mode with that line
 // (applyModeParams; no fusion: fetchRef2nd is luma's). Then the availability of the line (luma: and of the next one)
-// over their whole arms, which intra_deps could not know (refLineAvailability for block g_ti, in each invocation)
-void tmrlBlockParams( inout Tu t )
+// over their whole arms, which intra_deps could not know (lineAvailability for block g_ti; all invocations, uniform
+// control flow)
+void tmrlBlockParams( inout Tu t, int lid, int NT )
 {
   CBufI32 o = CBufI32( P.tmrlOut );
   const int tmrl = BufCu( P.cus ).v[t.cu].tmrl;
@@ -1013,11 +1032,14 @@ void tmrlBlockParams( inout Tu t )
   const int tAU = ( t.w << 3 ) / t.unitW, tLU = ( t.h << 3 ) / t.unitH;
   for( int ln = 0; ln < ( luma ? 2 : 1 ); ln++ )
   {
-    int av[7];
-    refLineAvailability( om, g_ti, t.x, t.y, t.w, t.h, tAU, tLU, t.mrl + ln, t.unitW, t.unitH, tAU, tLU, av );
-    t.avail[ln]      = av;
+    lineAvailability( om, g_ti, t.x, t.y, t.w, t.h, tAU, tLU, t.mrl + ln, t.unitW, t.unitH, lid, NT );
+    for( int k = 0; k < 7; k++ )
+    {
+      t.avail[ln][k] = s_lineAvail[k];
+    }
     t.readMax[ln][0] = ( t.w << 3 ) + t.mrl + ln;
     t.readMax[ln][1] = ( t.h << 3 ) + t.mrl + ln;
+    SYNC();   // (read before the next line's are written)
   }
 }
 

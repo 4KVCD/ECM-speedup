@@ -1034,9 +1034,9 @@ int ccpFusionTemplateBase( Tu t );   // (intra_ccp.glsl)
 // fusion's) the set of the lower template cost (the second only when strictly lower)
 void cccmPrediction( Tu t, bool both, int lid, int NT )
 {
+  cclmAvailability( t, lid, NT );
   if( lid == 0 )
   {
-    cclmAvailability( t );
     cccmArea( t );
   }
   if( lid >= 2 && lid < 6 )   // the slots of its wgSum2 calls, zero before each (with LFNST / NSPT it runs twice)

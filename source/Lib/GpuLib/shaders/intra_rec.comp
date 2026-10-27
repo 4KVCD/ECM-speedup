@@ -2731,7 +2731,7 @@ void main()
       }
       else if( WITH_TMRL && ( t.derive & DERIVE_TMRL ) != 0 )   // its node's mode and line (intra_tmrl.glsl)
       {
-        tmrlBlockParams( t );
+        tmrlBlockParams( t, lid, NT );
       }
       else if( s_mode >= DBV_MODE && s_mode < DBV_MODE + CR_DBV_MAX )   // DBV: no mode's parameters (verification: 0)
       {
@@ -3132,11 +3132,7 @@ void main()
         }
         else
         {
-          if( lid == 0 )
-          {
-            cclmAvailability( t );
-          }
-          SYNC();
+          cclmAvailability( t, lid, NT );
           if( lid == 0 )
           {
             cclmModel( t, lx, ly, predStride, 0, 0 );
