@@ -368,6 +368,18 @@ void ccpMergeSort()
 
 int g_ccpAngUsed = 0;   // the angular arrays' entries the CCCM luma buffers took (intra_rec clears them)
 
+// which filters' samples the CCCM luma buffers hold (ccpLumaKey; -1: none a candidate may reuse) and the luma offset
+// they were taken with
+int g_ccpLumaKey = -1, g_ccpLumaOffset = 0;
+
+// what a model's luma buffers depend on besides the luma offset: with or without subsampling, the filters (several
+// filters' mode, GLM with luma's pattern)
+int ccpLumaKey( int x )
+{
+  return ( g_cccmNoSub ? 1 : 0 ) | ( g_cccmMdf << 1 )
+         | ( g_cccmGlmLuma ? 8 | ( ccpWord( x, CCP_OUT_GLM_IDC ) << 4 ) : 0 );
+}
+
 // whether candidate type `type` predicts as a CCLM block (CCLM, GLM's gradient patterns), else as a CCCM block
 bool ccpLinear( int type ) { return ( type & ( CCP_TYPE_CCLM | CCP_TYPE_GLM0123 ) ) != 0; }
 
@@ -398,10 +410,33 @@ void ccpCccmModel( Tu t, int x, bool ownLoc, int lid, int NT )
   const bool loc = ( g_cccmGl || mdf != 0 ) && !ownLoc;
   g_cccmLocDX      = loc ? ccpWord( x, CCP_OUT_COR_OFF ) - g_cccmSizeX : 0;
   g_cccmLocDY      = loc ? ccpWord( x, CCP_OUT_COR_OFF + 1 ) - g_cccmSizeY : 0;
-  for( int b = 0; b < cccmNumBuffers(); b++ )
+  // The candidates' buffers differ mostly in their luma offset alone: where the previous candidate's buffers hold the
+  // same filters' samples, each sample (but GLM's gradient values, which have no offset) is moved by the offsets'
+  // difference instead of being downsampled from the picture again
+  const int key = ccpLumaKey( x );
+  if( key != g_ccpLumaKey )
   {
-    cccmBuildLuma( t, b, lid, NT );
+    for( int b = 0; b < cccmNumBuffers(); b++ )
+    {
+      cccmBuildLuma( t, b, lid, NT );
+    }
   }
+  else if( g_ccpLumaOffset != g_cccmLumaOffset )
+  {
+    const int delta = g_ccpLumaOffset - g_cccmLumaOffset, pad = 1 << g_cccmShift;
+    for( int i = lid; i < cccmNumBuffers() * cccmBufferSize(); i += NT )
+    {
+      const int b = i / cccmBufferSize(), j = i % cccmBufferSize();
+      const int px = j % cccmBufferW() - pad, py = j / cccmBufferW() - pad;
+      if( cccmFilterOf( b ) != CCCM_FILTER_GLM )
+      {
+        cccmSetLuma( b, px, py, cccmLumaOf( b, px, py ) + delta );
+      }
+    }
+    cccmSync();
+  }
+  g_ccpLumaKey    = key;
+  g_ccpLumaOffset = g_cccmLumaOffset;
   if( g_cccmSharedLuma )
   {
     g_ccpAngUsed = max( g_ccpAngUsed, ( cccmBufferSize() + 3 ) >> 2 );
@@ -1135,6 +1170,7 @@ void ccpMergePrediction( inout Tu t, int predStride, int lid, int NT )
   const bool twoSteps = derived || ddFusion;   // (list[1]'s prediction, then list[0]'s)
   const int  adjust = twoSteps || blendFusion ? 0 : kind;
   g_ccpAngUsed = 0;
+  g_ccpLumaKey = -1;   // (the fits below build buffers of their own)
   if( twoSteps )   // (where a prediction goes, also where no CCCM model of the block set them: list[1] a CCLM model)
   {
     g_cccmFusion = false;
@@ -1215,6 +1251,7 @@ void ccpMergePrediction( inout Tu t, int predStride, int lid, int NT )
     {
       if( step == numCost )   // the choice
       {
+        g_ccpLumaKey = -1;   // (the chosen candidates' buffers built anew)
         if( derived )
         {
           ccpDerivedChoice( t, lid, NT );

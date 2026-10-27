@@ -3165,6 +3165,12 @@ M127 (2026-10-27): IntraTMP's lists keep their entries in place: a list holds an
 stay in their slots, so an insertion or an erasure moves one word per entry behind it, not TE (tlSlot, tlPlace).
 GPU time (median of 5, idle, against M126): aiodd 324.7 -> 315.8 ms, ai720 2,058.1 -> 2,032.3 ms. Results (grn96,
 with M128 - M130 on top): identical but ra_ip64_md5 1 and ra720_pj17 4 (section 9).
+M128 (2026-10-27): CCP merge's CCCM candidates reuse the luma buffers of the candidate before where they hold the same
+filters' samples (ccpLumaKey: with or without subsampling, several filters' mode, GLM with luma's pattern), each
+sample moved by the luma offsets' difference instead of downsampled from the picture again (GLM's gradients, which
+have no offset, stay). Phase timers (aiodd, 84 merge blocks): the candidates' model loads 20.7 -> 9.6 ms. GPU time
+(median of 5): aiodd 315.8 -> 312.3 ms, ai720 2,032.3 -> 1,987.8 ms. Results as M127's. (Reading the history's and
+the list's records ahead in parallel with signatures of the compared words measured no faster: left out.)
 
 ## 8. Numbers (i7-10700 8C/16T, Win11, GCC 16.2, RTX 3070 driver 616.92)
 
