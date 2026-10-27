@@ -3152,6 +3152,15 @@ derives the model from its templates and applies it anyway, DecCu stores identit
 models InterPrediction holds after the prediction (GpuIntraRec::derivedLic, before it overwrites the CU's);
 affineRecord gives the PU those. Results (grn73 / grn74): identical but ra_ip64_md5 1 and ra720_pj17 4 (section 9).
 Inter CUs predicted by the CPU 517 -> 402.
+M126 (2026-10-26): IntraTMP's positions enumerated in parallel. The node's invocation 0 walked the sparse search's and
+the refinement's positions alone (aiodd: 33k and 74k); now it only cuts each chunk's rows (a region's rows, a candidate
+window's rows, a row too long for the chunk in pieces whose walk state the next chunk takes on), an invocation per row
+walks its positions with the same decisions in the same order (tmpSparseRow, tmpRefineRow), and tmpChunkPack puts them
+after each other in the rows' order. intra_rec's GPU time (median of 3, idle 3070, against M125's grn74): aiodd
+366.1 -> 310.2 ms (-15.3 %), ai720 2,322.8 -> 2,054.4 ms (-11.6 %). Results (build grn82, every picture of the 27
+streams): identical but ra_ip64_md5 1 and ra720_pj17 4 (section 9), and in one run ld_parkjoy_q27 1 of 9 (a CCCM
+block without subsampling, Cr 4 x 2 at 100,46 of POC 8; identical in two more runs of grn82 and in one of grn89:
+section 9's race).
 
 ## 8. Numbers (i7-10700 8C/16T, Win11, GCC 16.2, RTX 3070 driver 616.92)
 

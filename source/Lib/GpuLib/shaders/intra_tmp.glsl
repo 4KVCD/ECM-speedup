@@ -87,6 +87,73 @@ void tsSync()
                   gl_SemanticsAcquireRelease );
 }
 
+// ----- the lists (invocation 0 updates them): per template type the sparse search's and the refinement's, each its
+// size, then entries of TE words, in the scratch at their handles (TS_SPARSE + t * TS_LIST, TS_REFINE + t * TS_LIST)
+
+int  tlSize( int list )                       { return tsGet( list ); }
+int  tlAt( int list, int i, int f )           { return tsGet( list + 1 + i * TE + f ); }
+void tlSetAt( int list, int i, int f, int v ) { tsSet( list + 1 + i * TE + f, v ); }
+
+// updateCandList (UnitTools.h, uint64 costs): entry e into the list of capacity num after the entries of equal cost;
+// where the list is full, the last drops out, or e where it costs no less than the last
+void tlUpdate( int list, int e[TE], int num )
+{
+  const int size = min( tlSize( list ), num );
+  int shift = 0;
+  while( shift < size && e[TE_COST] < tlAt( list, size - 1 - shift, TE_COST ) )
+  {
+    shift++;
+  }
+  if( size >= num && shift == 0 )
+  {
+    return;
+  }
+  const int last = size >= num ? size - 1 : size;   // (the new last entry)
+  for( int i = last; i > size - shift; i-- )
+  {
+    for( int f = 0; f < TE; f++ )
+    {
+      tlSetAt( list, i, f, tlAt( list, i - 1, f ) );
+    }
+  }
+  for( int f = 0; f < TE; f++ )
+  {
+    tlSetAt( list, size - shift, f, e[f] );
+  }
+  tsSet( list, last + 1 );
+}
+
+void tlErase( int list, int i )
+{
+  const int size = tlSize( list );
+  for( int j = i; j < size - 1; j++ )
+  {
+    for( int f = 0; f < TE; f++ )
+    {
+      tlSetAt( list, j, f, tlAt( list, j + 1, f ) );
+    }
+  }
+  tsSet( list, size - 1 );
+}
+
+bool tlHas( int list, int x, int y )
+{
+  for( int i = 0; i < tlSize( list ); i++ )
+  {
+    if( tlAt( list, i, TE_X ) == x && tlAt( list, i, TE_Y ) == y )
+    {
+      return true;
+    }
+  }
+  return false;
+}
+
+// a list entry's values
+int[TE] tlEntry( int x, int y, ivec2 tl, ivec2 br, int region, int cost )
+{
+  return int[TE]( x, y, tl.x, tl.y, br.x, br.y, region, cost );
+}
+
 // ----- the template costs
 
 // the CU's own template (its rows above, with the L-shape's corner, then its columns left), which every cost reads, in
@@ -227,8 +294,8 @@ void tmpChunkCosts( Cu c, int tempType, int numTypes, ivec3 caps, bool refine, i
     if( refine )
     {
       const int tag = tsGet( TS_POS + 2 * k + 1 ), t = tag & 3, ci = tag >> 2, sparse = TS_SPARSE + t * TS_LIST;
-      const bool atCand = px == tsGet( sparse + 1 + ci * TE + TE_X ) && py == tsGet( sparse + 1 + ci * TE + TE_Y );
-      may = ( atCand ? tsGet( sparse + 1 + ci * TE + TE_COST ) : cs[t] ) < s_tmpThr[t];
+      const bool atCand = px == tlAt( sparse, ci, TE_X ) && py == tlAt( sparse, ci, TE_Y );
+      may = ( atCand ? tlAt( sparse, ci, TE_COST ) : cs[t] ) < s_tmpThr[t];
     }
   }
   tsSync();
@@ -243,12 +310,12 @@ void tmpChunkCosts( Cu c, int tempType, int numTypes, ivec3 caps, bool refine, i
     if( k < s_tmpCount && cost < s_tmpThr[t] )
     {
       const int list = TS_SPARSE + t * TS_LIST;
-      int       lo = 0, hi = tsGet( list );   // (the list's entries costing no more: it rises by cost)
+      int       lo = 0, hi = tlSize( list );   // (the list's entries costing no more: it rises by cost)
       while( lo < hi )
       {
         const int mid = ( lo + hi ) >> 1;
-        lo = tsGet( list + 1 + mid * TE + TE_COST ) <= cost ? mid + 1 : lo;
-        hi = tsGet( list + 1 + mid * TE + TE_COST ) <= cost ? hi : mid;
+        lo = tlAt( list, mid, TE_COST ) <= cost ? mid + 1 : lo;
+        hi = tlAt( list, mid, TE_COST ) <= cost ? hi : mid;
       }
       int before = lo;
       for( int j = 0; j < s_tmpCount && before < caps[t]; j++ )
@@ -272,72 +339,6 @@ void tmpEmit( inout int k, int x, int y, int tag )
   tsSet( TS_POS + 2 * k, ( x & 0xFFFF ) | ( y << 16 ) );
   tsSet( TS_POS + 2 * k + 1, tag );
   k++;
-}
-
-// ----- the lists (invocation 0)
-
-int  tlSize( int list )                       { return tsGet( list ); }
-int  tlAt( int list, int i, int f )           { return tsGet( list + 1 + i * TE + f ); }
-void tlSetAt( int list, int i, int f, int v ) { tsSet( list + 1 + i * TE + f, v ); }
-
-// updateCandList (UnitTools.h, uint64 costs): entry e into the list of capacity num after the entries of equal cost;
-// where the list is full, the last drops out, or e where it costs no less than the last
-void tlUpdate( int list, int e[TE], int num )
-{
-  const int size = min( tlSize( list ), num );
-  int shift = 0;
-  while( shift < size && e[TE_COST] < tlAt( list, size - 1 - shift, TE_COST ) )
-  {
-    shift++;
-  }
-  if( size >= num && shift == 0 )
-  {
-    return;
-  }
-  const int last = size >= num ? size - 1 : size;   // (the new last entry)
-  for( int i = last; i > size - shift; i-- )
-  {
-    for( int f = 0; f < TE; f++ )
-    {
-      tlSetAt( list, i, f, tlAt( list, i - 1, f ) );
-    }
-  }
-  for( int f = 0; f < TE; f++ )
-  {
-    tlSetAt( list, size - shift, f, e[f] );
-  }
-  tsSet( list, last + 1 );
-}
-
-void tlErase( int list, int i )
-{
-  const int size = tlSize( list );
-  for( int j = i; j < size - 1; j++ )
-  {
-    for( int f = 0; f < TE; f++ )
-    {
-      tlSetAt( list, j, f, tlAt( list, j + 1, f ) );
-    }
-  }
-  tsSet( list, size - 1 );
-}
-
-bool tlHas( int list, int x, int y )
-{
-  for( int i = 0; i < tlSize( list ); i++ )
-  {
-    if( tlAt( list, i, TE_X ) == x && tlAt( list, i, TE_Y ) == y )
-    {
-      return true;
-    }
-  }
-  return false;
-}
-
-// a list entry's values
-int[TE] tlEntry( int x, int y, ivec2 tl, ivec2 br, int region, int cost )
-{
-  return int[TE]( x, y, tl.x, tl.y, br.x, br.y, region, cost );
 }
 
 // region r of the record at head: mvXMin, mvXMax, mvYMin, mvYMax
@@ -1374,6 +1375,158 @@ int tmpFusionSample( Cu c, int at, int x, int y, int bitDepth )
 
 // ----- the node
 
+// the rows of a chunk of the sparse search or the refinement (cut by invocation 0 in tmpNode): per row TS_RROW_WORDS
+// words - the refinement's: its y, its right and its left end, its positions' tag, its candidate's region with whether
+// its window is valid (16), whether the row's walk has found a decoded block yet (32) and whether the row goes on in
+// the next chunk (64), its slot in TS_RBUF; the sparse search's: its y, its first x, its number of positions, its
+// region, whether its region checks decoded blocks (1), whether the row has found one yet (2) and whether it goes on
+// (4), its slot, its region's right and bottom bound -, its positions' number (TS_RCNT), where they go in the chunk
+// (TS_RDST); per position in TS_RBUF two words as at TS_POS; the state a row going on leaves for the next chunk
+// (TS_RFOUND). After the sub-sample search's area
+const int TS_RROW_WORDS = 8;
+const int TS_RROW       = TS_FCOST + 4 * TMP_FRAC_CANDS;
+const int TS_RCNT       = TS_RROW + TS_RROW_WORDS * TMP_CHUNK;
+const int TS_RDST       = TS_RCNT + TMP_CHUNK;
+const int TS_RBUF       = TS_RDST + TMP_CHUNK;
+const int TS_RFOUND     = TS_RBUF + 2 * TMP_CHUNK;
+
+// row r of the refinement's chunk (one invocation): its positions as the walk of the windows takes them, from the row's
+// right end leftwards - a checked one (a region's position where the window may leave the decoded area) only from
+// the first whose block is decoded on, a vector window's off the decoded area (not validWindow) only where its block
+// is valid (bvValid; BVG-DIMD's: from the first whose block is decoded, where the template's corner is) - into
+// TS_RBUF from its slot on, their number into TS_RCNT, the walk's state where the row goes on into TS_RFOUND
+void tmpRefineRow( Cu c, int r, bool licMode, bool bvg, OwnerMap om )
+{
+  const int  rb = TS_RROW + TS_RROW_WORDS * r, py = tsGet( rb ), xR = tsGet( rb + 1 ), xL = tsGet( rb + 2 );
+  const int  tag = tsGet( rb + 3 ), mode = tsGet( rb + 4 ), slot = tsGet( rb + 5 );
+  const int  candRegion = mode & 15, W = c.w, H = c.h;
+  const bool validWindow = ( mode & 16 ) != 0;
+  bool       found = ( mode & 32 ) != 0;
+  int        n = 0;
+  for( int px = xR; px >= xL; px-- )
+  {
+    const bool checked = candRegion == 4 || candRegion == 5
+                         || ( !licMode && ( ( candRegion == 3 && px > 0 ) || ( candRegion == 1 && py > 0 ) ) );
+    if( checked && !found )
+    {
+      if( !decodedBefore( om, c.x + px + W - 1, c.y + py + H - 1, g_ti ) )
+      {
+        continue;
+      }
+      found = true;
+    }
+    else if( candRegion > 5 && !validWindow && !bvg && !bvValid( c.x, c.y, W, H, ivec2( px, py ), g_ti ) )
+    {
+      continue;
+    }
+    else if( candRegion > 5 && !validWindow && bvg )   // (validItmpBv with isAvailablePairFound)
+    {
+      if( ( !found && !decodedBefore( om, c.x + px + W - 1, c.y + py + H - 1, g_ti ) )
+          || !decodedBefore( om, c.x + px - TMP_TEMPLATE_SIZE, c.y + py - TMP_TEMPLATE_SIZE, g_ti ) )
+      {
+        continue;
+      }
+      found = true;
+    }
+    tsSet( TS_RBUF + 2 * ( slot + n ), ( px & 0xFFFF ) | ( py << 16 ) );
+    tsSet( TS_RBUF + 2 * ( slot + n ) + 1, tag );
+    n++;
+  }
+  tsSet( TS_RCNT + r, n );
+  if( ( mode & 64 ) != 0 )
+  {
+    tsSet( TS_RFOUND, found ? 1 : 0 );
+  }
+}
+
+// row r of the sparse search's chunk (one invocation): its positions from its first x leftwards by S - in regions 4
+// and 5 where the region checks decoded blocks only from the first whose block is decoded on (rowFound); with LIC (mr)
+// a position's cost and entry those S / 2 right and below it, but where that leaves the region (transferred, bits 4
+// and 5 of its tag) or, before rowFound, its block is not decoded (both transferred) - into TS_RBUF from its slot on,
+// their number into TS_RCNT, rowFound where the row goes on into TS_RFOUND
+void tmpSparseRow( Cu c, int r, bool mr, int S, OwnerMap om )
+{
+  const int  rb = TS_RROW + TS_RROW_WORDS * r, y = tsGet( rb ), x0 = tsGet( rb + 1 ), take = tsGet( rb + 2 );
+  const int  region = tsGet( rb + 3 ), mode = tsGet( rb + 4 ), slot = tsGet( rb + 5 );
+  const int  gRight = tsGet( rb + 6 ), gBottom = tsGet( rb + 7 ), W = c.w, H = c.h;
+  const bool checkR4R5 = ( mode & 1 ) != 0;
+  bool       rowFound = ( mode & 2 ) != 0;
+  int        n = 0;
+  for( int k = 0; k < take; k++ )
+  {
+    const int px = x0 - k * S;
+    int       mx = px + ( S >> 1 ), my = y + ( S >> 1 ), flags = 0;
+    if( mx > gRight )
+    {
+      mx = px;
+      flags |= 16;
+    }
+    if( my > gBottom )
+    {
+      my = y;
+      flags |= 32;
+    }
+    if( ( region == 4 || region == 5 ) && !rowFound && checkR4R5 )
+    {
+      if( !decodedBefore( om, c.x + px + W - 1, c.y + y + H - 1, g_ti ) )
+      {
+        continue;
+      }
+      if( mr && !decodedBefore( om, c.x + mx + W - 1, c.y + my + H - 1, g_ti ) )
+      {
+        mx    = px;
+        my    = y;
+        flags = 48;
+      }
+      else
+      {
+        rowFound = true;
+      }
+    }
+    const ivec2 p = mr ? ivec2( mx, my ) : ivec2( px, y );
+    tsSet( TS_RBUF + 2 * ( slot + n ), ( p.x & 0xFFFF ) | ( p.y << 16 ) );
+    tsSet( TS_RBUF + 2 * ( slot + n ) + 1, mr ? region | flags : region );
+    n++;
+  }
+  tsSet( TS_RCNT + r, n );
+  if( ( mode & 4 ) != 0 )
+  {
+    tsSet( TS_RFOUND, rowFound ? 1 : 0 );
+  }
+}
+
+// the chunk's rows' positions after each other in the rows' order into TS_POS, their number into s_tmpCount, which
+// held the rows' (all invocations, after tmpSparseRow / tmpRefineRow and a tsSync; ending with a barrier)
+void tmpChunkPack( int lid, int NT )
+{
+  const int numRows = s_tmpCount;
+  int       total   = 0;
+  if( lid == 0 )
+  {
+    for( int r = 0; r < numRows; r++ )
+    {
+      tsSet( TS_RDST + r, total );
+      total += tsGet( TS_RCNT + r );
+    }
+  }
+  tsSync();
+  for( int r = lid; r < numRows; r += NT )
+  {
+    const int slot = tsGet( TS_RROW + TS_RROW_WORDS * r + 5 ), n = tsGet( TS_RCNT + r ), dst = tsGet( TS_RDST + r );
+    for( int j = 0; j < n; j++ )
+    {
+      tsSet( TS_POS + 2 * ( dst + j ), tsGet( TS_RBUF + 2 * ( slot + j ) ) );
+      tsSet( TS_POS + 2 * ( dst + j ) + 1, tsGet( TS_RBUF + 2 * ( slot + j ) + 1 ) );
+    }
+  }
+  tsSync();
+  if( lid == 0 )
+  {
+    s_tmpCount = total;
+  }
+  tsSync();
+}
+
 // the node of IntraTMP CU c (record cuIndex; all invocations, uniform control flow): its list of vectors into its
 // DimdOut, the vector its block copies (and the list's first) into its record of vectors
 void tmpNode( Cu c, int cuIndex, int bitDepth, int lid, int NT )
@@ -1425,15 +1578,22 @@ void tmpNode( Cu c, int cuIndex, int bitDepth, int lid, int NT )
   // where that leaves the region (transferred: the window then extends from it by S - 1) or, in regions 4 and 5 before
   // the row's first such, its block is not decoded (both transferred). Each chunk costed in parallel, then put into the
   // sparse lists by invocation 0 (a region's tag with the transferred flags as bits 4 and 5)
+  // (a chunk's positions: the regions' next rows, invocation 0 cutting them as the refinement's below, each row's
+  // positions taken by an invocation of its own, tmpSparseRow)
   int   checkIdx = 0, region = 0, y = 0, x = 0, shiftX = 0;
-  bool  inRegion = false, newRow = false, rowFound = false, checkR4R5 = true;
+  bool  inRegion = false, newRow = false, rowFound = false, checkR4R5 = true, goesOn = false;
   ivec4 g = ivec4( 0 );
   for( ;; )
   {
     if( lid == 0 )
     {
-      int k = 0;
-      while( k < TMP_CHUNK && checkIdx < 6 )
+      if( goesOn )   // (a row the last chunk began goes on with the state its invocation left)
+      {
+        rowFound = tsGet( TS_RFOUND ) != 0;
+        goesOn   = false;
+      }
+      int numRows = 0, width = 0;
+      while( width < TMP_CHUNK && checkIdx < 6 )
       {
         if( !inRegion )
         {
@@ -1482,46 +1642,27 @@ void tmpNode( Cu c, int cuIndex, int bitDepth, int lid, int NT )
           newRow = true;
           continue;
         }
-        const int px = x;
-        x -= S;
-        int mx = px + ( S >> 1 ), my = y + ( S >> 1 ), flags = 0;
-        if( mx > g.y )
+        // the row's positions from x leftwards by S, as many as the chunk has room for
+        const int count = ( x - g.x ) / S + 1, take = min( count, TMP_CHUNK - width );
+        const int rb    = TS_RROW + TS_RROW_WORDS * numRows;
+        goesOn          = take < count;
+        tsSet( rb, y );
+        tsSet( rb + 1, x );
+        tsSet( rb + 2, take );
+        tsSet( rb + 3, region );
+        tsSet( rb + 4, ( checkR4R5 ? 1 : 0 ) | ( rowFound ? 2 : 0 ) | ( goesOn ? 4 : 0 ) );
+        tsSet( rb + 5, width );
+        tsSet( rb + 6, g.y );
+        tsSet( rb + 7, g.w );
+        numRows++;
+        width += take;
+        x     -= take * S;
+        if( goesOn )
         {
-          mx = px;
-          flags |= 16;
-        }
-        if( my > g.w )
-        {
-          my = y;
-          flags |= 32;
-        }
-        if( ( region == 4 || region == 5 ) && !rowFound && checkR4R5 )
-        {
-          if( !decodedBefore( om, c.x + px + W - 1, c.y + y + H - 1, g_ti ) )
-          {
-            continue;
-          }
-          if( mr && !decodedBefore( om, c.x + mx + W - 1, c.y + my + H - 1, g_ti ) )
-          {
-            mx    = px;
-            my    = y;
-            flags = 48;
-          }
-          else
-          {
-            rowFound = true;
-          }
-        }
-        if( mr )
-        {
-          tmpEmit( k, mx, my, region | flags );
-        }
-        else
-        {
-          tmpEmit( k, px, y, region );
+          break;
         }
       }
-      s_tmpCount = k;
+      s_tmpCount = numRows;   // (the rows; the positions below)
       s_tmpDone  = checkIdx >= 6 ? 1 : 0;
       for( int t = 0; t < numTypes; t++ )
       {
@@ -1529,6 +1670,12 @@ void tmpNode( Cu c, int cuIndex, int bitDepth, int lid, int NT )
       }
     }
     tsSync();
+    for( int r = lid; r < s_tmpCount; r += NT )
+    {
+      tmpSparseRow( c, r, mr, S, om );
+    }
+    tsSync();
+    tmpChunkPack( lid, NT );
     tmpChunkCosts( c, tempType, numTypes, ivec3( numSparse[0], numSparse[1], numSparse[2] ), false, lid, NT );
     const bool last = s_tmpDone != 0;   // (read before invocation 0 may write the next chunk's)
     if( lid == 0 )
@@ -1722,9 +1869,11 @@ void tmpNode( Cu c, int cuIndex, int bitDepth, int lid, int NT )
 
   // the refinement: per list type its candidates' windows (a sparse one's clipped to its region but where the
   // exception allows, a vector's whole, its positions checked where the window may leave the decoded area), each
-  // position once per list, costed in chunks; the lists of the top and the left template keep TL_NUM
-  int  type = 0, cand = 0, wy = 0, wx = 0, curType = -1;
-  bool open = false, found = false, validWindow = true;
+  // position once per list, costed in chunks; the lists of the top and the left template keep TL_NUM. A chunk's
+  // positions are the windows' next rows (invocation 0 cuts them, a row too long for the chunk in pieces), each row's
+  // taken by an invocation of its own (tmpRefineRow), then put after each other in the rows' order (tmpChunkPack)
+  int  type = 0, cand = 0, wy = 0, wx = 0, curType = -1, numRows = 0;
+  bool open = false, found = false, validWindow = true, rowGoesOn = false;
   ivec4 win = ivec4( 0 );
   int   candRegion = 0;
   int   rDiff[3] = int[3]( 0, 0, 0 );
@@ -1733,8 +1882,14 @@ void tmpNode( Cu c, int cuIndex, int bitDepth, int lid, int NT )
   {
     if( lid == 0 )
     {
-      int k = 0;
-      while( k < TMP_CHUNK && type < numTypes )
+      if( rowGoesOn )   // (a row the last chunk began goes on with the state its invocation left)
+      {
+        found     = tsGet( TS_RFOUND ) != 0;
+        rowGoesOn = false;
+      }
+      numRows = 0;
+      int width = 0;
+      while( width < TMP_CHUNK && type < numTypes )
       {
         const int list = TS_SPARSE + type * TS_LIST;
         if( !open )
@@ -1779,34 +1934,24 @@ void tmpNode( Cu c, int cuIndex, int bitDepth, int lid, int NT )
           found = false;
           continue;
         }
-        const int px = wx, py = wy;
-        wx--;
-        const bool checked = candRegion == 4 || candRegion == 5
-                             || ( !licMode && ( ( candRegion == 3 && px > 0 ) || ( candRegion == 1 && py > 0 ) ) );
-        if( checked && !found )
+        // the row's positions from wx leftwards, as many as the chunk has room for
+        const int take = min( wx - win.x + 1, TMP_CHUNK - width ), rb = TS_RROW + TS_RROW_WORDS * numRows;
+        rowGoesOn      = take < wx - win.x + 1;
+        tsSet( rb, wy );
+        tsSet( rb + 1, wx );
+        tsSet( rb + 2, wx - take + 1 );
+        tsSet( rb + 3, type | cand << 2 );
+        tsSet( rb + 4, candRegion | ( validWindow ? 16 : 0 ) | ( found ? 32 : 0 ) | ( rowGoesOn ? 64 : 0 ) );
+        tsSet( rb + 5, width );
+        numRows++;
+        width += take;
+        wx    -= take;
+        if( rowGoesOn )
         {
-          if( !decodedBefore( om, c.x + px + W - 1, c.y + py + H - 1, g_ti ) )
-          {
-            continue;
-          }
-          found = true;
+          break;
         }
-        else if( candRegion > 5 && !validWindow && !bvg && !bvValid( c.x, c.y, W, H, ivec2( px, py ), g_ti ) )
-        {
-          continue;
-        }
-        else if( candRegion > 5 && !validWindow && bvg )   // (validItmpBv with isAvailablePairFound: once a position
-        {                                                  // of the row has its block decoded, the template's corner)
-          if( ( !found && !decodedBefore( om, c.x + px + W - 1, c.y + py + H - 1, g_ti ) )
-              || !decodedBefore( om, c.x + px - TMP_TEMPLATE_SIZE, c.y + py - TMP_TEMPLATE_SIZE, g_ti ) )
-          {
-            continue;
-          }
-          found = true;
-        }
-        tmpEmit( k, px, py, type | cand << 2 );
       }
-      s_tmpCount = k;
+      s_tmpCount = numRows;   // (the rows; the positions below)
       s_tmpDone  = type >= numTypes ? 1 : 0;
       for( int t = 0; t < numTypes; t++ )   // (a type not begun yet starts from its own threshold)
       {
@@ -1814,6 +1959,12 @@ void tmpNode( Cu c, int cuIndex, int bitDepth, int lid, int NT )
       }
     }
     tsSync();
+    for( int r = lid; r < s_tmpCount; r += NT )
+    {
+      tmpRefineRow( c, r, licMode, bvg, om );
+    }
+    tsSync();
+    tmpChunkPack( lid, NT );
     tmpChunkCosts( c, tempType, numTypes, ivec3( 0 ), true, lid, NT );
     const bool last = s_tmpDone != 0;
     if( lid == 0 )
