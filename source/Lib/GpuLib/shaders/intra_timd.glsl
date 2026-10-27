@@ -1445,9 +1445,13 @@ int timdNode( Cu c, int cuIndex, int nbrMode[MPM_NEIGHBOURS], int dimdModes[3], 
   // refinement and the final choice
   SYNC();   // (dimdSelect has read its histograms)
   const bool vectors = c.bvList >= 0 && !( WITH_MPM && c.kind == CU_SGPM );   // (an SGPM CU's list is SGPM's own)
-  if( vectors && lid == 0 )
+  if( vectors )
   {
-    s_spCost[TC_NUM_BV] = uint( bvMergeList( c, g_ti ) );
+    const int numBv = bvMergeList( c, g_ti, lid, NT );
+    if( lid == 0 )
+    {
+      s_spCost[TC_NUM_BV] = uint( numBv );
+    }
   }
   timdFillReference( head.t, BufI32( P.timdData ), c.timd + TIMD_HEAD, 0, c.x, c.y, c.w, c.h, TIMD_REF_SHIFT,
                      bitDepth, lid, NT );
@@ -1580,9 +1584,10 @@ void dimdVectorChoice( Cu c, int cuIndex, int bitDepth, bool noPdpc, int lid, in
   BufI32              data = BufI32( P.timdData );
   const TemplateUnits t    = templateUnitsAt( data, c.bvList + BV_LIST );
   SYNC();   // (the node's shared arrays are free)
+  const int numBv = bvMergeList( c, g_ti, lid, NT );
   if( lid == 0 )
   {
-    s_spCost[TC_NUM_BV] = uint( bvMergeList( c, g_ti ) );
+    s_spCost[TC_NUM_BV] = uint( numBv );
   }
   timdFillReference( t, data, c.bvList + BV_LIST + TEMPLATE_UNITS, 0, c.x, c.y, c.w, c.h, TIMD_REF_SHIFT, bitDepth, lid,
                      NT );

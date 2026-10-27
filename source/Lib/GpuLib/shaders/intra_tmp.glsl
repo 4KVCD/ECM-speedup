@@ -918,16 +918,21 @@ int tmpSortInOut( int head, int n )
   {
     return n;
   }
-  bool outside[BV_LIST_MAX];
-  int  numOut = 0;
+  bool  outside[BV_LIST_MAX];
+  int   numOut = 0;
+  ivec4 g[6];   // (the regions, loaded once)
+  for( int r = 0; r < 6; r++ )
+  {
+    g[r] = tmpRegion( head, r );
+  }
   for( int i = 0; i < n; i++ )
   {
     const ivec2 bv     = bvListAt( i );
     bool        inside = false;
     for( int r = 0; r < 6; r++ )
     {
-      const ivec4 g = tmpRegion( head, r );
-      inside = inside || ( g.y >= g.x && g.w >= g.z && bv.x >= g.x && bv.x <= g.y && bv.y >= g.z && bv.y <= g.w );
+      inside = inside || ( g[r].y >= g[r].x && g[r].w >= g[r].z && bv.x >= g[r].x && bv.x <= g[r].y && bv.y >= g[r].z
+                           && bv.y <= g[r].w );
     }
     outside[i] = !inside;
     numOut += inside ? 0 : 1;
@@ -1653,10 +1658,17 @@ void tmpNode( Cu c, int cuIndex, int bitDepth, int lid, int NT )
   // invocation 0's state: the vector list's parts (itmpSize, itmpSize1), the thresholds, the enumeration
   int itmpSize = 0, itmpSize1 = 0, numList = 0;
   int pDiff[3] = int[3]( numTL << bitDepth, numTop << bitDepth, numLeft << bitDepth );
+  const int numNeighbours = bvNeighbourList( c, g_ti, lid, NT );
   if( lid == 0 )
   {
-    itmpSize  = tmpSortInOut( head, bvNeighbourList( c, g_ti ) );
-    itmpSize1 = bvCascade( c, itmpSize, g_ti );
+    s_bvLen = tmpSortInOut( head, numNeighbours );
+  }
+  tsSync();
+  itmpSize  = s_bvLen;
+  tsSync();   // (read before bvCascade writes it)
+  itmpSize1 = bvCascade( c, itmpSize, g_ti, lid, NT );
+  if( lid == 0 )
+  {
     for( int t = 0; t < 3; t++ )
     {
       tlClear( TS_SPARSE + t * TS_LIST );

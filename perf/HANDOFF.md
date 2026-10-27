@@ -3177,6 +3177,11 @@ more, the chunk's positions of its type below the threshold that cost less or as
 clustered type only those not equal to one in the list or earlier) - which every invocation counts for its position
 (tmpRefineRanks; not BVG-DIMD's, whose threshold also falls by the list's cheapest). GPU time (median of 5, grn89 ->
 grn92): aiodd 312.1 -> 297.5 ms, ai720 1,987.3 -> 1,924.5 ms. Results as M127's.
+M130 (2026-10-27): the block vector lists (getItmpMergeCandidate's, the cascade's rounds) read ahead by the whole
+workgroup into the end of its scratch - each candidate's vector and validity, each cascade position's CU - and
+invocation 0 only compares and appends in shared memory (bvNeighbourList, bvCascade: IntraTMP, TIMD and DIMD nodes).
+GPU time (grn92 -> grn93): aiodd 297.5 -> 277.1 ms, ai720 1,924.5 -> 1,838.0 ms. Results (grn96, this state): as
+M127's.
 
 ## 8. Numbers (i7-10700 8C/16T, Win11, GCC 16.2, RTX 3070 driver 616.92)
 

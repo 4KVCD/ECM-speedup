@@ -80,27 +80,73 @@ const int BV_LIST_KEEP  = 1;
 const int BV_LIST_NBRS  = 2;
 const int BV_LIST       = BV_LIST_NBRS + BV_NBRS;
 
-// getItmpMergeCandidate's list of CU c (invocation 0; the node of task `before`): the vectors of the CUs at its
-// neighbour positions each in its order, each once and valid. Returns the length
-int bvNeighbourList( Cu c, int before )
+// The lists' candidates read ahead by the whole workgroup (bvValid's owner map loads, the records' loads) into the end
+// of its scratch (BLEND_ACC's sums, free in a node), so that invocation 0 only compares and appends (bvListHas, in
+// shared memory) instead of loading them one after the other: getItmpMergeCandidate's per neighbour and vector its
+// vector and validity (2 words), a cascade round's per list vector and position a slot (the CU's number of vectors, -1
+// for none, and its first cheapest one, BV_OUT_FUSION; then per vector moved and plain each its vector and validity)
+const int BV_CAND_SLOT = 2 + 4 * BV_MAX;
+const int BV_CAND_BASE = BLEND_ACC - BV_LIST_MAX * 5 * BV_CAND_SLOT;
+
+shared int s_bvLen;   // the list's length (invocation 0's), for every invocation
+
+int  bvcGet( int o )        { return WBufI32( P.scratch ).v[int( gl_WorkGroupID.x ) * BLEND_ACC + BV_CAND_BASE + o]; }
+void bvcSet( int o, int v ) { WBufI32( P.scratch ).v[int( gl_WorkGroupID.x ) * BLEND_ACC + BV_CAND_BASE + o] = v; }
+
+// a barrier after which the scratch's and shared memory's writes are visible to the workgroup
+void bvSync()
+{
+  controlBarrier( gl_ScopeWorkgroup, gl_ScopeWorkgroup, gl_StorageSemanticsBuffer | gl_StorageSemanticsShared,
+                  gl_SemanticsAcquireRelease );
+}
+
+// bv appended to the list of n where it is valid (read ahead) and not in it; returns the new length
+int bvListAddKnown( int n, ivec2 bv, bool valid )
+{
+  if( n < BV_LIST_MAX && valid && !bvListHas( n, bv ) )
+  {
+    s_bvList[2 * n]     = int16_t( bv.x );
+    s_bvList[2 * n + 1] = int16_t( bv.y );
+    n++;
+  }
+  return n;
+}
+
+// getItmpMergeCandidate's list of CU c (all invocations, uniform control flow; the node of task `before`): the vectors
+// of the CUs at its neighbour positions each in its order, each once and valid. Returns the length
+int bvNeighbourList( Cu c, int before, int lid, int NT )
 {
   BufI32  data = BufI32( P.timdData );
   CBufI32 recs = CBufI32( P.timdData );   // (records written by other workgroups' nodes)
-  int     n    = 0;
-  for( int k = 0; k < BV_NBRS; k++ )
+  for( int i = lid; i < BV_NBRS * BV_MAX; i += NT )   // (neighbour i / BV_MAX, its vector i % BV_MAX)
   {
-    const int src = data.v[c.bvList + BV_LIST_NBRS + k];
-    if( src < 0 )
-    {
-      continue;
-    }
-    const int at = P.bvOut + src * BV_OUT;
-    for( int j = 0; j < recs.v[at]; j++ )
-    {
-      n = bvListAdd( n, bvUnpack( recs.v[at + 1 + j] ), c, before );
-    }
+    const int   src = data.v[c.bvList + BV_LIST_NBRS + i / BV_MAX], at = P.bvOut + src * BV_OUT;
+    const bool  has = src >= 0 && i % BV_MAX < recs.v[at];
+    const ivec2 bv  = has ? bvUnpack( recs.v[at + 1 + i % BV_MAX] ) : ivec2( 0 );
+    bvcSet( 2 * i, bvPack( bv ) );
+    bvcSet( 2 * i + 1, has && bvValid( c.x, c.y, c.w, c.h, bv, before ) ? 1 : 0 );
   }
+  bvSync();
+  if( lid == 0 )
+  {
+    int n = 0;
+    for( int i = 0; i < BV_NBRS * BV_MAX; i++ )
+    {
+      n = bvListAddKnown( n, bvUnpack( bvcGet( 2 * i ) ), bvcGet( 2 * i + 1 ) != 0 );
+    }
+    s_bvLen = n;
+  }
+  bvSync();
+  const int n = s_bvLen;
+  bvSync();   // (read before s_bvLen is written again)
   return n;
+}
+
+// the cascade's position p of CU c: its centre, then its corners
+ivec2 bvCascadePos( Cu c, int p )
+{
+  return p == 0 ? ivec2( c.x + ( c.w >> 1 ), c.y + ( c.h >> 1 ) )
+                : ivec2( ( p & 1 ) != 0 ? c.x : c.x + c.w - 1, p <= 2 ? c.y : c.y + c.h - 1 );
 }
 
 // one step of a cascade (invocation 0): the CUs at the five positions of CU c (its centre and corners) moved by cmv,
@@ -111,12 +157,10 @@ int bvCascadeStep( Cu c, int n, int total, ivec2 cmv, bool sparse, int before )
   BufI32      data    = BufI32( P.timdData );
   CBufI32     recs    = CBufI32( P.timdData );
   const int   cuIndex = data.v[c.bvList + BV_LIST_INDEX];
-  const ivec2 pos[5]  = ivec2[5]( ivec2( c.x + ( c.w >> 1 ), c.y + ( c.h >> 1 ) ), ivec2( c.x, c.y ),
-                                  ivec2( c.x + c.w - 1, c.y ), ivec2( c.x, c.y + c.h - 1 ),
-                                  ivec2( c.x + c.w - 1, c.y + c.h - 1 ) );
   for( int p = 0; p < 5 && n < total; p++ )
   {
-    const int src = bvCuAt( pos[p].x + cmv.x, pos[p].y + cmv.y );
+    const ivec2 pos = bvCascadePos( c, p );
+    const int   src = bvCuAt( pos.x + cmv.x, pos.y + cmv.y );
     if( src < 0 || src > cuIndex )   // (getPURestricted: decoded no later than the CU)
     {
       continue;
@@ -160,35 +204,104 @@ int bvCascadeStep( Cu c, int n, int total, ivec2 cmv, bool sparse, int before )
   return n;
 }
 
-// getArBvMergeCandidate's cascade of the list of n (invocation 0): per vector of the list (those it adds too, in
-// rounds) a cascade step, until the list has max(NUM_BV, n + NUM_TMP_ARBVP). Returns the length
-int bvCascade( Cu c, int n, int before )
+// bvCascadeStep's of the cascade (not sparse) from the slots read ahead (invocation 0): the step of the round's list
+// vector r
+int bvCascadeStepKnown( int n, int total, int r )
+{
+  for( int p = 0; p < 5 && n < total; p++ )
+  {
+    const int o = ( r * 5 + p ) * BV_CAND_SLOT, num = bvcGet( o ), fusion = bvcGet( o + 1 );
+    for( int j = 0; j < num; j++ )   // (no CU there: num -1)
+    {
+      const bool tail = fusion >= 0 && j >= fusion;
+      if( !tail && n >= total )
+      {
+        if( fusion < 0 )
+        {
+          break;
+        }
+        j = fusion - 1;
+        continue;
+      }
+      for( int k = 0; k < 2 && ( tail || n < total ); k++ )
+      {
+        const int w = o + 2 + 4 * j + 2 * k;
+        const int m = bvListAddKnown( n, bvUnpack( bvcGet( w ) ), bvcGet( w + 1 ) != 0 );
+        if( tail && m > n && m >= total )
+        {
+          return m;
+        }
+        n = m;
+      }
+    }
+  }
+  return n;
+}
+
+// getArBvMergeCandidate's cascade of the list of n (all invocations, uniform control flow): per vector of the list
+// (those it adds too, in rounds) a cascade step, until the list has max(NUM_BV, n + NUM_TMP_ARBVP). Per round the
+// workgroup reads the steps' CUs and vectors ahead (bvCascadeStep's, into the slots), then invocation 0 takes them in
+// the steps' order. Returns the length
+int bvCascade( Cu c, int n, int before, int lid, int NT )
 {
   if( n == 0 )
   {
     return 0;
   }
-  const int total = max( NUM_BV, n + NUM_TMP_ARBVP );
-  int       end   = 0;
+  CBufI32   recs    = CBufI32( P.timdData );
+  const int cuIndex = BufI32( P.timdData ).v[c.bvList + BV_LIST_INDEX];
+  const int total   = max( NUM_BV, n + NUM_TMP_ARBVP );
+  int       end     = 0;
   do
   {
     const int start = end;
     end = n;
-    for( int m = start; m < end && n < total; m++ )
+    for( int i = lid; i < ( end - start ) * 5 * BV_MAX; i += NT )   // (slot i / BV_MAX, its vector i % BV_MAX)
     {
-      n = bvCascadeStep( c, n, total, bvListAt( m ), false, before );
+      const int   r = i / BV_MAX / 5, p = i / BV_MAX % 5, j = i % BV_MAX, o = ( r * 5 + p ) * BV_CAND_SLOT;
+      const ivec2 cmv = bvListAt( start + r ), pos = bvCascadePos( c, p ) + cmv;
+      const int   src = bvCuAt( pos.x, pos.y ), at = P.bvOut + src * BV_OUT;
+      const bool  cu  = src >= 0 && src <= cuIndex;   // (getPURestricted: decoded no later than the CU)
+      const int   num = cu ? recs.v[at] : -1;
+      if( j == 0 )
+      {
+        bvcSet( o, num );
+        bvcSet( o + 1, cu ? recs.v[at + BV_OUT_FUSION] : -1 );
+      }
+      if( j < num )
+      {
+        const ivec2 bv = bvUnpack( recs.v[at + 1 + j] );
+        for( int k = 0; k < 2; k++ )
+        {
+          const ivec2 v = k == 0 ? cmv + bv : bv;
+          bvcSet( o + 2 + 4 * j + 2 * k, bvPack( v ) );
+          bvcSet( o + 3 + 4 * j + 2 * k, bvValid( c.x, c.y, c.w, c.h, v, before ) ? 1 : 0 );
+        }
+      }
     }
+    bvSync();
+    if( lid == 0 )
+    {
+      for( int m = start; m < end && n < total; m++ )
+      {
+        n = bvCascadeStepKnown( n, total, m - start );
+      }
+      s_bvLen = n;
+    }
+    bvSync();
+    n = s_bvLen;
+    bvSync();   // (read before invocation 0 writes the next round's)
   } while( n > end && n < total );
   return n;
 }
 
-// CU c's list of block vectors (invocation 0; the node of task `before`): getItmpMergeCandidate's, kept to its first
-// BV_LIST_KEEP (DIMD's), else (TIMD's) cascaded. Returns the length
-int bvMergeList( Cu c, int before )
+// CU c's list of block vectors (all invocations, uniform control flow; the node of task `before`):
+// getItmpMergeCandidate's, kept to its first BV_LIST_KEEP (DIMD's), else (TIMD's) cascaded. Returns the length
+int bvMergeList( Cu c, int before, int lid, int NT )
 {
   const int keep = BufI32( P.timdData ).v[c.bvList + BV_LIST_KEEP];
-  const int n    = bvNeighbourList( c, before );
-  return keep > 0 ? min( n, keep ) : bvCascade( c, n, before );
+  const int n    = bvNeighbourList( c, before, lid, NT );
+  return keep > 0 ? min( n, keep ) : bvCascade( c, n, before, lid, NT );
 }
 
 // CU c's record of its vectors (its node's choices: num of bv)
