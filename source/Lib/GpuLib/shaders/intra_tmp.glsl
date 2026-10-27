@@ -67,7 +67,8 @@ const int TE        = 8;   // an entry: x, y, its window's top-left x / y and bo
 const int TE_X = 0, TE_Y = 1, TE_TLX = 2, TE_TLY = 3, TE_BRX = 4, TE_BRY = 5, TE_REGION = 6, TE_COST = 7;
 const int TS_POS    = 0;                              // per position: x | y << 16, its tag (region / list entry)
 const int TS_COST   = TS_POS + 2 * TMP_CHUNK;         // per position its 3 costs
-const int TS_LIST   = 1 + ( MTMP_NUM_SPARSE + 1 ) * TE;
+const int TL_CAP    = MTMP_NUM_SPARSE + 1;            // a list's room (the longest list, one more)
+const int TS_LIST   = 1 + TL_CAP * ( 1 + TE );        // a list: its size, its order, its entries (tlAt)
 const int TS_SPARSE = TS_COST + 3 * TMP_CHUNK;        // 3 lists: the L-shape's (or the only one), the top's, the left's
 const int TS_REFINE = TS_SPARSE + 3 * TS_LIST;        // 3 lists alike
 const int TS_MCOST  = TS_REFINE + 3 * TS_LIST;        // per vector of the list its 3 costs
@@ -87,12 +88,26 @@ void tsSync()
                   gl_SemanticsAcquireRelease );
 }
 
-// ----- the lists (invocation 0 updates them): per template type the sparse search's and the refinement's, each its
-// size, then entries of TE words, in the scratch at their handles (TS_SPARSE + t * TS_LIST, TS_REFINE + t * TS_LIST)
+// ----- the lists (invocation 0 updates them): per template type the sparse search's and the refinement's, in the
+// scratch at their handles (TS_SPARSE + t * TS_LIST, TS_REFINE + t * TS_LIST): the size; the order, TL_CAP slots
+// numbers, the entries' in the list's order, then the free ones; per slot an entry of TE words. An entry stays in its
+// slot while the list changes, so an insertion or an erasure moves one word per entry behind it, not TE
 
 int  tlSize( int list )                       { return tsGet( list ); }
-int  tlAt( int list, int i, int f )           { return tsGet( list + 1 + i * TE + f ); }
-void tlSetAt( int list, int i, int f, int v ) { tsSet( list + 1 + i * TE + f, v ); }
+int  tlSlot( int list, int i )                { return tsGet( list + 1 + i ); }
+int  tlEntryAt( int list, int slot )          { return list + 1 + TL_CAP + slot * TE; }
+int  tlAt( int list, int i, int f )           { return tsGet( tlEntryAt( list, tlSlot( list, i ) ) + f ); }
+void tlSetAt( int list, int i, int f, int v ) { tsSet( tlEntryAt( list, tlSlot( list, i ) ) + f, v ); }
+
+// an empty list, every slot free
+void tlClear( int list )
+{
+  tsSet( list, 0 );
+  for( int k = 0; k < TL_CAP; k++ )
+  {
+    tsSet( list + 1 + k, k );
+  }
+}
 
 // updateCandList (UnitTools.h, uint64 costs): entry e into the list of capacity num after the entries of equal cost;
 // where the list is full, the last drops out, or e where it costs no less than the last
@@ -109,38 +124,55 @@ void tlUpdate( int list, int e[TE], int num )
     return;
   }
   const int last = size >= num ? size - 1 : size;   // (the new last entry)
+  const int slot = tlSlot( list, last );             // (a free slot, or with the list full the dropped entry's)
   for( int i = last; i > size - shift; i-- )
   {
-    for( int f = 0; f < TE; f++ )
-    {
-      tlSetAt( list, i, f, tlAt( list, i - 1, f ) );
-    }
+    tsSet( list + 1 + i, tlSlot( list, i - 1 ) );
   }
+  tsSet( list + 1 + size - shift, slot );
   for( int f = 0; f < TE; f++ )
   {
-    tlSetAt( list, size - shift, f, e[f] );
+    tsSet( tlEntryAt( list, slot ) + f, e[f] );
   }
   tsSet( list, last + 1 );
 }
 
 void tlErase( int list, int i )
 {
-  const int size = tlSize( list );
+  const int size = tlSize( list ), slot = tlSlot( list, i );
   for( int j = i; j < size - 1; j++ )
   {
-    for( int f = 0; f < TE; f++ )
-    {
-      tlSetAt( list, j, f, tlAt( list, j + 1, f ) );
-    }
+    tsSet( list + 1 + j, tlSlot( list, j + 1 ) );
   }
+  tsSet( list + size, slot );   // (free again: the order's entry size - 1)
   tsSet( list, size - 1 );
+}
+
+// the slot for an entry at position pos (the main list's merge): before the entry at pos, the entries from there on
+// one further back and the list's last dropped; past the end appended
+int tlPlace( int list, int pos )
+{
+  const int size = tlSize( list );
+  if( pos >= size )
+  {
+    tsSet( list, size + 1 );
+    return tlSlot( list, size );
+  }
+  const int slot = tlSlot( list, size - 1 );
+  for( int j = size - 1; j > pos; j-- )
+  {
+    tsSet( list + 1 + j, tlSlot( list, j - 1 ) );
+  }
+  tsSet( list + 1 + pos, slot );
+  return slot;
 }
 
 bool tlHas( int list, int x, int y )
 {
   for( int i = 0; i < tlSize( list ); i++ )
   {
-    if( tlAt( list, i, TE_X ) == x && tlAt( list, i, TE_Y ) == y )
+    const int e = tlEntryAt( list, tlSlot( list, i ) );
+    if( tsGet( e + TE_X ) == x && tsGet( e + TE_Y ) == y )
     {
       return true;
     }
@@ -1566,8 +1598,8 @@ void tmpNode( Cu c, int cuIndex, int bitDepth, int lid, int NT )
     itmpSize1 = bvCascade( c, itmpSize, g_ti );
     for( int t = 0; t < 3; t++ )
     {
-      tsSet( TS_SPARSE + t * TS_LIST, 0 );
-      tsSet( TS_REFINE + t * TS_LIST, 0 );
+      tlClear( TS_SPARSE + t * TS_LIST );
+      tlClear( TS_REFINE + t * TS_LIST );
     }
   }
 
@@ -2035,28 +2067,14 @@ void tmpNode( Cu c, int cuIndex, int bitDepth, int lid, int NT )
           {
             continue;
           }
-          const int pos = MTMP_NUM - tlSize( top ) - tlSize( left ) + cnt++, size = tlSize( main );
-          if( pos < size )
-          {
-            for( int j = size - 1; j > pos; j-- )
-            {
-              for( int f = 0; f < TE; f++ )
-              {
-                tlSetAt( main, j, f, tlAt( main, j - 1, f ) );
-              }
-            }
-          }
-          else
-          {
-            tsSet( main, size + 1 );
-          }
-          const int at = pos < size ? pos : size;
+          const int pos = MTMP_NUM - tlSize( top ) - tlSize( left ) + cnt++;
+          const int e   = tlEntryAt( main, tlPlace( main, pos ) );
           for( int f = 0; f < TE; f++ )
           {
-            tlSetAt( main, at, f, tlAt( list, i, f ) );
+            tsSet( e + f, tlAt( list, i, f ) );
           }
           // (m_mtmpRequiredTemplate: t)
-          tlSetAt( main, at, TE_REGION, ( tlAt( list, i, TE_REGION ) & 255 ) | t << 8 );
+          tsSet( e + TE_REGION, ( tlAt( list, i, TE_REGION ) & 255 ) | t << 8 );
         }
       }
     }

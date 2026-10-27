@@ -3161,6 +3161,10 @@ after each other in the rows' order. intra_rec's GPU time (median of 3, idle 307
 streams): identical but ra_ip64_md5 1 and ra720_pj17 4 (section 9), and in one run ld_parkjoy_q27 1 of 9 (a CCCM
 block without subsampling, Cr 4 x 2 at 100,46 of POC 8; identical in two more runs of grn82 and in one of grn89:
 section 9's race).
+M127 (2026-10-27): IntraTMP's lists keep their entries in place: a list holds an order of slot numbers and the entries
+stay in their slots, so an insertion or an erasure moves one word per entry behind it, not TE (tlSlot, tlPlace).
+GPU time (median of 5, idle, against M126): aiodd 324.7 -> 315.8 ms, ai720 2,058.1 -> 2,032.3 ms. Results (grn96,
+with M128 - M130 on top): identical but ra_ip64_md5 1 and ra720_pj17 4 (section 9).
 
 ## 8. Numbers (i7-10700 8C/16T, Win11, GCC 16.2, RTX 3070 driver 616.92)
 
