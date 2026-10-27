@@ -303,10 +303,62 @@ ivec3 tmpCosts( Cu c, int tempType, int bx, int by )
   return ivec3( sum, top, left );
 }
 
+// The refinement's walk (invocation 0) takes a position of type t into the type's list where its cost is below the
+// list's threshold, which only falls as the list fills (not with BVG-DIMD's threshold by the list's cheapest: caps 0,
+// which leaves this out). A position below the threshold at the chunk's start then ends in the list only where fewer
+// than the list's cap (caps[t]) rank before it: the list's entries that cost no more, which stay while it does, and
+// the chunk's positions of its type below the threshold that cost less or as much and come earlier, each of which
+// either enters before the position would leave or shows that the threshold fell to the position's cost. Of a
+// clustered type, whose list takes each position once, a position counts only where none equal to it is in the list or
+// earlier in the chunk (else the walk may skip it). The others are left out of the walk (may: whether the position's
+// threshold test passed; all invocations, after the chunk's costs, ending with a barrier; one position per invocation,
+// its cost as its list takes it, its type; s_spCost per position its cost, below 2^24, and its type, or ~0 for one that
+// does not count)
+void tmpRefineRanks( int cost, int type, int px, int py, ivec3 caps, inout bool may, int lid )
+{
+  const int  n = s_tmpCount, k = lid, list = TS_REFINE + type * TS_LIST;
+  const bool dedupe = ( ( tsGet( TS_WIN ) >> type ) & 1 ) != 0;
+  bool counts = k < n && may;
+  if( counts && dedupe )
+  {
+    const int p = ( px & 0xFFFF ) | ( py << 16 );
+    counts = !tlHas( list, px, py );
+    for( int i = 0; i < k && counts; i++ )
+    {
+      counts = tsGet( TS_POS + 2 * i ) != p || ( tsGet( TS_POS + 2 * i + 1 ) & 3 ) != type;
+    }
+  }
+  if( k < n )
+  {
+    s_spCost[k] = counts ? uint( cost ) | uint( type ) << 28 : ~0u;
+  }
+  tsSync();
+  if( k < n && may )
+  {
+    int lo = 0, hi = tlSize( list );   // (the list's entries costing no more: it rises by cost)
+    while( lo < hi )
+    {
+      const int mid = ( lo + hi ) >> 1;
+      lo = tlAt( list, mid, TE_COST ) <= cost ? mid + 1 : lo;
+      hi = tlAt( list, mid, TE_COST ) <= cost ? hi : mid;
+    }
+    int before = lo;
+    for( int j = 0; j < n && before < caps[type]; j++ )
+    {
+      const uint v = s_spCost[j];
+      const int  cj = int( v & 0x0fffffffu );
+      before += j != k && v != ~0u && int( v >> 28 ) == type && ( cj < cost || ( cj == cost && j < k ) ) ? 1 : 0;
+    }
+    may = before < caps[type];
+  }
+  tsSync();   // (s_spCost read before the chunk's flags replace it)
+}
+
 // the costs of the chunk's s_tmpCount positions (all invocations, after a tsSync; positions at TS_POS), into TS_COST,
 // and per position whether it may change a list (s_spCost, sign prediction's costs, free in a node), which invocation
 // 0 then walks alone. The refinement's (refine): a cost of its own type (tag & 3; at its candidate's own position that
-// candidate's cost) below the type's threshold at the chunk's start (s_tmpThr), as a list's threshold only falls. The
+// candidate's cost) below the type's threshold at the chunk's start (s_tmpThr), as a list's threshold only falls, and
+// with caps (the lists' lengths) few enough ranking before it (tmpRefineRanks). The
 // sparse search's (the first numTypes lists, of caps entries): a position that is in a list after the chunk. Such a
 // list keeps the first positions by cost, then by order (updateCandList inserts after equal costs; none enters past
 // the threshold, which is the last entry's once the list is full), so a position below the threshold ends in it
@@ -316,9 +368,12 @@ ivec3 tmpCosts( Cu c, int tempType, int bx, int by )
 void tmpChunkCosts( Cu c, int tempType, int numTypes, ivec3 caps, bool refine, int lid, int NT )
 {
   bool may = false;
+  int  cost = 0, type = 0, px = 0, py = 0;   // (the refinement's: the position's cost as its list takes it, its type)
   for( int k = lid; k < s_tmpCount; k += NT )
   {
-    const int   p  = tsGet( TS_POS + 2 * k ), px = bitfieldExtract( p, 0, 16 ), py = p >> 16;
+    const int p = tsGet( TS_POS + 2 * k );
+    px = bitfieldExtract( p, 0, 16 );
+    py = p >> 16;
     const ivec3 cs = tmpCosts( c, tempType, px, py );
     tsSet( TS_COST + 3 * k, cs.x );
     tsSet( TS_COST + 3 * k + 1, cs.y );
@@ -327,10 +382,16 @@ void tmpChunkCosts( Cu c, int tempType, int numTypes, ivec3 caps, bool refine, i
     {
       const int tag = tsGet( TS_POS + 2 * k + 1 ), t = tag & 3, ci = tag >> 2, sparse = TS_SPARSE + t * TS_LIST;
       const bool atCand = px == tlAt( sparse, ci, TE_X ) && py == tlAt( sparse, ci, TE_Y );
-      may = ( atCand ? tlAt( sparse, ci, TE_COST ) : cs[t] ) < s_tmpThr[t];
+      type = t;
+      cost = atCand ? tlAt( sparse, ci, TE_COST ) : cs[t];
+      may  = cost < s_tmpThr[t];
     }
   }
   tsSync();
+  if( refine && caps.x > 0 )
+  {
+    tmpRefineRanks( cost, type, px, py, caps, may, lid );
+  }
   for( int t = 0; t < numTypes && !refine; t++ )   // (the sparse search's: the chunk's costs of type t in s_spCost)
   {
     const int k = lid, cost = k < s_tmpCount ? tsGet( TS_COST + 3 * k + t ) : 0;
@@ -1997,7 +2058,8 @@ void tmpNode( Cu c, int cuIndex, int bitDepth, int lid, int NT )
     }
     tsSync();
     tmpChunkPack( lid, NT );
-    tmpChunkCosts( c, tempType, numTypes, ivec3( 0 ), true, lid, NT );
+    tmpChunkCosts( c, tempType, numTypes, bvg ? ivec3( 0 ) : ivec3( numRefine[0], numRefine[1], numRefine[2] ), true,
+                   lid, NT );
     const bool last = s_tmpDone != 0;
     if( lid == 0 )
     {

@@ -3171,6 +3171,12 @@ sample moved by the luma offsets' difference instead of downsampled from the pic
 have no offset, stay). Phase timers (aiodd, 84 merge blocks): the candidates' model loads 20.7 -> 9.6 ms. GPU time
 (median of 5): aiodd 315.8 -> 312.3 ms, ai720 2,032.3 -> 1,987.8 ms. Results as M127's. (Reading the history's and
 the list's records ahead in parallel with signatures of the compared words measured no faster: left out.)
+M129 (2026-10-27): IntraTMP's refinement walks only the positions that can enter its lists: a position below its
+list's threshold must also have fewer than the list's length ranking before it - the list's entries that cost no
+more, the chunk's positions of its type below the threshold that cost less or as much and come earlier (of a
+clustered type only those not equal to one in the list or earlier) - which every invocation counts for its position
+(tmpRefineRanks; not BVG-DIMD's, whose threshold also falls by the list's cheapest). GPU time (median of 5, grn89 ->
+grn92): aiodd 312.1 -> 297.5 ms, ai720 1,987.3 -> 1,924.5 ms. Results as M127's.
 
 ## 8. Numbers (i7-10700 8C/16T, Win11, GCC 16.2, RTX 3070 driver 616.92)
 
