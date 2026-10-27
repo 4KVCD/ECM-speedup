@@ -3182,6 +3182,10 @@ workgroup into the end of its scratch - each candidate's vector and validity, ea
 invocation 0 only compares and appends in shared memory (bvNeighbourList, bvCascade: IntraTMP, TIMD and DIMD nodes).
 GPU time (grn92 -> grn93): aiodd 297.5 -> 277.1 ms, ai720 1,924.5 -> 1,838.0 ms. Results (grn96, this state): as
 M127's.
+M131 (2026-10-27): DIMD's strongest modes ranked in parallel (dimdRanks: every mode counts those ranking before it),
+which invocation 0 inserted one by one (dimdSelect). GPU time (grn100 -> grn98): aiodd 277.7 -> 269.0 ms (median of
+7), ai720 1,862.2 -> 1,825.8 ms. Results (grn115, M131 - M134 together): identical but ra_ip64_md5 1 and ra720_pj17
+4 (section 9).
 
 ## 8. Numbers (i7-10700 8C/16T, Win11, GCC 16.2, RTX 3070 driver 616.92)
 

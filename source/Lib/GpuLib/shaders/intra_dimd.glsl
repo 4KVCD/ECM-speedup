@@ -363,42 +363,62 @@ struct DimdOut
   int trSecond;   // the second strongest mode (candModeListForTransform[1]; 0 where fewer modes have an amplitude)
 };
 
-// the DIMD modes, blending and weights of a luma CU of w x h from its histograms (deriveDimdMode's and
-// deriveDimdModeAdaptive's common end, without MDIP's excluded modes); one invocation
-DimdOut dimdSelect( int w, int h )
+// the strongest modes of a luma CU of w x h, in s_spCost (free in a node before its mode's search): their amplitudes
+// (all three histograms summed), then their modes
+const int DIMD_TOP_AMP = 0, DIMD_TOP_MODE = DIMD_FUSION_NUM - 1;
+
+int dimdAmp( int mode )
+{
+  return s_dimdHist[mode] + s_dimdHist[NUM_LUMA_MODE + mode] + s_dimdHist[2 * NUM_LUMA_MODE + mode];
+}
+
+// deriveDimdMode's strongest modes, in order (the first of equal amplitudes), as many as numPred - 1 where they have
+// an amplitude, the others amplitude 0 and mode 0 (all invocations, after the histograms' barrier, ending with a
+// barrier): the CPU inserts each mode into its sorted list, so a mode's place is the number of modes ranking before
+// it - stronger, or as strong and of a lower index -, which every mode counts for itself
+void dimdRanks( int w, int h, int lid )
+{
+  const int numPred = w * h >= 128 ? DIMD_FUSION_NUM : DIMD_FUSION_NUM_SMALL;
+  if( lid < DIMD_FUSION_NUM - 1 )
+  {
+    s_spCost[DIMD_TOP_AMP + lid]  = 0u;
+    s_spCost[DIMD_TOP_MODE + lid] = 0u;
+  }
+  SYNC();
+  if( lid < NUM_LUMA_MODE )
+  {
+    const int a = dimdAmp( lid );
+    int       rank = 0;
+    for( int j = 0; j < NUM_LUMA_MODE; j++ )
+    {
+      const int b = dimdAmp( j );
+      rank += b > a || ( b == a && j < lid ) ? 1 : 0;
+    }
+    if( a > 0 && rank < numPred - 1 )
+    {
+      s_spCost[DIMD_TOP_AMP + rank]  = uint( a );
+      s_spCost[DIMD_TOP_MODE + rank] = uint( lid );
+    }
+  }
+  SYNC();
+}
+
+// the DIMD modes, blending and weights of a luma CU from its histograms (deriveDimdMode's and deriveDimdModeAdaptive's
+// common end, without MDIP's excluded modes; one invocation, after dimdRanks)
+DimdOut dimdSelect()
 {
   DimdOut d;
   int amp[DIMD_FUSION_NUM - 1], mode[DIMD_FUSION_NUM - 1];
   for( int i = 0; i < DIMD_FUSION_NUM - 1; i++ )
   {
-    amp[i] = 0;
-    mode[i] = 0;
+    amp[i] = int( s_spCost[DIMD_TOP_AMP + i] );
+    mode[i] = int( s_spCost[DIMD_TOP_MODE + i] );
     d.blendMode[i] = -1;
     d.locDep[i] = 0;
   }
   for( int i = 0; i < DIMD_FUSION_NUM; i++ )
   {
     d.relWeight[i] = -1;
-  }
-  // the strongest modes, in order (the first of equal amplitudes)
-  const int numPred = w * h >= 128 ? DIMD_FUSION_NUM : DIMD_FUSION_NUM_SMALL;
-  for( int i = 0; i < NUM_LUMA_MODE; i++ )
-  {
-    const int curAmp = s_dimdHist[i] + s_dimdHist[NUM_LUMA_MODE + i] + s_dimdHist[2 * NUM_LUMA_MODE + i];
-    for( int j = 0; j < numPred - 1; j++ )
-    {
-      if( curAmp > amp[j] )
-      {
-        for( int k = numPred - 2; k > j; k-- )
-        {
-          amp[k]  = amp[k - 1];
-          mode[k] = mode[k - 1];
-        }
-        amp[j]  = curAmp;
-        mode[j] = i;
-        break;
-      }
-    }
   }
   // location dependence (JVET-AC0098): little of a mode's amplitude from the left (1) / from above (2)
   for( int i = 0; i < DIMD_FUSION_NUM - 1; i++ )

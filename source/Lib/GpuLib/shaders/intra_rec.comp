@@ -2355,12 +2355,17 @@ void main()
         dimdHistograms( c, lid, NT );
       }
       SYNC();
+      const bool chromaDimd = c.kind == CU_CHROMA_DIMD || c.kind == CU_CHROMA_TMRL || c.kind == CU_CHROMA_REORDER;
+      if( dimd && !chromaDimd )
+      {
+        dimdRanks( c.w, c.h, lid );
+      }
       DimdOut d;   // invocation 0's
       int dimdModes[3] = int[3]( -1, -1, -1 );
       if( lid == 0 )
       {
         // (after the co-located luma mode's: s_modesRead[0])
-        if( dimd && ( c.kind == CU_CHROMA_DIMD || c.kind == CU_CHROMA_TMRL || c.kind == CU_CHROMA_REORDER ) )
+        if( dimd && chromaDimd )
         {
           // (DecCu's exchange with getCoLocatedIntraLumaMode, an NN CU's PNN_IDX for chroma reordering: no mode)
           const bool nnLuma = c.kind == CU_CHROMA_REORDER && c.nbr[CR_NBR_DM] != -1;
@@ -2370,7 +2375,7 @@ void main()
         }
         else if( dimd )
         {
-          d = dimdSelect( c.w, c.h );
+          d = dimdSelect();
           dimdStore( t.cu, d );
           dimdModes = int[3]( d.mode, d.blendMode[0], d.blendMode[1] );
         }
