@@ -731,6 +731,124 @@ void cccmAccumulate( Tu t, int k, bool twoModels, int lid, int NT )
 
 int64_t cccmSum( int e ) { return cccmTmpLoad( CCCM_SUMS + e ); }
 
+// cccmAccumulate's sums of both classes of a set of two models (set 0: the whole template, or with g_ccpFlyTwoLines its
+// two lines) in one pass over the samples, whose features each invocation computes once for both: lanes of an entry
+// and class add their share of the samples of their class; class 0's sums into CCCM_SUMS and its range into
+// CCCM_RANGE, class 1's into CCCM_SUMS2 and CCCM_RANGE2 (all invocations, ending with a barrier). cccmNextClass then
+// moves class 1's where cccmSolve reads them, and the sums of both together - a single model's over the same samples -
+// where cccmBothClasses takes them from
+const int CCCM_SUMS2  = CCCM_SUMS + 96;   // (after the largest model's 88 sums)
+const int CCCM_RANGE2 = 58;
+
+void cccmAccumulatePair( Tu t, int lid, int NT )
+{
+  if( lid < 4 )   // (class 0's Cb and Cr, class 1's)
+  {
+    const int at = lid < 2 ? CCCM_RANGE + 2 * lid : CCCM_RANGE2 + 2 * ( lid - 2 );
+    s_cclm[at]     = 32767;
+    s_cclm[at + 1] = -32768;
+  }
+  SYNC();
+  const int   M = g_cccmParams, F = M + 2, entries = cccmNumEntries( M ), lanes = NT / ( 2 * entries );
+  const int   bitDepth = t.bitDepth;
+  const ivec4 r = cccmTemplate( t, WITH_CCP_MERGE && g_ccpFlyTwoLines );
+  const ivec2 counts = cccmTemplateCounts( r );
+  const int   total = counts.x + counts.y, thr = s_cclm[CCCM_THRESHOLD];
+  const int   e = lid % entries, cls = ( lid / entries ) & 1, lane = lid / ( 2 * entries );
+  int i = 0, j = 0;
+  if( lane < lanes )
+  {
+    cccmEntry( e, M, i, j );
+  }
+  const bool range = lane < lanes && i == 0 && j >= M;
+  int64_t sum = 0;
+  int     lo = 32767, hi = -32768;
+  for( int base = 0; base < total; base += CCCM_CHUNK )
+  {
+    const int n = min( CCCM_CHUNK, total - base );
+    if( lid < n )
+    {
+      const ivec2 p = cccmTemplateSample( r, counts, base + lid );
+      const int   c = cccmColocated( p.x, p.y );
+      for( int f = 0; f < F; f++ )
+      {
+        s_spCoef[lid * ( F + 1 ) + f] = int16_t( cccmFeature( f, p.x, p.y, c, bitDepth ) );
+      }
+      s_spCoef[lid * ( F + 1 ) + F] = int16_t( c <= thr ? 0 : 1 );   // (its class)
+    }
+    SYNC();
+    for( int q = lane; lane < lanes && q < n; q += lanes )
+    {
+      const int at = q * ( F + 1 );
+      if( int( s_spCoef[at + F] ) == cls )
+      {
+        const int fj = int( s_spCoef[at + j] );
+        sum += int64_t( int( s_spCoef[at + i] ) * fj );
+        lo = min( lo, fj );
+        hi = max( hi, fj );
+      }
+    }
+    SYNC();
+  }
+  if( lane < lanes )
+  {
+    cccmTmpStore( ( cls * entries + e ) * lanes + lane, sum );
+  }
+  if( range )
+  {
+    atomicMin( s_cclm[( cls == 0 ? CCCM_RANGE : CCCM_RANGE2 ) + 2 * ( j - M )], lo );
+    atomicMax( s_cclm[( cls == 0 ? CCCM_RANGE : CCCM_RANGE2 ) + 2 * ( j - M ) + 1], hi );
+  }
+  SYNC();
+  if( lid < 2 * entries )
+  {
+    int64_t s = 0;
+    for( int l = 0; l < lanes; l++ )
+    {
+      s += cccmTmpLoad( lid * lanes + l );
+    }
+    cccmTmpStore( ( lid < entries ? CCCM_SUMS : CCCM_SUMS2 - entries ) + lid, s );
+  }
+  SYNC();
+}
+
+// after class 0's model is solved: class 1's sums and range where cccmSolve reads them, the sums of both classes and
+// the union of their ranges into class 1's place (all invocations, ending with a barrier)
+void cccmNextClass( int lid )
+{
+  if( lid < cccmNumEntries( g_cccmParams ) )
+  {
+    const int64_t s0 = cccmTmpLoad( CCCM_SUMS + lid ), s1 = cccmTmpLoad( CCCM_SUMS2 + lid );
+    cccmTmpStore( CCCM_SUMS + lid, s1 );
+    cccmTmpStore( CCCM_SUMS2 + lid, s0 + s1 );
+  }
+  if( lid < 2 )
+  {
+    const ivec2 r0 = ivec2( s_cclm[CCCM_RANGE + 2 * lid], s_cclm[CCCM_RANGE + 2 * lid + 1] );
+    const ivec2 r1 = ivec2( s_cclm[CCCM_RANGE2 + 2 * lid], s_cclm[CCCM_RANGE2 + 2 * lid + 1] );
+    s_cclm[CCCM_RANGE + 2 * lid]      = r1.x;
+    s_cclm[CCCM_RANGE + 2 * lid + 1]  = r1.y;
+    s_cclm[CCCM_RANGE2 + 2 * lid]     = min( r0.x, r1.x );
+    s_cclm[CCCM_RANGE2 + 2 * lid + 1] = max( r0.y, r1.y );
+  }
+  SYNC();
+}
+
+// after cccmNextClass: the sums and range of a single model over both classes' samples where cccmSolve reads them (all
+// invocations, ending with a barrier)
+void cccmBothClasses( int lid )
+{
+  if( lid < cccmNumEntries( g_cccmParams ) )
+  {
+    cccmTmpStore( CCCM_SUMS + lid, cccmTmpLoad( CCCM_SUMS2 + lid ) );
+  }
+  if( lid < 4 )
+  {
+    s_cclm[CCCM_RANGE + lid] = s_cclm[CCCM_RANGE2 + lid];
+  }
+  SYNC();
+}
+
 // the models' precision, DECIM_BITS of the bit depth: 16 bits up to 10, else 22 (JVET-AJ0237's CCCM_DECIM_BITS_HBD;
 // Params::cccmDecim)
 int cccmDecim() { return P.cccmDecim; }

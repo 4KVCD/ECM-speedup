@@ -3195,6 +3195,18 @@ M133 (2026-10-27): reference line availability (refLineAvailability's prefix wal
 each unit by an invocation, each arm's prefix by atomicMin (lineAvailability, in intra_tmrl.glsl): TMRL nodes' lines,
 TMRL blocks' lines, LM blocks' templates (cclmAvailability). GPU time (grn101 -> grn104): aiodd 271.6 -> 267.0 ms,
 ai720 1,786.2 -> 1,770.7 ms. Results as M131's.
+M134 (2026-10-27): CCP merge adjustment's six on-the-fly fits from three passes over the template: a fit of two models
+takes both classes in one pass (cccmAccumulatePair), the single model over the same samples from their sums added
+(cccmNextClass, cccmBothClasses; CCP_FIT_ORDER). GPU time (grn104 -> grn115): aiodd 268.9 -> 263.8 ms, ai720
+unchanged. Results (grn115): identical but ra_ip64_md5 1 and ra720_pj17 4 (section 9). Since M125 (grn74 -> grn115,
+median of 5, one session): aiodd 365.8 -> 251.9 ms (-31 %), ai720 2,334.9 -> 1,769.8 ms (-24 %).
+Tried after M125 and left out (idle 3070, median of 5 or 7): the CCP merge history's and list's records read ahead in
+parallel with signatures (neutral); IntraTMP's refinement ranks counting only the windows that overlap no other
+(+3 % aiodd: the weaker filter sends more positions to the walk) or comparing only positions of overlapping windows
+(+7 % aiodd); the sparse cascade read ahead (neutral); MDIP's modes ranked in parallel (neutral); the cascade's slots
+loaded at once (+1.5 %); the block vector cascade read in two passes (neutral); NN layers with 4 packs loaded at once
+and no partial sums for the wide layers (+1 % ai720). Section 7's codegen effect (~1 % from structural changes in
+intra_rec) makes gains below ~2 % hard to see.
 
 ## 8. Numbers (i7-10700 8C/16T, Win11, GCC 16.2, RTX 3070 driver 616.92)
 
@@ -3248,10 +3260,17 @@ within the budget (M118's 3070 runs skipped those pictures with ECM_GPU_NO_CCP_L
    c. CCP records whose first difference moves between runs: ldp_parkjoy_q27 POC 8 (a CCCM model of a 2-row chroma
       block, no subsampling at 104,64 4x2, or GL-CCCM at 96,26 8x4; identical in M121's run), ra720_pj17 POCs 4, 8,
       10 and 12 (a CCCM / MDF-CCCM record's parameters or type, a CCP merge block): look for a race or for luma
-      samples a block reads before it writes them (the shared luma buffer in the angular arrays) first.
-   d. Performance (section 8): IntraTMP's enumeration of positions in parallel (57 ms of aiodd), then the blocks of a
-      known mode (luma 130-190 us each, chroma ~0.6 ms): profile their phases as IntraTMP's were. (CCCM's features
-      once per template sample: M122, -2 %.)
+      samples a block reads before it writes them (the shared luma buffer in the angular arrays) first. Also
+      ld_parkjoy_q27 POC 8 in 1 of 4 runs (2026-10-26/27: M126's, M133's): its first block a Cr CCCM block without
+      subsampling of 2 rows (100,46 4x2; 96,24 8x2, then the CCLM record at 96,26 8x4) - the same kind as above,
+      identical in the other runs.
+   d. Performance (section 8, M126 - M134): aiodd's GPU time per kind now (phase timers, under load): IntraTMP nodes
+      ~90 ms (updates ~23, enumeration ~18, ranks ~10, setup ~10, clustering ~9), CCP merge blocks ~44 (candidates'
+      template samples 12, model loads 10, fits ~4), TIMD nodes ~41 (the vector list ~13, the costs ~10), NN blocks ~30
+      (layers 0 and 1: ~110 us per block, latency-bound loads of their sparse weights), MPM nodes ~19 (MDIP's list
+      4, its costs 4, the end 5), SGPM ~18, TMRL ~14. Next: the CCP candidates' steps batched (one luma buffer per
+      filter kind, the candidates' offsets applied in the features), the NN weights' loads, the MPM node's serial
+      parts.
    e. Ports by count (M121's run): GPM CIIP of several TUs 130, GPM affine parts with LIC 118, affine CIIP with LIC
       of uni-prediction 115, affine CIIP of sub-block merge 90, GPM bi-prediction parts with BDOF and LIC 82 (as
       M121's LIC with BDOF, the part's inherited models), GPM regression blending with an intra part 60; intra: IBC

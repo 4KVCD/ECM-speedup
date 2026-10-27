@@ -41,6 +41,10 @@
 const int CCP_MAX_CANDS     = 12;   // MAX_CCP_CAND_LIST_SIZE (also the defaults' number)
 const int CCP_MAX_LIST      = 15;   // MAX_CCP_CAND_LIST_INIT_SIZE: the list with adjustment
 const int CCP_FLY_MAX       = 6;    // MAX_NUM_DERIVED_CCP_ADJUST_CAND: adjustment's on-the-fly models
+// the order ccpFitModels fits them in: each fit of two models (both classes' sums in one pass) before the single model
+// over the same samples, whose sums are the two classes' together: the whole template's, its reference samples', its
+// two lines'
+const int CCP_FIT_ORDER[CCP_FLY_MAX] = int[]( 0, 1, 4, 3, 5, 2 );
 const int CCP_HIST_MAX      = 6;    // MAX_NUM_HCCP_CANDS: the history's models
 const int CCP_DEFAULT_SHIFT = 3;    // the defaults' shift
 // the defaults' slopes (getCCPModelCandidateList's defaultA): with a CCLM candidate before them its slope moved by
@@ -919,17 +923,33 @@ void ccpFitModels( Tu t, bool derived, int lid, int NT )
                            : num == 0 ? 1 << ( t.bitDepth - 1 ) : cccmDivideLowPrec( total, num );
   }
   const int numFits = !derived ? CCP_FLY_MAX : t.w * t.h > P.ccpDerivedGl ? 3 : 2;
-  for( int k = 0; k < numFits; k++ )
+  for( int s = 0; s < numFits; s++ )
   {
+    const int  k     = derived ? s : CCP_FIT_ORDER[s];
     const bool two   = derived ? k == 1 : k == 0 || k >= 4;
     g_ccpFlyTwoLines = derived ? k == 0 : k == 2 || k == 5;
     g_ccpFlyRefOnly  = !derived && ( k == 3 || k == 4 );
     g_cccmGl         = derived && k == 2;
+    if( two )   // (both classes' sums in one pass)
+    {
+      cccmAccumulatePair( t, lid, NT );
+    }
+    else if( !derived )   // (adjustment's single model: the sums of the two before it, over the same samples)
+    {
+      cccmBothClasses( lid );
+    }
+    else
+    {
+      cccmAccumulate( t, 0, false, lid, NT );
+    }
     for( int m = 0; m < ( two ? 2 : 1 ); m++ )
     {
-      cccmAccumulate( t, m, two, lid, NT );
+      if( m == 1 )
+      {
+        cccmNextClass( lid );
+      }
       cccmSolve( t, m, lid );
-      if( lid < 2 )   // (the next model's cccmAccumulate resets CCCM_RANGE in the same invocations)
+      if( lid < 2 )   // (the next model's cccmNextClass or the next fit changes CCCM_RANGE in the same invocations)
       {
         s_cclm[CCCM_MODEL_RANGE + 4 * m + 2 * lid]     = s_cclm[CCCM_RANGE + 2 * lid];
         s_cclm[CCCM_MODEL_RANGE + 4 * m + 2 * lid + 1] = s_cclm[CCCM_RANGE + 2 * lid + 1];
