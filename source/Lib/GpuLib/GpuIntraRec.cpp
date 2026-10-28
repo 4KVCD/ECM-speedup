@@ -12577,13 +12577,17 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
     cflm              = cflm || lmFusionType( t ) > 1;
     ccpMerge          = ccpMerge || t.ccpMerge >= 0;
   }
-  const IntraRecVariant variant = m.numMpm > 0 || eip || m.numIbcObmc > 0 ? VARIANT_MPM
+  // development: ECM_GPU_FULL_PIPELINE=1 runs every picture in the largest pipeline (each variant and level holds the
+  // ones below it), so that a shader change is compiled once for all streams rather than per variant and level they
+  // use; verification of a change still runs without it, in the pipelines the pictures pick
+  const bool full = getenv( "ECM_GPU_FULL_PIPELINE" ) != nullptr;
+  const IntraRecVariant variant = full || m.numMpm > 0 || eip || m.numIbcObmc > 0 ? VARIANT_MPM
                                   : !m.cpuTmrl.empty() ? VARIANT_TMRL
                                   : m.numTimdMerge > 0 ? VARIANT_TIMD_MERGE
                                   : m.numTimdSad > 0 ? VARIANT_TIMD_SAD : m.numTimd > 0 ? VARIANT_TIMD
                                   : m.numMerge > 0 ? VARIANT_MERGE : dimd ? VARIANT_FULL
                                   : derivedTransforms ? VARIANT_DERIVED_TRANSFORMS : VARIANT_PLAIN;
-  LmLevel lmLevel = m.numCcpLfnst > 0 ? LEVEL_CCP_LFNST
+  LmLevel lmLevel = full || m.numCcpLfnst > 0 ? LEVEL_CCP_LFNST
                     : m.numDerivedCcp > 0 || m.numDdMergeFusion > 0 || m.numFusionBlend > 0 ? LEVEL_CCP_DERIVED
                     : ccpMerge ? LEVEL_CCP_MERGE : cflm ? LEVEL_CFLM : cccm ? LEVEL_CCCM : cclm ? LEVEL_CCLM
                     : LEVEL_NO_LM;

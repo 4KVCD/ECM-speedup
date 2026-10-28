@@ -3272,6 +3272,9 @@ M147 (2026-10-28): OBMC of inter CUs with an IBC neighbour with LIC: the copy th
 LMCS's inverse): OBMC_SEG_IBC_LIC, the models after the record at OBMC_SEG_MV2. Two vectors with LIC stay on the CPU.
 Results (27 streams, grn154 / grn153 with ECM_GPU_FULL_PIPELINE): as before the series, identical but ra_ip64_md5 1
 and ra720_pj17 4 (section 9). Inter CUs from the CPU: 27 -> 3 (now their other cause, several TUs / ASBT).
+GPU tooling (2026-10-28): ECM_GPU_FULL_PIPELINE=1 runs every picture in the largest intra_rec pipeline (MPM variant,
+CCP-LFNST level; each holds those below), so a shader change compiles once for all streams (the 27 then verify in
+about an hour) instead of once per variant and level a stream uses; a change's verification still runs without it.
 Tried after M125 and left out (idle 3070, median of 5 or 7): the CCP merge history's and list's records read ahead in
 parallel with signatures (neutral); IntraTMP's refinement ranks counting only the windows that overlap no other
 (+3 % aiodd: the weaker filter sends more positions to the walk) or comparing only positions of overlapping windows
