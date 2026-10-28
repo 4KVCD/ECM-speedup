@@ -3255,6 +3255,10 @@ prediction's second mode (none for a TIMD CU whose modes do not blend; an OBIC b
 Results (27 streams, grn154 / grn153 with ECM_GPU_FULL_PIPELINE): as before the series, identical but ra_ip64_md5 1
 and ra720_pj17 4 (section 9). Intra CUs from the CPU: 41 -> 0 (and fp720_ai's intra merge CUs of such neighbours 19 ->
 6).
+M145 (2026-10-28): DBV with LM chroma fusion's first type (its CCCM blend applies to the DBV copy in storeRegion);
+CFLM, IBC LIC and the flip stay on the CPU (their reasons apart). Results (27 streams, grn154 / grn153 with
+ECM_GPU_FULL_PIPELINE): as before the series, identical but ra_ip64_md5 1 and ra720_pj17 4 (section 9). Intra CUs from
+the CPU: 37 -> 26.
 Tried after M125 and left out (idle 3070, median of 5 or 7): the CCP merge history's and list's records read ahead in
 parallel with signatures (neutral); IntraTMP's refinement ranks counting only the windows that overlap no other
 (+3 % aiodd: the weaker filter sends more positions to the walk) or comparing only positions of overlapping windows
