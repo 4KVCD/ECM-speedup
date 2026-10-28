@@ -3267,6 +3267,11 @@ IBC's); inter_mc runs for such jobs alone too. calcGradForOBMC passes a neighbou
 an intra or IBC part by one unit (unitsToSkip; ra_long POC 184). Results (27 streams, grn157 with
 ECM_GPU_FULL_PIPELINE): as before the series, identical but ra_ip64_md5 1 and ra720_pj17 4 (section 9). Intra CUs from
 the CPU: IntraTMP OBMC with an inter neighbour 69 -> 0.
+M147 (2026-10-28): OBMC of inter CUs with an IBC neighbour with LIC: the copy through the neighbour's list-0 model
+(subBlockOBMC copies licScale / licOffset, xPredInterBlk's isobmcMC branch applies them, skip test copies too, before
+LMCS's inverse): OBMC_SEG_IBC_LIC, the models after the record at OBMC_SEG_MV2. Two vectors with LIC stay on the CPU.
+Results (27 streams, grn154 / grn153 with ECM_GPU_FULL_PIPELINE): as before the series, identical but ra_ip64_md5 1
+and ra720_pj17 4 (section 9). Inter CUs from the CPU: 27 -> 3 (now their other cause, several TUs / ASBT).
 Tried after M125 and left out (idle 3070, median of 5 or 7): the CCP merge history's and list's records read ahead in
 parallel with signatures (neutral); IntraTMP's refinement ranks counting only the windows that overlap no other
 (+3 % aiodd: the weaker filter sends more positions to the walk) or comparing only positions of overlapping windows

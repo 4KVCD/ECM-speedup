@@ -1427,10 +1427,11 @@ constexpr int OBMC_REC_TM = 1, OBMC_REC_TOP = 2, OBMC_REC_LEFT = 4, OBMC_REC_INV
 constexpr int OBMC_SEG_INTRA = 2, OBMC_SEG_MODE = 8;
 constexpr int OBMC_REC_INTRA = 256, OBMC_REC_INTRA_INV = 512, OBMC_REC_NO_PDPC = 1024, OBMC_REC_NO_REF_FILTER = 2048;
 // a segment of an IBC neighbour (OBMC_SEG_IBC in its head, its vector at OBMC_SEG_MV: intra_obmc.glsl's obmcInterIbc
-// copies its strip from the picture; with OBMC_SEG_IBC2 two vectors' copies averaged, the second at OBMC_SEG_MV2), the
-// record's flag: such segments (its CU's blocks wait for every block before them, DERIVE_PREFIX: the copy may read
-// anything decoded before)
-constexpr int OBMC_SEG_IBC = 4, OBMC_SEG_IBC2 = 16, OBMC_REC_IBC = 4096;
+// copies its strip from the picture; with OBMC_SEG_IBC2 two vectors' copies averaged, the second at OBMC_SEG_MV2;
+// with OBMC_SEG_IBC_LIC one copy through the neighbour's LIC models, whose place in Params::timdData is at
+// OBMC_SEG_MV2), the record's flag: such segments (its CU's blocks wait for every block before them, DERIVE_PREFIX:
+// the copy may read anything decoded before)
+constexpr int OBMC_SEG_IBC = 4, OBMC_SEG_IBC2 = 16, OBMC_SEG_IBC_LIC = 32, OBMC_REC_IBC = 4096;
 constexpr int OBMC_J_DIR = 32, OBMC_J_FLAGS = 33, OBMC_J_BASE = 34, OBMC_J_THRESHOLD = 37, OBMC_J_INT_MV = 39;
 constexpr int OBMC_J_INT_DIR = 43, OBMC_J_TPL = 44, OBMC_J_TPL_MOTION = 9, OBMC_J_LIC = 64, OBMC_J_NLIC = 76;
 constexpr int OBMC_J_CLIC = 88, OBMC_J_CNLIC = 100, OBMC_J = 106;
@@ -9105,17 +9106,22 @@ static const char* obmcPlan( const CodingUnit& cu, std::vector<ObmcSeg>& segs, b
             split = cu.firstTU->blocks[c].valid() && isAsbt( *cu.firstTU, ComponentID( c ) );
           }
           // (two vectors, JVET-AE0169: the average of the copies at both, of the default BCW weights, without weighted
-          // prediction - xPredInterBi's -, one copy where they are equal; obmcInterIbc)
+          // prediction - xPredInterBi's -, one copy where they are equal; obmcInterIbc. A neighbour with LIC: its one
+          // copy through its models - xPredInterBlk's isobmcMC branch -, which two copies would leave out of the strip
+          // but not out of skipObmcConditionByPixel's test)
           const bool wp = ( slice.getSliceType() == P_SLICE && cu.cs->pps->getUseWP() )
                           || ( slice.getSliceType() == B_SLICE && cu.cs->pps->getWPBiPred() );
           if( !nb || ( mi.interDir != 1 && ( mi.interDir != 3 || nb->cu->bcwIdx != BCW_DEFAULT || wp ) ) )
           {
             return "OBMC with an IBC neighbour of two vectors with BCW or weighted prediction";
           }
-          if( nb->cu->ibcLicFlag || split )
+          if( split )
           {
-            return nb->cu->ibcLicFlag ? "OBMC with an IBC neighbour with LIC"
-                                      : "OBMC with an IBC neighbour, of a CU of several TUs or with ASBT";
+            return "OBMC with an IBC neighbour, of a CU of several TUs or with ASBT";
+          }
+          if( nb->cu->ibcLicFlag && ibcObmcTwoCopies( cu, mi ) )
+          {
+            return "OBMC with an IBC neighbour of two vectors with LIC";
           }
           if( segs.size() == OBMC_MAX_SEG )
           {
@@ -10421,11 +10427,18 @@ void GpuIntraRec::recordInterCu( const CodingUnit& cu )
       {
         m.obmcData += (int32_t) ( ( cu.lwidth() >> 2 ) * ( cu.lheight() >> 2 ) ) * OBMC_INNER;
       }
+      std::vector<std::pair<size_t, const CodingUnit*>> licSegs;   // (an IBC neighbour's LIC models: placed below)
       for( const ObmcSeg& s: sg )
       {
         const int  bw = s.dir == 0 ? s.len : 4, bh = s.dir == 0 ? 4 : s.len;
         const bool ibc = s.mi.isIBCmot, two = ibc && ibcObmcTwoCopies( cu, s.mi );
-        const int  head = s.dir | ( ibc ? OBMC_SEG_IBC : 0 ) | ( two ? OBMC_SEG_IBC2 : 0 );
+        const bool lic = ibc && !two && s.nb->cu->ibcLicFlag;
+        const int  head = s.dir | ( ibc ? OBMC_SEG_IBC : 0 ) | ( two ? OBMC_SEG_IBC2 : 0 )
+                         | ( lic ? OBMC_SEG_IBC_LIC : 0 );
+        if( lic )
+        {
+          licSegs.push_back( { m.timdData.size() + OBMC_SEG_MV2, s.nb->cu } );
+        }
         m.timdData.insert( m.timdData.end(), { head, s.start, s.len, m.obmcData, ibc ? s.mi.mv[0].hor : 0,
                                                ibc ? s.mi.mv[0].ver : 0, two ? s.mi.mv[1].hor : 0,
                                                two ? s.mi.mv[1].ver : 0 } );
@@ -10434,6 +10447,17 @@ void GpuIntraRec::recordInterCu( const CodingUnit& cu )
         m.obmcData += OBMC_D_TPL + 2 * s.len + bw * bh + 2 * ( bw >> 1 ) * ( bh >> 1 );
       }
       obmcIntraRecord( m, is );   // (after the motion segments, which obmcJobs numbers)
+      // an IBC neighbour's LIC models after the record, per component list 0's scale and offset: subBlockOBMC copies
+      // the neighbour's licScale / licOffset (those DecCu stored after its prediction), which xPredInterBlk's
+      // isobmcMC branch applies to the copy
+      for( const std::pair<size_t, const CodingUnit*>& l: licSegs )
+      {
+        m.timdData[l.first] = (int32_t) m.timdData.size();
+        for( int c = 0; c < MAX_NUM_COMPONENT; c++ )
+        {
+          m.timdData.insert( m.timdData.end(), { l.second->licScale[0][c], l.second->licOffset[0][c] } );
+        }
+      }
       return r;
     };
     inner      = geoParts ? geoInner[kInter] != 0 : inner;

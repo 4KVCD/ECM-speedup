@@ -913,12 +913,14 @@ void tmpObmc( Tu t, Cu c, int rec, int lid, int NT )
 // band, as inter_mc's mode 3 leaves a motion segment's) and its skip flag at d (OBMC_D_SKIP). The strip is
 // xSubBlockMotionCompensation's of MODE_IBC: xPredInterBlk's copy of the picture at vector mv - with two vectors
 // (OBMC_SEG_IBC2: JVET-AE0169's, of the default BCW weights) xPredInterBi's average of the copies at mv and mv2 at the
-// intermediate precision -, luma mapped back by LMCS's inverse (OBMC_REC_INV_LMCS: subBlockOBMC's lut of an inter CU's
-// IBC neighbour). skipObmcConditionByPixel (not with GPM's separate OBMC), per vector (the first one's first): at the
+// intermediate precision -, with one copy through the neighbour's LIC model `lic` (obmcLicSample; xPredInterBlk's
+// isobmcMC branch), luma mapped back by LMCS's inverse (OBMC_REC_INV_LMCS: subBlockOBMC's lut of an inter CU's IBC
+// neighbour). skipObmcConditionByPixel (not with GPM's separate OBMC), per vector (the first one's first): at the
 // vector clipped to the strip (clipMvInl) and rounded to samples, a copy there that is not valid (PU::searchBv) ends
-// the tests, else a sample of it 96 (8 bits) or more from the CU's prediction before OBMC skips the segment. All
-// invocations, uniform control flow
-void obmcInterIbc( Tu t, int flags, ivec2 mv, ivec2 mv2, bool two, ivec4 st, int d, int pred, int lid, int NT )
+// the tests, else a sample of it (through the LIC model too) 96 (8 bits) or more from the CU's prediction before OBMC
+// skips the segment. All invocations, uniform control flow
+void obmcInterIbc( Tu t, int flags, ivec2 mv, ivec2 mv2, bool two, ivec3 lic, ivec4 st, int d, int pred, int lid,
+                   int NT )
 {
   const int   cs = t.comp == 0 ? 0 : 1;
   const bool  inv = t.comp == 0 && ( flags & OBMC_REC_INV_LMCS ) != 0;
@@ -974,7 +976,7 @@ void obmcInterIbc( Tu t, int flags, ivec2 mv, ivec2 mv2, bool two, ivec4 st, int
         const int first = int( CBufI16( P.interPred ).v[pred + i] );
         c = clamp( ( first + c + ( 1 << ( sh - 1 ) ) + 2 * 8192 ) >> sh, 0, maxPel );
       }
-      c = inv ? invLut( c ) : c;
+      c = inv ? invLut( obmcLicSample( c, lic, maxPel ) ) : obmcLicSample( c, lic, maxPel );
       if( pass >= 2 )
       {
         CBufI16( P.interPred ).v[pred + i] = int16_t( c );
@@ -1044,7 +1046,10 @@ void obmcInterIntra( Tu t, int r, int lid, int NT )
     {
       const ivec2 mv  = ivec2( rec.v[o + OBMC_SEG_MV], rec.v[o + OBMC_SEG_MV + 1] );
       const ivec2 mv2 = ivec2( rec.v[o + OBMC_SEG_MV2], rec.v[o + OBMC_SEG_MV2 + 1] );
-      obmcInterIbc( t, flags, mv, mv2, ( head & OBMC_SEG_IBC2 ) != 0, st, d, pred, lid, NT );
+      const bool  withLic = ( head & OBMC_SEG_IBC_LIC ) != 0;
+      const int   m       = withLic ? rec.v[o + OBMC_SEG_MV2] + 2 * t.comp : 0;   // (the component's model)
+      const ivec3 lic     = withLic ? ivec3( 1, rec.v[m], rec.v[m + 1] ) : ivec3( 0 );
+      obmcInterIbc( t, flags, mv, mv2, ( head & OBMC_SEG_IBC2 ) != 0, lic, st, d, pred, lid, NT );
       continue;
     }
     obmcStripPredict( u, st, b, start == 0, head >> OBMC_SEG_MODE, OBMC_INTER_STRIP, OBMC_INTER_PREP, lid, NT );
