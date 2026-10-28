@@ -3275,6 +3275,13 @@ and ra720_pj17 4 (section 9). Inter CUs from the CPU: 27 -> 3 (now their other c
 GPU tooling (2026-10-28): ECM_GPU_FULL_PIPELINE=1 runs every picture in the largest intra_rec pipeline (MPM variant,
 CCP-LFNST level; each holds those below), so a shader change compiles once for all streams (the 27 then verify in
 about an hour) instead of once per variant and level a stream uses; a change's verification still runs without it.
+M148 (2026-10-28): the last open differences (section 9's items a and c): ccpCccmModel sets g_cccmInterNs for a CCP
+merge candidate of inter CCCM, and nothing reset it, so the next CCCM model a workgroup fitted (an intra CCCM block's,
+a CFLM block's, decoder-derived CCP fusion's fits) took inter CCCM's features: the first difference moved with the
+schedule (c), the derived fusion's CCCM costs came out several times too high (a). cccmPrediction, cflmArea and
+ccpFitModels reset it. Found by dumping a block's luma buffer, area, offsets, template chroma (all the CPU's) and its
+feature sums (inter CCCM's list) under ECM_GPU_GROUPS=1. Results (27 streams, grn167 with ECM_GPU_FULL_PIPELINE, M148
+to M151): every picture identical. Before: identical but ra720_pj17 4 and ra_ip64_md5 1.
 Tried after M125 and left out (idle 3070, median of 5 or 7): the CCP merge history's and list's records read ahead in
 parallel with signatures (neutral); IntraTMP's refinement ranks counting only the windows that overlap no other
 (+3 % aiodd: the weaker filter sends more positions to the walk) or comparing only positions of overlapping windows
@@ -3324,7 +3331,8 @@ within the budget (M118's 3070 runs skipped those pictures with ECM_GPU_NO_CCP_L
 
 000. Now (2026-10-26, after M121; RTX 3070 PC): every picture verifies (no ECM_GPU_NO_* switch needed). Open
    differences, all of them older (pictures the switches skipped before):
-   a. Decoder-derived CCP fusion in an inter picture (ra_ip64_md5 POC 8, chroma 4,32 4x16: CPU type 16, GPU 1; also
+   a. Fixed by M148 (a CCP merge candidate's inter CCCM switch left set). It was: decoder-derived CCP fusion in an
+      inter picture (ra_ip64_md5 POC 8, chroma 4,32 4x16: CPU type 16, GPU 1; also
       4x16 blocks of ra720_pj17 POC 4): the CPU's mode costs (decoderDerivedCcp) 250 for CCLM, 83 / 82 for CCCM
       without / with the inside filter, 237 / 251 for MMLM, 285 for GL-CCCM, then the CCCM pair (cost 79); the GPU's
       CCLM cost agrees (250) but its CCCM modes' are 461, 468, 479, 455 and 820. Its first fitted model (the two
@@ -3332,7 +3340,8 @@ within the budget (M118's 3070 runs skipped those pictures with ECM_GPU_NO_CCP_L
       smoother (Cb above 472 472 472 471, left 470 .. 469 against the CPU's 468 .. and 466 .. 478): the model as the
       step reloads it from its record or the luma the step rebuilds differs.
    b. (Fixed by M121: a CCP record's inside filter flag.)
-   c. CCP records whose first difference moves between runs: ldp_parkjoy_q27 POC 8 (a CCCM model of a 2-row chroma
+   c. Fixed by M148 (the same switch). It was: CCP records whose first difference moves between runs:
+      ldp_parkjoy_q27 POC 8 (a CCCM model of a 2-row chroma
       block, no subsampling at 104,64 4x2, or GL-CCCM at 96,26 8x4; identical in M121's run), ra720_pj17 POCs 4, 8,
       10 and 12 (a CCCM / MDF-CCCM record's parameters or type, a CCP merge block): look for a race or for luma
       samples a block reads before it writes them (the shared luma buffer in the angular arrays) first. Also

@@ -1165,6 +1165,7 @@ void cccmPrediction( Tu t, bool both, int lid, int NT )
   g_cccmGl         = ( t.lm & LM_CCCM_GL ) != 0;
   g_cccmMdf        = ( t.lm >> LM_CCCM_MDF_SHIFT ) & 3;
   g_cccmNoSub      = ( t.lm & LM_CCCM_NOSUB ) != 0;
+  g_cccmInterNs    = false;   // (a CCP merge block's inter CCCM candidate before it in the workgroup sets it)
   g_cccmGlmLuma    = ( t.lm & LM_CCCM_GLM_LUMA ) != 0;
   g_cccmGlmPattern = ( ( t.lm >> LM_GLM_SHIFT ) & 15 ) - NUM_GLM_PATTERN;
   g_cccmFusion     = lmFusionType( t ) == 1;
@@ -1341,6 +1342,7 @@ void cflmArea( Tu t, int lid )
   g_cccmGl      = false;
   g_cccmMdf     = 0;
   g_cccmNoSub   = false;
+  g_cccmInterNs = false;
   g_cccmGlmLuma = false;
   g_cccmFusion  = false;
   g_cccmShift   = 0;

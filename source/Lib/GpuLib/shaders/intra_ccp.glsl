@@ -885,6 +885,7 @@ void ccpFitModels( Tu t, bool derived, int lid, int NT )
   g_cccmGl         = false;
   g_cccmMdf        = 0;
   g_cccmNoSub      = false;
+  g_cccmInterNs    = false;   // (an inter CCCM candidate's, which ccpCccmModel sets)
   g_cccmGlmLuma    = false;
   g_cccmFusion     = false;
   g_cccmCflm       = false;
