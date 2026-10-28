@@ -6568,6 +6568,12 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
   // (xCflmCreateLumaRef downsamples the luma as xCccmGetLumaVal does: never without subsampling, which a cccmNoSubFlag
   // would select). The CPU predicts at the PU, the GPU at the block: one per component. Not above 12 bits nor with
   // unequal bit depths (the CCCM solvers' precision; CFLM's bias takes the luma bit depth)
+#if JVET_AG0154_DECODER_DERIVED_CCP_FUSION
+  // (development: ECM_GPU_CPU_DERIVED_CCP leaves decoder-derived CCP fusion's CUs to the CPU, so that the pictures of
+  // its open difference - HANDOFF section 9a - verify the rest)
+  else if( !isLuma( compID ) && pu.decoderDerivedCcpMode && getenv( "ECM_GPU_CPU_DERIVED_CCP" ) )
+    why = "decoder-derived CCP fusion (ECM_GPU_CPU_DERIVED_CCP)";
+#endif
   else if( !isLuma( compID ) && pu.isChromaFusion > 1 && !GPU_CFLM )         why = "CFLM";
   else if( !isLuma( compID ) && pu.isChromaFusion > 1 && pu.cccmNoSubFlag )  why = "CFLM without subsampling";
   else if( !isLuma( compID ) && pu.isChromaFusion && !GPU_CCCM )    why = "LM chroma fusion";
