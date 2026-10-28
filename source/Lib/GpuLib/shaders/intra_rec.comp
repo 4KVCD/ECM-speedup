@@ -145,9 +145,14 @@ int    g_blendClass;   // its class
 bool   g_blendTaps;    // DIMD: the prediction's filter length by its weight (JVET-AN0158)
 // an SGPM block's blend (DERIVE_SGPM, its two predictions of weight 1): the weight of the first prediction per sample
 // (of 32; the second's the rest), which emitPred applies, in the workgroup's scratch from SGPM_BLOCK_W (after the
-// blending sums of a block of 32 x 32 samples at most; sgpmBlockWeights)
+// blending sums of a block of 64 x 64 samples at most; sgpmBlockWeights)
 bool   g_sgpmBlend;
-const int SGPM_BLOCK_W = 3 * 32 * 32;
+const int SGPM_BLOCK_W = 3 * 64 * 64;
+// a deferred block (g_deferRecon) above the 32 x 32 samples of s_spPred (an SGPM block up to 64 x 64; not a large NN
+// block, whose prediction pnnSample computes again): its prediction in the workgroup's scratch from DEFER_LARGE (after
+// the SGPM weights)
+bool   g_deferLarge;
+const int DEFER_LARGE = SGPM_BLOCK_W + 64 * 64;
 
 #include "intra_modes.glsl"
 
@@ -643,10 +648,15 @@ void storeRecon( Tu t, int x, int y, int pr )
   if( t.spCoded >= 0 || g_deferRecon )
   {
     // (sign prediction of an inter block above 32 x 32: signPredictionLarge; a deferred block of a 64-sample side - an
-    // SGPM block of 16 x 64 - still fits s_spPred, where the DIMD of its prediction reads it)
+    // SGPM block of 16 x 64 - still fits s_spPred, where the DIMD of its prediction reads it, one above 32 x 32 samples
+    // DEFER_LARGE)
     if( t.spCoded >= 0 && ( t.w > 32 || t.h > 32 ) )
     {
       splSet( SPL_PRED + y * t.w + x, pr );
+    }
+    else if( g_deferLarge )
+    {
+      splSet( DEFER_LARGE + y * t.w + x, pr );
     }
     else if( g_pnnLarge < 0 )   // (a large NN block's prediction is computed again: pnnSample)
     {
@@ -664,6 +674,14 @@ int  interCcpBlend( Tu t, int x, int y, int pr );     // (intra_ccp.glsl)
 bool sgpmNoDimd( Tu t );   // (intra_sgpm.glsl)
 int  pnnSample( int r, int W, int H, int col, int u );   // (intra_nn.glsl)
 void cflmStore( Tu t, int x, int y, int pr );
+
+// sample (x, y) of a deferred block's prediction of W x H (g_deferRecon; storeRecon kept it)
+int deferredPred( int W, int H, int x, int y )
+{
+  return g_pnnLarge >= 0 ? pnnSample( g_pnnLarge, W, H, x, y )
+         : g_deferLarge  ? splGet( DEFER_LARGE + y * W + x )
+                         : int( s_spPred[y * W + x] );
+}
 
 // sample (x, y) of the predicted region: reconstructed if it lies in the block (the region of an ISP sub-partition 1
 // or 2 wide is 4 wide; the CPU predicts it once and each sub-partition takes its columns); a block of LM chroma fusion
@@ -765,8 +783,7 @@ const int MIN_MTSS_SIZE = 128;
 // reads. pdp: the prediction is PDP's (intra_pdp.glsl, in s_spPred)
 int mipPredAt( int x, int y, int W, int H, int ps, int upH, int upV, int predStride, bool pdp )
 {
-  return !pdp ? mipSample( x, y, ps, upH, upV, predStride )
-              : g_pnnLarge >= 0 ? pnnSample( g_pnnLarge, W, H, x, y ) : int( s_spPred[y * W + x] );
+  return !pdp ? mipSample( x, y, ps, upH, upV, predStride ) : deferredPred( W, H, x, y );
 }
 void mipTransformMode( Tu t, int W, int H, int ps, int upH, int upV, int predStride, bool pdp, int lid, int NT )
 {
@@ -2349,6 +2366,7 @@ void main()
                    && ( ( t.derive & ( DERIVE_PNN_DIMD | DERIVE_EIP | DERIVE_TMP | DERIVE_SGPM ) ) != 0 || ciipDimd );
     g_secMode    = -1;
     g_pnnLarge   = t.pnn >= 0 && t.w * t.h > 32 * 32 ? t.pnn : -1;
+    g_deferLarge = g_deferRecon && g_pnnLarge < 0 && t.w * t.h > 32 * 32;
     g_bvSubs     = 0;
     g_bvTransform = false;
     g_sgpmBlend   = false;
@@ -2823,6 +2841,7 @@ void main()
       // (the block keeps its prediction until the transforms are chosen)
       g_deferRecon = g_deferRecon
                      || ( WITH_DERIVED_TRANSFORMS && g_bvTransform && ( t.derive & DERIVE_TRANSFORM ) != 0 );
+      g_deferLarge = g_deferRecon && g_pnnLarge < 0 && t.w * t.h > 32 * 32;
       if( pc.verify != 0 && lid == 0 )
       {
         const int o = g_ti * DBG_PARAMS;
@@ -3634,7 +3653,14 @@ void main()
       {
         s_dimdHist[i] = 0;
       }
-      SYNC();
+      if( g_deferLarge )   // (its prediction in the scratch)
+      {
+        splSync();
+      }
+      else
+      {
+        SYNC();
+      }
       if( ciipDimd )   // (xDecodeInterTexture's deriveIpmForTransform, the inter block's operators)
       {
         interTransformMode( t, true, lid, NT );
@@ -3707,7 +3733,7 @@ void main()
       t.ciip       = 0;   // (a CIIP block's kept prediction is the blended one)
       for( int i = lid; i < N && t.spCoded < 0; i += NT )
       {
-        storeRecon( t, i % W, i / W, g_pnnLarge >= 0 ? pnnSample( t.pnn, W, H, i % W, i / W ) : int( s_spPred[i] ) );
+        storeRecon( t, i % W, i / W, deferredPred( W, H, i % W, i / W ) );
       }
     }
 

@@ -4467,8 +4467,8 @@ static bool addTimdRecord( GpuIntraRec::Impl& m, const CodingUnit& cu, Cu& c, co
 // first six: getSpatialIpm, fillMPMList) and where DecCu derives TIMD's two modes a TIMD record (deriveTimdMode reads
 // its MPM list), the five CUs getSgpmIntraMPMs reads, its list's entry and flags, its size's weights, its template
 // (its list of vectors: endPicture's list record, Cu::bvList). False with why set where the GPU lacks what the CU
-// needs: a flipped list vector or an inter IBC neighbour, more samples than intra_rec's prediction buffer, MTSS, a luma
-// CU with a DBV chroma mode (searchBv's other reference area)
+// needs: a flipped list vector or an inter IBC neighbour, MTSS, a luma CU with a DBV chroma mode (searchBv's other
+// reference area)
 static bool addSgpmRecord( GpuIntraRec::Impl& m, const CodingUnit& cu, Cu& c, const char*& why )
 {
 #if GPU_TIMD && JVET_AB0155_SGPM && JVET_AJ0107_GPM_SHAPE_ADAPT && JVET_AJ0112_REGRESSION_SGPM \
@@ -4517,7 +4517,6 @@ static bool addSgpmRecord( GpuIntraRec::Impl& m, const CodingUnit& cu, Cu& c, co
   }
   why = source ? source
         : missed ? "SGPM with a vector its neighbours' checks missed"
-        : cu.lwidth() * cu.lheight() > 32 * 32 ? "SGPM above 1024 samples"
         : PU::isDbvMode( pu.intraDir[CHANNEL_TYPE_CHROMA] ) ? "SGPM with a DBV chroma mode" : nullptr;
   // DecCu derives timdHor / timdVer for a CU of 1024 samples at most with the SPS's TIMD, not for regression SGPM; else
   // they keep initData's -1, which getSgpmIntraMPMs skips
