@@ -121,6 +121,11 @@ int    g_pnnLarge;
 // its CU's records keep apart
 int    g_bvSubs;
 bool   g_bvTransform;
+// with g_bvTransform and MTSS the mode MTSS tries first (getFinalIntraModeForTransform): BV_SECOND_DIMD the DIMD of
+// the prediction's second (getTimdVimp / getDimdVimp), -1 none (a TIMD CU whose modes do not blend), else that mode (an
+// OBIC CU's second OBIC mode, which overrides the DIMD's)
+const int BV_SECOND_DIMD = -2;
+int    g_bvSecond;
 // a DBV block (a CU_CHROMA_DBV CU's of DBV_MODE, a chroma reordering CU's of a DBV entry): its prediction the copy at
 // the co-located luma CU's vector, or at its CU's refined DBV vector; then its reconstruction flipped by g_recFlip
 // (DecCu: pReco.flipSignal of the CU's rribcFlipType: 1 horizontally, 2 vertically)
@@ -844,7 +849,8 @@ void mipTransformMode( Tu t, int W, int H, int ps, int upH, int upV, int predStr
     if( ( t.derive & DERIVE_MTSS ) != 0 && !( WITH_MPM && ( t.derive & DERIVE_SGPM ) != 0 ) )   // (SGPM: sgpmMtss)
     {
       const ivec3 list   = ivec3( o.v[base + DIMD_OUT_MTSS_LIST], o.v[base + DIMD_OUT_MTSS_LIST + 1], o.v[base + DIMD_OUT_MTSS_LIST + 2] );
-      const ivec2 choice = mtssChoice( BufCu( P.cus ).v[t.cu], first, second, list );
+      const int   tried  = g_bvTransform && g_bvSecond != BV_SECOND_DIMD ? g_bvSecond : second;
+      const ivec2 choice = mtssChoice( BufCu( P.cus ).v[t.cu], first, tried, list );
       o.v[base + DIMD_OUT_MTSS_MODE]   = choice.x;
       o.v[base + DIMD_OUT_MTSS_BUCKET] = choice.y;
     }
@@ -2369,6 +2375,7 @@ void main()
     g_deferLarge = g_deferRecon && g_pnnLarge < 0 && t.w * t.h > 32 * 32;
     g_bvSubs     = 0;
     g_bvTransform = false;
+    g_bvSecond    = BV_SECOND_DIMD;
     g_sgpmBlend   = false;
     g_dbv        = false;
     g_recFlip    = 0;
@@ -2791,6 +2798,7 @@ void main()
         // predictions from block vectors (not with ISP)
         g_bvSubs      = t.isp == 0 ? o.v[timdOut + TIMD_OUT_BV_FLAGS] & ( blending ? 7 : 1 ) : 0;
         g_bvTransform = g_bvSubs != 0;
+        g_bvSecond    = blending ? BV_SECOND_DIMD : -1;
       }
       else if( WITH_TMRL && ( t.derive & DERIVE_TMRL ) != 0 )   // its node's mode and line (intra_tmrl.glsl)
       {
@@ -2836,6 +2844,8 @@ void main()
             g_bvSubs |= ( obicCu ? s_blendMode[k] == PLANAR_IDX && s_blendW[k] != 0 : k == 1 ) ? 1 << k : 0;
           }
           g_bvTransform = !mergeCu;
+          const int obicSecond = OBIC_OUT * BufCu( P.cus ).v[t.cu].obic + OBIC_OUT_MODE + 1;
+          g_bvSecond = obicCu && blending ? max( CBufI32( P.obicOut ).v[obicSecond], PLANAR_IDX ) : BV_SECOND_DIMD;
         }
       }
       // (the block keeps its prediction until the transforms are chosen)

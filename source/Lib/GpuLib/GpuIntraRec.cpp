@@ -4316,12 +4316,6 @@ static bool addTimdRecord( GpuIntraRec::Impl& m, const CodingUnit& cu, Cu& c, co
       return false;
     }
   }
-  // its transforms where it predicts from one: by the DIMD of its prediction, which MTSS would also take
-  if( PU::isBvTimdApplied( const_cast<CodingUnit*>( &cu ) ) && usesMtss( *cu.firstTU ) )
-  {
-    why = "TIMD with a block vector and MTSS";
-    return false;
-  }
   for( int k = 0; k < TIMD_FUSION_NUM && cu.timdMrg; k++ )   // (a TIMD merge CU's candidate with one)
   {
     if( cu.isBvTimd[k] || cu.isBvTimdSad[k] )
@@ -5267,11 +5261,7 @@ static int32_t cuRecord( GpuIntraRec::Impl& m, const TransformUnit& tu, const Co
     // with intra merge the parameters of a neighbour, ranked by template costs
     else if( m.deriveModes && cu.dimd )
     {
-      // (with a block vector chosen instead of planar its transforms take the DIMD of its prediction, which MTSS would
-      // also take)
-      why = PU::isBvDimdApplied( const_cast<CodingUnit*>( &cu ) ) && usesMtss( *cu.firstTU ) && !cu.intraMergeMode
-            ? "DIMD with a block vector and MTSS"
-            : cu.obicFlag && cu.obicMode[0] < 0 ? "OBIC without a mode" : nullptr;
+      why = cu.obicFlag && cu.obicMode[0] < 0 ? "OBIC without a mode" : nullptr;
       if( why || ( cu.obicFlag && !addObicNeighbours( m, cu, c, why ) )
           || ( cu.intraMergeMode && !addMergeRecord( m, cu, c, why ) ) )
       {
