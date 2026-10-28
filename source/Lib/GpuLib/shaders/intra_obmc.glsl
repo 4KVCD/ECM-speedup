@@ -738,11 +738,11 @@ ObmcCopy obmcRunCopy( Cu c, int k )
   return r;
 }
 
-// IntraTMP block t's prediction into s_spPred (all invocations): the reconstruction at the vector of its CU's list that
-// tmpIdx selects (generateTMPrediction), which its CU's node has put in its DimdOut's DIMD_OUT_BV; at a sub-sample
-// vector (DIMD_OUT_TMP_MV) getPredIBCBlk's interpolation over its CU, xPredIBCBlkPadding's region moved by 1 where the
-// vector's integer part lies left of / above that vector (deltaX / deltaY). With OBMC also its operations (obmcPlan)
-// and the copies of its motion runs into TO_MCS (one call site of ibcPredict for both)
+// IntraTMP block t's prediction into its deferred prediction (deferredSet; all invocations): the reconstruction at the
+// vector of its CU's list that tmpIdx selects (generateTMPrediction), which its CU's node has put in its DimdOut's
+// DIMD_OUT_BV; at a sub-sample vector (DIMD_OUT_TMP_MV) getPredIBCBlk's interpolation over its CU, xPredIBCBlkPadding's
+// region moved by 1 where the vector's integer part lies left of / above that vector (deltaX / deltaY). With OBMC also
+// its operations (obmcPlan) and the copies of its motion runs into TO_MCS (one call site of ibcPredict for both)
 void tmpPredict( Tu t, int lid, int NT )
 {
   CBufI32     o     = CBufI32( P.dimdOut );
@@ -786,7 +786,7 @@ void tmpPredict( Tu t, int lid, int NT )
                                   : ibcPredict( r.x, r.y, r.z, r.w, v, false, p.x, p.y, g_ti, t.bitDepth, d, hp );
     if( i < N )
     {
-      s_spPred[i] = int16_t( s );
+      deferredSet( t.w, i % t.w, i / t.w, s );   // (above 32 x 32 samples in the scratch, as deferredPred reads it)
     }
     else   // (through the run's LIC)
     {
@@ -796,15 +796,23 @@ void tmpPredict( Tu t, int lid, int NT )
   tsSync();
 }
 
+// where TO_BEFORE keeps sample (x, y) of a block W wide: only the band OBMC blends - the 4 rows at the top, then the
+// 4 columns left of the rows below them -, which holds a block of 64 x 64 in 496 samples
+int tmpBeforeAt( int W, int x, int y ) { return y < 4 ? y * W + x : 4 * W + ( y - 4 ) * 4 + x; }
+
 // the IntraTMP block t's OBMC (all invocations, uniform control flow; after tmpPredict and the DIMD of its
-// prediction): its prediction in s_spPred, its CU c, the OBMC record rec; per operation (obmcPlan's) a motion run's
-// copy (tmpPredict's) unless skipObmcConditionByPixel, an intra run's strip, each blended into the prediction
+// prediction): its prediction (deferredPred's), its CU c, the OBMC record rec; per operation (obmcPlan's) a motion
+// run's copy (tmpPredict's) unless skipObmcConditionByPixel, an intra run's strip, each blended into the prediction
 void tmpObmc( Tu t, Cu c, int rec, int lid, int NT )
 {
-  const int W = t.w;
-  for( int i = lid; i < W * t.h; i += NT )
+  const int W = t.w, H = t.h;
+  for( int i = lid; i < 4 * W + 4 * max( H - 4, 0 ); i += NT )   // (the band before OBMC, for the skip tests)
   {
-    tsSet( TO_BEFORE + i, int( s_spPred[i] ) );
+    const int x = i < 4 * W ? i % W : ( i - 4 * W ) % 4, y = i < 4 * W ? i / W : 4 + ( i - 4 * W ) / 4;
+    if( y < H )
+    {
+      tsSet( TO_BEFORE + tmpBeforeAt( W, x, y ), deferredPred( W, H, x, y ) );
+    }
   }
   tsSync();
   const int numOps = tsGet( TO_OPS ), maxPel = ( 1 << t.bitDepth ) - 1;
@@ -844,7 +852,7 @@ void tmpObmc( Tu t, Cu c, int rec, int lid, int NT )
         for( int i = lid; i < st.z * st.w; i += NT )
         {
           const int x = i % st.z, y = i / st.z;
-          const int before = tsGet( TO_BEFORE + ( st.y - c.y + y ) * W + st.x - c.x + x );
+          const int before = tsGet( TO_BEFORE + tmpBeforeAt( W, st.x - c.x + x, st.y - c.y + y ) );
           if( abs( before - obmcLicSample( recoAt( 0, st.x + r.x + x, st.y + r.y + y ), lic, maxPel ) ) >= threshold )
           {
             s_obmcSkip = 1;
@@ -871,7 +879,7 @@ void tmpObmc( Tu t, Cu c, int rec, int lid, int NT )
       for( int i = lid; i < len; i += NT )
       {
         const int x = i % st.z, y = i / st.z;
-        const int before = tsGet( TO_BEFORE + ( st.y - c.y + y ) * W + st.x - c.x + x );
+        const int before = tsGet( TO_BEFORE + tmpBeforeAt( W, st.x - c.x + x, st.y - c.y + y ) );
         for( int l = 0; l < 2; l++ )
         {
           const int v = int( CBufI16( P.interPred ).v[pred + ( l + 1 ) * len + i] );
@@ -896,13 +904,12 @@ void tmpObmc( Tu t, Cu c, int rec, int lid, int NT )
     const int  sh = 15 - t.bitDepth, len = st.z * st.w;
     for( int i = lid; i < len && !skip; i += NT )
     {
-      const int x = i % st.z, y = i / st.z, j = b == 0 ? y : x;
-      const int at = ( st.y - c.y + y ) * W + st.x - c.x + x;
+      const int x = i % st.z, y = i / st.z, j = b == 0 ? y : x, px = st.x - c.x + x, py = st.y - c.y + y;
       const int sum = tsGet( strip + i ) + ( average ? tsGet( strip + len + i ) : 0 );
       const int v   = average ? clamp( ( sum + ( 1 << ( sh - 1 ) ) + 2 * 8192 ) >> sh, 0, maxPel ) : sum;
-      s_spPred[at] = int16_t( ( w0[j] * int( s_spPred[at] ) + w1[j] * v + 16 ) >> 5 );
+      deferredSet( W, px, py, ( w0[j] * deferredPred( W, H, px, py ) + w1[j] * v + 16 ) >> 5 );
     }
-    SYNC();
+    tsSync();   // (a large block's prediction is in the scratch)
   }
 }
 

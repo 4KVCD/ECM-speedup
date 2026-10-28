@@ -4883,7 +4883,9 @@ static bool addTmpRecord( GpuIntraRec::Impl& m, const CodingUnit& cu, Cu& c, con
         : ( cu.tmpFusionFlag || cu.tmpFlmFlag ) && sps.getBitDepth( CHANNEL_TYPE_LUMA ) > 10
           ? "IntraTMP fusion / FLM above 10 bits"
         : cu.tempType == NO_TEMPLATE ? "IntraTMP without a template"
-        : cu.lwidth() * cu.lheight() > 32 * 32 ? "IntraTMP above 1024 samples"
+        // (a block above 32 x 32 samples keeps its prediction in the workgroup's scratch, intra_rec.comp's DEFER_LARGE,
+        // of 64 x 64, as the sub-sample search its template's padded region, intra_tmp.glsl's TS_FBUF, of 72 x 72)
+        : cu.lwidth() * cu.lheight() > 64 * 64 ? "IntraTMP above 4096 samples"
         : !sps.getUseDimd() ? "IntraTMP without DIMD" : nullptr;
   if( why )
   {

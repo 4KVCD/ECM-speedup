@@ -3303,6 +3303,11 @@ M151 (2026-10-28): OBIC with an NN neighbour: the NN CU's luma block derives the
 (DERIVE_PNN_DIMD) into its DimdOut, the neighbour's entry a negative sample count, the OBIC CU's node waiting for all
 before it (DERIVE_PREFIX). Results (27 streams, grn167 with ECM_GPU_FULL_PIPELINE, M148 to M151): every picture
 identical. Intra CUs from the CPU: OBIC with an NN neighbour 16 -> 0; with M148 to M151 253 -> 113.
+M152 (2026-10-29): IntraTMP CUs above 1024 samples (up to 64 x 64): the prediction at DEFER_LARGE in the scratch
+(tmpPredict, tmpLicApply and tmpObmc through deferredSet / deferredPred), the OBMC's copy before OBMC only the band it
+blends (tmpBeforeAt), the sub-sample search's padded region above 2560 samples in the node's scratch at TS_FBUF
+(g_tfScratch). Results (27 streams, grn170 with ECM_GPU_FULL_PIPELINE, M152 to M154): every picture identical. Intra
+CUs from the CPU: IntraTMP above 1024 samples 11 -> 0.
 Tried after M125 and left out (idle 3070, median of 5 or 7): the CCP merge history's and list's records read ahead in
 parallel with signatures (neutral); IntraTMP's refinement ranks counting only the windows that overlap no other
 (+3 % aiodd: the weaker filter sends more positions to the walk) or comparing only positions of overlapping windows

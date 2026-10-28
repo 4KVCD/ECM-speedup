@@ -602,8 +602,8 @@ int tmpLicSample( int v, int m[TMP_LIC], int maxPel )
   return clamp( ( shift >= 0 ? scaled >> shift : scaled << -shift ) + m[k + 2], 0, maxPel );
 }
 
-// IntraTMP block t's LIC (all invocations; after the DIMD of its prediction in s_spPred, as DecCu applies it after
-// generateTMPrediction): its CU's model from its DimdOut through every sample
+// IntraTMP block t's LIC (all invocations; after the DIMD of its prediction - deferredPred's -, as DecCu applies it
+// after generateTMPrediction): its CU's model from its DimdOut through every sample
 void tmpLicApply( Tu t, int lid, int NT )
 {
   CBufI32   o  = CBufI32( P.dimdOut );
@@ -615,7 +615,8 @@ void tmpLicApply( Tu t, int lid, int NT )
   }
   for( int i = lid; i < t.w * t.h; i += NT )
   {
-    s_spPred[i] = int16_t( tmpLicSample( int( s_spPred[i] ), m, maxPel ) );
+    const int x = i % t.w, y = i / t.w;
+    deferredSet( t.w, x, y, tmpLicSample( deferredPred( t.w, t.h, x, y ), m, maxPel ) );
   }
 }
 
@@ -637,17 +638,28 @@ const int   TMP_FRAC_DIST[4] = int[4]( 8, 4, 2, 6 );
 
 // the padded region's sample (bx, by) (relative to the template's top-left at the vector; rows of `stride`), in shared
 // memory: sign prediction's low and high halves and templates (s_spLow, s_spHigh, s_spTempl; 2560 samples, the region
-// of a 128 x 8 CU 2176), free in a node; every candidate's cost reads it 4 to 16 times per sample
+// of a 128 x 8 CU 2176), free in a node; every candidate's cost reads it 4 to 16 times per sample. A larger region (a
+// CU of 64 x 32 or more: ( W + 8 ) x ( H + 8 )) is in the node's scratch from TS_FBUF (g_tfScratch)
+bool g_tfScratch = false;
+
 int tfGet( int stride, int bx, int by )
 {
   const int i = ( by + TMP_PAD ) * stride + bx + TMP_PAD;
+  if( g_tfScratch )
+  {
+    return tsGet( TS_FBUF + i );
+  }
   return int( i < 1024 ? s_spLow[i] : i < 2048 ? s_spHigh[i - 1024] : s_spTempl[i - 2048] );
 }
 
 void tfSet( int stride, int bx, int by, int v )
 {
   const int i = ( by + TMP_PAD ) * stride + bx + TMP_PAD;
-  if( i < 1024 )
+  if( g_tfScratch )
+  {
+    tsSet( TS_FBUF + i, v );
+  }
+  else if( i < 1024 )
   {
     s_spLow[i] = int16_t( v );
   }
@@ -765,6 +777,7 @@ void tmpFracSearch( Cu c, int cuIndex, int tempType, int bitDepth, int lid, int 
   const int   at   = cuIndex * DIMD_OUT, T = TMP_TEMPLATE_SIZE, D = TMP_PAD;
   const int   extW = tempType != TMP_ABOVE ? T : 0, extH = tempType != TMP_LEFT ? T : 0;
   const int   eW = c.w + extW, eH = c.h + extH, stride = eW + 2 * D, maxPel = ( 1 << bitDepth ) - 1;
+  g_tfScratch = stride * ( eH + 2 * D ) > 2560;
   const ivec2 bv   = bvUnpack( o.v[at + DIMD_OUT_BV] );
   const ivec2 pos  = ivec2( c.x + bv.x - extW, c.y + bv.y - extH );
   const int   req  = tsGet( TS_FRAC_REQ );
