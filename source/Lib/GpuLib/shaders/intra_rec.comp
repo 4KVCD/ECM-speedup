@@ -619,7 +619,7 @@ int ciipBlend( Tu t, int x, int y, int intra );
 
 void storeRecon( Tu t, int x, int y, int pr )
 {
-  if( ( t.ciip & CIIP_PRE_INTRA ) != 0 )   // (the pre-pass of a CIIP CU of several TUs: its intra prediction kept)
+  if( ( t.ciip & CIIP_PRE_INTRA ) != 0 )   // (a CIIP CU's pre-pass, ciipSplit's: its intra prediction kept)
   {
     CBufI16( P.interPred ).v[t.dbgOffset + y * t.w + x] = int16_t( pr );
     return;
@@ -2342,8 +2342,9 @@ void main()
     }
     Tu t = BufTu( P.tus ).v[g_ti];
     // (a CIIP block with LFNST / NSPT, DERIVE_INTER with DERIVE_TRANSFORM: their mode from a DIMD of its blended
-    // prediction)
-    const bool ciipDimd = WITH_DERIVED_TRANSFORMS && t.ciip != 0 && ( t.derive & DERIVE_TRANSFORM ) != 0;
+    // prediction - a CIIP_SPLIT block's in place, in the inter path)
+    const bool ciipDimd = WITH_DERIVED_TRANSFORMS && t.ciip != 0 && ( t.ciip & CIIP_SPLIT ) == 0
+                          && ( t.derive & DERIVE_TRANSFORM ) != 0;
     g_deferRecon = WITH_DERIVED_TRANSFORMS
                    && ( ( t.derive & ( DERIVE_PNN_DIMD | DERIVE_EIP | DERIVE_TMP | DERIVE_SGPM ) ) != 0 || ciipDimd );
     g_secMode    = -1;
@@ -2592,7 +2593,7 @@ void main()
     {
       crsSetup( t, lid, NT );
       interObmcBand( t, lid, NT );   // (OBMC before the blend, as the CPU's motion compensation)
-      if( ( t.ciip & CIIP_SPLIT ) != 0 )   // (CIIP of a CU of several TUs: its blend is the inter prediction)
+      if( ( t.ciip & CIIP_SPLIT ) != 0 )   // (a CIIP_SPLIT block: its blend is the inter prediction)
       {
         ciipSplitBlend( t, lid, NT );
         t.ciip = 0;
@@ -2619,7 +2620,7 @@ void main()
         crsSetup( t, lid, NT );
       }
       interObmcBand( t, lid, NT );   // (OBMC on the CU's top / left band; GPM's separate OBMC and blend)
-      if( ( t.ciip & CIIP_SPLIT ) != 0 )   // (CIIP of a CU of several TUs: the CU's intra prediction blended in here)
+      if( ( t.ciip & CIIP_SPLIT ) != 0 )   // (a CIIP_SPLIT block: the CU's intra prediction blended in here)
       {
         ciipSplitBlend( t, lid, NT );
         t.ciip = 0;
@@ -2662,7 +2663,7 @@ void main()
     if( WITH_CCP_MERGE && ( t.derive & DERIVE_INTER_BLEND ) != 0 )
     {
       interObmcBand( t, lid, NT );
-      if( ( t.ciip & CIIP_SPLIT ) != 0 )   // (CIIP of a CU of several TUs: its blend is the inter prediction)
+      if( ( t.ciip & CIIP_SPLIT ) != 0 )   // (a CIIP_SPLIT block: its blend is the inter prediction)
       {
         ciipSplitBlend( t, lid, NT );
         t.ciip = 0;

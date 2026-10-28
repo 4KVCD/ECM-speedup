@@ -3235,6 +3235,9 @@ prediction (M135's pre-pass) into their inter prediction in place before their o
 CCCM and the CCP merge paths), no chroma pre-pass; CIIP_SPLIT finds the pre-pass through Tu::ispPrev's record, as
 those blends' records take Tu::ibc. Results (27 streams, grn154 / grn153 with ECM_GPU_FULL_PIPELINE): as before the
 series, identical but ra_ip64_md5 1 and ra720_pj17 4 (section 9). Inter CUs from the CPU: 15 -> 0.
+M140 (2026-10-28): CIIP with LFNST / NSPT above 32 samples a side through M135's split path (ciipSplit), whose blend
+the inter path's DIMD reads in place (no s_spPred). Results (27 streams, grn154 / grn153 with ECM_GPU_FULL_PIPELINE):
+as before the series, identical but ra_ip64_md5 1 and ra720_pj17 4 (section 9). Inter CUs from the CPU: 18 -> 0.
 Tried after M125 and left out (idle 3070, median of 5 or 7): the CCP merge history's and list's records read ahead in
 parallel with signatures (neutral); IntraTMP's refinement ranks counting only the windows that overlap no other
 (+3 % aiodd: the weaker filter sends more positions to the walk) or comparing only positions of overlapping windows

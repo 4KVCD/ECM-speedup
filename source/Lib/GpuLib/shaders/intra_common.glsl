@@ -336,7 +336,8 @@ const int CIIP_FWD = 32;
 // into Params::interPred at Tu::ibc, nothing is reconstructed -; CIIP_KEEP_PRED: the luma block of such a CU with inter
 // CCCM keeps its blend in its own inter prediction, inter CCCM's luma prediction)
 const int CIIP_TO_PRED = 256, CIIP_KEEP_PRED = 512;
-// (a CU of several TUs, whose intra prediction the CPU makes once for the CU: CIIP_PRE_INTRA its pre-pass of the CU's
+// (a CU of several TUs, whose intra prediction the CPU makes once for the CU, or with LFNST / NSPT above 32 a side,
+// whose blend their mode's DIMD reads in place (GpuIntraRec.cpp's ciipSplit): CIIP_PRE_INTRA its pre-pass of the CU's
 // area, which keeps the intra prediction in its own place in Params::interPred, nothing reconstructed; CIIP_SPLIT a TU
 // block of it, which blends that - at the pre-pass's (Tu::ispPrev) dbgOffset, rows of Tu::cuW, the block at its offset
 // in the CU, Tu::cuX / cuY - into its inter prediction by the CU's weights, then reconstructs as an inter block or
