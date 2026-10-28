@@ -687,11 +687,13 @@ constexpr int CCCM_LUMA_MAX = 4 * 1792, CCCM_PRED_MAX = 2048;
 constexpr int BLEND_ACC  = 3 * 128 * 128;    // int32 per intra_rec workgroup: the sums of DIMD / OBIC blending
 
 // a neighbour of an OBIC CU whose mode counts (intra_common.glsl's ObicNbr, IntraPrediction::obicNeighbours): its
-// record (-1: none) and the samples it counts (negated for an NN CU, which counts the mode in its DimdOut)
+// record (-1: none) and the samples it counts (negated for an NN CU, which counts the mode in its DimdOut); or
+// OBIC_INTER, the inter neighbours' counts, and their list's place in Params::timdData (addObicNeighbours)
 struct ObicNbr
 {
   int32_t cu, numSamples;
 };
+constexpr int OBIC_INTER = -2;
 constexpr int OBIC_NBRS  = 20;               // ObicNbr per OBIC CU (deriveObicMode's limitMaxNeigh)
 constexpr int OBIC_MODES = 6;                // the modes OBIC blends (OBIC_FUSION_NUM)
 constexpr int OBIC_OUT   = 3 * OBIC_MODES;   // int32 per OBIC CU: obicMode, obicFusionWeight, obicLocDep
@@ -3436,24 +3438,31 @@ static void addMtssCalls( GpuIntraRec::Impl& m, const CodingUnit& cu, Cu& c )
 
 // the neighbours of an OBIC CU whose modes its histogram counts (IntraPrediction::obicNeighbours), added to the
 // picture's (Cu::obic): their records and the samples each counts. MIP CUs count nothing in an intra slice (deriveObicMode
-// takes their DIMD mode in inter slices only); the GPU tells the others apart by their records' kind. False with why
-// set where one cannot be read
+// takes their DIMD mode in inter slices only); the GPU tells the others apart by their records' kind; the inter CUs'
+// counts the host sums. False with why set where one cannot be read
 static bool addObicNeighbours( GpuIntraRec::Impl& m, const CodingUnit& cu, Cu& c, const char*& why )
 {
 #if GPU_DIMD
   const CodingUnit* nbrs[NUM_OBIC_CUS];
   int               numSamples[NUM_OBIC_CUS];
   const int         num = IntraPrediction::obicNeighbours( cu, nbrs, numSamples );
-  if( num < 0 )
-  {
-    why = "an inter OBIC neighbour";
-    return false;
-  }
   CHECK( num > OBIC_NBRS, "OBIC counts at most 20 neighbours" );
-  c.obic = (int32_t) ( m.obicNbrs.size() / OBIC_NBRS );
-  ObicNbr* o = &*m.obicNbrs.insert( m.obicNbrs.end(), OBIC_NBRS, ObicNbr{ -1, 0 } );
+  // (the picture's list takes them once all can be read: an OBIC CU left to the CPU has no entries, which would shift
+  // the later CUs' Cu::obic against their OBIC outputs)
+  ObicNbr list[OBIC_NBRS];
+  std::fill_n( list, OBIC_NBRS, ObicNbr{ -1, 0 } );
+  ObicNbr* o = list;
+  int      interCounts[NUM_LUMA_MODE] = {};
+  bool     inter = false;
   for( int n = 0; n < num; n++ )
   {
+    // an inter CU counts the intra modes its motion field keeps (obicInterModes): the host's, summed into one entry
+    if( CU::isInter( *nbrs[n] ) )
+    {
+      IntraPrediction::obicInterModes( *nbrs[n], interCounts );
+      inter = true;
+      continue;
+    }
     // (an EIP CU, too, counts nothing in an intra slice; in another its DIMD mode)
     // an NN CU counts the DIMD mode of its prediction (indicesRepresentationPnn), which its luma block publishes in the
     // CU's DimdOut (DERIVE_PNN_DIMD); the OBIC CU's node then waits for every block before it (DERIVE_PREFIX)
@@ -3512,6 +3521,24 @@ static bool addObicNeighbours( GpuIntraRec::Impl& m, const CodingUnit& cu, Cu& c
     }
     *o++ = ObicNbr{ rec->second, numSamples[n] };
   }
+  // (the inter neighbours' counts in one entry, which takes the place of at least one of theirs: OBIC_INTER, its count
+  // the list's place in Params::timdData - the number of modes, then per mode the mode and its count)
+  if( inter )
+  {
+    *o++ = ObicNbr{ OBIC_INTER, (int32_t) m.timdData.size() };
+    const size_t head = m.timdData.size();
+    m.timdData.push_back( 0 );
+    for( int mode = 0; mode < NUM_LUMA_MODE; mode++ )
+    {
+      if( interCounts[mode] )
+      {
+        m.timdData.insert( m.timdData.end(), { mode, interCounts[mode] } );
+        m.timdData[head]++;
+      }
+    }
+  }
+  c.obic = (int32_t) ( m.obicNbrs.size() / OBIC_NBRS );
+  m.obicNbrs.insert( m.obicNbrs.end(), list, list + OBIC_NBRS );
   return true;
 #else
   why = "OBIC";
@@ -5842,9 +5869,10 @@ static int32_t cuRecord( GpuIntraRec::Impl& m, const TransformUnit& tu, const Co
     d[DIMD_OUT_MTSS_BUCKET] = secondBucket ? 1 : 0;
   }
 #endif
-  if( c.kind == CU_OBIC )   // and its OBIC
+  if( c.kind == CU_OBIC )   // and its OBIC (at its place among the OBIC CUs' entries, Cu::obic)
   {
-    int32_t* o = &*m.cpuObic.insert( m.cpuObic.end(), OBIC_OUT, 0 );
+    m.cpuObic.resize( std::max( m.cpuObic.size(), size_t( c.obic + 1 ) * OBIC_OUT ), 0 );
+    int32_t* o = &m.cpuObic[size_t( c.obic ) * OBIC_OUT];
     std::copy_n( cu.obicMode, OBIC_MODES, o );
     std::copy_n( cu.obicFusionWeight, OBIC_MODES, o + OBIC_MODES );
     std::copy_n( cu.obicLocDep, OBIC_MODES, o + 2 * OBIC_MODES );
@@ -12640,6 +12668,8 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
   const size_t eipOutBytes  = m.cpuEip.size() * 4;
   const size_t cuBytes      = cusBytes + modeBytes + callBytes + nbrBytes + mergeBytes + timdBytes + ccpDataBytes
                               + eipOutBytes;
+  // (an OBIC output for every OBIC CU's neighbour entry: the GPU writes one at each Cu::obic)
+  m.cpuObic.resize( std::max( m.cpuObic.size(), m.obicNbrs.size() / OBIC_NBRS * OBIC_OUT ), 0 );
   const size_t dimdOutBytes   = m.cus.size() * DIMD_OUT * 4, obicOutBytes = m.cpuObic.size() * 4;
   const size_t timdOutBytes   = size_t( m.numTimd ) * TIMD_OUT * 4, tmrlOutBytes = m.cpuTmrl.size() * 4;
   const size_t mpmOutBytes    = m.cpuMpm.size() * 4;

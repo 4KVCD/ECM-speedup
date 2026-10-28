@@ -20117,10 +20117,33 @@ int IntraPrediction::dimdChromaHistogramCalls( const CodingUnit& cu, const CompA
 #endif
 
 #if JVET_AH0076_OBIC && JVET_AK0056_WEIGHTED_OBIC
+// deriveObicMode's counts of inter CU n (keep in step with its steps 3 and 4): the intra mode of each 4 x 4 unit of its
+// motion field (getIpmInfo, which spanIpmInfoInter took from the reference pictures), a GPM CU's partition angle as
+// one; it counts n where one is above planar, then 16 per unit whose mode is DC or angular
+bool IntraPrediction::obicInterModes( const CodingUnit& n, int counts[NUM_LUMA_MODE] )
+{
+  const int step = 4;
+  bool      used = false;
+  for( int m = 0; m < (int) n.lwidth(); m += step )
+  {
+    for( int k = 0; k < (int) n.lheight(); k += step )
+    {
+      const int ipm = n.geoFlag ? g_geoAngle2IntraAng[g_geoParams[n.firstPU->geoSplitDir][0]]
+                                : n.firstPU->getIpmInfo( n.Y().offset( m, k ) );
+      used = used || ( ipm > PLANAR_IDX && ipm < NUM_LUMA_MODE );
+      if( counts && ipm >= DC_IDX && ipm < NUM_LUMA_MODE )
+      {
+        counts[ipm] += step * step;
+      }
+    }
+  }
+  return used;
+}
+
 // the neighbours deriveObicMode builds its histogram of occurrence from, its steps 1 to 3 (keep in step with them): the
-// adjacent and non-adjacent luma CUs at its positions, those that are intra and at a position not taken yet, the
-// nearest 20 of them; with the samples each counts (its area, weighted by its place in the candidate list). Inter
-// neighbours count by the intra modes of their motion, which the GPU does not have: -1 where one would be used
+// adjacent and non-adjacent luma CUs at its positions, those that are intra or inter with a mode it counts
+// (obicInterModes) and at a position not taken yet, the nearest 20 of them; with the samples each counts (its area,
+// weighted by its place in the candidate list; an inter CU's counts are obicInterModes')
 int IntraPrediction::obicNeighbours( const CodingUnit& cu, const CodingUnit* nbrs[NUM_OBIC_CUS], int numSamples[NUM_OBIC_CUS] )
 {
   const CodingStructure& cs   = *cu.cs;
@@ -20219,11 +20242,8 @@ int IntraPrediction::obicNeighbours( const CodingUnit& cu, const CodingUnit* nbr
   }
   for( int i = 0; i < NUM_OBIC_CUS; i++ )
   {
-    if( cuNeighbours[i] && CU::isInter( *cuNeighbours[i] ) )
-    {
-      return -1;
-    }
-    useNeighbour[i] = cuNeighbours[i] && CU::isIntra( *cuNeighbours[i] );
+    useNeighbour[i] =
+      cuNeighbours[i] && ( CU::isIntra( *cuNeighbours[i] ) || obicInterModes( *cuNeighbours[i], nullptr ) );
     for( int j = i - 1; j >= 0 && useNeighbour[i]; j-- )
     {
       if( useNeighbour[j] && cuNeighbours[i]->lx() == cuNeighbours[j]->lx() && cuNeighbours[i]->ly() == cuNeighbours[j]->ly() )

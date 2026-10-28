@@ -572,7 +572,8 @@ const int SGPM_REGRESSION = 1, SGPM_NO_TIMD = 2, SGPM_NO_DIMD = 4;   // SGPM_HEA
 
 // a neighbour of an OBIC CU whose mode its histogram counts (layout shared with GpuIntraRec.cpp, OBIC_NBRS per OBIC CU
 // in Params::obicNbrs; IntraPrediction::obicNeighbours): its record (-1: none) and the samples it counts (negated for
-// an NN CU, which counts the mode in its DimdOut)
+// an NN CU, which counts the mode in its DimdOut); or OBIC_INTER, the inter neighbours' counts, and the place of their
+// list in Params::timdData (the number of modes, then per mode the mode and its count)
 struct ObicNbr
 {
   int cu;
@@ -580,6 +581,7 @@ struct ObicNbr
 };
 layout( buffer_reference, std430, buffer_reference_align = 4 ) buffer BufObicNbr { ObicNbr v[]; };
 const int OBIC_NBRS  = 20;
+const int OBIC_INTER = -2;
 
 // an OBIC CU's OBIC as its node derives it (OBIC_OUT int32 per OBIC CU in Params::obicOut): the CodingUnit fields
 // deriveObicMode sets, obicMode (-1 where not set), obicFusionWeight and obicLocDep

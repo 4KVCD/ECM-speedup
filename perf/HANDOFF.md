@@ -3308,6 +3308,13 @@ M152 (2026-10-29): IntraTMP CUs above 1024 samples (up to 64 x 64): the predicti
 blends (tmpBeforeAt), the sub-sample search's padded region above 2560 samples in the node's scratch at TS_FBUF
 (g_tfScratch). Results (27 streams, grn170 with ECM_GPU_FULL_PIPELINE, M152 to M154): every picture identical. Intra
 CUs from the CPU: IntraTMP above 1024 samples 11 -> 0.
+M153 (2026-10-29): OBIC with inter neighbours: the host sums their units' modes (obicInterModes: the motion field's
+getIpmInfo, a GPM CU's angle; 16 per unit, class 0) into one OBIC_INTER entry that obicHistogram adds. Also a host bug
+it exposed: an OBIC CU rejected after taking its neighbour entries shifted the later CUs' Cu::obic against their OBIC
+outputs (and the GPU wrote past them): entries now go in on success, the CPU's output at Cu::obic. Results (27
+streams, grn170 with ECM_GPU_FULL_PIPELINE, M152 to M154): every picture identical. Intra CUs from the CPU: an inter
+OBIC neighbour 16 -> 0 (14 of them now under their other neighbours' reasons: IntraTMP / MIP / EIP neighbours in inter
+slices).
 Tried after M125 and left out (idle 3070, median of 5 or 7): the CCP merge history's and list's records read ahead in
 parallel with signatures (neutral); IntraTMP's refinement ranks counting only the windows that overlap no other
 (+3 % aiodd: the weaker filter sends more positions to the walk) or comparing only positions of overlapping windows

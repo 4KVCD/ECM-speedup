@@ -713,9 +713,12 @@ public:
   static void eipTemporalModels( const PredictionUnit& pu, bool shifted, std::vector<EipModelCandidate>& models );
 #endif
 #if JVET_AH0076_OBIC && JVET_AK0056_WEIGHTED_OBIC
-  /// the neighbours deriveObicMode counts the modes of, with the samples each counts; returns their number (-1: an
-  /// inter neighbour), for the GPU reconstruction
+  /// the neighbours deriveObicMode counts the modes of, with the samples each counts; returns their number, for the GPU
+  /// reconstruction
   static int obicNeighbours( const CodingUnit& cu, const CodingUnit* nbrs[NUM_OBIC_CUS], int numSamples[NUM_OBIC_CUS] );
+  /// whether deriveObicMode counts inter CU n (a 4 x 4 unit of its motion field, or a GPM CU's partition angle, with an
+  /// intra mode above planar); with counts, also adds what it counts per mode (16 per such unit, the class-0 counts)
+  static bool obicInterModes( const CodingUnit& n, int counts[NUM_LUMA_MODE] );
 #endif
   /// the parameters of CIIP's intra prediction of component compID (geneIntrainterPred's predIntraAng), for the GPU
   /// reconstruction

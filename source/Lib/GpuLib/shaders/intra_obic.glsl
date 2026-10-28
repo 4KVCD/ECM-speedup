@@ -25,7 +25,8 @@ void obicCount( int mode, int cls, int amount )
 // A DIMD CU counts its main mode, planar and its blend modes, those but the main one by their weights relative to the
 // main one's; a TIMD CU alike its modes; an OBIC CU its modes and an SGPM CU its two, each with all the samples; an
 // intra merge CU its modes, each with all the samples, without a class (s_obicPlain); another intra CU its mode, an NN
-// CU the DIMD mode of its prediction (MIP CUs, which count nothing in intra slices, are not in the list)
+// CU the DIMD mode of its prediction; the inter CUs their units' modes, the host's counts in one entry (OBIC_INTER)
+// (MIP CUs, which count nothing in intra slices, are not in the list)
 void obicHistogram( Cu c, int lid, int NT )
 {
   for( int i = lid; i < 3 * NUM_LUMA_MODE; i += NT )
@@ -38,7 +39,16 @@ void obicHistogram( Cu c, int lid, int NT )
   }
   SYNC();
   const ObicNbr nb = lid < OBIC_NBRS ? BufObicNbr( P.obicNbrs ).v[c.obic * OBIC_NBRS + lid] : ObicNbr( -1, 0 );
-  if( nb.cu >= 0 )
+  if( nb.cu == OBIC_INTER )   // (the inter neighbours' counts per mode, the host's: class 0)
+  {
+    BufI32    d = BufI32( P.timdData );
+    const int n = d.v[nb.numSamples];
+    for( int k = 0; k < n; k++ )
+    {
+      obicCount( d.v[nb.numSamples + 1 + 2 * k], 0, d.v[nb.numSamples + 2 + 2 * k] );
+    }
+  }
+  else if( nb.cu >= 0 )
   {
     const int kind = BufCu( P.cus ).v[nb.cu].kind;
     const int ns   = abs( nb.numSamples );   // (negative for an NN CU, below)
