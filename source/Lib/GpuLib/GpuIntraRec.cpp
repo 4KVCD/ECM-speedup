@@ -8292,10 +8292,6 @@ static const char* ciipWhy( const CodingUnit& cu )
       }
     }
   }
-  if( cu.altLMFlag )
-  {
-    return "CIIP with LIC";
-  }
   if( cu.chromaFormat != CHROMA_420 )
   {
     return "CIIP not 4:2:0";

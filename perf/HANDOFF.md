@@ -3243,6 +3243,9 @@ obmcInterIbc's strip the average of the two copies (OBMC_SEG_IBC2, OBMC_SEG_MV2;
 skipObmcConditionByPixel per vector. No such CU in the 27 streams: the second copy is not exercised yet. Results (27
 streams, grn154 / grn153 with ECM_GPU_FULL_PIPELINE): as before the series, identical but ra_ip64_md5 1 and ra720_pj17
 4 (section 9).
+M142 (2026-10-28): CIIP with non-local LIC (ciipWhy's rejection removed: the GPU's non-local LIC prediction, then
+CIIP's blend). Results (27 streams, grn154 / grn153 with ECM_GPU_FULL_PIPELINE): as before the series, identical but
+ra_ip64_md5 1 and ra720_pj17 4 (section 9). Inter CUs from the CPU: affine (CIIP: CIIP with LIC) 24 -> 0.
 Tried after M125 and left out (idle 3070, median of 5 or 7): the CCP merge history's and list's records read ahead in
 parallel with signatures (neutral); IntraTMP's refinement ranks counting only the windows that overlap no other
 (+3 % aiodd: the weaker filter sends more positions to the walk) or comparing only positions of overlapping windows
