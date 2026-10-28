@@ -2379,6 +2379,8 @@ void main()
     g_sgpmBlend   = false;
     g_dbv        = false;
     g_recFlip    = 0;
+    g_cccmBvg    = false;   // (BVG-CCCM's: cccmPrediction sets both; a CCP merge block's scratch has no candidates)
+    g_bvgWords   = 0;
     // the dependents, prefetched (their release ends the block)
     const int d0 = BufI32( P.depOffset ).v[g_ti], d1 = BufI32( P.depOffset ).v[g_ti + 1];
     if( lid < d1 - d0 )

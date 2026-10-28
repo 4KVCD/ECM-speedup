@@ -223,6 +223,9 @@ constexpr int LM_HIST_CB = 1024, LM_HIST_CR = 2048, LM_OTHER_SHIFT = 12;
 constexpr int LM_GLM_SHIFT = 20, LM_OTHER_GLM_SHIFT = 24;   // GLM's gradient pattern (glmIdc), the other component's
 constexpr int LM_CCCM_SHIFT = 28, LM_CCCM_GL = 4096, LM_CCCM_MDF_SHIFT = 13, LM_CCCM_NOSUB = 32768;
 constexpr int LM_CCCM_GLM_LUMA = 65536;
+// (BVG-CCCM, JVET-AE0100: its models of the copies at block vectors, intra_cccm.glsl's bvgPrediction; its sources'
+// record, bvgRecord's, at Tu::ibc. A CCCM block's bit 18 is free: the other component's field is a CCLM block's)
+constexpr int LM_CCCM_BVG = 1 << 18;
 // (LM chroma fusion's mark beyond every LM field: a CCLM block's other-component field reaches bit 19; its type
 // (isChromaFusion) in the second slope adjustment's field and the first type's weight in the first's, which a fusion
 // block does not have)
@@ -3264,13 +3267,90 @@ static bool usesMtss( const TransformUnit& tu )
 static const char* otherCccm( const PredictionUnit& pu )
 {
 #if JVET_AE0100_BVGCCCM
+  // (BVG-CCCM on the GPU: its plain models of a dual tree's 4:2:0 CU, bvgRecord's sources; PU::hasBvgCccmFlag allows it
+  // in a dual tree alone)
   if( pu.bvgCccmFlag )
   {
-    return "BVG-CCCM";
+    const CodingUnit& cu = *pu.cu;
+    return !CS::isDualITree( *cu.cs ) || cu.chromaFormat != CHROMA_420 ? "BVG-CCCM outside a 4:2:0 dual tree"
+           : pu.ccInsideFilter || pu.isChromaFusion                   ? "BVG-CCCM with the inside filter or LM fusion"
+           : cu.lfnstIdx                                              ? "BVG-CCCM with LFNST / NSPT"
+           : pu.cccmNoSubFlag || pu.glCccmFlag || pu.cccmMultiFilterIdx ? "BVG-CCCM of another CCCM kind"
+                                                                      : nullptr;
   }
 #endif
   return nullptr;
 }
+
+#if JVET_AE0100_BVGCCCM
+// BVG-CCCM: a source attempt's kinds (BVG_SRC: its vector in the record; else the IntraTMP CU record whose node found
+// it; BVG_STOP: the PU of an earlier position, which ends its position), the words per attempt and per position
+constexpr int BVG_SRC = -1, BVG_STOP = -2, BVG_ATTEMPT = 4, BVG_ATTEMPTS = 4;
+constexpr int BVG_POSITION = 1 + BVG_ATTEMPTS * BVG_ATTEMPT;
+
+// BVG-CCCM chroma PU pu's sources (PU::getBvgCccmCands / isBvgCccmCand) into m.timdData, at the returned index: per
+// position of the co-located luma area (its centre, then its corners) the attempts in order, the luma PU there, then
+// at the three positions half BVG_CCCM_POS_OFFSET above and left of it, each where it is IBC or IntraTMP: its source
+// (an IntraTMP CU of the GPU its record, else BVG_SRC), adjustChromaBv's vector in 1/16 samples, its RR-IBC flip; the
+// PU of an earlier position stops the position. intra_cccm.glsl's bvgCandidates checks the vectors (an IntraTMP node's
+// found on the GPU)
+static int32_t bvgRecord( GpuIntraRec::Impl& m, const PredictionUnit& pu )
+{
+  const CodingStructure& cs = *pu.cs;
+  const CompArea lumaArea = clipArea( CompArea( COMPONENT_Y, pu.chromaFormat, pu.Cb().lumaPos(),
+                                                recalcSize( pu.chromaFormat, CHANNEL_TYPE_CHROMA, CHANNEL_TYPE_LUMA,
+                                                            pu.Cb().size() ) ),
+                                      cs.picture->block( COMPONENT_Y ) );
+  const Position pos[NUM_BVG_CCCM_CANDS] = { lumaArea.center(), lumaArea.topLeft(), lumaArea.topRight(),
+                                             lumaArea.bottomLeft(), lumaArea.bottomRight() };
+  const int      off = BVG_CCCM_POS_OFFSET >> 1;
+  const int32_t  r   = (int32_t) m.timdData.size();
+  m.timdData.resize( r + NUM_BVG_CCCM_CANDS * BVG_POSITION, 0 );
+  for( int n = 0; n < NUM_BVG_CCCM_CANDS; n++ )
+  {
+    int32_t* p = &m.timdData[r + n * BVG_POSITION];
+    for( int k = -1; k < 3 && p[0] < BVG_ATTEMPTS; k++ )   // (k: isBvgCandidate's offsets a = 0 .. 2)
+    {
+      const Position at = k < 0 ? pos[n]
+                                : pos[n].offset( -( k == 0 ? 1 : k >> 1 ) * off, -( k == 0 ? 1 : k % 2 ) * off );
+      const PredictionUnit* lp = cs.getLumaPU( at, CHANNEL_TYPE_LUMA );
+      if( !lp || !( CU::isIBC( *lp->cu ) || PU::isTmp( *lp ) ) )
+      {
+        continue;
+      }
+      int32_t* a = p + 1 + p[0]++ * BVG_ATTEMPT;
+      bool     earlier = false;
+      for( int e = 0; e < n; e++ )
+      {
+        earlier = earlier || cs.getLumaPU( pos[e], CHANNEL_TYPE_LUMA ) == lp;
+      }
+      if( earlier )
+      {
+        a[0] = BVG_STOP;
+        break;
+      }
+      const auto rec = m.cuIndex[CHANNEL_TYPE_LUMA].find( lp->cu );
+      const bool node = !CU::isIBC( *lp->cu ) && !m.cpuCus.count( lp->cu ) && rec != m.cuIndex[CHANNEL_TYPE_LUMA].end()
+                        && m.cus[rec->second].kind == CU_TMP;
+      const Mv   bv   = PU::adjustChromaBv( *lp, lumaArea );
+      a[0] = node ? rec->second : BVG_SRC;
+      a[1] = bv.hor;
+      a[2] = bv.ver;
+      a[3] = lp->cu->rribcFlipType;
+    }
+  }
+  return r;
+}
+
+// the words of a BVG-CCCM block's candidates in the workgroup's CCCM scratch (intra_cccm.glsl's BVG_HEAD,
+// bvgCandidateWords): their number and per candidate five words, then per candidate its luma with a sample of padding
+// around, its Cb and Cr
+static int bvgScratch( const CompArea& area )
+{
+  return 1 + 5 * NUM_BVG_CCCM_CANDS
+         + NUM_BVG_CCCM_CANDS * ( ( area.width + 2 ) * ( area.height + 2 ) + 2 * area.width * area.height );
+}
+#endif
 
 // the samples of intra_cccm.glsl's luma buffer for a CCCM block's largest reference area: up to 6 lines above / left,
 // arms of twice the block, a sample of padding all around; without subsampling (noSub) the luma itself, twice as many
@@ -6778,6 +6858,18 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
       {
         m.cccmScratchWords = std::max( m.cccmScratchWords, numBuffers * lumaArea + predWords );
       }
+#if JVET_AE0100_BVGCCCM
+      // BVG-CCCM: its sources' record; its candidates' samples after the luma buffer in the scratch (the luma buffer
+      // there too), the prediction after them. It waits for all blocks before it (DERIVE_PREFIX): the IntraTMP nodes'
+      // vectors and the copies' samples, all decoded before it
+      if( pu.bvgCccmFlag )
+      {
+        t.lm     |= LM_CCCM_BVG;
+        t.ibc     = bvgRecord( m, pu );
+        t.derive |= DERIVE_PREFIX;
+        m.cccmScratchWords = std::max( m.cccmScratchWords, lumaArea + bvgScratch( area ) + predWords );
+      }
+#endif
     }
     else
 #endif
@@ -6809,7 +6901,9 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
     t.intraPredAngle = t.absInvAngle = t.angularScale = 0;
     t.refFilter = t.applyPDPC = t.gradPDPC = t.fusion = 0;
     bool newRecord = false;
-    t.ccp = ccpRecord( m, pu, &newRecord );   // the CU's CCP model (CCP merge's curCand)
+    // the CU's CCP model (CCP merge's curCand); a BVG-CCCM CU has none - predIntraCCCM sets no curCand -, so it is no
+    // merge candidate of its neighbours and not in the CTU row's history
+    t.ccp = pu.bvgCccmFlag ? -1 : ccpRecord( m, pu, &newRecord );
 #if JVET_AD0188_CCP_MERGE
     if( newRecord )
     {
@@ -7004,7 +7098,8 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
   // a derived mode: what its parameters depend on besides the mode (initIntraPatternChType's fetchRef2nd, the
   // filter's conditions, the SPS's switches)
   t.cu     = cuIdx;
-  t.derive = eipBlock ? DERIVE_EIP : tmpBlock ? DERIVE_TMP : 0;
+  // (a BVG-CCCM block's wait for all blocks before it, set with its LM record above, stays)
+  t.derive = ( eipBlock ? DERIVE_EIP : tmpBlock ? DERIVE_TMP : 0 ) | ( t.derive & DERIVE_PREFIX );
   if( derived )
   {
     // a DIMD CU's fetchRef2nd without its DIMD term (the CPU's depends on the blending the GPU derives): DIMD has no
@@ -7030,7 +7125,8 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
                                                  && !cu.plIdx && !sps.getDisableIntraFusion()
                           : tmrlCu && isLuma( compID ) ? area.area() >= SIZE_CONSTRAINT && !sps.getDisableIntraFusion()
                                                        : ipa.fetchRef2nd && !( cu.ispMode && isLuma( compID ) );
-    t.derive = DERIVE_MODE | ( fetch2nd ? DERIVE_FETCH2ND : 0 ) | ( bfBase && !bvgCu && !sgpmCu ? DERIVE_BF : 0 )
+    t.derive = ( t.derive & DERIVE_PREFIX ) | DERIVE_MODE | ( fetch2nd ? DERIVE_FETCH2ND : 0 )
+               | ( bfBase && !bvgCu && !sgpmCu ? DERIVE_BF : 0 )
                | ( sps.getDisablePdpc() ? DERIVE_NO_PDPC : 0 )
                | ( sps.getSpsRangeExtension().getIntraSmoothingDisabledFlag() ? DERIVE_NO_SMOOTHING : 0 )
                | ( sps.getDisableIntraFusion() ? DERIVE_NO_FUSION : 0 )
@@ -7119,6 +7215,13 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
     {
       if( std::abs( cb->jccr ) == 3 )   // Cr coded: this block decides and writes the Cb block's residual
       {
+        // (the Cb block then waits for this one, which cannot also wait for all blocks before it - the Cb block among
+        // them - as a BVG-CCCM block does)
+        if( t.derive & DERIVE_PREFIX )
+        {
+          reject( "BVG-CCCM with joint CbCr whose Cr block decides the signs" );
+          return;
+        }
         t.spCoded               = cbIndex;
         m.rec[cbIndex].resiFrom = cbIndex + 1;
         // (with the Cb block's transforms; of a CCLM CU their mode is the DIMD this block then finds too)

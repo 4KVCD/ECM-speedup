@@ -1,9 +1,10 @@
 // CCCM on the GPU (JVET-AA0057's convolutional cross-component models; the plain kind, GL-CCCM (JVET-AC0054), several
-// downsampling filters (JVET-AD0202) and no subsampling (JVET-AC0147): not BVG-CCCM): IntraPrediction::predIntraCCCM
-// for one chroma block of a CCCM CU. xCccmCreateLumaRef downsamples the luma (xCccmGetLumaVal, minus a luma offset:
-// JVET-AB0174) of the reference area - the block, up to 6 rows above and columns left of it, and the units above-right
-// / below-left that are available - padded by a sample all around, into a buffer (with several filters a buffer per
-// filter; without subsampling xCccmCreateLumaNoSubRef's buffer holds the luma itself, padded by two samples);
+// downsampling filters (JVET-AD0202), no subsampling (JVET-AC0147); BVG-CCCM, JVET-AE0100, in a section of its own):
+// IntraPrediction::predIntraCCCM for one chroma block of a CCCM CU. xCccmCreateLumaRef downsamples the luma
+// (xCccmGetLumaVal, minus a luma offset: JVET-AB0174) of the reference area - the block, up to 6 rows above and
+// columns left of it, and the units above-right / below-left that are available - padded by a sample all around, into
+// a buffer (with several filters a buffer per filter; without subsampling xCccmCreateLumaNoSubRef's buffer holds the
+// luma itself, padded by two samples);
 // xCccmCalcModels fits each chroma component a model (cccmFeature: of 7 parameters, the luma sample, its four
 // neighbours - with GL-CCCM a vertical and a horizontal gradient and the sample's position instead -, a nonlinear term,
 // a bias; of 10 or 11 with several filters, of 9 or 11 without subsampling) to the template - the area's samples
@@ -132,6 +133,7 @@ int  g_cccmGlmPattern;   // its gradient pattern (1 .. NUM_GLM_PATTERN)
 int  g_cccmShift;        // log2 of the luma buffer's samples per chroma sample and direction (1 without subsampling)
 int  g_cccmParams;       // the model's parameters
 int  g_cccmSet;          // the set of models that predicts (LBCCP's choice; 0 without it)
+bool g_cccmBvg = false;  // BVG-CCCM's models (bvgPrediction: fitted to copies at block vectors)
 // the offsets of the position features (GL-CCCM, several filters) from the reference area's coordinates: 0 for the
 // block's own models, a CCP merge candidate's corner offsets minus the block's where its costs or prediction place the
 // positions by the candidate's reference area (intra_ccp.glsl)
@@ -247,11 +249,21 @@ void cccmSetLuma( int b, int x, int y, int v )
   }
 }
 
+// BVG-CCCM's candidates in the workgroup's scratch after the luma buffer where it is there: their number and per
+// candidate its vector (chroma samples), the part of its copy decoded (checkIsChromaBvCandidateValid's maxWidth /
+// maxHeight) and its RR-IBC flip (BVG_HEAD words), then per candidate its luma with a sample of padding around and its
+// Cb and Cr (bvgCandidateWords; GpuIntraRec.cpp's bvgScratch)
+const int BVG_NUM = 5, BVG_CAND = 5, BVG_HEAD = 1 + BVG_NUM * BVG_CAND;
+int bvgHeadBase() { return cccmScratchBase() + ( g_cccmSharedLuma ? 0 : cccmNumBuffers() * cccmBufferSize() ); }
+int bvgCandidateWords( Tu t ) { return ( t.w + 2 ) * ( t.h + 2 ) + 2 * t.w * t.h; }
+int bvgCandidateBase( Tu t, int k ) { return bvgHeadBase() + BVG_HEAD + k * bvgCandidateWords( t ); }
+
 // where in the scratch a block too large for s_tmp keeps its prediction(s): after the luma buffers where they are there
-// too (the host allocates the scratch for such blocks)
+// too, after BVG-CCCM's candidates (the host allocates the scratch for such blocks)
+int g_bvgWords = 0;   // (BVG-CCCM: its candidates' words, BVG_HEAD + BVG_NUM * bvgCandidateWords; else 0)
 int cccmScratchPred()
 {
-  return cccmScratchBase() + ( g_cccmSharedLuma ? 0 : cccmNumBuffers() * cccmBufferSize() );
+  return cccmScratchBase() + ( g_cccmSharedLuma ? 0 : cccmNumBuffers() * cccmBufferSize() ) + g_bvgWords;
 }
 
 // where LM chroma fusion's CCCM prediction of block t is: at the end of the workgroup's scratch, so that a CCP merge
@@ -332,6 +344,152 @@ int cccmFetch( int x, int y, int fi )
   const ivec2 maxPos = cccmPictureMax();
   return cccmLumaSample( clamp( ( g_cccmRefX << g_cccmShift ) + x, 0, maxPos.x ),
                          clamp( ( g_cccmRefY << g_cccmShift ) + y, 0, maxPos.y ), fi );
+}
+
+// ----- BVG-CCCM (JVET-AE0100: predIntraCCCM's bvgCccmFlag branch)
+// A BVG-CCCM block fits its models not to a template but to up to BVG_NUM copies of the block at block vectors of the
+// co-located luma's IBC / IntraTMP CUs (PU::getBvgCccmCands; GpuIntraRec.cpp's bvgRecord): each copy's luma
+// (downsampled, minus the luma offset) with a sample of padding around, and its Cb and Cr (xBvgCccmCreateLumaRef); of
+// their samples those within the block luma's range widened by a sixteenth of it (xBvgCccmCalcBlkRange), each picture
+// position once - the first copy's - (xBvgCccmCalcModels), 11 parameters (the sample, its neighbours above, below,
+// left and right, the nonlinear terms of the five, the bias), two models split at the block's mean luma for the MMLM
+// modes (xBvgCccmCalcBlkAver); the block's own luma buffer then predicts with them (xBvgCccmApplyModel)
+const int BVG_SRC = -1, BVG_STOP = -2, BVG_ATTEMPT = 4, BVG_ATTEMPTS = 4, BVG_POSITION = 1 + BVG_ATTEMPTS * BVG_ATTEMPT;
+const int BVG_MIN = 58, BVG_MAX = 59, BVG_SAMPLES = 60;   // (in s_cclm: the luma range, the copies' samples)
+
+// chroma sample (x, y) decoded before the block (the chroma tree's isDecomp)
+bool bvgDecoded( int x, int y )
+{
+  OwnerMap om = OwnerMap( BufI32( P.owner[1] ), P.ownerW[1], P.ownerH[1], P.unitLog2X[1], P.unitLog2Y[1] );
+  return decodedBefore( om, x, y, g_ti );
+}
+
+// PU::checkIsChromaBvCandidateValid of block t's copy at chroma vector bv: not overlapping the block, its top-left
+// decoded, and its bottom-right too or else the corner of the last decoded samples scanning back along the copy's top
+// row and its left column; the decoded part's size (maxWidth / maxHeight)
+bool bvgValid( Tu t, ivec2 bv, out ivec2 size )
+{
+  size = ivec2( t.w, t.h );
+  if( bv.x + t.w > 0 && bv.y + t.h > 0 )
+  {
+    return false;
+  }
+  const int l = t.x + bv.x, top = t.y + bv.y, r = l + t.w - 1, b = top + t.h - 1;
+  if( !bvgDecoded( l, top ) )
+  {
+    return false;
+  }
+  if( bvgDecoded( r, b ) )
+  {
+    return true;
+  }
+  int vx = r, vy = b;
+  for( int x = r; x >= 0; x-- )
+  {
+    if( bvgDecoded( x, top ) )
+    {
+      vx = x;
+      break;
+    }
+  }
+  for( int y = b; y >= 0; y-- )
+  {
+    if( bvgDecoded( l, y ) )
+    {
+      vy = y;
+      break;
+    }
+  }
+  size -= ivec2( r - vx, b - vy );
+  return bvgDecoded( vx, vy );
+}
+
+// the candidates of BVG-CCCM block t (getBvgCccmCands; invocation 0) into the scratch's head: per position the first
+// attempt whose vector is valid - an IntraTMP CU's of the GPU its node's, the luma vector in 1/16 samples down to whole
+// chroma samples (isBvgCccmCand) -, unless the same vector is a candidate already; a stop ends the position
+void bvgCandidates( Tu t )
+{
+  BufI32    d = BufI32( P.timdData );
+  WBufI32   o = WBufI32( P.scratch );
+  const int head = bvgHeadBase();
+  int       n = 0;
+  for( int p = 0; p < BVG_NUM; p++ )
+  {
+    const int at = t.ibc + p * BVG_POSITION;
+    for( int k = 0; k < d.v[at]; k++ )
+    {
+      const int a = at + 1 + k * BVG_ATTEMPT, src = d.v[a];
+      if( src == BVG_STOP )
+      {
+        break;
+      }
+      const ivec2 bv = ( src >= 0 ? dbvLumaVector( src ).xy : ivec2( d.v[a + 1], d.v[a + 2] ) ) >> 5;
+      ivec2       size;
+      if( !bvgValid( t, bv, size ) )
+      {
+        continue;
+      }
+      bool known = false;
+      for( int j = 0; j < n; j++ )
+      {
+        known = known || ivec2( o.v[head + 1 + j * BVG_CAND], o.v[head + 2 + j * BVG_CAND] ) == bv;
+      }
+      if( !known )
+      {
+        const int c = head + 1 + n * BVG_CAND;
+        o.v[c]     = bv.x;
+        o.v[c + 1] = bv.y;
+        o.v[c + 2] = size.x;
+        o.v[c + 3] = size.y;
+        o.v[c + 4] = src >= 0 ? 0 : d.v[a + 3];   // (an IntraTMP CU has no flip)
+        n++;
+      }
+      break;
+    }
+  }
+  o.v[head] = n;
+}
+
+// the candidates' copies (xBvgCccmCreateLumaRef; all invocations, ending with a barrier) at the block's position plus
+// each vector, every picture position clamped into the picture, beyond the decoded part the part's last column / row
+// again; around the luma the row above, the row below - the copy's last row again at the picture's last row, at a CTU
+// row's start or where the decoded part is shorter -, the column left, the column right - likewise at the picture's
+// last column, a CTU column's start or a narrower part -, the corners unused; then flipped by the RR-IBC flip (1
+// horizontally, 2 vertically; the luma with its padding, Cb and Cr)
+void bvgFill( Tu t, int lid, int NT )
+{
+  WBufI32   o = WBufI32( P.scratch );
+  const int n = o.v[bvgHeadBase()], W = t.w, H = t.h, LW = W + 2, lumaWords = LW * ( H + 2 );
+  const int maxX = P.width[1] - 1, maxY = P.height[1] - 1, ctu = P.ctuSize >> 1;
+  for( int i = lid; i < n * bvgCandidateWords( t ); i += NT )
+  {
+    const int   k = i / bvgCandidateWords( t ), j = i % bvgCandidateWords( t ), c = bvgHeadBase() + 1 + k * BVG_CAND;
+    const ivec2 ref = ivec2( t.x + o.v[c], t.y + o.v[c + 1] ), size = ivec2( o.v[c + 2], o.v[c + 3] );
+    const int   flip = o.v[c + 4];
+    const bool  luma = j < lumaWords;
+    const int   comp = luma ? 0 : 1 + ( j - lumaWords ) / ( W * H ), e = luma ? j : ( j - lumaWords ) % ( W * H );
+    const int   x = luma ? e % LW - 1 : e % W, y = luma ? e / LW - 1 : e / W;
+    const bool  inX = x >= 0 && x < W, inY = y >= 0 && y < H;
+    ivec2       q = min( ivec2( x, y ), size - 1 );   // (the sample read, of the copy; inside the block's area)
+    if( !inY && inX )   // (the row above or below)
+    {
+      const int  sy = clamp( ref.y + H, 0, maxY );
+      const bool again = sy >= maxY || sy % ctu == 0 || size.y < H;
+      q = y < 0 ? ivec2( q.x, -1 ) : again ? min( ivec2( x, H - 1 ), size - 1 ) : ivec2( q.x, H );
+    }
+    else if( !inX && inY )   // (the column left or right)
+    {
+      const int  sx = clamp( ref.x + W, 0, maxX );
+      const bool again = sx >= maxX || sx % ctu == 0 || size.x < W;
+      q = x < 0 ? ivec2( -1, q.y ) : again ? min( ivec2( W - 1, y ), size - 1 ) : ivec2( W, q.y );
+    }
+    const ivec2 pp = clamp( ref + q, ivec2( 0 ), ivec2( maxX, maxY ) );
+    const int   v  = !inX && !inY ? 0 : luma ? cccmLumaSample( pp.x, pp.y, 0 ) : recoAt( comp, pp.x, pp.y );
+    const int   fx = flip == 1 ? W - 1 - x : x, fy = flip == 2 ? H - 1 - y : y;
+    const int   at = luma ? ( fy + 1 ) * LW + fx + 1 : lumaWords + ( comp - 1 ) * W * H + fy * W + fx;
+    o.v[bvgCandidateBase( t, k ) + at] = v;
+  }
+  cccmSync();
 }
 
 // xCccmCreateLumaRef into luma buffer b (all invocations, ending with a barrier), step by step in its order (a later
@@ -609,6 +767,13 @@ int cccmFeature( int f, int x, int y, int c, int bitDepth )
     b   = f >= 3 && f < 6 ? 1 : 0;
     use = f < 6 ? CCCM_SUM : CCCM_NONLINEAR;
   }
+  else if( g_cccmBvg )   // (BVG-CCCM: the sample, its neighbours above, below, left and right, then the five's
+  {                      // nonlinear terms)
+    const int k = f % 5;
+    p   = ivec2( x, y ) + ( k == 1 ? ivec2( 0, -1 ) : k == 2 ? ivec2( 0, 1 ) : k == 3 ? ivec2( -1, 0 )
+                          : k == 4 ? ivec2( 1, 0 ) : ivec2( 0 ) );
+    use = f < 5 ? CCCM_SUM : CCCM_NONLINEAR;
+  }
   else if( g_cccmGl && f >= 1 && f <= 4 )
   {
     if( f >= 3 )
@@ -645,6 +810,35 @@ int cccmFeature( int f, int x, int y, int c, int bitDepth )
                                     : sum;
 }
 
+// sample s of BVG-CCCM block t's copies (copy, row, column) into the features at s_spCoef[at] (CCCM_ROW words: the
+// model's 11, Cb, Cr), and whether it counts for class cls (two models: the luma at most the threshold, above it): its
+// luma within the range and its position in no earlier copy
+bool bvgSample( Tu t, int s, bool twoModels, int cls, int thr, int at, int bitDepth )
+{
+  WBufI32   o = WBufI32( P.scratch );
+  const int W = t.w, H = t.h, LW = W + 2, k = s / ( W * H ), x = s % W, y = ( s / W ) % H;
+  const int base = bvgCandidateBase( t, k ), c = o.v[base + ( y + 1 ) * LW + x + 1];
+  bool used = ( !twoModels || ( cls == 0 ? c <= thr : c > thr ) ) && c >= s_cclm[BVG_MIN] && c <= s_cclm[BVG_MAX];
+  const ivec2 p = ivec2( o.v[bvgHeadBase() + 1 + k * BVG_CAND], o.v[bvgHeadBase() + 2 + k * BVG_CAND] ) + ivec2( x, y );
+  for( int j = 0; j < k && used; j++ )
+  {
+    const ivec2 q = p - ivec2( o.v[bvgHeadBase() + 1 + j * BVG_CAND], o.v[bvgHeadBase() + 2 + j * BVG_CAND] );
+    used = !( q.x >= 0 && q.x < W && q.y >= 0 && q.y < H );
+  }
+  for( int f = 0; f < 5; f++ )   // (the sample, its neighbours above, below, left, right; their nonlinear terms)
+  {
+    const ivec2 d = f == 0 ? ivec2( 0 ) : f == 1 ? ivec2( 0, -1 ) : f == 2 ? ivec2( 0, 1 ) : f == 3 ? ivec2( -1, 0 )
+                                                                                          : ivec2( 1, 0 );
+    const int v = o.v[base + ( y + 1 + d.y ) * LW + x + 1 + d.x];
+    s_spCoef[at + f]     = int16_t( used ? v : 0 );
+    s_spCoef[at + 5 + f] = int16_t( used ? cccmNonlinear( v, bitDepth ) : 0 );
+  }
+  s_spCoef[at + 10] = int16_t( used ? 1 << ( bitDepth - 1 ) : 0 );
+  s_spCoef[at + 11] = int16_t( used ? o.v[base + LW * ( H + 2 ) + y * W + x] : 0 );
+  s_spCoef[at + 12] = int16_t( used ? o.v[base + LW * ( H + 2 ) + W * H + y * W + x] : 0 );
+  return used;
+}
+
 // the sums of model k (set k / 2, class k % 2) over its samples (solve2's dot products of xCccmCalcModels' vectors): the
 // template samples - of a single model's set 1 the two lines next to the block, else all (predIntraCCCM's LBCCP: a
 // second set of two models differs in its threshold alone) - with two models only those of its class (0: the luma at
@@ -669,7 +863,7 @@ void cccmAccumulate( Tu t, int k, bool twoModels, int lid, int NT )
   const int   set = k >> 1, cls = k & 1, bitDepth = t.bitDepth;
   const ivec4 r = cccmTemplate( t, ( set == 1 && !twoModels ) || ( WITH_CCP_MERGE && g_ccpFlyTwoLines ) );
   const ivec2 counts = cccmTemplateCounts( r );
-  const int   total = counts.x + counts.y, thr = s_cclm[CCCM_THRESHOLD + set];
+  const int   total = g_cccmBvg ? s_cclm[BVG_SAMPLES] : counts.x + counts.y, thr = s_cclm[CCCM_THRESHOLD + set];
   const int   e = lid % entries, lane = lid / entries;
   int i = 0, j = 0;
   if( lane < lanes )
@@ -682,7 +876,12 @@ void cccmAccumulate( Tu t, int k, bool twoModels, int lid, int NT )
   for( int base = 0; base < total; base += CCCM_CHUNK )
   {
     const int n = min( CCCM_CHUNK, total - base );
-    if( lid < n )
+    if( lid < n && g_cccmBvg )   // (BVG-CCCM: the copies' samples)
+    {
+      const bool used = bvgSample( t, base + lid, twoModels, cls, thr, lid * ( F + 1 ), bitDepth );
+      s_spCoef[lid * ( F + 1 ) + F] = int16_t( used ? 1 : 0 );
+    }
+    else if( lid < n )
     {
       const ivec2 p    = cccmTemplateSample( r, counts, base + lid );
       const int   c    = cccmColocated( p.x, p.y );
@@ -1141,6 +1340,44 @@ void cccmStoreCcp( Tu t, bool twoModels )
   }
 }
 
+// BVG-CCCM's set-up after the block's luma buffer (all invocations, ending with a barrier): the block luma's range
+// widened by a sixteenth (BVG_MIN, BVG_MAX), with two models its mean as the threshold (xCccmDivideLowPrec), the
+// candidates, their copies and samples (BVG_SAMPLES)
+void bvgSetup( Tu t, bool twoModels, int lid, int NT )
+{
+  if( lid == 0 )
+  {
+    s_cclm[BVG_MIN] = 32767;
+    s_cclm[BVG_MAX] = -32768;
+  }
+  SYNC();
+  int lo = 32767, hi = -32768, sum = 0;
+  for( int i = lid; i < t.w * t.h; i += NT )
+  {
+    const int v = cccmLuma( g_cccmSizeX + i % t.w, g_cccmSizeY + i / t.w );
+    lo  = min( lo, v );
+    hi  = max( hi, v );
+    sum += v;
+  }
+  atomicMin( s_cclm[BVG_MIN], lo );
+  atomicMax( s_cclm[BVG_MAX], hi );
+  const int total = wgSum2( sum, 0, 2 ).x;   // (ends with a barrier)
+  if( lid == 0 )
+  {
+    const int range = abs( s_cclm[BVG_MAX] - s_cclm[BVG_MIN] ) >> 4;
+    s_cclm[BVG_MIN] -= range;
+    s_cclm[BVG_MAX] += range;
+    s_cclm[CCCM_THRESHOLD] = twoModels ? cccmDivideLowPrec( total, t.w * t.h ) : 0;
+    bvgCandidates( t );
+  }
+  cccmSync();
+  if( lid == 0 )
+  {
+    s_cclm[BVG_SAMPLES] = WBufI32( P.scratch ).v[bvgHeadBase()] * t.w * t.h;
+  }
+  bvgFill( t, lid, NT );
+}
+
 int ccpFusionTemplateBase( Tu t );   // (intra_ccp.glsl)
 
 // the prediction of CCCM block t into s_tmp, larger ones into the scratch (rows of t.w; all invocations, ending with a
@@ -1173,9 +1410,11 @@ void cccmPrediction( Tu t, bool both, int lid, int NT )
   g_cccmLocDX      = 0;
   g_cccmLocDY      = 0;
   g_cccmShift      = g_cccmNoSub ? 1 : 0;
-  g_cccmParams     = g_cccmGlmLuma ? GLM_PARAMS
+  g_cccmBvg        = ( t.lm & LM_CCCM_BVG ) != 0;
+  g_cccmParams     = g_cccmGlmLuma ? GLM_PARAMS : g_cccmBvg ? 11
                    : g_cccmNoSub ? ( P.cclmFilter == CCLM_FILTER_AVERAGE ? 9 : 11 )
                    : g_cccmMdf == 0 ? 7 : g_cccmMdf == 1 ? 10 : 11;
+  g_bvgWords       = g_cccmBvg ? BVG_HEAD + BVG_NUM * bvgCandidateWords( t ) : 0;
   SYNC();
   cccmLoadArea();
   for( int b = 0; b < cccmNumBuffers(); b++ )
@@ -1186,8 +1425,12 @@ void cccmPrediction( Tu t, bool both, int lid, int NT )
   // (GLM with luma: never two models, its LM modes have a single one; LM chroma fusion's are MMLM_CHROMA_IDX's)
   const bool twoModels = cclmMultiModel( t.dirMode ) || g_cccmFusion;
   const bool lbccp     = P.cccmLbccp != 0 && !g_cccmGl && g_cccmMdf == 0 && !g_cccmNoSub && !g_cccmGlmLuma
-                         && !g_cccmFusion;
-  if( twoModels )
+                         && !g_cccmFusion && !g_cccmBvg;
+  if( g_cccmBvg )   // (its threshold the block's mean luma, its samples the copies')
+  {
+    bvgSetup( t, twoModels, lid, NT );
+  }
+  else if( twoModels )
   {
     const ivec4 r = cccmTemplate( t, false );
     const ivec2 counts = cccmTemplateCounts( r );

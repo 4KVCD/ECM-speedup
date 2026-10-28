@@ -140,6 +140,8 @@ const int LM_CCCM_GL      = 4096;
 const int LM_CCCM_MDF_SHIFT = 13;   // 2 bits
 const int LM_CCCM_NOSUB   = 32768;
 const int LM_CCCM_GLM_LUMA = 65536;
+// BVG-CCCM (JVET-AE0100; intra_cccm.glsl's bvg*): its sources' record at Tu::ibc
+const int LM_CCCM_BVG = 1 << 18;
 const int LM_FUSION       = 1 << 30;
 const int LM_FUSION_W_SHIFT    = 0;   // 2 bits
 const int LM_FUSION_TYPE_SHIFT = 4;   // 2 bits

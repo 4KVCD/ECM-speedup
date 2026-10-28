@@ -3282,6 +3282,17 @@ schedule (c), the derived fusion's CCCM costs came out several times too high (a
 ccpFitModels reset it. Found by dumping a block's luma buffer, area, offsets, template chroma (all the CPU's) and its
 feature sums (inter CCCM's list) under ECM_GPU_GROUPS=1. Results (27 streams, grn167 with ECM_GPU_FULL_PIPELINE, M148
 to M151): every picture identical. Before: identical but ra720_pj17 4 and ra_ip64_md5 1.
+M149 (2026-10-28): BVG-CCCM (JVET-AE0100): the host records each position's attempts (bvgRecord: the luma PU's kind,
+adjustChromaBv's vector or an IntraTMP CU's record, whose node finds it; the PU of an earlier position ends the
+position), intra_cccm.glsl checks them (bvgCandidates, checkIsChromaBvCandidateValid from the owner map), copies each
+candidate's luma with padding, Cb and Cr into the scratch (bvgFill: xBvgCccmCreateLumaRef's padding rules, the flip),
+fits the plain 11-parameter models to the samples in the block luma's widened range, each picture position once
+(bvgSample in cccmAccumulate; MMLM split at the block's mean luma), and predicts from the block's luma buffer. No CCP
+record (predIntraCCCM sets no curCand). Its blocks wait for all before them (DERIVE_PREFIX; record() kept assigning
+Tu::derive over it until now); a joint CbCr pair whose Cr block decides the signs stays on the CPU (a wait cycle
+otherwise). Not with LFNST / NSPT, the inside filter, LM fusion or another CCCM kind. Results (27 streams, grn167 with
+ECM_GPU_FULL_PIPELINE, M148 to M151): every picture identical. Intra CUs from the CPU: BVG-CCCM 89 -> 8 (LFNST 6,
+joint CbCr 2).
 Tried after M125 and left out (idle 3070, median of 5 or 7): the CCP merge history's and list's records read ahead in
 parallel with signatures (neutral); IntraTMP's refinement ranks counting only the windows that overlap no other
 (+3 % aiodd: the weaker filter sends more positions to the walk) or comparing only positions of overlapping windows
