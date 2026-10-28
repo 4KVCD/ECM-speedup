@@ -687,7 +687,7 @@ constexpr int CCCM_LUMA_MAX = 4 * 1792, CCCM_PRED_MAX = 2048;
 constexpr int BLEND_ACC  = 3 * 128 * 128;    // int32 per intra_rec workgroup: the sums of DIMD / OBIC blending
 
 // a neighbour of an OBIC CU whose mode counts (intra_common.glsl's ObicNbr, IntraPrediction::obicNeighbours): its
-// record (-1: none) and the samples it counts
+// record (-1: none) and the samples it counts (negated for an NN CU, which counts the mode in its DimdOut)
 struct ObicNbr
 {
   int32_t cu, numSamples;
@@ -2289,6 +2289,7 @@ struct GpuIntraRec::Impl
   int                                                  numReorderCpu = 0;   // its CUs left the CPU's mode
   std::vector<const PredictionUnit*>                   ccpPu;
   std::vector<const PredictionUnit*>                   untypedCcpPu;   // the chroma PUs without a record
+  std::unordered_set<const CodingUnit*>                obicWaits;   // OBIC CUs whose node waits for all before it
   // CCP merge (Params::ccpData, assembled at endPicture): per record its blocks (CCP_WRITERS), the records
   // CU::saveModelsInHCCP pushes into the CTU rows' histories (cs.ccpLut) in decoding order, the current row and where
   // its history begins, the merge CUs' entries (their history's position relative to ccpHist, their ordinal for their
@@ -2667,6 +2668,7 @@ void GpuIntraRec::beginPicture( const CodingStructure& cs )
   m.numReorderCpu = 0;
   m.ccpPu.clear();
   m.untypedCcpPu.clear();
+  m.obicWaits.clear();
   m.ccpWriters.clear();
   m.ccpHist.clear();
   m.ccpHistRow      = -1;
@@ -3453,12 +3455,27 @@ static bool addObicNeighbours( GpuIntraRec::Impl& m, const CodingUnit& cu, Cu& c
   for( int n = 0; n < num; n++ )
   {
     // (an EIP CU, too, counts nothing in an intra slice; in another its DIMD mode)
-    // an NN CU counts the DIMD mode of its prediction (indicesRepresentationPnn), which the GPU's NN blocks do not
-    // publish yet
-    if( nbrs[n]->firstPU->intraDir[CHANNEL_TYPE_LUMA] == PNN_IDX )
+    // an NN CU counts the DIMD mode of its prediction (indicesRepresentationPnn), which its luma block publishes in the
+    // CU's DimdOut (DERIVE_PNN_DIMD); the OBIC CU's node then waits for every block before it (DERIVE_PREFIX)
+    if( nbrs[n]->firstPU->intraDir[CHANNEL_TYPE_LUMA] == PNN_IDX && !m.cpuCus.count( nbrs[n] ) )
     {
-      why = "OBIC with an NN neighbour";
-      return false;
+      const auto rec = m.cuIndex[CHANNEL_TYPE_LUMA].find( nbrs[n] );
+      int        b   = (int) m.rec.size() - 1;
+      while( rec != m.cuIndex[CHANNEL_TYPE_LUMA].end() && b >= 0
+             && !( m.rec[b].cu == rec->second && m.rec[b].comp == 0 && m.rec[b].pnn >= 0 ) )
+      {
+        b--;
+      }
+      if( rec == m.cuIndex[CHANNEL_TYPE_LUMA].end() || b < 0 || nbrs[n]->firstTU != nbrs[n]->lastTU )
+      {
+        why = "OBIC with an NN neighbour of several blocks or without its block";
+        return false;
+      }
+      m.rec[b].derive |= DERIVE_PNN_DIMD;
+      m.cuMipDimd[rec->second] = 2;
+      m.obicWaits.insert( &cu );
+      *o++ = ObicNbr{ rec->second, -numSamples[n] };   // (negative: the mode is its DimdOut's, not its CU mode)
+      continue;
     }
     // (in an inter slice deriveObicMode counts an IntraTMP or MIP neighbour's DIMD of its prediction, which the
     // GPU's blocks of such CUs do not publish for OBIC; in an intra slice an IntraTMP neighbour counts nothing, and its
@@ -5666,7 +5683,7 @@ static int32_t cuRecord( GpuIntraRec::Impl& m, const TransformUnit& tu, const Co
     node.unitW     = cu.cs->pcv->minCUWidth >> ( noShift ? 0 : getComponentScaleX( ComponentID( node.comp ), cu.cs->sps->getChromaFormatIdc() ) );
     node.unitH     = cu.cs->pcv->minCUHeight >> ( noShift ? 0 : getComponentScaleY( ComponentID( node.comp ), cu.cs->sps->getChromaFormatIdc() ) );
     node.disableRefFilter = cu.cs->sps->getDisableRefFilter();
-    node.derive   |= c.kind == CU_CHROMA_DBV ? DERIVE_PREFIX : 0;
+    node.derive   |= c.kind == CU_CHROMA_DBV || ( c.kind == CU_OBIC && m.obicWaits.count( &cu ) ) ? DERIVE_PREFIX : 0;
     node.derive   |= c.kind == CU_CHROMA_REORDER
                      ? DERIVE_PREFIX
                        | ( cu.cs->sps->getSpsRangeExtension().getIntraSmoothingDisabledFlag() ? DERIVE_NO_SMOOTHING : 0 )

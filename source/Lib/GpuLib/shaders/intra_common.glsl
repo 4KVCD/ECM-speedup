@@ -571,7 +571,8 @@ const int SGPM_HEAD_WEIGHTS = 9, SGPM_HEAD_T = 11;
 const int SGPM_REGRESSION = 1, SGPM_NO_TIMD = 2, SGPM_NO_DIMD = 4;   // SGPM_HEAD_FLAGS
 
 // a neighbour of an OBIC CU whose mode its histogram counts (layout shared with GpuIntraRec.cpp, OBIC_NBRS per OBIC CU
-// in Params::obicNbrs; IntraPrediction::obicNeighbours): its record (-1: none) and the samples it counts
+// in Params::obicNbrs; IntraPrediction::obicNeighbours): its record (-1: none) and the samples it counts (negated for
+// an NN CU, which counts the mode in its DimdOut)
 struct ObicNbr
 {
   int cu;

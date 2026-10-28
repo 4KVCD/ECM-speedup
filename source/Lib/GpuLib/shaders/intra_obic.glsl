@@ -24,8 +24,8 @@ void obicCount( int mode, int cls, int amount )
 // deriveObicMode's step 4 over the neighbours of OBIC CU c, one invocation each, all invocations (ends with a barrier).
 // A DIMD CU counts its main mode, planar and its blend modes, those but the main one by their weights relative to the
 // main one's; a TIMD CU alike its modes; an OBIC CU its modes and an SGPM CU its two, each with all the samples; an
-// intra merge CU its modes, each with all the samples, without a class (s_obicPlain); another intra CU its mode (MIP
-// CUs, which count nothing in intra slices, are not in the list)
+// intra merge CU its modes, each with all the samples, without a class (s_obicPlain); another intra CU its mode, an NN
+// CU the DIMD mode of its prediction (MIP CUs, which count nothing in intra slices, are not in the list)
 void obicHistogram( Cu c, int lid, int NT )
 {
   for( int i = lid; i < 3 * NUM_LUMA_MODE; i += NT )
@@ -41,7 +41,7 @@ void obicHistogram( Cu c, int lid, int NT )
   if( nb.cu >= 0 )
   {
     const int kind = BufCu( P.cus ).v[nb.cu].kind;
-    const int ns   = nb.numSamples;
+    const int ns   = abs( nb.numSamples );   // (negative for an NN CU, below)
     if( kind == CU_DIMD )   // its node's DimdOut
     {
       CBufI32    d        = CBufI32( P.dimdOut );
@@ -135,9 +135,10 @@ void obicHistogram( Cu c, int lid, int NT )
         }
       }
     }
-    else   // its intra mode (firstPU->intraDir[0]; a TMRL CU's MAP131TO67 of it: cuModeOf's)
-    {
-      obicCount( cuModeOf( nb.cu ), 0, ns );
+    else   // its intra mode (firstPU->intraDir[0]; a TMRL CU's MAP131TO67 of it: cuModeOf's); an NN CU's (a negative
+    {      // count) the DIMD mode of its prediction (indicesRepresentationPnn), which its luma block writes in DimdOut
+      const int mode = nb.numSamples < 0 ? CBufI32( P.dimdOut ).v[nb.cu * DIMD_OUT + DIMD_OUT_MODE] : cuModeOf( nb.cu );
+      obicCount( mode, 0, ns );
     }
   }
   SYNC();

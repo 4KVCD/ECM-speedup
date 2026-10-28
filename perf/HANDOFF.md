@@ -3299,6 +3299,10 @@ block: xCflmCreateChromaPred's DBV branch, cflmDbvArm), the block's chroma featu
 flipped back before the reconstruction's flip; the host checks the CPU's arms (a PU of another CU beside the block)
 are the picture's. Results (27 streams, grn167 with ECM_GPU_FULL_PIPELINE, M148 to M151): every picture identical.
 Intra CUs from the CPU: DBV with CFLM 22 -> 0.
+M151 (2026-10-28): OBIC with an NN neighbour: the NN CU's luma block derives the DIMD mode of its prediction
+(DERIVE_PNN_DIMD) into its DimdOut, the neighbour's entry a negative sample count, the OBIC CU's node waiting for all
+before it (DERIVE_PREFIX). Results (27 streams, grn167 with ECM_GPU_FULL_PIPELINE, M148 to M151): every picture
+identical. Intra CUs from the CPU: OBIC with an NN neighbour 16 -> 0; with M148 to M151 253 -> 113.
 Tried after M125 and left out (idle 3070, median of 5 or 7): the CCP merge history's and list's records read ahead in
 parallel with signatures (neutral); IntraTMP's refinement ranks counting only the windows that overlap no other
 (+3 % aiodd: the weaker filter sends more positions to the walk) or comparing only positions of overlapping windows
