@@ -865,33 +865,45 @@ void tmpObmc( Tu t, Cu c, int rec, int lid, int NT )
 // an IBC neighbour's segment (OBMC_SEG_IBC) of an inter CU's OBMC record (flags its OBMC_REC_* flags), on strip st of
 // block t's component - the whole strip lies in the block, the CU's single TU -: its prediction at pred (the data's
 // band, as inter_mc's mode 3 leaves a motion segment's) and its skip flag at d (OBMC_D_SKIP). The strip is
-// xSubBlockMotionCompensation's of MODE_IBC: xPredInterBlk's copy of the picture at vector (mvx, mvy), luma mapped back
-// by LMCS's inverse (OBMC_REC_INV_LMCS: subBlockOBMC's lut of an inter CU's IBC neighbour). skipObmcConditionByPixel
-// (not with GPM's separate OBMC): at the vector clipped to the strip (clipMvInl) and rounded to samples, valid
-// (PU::searchBv), a sample of the copy 96 (8 bits) or more from the CU's prediction before OBMC skips the segment.
-// All invocations, uniform control flow
-void obmcInterIbc( Tu t, int flags, int mvx, int mvy, ivec4 st, int d, int pred, int lid, int NT )
+// xSubBlockMotionCompensation's of MODE_IBC: xPredInterBlk's copy of the picture at vector mv - with two vectors
+// (OBMC_SEG_IBC2: JVET-AE0169's, of the default BCW weights) xPredInterBi's average of the copies at mv and mv2 at the
+// intermediate precision -, luma mapped back by LMCS's inverse (OBMC_REC_INV_LMCS: subBlockOBMC's lut of an inter CU's
+// IBC neighbour). skipObmcConditionByPixel (not with GPM's separate OBMC), per vector (the first one's first): at the
+// vector clipped to the strip (clipMvInl) and rounded to samples, a copy there that is not valid (PU::searchBv) ends
+// the tests, else a sample of it 96 (8 bits) or more from the CU's prediction before OBMC skips the segment. All
+// invocations, uniform control flow
+void obmcInterIbc( Tu t, int flags, ivec2 mv, ivec2 mv2, bool two, ivec4 st, int d, int pred, int lid, int NT )
 {
   const int   cs = t.comp == 0 ? 0 : 1;
   const bool  inv = t.comp == 0 && ( flags & OBMC_REC_INV_LMCS ) != 0;
-  const ivec2 mv = ivec2( mvx, mvy );
   const ivec4 sl = ivec4( st.x << cs, st.y << cs, st.z << cs, st.w << cs );   // (the strip in luma samples)
   const int horMax = ( P.width[0] + 8 + 16 - sl.x - 1 ) << 4, horMin = ( -P.ctuSize - 8 - 16 - sl.x + 1 ) << 4;
   const int verMax = ( P.height[0] + 8 + 16 - sl.y - 1 ) << 4, verMin = ( -P.ctuSize - 8 - 16 - sl.y + 1 ) << 4;
-  ivec2 rv = ivec2( clamp( mv.x, horMin, horMax ), clamp( mv.y, verMin, verMax ) );
-  rv = mix( ( rv + 8 ) >> 4, ( rv + 7 ) >> 4, greaterThanEqual( rv, ivec2( 0 ) ) );
   if( lid == 0 )
   {
     s_obmcSkip = 0;
   }
   SYNC();
-  // pass 0 the skip test's copy at the rounded vector (where it is valid), pass 1 the strip's at the vector (one call
-  // site of each copy: they are large)
-  const bool test = ( flags & OBMC_REC_GEO ) == 0 && ibcAreaValid( sl.x, sl.y, sl.z, sl.w, rv, 0, 0, g_ti );
-  const int  threshold = 96 << ( t.bitDepth - 8 );
-  for( int pass = test ? 0 : 1; pass < 2; pass++ )
+  // passes 0 and 1 the skip tests' copies at the rounded vectors (while they are valid), pass 2 the strip's copy at the
+  // vector, with two vectors pass 3 the one at the second, averaged with pass 2's kept at the intermediate precision
+  // (one call site of each copy: they are large)
+  const int threshold = 96 << ( t.bitDepth - 8 ), maxPel = ( 1 << t.bitDepth ) - 1, sh = 15 - t.bitDepth;
+  bool      testing   = ( flags & OBMC_REC_GEO ) == 0;
+  for( int pass = 0; pass < ( two ? 4 : 3 ); pass++ )
   {
-    if( pass == 1 )
+    ivec2 v = pass == 1 || pass == 3 ? mv2 : mv;
+    if( pass < 2 )
+    {
+      v = ivec2( clamp( v.x, horMin, horMax ), clamp( v.y, verMin, verMax ) );
+      v = mix( ( v + 8 ) >> 4, ( v + 7 ) >> 4, greaterThanEqual( v, ivec2( 0 ) ) );
+      testing = testing && ( pass == 0 || two ) && ibcAreaValid( sl.x, sl.y, sl.z, sl.w, v, 0, 0, g_ti );
+      if( !testing )
+      {
+        continue;
+      }
+      v <<= 4;
+    }
+    else
     {
       tsSync();
       if( s_obmcSkip != 0 )
@@ -899,15 +911,25 @@ void obmcInterIbc( Tu t, int flags, int mvx, int mvy, ivec4 st, int d, int pred,
         break;
       }
     }
-    const ivec2 v = pass == 0 ? rv << 4 : mv;
+    const bool hp = pass >= 2 && two;
     for( int i = lid; i < st.z * st.w; i += NT )
     {
       const int x = i % st.z, y = i / st.z;
       int       c = t.comp == 0
-                      ? ibcPredict( st.x, st.y, st.z, st.w, v, false, x, y, g_ti, t.bitDepth, ivec2( 0 ), false )
-                      : ibcChromaPredict( t.comp, st.x, st.y, st.z, st.w, v, x, y, g_ti, t.bitDepth, false );
+                      ? ibcPredict( st.x, st.y, st.z, st.w, v, false, x, y, g_ti, t.bitDepth, ivec2( 0 ), hp )
+                      : ibcChromaPredict( t.comp, st.x, st.y, st.z, st.w, v, x, y, g_ti, t.bitDepth, hp );
+      if( pass == 2 && two )   // (the first copy, kept)
+      {
+        CBufI16( P.interPred ).v[pred + i] = int16_t( c );
+        continue;
+      }
+      if( pass == 3 )   // (xWeightedAverage of the two copies)
+      {
+        const int first = int( CBufI16( P.interPred ).v[pred + i] );
+        c = clamp( ( first + c + ( 1 << ( sh - 1 ) ) + 2 * 8192 ) >> sh, 0, maxPel );
+      }
       c = inv ? invLut( c ) : c;
-      if( pass == 1 )
+      if( pass >= 2 )
       {
         CBufI16( P.interPred ).v[pred + i] = int16_t( c );
       }
@@ -916,6 +938,11 @@ void obmcInterIbc( Tu t, int flags, int mvx, int mvy, ivec4 st, int d, int pred,
       {
         s_obmcSkip = 1;
       }
+    }
+    if( pass < 2 )   // (a skip ends the tests)
+    {
+      tsSync();
+      testing = testing && s_obmcSkip == 0;
     }
   }
   tsSync();
@@ -969,7 +996,9 @@ void obmcInterIntra( Tu t, int r, int lid, int NT )
     const int pred = d + OBMC_D_TPL + 2 * len + ( t.comp == 0 ? 0 : W * H + ( t.comp - 1 ) * ( W >> 1 ) * ( H >> 1 ) );
     if( ibc )
     {
-      obmcInterIbc( t, flags, rec.v[o + OBMC_SEG_MV], rec.v[o + OBMC_SEG_MV + 1], st, d, pred, lid, NT );
+      const ivec2 mv  = ivec2( rec.v[o + OBMC_SEG_MV], rec.v[o + OBMC_SEG_MV + 1] );
+      const ivec2 mv2 = ivec2( rec.v[o + OBMC_SEG_MV2], rec.v[o + OBMC_SEG_MV2 + 1] );
+      obmcInterIbc( t, flags, mv, mv2, ( head & OBMC_SEG_IBC2 ) != 0, st, d, pred, lid, NT );
       continue;
     }
     obmcStripPredict( u, st, b, start == 0, head >> OBMC_SEG_MODE, OBMC_INTER_STRIP, OBMC_INTER_PREP, lid, NT );

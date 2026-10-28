@@ -296,10 +296,11 @@ const int IBC_REC_BI = 14, IBC_REC_OWN_MV2 = 15;
 // an OBMC CU's record in Params::timdData (Tu::obmc - 1; intra_rec's OBMC, intra_deps' obmcIntraDeps): the CU
 // (luma), the flags, the segments (OBMC_SEG_* each: the boundary - 0 top, 1 left -, the first luma sample along it
 // relative to the CU, the length, its data in Params::interPred: inter_mc.comp's OBMC_D_* -, an IBC neighbour's
-// vector)
+// vectors)
 const int OBMC_REC_X = 0, OBMC_REC_Y = 1, OBMC_REC_W = 2, OBMC_REC_H = 3, OBMC_REC_FLAGS = 4, OBMC_REC_NUM = 5;
 const int OBMC_REC_BD = 6, OBMC_REC_BASE = 7, OBMC_REC_INNER = 8, OBMC_REC_SEG = 10;   // (BASE: where the data start)
-const int OBMC_SEG_DIR = 0, OBMC_SEG_START = 1, OBMC_SEG_LEN = 2, OBMC_SEG_DATA = 3, OBMC_SEG_MV = 4, OBMC_SEG = 6;
+const int OBMC_SEG_DIR = 0, OBMC_SEG_START = 1, OBMC_SEG_LEN = 2, OBMC_SEG_DATA = 3, OBMC_SEG_MV = 4, OBMC_SEG_MV2 = 6;
+const int OBMC_SEG = 8;
 const int OBMC_REC_TM = 1, OBMC_REC_TOP = 2, OBMC_REC_LEFT = 4, OBMC_REC_INV_LMCS = 8, OBMC_REC_SUB = 16;
 const int OBMC_REC_SUB_LUMA = 64;   // (the inner sub-block OBMC of luma alone: affine's innerObmcSkipChroma)
 const int OBMC_REC_GEO = 32;        // (GPM's separate OBMC - m_geoOBMC -: no skipObmcConditionByPixel)
@@ -309,8 +310,9 @@ const int OBMC_REC_GEO = 32;        // (GPM's separate OBMC - m_geoOBMC -: no sk
 const int OBMC_SEG_INTRA = 2, OBMC_SEG_MODE = 8;
 const int OBMC_REC_INTRA = 256, OBMC_REC_INTRA_INV = 512, OBMC_REC_NO_PDPC = 1024, OBMC_REC_NO_REF_FILTER = 2048;
 // a segment of an IBC neighbour (OBMC_SEG_IBC in its head: its strip intra_obmc.glsl's obmcInterIbc copies from the
-// picture at OBMC_SEG_MV, plainly blended); the record's flag: such segments
-const int OBMC_SEG_IBC = 4, OBMC_REC_IBC = 4096;
+// picture at OBMC_SEG_MV - with OBMC_SEG_IBC2 too the average of that copy and the one at OBMC_SEG_MV2 -, plainly
+// blended); the record's flag: such segments
+const int OBMC_SEG_IBC = 4, OBMC_SEG_IBC2 = 16, OBMC_REC_IBC = 4096;
 // with DERIVE_INTER a chroma block of inter CCCM (intra_intercccm.glsl; its record at Tu::ibc)
 const int DERIVE_INTER_CCCM = int( 0x80000000 );
 // without DERIVE_INTER the same bit: an inter CU's chroma block of inter CCP merge, predicted on the intra path as a

@@ -3238,6 +3238,11 @@ series, identical but ra_ip64_md5 1 and ra720_pj17 4 (section 9). Inter CUs from
 M140 (2026-10-28): CIIP with LFNST / NSPT above 32 samples a side through M135's split path (ciipSplit), whose blend
 the inter path's DIMD reads in place (no s_spPred). Results (27 streams, grn154 / grn153 with ECM_GPU_FULL_PIPELINE):
 as before the series, identical but ra_ip64_md5 1 and ra720_pj17 4 (section 9). Inter CUs from the CPU: 18 -> 0.
+M141 (2026-10-28): OBMC of inter CUs with IBC neighbours of two vectors (default BCW, no weighted prediction):
+obmcInterIbc's strip the average of the two copies (OBMC_SEG_IBC2, OBMC_SEG_MV2; the segment record 8 words),
+skipObmcConditionByPixel per vector. No such CU in the 27 streams: the second copy is not exercised yet. Results (27
+streams, grn154 / grn153 with ECM_GPU_FULL_PIPELINE): as before the series, identical but ra_ip64_md5 1 and ra720_pj17
+4 (section 9).
 Tried after M125 and left out (idle 3070, median of 5 or 7): the CCP merge history's and list's records read ahead in
 parallel with signatures (neutral); IntraTMP's refinement ranks counting only the windows that overlap no other
 (+3 % aiodd: the weaker filter sends more positions to the walk) or comparing only positions of overlapping windows
