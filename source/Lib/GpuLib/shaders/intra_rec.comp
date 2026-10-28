@@ -488,6 +488,7 @@ int asPel( int v )   // the int16 Pel the CPU stores
 
 // LMCS: the forward and inverse luma mappings (Reshape's LUTs)
 int fwdLut( int v ) { return BufI32( P.lmcs ).v[v]; }
+int invLut( int v ) { return BufI32( P.lmcs ).v[P.lmcsLutSize + v]; }
 
 // CIIP (IntraPrediction::geneWeightedPred): sample (x, y) of block t's intra prediction `intra` blended with its inter
 // one (Params::interPred, after OBMC; with CIIP_FWD forward-mapped by LMCS): uniformly by the neighbours' weights, or
@@ -499,6 +500,8 @@ int ciipBlendAt( Tu t, int x, int y, int cx, int cy, int cw, int ch, int intra )
   inter     = ( t.ciip & CIIP_FWD ) != 0 ? fwdLut( inter ) : inter;
   if( ( t.ciip & CIIP_GPM ) != 0 )   // (GPM with an intra part: weightedGeoBlkRounded, part 0's weights)
   {
+    const bool orig = ( t.ciip & CIIP_ORIG ) != 0;
+    intra           = orig ? invLut( intra ) : intra;
     const int w = BufI32( P.timdData ).v[t.gpm - 1 + GPMR_W + y * t.w + x];
     const int a = ( t.ciip & CIIP_GPM_I1 ) != 0 ? inter : intra, b = ( t.ciip & CIIP_GPM_I1 ) != 0 ? intra : inter;
     return ( w * a + ( 32 - w ) * b + 16 ) >> 5;
@@ -534,8 +537,6 @@ void ciipSplitBlend( Tu t, int lid, int NT )
   }
   controlBarrier( gl_ScopeWorkgroup, gl_ScopeWorkgroup, gl_StorageSemanticsBuffer, gl_SemanticsAcquireRelease );
 }
-
-int invLut( int v ) { return BufI32( P.lmcs ).v[P.lmcsLutSize + v]; }
 
 // Reshape::scalePel: the residual scaled by scale / 2^11 (CSCALE_FP_PREC), magnitude rounded; scale is an int16_t there
 int scalePel( int val, int scale, int maxVal )
@@ -625,6 +626,9 @@ void storeRecon( Tu t, int x, int y, int pr )
   if( t.ciip != 0 )   // (CIIP: the inter prediction blended in first)
   {
     pr = ciipBlend( t, x, y, pr );
+    // (regression-based GPM's blend in the original domain, CIIP_ORIG: forward-mapped as an inter CU's prediction, at
+    // a deferred block after the DIMD of the unmapped blend - xDecodeInterTexture's deriveIpmForTransform)
+    pr = ( t.ciip & CIIP_ORIG ) != 0 && !g_deferRecon ? fwdLut( pr ) : pr;
     if( ( t.ciip & ( CIIP_TO_PRED | CIIP_KEEP_PRED ) ) != 0 )   // (the blend kept for an inter CCCM / CCP merge blend)
     {
       const bool pre = ( t.ciip & CIIP_TO_PRED ) != 0;
@@ -3680,6 +3684,14 @@ void main()
         }
       }
       g_deferRecon = false;
+      if( ( t.ciip & CIIP_ORIG ) != 0 )   // (regression-based GPM's blend, forward-mapped after its DIMD: storeRecon)
+      {
+        for( int i = lid; i < N; i += NT )
+        {
+          s_spPred[i] = int16_t( fwdLut( int( s_spPred[i] ) ) );
+        }
+        SYNC();
+      }
       t.ciip       = 0;   // (a CIIP block's kept prediction is the blended one)
       for( int i = lid; i < N && t.spCoded < 0; i += NT )
       {

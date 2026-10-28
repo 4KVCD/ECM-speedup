@@ -12295,13 +12295,17 @@ void InterPrediction::motionCompensationGeoBlend( CodingUnit& cu, MergeCtx& geoM
       pu.gpmIntraFlag = true;
       pcIntraPred->initIntraPatternChType(cu, pu.Y());
       pcIntraPred->predIntraAng(COMPONENT_Y, tmpGeoBuf0.Y(), pu);
+      pcIntraPred->gpmSnapshotSave( COMPONENT_Y );
+      m_gpuGeoPart[0][24] = pu.intraDir[0] + 1;
       if (isChromaEnabled(pu.chromaFormat))
       {
         pu.intraDir[1] = pu.intraDir[0];
         pcIntraPred->initIntraPatternChType(cu, pu.Cb());
         pcIntraPred->predIntraAng(COMPONENT_Cb, tmpGeoBuf0.Cb(), pu);
+        pcIntraPred->gpmSnapshotSave( COMPONENT_Cb );
         pcIntraPred->initIntraPatternChType(cu, pu.Cr());
         pcIntraPred->predIntraAng(COMPONENT_Cr, tmpGeoBuf0.Cr(), pu);
+        pcIntraPred->gpmSnapshotSave( COMPONENT_Cr );
       }
       pu.gpmIntraFlag = false;
 #if JVET_AM0215_REG_GPM_INTRA_INTER_MODIFY
@@ -12397,11 +12401,13 @@ void InterPrediction::motionCompensationGeoBlend( CodingUnit& cu, MergeCtx& geoM
         PU::spanMotionInfo(pu);
 #endif
         cu.isobmcMC = true;
+        gpuGeoObmc( 0, pu );
 #if JVET_AJ0161_OBMC_EXT_WITH_INTRA_PRED
         subBlockOBMC(pu, &tmpGeoBuf0, pcIntraPred);
 #else
         subBlockOBMC(pu, &tmpGeoBuf0);
 #endif
+        gpuGeoSub( 0 );
         cu.isobmcMC = false;
 #if !JVET_AM0215_REG_GPM_INTRA_INTER_MODIFY
         if (reshapeLUT)
@@ -12420,13 +12426,17 @@ void InterPrediction::motionCompensationGeoBlend( CodingUnit& cu, MergeCtx& geoM
       pu.gpmIntraFlag = true;
       pcIntraPred->initIntraPatternChType(cu, pu.Y());
       pcIntraPred->predIntraAng(COMPONENT_Y, tmpGeoBuf1.Y(), pu);
+      pcIntraPred->gpmSnapshotSave( COMPONENT_Y );
+      m_gpuGeoPart[1][24] = pu.intraDir[0] + 1;
       if (isChromaEnabled(pu.chromaFormat))
       {
         pu.intraDir[1] = pu.intraDir[0];
         pcIntraPred->initIntraPatternChType(cu, pu.Cb());
         pcIntraPred->predIntraAng(COMPONENT_Cb, tmpGeoBuf1.Cb(), pu);
+        pcIntraPred->gpmSnapshotSave( COMPONENT_Cb );
         pcIntraPred->initIntraPatternChType(cu, pu.Cr());
         pcIntraPred->predIntraAng(COMPONENT_Cr, tmpGeoBuf1.Cr(), pu);
+        pcIntraPred->gpmSnapshotSave( COMPONENT_Cr );
       }
       pu.gpmIntraFlag = false;
 #if JVET_AM0215_REG_GPM_INTRA_INTER_MODIFY
@@ -12520,11 +12530,13 @@ void InterPrediction::motionCompensationGeoBlend( CodingUnit& cu, MergeCtx& geoM
         PU::spanMotionInfo(pu);
 #endif
         cu.isobmcMC = true;
+        gpuGeoObmc( 1, pu );
 #if JVET_AJ0161_OBMC_EXT_WITH_INTRA_PRED
         subBlockOBMC(pu, &tmpGeoBuf1, pcIntraPred);
 #else
         subBlockOBMC(pu, &tmpGeoBuf1);
 #endif
+        gpuGeoSub( 1 );
         cu.isobmcMC = false;
 #if !JVET_AM0215_REG_GPM_INTRA_INTER_MODIFY
         if (reshapeLUT)

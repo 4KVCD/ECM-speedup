@@ -1918,7 +1918,8 @@ public:
   }
   // ... motionCompensationGeoBlend's (JVET-AG0112) blend: its kind (1, | 2 with an intra part, | 4 with TM), the CU's
   // blend model as weightedBlend takes it (params, shift, offset, min, max); the plain blend (at the intermediate
-  // precision) or the separate OBMC one (weightedBlend's roundOutputBD off) where both parts are inter
+  // precision) or the separate OBMC one (weightedBlend's roundOutputBD off) where both parts are inter, else
+  // (JVET-AK0101) the blend of an intra part, rounded as GPM's with one (the intra part's mode in its m_gpuGeoPart)
   void    gpuGeoBlend( const PredictionUnit& pu )
   {
     const AffineBlendingModel& b = pu.cu->blendModel;
@@ -1927,6 +1928,7 @@ public:
     std::copy( v, v + 8, m_gpuGeoBlend );
     m_gpuGeoPlain = !pu.geoBlendIntraFlag && !pu.cu->slice->getCheckUseSepOBMC();
     m_gpuGeoSep   = !pu.geoBlendIntraFlag && pu.cu->slice->getCheckUseSepOBMC();
+    m_gpuGeoIntra = pu.geoBlendIntraFlag;
     m_gpuGeoSplit = m_gpuGeoBld = 0;
   }
 #if JVET_AA0093_REFINED_MOTION_FOR_ARMC

@@ -1018,6 +1018,8 @@ constexpr int CIIP_TO_PRED = 256, CIIP_KEEP_PRED = 512;
 // (a CIIP CU of several TUs: CIIP_PRE_INTRA its pre-pass of the CU's area, which keeps its intra prediction in its own
 // place; CIIP_SPLIT a TU block, which blends that in by the CU's weights; ciipSplitPrePass)
 constexpr int CIIP_PRE_INTRA = 1024, CIIP_SPLIT = 2048;
+// (CIIP_GPM of regression-based blending with LMCS: the blend in the original domain, JVET-AM0215's)
+constexpr int CIIP_ORIG = 4096;
 constexpr int MC_GPM_INTRA = 16384, MC_GPM_I1 = 32768, MC_GPM_FIN = 65536, MC_GPM_RBD = 131072;
 constexpr int OBMC_P1 = 64;   // (OBMC_J_FLAGS: a GPM CU's part 1 - its prediction for skipObmcConditionByPixel)
 
@@ -8233,6 +8235,17 @@ static void affineRecord( GpuIntraRec::Impl& m, const CodingUnit& cu )
 
 static bool isAsbt( const TransformUnit& tu, const ComponentID compID );
 
+// whether GPM PU pu has an intra part: GPM-intra's (M115) or regression-based blending's (JVET-AK0101), whose intra
+// prediction the GPU makes as CIIP's
+static bool gpmIntraPart( const PredictionUnit& pu )
+{
+#if JVET_AK0101_REGRESSION_GPM_INTRA
+  return pu.gpmIntraFlag || pu.geoBlendIntraFlag;
+#else
+  return pu.gpmIntraFlag;
+#endif
+}
+
 // why the GPU does not predict CIIP CU cu (nullptr: it does, where its inter prediction's kind allows)
 static const char* ciipWhy( const CodingUnit& cu )
 {
@@ -8385,20 +8398,30 @@ static const char* gpmWhy( const GpuIntraRec::Impl& m, const CodingUnit& cu )
     {
       return "unrecorded";
     }
-    if( b[0] & 2 )   // (JVET-AK0101: one part intra, getGeoBlendIntraCand)
-    {
-      return "an intra part";
-    }
     if( b[6] < 0 || b[6] > b[7] || b[7] > 32 )   // (weightedBlendBlk's clip, which the geo blends do not have)
     {
       return "weights beyond 0 .. 32";
+    }
+    // (JVET-AK0101: one part intra, getGeoBlendIntraCand's. Its blend is in the original domain, its prediction
+    // forward-mapped as an inter CU's, where inter CCCM's and CCP merge's luma CIIP_KEEP_PRED keeps the blend unmapped)
+    bool blend = false;
+    for( const TransformUnit& tu: CU::traverseTUs( cu ) )
+    {
+      blend = blend || isInterCcp( tu );
+#if JVET_AE0059_INTER_CCCM
+      blend = blend || tu.interCccm;
+#endif
+    }
+    if( ( b[0] & 2 ) && blend )
+    {
+      return "an intra part with inter CCCM or CCP merge";
     }
   }
 #endif
 #if JVET_Y0065_GPM_INTRA
   // (an intra part, M115: as CIIP's intra prediction - ciipWhy's limits -; the inter part's LIC is its record's, the
   // CU's flag the last part's)
-  if( pu.gpmIntraFlag )
+  if( gpmIntraPart( pu ) )
   {
     // (JVET-AN0093's parts of SGPM's list too: the part's mode comes in its record, InterPrediction::m_gpuGeoPart)
     const char* const why = ciipWhy( cu );
@@ -8436,7 +8459,8 @@ static const char* gpmWhy( const GpuIntraRec::Impl& m, const CodingUnit& cu )
 #else
   const bool affinePart = false;
 #endif
-  if( g == m.gpmInfo.end() || g->second[0] != ( pu.gpmIntraFlag ? 3 : slice.getCheckUseSepOBMC() || affinePart ? 2 : 1 ) )
+  const int kind = gpmIntraPart( pu ) ? 3 : slice.getCheckUseSepOBMC() || affinePart ? 2 : 1;
+  if( g == m.gpmInfo.end() || g->second[0] != kind )
   {
     return "not the plain blend";
   }
@@ -8475,7 +8499,7 @@ static const char* gpmWhy( const GpuIntraRec::Impl& m, const CodingUnit& cu )
       }
     }
   }
-  return slice.getCheckUseSepOBMC() || pu.gpmIntraFlag || affinePart ? gpmSepPlan( m, cu, nullptr ) : nullptr;
+  return slice.getCheckUseSepOBMC() || gpmIntraPart( pu ) || affinePart ? gpmSepPlan( m, cu, nullptr ) : nullptr;
 }
 
 // the weights of part 0 (of 32) over component compID of GPM PU pu, xWeightedGeoBlk's walk, appended to out
@@ -9892,7 +9916,7 @@ static bool recordInterBlock( GpuIntraRec::Impl& m, const TransformUnit& tu, con
         }
       }
       j[MC_BDOF_OUT] = rec->second;
-      if( pu.gpmIntraFlag )   // (an intra part, M115: the inter part's prediction; intra_rec's CIIP_GPM the rest)
+      if( gpmIntraPart( pu ) )   // (an intra part, M115: the inter part's prediction; intra_rec's CIIP_GPM the rest)
       {
         const int kIntra = g[3 + GPM_INTRA] ? 0 : 1;
         j[MC_FLAGS] |= MC_GPM_INTRA | ( kIntra == 0 ? MC_GPM_I1 : 0 ) | ( slice.getCheckUseSepOBMC() ? MC_GPM_FIN : 0 );
@@ -9907,7 +9931,10 @@ static bool recordInterBlock( GpuIntraRec::Impl& m, const TransformUnit& tu, con
           }
         }
         ciipFields( m, cu, compID, area, t, g[3 + GPM_PART * kIntra + GPM_INTRA] - 1 );
-        t.ciip = CIIP_ON | CIIP_GPM | ( kIntra == 1 ? CIIP_GPM_I1 : 0 ) | ( t.ciip & CIIP_FWD );
+        // (LMCS: GPM-intra blends in the mapped domain, the inter part forward-mapped; regression-based blending,
+        // JVET-AM0215, in the original one, the intra part inverse-mapped, the blend then forward-mapped)
+        const int lmcs = ( t.ciip & CIIP_FWD ) == 0 ? 0 : pu.gpmIntraFlag ? CIIP_FWD : CIIP_ORIG;
+        t.ciip         = CIIP_ON | CIIP_GPM | ( kIntra == 1 ? CIIP_GPM_I1 : 0 ) | lmcs;
       }
       else if( g[0] == 2 )   // (the rounded blend after each part's OBMC: part 1's final prediction, Tu::gpm's record;
       {                      // without separate OBMC - an affine part, M117 - by roundBD of the intermediates)
@@ -10155,7 +10182,7 @@ static bool ciipBeneathChromaBlend( const GpuIntraRec::Impl& m, const TransformU
 #if JVET_AE0059_INTER_CCCM
   blend = blend || tu.interCccm;
 #endif
-  return blend && ( pu.ciipFlag || pu.gpmIntraFlag ) && m.mcCus.count( &cu ) && !CU::isIBC( cu );
+  return blend && ( pu.ciipFlag || gpmIntraPart( pu ) ) && m.mcCus.count( &cu ) && !CU::isIBC( cu );
 }
 
 // the pre-pass of the chroma blocks of CIIP TU tu (ciipBeneathChromaBlend): their records as CIIP blocks (pre[0] Cb's,
@@ -10261,7 +10288,7 @@ void GpuIntraRec::recordInterCu( const CodingUnit& cu )
   bool                 inner  = false;
   const bool           geoSep = cu.geoFlag && cu.slice->getCheckUseSepOBMC();
   // (GPM with an intra part, M115: its inter part's OBMC, with that part's motion; kInter the inter part)
-  const bool           geoIntra = cu.geoFlag && cu.firstPU->gpmIntraFlag;
+  const bool           geoIntra = cu.geoFlag && gpmIntraPart( *cu.firstPU );
 #if JVET_AG0164_AFFINE_GPM
   const bool           geoAff   = cu.geoFlag && ( cu.firstPU->affineGPM[0] || cu.firstPU->affineGPM[1] );   // (M117)
 #else
@@ -10352,7 +10379,7 @@ void GpuIntraRec::recordInterCu( const CodingUnit& cu )
   // (CIIP or GPM with an intra part of several TUs: the CU's intra prediction by a pre-pass per component, which its TU
   // blocks blend in)
   int32_t splitPre[MAX_NUM_COMPONENT] = { -1, -1, -1 };
-  if( ( cu.firstPU->ciipFlag || cu.firstPU->gpmIntraFlag ) && cu.firstTU != cu.lastTU && m.mcCus.count( &cu )
+  if( ( cu.firstPU->ciipFlag || gpmIntraPart( *cu.firstPU ) ) && cu.firstTU != cu.lastTU && m.mcCus.count( &cu )
       && !CU::isIBC( cu ) && !m.cpuCus.count( &cu ) && !ibcLate )
   {
     const char* why = ciipSplitPrePass( m, cu, splitPre );

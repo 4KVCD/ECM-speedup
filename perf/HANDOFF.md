@@ -3220,6 +3220,16 @@ BCW's index), which now takes the CU's second vector too (IBC_REC_OWN_MV2, obmcP
 vector, a value no neighbour has where the CU's BCW is not the default). ibcWhy's composite bi-prediction reason is
 split. Results (grn123, the streams with such CUs): fp720_ai and pj720_ai identical; their intra CUs from the CPU 279
 -> 171 ("IBC bi-prediction with OBMC" 109 -> 0, one of them now "above 1024 samples").
+M138 (2026-10-28): regression-based GPM blending with an intra part (JVET-AK0101) on M115's GPM-intra path: the inter
+part's prediction with its OBMC, the intra part as CIIP's intra prediction with the CPU's mode, blended by the
+regression model's weights (gpmBlendWeights; weightedBlend with roundOutputBD off rounds as weightedGeoBlkRounded).
+JVET-AM0215's LMCS order: the blend in the original domain (the intra part inverse-mapped: CIIP_ORIG), forward-mapped
+as an inter CU's prediction at the reconstruction, a deferred block's after its DIMD of the unmapped blend
+(xDecodeInterTexture's deriveIpmForTransform reads the prediction before xDecodeInterTU maps it).
+motionCompensationGeoBlend records the intra part's mode and parameters and the inter part's OBMC motion as
+motionCompensationGeo does; gpmIntraPart() names both kinds. Not with inter CCCM / CCP merge. Results (27 streams,
+grn154 / grn153 with ECM_GPU_FULL_PIPELINE): as before the series, identical but ra_ip64_md5 1 and ra720_pj17 4
+(section 9). Inter CUs from the CPU: GPM (regression-based blending: an intra part) 60 -> 0.
 Tried after M125 and left out (idle 3070, median of 5 or 7): the CCP merge history's and list's records read ahead in
 parallel with signatures (neutral); IntraTMP's refinement ranks counting only the windows that overlap no other
 (+3 % aiodd: the weaker filter sends more positions to the walk) or comparing only positions of overlapping windows
