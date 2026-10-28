@@ -3315,6 +3315,10 @@ outputs (and the GPU wrote past them): entries now go in on success, the CPU's o
 streams, grn170 with ECM_GPU_FULL_PIPELINE, M152 to M154): every picture identical. Intra CUs from the CPU: an inter
 OBIC neighbour 16 -> 0 (14 of them now under their other neighbours' reasons: IntraTMP / MIP / EIP neighbours in inter
 slices).
+M154 (2026-10-29): inter CCCM with luma ASBT: the inter CCCM record lists the TU's luma records (one, or ASBT's
+parts), icccmLuma reads from the part holding a sample; chroma ASBT stays on the CPU. Results (27 streams, grn170 with
+ECM_GPU_FULL_PIPELINE, M152 to M154): every picture identical. Intra CUs from the CPU: inter CCCM with ASBT 14 -> 0;
+with M152 to M154 113 -> 86.
 Tried after M125 and left out (idle 3070, median of 5 or 7): the CCP merge history's and list's records read ahead in
 parallel with signatures (neutral); IntraTMP's refinement ranks counting only the windows that overlap no other
 (+3 % aiodd: the weaker filter sends more positions to the walk) or comparing only positions of overlapping windows

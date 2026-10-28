@@ -201,16 +201,18 @@ constexpr int IBC_REC_BI = 14, IBC_REC_OWN_MV2 = 15, IBC_REC = 17;
 constexpr int IBC_OWN_MV2_NONE = 0x7FFFFFFF, IBC_OWN_MV2_NEVER = 0x7FFFFFFE;
 // with DERIVE_INTER a chroma block of inter CCCM (JVET-AE0059): its prediction blended with the CCCM one of a model its
 // TU's luma and chroma predictions fit (intra_intercccm.glsl); its record in Params::timdData at Tu::ibc: the luma
-// block's position and size, its prediction's offset in Params::interPred, whether that is forward-mapped by LMCS, the
-// SPS's collocated chroma (CclmCollocatedChromaFlag: five luma taps, else six)
+// block's position and size, whether its prediction is forward-mapped by LMCS, the SPS's collocated chroma
+// (CclmCollocatedChromaFlag: five luma taps, else six), then the luma records holding its prediction - one, or with
+// ASBT the parts around its sub-block and the sub-block - their number, then per record (ICCCM_PART words) its
+// position, size and prediction's offset in Params::interPred
 constexpr int DERIVE_INTER_CCCM = INT32_MIN;
 // without DERIVE_INTER the same bit marks an inter CU's chroma block of inter CCP merge (JVET-AF0073), predicted on the
 // intra path as a CCP merge block whose prediction storeRegion blends with the inter one; its record at Tu::ibc: the
 // CCP prediction's weight (of 4), the record of its on-the-fly CCCM candidate (else -1)
 constexpr int DERIVE_INTER_BLEND = DERIVE_INTER_CCCM;
 constexpr int ICCP_REC_W = 0, ICCP_REC_FLY = 1, ICCP_REC = 2;
-constexpr int ICCCM_REC_X = 0, ICCCM_REC_Y = 1, ICCCM_REC_W = 2, ICCCM_REC_H = 3, ICCCM_REC_PRED = 4,
-              ICCCM_REC_FWD = 5, ICCCM_REC_COLLOC = 6, ICCCM_REC = 7;
+constexpr int ICCCM_REC_X = 0, ICCCM_REC_Y = 1, ICCCM_REC_W = 2, ICCCM_REC_H = 3, ICCCM_REC_FWD = 4,
+              ICCCM_REC_COLLOC = 5, ICCCM_REC_PARTS = 6, ICCCM_REC_PART = 7, ICCCM_PART = 5;
 
 // Tu::lm (intra_common.glsl's LM_*): whether the block is a CCLM block (the modes from 67 on are also those of TIMD /
 // TMRL luma blocks), its slope adjustments (+ 8, in 4 bits each) and LBCCP's inside filter; with DERIVE_CCLM_DIMD the
@@ -7864,9 +7866,12 @@ static const char* interCccmWhy( const CodingUnit& cu, const TransformUnit& tu )
     return "inter CCCM of an IBC CU";
   }
 #if JVET_AL0181_ASBT
-  if( tu.asbtDecimW[COMPONENT_Y] || tu.asbtDecimH[COMPONENT_Y] )   // (its luma prediction in several records)
+  // (ASBT of its luma splits the luma prediction into the records of its parts, which interCccmRecord lists; of its
+  // chroma it would split the block itself)
+  if( tu.asbtDecimW[COMPONENT_Cb] || tu.asbtDecimH[COMPONENT_Cb] || tu.asbtDecimW[COMPONENT_Cr]
+      || tu.asbtDecimH[COMPONENT_Cr] )
   {
-    return "inter CCCM with ASBT";
+    return "inter CCCM with chroma ASBT";
   }
 #endif
   return nullptr;
@@ -7883,14 +7888,33 @@ static void interCccmRecord( GpuIntraRec::Impl& m, const TransformUnit& tu, cons
   CHECK( pred == m.interChromaPreds.end(), "an inter CCCM TU without its prediction" );
   const size_t first = compID == COMPONENT_Cb ? 0 : tu.blocks[COMPONENT_Cb].area();
   std::copy_n( pred->second.begin() + first, area.area(), m.interPred.begin() + t.dbgOffset );
-  const Tu* luma = nullptr;   // (the TU's luma record, before its chroma ones)
-  for( size_t r = m.rec.size() - 1; r-- > 0 && !luma; )
+  // the TU's luma records, before its chroma ones: the block's, or with ASBT its parts (recordAsbtBlock's) tiling it
+  const CompArea&        la = tu.blocks[COMPONENT_Y];
+  std::vector<const Tu*> parts;
+  for( size_t r = m.rec.size() - 1; r-- > 0; )
   {
     const Tu& l = m.rec[r];
-    luma = l.comp == COMPONENT_Y && l.x == tu.blocks[COMPONENT_Y].x && l.y == tu.blocks[COMPONENT_Y].y ? &l : nullptr;
+    if( ( l.derive & DERIVE_NODE ) && !( l.derive & DERIVE_CPU_FILL ) )   // (a record of no samples)
+    {
+      continue;
+    }
+    const bool part = l.comp == COMPONENT_Y && l.x >= la.x && l.y >= la.y && l.x + l.w <= (int) ( la.x + la.width )
+                      && l.y + l.h <= (int) ( la.y + la.height );
+    if( part )
+    {
+      parts.push_back( &l );
+    }
+    else if( !parts.empty() || l.comp == COMPONENT_Y )
+    {
+      break;
+    }
   }
-  CHECK( !luma || luma->w != (int) tu.blocks[COMPONENT_Y].width || luma->h != (int) tu.blocks[COMPONENT_Y].height,
-         "an inter CCCM TU without its luma record" );
+  int covered = 0;
+  for( const Tu* p: parts )
+  {
+    covered += p->w * p->h;
+  }
+  CHECK( parts.empty() || parts.size() > 3 || covered != (int) la.area(), "an inter CCCM TU without its luma records" );
   t.derive |= DERIVE_INTER_CCCM | DERIVE_PREFIX;
   t.ibc = (int32_t) m.timdData.size();
 #if JVET_AN0090_ADAPTIVE_SUBSAMPLING_FILTER_SELECTION
@@ -7898,9 +7922,13 @@ static void interCccmRecord( GpuIntraRec::Impl& m, const TransformUnit& tu, cons
 #else
   const bool colloc = tu.cs->sps->getCclmCollocatedChromaFlag();
 #endif
-  const int32_t rec[ICCCM_REC] = { luma->x, luma->y, luma->w, luma->h, luma->dbgOffset,
-                                   ( luma->lmcs & LMCS_INTER_FWD ) ? 1 : 0, colloc ? 1 : 0 };
-  m.timdData.insert( m.timdData.end(), rec, rec + ICCCM_REC );
+  m.timdData.insert( m.timdData.end(), { (int32_t) la.x, (int32_t) la.y, (int32_t) la.width, (int32_t) la.height,
+                                         ( parts[0]->lmcs & LMCS_INTER_FWD ) ? 1 : 0, colloc ? 1 : 0,
+                                         (int32_t) parts.size() } );
+  for( const Tu* p: parts )
+  {
+    m.timdData.insert( m.timdData.end(), { p->x, p->y, p->w, p->h, p->dbgOffset } );
+  }
 }
 
 void GpuIntraRec::interChromaPred( const TransformUnit& tu )

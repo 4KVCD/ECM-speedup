@@ -10,8 +10,8 @@
 #ifndef INTRA_INTERCCCM_GLSL
 #define INTRA_INTERCCCM_GLSL
 
-const int ICCCM_REC_X = 0, ICCCM_REC_Y = 1, ICCCM_REC_W = 2, ICCCM_REC_H = 3, ICCCM_REC_PRED = 4, ICCCM_REC_FWD = 5;
-const int ICCCM_REC_COLLOC = 6;
+const int ICCCM_REC_X = 0, ICCCM_REC_Y = 1, ICCCM_REC_W = 2, ICCCM_REC_H = 3, ICCCM_REC_FWD = 4;
+const int ICCCM_REC_COLLOC = 5, ICCCM_REC_PARTS = 6, ICCCM_REC_PART = 7, ICCCM_PART = 5;
 const int ICCCM_PARAMS = 8;   // INTER_CCCM_NUM_PARAMS
 
 // deriveInterCccmPrediction's subsampling of the training grid by log2 of the chroma width - 1 and height - 1
@@ -22,16 +22,29 @@ const int ICCCM_SUB_Y[49] = int[49]( 1, 1, 1, 1, 1, 1, 1,  1, 1, 1, 1, 1, 1, 1, 
                                      1, 1, 1, 1, 1, 1, 1,  1, 1, 1, 2, 2, 2, 2,  1, 1, 2, 4, 4, 4, 4,
                                      1, 2, 4, 8, 8, 8, 8 );
 
-// the TU's luma at (x, y) of its block: its prediction (forward-mapped where xDecodeInterTU maps it) or reconstruction
+// whether the luma record of the part at `at` (x, y, w, h, its prediction's offset) holds picture sample (px, py)
+bool icccmInPart( BufI32 d, int at, int px, int py )
+{
+  return px >= d.v[at] && px < d.v[at] + d.v[at + 2] && py >= d.v[at + 1] && py < d.v[at + 1] + d.v[at + 3];
+}
+
+// the TU's luma at (x, y) of its block: its prediction (forward-mapped where xDecodeInterTU maps it) - from the luma
+// record holding it, one or ASBT's parts - or reconstruction
 int icccmLuma( int r, bool pred, int x, int y )
 {
-  BufI32 d = BufI32( P.timdData );
+  BufI32    d  = BufI32( P.timdData );
+  const int px = d.v[r + ICCCM_REC_X] + x, py = d.v[r + ICCCM_REC_Y] + y;
   if( pred )
   {
-    const int p = int( BufI16( P.interPred ).v[d.v[r + ICCCM_REC_PRED] + y * d.v[r + ICCCM_REC_W] + x] );
+    int at = r + ICCCM_REC_PART;
+    for( int k = 1; k < d.v[r + ICCCM_REC_PARTS] && !icccmInPart( d, at, px, py ); k++ )
+    {
+      at += ICCCM_PART;
+    }
+    const int p = int( BufI16( P.interPred ).v[d.v[at + 4] + ( py - d.v[at + 1] ) * d.v[at + 2] + px - d.v[at]] );
     return d.v[r + ICCCM_REC_FWD] != 0 ? fwdLut( p ) : p;
   }
-  return recoAt( 0, d.v[r + ICCCM_REC_X] + x, d.v[r + ICCCM_REC_Y] + y );
+  return recoAt( 0, px, py );
 }
 
 // feature f of chroma sample (x, y) (getNonDownSampledLumaValsOffset, as the vector's order takes them: s0, s3, s1,
