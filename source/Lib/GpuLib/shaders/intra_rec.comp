@@ -526,13 +526,14 @@ int ciipBlendAt( Tu t, int x, int y, int cx, int cy, int cw, int ch, int intra )
 int ciipBlend( Tu t, int x, int y, int intra ) { return ciipBlendAt( t, x, y, x, y, t.w, t.h, intra ); }
 
 // a CIIP_SPLIT block's inter prediction (after OBMC's band) blended in place with its CU's intra prediction, which the
-// CU's pre-pass left at Tu::ibc (all invocations, ending with a barrier)
+// CU's pre-pass (record Tu::ispPrev) left at its own samples (all invocations, ending with a barrier)
 void ciipSplitBlend( Tu t, int lid, int NT )
 {
+  const int intraAt = BufTu( P.tus ).v[t.ispPrev].dbgOffset;
   for( int i = lid; i < t.w * t.h; i += NT )
   {
     const int x = i % t.w, y = i / t.w, cx = t.x - t.cuX + x, cy = t.y - t.cuY + y;
-    const int intra = int( CBufI16( P.interPred ).v[t.ibc + cy * t.cuW + cx] );
+    const int intra = int( CBufI16( P.interPred ).v[intraAt + cy * t.cuW + cx] );
     CBufI16( P.interPred ).v[t.dbgOffset + i] = int16_t( ciipBlendAt( t, x, y, cx, cy, t.cuW, t.cuH, intra ) );
   }
   controlBarrier( gl_ScopeWorkgroup, gl_ScopeWorkgroup, gl_StorageSemanticsBuffer, gl_SemanticsAcquireRelease );
@@ -2591,6 +2592,11 @@ void main()
     {
       crsSetup( t, lid, NT );
       interObmcBand( t, lid, NT );   // (OBMC before the blend, as the CPU's motion compensation)
+      if( ( t.ciip & CIIP_SPLIT ) != 0 )   // (CIIP of a CU of several TUs: its blend is the inter prediction)
+      {
+        ciipSplitBlend( t, lid, NT );
+        t.ciip = 0;
+      }
       interCccmBlock( t, lid, NT );
       if( t.spCoded >= 0 )
       {
@@ -2656,6 +2662,11 @@ void main()
     if( WITH_CCP_MERGE && ( t.derive & DERIVE_INTER_BLEND ) != 0 )
     {
       interObmcBand( t, lid, NT );
+      if( ( t.ciip & CIIP_SPLIT ) != 0 )   // (CIIP of a CU of several TUs: its blend is the inter prediction)
+      {
+        ciipSplitBlend( t, lid, NT );
+        t.ciip = 0;
+      }
     }
     // ----- a block of a CU whose mode its node derived: the parameters for the mode
     if( ( t.derive & DERIVE_MODE ) != 0 )

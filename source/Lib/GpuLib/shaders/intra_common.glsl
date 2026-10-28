@@ -81,8 +81,7 @@ struct Tu
   int pdp;
   // a block of NN intra prediction (intra_nn.glsl): its record in Params::timdData (PNN_REC_*; -1: none)
   int pnn;
-  // an IBC CU's block (DERIVE_IBC): its record in Params::timdData (IBC_REC_*; read with DERIVE_IBC only); a
-  // CIIP_SPLIT block: its CU's intra prediction in Params::interPred
+  // an IBC CU's block (DERIVE_IBC): its record in Params::timdData (IBC_REC_*; read with DERIVE_IBC only)
   int ibc;
   // an OBMC CU's block on the CU's top or left band: its CU's OBMC record in Params::timdData + 1 (intra_rec's
   // OBMC_REC_*; 0: none)
@@ -339,8 +338,9 @@ const int CIIP_FWD = 32;
 const int CIIP_TO_PRED = 256, CIIP_KEEP_PRED = 512;
 // (a CU of several TUs, whose intra prediction the CPU makes once for the CU: CIIP_PRE_INTRA its pre-pass of the CU's
 // area, which keeps the intra prediction in its own place in Params::interPred, nothing reconstructed; CIIP_SPLIT a TU
-// block of it, which blends that - at Tu::ibc, rows of Tu::cuW, the block at its offset in the CU, Tu::cuX / cuY - into
-// its inter prediction by the CU's weights, then reconstructs as an inter block)
+// block of it, which blends that - at the pre-pass's (Tu::ispPrev) dbgOffset, rows of Tu::cuW, the block at its offset
+// in the CU, Tu::cuX / cuY - into its inter prediction by the CU's weights, then reconstructs as an inter block or
+// blends inter CCCM / CCP merge into it, whose records take Tu::ibc)
 const int CIIP_PRE_INTRA = 1024, CIIP_SPLIT = 2048;
 
 // a CU's block vectors as the lists of later CUs take them (Params::bvOut per luma CU, by its index in the
