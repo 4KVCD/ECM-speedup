@@ -3293,6 +3293,12 @@ Tu::derive over it until now); a joint CbCr pair whose Cr block decides the sign
 otherwise). Not with LFNST / NSPT, the inside filter, LM fusion or another CCCM kind. Results (27 streams, grn167 with
 ECM_GPU_FULL_PIPELINE, M148 to M151): every picture identical. Intra CUs from the CPU: BVG-CCCM 89 -> 8 (LFNST 6,
 joint CbCr 2).
+M150 (2026-10-28): DBV with CFLM: the template's arms are copies at the DBV block's refined vector (W x 2 two rows up,
+2 x H two columns left; the flip's rows / columns, the vector itself where the arm's is no valid vector for the Cb
+block: xCflmCreateChromaPred's DBV branch, cflmDbvArm), the block's chroma feature its flipped copy, its prediction
+flipped back before the reconstruction's flip; the host checks the CPU's arms (a PU of another CU beside the block)
+are the picture's. Results (27 streams, grn167 with ECM_GPU_FULL_PIPELINE, M148 to M151): every picture identical.
+Intra CUs from the CPU: DBV with CFLM 22 -> 0.
 Tried after M125 and left out (idle 3070, median of 5 or 7): the CCP merge history's and list's records read ahead in
 parallel with signatures (neutral); IntraTMP's refinement ranks counting only the windows that overlap no other
 (+3 % aiodd: the weaker filter sends more positions to the walk) or comparing only positions of overlapping windows

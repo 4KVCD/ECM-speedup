@@ -1599,10 +1599,40 @@ void cflmArea( Tu t, int lid )
 // template's prediction and the block's regular one
 int cflmChromaIndex( int x, int y ) { return cccmScratchPred() + y * g_cccmAreaW + x; }
 
-// sample (x, y) of block t's regular prediction (storeRegion's: after PDPC, MRL and intra fusion), kept for its models
+// sample (x, y) of block t's regular prediction (storeRegion's: after PDPC, MRL and intra fusion), kept for its models;
+// a DBV block's flipped by its CU's flip (xCflmCreateChromaPred's predChroma.flipSignal)
 void cflmStore( Tu t, int x, int y, int pr )
 {
-  WBufI32( P.scratch ).v[cflmChromaIndex( g_cccmSizeX + x, g_cccmSizeY + y )] = pr;
+  const int fx = g_recFlip == 1 ? t.w - 1 - x : x, fy = g_recFlip == 2 ? t.h - 1 - y : y;
+  WBufI32( P.scratch ).v[cflmChromaIndex( g_cccmSizeX + fx, g_cccmSizeY + fy )] = pr;
+}
+
+// sample (idx along the arm, l across it) of CFLM's template arm beside DBV block t (xCflmCreateChromaPred's DBV
+// branch, CFLM_TEMPLATE samples thick): above, the copy of W x 2 at the block's vector two rows up - with a vertical
+// flip H rows down -, where that is no valid vector for the Cb block's arm (checkIsChromaBvCandidateValidChromaTm) the
+// vector itself - with a vertical flip H - 2 rows down -; left alike by columns; each copy (getPredIBCBlk at a
+// fraction) flipped as the block
+int cflmDbvArm( Tu t, bool above, int idx, int l )
+{
+  const int   W = t.w, H = t.h, T = CFLM_TEMPLATE, flip = g_recFlip;
+  const ivec2 mv = g_dbvMv;
+  if( above )
+  {
+    ivec2 m = mv + ivec2( 0, ( flip == 2 ? H : -T ) << 5 );
+    if( !ibcChromaValid( 1, t.x, t.y, W, T, m, 0, 0, g_ti ) )
+    {
+      m = flip == 2 ? mv + ivec2( 0, ( H - T ) << 5 ) : mv;
+    }
+    return ibcChromaPredict( t.comp, t.x, t.y, W, T, m, flip == 1 ? W - 1 - idx : idx, flip == 2 ? T - 1 - l : l, g_ti,
+                             t.bitDepth, false );
+  }
+  ivec2 m = mv + ivec2( ( flip == 1 ? W : -T ) << 5, 0 );
+  if( !ibcChromaValid( 1, t.x, t.y, T, H, m, 0, 0, g_ti ) )
+  {
+    m = flip == 1 ? mv + ivec2( ( W - T ) << 5, 0 ) : mv;
+  }
+  return ibcChromaPredict( t.comp, t.x, t.y, T, H, m, flip == 1 ? T - 1 - l : l, flip == 2 ? H - 1 - idx : idx, g_ti,
+                           t.bitDepth, false );
 }
 
 // the chroma feature at (x, y) of the area: its prediction minus the chroma offset
@@ -1614,7 +1644,8 @@ int cflmChroma( int x, int y )
 // CFLM block t's prediction from its regular one in the chroma buffer (visible to the workgroup), reconstructed (all
 // invocations; cflmArea before): the template's prediction by the block's mode (xCflmCreateChromaPred: the template
 // block's reference line - xFillTimdReferenceSamples' units of the record at Tu::cflm, arms twice its sides - and
-// predTimdIntraAng with initPredIntraParams' parameters of the block: intra_timd.glsl's chroma path), the area's luma
+// predTimdIntraAng with initPredIntraParams' parameters of the block: intra_timd.glsl's chroma path; a DBV block's the
+// copies at its vector, cflmDbvArm), the area's luma
 // but the corner's (xCflmCreateLumaRef: the downsampled luma minus the luma offset; in the angular arrays where it
 // fits, which the block clears again, else in the scratch), with two models their threshold (xCflmCalcRefAver: the
 // template's luma mean by PU::getMeanValue, without a template the mid level), the models (solve1 of the luma, the
@@ -1628,7 +1659,17 @@ void cflmPrediction( Tu t, int lid, int NT )
   {
     s_red[lid] = 0;
   }
-  if( sx > 0 || sy > 0 )
+  if( g_dbv )   // (the part above the block, then the part left of it)
+  {
+    for( int i = lid; i < sy * W + H * sx; i += NT )
+    {
+      const bool above = i < sy * W;
+      const int  x = above ? sx + i % W : ( i - sy * W ) % sx, y = above ? i / W : sy + ( i - sy * W ) / sx;
+      WBufI32( P.scratch ).v[cflmChromaIndex( x, y )] = above ? cflmDbvArm( t, true, x - sx, y )
+                                                              : cflmDbvArm( t, false, y - sy, x );
+    }
+  }
+  else if( sx > 0 || sy > 0 )
   {
     const TemplateUnits u = templateUnitsAt( BufI32( P.timdData ), t.cflm );
     timdFillReference( u, BufI32( P.timdData ), t.cflm + TEMPLATE_UNITS, t.comp, t.x, t.y, W, H, CFLM_REF_SHIFT,
@@ -1681,9 +1722,11 @@ void cflmPrediction( Tu t, int lid, int NT )
     cccmAccumulate( t, k, twoModels, lid, NT );
     cccmSolve( t, k, lid );
   }
+  // (a DBV block's prediction of the flipped chroma flipped back: geneChromaFusionPred's piPred.flipSignal)
   for( int i = lid; i < W * H; i += NT )
   {
-    storeRecon( t, i % W, i / W, cccmPredict( 0, 0, sx + i % W, sy + i / W, twoModels, bitDepth ) );
+    const int x = i % W, y = i / W, fx = g_recFlip == 1 ? W - 1 - x : x, fy = g_recFlip == 2 ? H - 1 - y : y;
+    storeRecon( t, fx, fy, cccmPredict( 0, 0, sx + x, sy + y, twoModels, bitDepth ) );
   }
 }
 

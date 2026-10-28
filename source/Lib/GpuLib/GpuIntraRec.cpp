@@ -3844,7 +3844,6 @@ static bool chromaReorderCu( GpuIntraRec::Impl& m, const CodingUnit& cu, const P
   const auto      idx = m.reorderIdx.find( &pu );
   const CompArea& cb  = pu.Cb();
   const char*     why = idx == m.reorderIdx.end() ? "no parsed index"
-                        : PU::hasChromaBvFlag( pu ) && pu.isChromaFusion > 1 ? "DBV with CFLM"
                         : PU::hasChromaBvFlag( pu ) && cu.firstTU != cu.lastTU ? "DBV in a CU of several blocks"
                         : c.lumaCu < 0 ? "no luma record"
                         : cu.chromaFormat != CHROMA_420 || sps.getBitDepth( CHANNEL_TYPE_LUMA ) > 10
@@ -6424,6 +6423,18 @@ static bool coefficientFields( GpuIntraRec::Impl& m, const TransformUnit& tu, co
   return true;
 }
 
+#if JVET_AC0071_DBV
+// CFLM's template of DBV block `area`: xCflmCreateChromaPred's DBV branch copies the arm above where a PU of another CU
+// lies two rows above the block's top-right sample, the arm left where one lies two columns left of its bottom-left
+// sample; the GPU's arms are those the picture has, which this checks to be the same
+static bool cflmDbvArms( const PredictionUnit& pu, const CompArea& area )
+{
+  const PredictionUnit* above = pu.cs->getPURestricted( area.topRight().offset( 0, -2 ), pu, pu.chType );
+  const PredictionUnit* left  = pu.cs->getPURestricted( area.bottomLeft().offset( -2, 0 ), pu, pu.chType );
+  return ( area.y > 0 ) == ( above && above->cu != pu.cu ) && ( area.x > 0 ) == ( left && left->cu != pu.cu );
+}
+#endif
+
 void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, const IntraPrediction::IpaSnapshot& ipaIn,
                           const QpParam& qp, const CPelBuf* pred, const CPelBuf* resi )
 {
@@ -6525,16 +6536,17 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
 #if JVET_AC0071_DBV
   // DBV (JVET-AC0071, the parsed DBV_CHROMA_IDX): of a single tree (predIntraDbv's first branch) the copy at the vector
   // of the CU's own luma (an IntraTMP, BVG-DIMD or EIP-with-vector CU, its node's: CU_CHROMA_DBV), planar where it has
-  // none; its CU one chroma block (predIntraDbv copies at the PU's position), 4:2:0, without CFLM (geneChromaFusionPred
-  // after it, whose template DBV would predict too; its first type's CCCM blend applies to the copy as to any
-  // prediction: storeRegion), IBC's LIC or an RR-IBC flip. A dual tree's: chroma reordering's (CU_CHROMA_REORDER: its
-  // node takes deriveChromaBv's vectors, refineChromaBv's template matching, the flip), without CFLM; an
-  // adaptive dual tree's separate tree's is not on the GPU
+  // none; its CU one chroma block (predIntraDbv copies at the PU's position), 4:2:0, without IBC's LIC or an RR-IBC
+  // flip. A dual tree's: chroma reordering's (CU_CHROMA_REORDER: its node takes deriveChromaBv's vectors,
+  // refineChromaBv's template matching, the flip); an adaptive dual tree's separate tree's is not on the GPU. Its first
+  // type of LM chroma fusion blends CCCM into the copy as into any prediction (storeRegion); CFLM's template is copies
+  // at the vector too (xCflmCreateChromaPred's DBV branch: intra_cccm.glsl's cflmDbvArm), of the arms with a PU of
+  // another CU beside them, which the GPU takes to be those the picture has
   else if( dbv && cu.isSST && cu.separateTree && !CS::isDualITree( cs ) ) why = "DBV (separate tree)";
   else if( dbv && !CS::isDualITree( cs ) && ( !GPU_TMP || !m.deriveModes ) ) why = "DBV";
   else if( dbv && ( cu.chromaFormat != CHROMA_420 || area != cu.blocks[compID] ) )
     why = "DBV of a CU with several chroma blocks or not 4:2:0";
-  else if( dbv && pu.isChromaFusion > 1 )                            why = "DBV with CFLM";
+  else if( dbv && pu.isChromaFusion > 1 && !cflmDbvArms( pu, area ) ) why = "DBV with CFLM without a template arm";
   else if( dbv && !CS::isDualITree( cs ) && ( cu.rribcFlipType || cu.ibcLicFlag ) )
     why = cu.ibcLicFlag ? "DBV with IBC LIC" : "DBV with a flip";
 #endif

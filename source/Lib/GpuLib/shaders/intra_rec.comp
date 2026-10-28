@@ -128,9 +128,11 @@ const int BV_SECOND_DIMD = -2;
 int    g_bvSecond;
 // a DBV block (a CU_CHROMA_DBV CU's of DBV_MODE, a chroma reordering CU's of a DBV entry): its prediction the copy at
 // the co-located luma CU's vector, or at its CU's refined DBV vector; then its reconstruction flipped by g_recFlip
-// (DecCu: pReco.flipSignal of the CU's rribcFlipType: 1 horizontally, 2 vertically)
+// (DecCu: pReco.flipSignal of the CU's rribcFlipType: 1 horizontally, 2 vertically); g_dbvMv its vector, which CFLM's
+// template copies at too
 bool   g_dbv;
 int    g_recFlip;
+ivec2  g_dbvMv;
 // blending (a DERIVE_DIMD block whose CU's DIMD blends, a DERIVE_OBIC or DERIVE_MERGE block): the predictions of the
 // CU's modes (s_blendMode: DIMD's or the intra merge candidate's main mode, planar and blend modes, OBIC's modes) are
 // summed per location dependence class (emitPred), weighted, in the workgroup's BLEND_ACC sums at the start of the
@@ -3132,6 +3134,7 @@ void main()
           const ivec4 v = dbvLumaVector( c.lumaCu );
           mv = ibcChromaValid( t.comp, c.x, c.y, c.w, c.h, v.xy, 0, 0, g_ti ) ? v.xy : v.zw << 4;
         }
+        g_dbvMv = mv;
         for( int i = lid; i < N; i += NT )
         {
           emitPred( t, i % W, i / W,
