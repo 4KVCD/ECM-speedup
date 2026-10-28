@@ -1518,6 +1518,9 @@ const int OBMC_CNLIC = 16; // ... its own non-local LIC model (altLMParaUnit) at
 const int OBMC_T_MV0 = 0, OBMC_T_MV1 = 2, OBMC_T_REF0 = 4, OBMC_T_REF1 = 5, OBMC_T_KIND = 6, OBMC_T_W0 = 7, OBMC_T_W1 = 8;
 const int OBMC_TM = 1;   // OBMC_J_FLAGS: the templates
 const int OBMC_P1 = 64;  // ... a GPM CU's part 1 (M117): skipObmcConditionByPixel against part 1's prediction
+// ... an IntraTMP / IBC CU's run of an inter neighbour (its prediction intra_rec's): luma alone, the strip, then per
+// list of OBMC_J_INT_DIR the copy at its rounded vector after it (W x H each), which intra_rec's skip test compares
+const int OBMC_INT_OUT = 128;
 // a segment's data (int16): the skip flags (Y, Cb, Cr), the templates with the CU's and the neighbour's motion (L each),
 // the band's luma prediction (W x H), Cb's, Cr's (W / 2 x H / 2)
 const int OBMC_D_SKIP = 0, OBMC_D_TPL = 3;
@@ -1570,7 +1573,8 @@ void obmcJob( int o, int lid )
   const int cnlic = ( jb.v[o + OBMC_J_FLAGS] & OBMC_CNLIC ) != 0 ? o + OBMC_J_CNLIC : -1;
   const int predOff[3] = int[]( dst + OBMC_D_TPL + 2 * L, dst + OBMC_D_TPL + 2 * L + W * H,
                                 dst + OBMC_D_TPL + 2 * L + W * H + ( W >> 1 ) * ( H >> 1 ) );
-  for( int comp = 0; comp < 3; comp++ )
+  const bool intOut = ( jb.v[o + OBMC_J_FLAGS] & OBMC_INT_OUT ) != 0;
+  for( int comp = 0; comp < ( intOut ? 1 : 3 ); comp++ )
   {
     const int cs = comp == 0 ? 0 : 1, cw = W >> cs, ch = H >> cs, cx = bx >> cs, cy = by >> cs;
     const int bj = jb.v[o + OBMC_J_BASE + comp] * MC_JOB;   // (the CU's block job of this component)
@@ -1590,7 +1594,7 @@ void obmcJob( int o, int lid )
       // skipObmcConditionByPixel: each list of the neighbour's motion at its integer vector, uni-prediction of the band
       // (no lists: no test - GPM's separate OBMC, m_geoOBMC), against the CU's prediction there (a GPM CU's part 1:
       // part 1's, OBMC_P1)
-      const int before = jb.v[o + OBMC_J_INT_DIR] == 0 ? 0
+      const int before = jb.v[o + OBMC_J_INT_DIR] == 0 || intOut ? 0
                          : mcSample( base, bj, comp, x, y, base.v[bj + MC_PU_W], base.v[bj + MC_PU_H], bd, clipMin,
                                      clipMax, -1, ( jb.v[o + OBMC_J_FLAGS] & OBMC_P1 ) != 0 );
       for( int l = 0; l < 2; l++ )
@@ -1606,7 +1610,11 @@ void obmcJob( int o, int lid )
           // its one list - for both lists)
           const int lm = ( jb.v[o + MC_FLAGS] & ( MC_BI | MC_L1 ) ) != 0 ? 1 : 0;
           r = lic < 0 ? r : mcLic( jb, lic, lm, comp, r, clipMin, clipMax );
-          if( abs( before - r ) >= jb.v[o + OBMC_J_THRESHOLD + ( comp == 0 ? 0 : 1 )] )
+          if( intOut )
+          {
+            od.v[predOff[0] + ( l + 1 ) * W * H + i] = int16_t( r );
+          }
+          else if( abs( before - r ) >= jb.v[o + OBMC_J_THRESHOLD + ( comp == 0 ? 0 : 1 )] )
           {
             atomicOr( sObmcSkip, 1 );
           }

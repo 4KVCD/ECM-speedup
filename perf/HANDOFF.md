@@ -3259,6 +3259,14 @@ M145 (2026-10-28): DBV with LM chroma fusion's first type (its CCCM blend applie
 CFLM, IBC LIC and the flip stay on the CPU (their reasons apart). Results (27 streams, grn154 / grn153 with
 ECM_GPU_FULL_PIPELINE): as before the series, identical but ra_ip64_md5 1 and ra720_pj17 4 (section 9). Intra CUs from
 the CPU: 37 -> 26.
+M146 (2026-10-28): OBMC of IntraTMP / IBC CUs with inter neighbours: per run (getSameNeigMotion's) an inter_mc OBMC
+job (OBMC_INT_OUT: the luma strip and per list the copy at the rounded vector, obmcBandJob shared with the inter CUs'
+jobs), the run an operation of tmpObmc (OBMC_OP_INTER: the skip test against the copies, the strip blended), LMCS
+forward-mapped (OBMC_FLAG_FWD; subBlockOBMC makes an IntraTMP CU an IBC CU for its OBMC, so its lut and its mode 2 are
+IBC's); inter_mc runs for such jobs alone too. calcGradForOBMC passes a neighbour of motion by its PU, a GPM PU with
+an intra or IBC part by one unit (unitsToSkip; ra_long POC 184). Results (27 streams, grn157 with
+ECM_GPU_FULL_PIPELINE): as before the series, identical but ra_ip64_md5 1 and ra720_pj17 4 (section 9). Intra CUs from
+the CPU: IntraTMP OBMC with an inter neighbour 69 -> 0.
 Tried after M125 and left out (idle 3070, median of 5 or 7): the CCP merge history's and list's records read ahead in
 parallel with signatures (neutral); IntraTMP's refinement ranks counting only the windows that overlap no other
 (+3 % aiodd: the weaker filter sends more positions to the walk) or comparing only positions of overlapping windows

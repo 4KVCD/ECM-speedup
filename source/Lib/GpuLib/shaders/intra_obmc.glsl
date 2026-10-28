@@ -26,6 +26,10 @@ const int OBMC_U_BI = 10, OBMC_UNIT = 11;
 // intermediate precision - xPredInterBi's)
 const int OBMC_BI_NONE = 0, OBMC_BI_ONE_COPY = 1, OBMC_BI_AVERAGE = 2;
 const int OBMC_NONE = 0, OBMC_INTRA = 1, OBMC_PLT = 2, OBMC_MOTION = 3, OBMC_MOTION_INVALID = 4;
+// a unit of a CU of inter motion: its run's strip inter_mc's (GpuIntraRec.cpp's bvObmcInterJobs) - at the run's first
+// unit OBMC_U_MV its data in Params::interPred (inter_mc's OBMC_D_*: the strip, then per list of OBMC_U_LIC the copy
+// at its rounded vector) and the run's units -; OBMC_FLAG_FWD: those forward-mapped by LMCS
+const int OBMC_INTER = 5, OBMC_FLAG_FWD = 64;
 const int OBMC_BOTH = 0, OBMC_ONLY_ABOVE = 1, OBMC_ONLY_LEFT = 2;   // IntraPrediction::m_intraOBMCNeighState
 const int OBMC_MAX_UNITS = 64;   // per side
 
@@ -139,7 +143,7 @@ void obmcGradModes( Cu c, int rec, int b )
   while( i < total )
   {
     const int kind = obUnit( rec, k0 + i, OBMC_U_KIND );
-    if( kind == OBMC_MOTION || kind == OBMC_MOTION_INVALID )   // (past the CU with the vector)
+    if( kind == OBMC_MOTION || kind == OBMC_MOTION_INVALID || kind == OBMC_INTER )   // (past the CU with motion)
     {
       i += obUnit( rec, k0 + i, OBMC_U_SKIP );
       prevSaved = false;
@@ -153,7 +157,7 @@ void obmcGradModes( Cu c, int rec, int b )
       for( ; i + numIntra < total; numIntra++ )
       {
         const int nk = obUnit( rec, k0 + i + numIntra, OBMC_U_KIND );
-        if( nk == OBMC_MOTION || nk == OBMC_MOTION_INVALID || nk == OBMC_PLT
+        if( nk == OBMC_MOTION || nk == OBMC_MOTION_INVALID || nk == OBMC_INTER || nk == OBMC_PLT
             || obmcUnitMode( rec, k0 + i + numIntra ) != mode )
         {
           break;
@@ -223,7 +227,7 @@ void obmcGradModes( Cu c, int rec, int b )
 
 // ----- the operations of side b (invocation 0; getSameNeigMotion's runs): appended at TO_OPS
 
-const int OBMC_OP_MOTION = 0, OBMC_OP_INTRA = 1;
+const int OBMC_OP_MOTION = 0, OBMC_OP_INTRA = 1, OBMC_OP_INTER = 2;   // (OBMC_OP_INTER: its data, its lists)
 
 void obmcAddOp( int b, int kind, int u0, int n, int a, int c, ivec3 lic, ivec2 mv2, int bi )
 {
@@ -256,6 +260,14 @@ void obmcSideOps( Cu c, int rec, int b, ivec2 ownMv, ivec2 ownMv2, ivec3 ownLic,
     {
       break;
     }
+    if( kind == OBMC_INTER )   // (a run of a CU of inter motion: getSameNeigMotion's, the host's)
+    {
+      const int n = obUnit( rec, k0 + iSub, OBMC_U_MV + 1 );
+      obmcAddOp( b, OBMC_OP_INTER, iSub, n, obUnit( rec, k0 + iSub, OBMC_U_MV ), obUnit( rec, k0 + iSub, OBMC_U_LIC ),
+                 ivec3( 0 ), ivec2( 0 ), OBMC_BI_NONE );
+      iSub += n;
+      continue;
+    }
     // (a CU of two vectors: both valid, checkIsIBCCandidateValidBi)
     const ivec2 mv    = kind == OBMC_MOTION ? obmcUnitMv( rec, k0 + iSub ) : ivec2( 0 );
     const int   bi    = kind == OBMC_MOTION ? obUnit( rec, k0 + iSub, OBMC_U_BI ) : OBMC_BI_NONE;
@@ -275,7 +287,9 @@ void obmcSideOps( Cu c, int rec, int b, ivec2 ownMv, ivec2 ownMv2, ivec3 ownLic,
       const ivec2 nv2 = nb != OBMC_BI_NONE ? obmcUnitMv2( rec, k ) : ivec2( 0 );
       const bool  nValid = nk == OBMC_MOTION && obmcVectorValid( c, b, iSub, len + 1, nv )
                            && ( nb == OBMC_BI_NONE || obmcVectorValid( c, b, iSub, len + 1, nv2 ) );
-      if( valid ? !( nValid && nv == mv && nb == bi && nv2 == mv2 && obmcUnitLic( rec, k ) == lic ) : nValid )
+      // (a unit of inter motion ends any run: getSameNeigMotion's validInter)
+      if( nk == OBMC_INTER
+          || ( valid ? !( nValid && nv == mv && nb == bi && nv2 == mv2 && obmcUnitLic( rec, k ) == lic ) : nValid ) )
       {
         break;
       }
@@ -839,6 +853,38 @@ void tmpObmc( Tu t, Cu c, int rec, int lid, int NT )
         tsSync();
         skip = s_obmcSkip != 0;
       }
+    }
+    else if( kind == OBMC_OP_INTER )
+    {
+      // a run of an inter CU (inter_mc's data, OBMC_INTER; with OBMC_FLAG_FWD forward-mapped by LMCS, subBlockOBMC's
+      // lut): skipObmcConditionByPixel per list of its motion - the copy at the vector rounded to samples 96 (8 bits)
+      // or more from the prediction before OBMC skips the run -, else its strip into the scratch
+      const int  data = tsGet( TO_OPS + 4 + op * TO_OP ), lists = tsGet( TO_OPS + 5 + op * TO_OP );
+      const bool fwd  = ( BufI32( P.timdData ).v[rec + OBMC_FLAGS] & OBMC_FLAG_FWD ) != 0;
+      const int  len  = st.z * st.w, pred = data + OBMC_D_TPL + 2 * ( b == 0 ? st.z : st.w );
+      const int  threshold = 96 << ( t.bitDepth - 8 );
+      if( lid == 0 )
+      {
+        s_obmcSkip = 0;
+      }
+      SYNC();
+      for( int i = lid; i < len; i += NT )
+      {
+        const int x = i % st.z, y = i / st.z;
+        const int before = tsGet( TO_BEFORE + ( st.y - c.y + y ) * W + st.x - c.x + x );
+        for( int l = 0; l < 2; l++ )
+        {
+          const int v = int( CBufI16( P.interPred ).v[pred + ( l + 1 ) * len + i] );
+          if( ( ( lists >> l ) & 1 ) != 0 && abs( before - ( fwd ? fwdLut( v ) : v ) ) >= threshold )
+          {
+            s_obmcSkip = 1;
+          }
+        }
+        const int s = int( CBufI16( P.interPred ).v[pred + i] );
+        tsSet( TO_STRIP + i, fwd ? fwdLut( s ) : s );
+      }
+      tsSync();
+      skip = s_obmcSkip != 0;
     }
     else
     {
