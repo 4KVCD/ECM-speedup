@@ -3384,8 +3384,18 @@ picture the phases' sums per kind ('[gpu-intra] POC n phases of <kind>: 0 <ms>; 
 end). Marked: IntraTMP's node (setup, sparse search, the vector list's cascade and costs, clustering, refinement, then
 the list), CCP merge blocks (the list, the block's own fits, the candidates' costs, the choice), NN blocks (the input,
 the layers, the output).
-Tried after M125 and left out (idle 3070, median of 5 or 7): the CCP merge history's and list's records read ahead in
-parallel with signatures (neutral); IntraTMP's refinement ranks counting only the windows that overlap no other
+M169 (2026-10-29): IntraTMP's chunks in shared memory without packing: a chunk's rows write their positions straight
+into their slots (x, y, tag as int16 in s_angL[0], -1 marking a slot the row's walk left out), their costs in
+s_angL[1] (tmpChunkClear zeroes both after the node), instead of the scratch with invocation 0 packing the rows'
+positions (tmpChunkPack's serial loop and 3 barriers per chunk); the sparse search's ranks read the position's own
+costs from registers; tmpLicModel keeps the scratch's start (TS_LIC). GPU time (27 streams, one session, grn181 ->
+grn189): 58,420 -> 58,160 ms (-0.4 %), all-intra -1 to -2 % (fp720_ai 14,432 -> 14,223 ms, ai720 1,812 -> 1,790 ms),
+the others within +-1 %. Results (grn189): every picture identical.
+Tried after M125 and left out (idle 3070, median of 5 or 7): IntraTMP's lists in the angular arrays (s_angA, a word
+as two int16; paired: aiodd +19 %, ra720 +41 %, the clustering 6.6 times as long - likely the index division and the
+two loads per word in invocation 0's walks, against the scratch's one load; with the division gone, M169's chunks
+gain); the CCP merge history's and list's records read ahead in parallel with signatures (neutral); IntraTMP's
+refinement ranks counting only the windows that overlap no other
 (+3 % aiodd: the weaker filter sends more positions to the walk) or comparing only positions of overlapping windows
 (+7 % aiodd); the sparse cascade read ahead (neutral); MDIP's modes ranked in parallel (neutral); the cascade's slots
 loaded at once (+1.5 %); the block vector cascade read in two passes (neutral); NN layers with 4 packs loaded at once

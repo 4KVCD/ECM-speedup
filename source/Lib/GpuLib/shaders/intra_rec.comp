@@ -2505,6 +2505,7 @@ void main()
       if( WITH_MPM && c.tmp >= 0 )
       {
         tmpNode( c, t.cu, t.bitDepth, lid, NT );
+        tmpChunkClear( lid, NT );   // (its chunks were in the angular arrays)
       }
       if( WITH_DIMD && c.kind == CU_OBIC )
       {
