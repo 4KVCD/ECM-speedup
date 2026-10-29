@@ -3392,6 +3392,18 @@ positions (tmpChunkPack's serial loop and 3 barriers per chunk); the sparse sear
 costs from registers; tmpLicModel keeps the scratch's start (TS_LIC). GPU time (27 streams, one session, grn181 ->
 grn189): 58,420 -> 58,160 ms (-0.4 %), all-intra -1 to -2 % (fp720_ai 14,432 -> 14,223 ms, ai720 1,812 -> 1,790 ms),
 the others within +-1 %. Results (grn189): every picture identical.
+M170 (2026-10-29): IntraTMP's lists merged in parallel after each chunk (tmpListMerge) instead of invocation 0's
+walk inserting the chunk's positions one by one: a position that enters a list has its place there after the chunk
+in its rank (the list's entries and the chunk's positions before it, which tmpChunkCosts / tmpRefineRanks count
+already), so each such position writes its entry there, each other place takes the list's next entry (its bit masks,
+s_tmpTaken), and the lists go back in order, all three in one pass. The sparse search merges every chunk; the
+refinement merges where no position that may enter repeats one in its list or before it in the chunk (a clustered
+type's), else, and for BVG-DIMD (whose threshold also falls by the cheapest), it walks as before (s_tmpSerial).
+GPU time (27 streams, one session, grn189 -> grn198): 58,254 -> 56,617 ms (-2.8 %); ra720 2,363 -> 2,158 ms (-9 %),
+ld_foreman_q22 -8 %, fp720_ai 14,378 -> 13,605 ms (-5 %), ai720 1,803 -> 1,712 ms (-5 %); ra720_pj17 +1.4 %,
+ld_parkjoy_q27 +0.9 %, the rest faster or within 1 %. Results (grn198): every picture identical. A
+first version (grn196) put intra_rec's shared memory 180 bytes over the 49,152-byte limit with a word per place:
+NVIDIA's driver created the pipeline and the device was lost on every stream; shared_size.py checks that now.
 Tried after M125 and left out (idle 3070, median of 5 or 7): IntraTMP's lists in the angular arrays (s_angA, a word
 as two int16; paired: aiodd +19 %, ra720 +41 %, the clustering 6.6 times as long - likely the index division and the
 two loads per word in invocation 0's walks, against the scratch's one load; with the division gone, M169's chunks

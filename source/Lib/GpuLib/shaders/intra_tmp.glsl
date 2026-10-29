@@ -355,8 +355,10 @@ ivec3 tmpCosts( Cu c, int tempType, int bx, int by )
 // earlier in the chunk (else the walk may skip it). The others are left out of the walk (may: whether the position's
 // threshold test passed; all invocations, after the chunk's costs, ending with a barrier; one position per invocation,
 // its cost as its list takes it, its type; s_spCost per position its cost, below 2^24, and its type, or ~0 for one that
-// does not count)
-void tmpRefineRanks( int cost, int type, int px, int py, ivec3 caps, inout bool may, int lid )
+// does not count). Its rank: where no position that may enter has one equal to it before it (else s_tmpSerial), the
+// position's place in its list after the chunk (caps where it is in none)
+shared int s_tmpSerial;   // whether the chunk's refinement needs the walk: a position that may enter is a repeated one
+void tmpRefineRanks( int cost, int type, int px, int py, ivec3 caps, inout bool may, out int rank, int lid )
 {
   const int  n = s_tmpCount, k = lid, list = TS_REFINE + type * TS_LIST;
   const bool dedupe = ( ( tsGet( TS_WIN ) >> type ) & 1 ) != 0;
@@ -368,12 +370,17 @@ void tmpRefineRanks( int cost, int type, int px, int py, ivec3 caps, inout bool 
     {
       counts = tcPos( i ) != ivec2( px, py ) || ( tcTag( i ) & 3 ) != type;
     }
+    if( !counts )
+    {
+      s_tmpSerial = 1;
+    }
   }
   if( k < n )
   {
     s_spCost[k] = counts ? uint( cost ) | uint( type ) << 28 : ~0u;
   }
   tsSync();
+  rank = caps[type];
   if( k < n && may )
   {
     int lo = 0, hi = tlSize( list );   // (the list's entries costing no more: it rises by cost)
@@ -390,24 +397,25 @@ void tmpRefineRanks( int cost, int type, int px, int py, ivec3 caps, inout bool 
       const int  cj = int( v & 0x0fffffffu );
       before += j != k && v != ~0u && int( v >> 28 ) == type && ( cj < cost || ( cj == cost && j < k ) ) ? 1 : 0;
     }
-    may = before < caps[type];
+    may  = before < caps[type];
+    rank = before;
   }
   tsSync();   // (s_spCost read before the chunk's flags replace it)
 }
 
 // the costs of the chunk's s_tmpCount positions (all invocations, after a tsSync; positions at tcPos; a hole's
-// costs the largest int, which no list takes), into tcCost, and per position whether it may change a list
-// (s_spCost, sign prediction's costs, free in a node), which invocation 0 then walks alone. The refinement's
-// (refine): a cost of its own type (tag & 3; at its candidate's own position that candidate's cost) below the type's
-// threshold at the chunk's start (s_tmpThr), as a list's threshold only falls, and with caps (the lists' lengths) few
-// enough ranking before it (tmpRefineRanks). The sparse search's (the first numTypes lists, of caps entries): a
-// position that is in a list after the chunk. Such a list keeps the first positions by cost, then by order
+// costs the largest int, which no list takes), into tcCost. The refinement's (refine): per position whether it may
+// change a list (s_spCost, sign prediction's costs, free in a node) - a cost of its own type (tag & 3; at its
+// candidate's own position that candidate's cost) below the type's threshold at the chunk's start (s_tmpThr), as a
+// list's threshold only falls, and with caps (the lists' lengths) few enough ranking before it (tmpRefineRanks) -;
+// returns the invocation's position's rank there, its type and its cost as its list takes it. The sparse search's
+// (the first numTypes lists, of caps entries): returns the invocation's position's ranks, its places in the lists
+// after the chunk (caps where it is in none). Such a list keeps the first positions by cost, then by order
 // (updateCandList inserts after equal costs; none enters past the threshold, which is the last entry's once the list
 // is full), so a position below the threshold ends in it exactly where fewer than the list's cap rank before it: the
-// list's entries and the chunk's earlier positions that cost no more, its later ones that cost less. The others leave
-// it again within the chunk if they enter at all. (One position per invocation: TMP_CHUNK is intra_rec's workgroup
-// size)
-void tmpChunkCosts( Cu c, int tempType, int numTypes, ivec3 caps, bool refine, int lid, int NT )
+// list's entries and the chunk's earlier positions that cost no more, its later ones that cost less. (One position per
+// invocation: TMP_CHUNK is intra_rec's workgroup size)
+ivec3 tmpChunkCosts( Cu c, int tempType, int numTypes, ivec3 caps, bool refine, int lid, int NT )
 {
   bool  may = false;
   int   cost = 0, type = 0, px = 0, py = 0;   // (the refinement's: the position's cost as its list takes it, its type)
@@ -431,11 +439,23 @@ void tmpChunkCosts( Cu c, int tempType, int numTypes, ivec3 caps, bool refine, i
       may  = cost < s_tmpThr[t];
     }
   }
+  if( lid == 0 )
+  {
+    s_tmpSerial = 0;
+  }
   tsSync();
   if( refine && caps.x > 0 )
   {
-    tmpRefineRanks( cost, type, px, py, caps, may, lid );
+    int at;
+    tmpRefineRanks( cost, type, px, py, caps, may, at, lid );
+    if( lid < s_tmpCount )
+    {
+      s_spCost[lid] = may ? 1u : 0u;
+    }
+    tsSync();
+    return ivec3( at, type, cost );
   }
+  ivec3 rank = caps;
   for( int t = 0; t < numTypes && !refine; t++ )   // (the sparse search's: the chunk's costs of type t in s_spCost)
   {
     const int k = lid, cost = k < s_tmpCount ? cs[t] : 0;   // (one position per invocation)
@@ -460,7 +480,7 @@ void tmpChunkCosts( Cu c, int tempType, int numTypes, ivec3 caps, bool refine, i
         const int cj = int( s_spCost[j] );
         before += cj < cost || ( cj == cost && j < k ) ? 1 : 0;
       }
-      may = may || before < caps[t];
+      rank[t] = before;
     }
     tsSync();
   }
@@ -469,6 +489,7 @@ void tmpChunkCosts( Cu c, int tempType, int numTypes, ivec3 caps, bool refine, i
     s_spCost[lid] = may ? 1u : 0u;
   }
   tsSync();
+  return rank;
 }
 
 void tmpEmit( inout int k, int x, int y, int tag )
@@ -1561,6 +1582,7 @@ int tmpFusionSample( Cu c, int at, int x, int y, int bitDepth )
 const int TS_RROW_WORDS = 8;
 const int TS_RROW       = TS_FCOST + 4 * TMP_FRAC_CANDS;
 const int TS_RFOUND     = TS_RROW + TS_RROW_WORDS * TMP_CHUNK;
+const int TS_MERGE      = TS_RFOUND + 1;   // tmpListMerge's list: TL_CAP entries of TE words in order
 
 // row r of the refinement's chunk (one invocation): its positions as the walk of the windows takes them, from the row's
 // right end leftwards - a checked one (a region's position where the window may leave the decoded area) only from
@@ -1669,6 +1691,83 @@ void tmpSparseRow( Cu c, int r, bool mr, int S, OwnerMap om )
   {
     tsSet( TS_RFOUND, rowFound ? 1 : 0 );
   }
+}
+
+// a chunk's entries merged into the numTypes lists from lists on, of caps entries (all invocations, one entry per
+// invocation, after the chunk's ranks; ending with a barrier): an invocation's entry e with list t's cost costs[t]
+// where it enters list t (at[t], its rank there, below caps[t]) at its place after the chunk, the list's entries in
+// order in the places left, as far as they fit. That is updateCandList's list after the chunk's positions in their
+// order, without walking them one by one: a position's rank counts the list's entries and the chunk's positions that
+// come before it in that list. A merged list's order its places' (its slots in order). Returns which lists took
+// entries (bits)
+shared uint s_tmpTaken[3];   // per list the places entering entries take (bits: TL_CAP is at most 32)
+const int   TS_MERGE_LIST = TL_CAP * TE;
+int tmpListMerge( int lists, int numTypes, ivec3 caps, ivec3 at, int e[TE], ivec3 costs, int lid, int NT )
+{
+  if( lid < 3 )
+  {
+    s_tmpTaken[lid] = 0u;
+  }
+  tsSync();
+  for( int t = 0; t < numTypes; t++ )
+  {
+    if( at[t] < caps[t] )
+    {
+      e[TE_COST] = costs[t];
+      for( int f = 0; f < TE; f++ )
+      {
+        tsSet( TS_MERGE + t * TS_MERGE_LIST + at[t] * TE + f, e[f] );
+      }
+      atomicOr( s_tmpTaken[t], 1u << at[t] );
+    }
+  }
+  tsSync();
+  const uvec3 taken    = uvec3( s_tmpTaken[0], s_tmpTaken[1], s_tmpTaken[2] );
+  const int   entering = ( taken.x != 0u ? 1 : 0 ) | ( taken.y != 0u ? 2 : 0 ) | ( taken.z != 0u ? 4 : 0 );
+  if( entering == 0 )
+  {
+    return 0;
+  }
+  for( int i = lid; i < numTypes * TL_CAP; i += NT )   // (place p of list t takes the list's next entry)
+  {
+    const int t = i / TL_CAP, p = i % TL_CAP, list = lists + t * TS_LIST;
+    const int before = bitCount( taken[t] & ( ( 1u << p ) - 1u ) );   // (the places before p entering entries take)
+    if( taken[t] != 0u && p < caps[t] && ( ( taken[t] >> p ) & 1u ) == 0u && p - before < tlSize( list ) )
+    {
+      for( int f = 0; f < TE; f++ )
+      {
+        tsSet( TS_MERGE + t * TS_MERGE_LIST + p * TE + f, tlAt( list, p - before, f ) );
+      }
+    }
+  }
+  ivec3 num;   // (the lists' sizes after the chunk; read before they change)
+  for( int t = 0; t < 3; t++ )
+  {
+    num[t] = t < numTypes ? min( caps[t], tlSize( lists + t * TS_LIST ) + bitCount( taken[t] ) ) : 0;
+  }
+  tsSync();
+  for( int t = 0; t < numTypes; t++ )
+  {
+    if( taken[t] == 0u )
+    {
+      continue;
+    }
+    const int list = lists + t * TS_LIST;
+    for( int i = lid; i < num[t] * TE; i += NT )
+    {
+      tsSet( tlEntryAt( list, i / TE ) + i % TE, tsGet( TS_MERGE + t * TS_MERGE_LIST + i ) );
+    }
+    for( int i = lid; i < TL_CAP; i += NT )
+    {
+      tsSet( list + 1 + i, i );
+    }
+    if( lid == 0 )
+    {
+      tsSet( list, num[t] );
+    }
+  }
+  tsSync();
+  return entering;
 }
 
 // the node of IntraTMP CU c (record cuIndex; all invocations, uniform control flow): its list of vectors into its
@@ -1828,36 +1927,24 @@ void tmpNode( Cu c, int cuIndex, int bitDepth, int lid, int NT )
       tmpSparseRow( c, r, mr, S, om );
     }
     tsSync();
-    tmpChunkCosts( c, tempType, numTypes, ivec3( numSparse[0], numSparse[1], numSparse[2] ), false, lid, NT );
-    const bool last = s_tmpDone != 0;   // (read before invocation 0 may write the next chunk's)
-    if( lid == 0 )
+    const ivec3 rank = tmpChunkCosts( c, tempType, numTypes, ivec3( numSparse[0], numSparse[1], numSparse[2] ), false,
+                                      lid, NT );
+    const bool  last = s_tmpDone != 0;   // (read before invocation 0 may write the next chunk's)
+    // the lists after the chunk (tmpListMerge: its positions at their ranks), each full one's threshold its last
+    // entry's cost
+    const ivec2 p  = tcPos( lid );
+    const int   rr = S >> 1;
+    tmpListMerge( TS_SPARSE, numTypes, ivec3( numSparse[0], numSparse[1], numSparse[2] ), rank,
+                  tlEntry( p.x, p.y, p - rr, p + rr, tcTag( lid ), 0 ),
+                  ivec3( tcCost( lid, 0 ), tcCost( lid, 1 ), tcCost( lid, 2 ) ), lid, NT );
+    for( int t = 0; t < numTypes && lid == 0; t++ )
     {
-      const int rr = S >> 1;
-      for( int k = 0; k < s_tmpCount; k++ )
+      const int list = TS_SPARSE + t * TS_LIST;
+      if( tlSize( list ) == numSparse[t] )
       {
-        if( s_spCost[k] == 0u )
-        {
-          continue;
-        }
-        const ivec2 p = tcPos( k );
-        const int   px = p.x, py = p.y;
-        for( int t = 0; t < numTypes; t++ )
-        {
-          const int cost = tcCost( k, t ), list = TS_SPARSE + t * TS_LIST;
-          if( cost < pDiff[t] )
-          {
-            const int region = tcTag( k );
-            tlUpdate( list, tlEntry( px, py, ivec2( px - rr, py - rr ), ivec2( px + rr, py + rr ), region, cost ),
-                      numSparse[t] );
-            if( tlSize( list ) == numSparse[t] )
-            {
-              pDiff[t] = min( tlAt( list, numSparse[t] - 1, TE_COST ), pDiff[t] );
-            }
-          }
-        }
+        pDiff[t] = min( tlAt( list, numSparse[t] - 1, TE_COST ), pDiff[t] );
       }
     }
-    tsSync();
     if( last )
     {
       break;
@@ -2123,10 +2210,47 @@ void tmpNode( Cu c, int cuIndex, int bitDepth, int lid, int NT )
       tmpRefineRow( c, r, licMode, bvg, om );
     }
     tsSync();
-    tmpChunkCosts( c, tempType, numTypes, bvg ? ivec3( 0 ) : ivec3( numRefine[0], numRefine[1], numRefine[2] ), true,
-                   lid, NT );
-    const bool last = s_tmpDone != 0;
-    if( lid == 0 )
+    const ivec3 own = tmpChunkCosts( c, tempType, numTypes,
+                                     bvg ? ivec3( 0 ) : ivec3( numRefine[0], numRefine[1], numRefine[2] ), true, lid,
+                                     NT );   // (the position's rank, type, cost)
+    const bool  last = s_tmpDone != 0;
+    if( !bvg && s_tmpSerial == 0 )
+    {
+      // without a repeated position that may enter, the lists as the walk below leaves them, by tmpListMerge (each
+      // position at its rank), a type's threshold as the walk's: from the chunk's start, its list's last entry's cost
+      // once full; the last type that took a position the walk's current one
+      const ivec3 caps   = ivec3( numRefine[0], numRefine[1], numRefine[2] );
+      const int   tag    = tcTag( lid ), ci = tag >> 2, sparse = TS_SPARSE + own.y * TS_LIST;
+      const bool  enters = lid < s_tmpCount && tag >= 0 && own.x < caps[own.y];
+      const ivec2 p      = tcPos( lid );
+      int         e[TE]  = tlEntry( 0, 0, ivec2( 0 ), ivec2( 0 ), 0, 0 );
+      ivec3       at     = caps;
+      if( enters )
+      {
+        e = tlEntry( p.x, p.y, ivec2( tlAt( sparse, ci, TE_TLX ), tlAt( sparse, ci, TE_TLY ) ),
+                     ivec2( tlAt( sparse, ci, TE_BRX ), tlAt( sparse, ci, TE_BRY ) ), tlAt( sparse, ci, TE_REGION ),
+                     0 );
+        at[own.y] = own.x;
+      }
+      const int took = tmpListMerge( TS_REFINE, numTypes, caps, at, e, ivec3( own.z ), lid, NT );
+      for( int t = 0; t < numTypes && lid == 0; t++ )
+      {
+        if( ( ( took >> t ) & 1 ) != 0 )
+        {
+          const int refine = TS_REFINE + t * TS_LIST;
+          curType = t;
+          for( int i = 0; i < 3; i++ )
+          {
+            rDiff[i] = i == t ? s_tmpThr[t] : 0;
+          }
+          if( tlSize( refine ) == numRefine[t] )
+          {
+            rDiff[t] = min( tlAt( refine, numRefine[t] - 1, TE_COST ), rDiff[t] );
+          }
+        }
+      }
+    }
+    else if( lid == 0 )
     {
       for( int k = 0; k < s_tmpCount; k++ )
       {
