@@ -3471,6 +3471,12 @@ static bool addObicNeighbours( GpuIntraRec::Impl& m, const CodingUnit& cu, Cu& c
       inter = true;
       continue;
     }
+    // an IBC or palette CU counts nothing (deriveObicMode has no branch for one; obicNeighbours lists it where its
+    // motion field keeps modes, which only its place among the neighbours depends on)
+    if( CU::isIBC( *nbrs[n] ) || CU::isPLT( *nbrs[n] ) )
+    {
+      continue;
+    }
     // an NN CU counts the DIMD mode of its prediction (indicesRepresentationPnn), and in an inter slice an IntraTMP or
     // MIP CU too (intraTmpDimdMode, mipDimdMode): its luma block writes it into its CU's DimdOut (an NN block with
     // DERIVE_PNN_DIMD, a MIP one with DERIVE_MIP_DIMD, an IntraTMP one in any case), its entry's count negative; the

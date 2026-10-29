@@ -3415,6 +3415,11 @@ cascade's chunk (TS_MCOST's copy gone). GPU time (27 streams, one session, grn19
 the device: its loop ran over
 numList, which only invocation 0 has (the others' 0), so the invocations met different barriers - a loop with
 barriers needs a bound every invocation shares (s_tmpCount here).
+M172 (2026-10-29): the last CU from the CPU - "an OBIC neighbour that is not a recorded CU" (ra720, 1 CU) was an IBC
+neighbour: obicNeighbours lists one whose motion field keeps intra modes, but deriveObicMode has no branch for an IBC
+(or palette) CU, so it counts nothing; addObicNeighbours now leaves it out instead of looking for its record. Results
+(27 streams, grn225 with ECM_GPU_FULL_PIPELINE): every picture identical, CUs from the CPU 1 -> 0 (none left on the
+test streams). Host only: the shaders' SPIR-V is unchanged.
 Tried after M125 and left out (idle 3070, median of 5 or 7): IntraTMP's lists in the angular arrays (s_angA, a word
 as two int16; paired: aiodd +19 %, ra720 +41 %, the clustering 6.6 times as long - likely the index division and the
 two loads per word in invocation 0's walks, against the scratch's one load; with the division gone, M169's chunks
