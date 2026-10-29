@@ -2370,6 +2370,8 @@ struct GpuIntraRec::Impl
   std::unordered_set<const CodingUnit*>                        mcCus;
   // xSubPuMC's CUs (subPuMotion): per CU InterPrediction::m_gpuSubPu (the PU, then its groups and runs)
   std::unordered_map<const CodingUnit*, std::vector<int32_t>>  subPuItems;
+  // multi-hypothesis CUs' hypotheses' LIC models (hypothesisLic: InterPrediction::m_gpuHypLic)
+  std::unordered_map<const CodingUnit*, std::vector<int32_t>>  hypLic;
   std::vector<int32_t>                                         mcJobs;
   // BDOF: its PUs' luma predictions (where in mcBdofBuf, int16) and the sub-blocks' jobs (inter_mc's mode 1)
   std::unordered_map<const CodingUnit*, int32_t>               bdofOut;
@@ -2707,6 +2709,7 @@ void GpuIntraRec::beginPicture( const CodingStructure& cs )
   m.interPred.clear();
   m.mcCus.clear();
   m.subPuItems.clear();
+  m.hypLic.clear();
   m.mcJobs.clear();
   m.bdofOut.clear();
   m.bdofJobs.clear();
@@ -8306,6 +8309,23 @@ static bool affineGpu( const GpuIntraRec::Impl& m, const CodingUnit& cu )
 
 static int32_t wpRecord( GpuIntraRec::Impl& m, const Slice& slice, int ref0, int ref1, int bcw );
 
+// a multi-hypothesis CU's LIC models as the CPU handed them over (hypothesisLic: InterPrediction::m_gpuHypLic): first
+// those its base prediction applied, per list and component scale and offset, then the hypotheses' (4 words each)
+constexpr int HYP_LIC_BASE = 2 * MAX_NUM_COMPONENT * 2;
+
+// the LIC model (scale, offset) of list l and component c that CU cu's own prediction applied: its stored one, but a
+// multi-hypothesis CU's base prediction's as the CPU handed it over (its hypotheses may leave another one stored)
+static std::pair<int32_t, int32_t> cuLicModel( const GpuIntraRec::Impl& m, const CodingUnit& cu, int l, int c )
+{
+  const auto it = m.hypLic.find( &cu );
+  if( it != m.hypLic.end() && it->second.size() >= HYP_LIC_BASE )
+  {
+    const int32_t* b = &it->second[( l * MAX_NUM_COMPONENT + c ) * 2];
+    return { b[0], b[1] };
+  }
+  return { cu.licScale[l][c], cu.licOffset[l][c] };
+}
+
 // the record of affine CU cu (inter_mc.comp's AF_*), appended to m.affineData
 static void affineRecord( GpuIntraRec::Impl& m, const CodingUnit& cu )
 {
@@ -8412,9 +8432,9 @@ static void affineRecord( GpuIntraRec::Impl& m, const CodingUnit& cu )
       c[AF_SLOT] = mcSlot( m, slice, l, pu.refIdx[l] );
     }
   }
-  // (LIC: the CU's models per list and component, scale and offset; not inherited ones: xPredInterUni's affine branch
-  // turns licFlag off for xPredAffineBlk and tests the model against it while it is off, so it never applies one, and
-  // xLicCompAdj leaves inherited models to xPredInterBlk)
+  // (LIC: the CU's models per list and component, scale and offset - cuLicModel's -; not inherited ones:
+  // xPredInterUni's affine branch turns licFlag off for xPredAffineBlk and tests the model against it while it is
+  // off, so it never applies one, and xLicCompAdj leaves inherited models to xPredInterBlk)
   // (affine CIIP's uni-prediction where CIIP's condition leaves LIC out: the models xPredAffineBlk derived and applied
   // anyway, derivedLic's)
   const auto derived = m.derivedLic.find( &cu );
@@ -8425,7 +8445,8 @@ static void affineRecord( GpuIntraRec::Impl& m, const CodingUnit& cu )
     {
       for( int c = 0; c < MAX_NUM_COMPONENT; c++ )
       {
-        m.affineData.insert( m.affineData.end(), { cu.licScale[l][c], cu.licOffset[l][c] } );
+        const std::pair<int32_t, int32_t> model = cuLicModel( m, cu, l, c );
+        m.affineData.insert( m.affineData.end(), { model.first, model.second } );
       }
     }
   }
@@ -8791,9 +8812,39 @@ static std::pair<int, int> mhpRef( const Slice& slice, const MultiHypPredictionD
   return { (int) r.refList, (int) r.refIdx };
 }
 
-// why the GPU does not add the hypotheses of CU cu (nullptr: it does): a hypothesis with LIC (the model it derives from
-// its templates is not stored), weighted prediction, a scaled reference
-static const char* mhpWhy( const CodingUnit& cu )
+// whether the CPU handed over CU cu's LIC models (hypLic: its base prediction's, HYP_LIC_BASE words), and those it
+// derived for its hypotheses are those of its hypotheses with LIC: each one's components in order, of LIC's shift
+// (m_licShift 5, which xUpdateLicModel keeps: mcLic's)
+static bool mhpLicKnown( const GpuIntraRec::Impl& m, const CodingUnit& cu )
+{
+  const auto it = m.hypLic.find( &cu );
+  if( it == m.hypLic.end() || it->second.size() < HYP_LIC_BASE )   // (none: needed only with LIC somewhere)
+  {
+    bool lic = cu.licFlag;
+    for( const MultiHypPredictionData& h: cu.firstPU->addHypData )
+    {
+      lic = lic || h.licFlag;
+    }
+    return !lic;
+  }
+  const int32_t* models = it->second.data();
+  size_t         k      = HYP_LIC_BASE;
+  for( const MultiHypPredictionData& h: cu.firstPU->addHypData )
+  {
+    for( int c = 0; c < MAX_NUM_COMPONENT && h.licFlag; c++, k += 4 )
+    {
+      if( k + 4 > it->second.size() || models[k] != c || models[k + 2] != 5 )
+      {
+        return false;
+      }
+    }
+  }
+  return k == it->second.size();
+}
+
+// why the GPU does not add the hypotheses of CU cu (nullptr: it does): LIC models the CPU did not hand over
+// (hypothesisLic), weighted prediction, a scaled reference
+static const char* mhpWhy( const GpuIntraRec::Impl& m, const CodingUnit& cu )
 {
   const Slice& slice = *cu.slice;
   const PPS&   pps   = *cu.cs->pps;
@@ -8801,12 +8852,12 @@ static const char* mhpWhy( const CodingUnit& cu )
   {
     return "weighted prediction";
   }
+  if( !mhpLicKnown( m, cu ) )
+  {
+    return "LIC models not handed over";
+  }
   for( const MultiHypPredictionData& h: cu.firstPU->addHypData )
   {
-    if( h.licFlag )
-    {
-      return "a hypothesis with LIC";
-    }
     const std::pair<int, int> r = mhpRef( slice, h );
     if( cu.cs->sps->getRprEnabledFlag() && slice.getRefPic( RefPicList( r.first ), r.second )->isRefScaled( &pps ) )
     {
@@ -8817,12 +8868,15 @@ static const char* mhpWhy( const CodingUnit& cu )
 }
 
 // CU cu's hypotheses (inter_mc.comp's mcHypotheses): their count, then per hypothesis its reference slot, its vector
-// (clipped as xPredInterUni clips it), its half-sample filter flag and its weight
+// (clipped as xPredInterUni clips it), its half-sample filter flag, its weight and per component its LIC model's
+// scale and offset (hypLic's; without LIC 32 and 0, which leave the sample as it is)
 static int32_t mhpRecord( GpuIntraRec::Impl& m, const CodingUnit& cu )
 {
   const PredictionUnit& pu    = *cu.firstPU;
   const Slice&          slice = *cu.slice;
   const int32_t         r     = (int32_t) m.affineData.size();
+  const auto            lic   = m.hypLic.find( &cu );
+  size_t                k     = HYP_LIC_BASE;   // (the next of its hypotheses' models)
   m.affineData.push_back( (int32_t) pu.addHypData.size() );
   for( const MultiHypPredictionData& h: pu.addHypData )
   {
@@ -8831,6 +8885,11 @@ static int32_t mhpRecord( GpuIntraRec::Impl& m, const CodingUnit& cu )
     clipMv( mv, pu.lumaPos(), pu.lumaSize(), *cu.cs->sps, *cu.cs->pps );
     m.affineData.insert( m.affineData.end(), { mcSlot( m, slice, ref.first, ref.second ), mv.getHor(), mv.getVer(),
                                                h.imv == IMV_HPEL ? 1 : 0, g_addHypWeight[h.weightIdx] } );
+    for( int c = 0; c < MAX_NUM_COMPONENT; c++, k += h.licFlag ? 4 : 0 )
+    {
+      m.affineData.push_back( h.licFlag ? lic->second[k + 1] : 32 );
+      m.affineData.push_back( h.licFlag ? lic->second[k + 3] : 0 );
+    }
   }
   return r;
 }
@@ -8860,7 +8919,7 @@ static bool interMcGpu( const GpuIntraRec::Impl& m, const CodingUnit& cu )
 #if MULTI_HYP_PRED
   if( !strcmp( kind, "multi-hypothesis" ) )   // (its base prediction as its kind's, the hypotheses added: mhpRecord)
   {
-    if( mhpWhy( cu ) )
+    if( mhpWhy( m, cu ) )
     {
       return false;
     }
@@ -8956,7 +9015,7 @@ static const char* subPuWhy( const GpuIntraRec::Impl& m, const CodingUnit& cu )
 #if MULTI_HYP_PRED
   // (multi-hypothesis: xAddHypMC adds the hypotheses to the PU's prediction xSubPuMC made, as the jobs' MC_MHP adds
   // them to the one they read, mhpRecord's; but where mhpWhy leaves them to the CPU)
-  if( !pu.addHypData.empty() && mhpWhy( cu ) )
+  if( !pu.addHypData.empty() && mhpWhy( m, cu ) )
   {
     return "multi-hypothesis";
   }
@@ -9831,7 +9890,8 @@ static bool recordInterBlock( GpuIntraRec::Impl& m, const TransformUnit& tu, con
         {
           for( int c = 0; c < MAX_NUM_COMPONENT; c++ )
           {
-            m.affineData.insert( m.affineData.end(), { cu.licScale[l][c], cu.licOffset[l][c] } );
+            const std::pair<int32_t, int32_t> model = cuLicModel( m, cu, l, c );
+            m.affineData.insert( m.affineData.end(), { model.first, model.second } );
           }
         }
       }
@@ -10827,7 +10887,7 @@ void GpuIntraRec::recordInterCu( const CodingUnit& cu )
 #if MULTI_HYP_PRED
       if( kind == "multi-hypothesis" && !m.mcCus.count( &cu ) )   // (multi-hypothesis from the CPU: why)
       {
-        const char* const why = mhpWhy( cu );
+        const char* const why = mhpWhy( m, cu );
         kind += std::string( " (" ) + ( why ? why : sub ? "sub-block motion" : "its base prediction" ) + ")";
       }
 #endif
@@ -11212,6 +11272,15 @@ void GpuIntraRec::gpmParts( const CodingUnit& cu, int kind, int splitDir, int bl
   for( int k = 0; k < 2; k++ )
   {
     std::copy( partAff[k], partAff[k] + 17, a[k].begin() );
+  }
+}
+
+void GpuIntraRec::hypothesisLic( const CodingUnit& cu, const std::vector<int32_t>& models )
+{
+  Impl& m = *m_impl;
+  if( m.partial && m.interPending.count( &cu ) )
+  {
+    m.hypLic[&cu] = models;
   }
 }
 

@@ -3349,6 +3349,12 @@ M162 (2026-10-29): multi-hypothesis over sub-block motion: subPuWhy rejects only
 adds the hypotheses to xSubPuMC's PU prediction they read). Results (27 streams, grn181 with ECM_GPU_FULL_PIPELINE,
 M160 to M168 and the block clock): every picture identical. Inter CUs from the CPU: multi-hypothesis (sub-block
 motion) 9 -> 0.
+M163 (2026-10-29): multi-hypothesis hypotheses with LIC: the CPU hands over the models xLocalIlluComp derives for them
+(InterPrediction::m_gpuHypLic, GpuIntraRec::hypothesisLic), mhpRecord gives each hypothesis its per-component scale
+and offset, mcHypotheses applies them (mcLic); m_gpuHypLic starts with the models the base prediction applied (the
+hypotheses can leave another stored: an affine LIC base's 32 / 8 stored as 32 / -1, ld_cif33 POC 24), which the CU's
+own LIC records take (cuLicModel). Results (27 streams, grn181 with ECM_GPU_FULL_PIPELINE, M160 to M168 and the block
+clock): every picture identical. Inter CUs from the CPU: multi-hypothesis (a hypothesis with LIC) 6 -> 0.
 Tried after M125 and left out (idle 3070, median of 5 or 7): the CCP merge history's and list's records read ahead in
 parallel with signatures (neutral); IntraTMP's refinement ranks counting only the windows that overlap no other
 (+3 % aiodd: the weaker filter sends more positions to the walk) or comparing only positions of overlapping windows
