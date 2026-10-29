@@ -3362,6 +3362,9 @@ identical. Intra CUs from the CPU: 3 -> 0.
 M165 (2026-10-29): IBC CUs with OBMC above 1024 samples: ibcBlock keeps such a luma block's prediction in the scratch
 (g_deferLarge, deferredSet / deferredPred), as M152's IntraTMP blocks. Results (27 streams, grn181 with
 ECM_GPU_FULL_PIPELINE, M160 to M168 and the block clock): every picture identical. Intra CUs from the CPU: 1 -> 0.
+M166 (2026-10-29): CIIP / GPM with an intra part of ciipSplit with ASBT: every record of an ASBT block blends the CU's
+intra prediction at its own part (ciipSplitBlock per record). Results (27 streams, grn181 with ECM_GPU_FULL_PIPELINE,
+M160 to M168 and the block clock): every picture identical. Inter CUs from the CPU: 2 -> 0.
 Tried after M125 and left out (idle 3070, median of 5 or 7): the CCP merge history's and list's records read ahead in
 parallel with signatures (neutral); IntraTMP's refinement ranks counting only the windows that overlap no other
 (+3 % aiodd: the weaker filter sends more positions to the walk) or comparing only positions of overlapping windows

@@ -8472,8 +8472,6 @@ static void affineRecord( GpuIntraRec::Impl& m, const CodingUnit& cu )
 // the CPU's mode, CIIP-TIMD's included) - blended with it in intra_rec's storeRecon (geneWeightedPred), then the
 // residual as an inter block's
 
-static bool isAsbt( const TransformUnit& tu, const ComponentID compID );
-
 // whether GPM PU pu has an intra part: GPM-intra's (M115) or regression-based blending's (JVET-AK0101), whose intra
 // prediction the GPU makes as CIIP's
 static bool gpmIntraPart( const PredictionUnit& pu )
@@ -8513,22 +8511,8 @@ static const char* ciipWhy( const CodingUnit& cu )
     return "CIIP-PDPC with an angular mode";
   }
 #endif
-  // (the CU's intra prediction by a pre-pass, ciipSplit, which each TU's blocks blend in - also before inter CCCM or
-  // CCP merge blends -, but not with ASBT's residual parts)
-  for( const TransformUnit& tu: CU::traverseTUs( cu ) )
-  {
-    if( !ciipSplit( cu ) )
-    {
-      break;
-    }
-    for( int c = 0; c < MAX_NUM_COMPONENT; c++ )
-    {
-      if( tu.blocks[c].valid() && isAsbt( tu, ComponentID( c ) ) )
-      {
-        return "CIIP of several TUs or with LFNST / NSPT above 32 a side, with ASBT";
-      }
-    }
-  }
+  // (the CU's intra prediction by a pre-pass, ciipSplit, which each TU's blocks - an ASBT block's parts each - blend
+  // in, also before inter CCCM or CCP merge blends)
   if( cu.chromaFormat != CHROMA_420 )
   {
     return "CIIP not 4:2:0";
@@ -10510,8 +10494,7 @@ static bool ciipChromaPrePass( GpuIntraRec::Impl& m, const TransformUnit& tu, in
 // the pre-pass of CIIP CU cu (or GPM with an intra part) of ciipSplit, whose intra prediction the CPU makes once for
 // the CU (geneWeightedPred over the CU, then each TU's residual): per component a CIIP record of the CU's area without
 // residual (CIIP_PRE_INTRA), recorded before the TUs' blocks, which keeps its intra prediction in its own place; the
-// TUs' blocks then blend it in (ciipSplitBlock; ciipWhy leaves out those with ASBT). Its
-// records into pre; the reason where a record fails (nullptr: none)
+// TUs' blocks then blend it in (ciipSplitBlock). Its records into pre; the reason where a record fails (nullptr: none)
 static const char* ciipSplitPrePass( GpuIntraRec::Impl& m, const CodingUnit& cu, int32_t pre[MAX_NUM_COMPONENT] )
 {
   const int numComp = cu.chromaFormat == CHROMA_400 ? 1 : MAX_NUM_COMPONENT;
@@ -10553,13 +10536,12 @@ static const char* ciipSplitPrePass( GpuIntraRec::Impl& m, const CodingUnit& cu,
   return nullptr;
 }
 
-// TU block compID of CIIP CU cu of ciipSplit, just recorded (the last record): it blends the CU's intra prediction
-// of its pre-pass (record pre) into its inter prediction by the CU's weights, then reconstructs as an inter block (or
-// blends inter CCCM / CCP merge into that); it waits for the pre-pass (Tu::ispPrev, which only ISP's chain uses
-// otherwise), whose samples it reads
-static void ciipSplitBlock( GpuIntraRec::Impl& m, const CodingUnit& cu, const ComponentID compID, int32_t pre )
+// record t of TU block compID of CIIP CU cu of ciipSplit (the block's, or a part's of an ASBT block): it blends the
+// CU's intra prediction of its pre-pass (record pre) at its samples into its inter prediction by the CU's weights, then
+// reconstructs as an inter block (or blends inter CCCM / CCP merge into that); it waits for the pre-pass (Tu::ispPrev,
+// which only ISP's chain uses otherwise), whose samples it reads
+static void ciipSplitBlock( Tu& t, const CodingUnit& cu, const ComponentID compID, int32_t pre )
 {
-  Tu&             t    = m.rec.back();
   const CompArea& area = cu.blocks[compID];
   t.ciip   |= CIIP_SPLIT;
   t.cuX     = area.x;
@@ -10720,6 +10702,7 @@ void GpuIntraRec::recordInterCu( const CodingUnit& cu )
       {
         ciipChromaPrePass( m, tu, pre, why );
       }
+      const size_t first = m.rec.size();   // (the block's records: an ASBT block's parts are several)
       if( m.cpuCus.count( &cu ) )   // (a block after one the GPU lacks something for: its CU is the CPU's)
       {
         cpuFillBlock( m, comp, tu.blocks[comp] );
@@ -10739,7 +10722,10 @@ void GpuIntraRec::recordInterCu( const CodingUnit& cu )
       }
       else if( splitPre[comp] >= 0 )
       {
-        ciipSplitBlock( m, cu, comp, splitPre[comp] );
+        for( size_t k = first; k < m.rec.size(); k++ )
+        {
+          ciipSplitBlock( m.rec[k], cu, comp, splitPre[comp] );
+        }
       }
 #if JVET_AE0059_INTER_CCCM
       if( tu.interCccm && isChroma( comp ) && !m.cpuCus.count( &cu ) )
