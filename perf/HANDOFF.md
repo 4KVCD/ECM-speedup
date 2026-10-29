@@ -3345,6 +3345,10 @@ M161 (2026-10-29): OBMC with an SGPM neighbour above 1024 samples: the table of 
 size and partition (SGPM_UNIT_WORDS: a 64 x 64 CU's 256 units). Results (27 streams, grn181 with
 ECM_GPU_FULL_PIPELINE, M160 to M168 and the block clock): every picture identical. Intra CUs from the CPU: IntraTMP
 OBMC with an SGPM neighbour 2 -> 0.
+M162 (2026-10-29): multi-hypothesis over sub-block motion: subPuWhy rejects only what mhpWhy does (the jobs' MC_MHP
+adds the hypotheses to xSubPuMC's PU prediction they read). Results (27 streams, grn181 with ECM_GPU_FULL_PIPELINE,
+M160 to M168 and the block clock): every picture identical. Inter CUs from the CPU: multi-hypothesis (sub-block
+motion) 9 -> 0.
 Tried after M125 and left out (idle 3070, median of 5 or 7): the CCP merge history's and list's records read ahead in
 parallel with signatures (neutral); IntraTMP's refinement ranks counting only the windows that overlap no other
 (+3 % aiodd: the weaker filter sends more positions to the walk) or comparing only positions of overlapping windows

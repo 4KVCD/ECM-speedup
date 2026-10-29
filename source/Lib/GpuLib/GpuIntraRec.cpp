@@ -8954,7 +8954,9 @@ static const char* subPuWhy( const GpuIntraRec::Impl& m, const CodingUnit& cu )
     return "no motion compensation";
   }
 #if MULTI_HYP_PRED
-  if( !pu.addHypData.empty() )
+  // (multi-hypothesis: xAddHypMC adds the hypotheses to the PU's prediction xSubPuMC made, as the jobs' MC_MHP adds
+  // them to the one they read, mhpRecord's; but where mhpWhy leaves them to the CPU)
+  if( !pu.addHypData.empty() && mhpWhy( cu ) )
   {
     return "multi-hypothesis";
   }
