@@ -144,6 +144,10 @@ public:
   bool                      vulkanMemoryModel() const { return m_vulkanMemoryModel; }
   /// kernels may read the device-wide clock (clockRealtimeEXT / VK_KHR_shader_clock)
   bool                      shaderDeviceClock() const { return m_shaderDeviceClock; }
+  /// the compute pipelines capture their statistics (printed where the driver compiles one)
+  bool                      pipelineStats() const { return m_pipelineStats; }
+  /// development (ECM_GPU_PIPELINE_STATS): every pipeline is compiled anew, without the cache files
+  bool                      pipelineStatsFresh() const { return m_pipelineStatsFresh; }
   /// a memory type with the wanted properties among those in typeBits, preferring types without the avoided ones;
   /// UINT32_MAX when there is none
   uint32_t                  memoryType( uint32_t typeBits, VkMemoryPropertyFlags want, VkMemoryPropertyFlags avoid ) const;
@@ -179,6 +183,8 @@ private:
   uint32_t                  m_queueFamily = 0;
   bool                      m_vulkanMemoryModel = false;
   bool                      m_shaderDeviceClock = false;
+  bool                      m_pipelineStats      = false;
+  bool                      m_pipelineStatsFresh = false;
   std::vector<VkQueue>      m_queues;
   std::unique_ptr<std::mutex[]> m_queueLocks;
   uint32_t                  m_nextQueue = 0;

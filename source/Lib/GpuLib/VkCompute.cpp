@@ -67,6 +67,65 @@ namespace gpu
 static VkDevice                    s_faultDevice = VK_NULL_HANDLE;
 static PFN_vkGetDeviceFaultInfoEXT s_getFaultInfo = nullptr;
 
+// VK_KHR_pipeline_executable_properties' statistics of each compute pipeline the driver compiles, printed after its
+// creation (NVIDIA's: its registers and local memory, where a shader's spills go, among others): "[gpu] pipeline
+// <name> <executable>: <statistic> <value>; ...". A pipeline from a cache (a cache file, the driver's own) has none and
+// prints nothing; ECM_GPU_PIPELINE_STATS=1 compiles every pipeline anew without the cache files (with the driver's
+// cache off too: __GL_SHADER_DISK_CACHE=0 on NVIDIA). NVIDIA's driver gives intra_rec 255 registers (one workgroup
+// per SM) or 128 (two), which moves the whole kernel's speed by several %: a change's time alone does not tell whether
+// the change or that choice made it
+static PFN_vkGetPipelineExecutablePropertiesKHR s_getExecutables = nullptr;
+static PFN_vkGetPipelineExecutableStatisticsKHR s_getStatistics  = nullptr;
+
+static void printPipelineStatistics( VkDevice dev, VkPipeline pipeline, const char* name )
+{
+  VkPipelineInfoKHR info{};
+  info.sType    = VK_STRUCTURE_TYPE_PIPELINE_INFO_KHR;
+  info.pipeline = pipeline;
+  uint32_t numExecutables = 0;
+  if( s_getExecutables( dev, &info, &numExecutables, nullptr ) != VK_SUCCESS || numExecutables == 0 )
+  {
+    return;
+  }
+  std::vector<VkPipelineExecutablePropertiesKHR> executables( numExecutables );
+  for( auto& e: executables )
+  {
+    e.sType = VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_PROPERTIES_KHR;
+  }
+  s_getExecutables( dev, &info, &numExecutables, executables.data() );
+  for( uint32_t i = 0; i < numExecutables; i++ )
+  {
+    VkPipelineExecutableInfoKHR exec{};
+    exec.sType           = VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_INFO_KHR;
+    exec.pipeline        = pipeline;
+    exec.executableIndex = i;
+    uint32_t numStats    = 0;
+    if( s_getStatistics( dev, &exec, &numStats, nullptr ) != VK_SUCCESS || numStats == 0 )
+    {
+      continue;
+    }
+    std::vector<VkPipelineExecutableStatisticKHR> stats( numStats );
+    for( auto& s: stats )
+    {
+      s.sType = VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_STATISTIC_KHR;
+    }
+    s_getStatistics( dev, &exec, &numStats, stats.data() );
+    std::string line = std::string( "[gpu] pipeline " ) + name + " " + executables[i].name + ":";
+    for( const auto& s: stats )
+    {
+      const std::string value = s.format == VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_BOOL32_KHR
+                                  ? std::to_string( s.value.b32 )
+                              : s.format == VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_INT64_KHR
+                                  ? std::to_string( s.value.i64 )
+                              : s.format == VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_UINT64_KHR
+                                  ? std::to_string( s.value.u64 )
+                                  : std::to_string( s.value.f64 );
+      line += std::string( " " ) + s.name + " " + value + ";";
+    }
+    printf( "%s\n", line.c_str() );   // (one call: pipelines compile on several threads)
+  }
+}
+
 static void reportDeviceFault()
 {
   if( !s_getFaultInfo )
@@ -366,11 +425,12 @@ GPU_LOAD_INSTANCE( EnumerateDeviceExtensionProperties )
   m_vk.EnumerateDeviceExtensionProperties( m_physical, nullptr, &numExt, nullptr );
   std::vector<VkExtensionProperties> exts( numExt );
   m_vk.EnumerateDeviceExtensionProperties( m_physical, nullptr, &numExt, exts.data() );
-  bool hasClockExt = false, hasFaultExt = false;
+  bool hasClockExt = false, hasFaultExt = false, hasStatsExt = false;
   for( const auto& e: exts )
   {
     hasClockExt |= strcmp( e.extensionName, VK_KHR_SHADER_CLOCK_EXTENSION_NAME ) == 0;
     hasFaultExt |= strcmp( e.extensionName, VK_EXT_DEVICE_FAULT_EXTENSION_NAME ) == 0;
+    hasStatsExt |= strcmp( e.extensionName, VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME ) == 0;
   }
   const bool wantFault = hasFaultExt && getenv( "ECM_GPU_FAULT" ) != nullptr;
   if( getenv( "ECM_GPU_FAULT" ) && !hasFaultExt )
@@ -379,11 +439,25 @@ GPU_LOAD_INSTANCE( EnumerateDeviceExtensionProperties )
   }
   VkPhysicalDeviceShaderClockFeaturesKHR hasClock{};
   hasClock.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_CLOCK_FEATURES_KHR;
+  VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR hasStats{};
+  hasStats.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR;
+  void** hasTail = &has13.pNext;
   if( hasClockExt )
   {
-    has13.pNext = &hasClock;
+    *hasTail = &hasClock;
+    hasTail  = &hasClock.pNext;
+  }
+  if( hasStatsExt )
+  {
+    *hasTail = &hasStats;
   }
   m_vk.GetPhysicalDeviceFeatures2( m_physical, &has );
+  m_pipelineStats      = hasStatsExt && hasStats.pipelineExecutableInfo;
+  m_pipelineStatsFresh = m_pipelineStats && getenv( "ECM_GPU_PIPELINE_STATS" ) != nullptr;
+  if( getenv( "ECM_GPU_PIPELINE_STATS" ) && !m_pipelineStats )
+  {
+    fprintf( stderr, "[gpu] ECM_GPU_PIPELINE_STATS: the device lacks VK_KHR_pipeline_executable_properties\n" );
+  }
   if( !has.features.shaderInt16 || !has.features.shaderInt64 || !has11.storageBuffer16BitAccess
       || !has12.storageBuffer8BitAccess || !has12.shaderInt8 || !has12.bufferDeviceAddress )
   {
@@ -423,9 +497,13 @@ GPU_LOAD_INSTANCE( EnumerateDeviceExtensionProperties )
   useFault.sType       = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT;
   useFault.deviceFault = VK_TRUE;
   useFault.pNext       = &use11;
+  VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR useStats{};
+  useStats.sType                  = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR;
+  useStats.pipelineExecutableInfo = VK_TRUE;
+  useStats.pNext                  = wantFault ? (void*) &useFault : (void*) &use11;
   VkPhysicalDeviceFeatures2 use{};
   use.sType                = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
-  use.pNext                = wantFault ? (void*) &useFault : (void*) &use11;
+  use.pNext                = m_pipelineStats ? (void*) &useStats : wantFault ? (void*) &useFault : (void*) &use11;
   use.features.shaderInt16 = VK_TRUE;
   use.features.shaderInt64 = VK_TRUE;
 
@@ -482,6 +560,10 @@ GPU_LOAD_INSTANCE( EnumerateDeviceExtensionProperties )
   {
     extNames.push_back( VK_EXT_DEVICE_FAULT_EXTENSION_NAME );
   }
+  if( m_pipelineStats )
+  {
+    extNames.push_back( VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME );
+  }
   deviceInfo.enabledExtensionCount   = (uint32_t) extNames.size();
   deviceInfo.ppEnabledExtensionNames = extNames.empty() ? nullptr : extNames.data();
   check( m_vk.CreateDevice( m_physical, &deviceInfo, nullptr, &m_device ), "vkCreateDevice" );
@@ -489,6 +571,14 @@ GPU_LOAD_INSTANCE( EnumerateDeviceExtensionProperties )
   {
     s_faultDevice  = m_device;
     s_getFaultInfo = (PFN_vkGetDeviceFaultInfoEXT) m_vk.GetDeviceProcAddr( m_device, "vkGetDeviceFaultInfoEXT" );
+  }
+  if( m_pipelineStats )
+  {
+    s_getExecutables = (PFN_vkGetPipelineExecutablePropertiesKHR) m_vk.GetDeviceProcAddr(
+      m_device, "vkGetPipelineExecutablePropertiesKHR" );
+    s_getStatistics = (PFN_vkGetPipelineExecutableStatisticsKHR) m_vk.GetDeviceProcAddr(
+      m_device, "vkGetPipelineExecutableStatisticsKHR" );
+    m_pipelineStats = s_getExecutables && s_getStatistics;
   }
 
   auto deviceFn = [this]( const char* name ) {
@@ -855,11 +945,15 @@ void Kernel::create( Context& ctx, const uint32_t* spirv, size_t bytes, uint32_t
     pipelineInfo.stage.pName  = "main";
     pipelineInfo.stage.pSpecializationInfo = specialization.empty() ? nullptr : &spec;
     pipelineInfo.layout       = m_layout;
+    pipelineInfo.flags        = ctx.pipelineStats() ? VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR : 0;
     // (ECM_GPU_PIPELINE_TIMES: each pipeline's name before a compile and its creation time after, on stderr; a cold
     // intra_rec pipeline takes minutes, and
     // VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT does not shorten it on NVIDIA's driver)
     const auto        start     = std::chrono::steady_clock::now();
-    const std::string cachePath = pipelineCachePath( ctx, spirv, bytes, name, specialization );
+    // (ECM_GPU_PIPELINE_STATS: compiled anew and not cached, for its statistics)
+    const std::string cachePath = ctx.pipelineStatsFresh()
+                                    ? std::string()
+                                    : pipelineCachePath( ctx, spirv, bytes, name, specialization );
     const std::vector<char> cached = cachePath.empty() ? std::vector<char>() : readFile( cachePath );
     VkPipelineCache   cache     = VK_NULL_HANDLE;
     if( !cachePath.empty() )
@@ -892,6 +986,10 @@ void Kernel::create( Context& ctx, const uint32_t* spirv, size_t bytes, uint32_t
       fprintf( stderr, "[gpu] pipeline %s: %.1f s%s\n", name,
                std::chrono::duration<double>( std::chrono::steady_clock::now() - start ).count(),
                !cached.empty() ? " (from its cache file)" : "" );
+    }
+    if( res == VK_SUCCESS && ctx.pipelineStats() )
+    {
+      printPipelineStatistics( dev, m_pipeline, name );
     }
   }
   vk.DestroyShaderModule( dev, module, nullptr );
