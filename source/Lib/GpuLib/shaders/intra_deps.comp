@@ -740,7 +740,8 @@ void dependencies( int comp )
     addAreaDeps( 0, t.x - linesLeft, t.y - linesAbove, t.x + above - 1, t.y - 1 );
     addAreaDeps( 0, t.x - linesLeft, t.y, t.x - 1, t.y + left - 1 );
   }
-  if( ( t.lm & LM_ACTIVE ) != 0 )   // CCLM: the luma it downsamples
+  // CCLM: the luma it downsamples (also LM chroma fusion's first type in an inter slice: MMLM's CCLM, not CCCM)
+  if( ( t.lm & LM_ACTIVE ) != 0 || ( lmFusionType( t ) == 1 && ( ( t.lm >> LM_CCCM_SHIFT ) & 3 ) == 0 ) )
   {
     cclmDeps( t );
   }

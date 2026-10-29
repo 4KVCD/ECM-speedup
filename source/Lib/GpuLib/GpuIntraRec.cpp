@@ -6689,8 +6689,12 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
   else if( !isLuma( compID ) && pu.isChromaFusion > 1 && !GPU_CFLM )         why = "CFLM";
   else if( !isLuma( compID ) && pu.isChromaFusion > 1 && pu.cccmNoSubFlag )  why = "CFLM without subsampling";
   else if( !isLuma( compID ) && pu.isChromaFusion && !GPU_CCCM )    why = "LM chroma fusion";
-  // (geneChromaFusionPred's first type in an inter slice blends an MMLM CCLM model's prediction instead of CCCM's)
-  else if( !isLuma( compID ) && pu.isChromaFusion == 1 && !slice.isIntra() ) why = "LM chroma fusion in an inter slice";
+  // (geneChromaFusionPred's first type, also in an inter slice, where it blends an MMLM CCLM model's prediction instead
+  // of CCCM's - adjusted by the PU's cclmOffsets, which only LM modes' syntax sets and the block's record has no room
+  // for -, only where the CCCM models are available)
+  else if( !isLuma( compID ) && pu.isChromaFusion == 1 && !slice.isIntra()
+           && ( pu.cclmOffsets.cb0 || pu.cclmOffsets.cb1 || pu.cclmOffsets.cr0 || pu.cclmOffsets.cr1 ) )
+    why = "LM chroma fusion in an inter slice with slope adjustments";
   else if( !isLuma( compID ) && pu.isChromaFusion == 1 && !PU::cccmMultiModeAvail( pu, MMLM_CHROMA_IDX, true ) )
     why = "LM chroma fusion without its CCCM models";
   else if( !isLuma( compID ) && pu.isChromaFusion && area != cu.blocks[compID] )
@@ -6998,18 +7002,22 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
   // LM chroma fusion (geneChromaFusionPred, its first type): the plain CCCM models of MMLM_CHROMA_IDX blended in, the
   // weight of the block's own prediction by whether the CUs below-left and above-right of the CU are LM CUs (1 both,
   // 3 neither, else 2), its CCCM luma buffer and prediction in the scratch; the models are the CU's curCand (a CCP
-  // merge candidate of its neighbours, not of the CTU row's history: CU::saveModelsInHCCP takes LM CUs only)
+  // merge candidate of its neighbours, not of the CTU row's history: CU::saveModelsInHCCP takes LM CUs only). In an
+  // inter slice MMLM_CHROMA_IDX's CCLM models instead (no CCCM bits: intra_rec's fusionCclm), the weight 2, the
+  // prediction alone in the scratch
   if( !isLuma( compID ) && pu.isChromaFusion == 1 )
   {
     t.ccp = ccpRecord( m, pu );
+    const bool            intra = slice.isIntra();
     const Position        posBL = pu.Cb().bottomLeft(), posTR = pu.Cb().topRight();
     const PredictionUnit* left  = cu.cs->getPURestricted( posBL.offset( -1, 0 ), pu, CHANNEL_TYPE_CHROMA );
     const PredictionUnit* above = cu.cs->getPURestricted( posTR.offset( 0, -1 ), pu, CHANNEL_TYPE_CHROMA );
     const bool leftLm  = left && PU::isLMCMode( left->intraDir[1] );
     const bool aboveLm = above && PU::isLMCMode( above->intraDir[1] );
-    const int  w0      = leftLm && aboveLm ? 1 : !leftLm && !aboveLm ? 3 : 2;
-    t.lm = ( 1 << LM_CCCM_SHIFT ) | LM_FUSION | ( 1 << LM_FUSION_TYPE_SHIFT ) | ( w0 << LM_FUSION_W_SHIFT );
-    m.cccmScratchWords = std::max( m.cccmScratchWords, cccmLumaArea( area, false ) + (int) area.area() );
+    const int  w0      = !intra ? 2 : leftLm && aboveLm ? 1 : !leftLm && !aboveLm ? 3 : 2;
+    t.lm = ( intra ? 1 << LM_CCCM_SHIFT : 0 ) | LM_FUSION | ( 1 << LM_FUSION_TYPE_SHIFT ) | ( w0 << LM_FUSION_W_SHIFT );
+    const int words    = ( intra ? cccmLumaArea( area, false ) : 0 ) + (int) area.area();
+    m.cccmScratchWords = std::max( m.cccmScratchWords, words );
   }
 #endif
 #if GPU_CFLM
@@ -12359,8 +12367,11 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
         addArea( COMPONENT_Y, t.x - a[3], t.y, t.x - 1, t.y + a[1] - 1 );
       }
       // CCLM: the luma its downsampling reads (xGetLumaRecPixels, 4:2:0): the co-located block, the rows above it (up
-      // to 3; MDLM's template 2W wide) and the columns left of it (3; 2H high)
-      if( t.lm & LM_ACTIVE )
+      // to 3; MDLM's template 2W wide) and the columns left of it (3; 2H high). Also LM chroma fusion's first type in
+      // an inter slice (MMLM's CCLM, not CCCM: LM_FUSION of type 1 without CCCM bits)
+      const bool fusionCclm = ( t.lm & LM_FUSION ) && ( ( t.lm >> LM_FUSION_TYPE_SHIFT ) & 3 ) == 1
+                              && ( ( t.lm >> LM_CCCM_SHIFT ) & 3 ) == 0;
+      if( ( t.lm & LM_ACTIVE ) || fusionCclm )
       {
         const int lx = t.x << 1, ly = t.y << 1, lw = t.w << 1, lh = t.h << 1;
         addArea( COMPONENT_Y, lx, ly, lx + lw - 1, ly + lh - 1 );

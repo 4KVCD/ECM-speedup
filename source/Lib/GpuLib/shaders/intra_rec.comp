@@ -2902,8 +2902,10 @@ void main()
 
     // ----- LM chroma fusion (geneChromaFusionPred): of its first type, and of CCP merge fusion with CCCM, the CCCM
     // prediction it blends in (storeRegion), into the scratch before the references and the prediction take s_tmp and
-    // the angular arrays; of CFLM the area whose chroma buffer keeps the regular prediction (intra_cccm.glsl)
-    if( WITH_CCCM && lmFusionType( t ) == 1 )
+    // the angular arrays (in an inter slice MMLM's CCLM prediction instead, below); of CFLM the area whose chroma
+    // buffer keeps the regular prediction (intra_cccm.glsl)
+    const bool fusionCclm = WITH_CCCM && lmFusionType( t ) == 1 && ( ( t.lm >> LM_CCCM_SHIFT ) & 3 ) == 0;
+    if( WITH_CCCM && lmFusionType( t ) == 1 && !fusionCclm )
     {
       cccmPrediction( t, false, lid, NT );
     }
@@ -2949,6 +2951,35 @@ void main()
       for( int i = lid; i <= predStride + predHSize && !blend; i += NT ) s_ref[0][i] = s_tmp[i];
       for( int i = lid; i <= predStride + predHSize && blend && !timdBlend; i += NT ) s_ref[1][i] = s_ref[0][i];
       SYNC();
+    }
+
+    // LM chroma fusion's first type in an inter slice (geneChromaFusionPred: predIntraChromaLM of MMLM_CHROMA_IDX, not
+    // CCCM): the two models from the block's references as its own mode has them - filtered where it filters them,
+    // xGetLMParametersLMS's getPredictorPtr - (an MMLM block's; its slope fields, which fusion's fields take, say no
+    // adjustment), the CU's CCP record of them (pu.curCand: CCP_TYPE_CCLM | CCP_TYPE_MMLM), their prediction into the
+    // scratch where storeRegion blends it in (s_tmp is free again: a fusion block blends nothing)
+    if( fusionCclm )
+    {
+      Tu mmlm = t;
+      mmlm.dirMode = MMLM_CHROMA_IDX;
+      mmlm.lm      = ( t.lm & ( LM_INSIDE | LM_RECORD_NO_INSIDE ) ) | ( 8 << LM_DELTA0_SHIFT )
+                     | ( 8 << LM_DELTA1_SHIFT );   // (8: no slope adjustment)
+      const int lx = t.x << 1, ly = t.y << 1, at = cccmFusionPredBase( t );
+      cclmAvailability( mmlm, lid, NT );
+      if( lid == 0 )
+      {
+        cclmModel( mmlm, lx, ly, predStride, 0, 0 );
+        if( t.ccp >= 0 )
+        {
+          cclmStoreCcp( mmlm );
+        }
+      }
+      SYNC();
+      for( int i = lid; i < t.w * t.h; i += NT )
+      {
+        WBufI32( P.scratch ).v[at + i] = cclmPredSample( mmlm, lx, ly, i % t.w, i / t.w, maxPel, 0 );
+      }
+      cccmSync();
     }
 
     // ----- PDP (intra_pdp.glsl): the filters of a block it may predict for the block's mode (a MIP block's for its MIP

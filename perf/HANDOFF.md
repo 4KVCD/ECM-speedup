@@ -3369,6 +3369,11 @@ M167 (2026-10-29): inter OBMC with an IBC neighbour over several TUs or ASBT par
 (OBMC_REC_PARTS) names the CU's records on its band; the first one on a strip copies it and tests it against the
 prediction of the record holding each sample (obmcStripFirst, obmcCuPred). Results (27 streams, grn181 with
 ECM_GPU_FULL_PIPELINE, M160 to M168 and the block clock): every picture identical. Inter CUs from the CPU: 8 -> 0.
+M168 (2026-10-29): LM chroma fusion in inter slices: MMLM's two CCLM models (not CCCM's), weights 2 : 2, the CCP
+record CCLM | MMLM (fusionCclm in intra_rec, fitted from the references as the block's own mode has them - filtered
+where it filters them: getPredictorPtr -; cclmDeps in intra_deps and the host's mirror). Results (27 streams, grn181
+with ECM_GPU_FULL_PIPELINE, M160 to M168 and the block clock): every picture identical. Intra CUs from the CPU: 1 ->
+0.
 Tried after M125 and left out (idle 3070, median of 5 or 7): the CCP merge history's and list's records read ahead in
 parallel with signatures (neutral); IntraTMP's refinement ranks counting only the windows that overlap no other
 (+3 % aiodd: the weaker filter sends more positions to the walk) or comparing only positions of overlapping windows
