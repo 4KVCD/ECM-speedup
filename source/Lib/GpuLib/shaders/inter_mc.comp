@@ -1459,18 +1459,21 @@ int mcPlain( BufI32 jb, int o, BufI32 lb, int comp, int x, int y, int puW, int p
 }
 
 // a multi-hypothesis CU's prediction v at component sample (x, y) with its hypotheses added (xAddHypMC), their record
-// at r in pc.affine: the count, then per hypothesis its reference slot, its vector, its half-sample filter flag and its
-// weight w of 8 - a uni-prediction at the vector, added by addHypothesisAndClip: ((8 - w) v + w h + 4) >> 3, clipped
+// at r in pc.affine: the count, then per hypothesis its reference slot, its vector, its half-sample filter flag, its
+// weight w of 8 and per component its LIC model (mcLic's scale and offset; one that changes nothing without LIC) - a
+// uni-prediction at the vector through the model, added by addHypothesisAndClip: ((8 - w) v + w h + 4) >> 3, clipped
 int mcHypotheses( int r, int comp, int x, int y, int puW, int puH, int bd, int clipMin, int clipMax, int v )
 {
   BufI32    a = BufI32( pc.affine );
   const int shift = comp == 0 ? 4 : 5, mask = ( 1 << shift ) - 1;
   [[dont_unroll]] for( int i = 0; i < a.v[r]; i++ )
   {
-    const int   h = r + 1 + i * 5;
+    const int   h = r + 1 + i * 11;
     const ivec2 mv = ivec2( a.v[h + 1], a.v[h + 2] );
-    const int   p = mcPredict( a.v[h], comp, x + ( mv.x >> shift ), y + ( mv.y >> shift ), mv.x & mask, mv.y & mask,
-                               a.v[h + 3] != 0, false, puW, puH, bd, clipMin, clipMax );
+    const int   p = mcLic( a, h + 5, 0, comp,
+                           mcPredict( a.v[h], comp, x + ( mv.x >> shift ), y + ( mv.y >> shift ), mv.x & mask,
+                                      mv.y & mask, a.v[h + 3] != 0, false, puW, puH, bd, clipMin, clipMax ),
+                           clipMin, clipMax );
     const int   w = a.v[h + 4];
     v = clamp( ( ( 8 - w ) * v + w * p + 4 ) >> 3, clipMin, clipMax );
   }

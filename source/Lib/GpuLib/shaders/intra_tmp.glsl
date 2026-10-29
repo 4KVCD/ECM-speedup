@@ -455,6 +455,22 @@ int licMsb( uint v )
   return v == 0u ? 1 : findMSB( v ) + 1;
 }
 
+// sample idx of the reference template above (top) or left of chroma block c (in its samples) of component comp at
+// vector mv, whose chroma part has a fraction (xGetIbcLicPredBlkTpl of a chroma component): with the SPS's fractional
+// IBC predicted at the vector moved by one luma sample - half a chroma sample - with the bilinear filter, else copied
+// at its integer part's row above / column left
+int tmpLicChromaRef( Cu c, int comp, ivec2 mv, bool top, int idx, int bitDepth )
+{
+  if( P.ibcFrac != 0 )
+  {
+    const ivec2 moved = mv + ( top ? ivec2( 0, -16 ) : ivec2( -16, 0 ) );
+    return ibcChromaPredict( comp, c.x, c.y, top ? c.w : 1, top ? 1 : c.h, moved, top ? idx : 0, top ? 0 : idx, g_ti,
+                             bitDepth, true, false );
+  }
+  const ivec2 b = mv >> 5;
+  return top ? recoAt( comp, c.x + b.x + idx, c.y + b.y - 1 ) : recoAt( comp, c.x + b.x - 1, c.y + b.y + idx );
+}
+
 // the LIC model of IntraTMP CU c at vector mv (1/16 samples; invocation 0; the scratch from TS_POS its work area):
 // xGetSublkTemplate's one-sample templates - the row above the CU (but for IBC_LIC_IDX_L or required template 2) and
 // the column left of it (but for IBC_LIC_IDX_T or required template 1) where the CU has a neighbour there and the row /
@@ -464,15 +480,17 @@ int licMsb( uint v )
 // xGetLICParamGeneral steps (numSteps per side, by the smaller side but for one side's own index), fitted as inter
 // LIC's one model (m_licShift 5, the sums cropped, m_licMultApprox's division) or with IBC_LIC_IDX_M as MMLM's two
 // split at the reference samples' mean (xLMSampleClassifiedTraining over 2^cntShift samples, the means without
-// division; cclmFit)
-int[TMP_LIC] tmpLicModel( Cu c, ivec2 mv, ivec2 delta, int licIdx, int req, int bitDepth )
+// division; cclmFit). comp: the component; a chroma one (4:2:0; c in its samples) is that of a single tree's DBV copy
+// at a vector with a chroma fraction (predIntraDbv's getPredIBCBlk, whose xPredInterBlk applies xLocalIlluComp of the
+// component): the luma check of the vector moved by a chroma sample, the templates tmpLicChromaRef's
+int[TMP_LIC] tmpLicModel( Cu c, ivec2 mv, ivec2 delta, int licIdx, int req, int bitDepth, int comp )
 {
-  const int   W = c.w, H = c.h, precShift = max( 0, bitDepth - 12 );
-  const ivec2 mvTop = mv + ivec2( 0, -16 ), mvLeft = mv + ivec2( -16, 0 );
+  const int   W = c.w, H = c.h, precShift = max( 0, bitDepth - 12 ), sc = comp != 0 ? 1 : 0;
+  const ivec2 mvTop = mv + ivec2( 0, -16 << sc ), mvLeft = mv + ivec2( -16 << sc, 0 );
   const bool  above = c.y > 0 && licIdx != IBC_LIC_IDX_L && req != 2
-                      && ibcAreaValid( c.x, c.y, W, 1, mvTop >> 4, 0, 0, g_ti );
+                      && ibcAreaValid( c.x << sc, c.y << sc, W << sc, 1, mvTop >> 4, 0, 0, g_ti );
   const bool  left  = c.x > 0 && licIdx != IBC_LIC_IDX_T && req != 1
-                      && ibcAreaValid( c.x, c.y, 1, H, mvLeft >> 4, 0, 0, g_ti );
+                      && ibcAreaValid( c.x << sc, c.y << sc, 1, H << sc, mvLeft >> 4, 0, 0, g_ti );
   const int  minDimBit = licIdx == IBC_LIC_IDX_T ? findMSB( W ) : licIdx == IBC_LIC_IDX_L ? findMSB( H )
                                                                                           : findMSB( min( W, H ) );
   const int  maxNumMinus1 = 30 - 2 * min( bitDepth, 12 ) - 1;
@@ -495,9 +513,12 @@ int[TMP_LIC] tmpLicModel( Cu c, ivec2 mv, ivec2 delta, int licIdx, int req, int 
     for( int k = 0; k < numSteps; k++ )
     {
       const int idx = ( k * ( side == 0 ? W : H ) ) >> dimShift;
-      const int rf  = ibcPredict( c.x, c.y, side == 0 ? W : 1, side == 0 ? 1 : H, side == 0 ? mvTop : mvLeft, true,
-                                  side == 0 ? idx : 0, side == 0 ? 0 : idx, g_ti, bitDepth, delta, false ) >> precShift;
-      const int rc  = ( side == 0 ? recoAt( 0, c.x + idx, c.y - 1 ) : recoAt( 0, c.x - 1, c.y + idx ) ) >> precShift;
+      const int rf  = ( comp != 0 ? tmpLicChromaRef( c, comp, mv, side == 0, idx, bitDepth )
+                        : ibcPredict( c.x, c.y, side == 0 ? W : 1, side == 0 ? 1 : H, side == 0 ? mvTop : mvLeft, true,
+                                      side == 0 ? idx : 0, side == 0 ? 0 : idx, g_ti, bitDepth, delta, false ) )
+                      >> precShift;
+      const int rc  = ( side == 0 ? recoAt( comp, c.x + idx, c.y - 1 ) : recoAt( comp, c.x - 1, c.y + idx ) )
+                      >> precShift;
       tsSet( REF + n, rf );
       tsSet( REC + n, rc );
       n++;
@@ -909,7 +930,7 @@ void tmpFracSearch( Cu c, int cuIndex, int tempType, int bitDepth, int lid, int 
       BufI32      data   = BufI32( P.timdData );
       const ivec2 delta  = ivec2( ( mv.x >> 4 ) < bv.x ? 1 : 0, ( mv.y >> 4 ) < bv.y ? 1 : 0 );
       const int   reqLic = data.v[c.tmp + TMP_HEAD_LIC_EXT] != 0 ? 0 : req;
-      const int   model[TMP_LIC] = tmpLicModel( c, mv, delta, licIdc - 1, reqLic, bitDepth );
+      const int   model[TMP_LIC] = tmpLicModel( c, mv, delta, licIdc - 1, reqLic, bitDepth, 0 );
       const int   slot = data.v[c.tmp + TMP_HEAD_LIC_SLOT];
       for( int k = 0; k < TMP_LIC; k++ )
       {
@@ -1210,7 +1231,7 @@ void tmpFusionSetup( Cu c, int cuIndex, int head, int tempType, int n, int bitDe
     if( lic )
     {
       const ivec2 bv = bvUnpack( o.v[at + DIMD_OUT_TMP_BV + first + j] );
-      const int   m[TMP_LIC] = tmpLicModel( c, bv << 4, ivec2( 0 ), 0, ext ? 0 : req[j], bitDepth );
+      const int   m[TMP_LIC] = tmpLicModel( c, bv << 4, ivec2( 0 ), 0, ext ? 0 : req[j], bitDepth, 0 );
       o.v[at + DIMD_OUT_TMP_FUS_LIC + 3 * j]     = m[1];
       o.v[at + DIMD_OUT_TMP_FUS_LIC + 3 * j + 1] = m[2];
       o.v[at + DIMD_OUT_TMP_FUS_LIC + 3 * j + 2] = m[3];
@@ -2199,7 +2220,7 @@ void tmpNode( Cu c, int cuIndex, int bitDepth, int lid, int NT )
       else if( licIdc != 0 )
       {
         const int req = data.v[head + TMP_HEAD_LIC_EXT] != 0 ? 0 : tsGet( TS_FRAC_REQ );
-        const int model[TMP_LIC] = tmpLicModel( c, bv[0] << 4, ivec2( 0 ), licIdc - 1, req, bitDepth );
+        const int model[TMP_LIC] = tmpLicModel( c, bv[0] << 4, ivec2( 0 ), licIdc - 1, req, bitDepth, 0 );
         const int slot = data.v[head + TMP_HEAD_LIC_SLOT];
         for( int k = 0; k < TMP_LIC; k++ )
         {

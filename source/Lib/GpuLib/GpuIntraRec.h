@@ -128,6 +128,9 @@ public:
   /// inter CU cu, which the CPU has predicted by xSubPuMC (sub-block merge, AMVP-SbTMVP, affine sub-PU BDOF): its
   /// predictions (InterPrediction::m_gpuSubPu), recordInterCu's
   void subPuMotion( const CodingUnit& cu, const std::vector<int32_t>& items );
+  /// multi-hypothesis CU cu with hypotheses of LIC: the models the CPU derived for them (InterPrediction::m_gpuHypLic),
+  /// recordInterCu's
+  void hypothesisLic( const CodingUnit& cu, const std::vector<int32_t>& models );
   /// GPM CU cu, which the CPU has predicted (motionCompensationGeo): the blend it took (1 the plain one, 2 the rounded
   /// one after each part's own OBMC, 3 the rounded one with an intra part, 0 another), the split direction, the
   /// blending index, each part's motion (InterPrediction::m_gpuGeoPart) and its motion and flags at its OBMC (m_gpuGeoMi, m_gpuGeoObmc), and with

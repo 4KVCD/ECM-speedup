@@ -3228,6 +3228,7 @@ void DecCu::xReconInter(CodingUnit &cu)
     const bool chroma = isChromaEnabled(cu.chromaFormat) && cu.Cb().valid();
 #if ECM_VULKAN
     m_pcInterPred->m_gpuSubPu.clear();
+    m_pcInterPred->m_gpuHypLic.clear();
 #endif
     if (luma && (chroma || !isChromaEnabled(cu.chromaFormat)))
     {
@@ -3245,6 +3246,10 @@ void DecCu::xReconInter(CodingUnit &cu)
     if( m_gpuIntraRec && !m_pcInterPred->m_gpuSubPu.empty() )   // (partial verification: xSubPuMC's predictions)
     {
       m_gpuIntraRec->subPuMotion( cu, m_pcInterPred->m_gpuSubPu );
+    }
+    if( m_gpuIntraRec && !m_pcInterPred->m_gpuHypLic.empty() )   // (partial verification: the hypotheses' LIC models)
+    {
+      m_gpuIntraRec->hypothesisLic( cu, m_pcInterPred->m_gpuHypLic );
     }
 #endif
 #if JVET_AF0159_AFFINE_SUBPU_BDOF_REFINEMENT

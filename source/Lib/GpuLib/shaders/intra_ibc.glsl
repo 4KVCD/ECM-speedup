@@ -224,17 +224,23 @@ bool ibcChromaValid( int comp, int px, int py, int w, int h, ivec2 mv, int xTap,
          && decodedBefore( om, r >> 1, d >> 1, before ) && decodedBefore( om, l >> 1, t >> 1, before );
 }
 
+// tap k of chroma fraction f: m_chromaFilter's, or the bilinear one's (m_bilinearFilterChroma, x 4)
+int ibcChromaTap( bool bilinear, int f, int k )
+{
+  return bilinear ? ( k == 0 ? 256 - 8 * f : 8 * f ) : IBC_CHROMA_FILTER[f * 6 + k];
+}
+
 // sample (i, j) of the chroma prediction of the region of w x h at (px, py) of component comp at vector mv (1/16 luma
 // samples) for block `before` (xPredInterBlk with isIBC: without the SPS's fractional IBC, or at an integer chroma
-// vector, the copy at the integer part; else m_chromaFilter in one pass rounded to the sample or in two through the
-// 14-bit intermediate, padded as xPredIBCBlkPadding pads where checkValidBv's reach - 6 chroma taps - is not all
-// decoded: IBC_INT_BV_VALID)
+// vector, the copy at the integer part; else m_chromaFilter - or with `bilinear` (filterIdx 1: IBC LIC's templates)
+// the bilinear filter - in one pass rounded to the sample or in two through the 14-bit intermediate, padded as
+// xPredIBCBlkPadding pads where checkValidBv's reach - the filter's chroma taps - is not all decoded: IBC_INT_BV_VALID)
 int ibcChromaPredict( int comp, int px, int py, int w, int h, ivec2 mv, int i, int j, int before, int bitDepth,
-                      bool hp )
+                      bool bilinear, bool hp )
 {
   IbcRef    g;
   const int fx = P.ibcFrac != 0 ? mv.x & 31 : 0, fy = P.ibcFrac != 0 ? mv.y & 31 : 0;
-  const int taps = 6, lead = 2;
+  const int taps = bilinear ? 2 : 6, lead = ( taps >> 1 ) - 1;
   g.ox     = px + ( mv.x >> 5 );
   g.oy     = py + ( mv.y >> 5 );
   g.w      = w;
@@ -255,19 +261,26 @@ int ibcChromaPredict( int comp, int px, int py, int w, int h, ivec2 mv, int i, i
   {
     const int k = n / nx, m = n % nx;
     const int v = ibcRef( g, fx != 0 ? i - lead + m : i, fy != 0 ? j - lead + k : j )
-                  * ( fx != 0 ? IBC_CHROMA_FILTER[fx * 6 + m] : 1 );
+                  * ( fx != 0 ? ibcChromaTap( bilinear, fx, m ) : 1 );
     if( !both )
     {
-      sum += v * ( fy != 0 ? IBC_CHROMA_FILTER[fy * 6 + k] : 1 );
+      sum += v * ( fy != 0 ? ibcChromaTap( bilinear, fy, k ) : 1 );
       continue;
     }
     row = m == 0 ? v : row + v;
     if( m == nx - 1 )
     {
-      sum += IBC_CHROMA_FILTER[fy * 6 + k] * ( ( row - ( 8192 << sh1 ) ) >> sh1 );
+      sum += ibcChromaTap( bilinear, fy, k ) * ( ( row - ( 8192 << sh1 ) ) >> sh1 );
     }
   }
   return ibcRound( sum, fx != 0 || fy != 0, both, sh1, sh2, bitDepth, hp );
+}
+
+// the prediction with m_chromaFilter (above)
+int ibcChromaPredict( int comp, int px, int py, int w, int h, ivec2 mv, int i, int j, int before, int bitDepth,
+                      bool hp )
+{
+  return ibcChromaPredict( comp, px, py, w, h, mv, i, j, before, bitDepth, false, hp );
 }
 
 #endif

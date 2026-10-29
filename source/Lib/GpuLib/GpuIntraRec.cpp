@@ -6547,8 +6547,10 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
 #if JVET_AC0071_DBV
   // DBV (JVET-AC0071, the parsed DBV_CHROMA_IDX): of a single tree (predIntraDbv's first branch) the copy at the vector
   // of the CU's own luma (an IntraTMP, BVG-DIMD or EIP-with-vector CU, its node's: CU_CHROMA_DBV), planar where it has
-  // none; its CU one chroma block (predIntraDbv copies at the PU's position), 4:2:0, without IBC's LIC or an RR-IBC
-  // flip. A dual tree's: chroma reordering's (CU_CHROMA_REORDER: its node takes deriveChromaBv's vectors,
+  // none; its CU one chroma block (predIntraDbv copies at the PU's position), 4:2:0, without an RR-IBC flip; with an
+  // IntraTMP CU's LIC at a vector with a chroma fraction through the block's own model (intra_tmp.glsl's tmpLicModel of
+  // a chroma component), but for CFLM, whose template arms take models at their own vectors. A dual tree's: chroma
+  // reordering's (CU_CHROMA_REORDER: its node takes deriveChromaBv's vectors,
   // refineChromaBv's template matching, the flip); an adaptive dual tree's separate tree's is not on the GPU. Its first
   // type of LM chroma fusion blends CCCM into the copy as into any prediction (storeRegion); CFLM's template is copies
   // at the vector too (xCflmCreateChromaPred's DBV branch: intra_cccm.glsl's cflmDbvArm), of the arms with a PU of
@@ -6558,8 +6560,10 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
   else if( dbv && ( cu.chromaFormat != CHROMA_420 || area != cu.blocks[compID] ) )
     why = "DBV of a CU with several chroma blocks or not 4:2:0";
   else if( dbv && pu.isChromaFusion > 1 && !cflmDbvArms( pu, area ) ) why = "DBV with CFLM without a template arm";
-  else if( dbv && !CS::isDualITree( cs ) && ( cu.rribcFlipType || cu.ibcLicFlag ) )
-    why = cu.ibcLicFlag ? "DBV with IBC LIC" : "DBV with a flip";
+  else if( dbv && !CS::isDualITree( cs ) && cu.rribcFlipType )     why = "DBV with a flip";
+  else if( dbv && !CS::isDualITree( cs ) && cu.ibcLicFlag && ( !cu.tmpFlag || !cu.tmpLicFlag || cu.ibcFilterFlag ) )
+    why = "DBV with IBC LIC of a CU other than IntraTMP";
+  else if( dbv && !CS::isDualITree( cs ) && cu.ibcLicFlag && pu.isChromaFusion > 1 ) why = "DBV with IBC LIC and CFLM";
 #endif
 #if JVET_AH0209_PDP
   // PDP: a PDP size's CU is one block

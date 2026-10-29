@@ -3127,6 +3127,7 @@ void main()
         // chroma reordering (a dual tree) its node's vector refined (crDbvRefine), its reconstruction flipped
         const Cu c = BufCu( P.cus ).v[t.cu];
         ivec2    mv;
+        int      lic = 0;
         if( c.kind == CU_CHROMA_REORDER )
         {
           if( lid == 0 )
@@ -3146,13 +3147,35 @@ void main()
         {
           const ivec4 v = dbvLumaVector( c.lumaCu );
           mv = ibcChromaValid( t.comp, c.x, c.y, c.w, c.h, v.xy, 0, 0, g_ti ) ? v.xy : v.zw << 4;
+          // with an IntraTMP luma CU's LIC, at a vector with a chroma fraction (predIntraDbv's getPredIBCBlk, even
+          // without the SPS's fractional IBC) the copy goes through the block's own model (the workgroup's scratch is
+          // there: the luma CU's record took it)
+          const Cu l = BufCu( P.cus ).v[c.lumaCu];
+          lic = l.kind == CU_TMP && ( ( mv.x | mv.y ) & 31 ) != 0 ? BufI32( P.timdData ).v[l.tmp + TMP_HEAD_LIC] : 0;
+          if( lic > 0 )
+          {
+            if( lid == 0 )
+            {
+              const int m[TMP_LIC] = tmpLicModel( c, mv, ivec2( 0 ), lic - 1, 0, t.bitDepth, t.comp );
+              for( int k = 0; k < TMP_LIC; k++ )
+              {
+                s_ibcLic[k] = m[k];
+              }
+            }
+            tsSync();
+          }
         }
         g_dbvMv = mv;
+        int licModel[TMP_LIC];
+        for( int k = 0; k < TMP_LIC; k++ )
+        {
+          licModel[k] = lic > 0 ? s_ibcLic[k] : 0;
+        }
         for( int i = lid; i < N; i += NT )
         {
-          emitPred( t, i % W, i / W,
-                    ibcChromaPredict( t.comp, c.x, c.y, c.w, c.h, mv, t.x - c.x + i % W, t.y - c.y + i / W, g_ti,
-                                      t.bitDepth, false ), false );
+          const int v = ibcChromaPredict( t.comp, c.x, c.y, c.w, c.h, mv, t.x - c.x + i % W, t.y - c.y + i / W, g_ti,
+                                          t.bitDepth, false );
+          emitPred( t, i % W, i / W, lic > 0 ? tmpLicSample( v, licModel, maxPel ) : v, false );
         }
       }
       else if( ( ( g_bvSubs >> bvSub ) & 1 ) != 0 )

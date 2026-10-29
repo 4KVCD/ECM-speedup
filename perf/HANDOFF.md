@@ -3335,6 +3335,12 @@ adjustment's range and ccpCccmModel's features hold for them; M148's switch was 
 differences). Results (27 streams, grn173, M155 to M159): every picture identical. Intra CUs from the CPU: 13 -> 0;
 with M155 to M159 86 -> 24 (DBV with IBC LIC 16, BVG-CCCM with joint CbCr 3, IntraTMP OBMC with an SGPM neighbour 2,
 three of one CU each).
+M160 (2026-10-29): DBV with IBC LIC: a single tree's DBV copy at a vector with a chroma fraction goes through the
+IntraTMP CU's LIC model of its chroma component (tmpLicModel with a component: the luma check of the vector moved by a
+chroma sample, the templates at the vector moved by one luma sample with the bilinear chroma filter,
+ibcChromaPredict's new filter choice). Results (8 streams with such CUs, grn174): every picture identical; Results (27
+streams, grn181 with ECM_GPU_FULL_PIPELINE, M160 to M168 and the block clock): every picture identical. Intra CUs from
+the CPU: DBV with IBC LIC 16 -> 0.
 Tried after M125 and left out (idle 3070, median of 5 or 7): the CCP merge history's and list's records read ahead in
 parallel with signatures (neutral); IntraTMP's refinement ranks counting only the windows that overlap no other
 (+3 % aiodd: the weaker filter sends more positions to the walk) or comparing only positions of overlapping windows

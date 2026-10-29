@@ -35,7 +35,7 @@ void ibcBlock( Tu t, int lid, int NT )
   {
     if( lid == 0 )
     {
-      const int m[TMP_LIC] = tmpLicModel( c, mv, ivec2( 0 ), lic - 1, 0, t.bitDepth );
+      const int m[TMP_LIC] = tmpLicModel( c, mv, ivec2( 0 ), lic - 1, 0, t.bitDepth, 0 );
       for( int k = 0; k < TMP_LIC; k++ )
       {
         s_ibcLic[k] = m[k];

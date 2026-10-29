@@ -103,7 +103,7 @@ int obmcUnitMode( int rec, int k )
   {                                                   // (spanIpmInfoSgpm: a vector's planar)
     CBufI32   o     = CBufI32( P.dimdOut );
     const int s     = o.v[n * DIMD_OUT + DIMD_OUT_SGPM_SPLIT], u = obUnit( rec, k, OBMC_U_MV + 1 );
-    const int bits  = BufI32( P.matrices ).v[trTab( TR_TAB_SGPM ) + obUnit( rec, k, OBMC_U_LIC ) + 2 * s + ( u >> 5 )];
+    const int bits  = BufI32( P.matrices ).v[trTab( TR_TAB_SGPM ) + obUnit( rec, k, OBMC_U_LIC ) + 8 * s + ( u >> 5 )];
     const int mode  = o.v[n * DIMD_OUT + DIMD_OUT_SGPM_MODE + ( ( bits >> ( u & 31 ) ) & 1 )];
     return mode >= NUM_LUMA_MODE ? PLANAR_IDX : mode;   // (SGPM_BV_START)
   }
@@ -915,8 +915,54 @@ void tmpObmc( Tu t, Cu c, int rec, int lid, int NT )
 
 // ----- an inter CU's OBMC with intra neighbours (JVET-AJ0161: subBlockOBMC's iState 1 segments)
 
-// an IBC neighbour's segment (OBMC_SEG_IBC) of an inter CU's OBMC record (flags its OBMC_REC_* flags), on strip st of
-// block t's component - the whole strip lies in the block, the CU's single TU -: its prediction at pred (the data's
+// whether block t is the first of OBMC record r's CU's records on its band (OBMC_REC_PARTS' table) to overlap strip st
+// of its component (without the table: the record's every block, a GPM CU's of separate OBMC)
+bool obmcStripFirst( Tu t, int r, ivec4 st )
+{
+  BufI32    rec = BufI32( P.timdData );
+  const int tab = rec.v[r + OBMC_REC_PARTS];
+  if( tab < 0 )
+  {
+    return true;
+  }
+  const int list = tab + rec.v[tab + t.comp];
+  for( int k = 0; k < rec.v[list]; k++ )
+  {
+    const int i = rec.v[list + 1 + k], bx = BufTu( P.tus ).v[i].x, by = BufTu( P.tus ).v[i].y;
+    if( st.x < bx + BufTu( P.tus ).v[i].w && bx < st.x + st.z && st.y < by + BufTu( P.tus ).v[i].h && by < st.y + st.w )
+    {
+      return i == g_ti;
+    }
+  }
+  return true;
+}
+
+// the CU's prediction before OBMC at sample (x, y) of block t's component on its band: in the record of OBMC record
+// r's table that holds it (OBMC_REC_PARTS), without the table block t's
+int obmcCuPred( Tu t, int r, int x, int y )
+{
+  BufI32    rec = BufI32( P.timdData );
+  const int tab = rec.v[r + OBMC_REC_PARTS];
+  int       at  = t.dbgOffset + ( y - t.y ) * t.w + x - t.x;
+  if( tab >= 0 )
+  {
+    const int list = tab + rec.v[tab + t.comp];
+    for( int k = 0; k < rec.v[list]; k++ )
+    {
+      const int i = rec.v[list + 1 + k], bx = BufTu( P.tus ).v[i].x, by = BufTu( P.tus ).v[i].y;
+      const int bw = BufTu( P.tus ).v[i].w;
+      if( x >= bx && x < bx + bw && y >= by && y < by + BufTu( P.tus ).v[i].h )
+      {
+        at = BufTu( P.tus ).v[i].dbgOffset + ( y - by ) * bw + x - bx;
+        break;
+      }
+    }
+  }
+  return int( CBufI16( P.interPred ).v[at] );
+}
+
+// an IBC neighbour's segment (OBMC_SEG_IBC) of an inter CU's OBMC record r (flags its OBMC_REC_* flags), on strip st
+// of block t's component - the first block of the CU on the strip, obmcStripFirst -: its prediction at pred (the data's
 // band, as inter_mc's mode 3 leaves a motion segment's) and its skip flag at d (OBMC_D_SKIP). The strip is
 // xSubBlockMotionCompensation's of MODE_IBC: xPredInterBlk's copy of the picture at vector mv - with two vectors
 // (OBMC_SEG_IBC2: JVET-AE0169's, of the default BCW weights) xPredInterBi's average of the copies at mv and mv2 at the
@@ -925,9 +971,9 @@ void tmpObmc( Tu t, Cu c, int rec, int lid, int NT )
 // neighbour). skipObmcConditionByPixel (not with GPM's separate OBMC), per vector (the first one's first): at the
 // vector clipped to the strip (clipMvInl) and rounded to samples, a copy there that is not valid (PU::searchBv) ends
 // the tests, else a sample of it (through the LIC model too) 96 (8 bits) or more from the CU's prediction before OBMC
-// skips the segment. All invocations, uniform control flow
-void obmcInterIbc( Tu t, int flags, ivec2 mv, ivec2 mv2, bool two, ivec3 lic, ivec4 st, int d, int pred, int lid,
-                   int NT )
+// (obmcCuPred) skips the segment. All invocations, uniform control flow
+void obmcInterIbc( Tu t, int r, int flags, ivec2 mv, ivec2 mv2, bool two, ivec3 lic, ivec4 st, int d, int pred,
+                   int lid, int NT )
 {
   const int   cs = t.comp == 0 ? 0 : 1;
   const bool  inv = t.comp == 0 && ( flags & OBMC_REC_INV_LMCS ) != 0;
@@ -988,8 +1034,7 @@ void obmcInterIbc( Tu t, int flags, ivec2 mv, ivec2 mv2, bool two, ivec3 lic, iv
       {
         CBufI16( P.interPred ).v[pred + i] = int16_t( c );
       }
-      else if( abs( int( CBufI16( P.interPred ).v[t.dbgOffset + ( st.y - t.y + y ) * t.w + st.x - t.x + x] ) - c )
-               >= threshold )
+      else if( abs( obmcCuPred( t, r, st.x + x, st.y + y ) - c ) >= threshold )
       {
         s_obmcSkip = 1;
       }
@@ -1049,14 +1094,17 @@ void obmcInterIntra( Tu t, int r, int lid, int NT )
     const int W = b == 0 ? len : 4, H = b == 0 ? 4 : len;   // (luma)
     const int d = rec.v[r + OBMC_REC_BASE] + rec.v[o + OBMC_SEG_DATA];
     const int pred = d + OBMC_D_TPL + 2 * len + ( t.comp == 0 ? 0 : W * H + ( t.comp - 1 ) * ( W >> 1 ) * ( H >> 1 ) );
-    if( ibc )
+    if( ibc )   // (by the CU's first block on the strip; the others, which wait for it, blend what it made)
     {
       const ivec2 mv  = ivec2( rec.v[o + OBMC_SEG_MV], rec.v[o + OBMC_SEG_MV + 1] );
       const ivec2 mv2 = ivec2( rec.v[o + OBMC_SEG_MV2], rec.v[o + OBMC_SEG_MV2 + 1] );
       const bool  withLic = ( head & OBMC_SEG_IBC_LIC ) != 0;
       const int   m       = withLic ? rec.v[o + OBMC_SEG_MV2] + 2 * t.comp : 0;   // (the component's model)
       const ivec3 lic     = withLic ? ivec3( 1, rec.v[m], rec.v[m + 1] ) : ivec3( 0 );
-      obmcInterIbc( t, flags, mv, mv2, ( head & OBMC_SEG_IBC2 ) != 0, lic, st, d, pred, lid, NT );
+      if( obmcStripFirst( t, r, st ) )
+      {
+        obmcInterIbc( t, r, flags, mv, mv2, ( head & OBMC_SEG_IBC2 ) != 0, lic, st, d, pred, lid, NT );
+      }
       continue;
     }
     obmcStripPredict( u, st, b, start == 0, head >> OBMC_SEG_MODE, OBMC_INTER_STRIP, OBMC_INTER_PREP, lid, NT );

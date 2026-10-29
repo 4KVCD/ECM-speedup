@@ -740,7 +740,8 @@ void dependencies( int comp )
     addAreaDeps( 0, t.x - linesLeft, t.y - linesAbove, t.x + above - 1, t.y - 1 );
     addAreaDeps( 0, t.x - linesLeft, t.y, t.x - 1, t.y + left - 1 );
   }
-  if( ( t.lm & LM_ACTIVE ) != 0 )   // CCLM: the luma it downsamples
+  // CCLM: the luma it downsamples (also LM chroma fusion's first type in an inter slice: MMLM's CCLM, not CCCM)
+  if( ( t.lm & LM_ACTIVE ) != 0 || ( lmFusionType( t ) == 1 && ( ( t.lm >> LM_CCCM_SHIFT ) & 3 ) == 0 ) )
   {
     cclmDeps( t );
   }
@@ -837,9 +838,11 @@ void main()
       const int d = BufI32( P.depTmp ).v[k];
       BufI32( P.depList ).v[BufI32( P.depOffset ).v[d] + atomicAdd( BufI32( P.numDep ).v[d], 1 )] = g_i;
     }
-    // a node waiting for all before it (DERIVE_PREFIX, but the first) has that wait as one more dependency, which
-    // intra_rec's prefix of finished blocks releases
-    const bool prefix = ( BufTu( P.tus ).v[g_i].derive & DERIVE_PREFIX ) != 0 && g_i > 0;
+    // a node waiting for all before it (DERIVE_PREFIX, but the first; a Cr block that waits for all before its joint
+    // CbCr pair's Cb block, prefixBeforePair, but where that is the first) has that wait as one more dependency,
+    // which intra_rec's prefix of finished blocks releases
+    const bool prefix = ( BufTu( P.tus ).v[g_i].derive & DERIVE_PREFIX ) != 0
+                        && g_i > ( prefixBeforePair( BufTu( P.tus ), g_i ) ? 1 : 0 );
     if( prefix )
     {
       BufI32( P.depCount ).v[g_i] += 1;

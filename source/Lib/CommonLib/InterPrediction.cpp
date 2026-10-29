@@ -26869,6 +26869,10 @@ void InterPrediction::xLocalIlluComp(const PredictionUnit& pu,
       m_offset[m_iRefListIdx][compID] = offset;
     }
   }
+  if (m_isAddHypMC)
+  {
+    m_gpuHypLic.insert(m_gpuHypLic.end(), { (int32_t) compID, scale, shift, offset });
+  }
 #endif
   const ClpRng& clpRng = pu.cu->cs->slice->clpRng(compID);
   dstBuf.linearTransform(scale, shift, offset, true, clpRng);
@@ -36637,11 +36641,19 @@ void InterPrediction::xAddHypMC(PredictionUnit& pu, PelUnitBuf& predBuf, PelUnit
 #endif
   MultiHypVec savedHypVec = pu.addHypData;
   pu.addHypData.clear();
+  m_gpuHypLic.clear();
   pu.mvRefine = true;
   motionCompensation(pu, predBuf, REF_PIC_LIST_X, true, !lumaOnly, predBufWOBIO);
   pu.mvRefine = false;
 #if INTER_LIC
   m_storeBeforeLIC = false;
+  for (int l = 0; l < 2; l++)   // (the models the base prediction applied, which the CU's stored ones may not be)
+  {
+    for (int c = 0; c < MAX_NUM_COMPONENT; c++)
+    {
+      m_gpuHypLic.insert(m_gpuHypLic.end(), { m_scale[l][c], m_offset[l][c] });
+    }
+  }
 #endif
   PredictionUnit fakePredData = pu;
   fakePredData.cu->affine = false;

@@ -2191,6 +2191,11 @@ public:
   // xPredInterBiSubPuBDOF -; a run: 1 xCheckIdenticalMotion)
   static constexpr int GPU_SUBPU = 13;
   std::vector<int32_t> m_gpuSubPu;
+  // the LIC models of the last multi-hypothesis PU (xAddHypMC), for the GPU reconstruction: those its base prediction
+  // applied, per list and component scale and offset (m_scale / m_offset after it: the CU stores what they are after
+  // the hypotheses, which may differ), then those xLocalIlluComp derived for its hypotheses (which no CU field keeps),
+  // per model in their order its component, scale, shift and offset
+  std::vector<int32_t> m_gpuHypLic;
   void gpuSubPu( int kind, const PredictionUnit& pu, const PredictionUnit& sub, int flags )
   {
     m_gpuSubPu.insert( m_gpuSubPu.end(), { kind, sub.lx() - pu.lx(), sub.ly() - pu.ly(), (int32_t) sub.lwidth(),
