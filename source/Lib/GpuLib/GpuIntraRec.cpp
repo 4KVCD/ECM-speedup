@@ -1376,9 +1376,10 @@ struct Params
   int32_t  cccmDecim;              // DECIM_BITS of the luma bit depth (intra_cccm.glsl's cccmDecim)
   int32_t  ccpDerivedGl;           // decoder-derived CCP fusion's GL-CCCM mode above this many chroma samples
   uint64_t resiPlane;              // ON mode with ALF: the luma residual intra_rec writes (0: none)
+  uint64_t blockClock;             // ECM_GPU_BLOCK_CLOCK: per block its start and end on the device's clock (0: none)
 };
 static_assert( offsetof( Params, origin ) == 328 && offsetof( Params, edgeCap ) == 408
-                 && offsetof( Params, resiPlane ) == 496 && sizeof( Params ) == 504,
+                 && offsetof( Params, resiPlane ) == 496 && sizeof( Params ) == 512,
                "Params layout" );
 
 constexpr double SLICE_NS = 250e6;   // intra_rec's time per slice: well below Windows' GPU timeout of 2 s
@@ -2226,6 +2227,7 @@ struct GpuIntraRec::Impl
   gpu::Buffer                 params, tus, coeffs, planes[3], owner[3], sched, dbgPred, dbgResi, lmcs, signPredBuf;
   gpu::Buffer                 interPredBuf;
   gpu::Buffer                 resiPlane;   // ON mode with ALF: the picture's luma residual (Params::resiPlane)
+  gpu::Buffer                 blockClock;  // ECM_GPU_BLOCK_CLOCK: the blocks' start and end (Params::blockClock)
   int32_t                     sliceBlocks = 1024;   // intra_rec's blocks per slice (from the time per block so far)
   gpu::Buffer                 cuBuf, dbgParams;   // the CU records and their modes; the derived parameters (verification)
   gpu::Buffer                 scratch;            // intra_rec's: DIMD / OBIC blending's sums, then CCCM's data
@@ -2442,7 +2444,7 @@ struct GpuIntraRec::Impl
     }
     for( gpu::Buffer* b: { &params, &tus, &coeffs, &planes[0], &planes[1], &planes[2], &owner[0], &owner[1], &owner[2],
                            &sched, &dbgPred, &dbgResi, &lmcs, &signPredBuf, &cuBuf, &dbgParams, &scratch,
-                           &upload, &download, &resiPlane } )
+                           &upload, &download, &resiPlane, &blockClock } )
     {
       b->destroy( *ctx );
     }
@@ -11648,6 +11650,64 @@ static std::string sideInformation( GpuIntraRec::Impl& m, const CodingStructure&
   return std::string();
 }
 
+// ECM_GPU_BLOCK_CLOCK (development): picture poc's time per kind of record, the sums of their durations between their
+// start and end on the device's realtime clock (nanoseconds on NVIDIA; a picture runs mostly along one chain of
+// dependencies, so the sums show where its time goes), printed by falling time: "[gpu-intra] POC n block clock:
+// <kind> <ms> ms (<records>); ..."
+static void printBlockClock( const GpuIntraRec::Impl& m, int poc, const uint64_t* clock )
+{
+  static const char* const nodeKinds[] = { "known", "MPM", "chroma DM", "chroma candidate", "DIMD", "DIMD chroma",
+                                           "OBIC", "intra merge", "TIMD", "TMRL", "chroma TMRL", "EIP",
+                                           "known (131 modes)", "IntraTMP", "BVG-DIMD", "SGPM", "SGPM view", "DBV",
+                                           "chroma reordering" };
+  const int numNodeKinds = (int) ( sizeof( nodeKinds ) / sizeof( nodeKinds[0] ) );
+  std::map<std::string, std::pair<double, int>> sums;
+  for( size_t i = 0; i < m.rec.size(); i++ )
+  {
+    const Tu& t = m.rec[i];
+    if( clock[2 * i] == 0 || clock[2 * i + 1] < clock[2 * i] )   // (not run)
+    {
+      continue;
+    }
+    std::string kind;
+    if( t.derive & DERIVE_NODE )
+    {
+      const int k = m.cus[t.cu].kind;
+      kind = std::string( "node " ) + ( k >= 0 && k < numNodeKinds ? nodeKinds[k] : "other" );
+    }
+    else if( t.derive & DERIVE_INTER )
+    {
+      kind = t.derive & DERIVE_IBC ? "IBC block" : t.comp ? "inter chroma block" : "inter luma block";
+    }
+    else if( t.comp != 0 )
+    {
+      kind = t.ccpMerge >= 0 ? "CCP merge block" : t.lm ? "LM / fusion block" : "chroma block";
+    }
+    else
+    {
+      kind = t.derive & DERIVE_TMP ? "IntraTMP block" : t.derive & DERIVE_EIP ? "EIP block"
+             : t.derive & DERIVE_SGPM ? "SGPM block" : t.derive & DERIVE_TIMD ? "TIMD block"
+             : t.derive & ( DERIVE_DIMD | DERIVE_OBIC | DERIVE_MERGE ) ? "DIMD / OBIC / merge block"
+             : t.pnn >= 0 ? "NN block" : t.mipMatrix >= 0 ? "MIP block" : "luma block";
+    }
+    std::pair<double, int>& s = sums[kind];
+    s.first += double( clock[2 * i + 1] - clock[2 * i] ) * 1e-6;
+    s.second++;
+  }
+  std::vector<std::pair<double, std::string>> order;
+  for( const auto& s: sums )
+  {
+    order.push_back( { s.second.first, s.first } );
+  }
+  std::sort( order.rbegin(), order.rend() );
+  printf( "[gpu-intra] POC %d block clock:", poc );
+  for( const auto& o: order )
+  {
+    printf( " %s %.2f ms (%d);", o.second.c_str(), o.first, sums[o.second].second );
+  }
+  printf( "\n" );
+}
+
 void GpuIntraRec::endPicture( const CodingStructure& cs )
 {
   Impl& m = *m_impl;
@@ -12516,6 +12576,10 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
     P.resiPlane = m.resiPlane.addr;
   }
 #endif
+#if ECM_GPU_BLOCK_CLOCK
+  m.blockClock.ensure( ctx, std::max<size_t>( m.rec.size(), 1 ) * 16, gpu::Buffer::DEVICE );
+  P.blockClock = m.blockClock.addr;
+#endif
   P.tus      = m.tus.addr;
   P.coeffs   = m.coeffs.addr;
   P.signPred   = m.signPredBuf.addr;
@@ -13085,6 +13149,8 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
     downBytes += P.resiPlane ? planeBytes[0] : 0;
     const size_t dStart = downBytes;   // (verification: intra_deps' dependency counts, as their prefix sums)
     downBytes += m.on ? 0 : ( n + 1 ) * 4;
+    const size_t dClock = downBytes;   // (ECM_GPU_BLOCK_CLOCK: the blocks' start and end)
+    downBytes += P.blockClock ? m.rec.size() * 16 : 0;
     m.download.ensure( ctx, downBytes, gpu::Buffer::DOWNLOAD );
 
     gpu::Stream& s = *m.stream;
@@ -13164,6 +13230,10 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
     if( P.resiPlane )
     {
       s.fill( m.resiPlane, 0, ( planeBytes[0] + 3 ) & ~size_t( 3 ), 0 );
+    }
+    if( P.blockClock && !m.rec.empty() )   // (0: a record that did not run)
+    {
+      s.fill( m.blockClock, 0, m.rec.size() * 16, 0 );
     }
     s.fill( m.sched, oQueue * 4, n * 4, 0xFFFFFFFFu );
     s.fill( m.sched, oCounter * 4, 5 * 4, 0 );
@@ -13321,8 +13391,16 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
     {
       s.copy( m.resiPlane, 0, m.download, dResiPlane, planeBytes[0] );
     }
+    if( P.blockClock && !m.rec.empty() )
+    {
+      s.copy( m.blockClock, 0, m.download, dClock, m.rec.size() * 16 );
+    }
     s.submitAndWait();
     ms = gpuNs * 1e-6;
+    if( P.blockClock && !m.rec.empty() )
+    {
+      printBlockClock( m, cs.slice->getPOC(), (const uint64_t*) ( (const char*) m.download.mapped + dClock ) );
+    }
     gPlanes  = (const int16_t*) ( (const char*) m.download.mapped + dPlane[0] );
     gResiPlane = P.resiPlane ? (const int16_t*) ( (const char*) m.download.mapped + dResiPlane ) : nullptr;
     gPredDl  = (const int16_t*) ( (const char*) m.download.mapped + dPred );

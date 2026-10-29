@@ -3374,6 +3374,10 @@ record CCLM | MMLM (fusionCclm in intra_rec, fitted from the references as the b
 where it filters them: getPredictorPtr -; cclmDeps in intra_deps and the host's mirror). Results (27 streams, grn181
 with ECM_GPU_FULL_PIPELINE, M160 to M168 and the block clock): every picture identical. Intra CUs from the CPU: 1 ->
 0.
+Block clock (2026-10-29, tooling): the CMake option ECM_GPU_BLOCK_CLOCK (off by default) makes intra_rec read the
+device's realtime clock at each block's start and end (Params::blockClock) and the decoder print per picture the sums
+per kind of record ('[gpu-intra] POC n block clock: ...'); perf/gpu/clocksum.py sums a build's partial-verification
+logs per stream and kind. It replaces the temporary phase timers of section 8.
 Tried after M125 and left out (idle 3070, median of 5 or 7): the CCP merge history's and list's records read ahead in
 parallel with signatures (neutral); IntraTMP's refinement ranks counting only the windows that overlap no other
 (+3 % aiodd: the weaker filter sends more positions to the walk) or comparing only positions of overlapping windows

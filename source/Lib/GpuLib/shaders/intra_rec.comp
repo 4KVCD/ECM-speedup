@@ -20,6 +20,9 @@
 #extension GL_KHR_shader_subgroup_arithmetic : require
 #extension GL_KHR_memory_scope_semantics : require
 #extension GL_EXT_control_flow_attributes : require
+#ifdef BLOCK_CLOCK   // (development, CMake's ECM_GPU_BLOCK_CLOCK: VK_KHR_shader_clock's shaderDeviceClock)
+#extension GL_EXT_shader_realtime_clock : require
+#endif
 #include "common.glsl"
 #include "intra_common.glsl"
 
@@ -2259,6 +2262,9 @@ void releaseDependents( int d0, int d1, int lid, int NT )
   }
   if( lid == 0 )
   {
+#ifdef BLOCK_CLOCK
+    BufU64( P.blockClock ).v[2 * g_ti + 1] = clockRealtimeEXT();
+#endif
     CBufI32 done = CBufI32( P.depTmp ), counter = CBufI32( P.counter );
     atomicStore( done.v[g_ti], 1, gl_ScopeQueueFamily, gl_StorageSemanticsBuffer, gl_SemanticsRelease );
     int p = atomicLoad( counter.v[3], gl_ScopeQueueFamily, gl_StorageSemanticsBuffer, gl_SemanticsAcquire );
@@ -2385,6 +2391,12 @@ void main()
       break;
     }
     Tu t = BufTu( P.tus ).v[g_ti];
+#ifdef BLOCK_CLOCK
+    if( lid == 0 )   // (its end: releaseDependents)
+    {
+      BufU64( P.blockClock ).v[2 * g_ti] = clockRealtimeEXT();
+    }
+#endif
     // (a CIIP block with LFNST / NSPT, DERIVE_INTER with DERIVE_TRANSFORM: their mode from a DIMD of its blended
     // prediction - a CIIP_SPLIT block's in place, in the inter path)
     const bool ciipDimd = WITH_DERIVED_TRANSFORMS && t.ciip != 0 && ( t.ciip & CIIP_SPLIT ) == 0

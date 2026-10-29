@@ -1021,6 +1021,8 @@ struct Params
   int      ccpDerivedGl;   // decoder-derived CCP fusion's GL-CCCM mode above this many chroma samples (8 outside I slices)
   uint64_t resiPlane;   // ON mode with ALF: int16 luma residual (written, origin / stride of plane 0; 0: none), which
                         // ALF reads (JVET-AC0162, the CPU's picture residual buffer)
+  uint64_t blockClock;  // BLOCK_CLOCK (development, ECM_GPU_BLOCK_CLOCK): uint64 per block its start and end on the
+                        // device's realtime clock
 };
 layout( buffer_reference, std430, buffer_reference_align = 8 ) buffer BufParams { Params p; };
 
