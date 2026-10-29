@@ -14,8 +14,9 @@ shared int s_ibcLic[TMP_LIC];   // the block's LIC model (tmpLicModel's; s_ibcLi
 // intermediate precision, averaged as xPredInterBi's xWeightedAverage), stored as the block's
 // reconstruction is (storeRecon, with the residual; with RR-IBC into the mirrored position, as xDecodeInterTU's
 // flipSignal of the TU's reconstruction); all invocations. A luma block with OBMC (the CU's whole block, in s_spPred
-// first): the plan of its OBMC record (intra_obmc.glsl's, of the CU's vector and LIC flag, scale and offset), the
-// copies of its motion runs with the block's samples, the blends of tmpObmc, then the reconstruction
+// first - above 32 x 32 samples in the scratch, deferredSet's -): the plan of its OBMC record (intra_obmc.glsl's, of
+// the CU's vector and LIC flag, scale and offset), the copies of its motion runs with the block's samples, the blends
+// of tmpObmc, then the reconstruction
 void ibcBlock( Tu t, int lid, int NT )
 {
   BufI32      d   = BufI32( P.timdData );
@@ -61,6 +62,7 @@ void ibcBlock( Tu t, int lid, int NT )
     extra = tsGet( TO_MC_TOTAL );
   }
   const int N = t.w * t.h, maxPel = ( 1 << t.bitDepth ) - 1;
+  g_deferLarge = obmc && N > 32 * 32;   // (its prediction then in the scratch, as a large IntraTMP block's)
   for( int i = lid; i < N + extra; i += NT )
   {
     const int x = i % t.w, y = i / t.w;
@@ -101,7 +103,7 @@ void ibcBlock( Tu t, int lid, int NT )
     }
     if( obmc )
     {
-      s_spPred[i] = int16_t( p );
+      deferredSet( t.w, x, y, p );
       continue;
     }
     if( flip == 0 )
@@ -135,7 +137,7 @@ void ibcBlock( Tu t, int lid, int NT )
     tmpObmc( t, c, ob, lid, NT );
     for( int i = lid; i < N; i += NT )
     {
-      storeRecon( t, i % t.w, i / t.w, int( s_spPred[i] ) );
+      storeRecon( t, i % t.w, i / t.w, deferredPred( t.w, t.h, i % t.w, i / t.w ) );
     }
   }
 }

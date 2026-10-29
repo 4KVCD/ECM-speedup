@@ -3359,6 +3359,9 @@ M164 (2026-10-29): BVG-CCCM with joint CbCr whose Cr block decides the signs: su
 the record before it: prefixBeforePair) waits for every record before its Cb block, which intra_rec's prefix release
 starts it at. Results (27 streams, grn181 with ECM_GPU_FULL_PIPELINE, M160 to M168 and the block clock): every picture
 identical. Intra CUs from the CPU: 3 -> 0.
+M165 (2026-10-29): IBC CUs with OBMC above 1024 samples: ibcBlock keeps such a luma block's prediction in the scratch
+(g_deferLarge, deferredSet / deferredPred), as M152's IntraTMP blocks. Results (27 streams, grn181 with
+ECM_GPU_FULL_PIPELINE, M160 to M168 and the block clock): every picture identical. Intra CUs from the CPU: 1 -> 0.
 Tried after M125 and left out (idle 3070, median of 5 or 7): the CCP merge history's and list's records read ahead in
 parallel with signatures (neutral); IntraTMP's refinement ranks counting only the windows that overlap no other
 (+3 % aiodd: the weaker filter sends more positions to the walk) or comparing only positions of overlapping windows

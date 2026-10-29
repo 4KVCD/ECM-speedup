@@ -7615,14 +7615,15 @@ static const char* ibcWhy( const GpuIntraRec::Impl& m, const CodingUnit& cu )
   if( cu.cs->sps->getUseOBMC() && cu.obmcFlag && pu.lwidth() * pu.lheight() >= 32 )   // (subBlockOBMC's own gates)
   {
 #if GPU_TMP && JVET_AK0076_EXTENDED_OBMC_IBC && JVET_AJ0161_OBMC_EXT_WITH_INTRA_PRED
-    // (luma's alone, as an IntraTMP CU's: intra_obmc.glsl, with the CU's prediction in s_spPred, whose single TU it is)
+    // (luma's alone, as an IntraTMP CU's: intra_obmc.glsl, with the CU's prediction in s_spPred - above 32 x 32
+    // samples in the workgroup's scratch -, whose single TU it is)
     if( isChromaEnabled( cu.chromaFormat ) && cu.Cb().valid() )
     {
       return "IBC with OBMC with chroma";
     }
-    if( pu.lwidth() * pu.lheight() > 32 * 32 || cu.firstTU != cu.lastTU )
+    if( cu.firstTU != cu.lastTU )
     {
-      return "IBC with OBMC above 1024 samples or of several TUs";
+      return "IBC with OBMC of several TUs";
     }
     // (what its units need; the known-mode records they name, which bvObmcUnits makes on first use, serve ibcRecord's)
     std::vector<int32_t> r;
