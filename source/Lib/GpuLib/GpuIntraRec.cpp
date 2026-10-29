@@ -1420,7 +1420,7 @@ constexpr int DM_SUB = 256, DM_RUN = 512, DM_UNI = 1024, DM_ZERO = 2048, DM_NLIC
 // mode 3: an McJob of the neighbour's motion over the band, then OBMC_J_*; a template motion OBMC_T_*), a segment's
 // data in Params::interPred (OBMC_D_*: the skip flags, the two templates, the band's predictions)
 constexpr int OBMC_REC_X = 0, OBMC_REC_Y = 1, OBMC_REC_W = 2, OBMC_REC_H = 3, OBMC_REC_FLAGS = 4, OBMC_REC_NUM = 5;
-constexpr int OBMC_REC_BD = 6, OBMC_REC_BASE = 7, OBMC_REC_INNER = 8, OBMC_REC_SEG = 10;
+constexpr int OBMC_REC_BD = 6, OBMC_REC_BASE = 7, OBMC_REC_INNER = 8, OBMC_REC_PARTS = 9, OBMC_REC_SEG = 10;
 constexpr int OBMC_REC_SUB = 16, OBMC_INNER = 1 + 4 * 24;   // (sub-block motion: the inner sub-blocks' entries)
 constexpr int OBMC_REC_SUB_LUMA = 64;   // (... of luma alone: affine's innerObmcSkipChroma)
 constexpr int OBMC_I_X = 1, OBMC_I_Y = 2, OBMC_I_DST = 5, OBMC_I_BD = 12, OBMC_I_CLIP_MIN = 13, OBMC_I_CLIP_MAX = 14;
@@ -1437,7 +1437,8 @@ constexpr int OBMC_REC_INTRA = 256, OBMC_REC_INTRA_INV = 512, OBMC_REC_NO_PDPC =
 // copies its strip from the picture; with OBMC_SEG_IBC2 two vectors' copies averaged, the second at OBMC_SEG_MV2;
 // with OBMC_SEG_IBC_LIC one copy through the neighbour's LIC models, whose place in Params::timdData is at
 // OBMC_SEG_MV2), the record's flag: such segments (its CU's blocks wait for every block before them, DERIVE_PREFIX:
-// the copy may read anything decoded before)
+// the copy may read anything decoded before); with them, but for GPM's separate OBMC, OBMC_REC_PARTS the place of
+// the table of the CU's records on its band (obmcPartsTable; else -1)
 constexpr int OBMC_SEG_IBC = 4, OBMC_SEG_IBC2 = 16, OBMC_SEG_IBC_LIC = 32, OBMC_REC_IBC = 4096;
 constexpr int OBMC_J_DIR = 32, OBMC_J_FLAGS = 33, OBMC_J_BASE = 34, OBMC_J_THRESHOLD = 37, OBMC_J_INT_MV = 39;
 constexpr int OBMC_J_INT_DIR = 43, OBMC_J_TPL = 44, OBMC_J_TPL_MOTION = 9, OBMC_J_LIC = 64, OBMC_J_NLIC = 76;
@@ -9231,7 +9232,6 @@ static bool ibcObmcTwoCopies( const CodingUnit& cu, const MotionInfo& mi )
 // and whether its inner sub-block OBMC applies (DMVR's sub-block motion), with intra its runs of intra neighbours
 // where the SPS has DIMD (JVET-AJ0161: obmcIntraSegs makes their segments); nullptr where the GPU can do it, else the
 // reason
-static bool        isAsbt( const TransformUnit& tu, const ComponentID compID );
 static const char* obmcPlan( const CodingUnit& cu, std::vector<ObmcSeg>& segs, bool& inner,
                              std::vector<ObmcSeg>* intra = nullptr, bool subPuMc = false )
 {
@@ -9296,13 +9296,8 @@ static const char* obmcPlan( const CodingUnit& cu, std::vector<ObmcSeg>& segs, b
       {
         const Position        pos = pu.lumaPos().offset( b == 0 ? s * minCUW : -1, b == 0 ? -1 : s * minCUW );
         const PredictionUnit* nb  = cu.cs->getPU( pos, pu.chType );
-        if( mi.isIBCmot )   // (its strip intra_rec's copy of the picture, obmcInterIbc: a CU of one TU per component)
-        {
-          bool split = cu.firstTU != cu.lastTU;
-          for( int c = 0; c < MAX_NUM_COMPONENT && !split; c++ )
-          {
-            split = cu.firstTU->blocks[c].valid() && isAsbt( *cu.firstTU, ComponentID( c ) );
-          }
+        if( mi.isIBCmot )   // (its strip intra_rec's copy of the picture, obmcInterIbc's; of several TUs or ASBT's
+        {                   // parts by the CU's first record on the strip, obmcPartsTable)
           // (two vectors, JVET-AE0169: the average of the copies at both, of the default BCW weights, without weighted
           // prediction - xPredInterBi's -, one copy where they are equal; obmcInterIbc. A neighbour with LIC: its one
           // copy through its models - xPredInterBlk's isobmcMC branch -, which two copies would leave out of the strip
@@ -9312,10 +9307,6 @@ static const char* obmcPlan( const CodingUnit& cu, std::vector<ObmcSeg>& segs, b
           if( !nb || ( mi.interDir != 1 && ( mi.interDir != 3 || nb->cu->bcwIdx != BCW_DEFAULT || wp ) ) )
           {
             return "OBMC with an IBC neighbour of two vectors with BCW or weighted prediction";
-          }
-          if( split )
-          {
-            return "OBMC with an IBC neighbour, of a CU of several TUs or with ASBT";
           }
           if( nb->cu->ibcLicFlag && ibcObmcTwoCopies( cu, mi ) )
           {
@@ -10551,6 +10542,32 @@ static void ciipSplitBlock( Tu& t, const CodingUnit& cu, const ComponentID compI
   t.ispPrev = pre;
 }
 
+// the table of OBMC record r's CU's records on its band (OBMC_REC_PARTS): per component the offset from the table's
+// start of its list - their number, then their indices in decoding order -, the records from cuFirst on whose OBMC
+// record it is (Tu::obmc). The first of them that overlaps an IBC neighbour's strip makes the strip's copy and skip
+// test (obmcInterIbc) from the CU's prediction before OBMC, which the others still keep: they wait for it
+// (DERIVE_PREFIX)
+static void obmcPartsTable( GpuIntraRec::Impl& m, int32_t r, size_t cuFirst )
+{
+  const int32_t tab = (int32_t) m.timdData.size();
+  m.timdData[r + OBMC_REC_PARTS] = tab;
+  m.timdData.insert( m.timdData.end(), MAX_NUM_COMPONENT, 0 );
+  for( int c = 0; c < MAX_NUM_COMPONENT; c++ )
+  {
+    const size_t list = m.timdData.size();
+    m.timdData[tab + c] = (int32_t) list - tab;
+    m.timdData.push_back( 0 );
+    for( size_t k = cuFirst; k < m.rec.size(); k++ )
+    {
+      if( m.rec[k].comp == c && m.rec[k].obmc == r + 1 )
+      {
+        m.timdData.push_back( (int32_t) k );
+        m.timdData[list]++;
+      }
+    }
+  }
+}
+
 void GpuIntraRec::recordInterCu( const CodingUnit& cu )
 {
   Impl& m = *m_impl;
@@ -10619,7 +10636,7 @@ void GpuIntraRec::recordInterCu( const CodingUnit& cu )
                                                | ( in && cu.affine && pu.mergeType == MRG_TYPE_DEFAULT_N ? OBMC_REC_SUB_LUMA : 0 )
                                                | ( geoSep ? OBMC_REC_GEO : 0 ) | obmcIntraFlags( m, cu, is ),
                                              (int32_t) ( sg.size() + is.size() ), cu.slice->clpRng( COMPONENT_Y ).bd, 0,
-                                             m.obmcData, 0 } );
+                                             m.obmcData, -1 } );
       if( in )
       {
         m.obmcData += (int32_t) ( ( cu.lwidth() >> 2 ) * ( cu.lheight() >> 2 ) ) * OBMC_INNER;
@@ -10686,6 +10703,7 @@ void GpuIntraRec::recordInterCu( const CodingUnit& cu )
       cpuFillCu( m, cu, why );
     }
   }
+  const size_t cuFirst = m.rec.size();   // (the records of its TUs' blocks)
   for( const TransformUnit& tu: CU::traverseTUs( cu ) )
   {
     const bool ciipPre = ciipBeneathChromaBlend( m, tu );
@@ -10753,6 +10771,13 @@ void GpuIntraRec::recordInterCu( const CodingUnit& cu )
         }
       }
     }
+  }
+  // (IBC neighbours' segments, whose skip test reads the CU's prediction: the CU's records on its band, obmcPartsTable;
+  // GPM's separate OBMC has no such test)
+  if( m.obmcRec >= 0 && ( m.timdData[m.obmcRec + OBMC_REC_FLAGS] & OBMC_REC_IBC )
+      && !( m.timdData[m.obmcRec + OBMC_REC_FLAGS] & OBMC_REC_GEO ) && !m.cpuCus.count( &cu ) )
+  {
+    obmcPartsTable( m, m.obmcRec, cuFirst );
   }
   // (OBMC: its segments' jobs, after its blocks'; GPM's separate OBMC: each part's, with its motion - TM's template)
   const int32_t rec1 = m.obmcRec1;

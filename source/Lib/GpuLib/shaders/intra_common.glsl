@@ -307,6 +307,7 @@ const int IBC_REC_BI = 14, IBC_REC_OWN_MV2 = 15;
 // vectors)
 const int OBMC_REC_X = 0, OBMC_REC_Y = 1, OBMC_REC_W = 2, OBMC_REC_H = 3, OBMC_REC_FLAGS = 4, OBMC_REC_NUM = 5;
 const int OBMC_REC_BD = 6, OBMC_REC_BASE = 7, OBMC_REC_INNER = 8, OBMC_REC_SEG = 10;   // (BASE: where the data start)
+const int OBMC_REC_PARTS = 9;   // (with IBC neighbours: the table of the CU's records on its band, -1 none)
 const int OBMC_SEG_DIR = 0, OBMC_SEG_START = 1, OBMC_SEG_LEN = 2, OBMC_SEG_DATA = 3, OBMC_SEG_MV = 4, OBMC_SEG_MV2 = 6;
 const int OBMC_SEG = 8;
 const int OBMC_REC_TM = 1, OBMC_REC_TOP = 2, OBMC_REC_LEFT = 4, OBMC_REC_INV_LMCS = 8, OBMC_REC_SUB = 16;

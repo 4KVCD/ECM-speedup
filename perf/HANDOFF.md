@@ -3365,6 +3365,10 @@ ECM_GPU_FULL_PIPELINE, M160 to M168 and the block clock): every picture identica
 M166 (2026-10-29): CIIP / GPM with an intra part of ciipSplit with ASBT: every record of an ASBT block blends the CU's
 intra prediction at its own part (ciipSplitBlock per record). Results (27 streams, grn181 with ECM_GPU_FULL_PIPELINE,
 M160 to M168 and the block clock): every picture identical. Inter CUs from the CPU: 2 -> 0.
+M167 (2026-10-29): inter OBMC with an IBC neighbour over several TUs or ASBT parts: the OBMC record's word 9
+(OBMC_REC_PARTS) names the CU's records on its band; the first one on a strip copies it and tests it against the
+prediction of the record holding each sample (obmcStripFirst, obmcCuPred). Results (27 streams, grn181 with
+ECM_GPU_FULL_PIPELINE, M160 to M168 and the block clock): every picture identical. Inter CUs from the CPU: 8 -> 0.
 Tried after M125 and left out (idle 3070, median of 5 or 7): the CCP merge history's and list's records read ahead in
 parallel with signatures (neutral); IntraTMP's refinement ranks counting only the windows that overlap no other
 (+3 % aiodd: the weaker filter sends more positions to the walk) or comparing only positions of overlapping windows
