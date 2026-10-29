@@ -3273,14 +3273,13 @@ static bool usesMtss( const TransformUnit& tu )
 static const char* otherCccm( const PredictionUnit& pu )
 {
 #if JVET_AE0100_BVGCCCM
-  // (BVG-CCCM on the GPU: its plain models of a dual tree's 4:2:0 CU, bvgRecord's sources; PU::hasBvgCccmFlag allows it
-  // in a dual tree alone)
+  // (BVG-CCCM on the GPU: its plain models of a dual tree's 4:2:0 CU, bvgRecord's sources - with LFNST / NSPT both
+  // components' predictions for their mode, cclmTransformMode's -; PU::hasBvgCccmFlag allows it in a dual tree alone)
   if( pu.bvgCccmFlag )
   {
     const CodingUnit& cu = *pu.cu;
     return !CS::isDualITree( *cu.cs ) || cu.chromaFormat != CHROMA_420 ? "BVG-CCCM outside a 4:2:0 dual tree"
            : pu.ccInsideFilter || pu.isChromaFusion                   ? "BVG-CCCM with the inside filter or LM fusion"
-           : cu.lfnstIdx                                              ? "BVG-CCCM with LFNST / NSPT"
            : pu.cccmNoSubFlag || pu.glCccmFlag || pu.cccmMultiFilterIdx ? "BVG-CCCM of another CCCM kind"
                                                                       : nullptr;
   }

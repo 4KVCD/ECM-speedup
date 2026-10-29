@@ -3328,6 +3328,8 @@ CU mode (eipDimdMode, written by their block). Results (27 streams, grn171): eve
 the CPU: 13 -> 0.
 M157 (2026-10-28): chroma TMRL with IBC luma CUs at its five positions (their known mode records). Results (27
 streams, grn172, M155 to M158): every picture identical. Intra CUs from the CPU: 6 -> 0.
+M158 (2026-10-28): BVG-CCCM with LFNST / NSPT (cclmTransformMode's both components through M149's path). Results (27
+streams, grn172): every picture identical. Intra CUs from the CPU: 6 -> 0 (one now under the joint CbCr reason).
 Tried after M125 and left out (idle 3070, median of 5 or 7): the CCP merge history's and list's records read ahead in
 parallel with signatures (neutral); IntraTMP's refinement ranks counting only the windows that overlap no other
 (+3 % aiodd: the weaker filter sends more positions to the walk) or comparing only positions of overlapping windows
