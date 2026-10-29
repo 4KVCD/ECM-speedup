@@ -5599,8 +5599,12 @@ static int32_t cuRecord( GpuIntraRec::Impl& m, const TransformUnit& tu, const Co
   }
   else
   {
-    const auto luma = m.cuIndex[CHANNEL_TYPE_LUMA].find( PU::getCoLocatedLumaPU( pu ).cu );
-    c.lumaCu = luma != m.cuIndex[CHANNEL_TYPE_LUMA].end() ? luma->second : -1;
+    const CodingUnit& lumaCu = *PU::getCoLocatedLumaPU( pu ).cu;
+    const auto        luma   = m.cuIndex[CHANNEL_TYPE_LUMA].find( &lumaCu );
+    // (an IBC luma CU has no CU record: a known record of the mode chroma DM reads, getCoLocatedIntraLumaMode's)
+    c.lumaCu = luma != m.cuIndex[CHANNEL_TYPE_LUMA].end() ? luma->second
+               : CU::isIBC( lumaCu )                     ? mpmModeCu( m, (int32_t) PU::getCoLocatedIntraLumaMode( pu ) )
+                                                         : -1;
     // (partial verification: the CPU's DM or candidate mode where chroma reordering reorders them, which the GPU lacks)
     const bool lumaDerived = c.lumaCu >= 0 && m.cus[c.lumaCu].kind != CU_KNOWN && !cu.bdpcmModeChroma
                              && !( m.partial && cu.cs->sps->getUseChromaReordering() );

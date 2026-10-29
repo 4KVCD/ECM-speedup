@@ -3303,22 +3303,25 @@ M151 (2026-10-28): OBIC with an NN neighbour: the NN CU's luma block derives the
 (DERIVE_PNN_DIMD) into its DimdOut, the neighbour's entry a negative sample count, the OBIC CU's node waiting for all
 before it (DERIVE_PREFIX). Results (27 streams, grn167 with ECM_GPU_FULL_PIPELINE, M148 to M151): every picture
 identical. Intra CUs from the CPU: OBIC with an NN neighbour 16 -> 0; with M148 to M151 253 -> 113.
-M152 (2026-10-29): IntraTMP CUs above 1024 samples (up to 64 x 64): the prediction at DEFER_LARGE in the scratch
+M152 (2026-10-28): IntraTMP CUs above 1024 samples (up to 64 x 64): the prediction at DEFER_LARGE in the scratch
 (tmpPredict, tmpLicApply and tmpObmc through deferredSet / deferredPred), the OBMC's copy before OBMC only the band it
 blends (tmpBeforeAt), the sub-sample search's padded region above 2560 samples in the node's scratch at TS_FBUF
 (g_tfScratch). Results (27 streams, grn170 with ECM_GPU_FULL_PIPELINE, M152 to M154): every picture identical. Intra
 CUs from the CPU: IntraTMP above 1024 samples 11 -> 0.
-M153 (2026-10-29): OBIC with inter neighbours: the host sums their units' modes (obicInterModes: the motion field's
+M153 (2026-10-28): OBIC with inter neighbours: the host sums their units' modes (obicInterModes: the motion field's
 getIpmInfo, a GPM CU's angle; 16 per unit, class 0) into one OBIC_INTER entry that obicHistogram adds. Also a host bug
 it exposed: an OBIC CU rejected after taking its neighbour entries shifted the later CUs' Cu::obic against their OBIC
 outputs (and the GPU wrote past them): entries now go in on success, the CPU's output at Cu::obic. Results (27
 streams, grn170 with ECM_GPU_FULL_PIPELINE, M152 to M154): every picture identical. Intra CUs from the CPU: an inter
 OBIC neighbour 16 -> 0 (14 of them now under their other neighbours' reasons: IntraTMP / MIP / EIP neighbours in inter
 slices).
-M154 (2026-10-29): inter CCCM with luma ASBT: the inter CCCM record lists the TU's luma records (one, or ASBT's
+M154 (2026-10-28): inter CCCM with luma ASBT: the inter CCCM record lists the TU's luma records (one, or ASBT's
 parts), icccmLuma reads from the part holding a sample; chroma ASBT stays on the CPU. Results (27 streams, grn170 with
 ECM_GPU_FULL_PIPELINE, M152 to M154): every picture identical. Intra CUs from the CPU: inter CCCM with ASBT 14 -> 0;
 with M152 to M154 113 -> 86.
+M155 (2026-10-28): a chroma CU whose co-located luma CU is IBC takes the known record of the mode chroma DM reads
+(getCoLocatedIntraLumaMode, syntax) as Cu::lumaCu, so chroma reordering (and its DBV entries) runs on the GPU. Results
+(27 streams, grn171, M155 and M156): every picture identical. Intra CUs from the CPU: DBV (dual tree) 17 -> 0.
 Tried after M125 and left out (idle 3070, median of 5 or 7): the CCP merge history's and list's records read ahead in
 parallel with signatures (neutral); IntraTMP's refinement ranks counting only the windows that overlap no other
 (+3 % aiodd: the weaker filter sends more positions to the walk) or comparing only positions of overlapping windows
