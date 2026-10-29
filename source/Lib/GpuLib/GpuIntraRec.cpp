@@ -2418,7 +2418,6 @@ struct GpuIntraRec::Impl
   // partial verification: the temporal CCP merge candidates (JVET-AE0043) of inter slices, the collocated picture's
   // models (the CPU's, as its decoding kept them: m_ccpModelLUT) as records of their own, per picture and model index
   std::deque<CCPModelCandidate>                                ccpTemporalModels;
-  std::unordered_set<int32_t>                                  ccpInterCccm;   // the records of inter CCCM models
   std::map<std::pair<const Picture*, int>, int32_t>            ccpTemporal;
   std::map<std::string, int>  cpuReasons;        // totals: why CUs were taken from the CPU
   std::map<std::string, int>  reorderCpu;        // totals: why chroma reordering CUs kept the CPU's mode
@@ -2739,7 +2738,6 @@ void GpuIntraRec::beginPicture( const CodingStructure& cs )
   m.interSign.clear();
   m.ccpTemporalModels.clear();
   m.ccpTemporal.clear();
-  m.ccpInterCccm.clear();
   std::string why;
   if( !supported( *cs.slice, why, m.partial ) )
   {
@@ -3168,10 +3166,6 @@ void GpuIntraRec::cpuCuModels( const CodingUnit& cu, bool history )
       m.ccpPu.push_back( nullptr );
       m.ccpWriters.insert( m.ccpWriters.end(), CCP_WRITERS, -1 );
       m.cpuCcp.push_back( { r.first->second, &tu.curCand, false } );
-      if( tu.curCand.type & CCP_TYPE_INTER_CCCM )
-      {
-        m.ccpInterCccm.insert( r.first->second );
-      }
       if( history )
       {
         cpuCcpHistory( m, cu, r.first->second );
@@ -6087,12 +6081,6 @@ static void ccpMergeSources( GpuIntraRec::Impl& m, const PredictionUnit& pu, std
           m.ccpTemporalModels.push_back( colPic->cs->m_ccpModelLUT[modelIdx - 1] );
           CHECK( m.ccpTemporalModels.back().type <= 0, "a temporal CCP model without a type" );
           m.cpuCcp.push_back( { t.first->second, &m.ccpTemporalModels.back(), false } );
-#if JVET_AF0073_INTER_CCP_MERGE
-          if( m.ccpTemporalModels.back().type & CCP_TYPE_INTER_CCCM )
-          {
-            m.ccpInterCccm.insert( t.first->second );
-          }
-#endif
         }
         add( t.first->second );
       }
@@ -6198,38 +6186,6 @@ static void ccpMergeSources( GpuIntraRec::Impl& m, const PredictionUnit& pu, std
     temporalAt( shift );
   }
 #endif
-}
-
-// whether CCP merge PU pu adjusts its model (JVET-AL0126) or fuses a pair (JVET-AG0154's merge fusion)
-static bool ccpMergeAdjustOrDd( const PredictionUnit& pu )
-{
-  bool r = false;
-#if JVET_AL0126_CCP_MERGE_WITH_ADJUST
-  r = r || pu.ccpMergeAdjustFlag;
-#endif
-#if JVET_AG0154_DECODER_DERIVED_CCP_FUSION
-  r = r || pu.ddNonLocalCCPFusion > 0;
-#endif
-  return r;
-}
-
-// partial verification: whether CCP merge PU pu has a candidate of inter CCCM (CCP_TYPE_INTER_CCCM, JVET-AE0059: an
-// inter CU's TU model, a temporal one) among its sources or its CTU row's history so far, a model kind the GPU lacks
-static bool ccpMergeInterCccm( GpuIntraRec::Impl& m, const PredictionUnit& pu )
-{
-  if( m.ccpInterCccm.empty() )
-  {
-    return false;
-  }
-  std::vector<int32_t> sources;
-  int                  numBefore = 0;
-  ccpMergeSources( m, pu, sources, numBefore );
-  const int row = ( pu.Cb().y << getComponentScaleY( COMPONENT_Cb, pu.chromaFormat ) ) / (int) pu.cs->sps->getMaxCUHeight();
-  if( row == m.ccpHistRow && ccpMergeHistory( pu ) )
-  {
-    sources.insert( sources.end(), m.ccpHist.begin() + m.ccpHistRowStart, m.ccpHist.end() );
-  }
-  return std::any_of( sources.begin(), sources.end(), [&]( int32_t r ) { return m.ccpInterCccm.count( r ) != 0; } );
 }
 
 // the entry of a decoder-derived CCP fusion PU (intra_ccp.glsl derives it as a merge block of this kind): no history,
@@ -6680,10 +6636,6 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
     why = "decoder-derived CCP merge fusion without the regression blend";
 #endif
   else if( !isLuma( compID ) && pu.idxNonLocalCCP && !GPU_CCCM )    why = "CCP merge of another configuration";
-  // (an inter CCCM candidate predicts as intra_cccm.glsl's g_cccmInterNs; not with adjustment or decoder-derived
-  // fusion, whose own steps take its parameters)
-  else if( !isLuma( compID ) && pu.idxNonLocalCCP && ccpMergeAdjustOrDd( pu ) && ccpMergeInterCccm( m, pu ) )
-    why = "CCP merge adjustment or decoder-derived fusion with an inter CCCM candidate";
 #endif
 #if JVET_AG0154_DECODER_DERIVED_CCP_FUSION
   // decoder-derived CCP fusion (JVET-AG0154: of a CCLM model and CCCM models fitted to the template the one of the

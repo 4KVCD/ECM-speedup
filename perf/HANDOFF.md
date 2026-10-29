@@ -3330,6 +3330,11 @@ M157 (2026-10-28): chroma TMRL with IBC luma CUs at its five positions (their kn
 streams, grn172, M155 to M158): every picture identical. Intra CUs from the CPU: 6 -> 0.
 M158 (2026-10-28): BVG-CCCM with LFNST / NSPT (cclmTransformMode's both components through M149's path). Results (27
 streams, grn172): every picture identical. Intra CUs from the CPU: 6 -> 0 (one now under the joint CbCr reason).
+M159 (2026-10-28): CCP merge adjustment and decoder-derived fusion with inter CCCM candidates (the check removed: the
+adjustment's range and ccpCccmModel's features hold for them; M148's switch was the likely cause of the old
+differences). Results (27 streams, grn173, M155 to M159): every picture identical. Intra CUs from the CPU: 13 -> 0;
+with M155 to M159 86 -> 24 (DBV with IBC LIC 16, BVG-CCCM with joint CbCr 3, IntraTMP OBMC with an SGPM neighbour 2,
+three of one CU each).
 Tried after M125 and left out (idle 3070, median of 5 or 7): the CCP merge history's and list's records read ahead in
 parallel with signatures (neutral); IntraTMP's refinement ranks counting only the windows that overlap no other
 (+3 % aiodd: the weaker filter sends more positions to the walk) or comparing only positions of overlapping windows
