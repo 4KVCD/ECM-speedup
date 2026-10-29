@@ -3322,6 +3322,10 @@ with M152 to M154 113 -> 86.
 M155 (2026-10-28): a chroma CU whose co-located luma CU is IBC takes the known record of the mode chroma DM reads
 (getCoLocatedIntraLumaMode, syntax) as Cu::lumaCu, so chroma reordering (and its DBV entries) runs on the GPU. Results
 (27 streams, grn171, M155 and M156): every picture identical. Intra CUs from the CPU: DBV (dual tree) 17 -> 0.
+M156 (2026-10-28): OBIC with IntraTMP / MIP neighbours in inter slices as M151's NN ones (their block's DIMD of its
+prediction in DimdOut, a MIP block now with DERIVE_MIP_DIMD; negative count; DERIVE_PREFIX), EIP neighbours by their
+CU mode (eipDimdMode, written by their block). Results (27 streams, grn171): every picture identical. Intra CUs from
+the CPU: 13 -> 0.
 Tried after M125 and left out (idle 3070, median of 5 or 7): the CCP merge history's and list's records read ahead in
 parallel with signatures (neutral); IntraTMP's refinement ranks counting only the windows that overlap no other
 (+3 % aiodd: the weaker filter sends more positions to the walk) or comparing only positions of overlapping windows

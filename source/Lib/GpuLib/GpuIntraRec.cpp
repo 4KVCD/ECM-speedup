@@ -3465,52 +3465,49 @@ static bool addObicNeighbours( GpuIntraRec::Impl& m, const CodingUnit& cu, Cu& c
       inter = true;
       continue;
     }
-    // (an EIP CU, too, counts nothing in an intra slice; in another its DIMD mode)
-    // an NN CU counts the DIMD mode of its prediction (indicesRepresentationPnn), which its luma block publishes in the
-    // CU's DimdOut (DERIVE_PNN_DIMD); the OBIC CU's node then waits for every block before it (DERIVE_PREFIX)
-    if( nbrs[n]->firstPU->intraDir[CHANNEL_TYPE_LUMA] == PNN_IDX && !m.cpuCus.count( nbrs[n] ) )
+    // an NN CU counts the DIMD mode of its prediction (indicesRepresentationPnn), and in an inter slice an IntraTMP or
+    // MIP CU too (intraTmpDimdMode, mipDimdMode): its luma block writes it into its CU's DimdOut (an NN block with
+    // DERIVE_PNN_DIMD, a MIP one with DERIVE_MIP_DIMD, an IntraTMP one in any case), its entry's count negative; the
+    // OBIC CU's node then waits for every block before it (DERIVE_PREFIX). (In an intra slice an IntraTMP neighbour
+    // counts nothing, and its mode as its node publishes it is planar - getIntraDirLuma's -, which OBIC never selects)
+    const CodingUnit& nb       = *nbrs[n];
+    const bool        nn       = nb.firstPU->intraDir[CHANNEL_TYPE_LUMA] == PNN_IDX;
+    const bool        predDimd = nn || ( !cu.slice->isIntra() && ( nb.tmpFlag || nb.mipFlag ) );
+    if( predDimd && !m.cpuCus.count( &nb ) )
     {
-      const auto rec = m.cuIndex[CHANNEL_TYPE_LUMA].find( nbrs[n] );
+      const auto rec = m.cuIndex[CHANNEL_TYPE_LUMA].find( &nb );
       int        b   = (int) m.rec.size() - 1;
       while( rec != m.cuIndex[CHANNEL_TYPE_LUMA].end() && b >= 0
-             && !( m.rec[b].cu == rec->second && m.rec[b].comp == 0 && m.rec[b].pnn >= 0 ) )
+             && !( m.rec[b].cu == rec->second && m.rec[b].comp == 0 && !( m.rec[b].derive & DERIVE_NODE ) ) )
       {
         b--;
       }
-      if( rec == m.cuIndex[CHANNEL_TYPE_LUMA].end() || b < 0 || nbrs[n]->firstTU != nbrs[n]->lastTU )
+      if( rec == m.cuIndex[CHANNEL_TYPE_LUMA].end() || b < 0 || nb.firstTU != nb.lastTU )
       {
-        why = "OBIC with an NN neighbour of several blocks or without its block";
+        why = "OBIC with a neighbour of its prediction's DIMD of several blocks or without its block";
         return false;
       }
-      m.rec[b].derive |= DERIVE_PNN_DIMD;
-      m.cuMipDimd[rec->second] = 2;
+      m.rec[b].derive |= nn ? DERIVE_PNN_DIMD : nb.mipFlag ? DERIVE_MIP_DIMD : 0;
+      if( nn || nb.mipFlag )
+      {
+        m.cuMipDimd[rec->second] = nn ? 2 : 1;
+      }
       m.obicWaits.insert( &cu );
       *o++ = ObicNbr{ rec->second, -numSamples[n] };   // (negative: the mode is its DimdOut's, not its CU mode)
       continue;
     }
-    // (in an inter slice deriveObicMode counts an IntraTMP or MIP neighbour's DIMD of its prediction, which the
-    // GPU's blocks of such CUs do not publish for OBIC; in an intra slice an IntraTMP neighbour counts nothing, and its
-    // mode as its node publishes it is planar - getIntraDirLuma's -, which OBIC never selects)
-    if( !cu.slice->isIntra() && ( nbrs[n]->tmpFlag || nbrs[n]->mipFlag ) )
-    {
-      why = "OBIC with an IntraTMP or MIP neighbour in an inter slice";
-      return false;
-    }
-    if( nbrs[n]->mipFlag || ( nbrs[n]->eipFlag && cu.slice->isIntra() ) )
+    // (a MIP or EIP CU counts nothing in an intra slice; in another an EIP CU its DIMD mode, eipDimdMode: its block
+    // writes that as its CU's mode, which obicHistogram reads after it - addModeDep's dependency on the block)
+    if( ( nb.mipFlag || nb.eipFlag ) && cu.slice->isIntra() )
     {
       continue;
     }
-    if( nbrs[n]->eipFlag )
-    {
-      why = "OBIC with an EIP neighbour in an inter slice";
-      return false;
-    }
     // partial verification: a neighbour taken from the CPU counts its mode once (a known CU's), which deriveObicMode
-    // does only for a CU of no tool it counts otherwise (TIMD's, DIMD's, SGPM's, NN's modes; nothing of IntraTMP)
-    const CodingUnit& nb = *nbrs[n];
+    // does only for a CU of no tool it counts otherwise (TIMD's, DIMD's, SGPM's, NN's modes; nothing of IntraTMP; the
+    // DIMD mode of a MIP or EIP CU's prediction in an inter slice)
     if( m.partial && m.cpuCus.count( &nb )
-        && ( nb.dimd || nb.timd || nb.sgpm || nb.tmrlFlag || nb.tmpFlag || !CU::isIntra( nb )
-             || nb.firstPU->intraDir[CHANNEL_TYPE_LUMA] >= NUM_LUMA_MODE ) )
+        && ( nb.dimd || nb.timd || nb.sgpm || nb.tmrlFlag || nb.tmpFlag || nb.mipFlag || nb.eipFlag
+             || !CU::isIntra( nb ) || nb.firstPU->intraDir[CHANNEL_TYPE_LUMA] >= NUM_LUMA_MODE ) )
     {
       why = "OBIC with a neighbour from the CPU that counts otherwise";
       return false;
