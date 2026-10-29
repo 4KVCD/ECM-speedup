@@ -71,9 +71,10 @@ const int TL_CAP    = MTMP_NUM_SPARSE + 1;            // a list's room (the long
 const int TS_LIST   = 1 + TL_CAP * ( 1 + TE );        // a list: its size, its order, its entries (tlAt)
 const int TS_SPARSE = TS_LIC + 5 * TMP_CHUNK;         // 3 lists: the L-shape's (or the only one), the top's, the left's
 const int TS_REFINE = TS_SPARSE + 3 * TS_LIST;        // 3 lists alike
-const int TS_MCOST  = TS_REFINE + 3 * TS_LIST;        // per vector of the list its 3 costs
-const int TS_WIN    = TS_MCOST + 3 * BV_LIST_MAX;     // which lists took vectors (bits), the refinement's 3 thresholds
+const int TS_WIN    = TS_REFINE + 3 * TS_LIST;        // which lists took vectors (bits), the refinement's 3 thresholds
 
+shared int s_tmpHit[2];   // the clustering's first list entry a vector meets (two turns: the last is still read)
+const int  TMP_NO_HIT = 0x7FFFFFFF;
 shared int s_tmpCount;    // the chunk's positions (with its holes)
 shared int s_tmpRows;     // the chunk's rows
 shared int s_tmpDone;     // the last chunk
@@ -1994,45 +1995,47 @@ void tmpNode( Cu c, int cuIndex, int bitDepth, int lid, int NT )
   // BVG-DIMD (invocation 0): of the sparse search's best and the neighbours' vectors that cost less than it, in turn,
   // the cheapest alone (bvgCandList of MAX_BVG_ROUGH_NUM 1), a vector's window BVG_REFINE_RANGE around it; the
   // refinement's threshold 1.2 times its cost, plus 1, without clustering (no position is tried twice)
-  if( lid == 0 && bvg )
+  if( bvg )
   {
-    int maxCost = pDiff[0];   // (the sparse best's cost, else the initial threshold: maxSparseCost)
-    for( int m = 0; m < numList; m++ )
+    if( lid == 0 )
     {
-      const int diff = tcCost( m, 0 );
-      if( diff < maxCost )
+      int maxCost = pDiff[0];   // (the sparse best's cost, else the initial threshold: maxSparseCost)
+      for( int m = 0; m < numList; m++ )
       {
-        const ivec2 cand = bvListAt( m );
-        tlUpdate( TS_SPARSE, tlEntry( cand.x, cand.y, cand - BVG_REFINE_RANGE, cand + BVG_REFINE_RANGE, TMP_MRG_REG_ID,
-                                      diff ), 1 );
-        maxCost = diff;
+        const int diff = tcCost( m, 0 );
+        if( diff < maxCost )
+        {
+          const ivec2 cand = bvListAt( m );
+          tlUpdate( TS_SPARSE, tlEntry( cand.x, cand.y, cand - BVG_REFINE_RANGE, cand + BVG_REFINE_RANGE,
+                                        TMP_MRG_REG_ID, diff ), 1 );
+          maxCost = diff;
+        }
       }
+      tsSet( TS_WIN, 0 );
+      tsSet( TS_WIN + 1, bvgThreshold( maxCost ) );
     }
-    tsSet( TS_WIN, 0 );
-    tsSet( TS_WIN + 1, bvgThreshold( maxCost ) );
   }
   // the windows of the neighbours' vectors (adaptive: by the cost against its threshold), the cascaded ones' fixed;
-  // then the clustering (invocation 0)
-  else if( lid == 0 )
+  // then the clustering: per vector and list type the list's first entry at the vector or whose window overlaps the
+  // vector's, which every invocation tests for an entry of its own (s_tmpHit: its index and what it found), and
+  // invocation 0's change of the list - the list's walk, entry by entry, was most of the clustering's time. The
+  // vectors' costs are still the cascade's chunk's (tcCost)
+  else
   {
-    for( int i = 0; i < numList; i++ )
-    {
-      tsSet( TS_MCOST + 3 * i, tcCost( i, 0 ) );
-      tsSet( TS_MCOST + 3 * i + 1, tcCost( i, 1 ) );
-      tsSet( TS_MCOST + 3 * i + 2, tcCost( i, 2 ) );
-    }
     const int numTemp   = tempType == TMP_L_SHAPE ? numTL : tempType == TMP_LEFT ? numLeft : numTop;
     const int threshold = numTemp << ( ( licMode ? TMP_LOG2MINCOST : TMP_LOG2MINCOST + 1 ) + bitDepth - 10 );
     const int arbvpS    = licMode ? 2 : 1;   // ARBVPS_RANGE (- 1 without the LIC mode)
-    bool clustered[3] = bool[3]( false, false, false );
-    for( int m = 0; m < numList; m++ )
+    const int numVectors = s_tmpCount;                    // (numList, which only invocation 0 has)
+    bool clustered[3] = bool[3]( false, false, false );   // (invocation 0's)
+    int  turn = 0;                                        // (s_tmpHit's slot: the one before is still being read)
+    for( int m = 0; m < numVectors; m++ )
     {
       const ivec2 cand = bvListAt( m );
       ivec2       winTL, winBR;
       int         regionId;
       if( m < itmpSize )
       {
-        const int cost  = tsGet( TS_MCOST + 3 * m );
+        const int cost  = tcCost( m, 0 );
         const int slope = cost < threshold ? TMP_MERGE_RANGE * cost / threshold : TMP_MERGE_RANGE;
         winTL    = cand - slope;
         winBR    = cand + slope;
@@ -2045,67 +2048,86 @@ void tmpNode( Cu c, int cuIndex, int bitDepth, int lid, int NT )
         winBR    = cand + r;
         regionId = m < itmpSize1 ? TMP_MRG_REG_ID + 1 : TMP_MRG_REG_ID + 2;
       }
-      for( int t = 0; t < numTypes; t++ )
+      for( int t = 0; t < numTypes; t++, turn ^= 1 )
       {
-        const int list = TS_SPARSE + t * TS_LIST, diff = tsGet( TS_MCOST + 3 * m + t );
-        bool overlap = false;
-        for( int i = 0; i < tlSize( list ); i++ )
+        const int list = TS_SPARSE + t * TS_LIST, diff = tcCost( m, t );
+        if( lid == 0 )
         {
-          if( tlAt( list, i, TE_X ) == cand.x && tlAt( list, i, TE_Y ) == cand.y )
+          s_tmpHit[turn] = TMP_NO_HIT;
+        }
+        tsSync();   // (also invocation 0's change of the list before)
+        if( lid < tlSize( list ) )   // (the entry's index, then whether it is at the vector, whether it costs no more)
+        {
+          const int   i   = lid;
+          const ivec2 sTL = ivec2( tlAt( list, i, TE_TLX ), tlAt( list, i, TE_TLY ) );
+          const ivec2 sBR = ivec2( tlAt( list, i, TE_BRX ), tlAt( list, i, TE_BRY ) );
+          const bool  at  = tlAt( list, i, TE_X ) == cand.x && tlAt( list, i, TE_Y ) == cand.y;
+          if( at || ( !( winBR.x < sTL.x || winTL.x > sBR.x ) && !( winBR.y < sTL.y || winTL.y > sBR.y ) ) )
           {
-            overlap = true;
-            break;
-          }
-          ivec2 sTL = ivec2( tlAt( list, i, TE_TLX ), tlAt( list, i, TE_TLY ) );
-          ivec2 sBR = ivec2( tlAt( list, i, TE_BRX ), tlAt( list, i, TE_BRY ) );
-          if( !( winBR.x < sTL.x || winTL.x > sBR.x ) && !( winBR.y < sTL.y || winTL.y > sBR.y ) )
-          {
-            if( diff < tlAt( list, i, TE_COST ) )   // the vector replaces the sparse one, their windows merged
-            {
-              sTL = bigCtu ? min( sTL, winTL ) : min( sTL + 1, winTL );
-              sBR = bigCtu ? max( sBR, winBR ) : max( sBR - 1, winBR );
-              tlErase( list, i );
-              tlUpdate( list, tlEntry( cand.x, cand.y, sTL, sBR, regionId, diff ), numSparse[t] );
-              if( tlSize( list ) == numSparse[t] )
-              {
-                pDiff[t] = min( tlAt( list, numSparse[t] - 1, TE_COST ), pDiff[t] );
-              }
-            }
-            else   // the sparse one's window takes the vector in (also the window the next types test with)
-            {
-              if( !bigCtu )
-              {
-                const int r = regionId == TMP_MRG_REG_ID ? 2 : 1;
-                winTL = cand - r;
-                winBR = cand + r;
-              }
-              const ivec2 aTL = bigCtu ? cand : winTL, aBR = bigCtu ? cand : winBR;
-              tlSetAt( list, i, TE_TLX, min( sTL.x, aTL.x ) );
-              tlSetAt( list, i, TE_TLY, min( sTL.y, aTL.y ) );
-              tlSetAt( list, i, TE_BRX, max( sBR.x, aBR.x ) );
-              tlSetAt( list, i, TE_BRY, max( sBR.y, aBR.y ) );
-              tlSetAt( list, i, TE_REGION, regionId );
-            }
-            clustered[t] = true;
-            overlap      = true;
-            break;
+            atomicMin( s_tmpHit[turn], i << 2 | ( at ? 1 : 0 ) | ( diff < tlAt( list, i, TE_COST ) ? 0 : 2 ) );
           }
         }
-        if( !overlap && diff < pDiff[t] )
+        tsSync();
+        const int hit = s_tmpHit[turn], i = hit >> 2;
+        if( hit == TMP_NO_HIT )   // the vector a list entry of its own
         {
-          tlUpdate( list, tlEntry( cand.x, cand.y, winTL, winBR, regionId, diff ), numSparse[t] );
-          if( tlSize( list ) == numSparse[t] )
+          if( lid == 0 && diff < pDiff[t] )
           {
-            pDiff[t] = min( tlAt( list, numSparse[t] - 1, TE_COST ), pDiff[t] );
+            tlUpdate( list, tlEntry( cand.x, cand.y, winTL, winBR, regionId, diff ), numSparse[t] );
+            if( tlSize( list ) == numSparse[t] )
+            {
+              pDiff[t] = min( tlAt( list, numSparse[t] - 1, TE_COST ), pDiff[t] );
+            }
+            clustered[t] = true;
           }
-          clustered[t] = true;
+        }
+        else if( ( hit & 1 ) == 0 && ( hit & 2 ) == 0 )   // the vector replaces the sparse one, their windows merged
+        {
+          if( lid == 0 )
+          {
+            const ivec2 sTL = ivec2( tlAt( list, i, TE_TLX ), tlAt( list, i, TE_TLY ) );
+            const ivec2 sBR = ivec2( tlAt( list, i, TE_BRX ), tlAt( list, i, TE_BRY ) );
+            tlErase( list, i );
+            tlUpdate( list, tlEntry( cand.x, cand.y, bigCtu ? min( sTL, winTL ) : min( sTL + 1, winTL ),
+                                     bigCtu ? max( sBR, winBR ) : max( sBR - 1, winBR ), regionId, diff ),
+                      numSparse[t] );
+            if( tlSize( list ) == numSparse[t] )
+            {
+              pDiff[t] = min( tlAt( list, numSparse[t] - 1, TE_COST ), pDiff[t] );
+            }
+            clustered[t] = true;
+          }
+        }
+        else if( ( hit & 1 ) == 0 )   // the sparse one's window takes the vector in (the next types test that window)
+        {
+          if( !bigCtu )
+          {
+            const int r = regionId == TMP_MRG_REG_ID ? 2 : 1;
+            winTL = cand - r;
+            winBR = cand + r;
+          }
+          if( lid == 0 )
+          {
+            const ivec2 sTL = ivec2( tlAt( list, i, TE_TLX ), tlAt( list, i, TE_TLY ) );
+            const ivec2 sBR = ivec2( tlAt( list, i, TE_BRX ), tlAt( list, i, TE_BRY ) );
+            const ivec2 aTL = bigCtu ? cand : winTL, aBR = bigCtu ? cand : winBR;
+            tlSetAt( list, i, TE_TLX, min( sTL.x, aTL.x ) );
+            tlSetAt( list, i, TE_TLY, min( sTL.y, aTL.y ) );
+            tlSetAt( list, i, TE_BRX, max( sBR.x, aBR.x ) );
+            tlSetAt( list, i, TE_BRY, max( sBR.y, aBR.y ) );
+            tlSetAt( list, i, TE_REGION, regionId );
+            clustered[t] = true;
+          }
         }
       }
     }
-    tsSet( TS_WIN, ( clustered[0] ? 1 : 0 ) | ( clustered[1] ? 2 : 0 ) | ( clustered[2] ? 4 : 0 ) );
-    for( int t = 0; t < 3; t++ )   // the refinement's thresholds
+    if( lid == 0 )
     {
-      tsSet( TS_WIN + 1 + t, pDiff[t] + ( tlSize( TS_SPARSE + t * TS_LIST ) < numSparse[t] ? 0 : 1 ) );
+      tsSet( TS_WIN, ( clustered[0] ? 1 : 0 ) | ( clustered[1] ? 2 : 0 ) | ( clustered[2] ? 4 : 0 ) );
+      for( int t = 0; t < 3; t++ )   // the refinement's thresholds
+      {
+        tsSet( TS_WIN + 1 + t, pDiff[t] + ( tlSize( TS_SPARSE + t * TS_LIST ) < numSparse[t] ? 0 : 1 ) );
+      }
     }
   }
   tsSync();

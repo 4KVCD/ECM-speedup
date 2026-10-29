@@ -3404,10 +3404,23 @@ ld_foreman_q22 -8 %, fp720_ai 14,378 -> 13,605 ms (-5 %), ai720 1,803 -> 1,712 m
 ld_parkjoy_q27 +0.9 %, the rest faster or within 1 %. Results (grn198): every picture identical. A
 first version (grn196) put intra_rec's shared memory 180 bytes over the 49,152-byte limit with a word per place:
 NVIDIA's driver created the pipeline and the device was lost on every stream; shared_size.py checks that now.
+M171 (2026-10-29): IntraTMP's clustering in parallel: per vector of the list and list type, every invocation tests
+an entry of the list (at the vector, or its window overlapping the vector's) and atomicMin finds the first (s_tmpHit:
+the index and what it found, two slots by turn so that invocation 0 never resets the one still being read); invocation
+0 then changes the list as before (replace, take in, or a new entry). The list's walk, entry by entry, was most of
+the clustering (197 of the node's 1,157 ms on aiodd, ai720 and ra720). The vectors' costs come straight from the
+cascade's chunk (TS_MCOST's copy gone). GPU time (27 streams, one session, grn198 -> grn205): 56,588 -> 52,918 ms
+(-6.5 %), every stream faster: fp720_ai 13,610 -> 12,430 ms (-8.7 %), ai720 1,716 -> 1,567 ms (-8.7 %), ra720 2,155 ->
+1,973 ms (-8.4 %), the long RA streams -0.5 to -1.2 %. Results (grn205): every picture identical. A first build lost
+the device: its loop ran over
+numList, which only invocation 0 has (the others' 0), so the invocations met different barriers - a loop with
+barriers needs a bound every invocation shares (s_tmpCount here).
 Tried after M125 and left out (idle 3070, median of 5 or 7): IntraTMP's lists in the angular arrays (s_angA, a word
 as two int16; paired: aiodd +19 %, ra720 +41 %, the clustering 6.6 times as long - likely the index division and the
 two loads per word in invocation 0's walks, against the scratch's one load; with the division gone, M169's chunks
-gain); the CCP merge history's and list's records read ahead in parallel with signatures (neutral); IntraTMP's
+gain); the CCP merge candidates' costs grouped by their luma buffers' filters, each set built once (neutral: the
+rebuilds are mostly each block's first); the CCP merge history's and list's records read ahead in parallel with
+signatures (neutral); IntraTMP's
 refinement ranks counting only the windows that overlap no other
 (+3 % aiodd: the weaker filter sends more positions to the walk) or comparing only positions of overlapping windows
 (+7 % aiodd); the sparse cascade read ahead (neutral); MDIP's modes ranked in parallel (neutral); the cascade's slots
