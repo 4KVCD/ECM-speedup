@@ -4058,6 +4058,12 @@ static bool addChromaTmrlNeighbours( GpuIntraRec::Impl& m, const PredictionUnit&
   {
     const PredictionUnit* lumaPU = pu.cs->getLumaPU( lumaPos[k], CHANNEL_TYPE_LUMA );
     const auto rec = lumaPU ? m.cuIndex[CHANNEL_TYPE_LUMA].find( lumaPU->cu ) : m.cuIndex[CHANNEL_TYPE_LUMA].end();
+    if( lumaPU && rec == m.cuIndex[CHANNEL_TYPE_LUMA].end() && CU::isIBC( *lumaPU->cu ) )
+    {
+      // (an IBC CU has no CU record: a known record of its parsed mode, getIntraDirLuma's)
+      c.nbr[CHROMA_TMRL_NBR_LUMA + k] = mpmModeCu( m, (int32_t) PU::getIntraDirLuma( *lumaPU, 0 ) );
+      continue;
+    }
     if( rec == m.cuIndex[CHANNEL_TYPE_LUMA].end() )
     {
       why = "a chroma TMRL luma CU that is not recorded";
