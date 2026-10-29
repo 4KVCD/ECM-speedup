@@ -3355,6 +3355,10 @@ and offset, mcHypotheses applies them (mcLic); m_gpuHypLic starts with the model
 hypotheses can leave another stored: an affine LIC base's 32 / 8 stored as 32 / -1, ld_cif33 POC 24), which the CU's
 own LIC records take (cuLicModel). Results (27 streams, grn181 with ECM_GPU_FULL_PIPELINE, M160 to M168 and the block
 clock): every picture identical. Inter CUs from the CPU: multi-hypothesis (a hypothesis with LIC) 6 -> 0.
+M164 (2026-10-29): BVG-CCCM with joint CbCr whose Cr block decides the signs: such a Cr block (DERIVE_PREFIX, spCoded
+the record before it: prefixBeforePair) waits for every record before its Cb block, which intra_rec's prefix release
+starts it at. Results (27 streams, grn181 with ECM_GPU_FULL_PIPELINE, M160 to M168 and the block clock): every picture
+identical. Intra CUs from the CPU: 3 -> 0.
 Tried after M125 and left out (idle 3070, median of 5 or 7): the CCP merge history's and list's records read ahead in
 parallel with signatures (neutral); IntraTMP's refinement ranks counting only the windows that overlap no other
 (+3 % aiodd: the weaker filter sends more positions to the walk) or comparing only positions of overlapping windows

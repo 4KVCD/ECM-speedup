@@ -2248,7 +2248,8 @@ void releaseOne( int d )
 // a block to finish takes it over (one per block, the workgroup continues with it) or queues it. Then the prefix of
 // finished blocks and nodes in decoding order (counter[3]; per block a done flag in depTmp, which intra_deps no longer
 // needs): each finisher moves it on over the finished ones, by compare-and-swap, and whoever moves it to a node waiting
-// for all before it (DERIVE_PREFIX) releases that node
+// for all before it (DERIVE_PREFIX) releases that node - to a Cb block, the Cr block after it that waits for all before
+// the Cb block (prefixBeforePair)
 void releaseDependents( int d0, int d1, int lid, int NT )
 {
   controlBarrier( gl_ScopeWorkgroup, gl_ScopeQueueFamily, gl_StorageSemanticsBuffer, gl_SemanticsAcquireRelease );
@@ -2272,9 +2273,14 @@ void releaseDependents( int d0, int d1, int lid, int NT )
         continue;
       }
       p++;
-      if( p < pc.numTus && ( BufTu( P.tus ).v[p].derive & DERIVE_PREFIX ) != 0 )
+      if( p < pc.numTus && ( BufTu( P.tus ).v[p].derive & DERIVE_PREFIX ) != 0
+          && !prefixBeforePair( BufTu( P.tus ), p ) )
       {
         releaseOne( p );
+      }
+      if( p + 1 < pc.numTus && prefixBeforePair( BufTu( P.tus ), p + 1 ) )
+      {
+        releaseOne( p + 1 );
       }
     }
     atomicAdd( counter.v[2], 1 );   // finished blocks and nodes

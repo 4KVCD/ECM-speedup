@@ -7245,13 +7245,9 @@ void GpuIntraRec::record( const TransformUnit& tu, const ComponentID compID, con
     {
       if( std::abs( cb->jccr ) == 3 )   // Cr coded: this block decides and writes the Cb block's residual
       {
-        // (the Cb block then waits for this one, which cannot also wait for all blocks before it - the Cb block among
-        // them - as a BVG-CCCM block does)
-        if( t.derive & DERIVE_PREFIX )
-        {
-          reject( "BVG-CCCM with joint CbCr whose Cr block decides the signs" );
-          return;
-        }
+        // (the Cb block then waits for this one, which so cannot also wait for all blocks before it, the Cb block among
+        // them: where it waits for all before it, as a BVG-CCCM block does, it waits for all before the Cb block -
+        // intra_rec's prefix release, by its spCoded; nothing its prediction or decision reads is the Cb block's)
         t.spCoded               = cbIndex;
         m.rec[cbIndex].resiFrom = cbIndex + 1;
         // (with the Cb block's transforms; of a CCLM CU their mode is the DIMD this block then finds too)

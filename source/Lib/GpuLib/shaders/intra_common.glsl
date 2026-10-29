@@ -307,7 +307,6 @@ const int IBC_REC_BI = 14, IBC_REC_OWN_MV2 = 15;
 // vectors)
 const int OBMC_REC_X = 0, OBMC_REC_Y = 1, OBMC_REC_W = 2, OBMC_REC_H = 3, OBMC_REC_FLAGS = 4, OBMC_REC_NUM = 5;
 const int OBMC_REC_BD = 6, OBMC_REC_BASE = 7, OBMC_REC_INNER = 8, OBMC_REC_SEG = 10;   // (BASE: where the data start)
-const int OBMC_REC_PARTS = 9;   // (with IBC neighbours: the table of the CU's records on its band, -1 none)
 const int OBMC_SEG_DIR = 0, OBMC_SEG_START = 1, OBMC_SEG_LEN = 2, OBMC_SEG_DATA = 3, OBMC_SEG_MV = 4, OBMC_SEG_MV2 = 6;
 const int OBMC_SEG = 8;
 const int OBMC_REC_TM = 1, OBMC_REC_TOP = 2, OBMC_REC_LEFT = 4, OBMC_REC_INV_LMCS = 8, OBMC_REC_SUB = 16;
@@ -1021,8 +1020,6 @@ struct Params
   int      ccpDerivedGl;   // decoder-derived CCP fusion's GL-CCCM mode above this many chroma samples (8 outside I slices)
   uint64_t resiPlane;   // ON mode with ALF: int16 luma residual (written, origin / stride of plane 0; 0: none), which
                         // ALF reads (JVET-AC0162, the CPU's picture residual buffer)
-  uint64_t blockClock;  // BLOCK_CLOCK (development, ECM_GPU_BLOCK_CLOCK): uint64 per block its start and end on the
-                        // device's realtime clock
 };
 layout( buffer_reference, std430, buffer_reference_align = 8 ) buffer BufParams { Params p; };
 
