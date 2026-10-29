@@ -1709,6 +1709,7 @@ void tmpNode( Cu c, int cuIndex, int bitDepth, int lid, int NT )
       tlClear( TS_REFINE + t * TS_LIST );
     }
   }
+  clockMark( 0 );   // (BLOCK_CLOCK: the setup)
 
   // the sparse search: the regions 3, 4, 5, 0, 1, 2 (but for a small block a region inside a neighbour vector's
   // window), rows from the bottom up by S, row r's first position S - 1 - (r - 1) % S left of the right edge, then
@@ -1850,6 +1851,8 @@ void tmpNode( Cu c, int cuIndex, int bitDepth, int lid, int NT )
     }
   }
 
+  clockMark( 1 );   // (BLOCK_CLOCK: the sparse search)
+
   // an EIP CU with a vector: the sparse search's best (m_tmpSparseSearchXdisp; the number found, 0 or 1) into its
   // DimdOut and its record of vectors (pu.bv), which is all it searches for
   if( onlyBest )
@@ -1886,6 +1889,7 @@ void tmpNode( Cu c, int cuIndex, int bitDepth, int lid, int NT )
   }
   tsSync();
   tmpChunkCosts( c, tempType, 0, ivec3( 0 ), false, lid, NT );   // (at most BV_LIST_MAX)
+  clockMark( 2 );   // (BLOCK_CLOCK: the vector list's cascade and costs)
 
   // BVG-DIMD (invocation 0): of the sparse search's best and the neighbours' vectors that cost less than it, in turn,
   // the cheapest alone (bvgCandList of MAX_BVG_ROUGH_NUM 1), a vector's window BVG_REFINE_RANGE around it; the
@@ -2005,6 +2009,8 @@ void tmpNode( Cu c, int cuIndex, int bitDepth, int lid, int NT )
     }
   }
   tsSync();
+
+  clockMark( 3 );   // (BLOCK_CLOCK: the clustering)
 
   // the refinement: per list type its candidates' windows (a sparse one's clipped to its region but where the
   // exception allows, a vector's whole, its positions checked where the window may leave the decoded area), each
@@ -2155,6 +2161,8 @@ void tmpNode( Cu c, int cuIndex, int bitDepth, int lid, int NT )
   {
     return;
   }
+
+  clockMark( 4 );   // (BLOCK_CLOCK: the refinement)
 
   // the list: the L-shape's (or the only one's), with the top and the left template's merged in from INIT_TL_POS on
   // (each vector once; where the list is shorter, appended); its vectors cyclically repeated to MTMP_NUM

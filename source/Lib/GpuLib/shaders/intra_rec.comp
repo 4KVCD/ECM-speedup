@@ -107,6 +107,20 @@ shared int     s_modesRead[MPM_NEIGHBOURS];   // the modes its derivation reads 
 
 Params P;      // the parameter block (loaded once)
 int    g_ti;   // the block being reconstructed
+
+// BLOCK_CLOCK (development): the end of phase k (< CLOCK_PHASES) of the running record on the device's clock, after
+// every record's start and end (invocation 0; the phases of IntraTMP's node, of a CCP merge block, of an NN block)
+const int CLOCK_PHASES = 8;
+void clockMark( int k )
+{
+#ifdef BLOCK_CLOCK
+  if( gl_LocalInvocationID.x == 0 )
+  {
+    BufU64( P.blockClock ).v[2 * pc.numTus + CLOCK_PHASES * g_ti + k] = clockRealtimeEXT();
+  }
+#endif
+}
+
 bool   g_crs;       // LMCS chroma residual scaling of the block
 int    g_crsScale;  // its scale (Reshape::calculateChromaAdj)
 // a block whose transforms depend on its prediction (DERIVE_PNN_DIMD): its prediction is kept in s_spPred (as sign

@@ -1235,6 +1235,7 @@ void ccpMergePrediction( inout Tu t, int predStride, int lid, int NT )
     }
   }
   SYNC();
+  clockMark( 0 );   // (BLOCK_CLOCK: the list)
   // the models the block fits itself: decoder-derived fusion's, adjustment's on-the-fly ones (appended while the list
   // has room)
   if( derived || ( adjust != 0 && s_ccp[CCP_LIST_NUM] < CCP_MAX_LIST ) )
@@ -1256,6 +1257,7 @@ void ccpMergePrediction( inout Tu t, int predStride, int lid, int NT )
     }
     SYNC();
   }
+  clockMark( 1 );   // (BLOCK_CLOCK: the block's own fits)
   const int  W = t.w, H = t.h, len = W + H, numCost = s_ccp[CCP_LIST_NUM], maxPel = ( 1 << t.bitDepth ) - 1;
   const int  steps = numCost + ( twoSteps ? 2 : 1 );
   const bool above = s_cclm[CCLM_POS_ABOVE] != 0, left = s_cclm[CCLM_POS_LEFT] != 0;
@@ -1436,7 +1438,12 @@ void ccpMergePrediction( inout Tu t, int predStride, int lid, int NT )
       s_ccp[CCP_LIST_COST + step] = total;
     }
     SYNC();
+    if( step == numCost - 1 )
+    {
+      clockMark( 2 );   // (BLOCK_CLOCK: the candidates' costs)
+    }
   }
+  clockMark( 3 );   // (BLOCK_CLOCK: the choice and the chosen model's prediction)
   // the chosen model as its LM block's; a merge fusion block's fields kept: storeRegion blends its CCCM prediction in,
   // decoder-derived fusion's list[1] with the weight 3 for list[0], decoder-derived merge fusion's by the pair's model
   // (the weight 0 that stands for it)

@@ -1381,6 +1381,10 @@ struct Params
 static_assert( offsetof( Params, origin ) == 328 && offsetof( Params, edgeCap ) == 408
                  && offsetof( Params, resiPlane ) == 496 && sizeof( Params ) == 512,
                "Params layout" );
+// ECM_GPU_BLOCK_CLOCK's buffer (Params::blockClock, uint64): per record its start and end, then per record
+// CLOCK_PHASES marks of its phases (intra_rec's clockMark)
+constexpr int    CLOCK_PHASES      = 8;
+constexpr size_t BLOCK_CLOCK_BYTES = 8 * ( 2 + CLOCK_PHASES );
 
 constexpr double SLICE_NS = 250e6;   // intra_rec's time per slice: well below Windows' GPU timeout of 2 s
 
@@ -11653,9 +11657,13 @@ static std::string sideInformation( GpuIntraRec::Impl& m, const CodingStructure&
 // ECM_GPU_BLOCK_CLOCK (development): picture poc's time per kind of record, the sums of their durations between their
 // start and end on the device's realtime clock (nanoseconds on NVIDIA; a picture runs mostly along one chain of
 // dependencies, so the sums show where its time goes), printed by falling time: "[gpu-intra] POC n block clock:
-// <kind> <ms> ms (<records>); ..."
+// <kind> <ms> ms (<records>); ..."; then per kind whose records mark phases (intra_rec's clockMark: after the
+// records' start and end CLOCK_PHASES marks each, 0 where not reached) the sums of the phases, the last one's up to
+// the record's end: "[gpu-intra] POC n phases of <kind>: <phase> <ms>; ..."
 static void printBlockClock( const GpuIntraRec::Impl& m, int poc, const uint64_t* clock )
 {
+  const uint64_t* marks = clock + 2 * m.rec.size();
+  std::map<std::string, std::vector<double>> phases;
   static const char* const nodeKinds[] = { "known", "MPM", "chroma DM", "chroma candidate", "DIMD", "DIMD chroma",
                                            "OBIC", "intra merge", "TIMD", "TMRL", "chroma TMRL", "EIP",
                                            "known (131 modes)", "IntraTMP", "BVG-DIMD", "SGPM", "SGPM view", "DBV",
@@ -11693,6 +11701,18 @@ static void printBlockClock( const GpuIntraRec::Impl& m, int poc, const uint64_t
     std::pair<double, int>& s = sums[kind];
     s.first += double( clock[2 * i + 1] - clock[2 * i] ) * 1e-6;
     s.second++;
+    uint64_t last = clock[2 * i];   // (the phases': each from the mark before it)
+    for( int k = 0; k <= CLOCK_PHASES; k++ )
+    {
+      const uint64_t at = k < CLOCK_PHASES ? marks[i * CLOCK_PHASES + k] : clock[2 * i + 1];
+      if( at >= last && ( k < CLOCK_PHASES ? at != 0 : last != clock[2 * i] ) )
+      {
+        std::vector<double>& p = phases[kind];
+        p.resize( CLOCK_PHASES + 1, 0.0 );
+        p[k] += double( at - last ) * 1e-6;
+        last = at;
+      }
+    }
   }
   std::vector<std::pair<double, std::string>> order;
   for( const auto& s: sums )
@@ -11706,6 +11726,15 @@ static void printBlockClock( const GpuIntraRec::Impl& m, int poc, const uint64_t
     printf( " %s %.2f ms (%d);", o.second.c_str(), o.first, sums[o.second].second );
   }
   printf( "\n" );
+  for( const auto& p: phases )
+  {
+    printf( "[gpu-intra] POC %d phases of %s:", poc, p.first.c_str() );
+    for( int k = 0; k <= CLOCK_PHASES; k++ )
+    {
+      printf( " %d %.2f;", k, p.second[k] );
+    }
+    printf( "\n" );
+  }
 }
 
 void GpuIntraRec::endPicture( const CodingStructure& cs )
@@ -12577,7 +12606,7 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
   }
 #endif
 #if ECM_GPU_BLOCK_CLOCK
-  m.blockClock.ensure( ctx, std::max<size_t>( m.rec.size(), 1 ) * 16, gpu::Buffer::DEVICE );
+  m.blockClock.ensure( ctx, std::max<size_t>( m.rec.size(), 1 ) * BLOCK_CLOCK_BYTES, gpu::Buffer::DEVICE );
   P.blockClock = m.blockClock.addr;
 #endif
   P.tus      = m.tus.addr;
@@ -13150,7 +13179,7 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
     const size_t dStart = downBytes;   // (verification: intra_deps' dependency counts, as their prefix sums)
     downBytes += m.on ? 0 : ( n + 1 ) * 4;
     const size_t dClock = downBytes;   // (ECM_GPU_BLOCK_CLOCK: the blocks' start and end)
-    downBytes += P.blockClock ? m.rec.size() * 16 : 0;
+    downBytes += P.blockClock ? m.rec.size() * BLOCK_CLOCK_BYTES : 0;
     m.download.ensure( ctx, downBytes, gpu::Buffer::DOWNLOAD );
 
     gpu::Stream& s = *m.stream;
@@ -13233,7 +13262,7 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
     }
     if( P.blockClock && !m.rec.empty() )   // (0: a record that did not run)
     {
-      s.fill( m.blockClock, 0, m.rec.size() * 16, 0 );
+      s.fill( m.blockClock, 0, m.rec.size() * BLOCK_CLOCK_BYTES, 0 );
     }
     s.fill( m.sched, oQueue * 4, n * 4, 0xFFFFFFFFu );
     s.fill( m.sched, oCounter * 4, 5 * 4, 0 );
@@ -13393,7 +13422,7 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
     }
     if( P.blockClock && !m.rec.empty() )
     {
-      s.copy( m.blockClock, 0, m.download, dClock, m.rec.size() * 16 );
+      s.copy( m.blockClock, 0, m.download, dClock, m.rec.size() * BLOCK_CLOCK_BYTES );
     }
     s.submitAndWait();
     ms = gpuNs * 1e-6;

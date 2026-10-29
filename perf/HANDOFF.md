@@ -3378,6 +3378,12 @@ Block clock (2026-10-29, tooling): the CMake option ECM_GPU_BLOCK_CLOCK (off by 
 device's realtime clock at each block's start and end (Params::blockClock) and the decoder print per picture the sums
 per kind of record ('[gpu-intra] POC n block clock: ...'); perf/gpu/clocksum.py sums a build's partial-verification
 logs per stream and kind. It replaces the temporary phase timers of section 8.
+Block clock phases (2026-10-29, tooling): with the option, intra_rec's clockMark( k ) also marks the end of phase k
+of the running record (up to 8 per record, after the starts and ends in the buffer), and the decoder prints per
+picture the phases' sums per kind ('[gpu-intra] POC n phases of <kind>: 0 <ms>; ...', the last up to the record's
+end). Marked: IntraTMP's node (setup, sparse search, the vector list's cascade and costs, clustering, refinement, then
+the list), CCP merge blocks (the list, the block's own fits, the candidates' costs, the choice), NN blocks (the input,
+the layers, the output).
 Tried after M125 and left out (idle 3070, median of 5 or 7): the CCP merge history's and list's records read ahead in
 parallel with signatures (neutral); IntraTMP's refinement ranks counting only the windows that overlap no other
 (+3 % aiodd: the weaker filter sends more positions to the walk) or comparing only positions of overlapping windows

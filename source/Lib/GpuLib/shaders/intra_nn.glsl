@@ -172,6 +172,7 @@ void pnnPredict( Tu t, int predStride, int lid, int NT )
     s_ref[1][e] = int16_t( zeroMean ? ( int( s_ref[1][e] ) - mean ) << nb : 0 );
   }
   SYNC();
+  clockMark( 0 );   // (BLOCK_CLOCK: the input)
   // the layers (MatMul, its saturation, a leaky ReLU), alternating between s_ref[1] and s_tmp. An output's sum runs
   // over its column's packs, each a few dependent loads of its weights: with fewer outputs than invocations, lanes
   // (a power of two, at most 8) share each output's packs, adding their partial sums in s_spCost (sign prediction's,
@@ -226,6 +227,7 @@ void pnnPredict( Tu t, int predStride, int lid, int NT )
       }
     }
     SYNC();
+    clockMark( min( 1 + l, CLOCK_PHASES - 2 ) );   // (BLOCK_CLOCK: the layers, the last ones together)
   }
   // invertPreprocessingContext: the output (the model's target size, transposed for a tall block) plus the mean,
   // clipped, scaled down
@@ -265,4 +267,5 @@ void pnnPredict( Tu t, int predStride, int lid, int NT )
     s_spPred[i] = int16_t( pnnSample( r, W, H, i % W, i / W ) );
   }
   SYNC();
+  clockMark( CLOCK_PHASES - 1 );   // (BLOCK_CLOCK: the output and its upsampling; then the block's rest)
 }
