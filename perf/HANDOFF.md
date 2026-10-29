@@ -3341,6 +3341,10 @@ chroma sample, the templates at the vector moved by one luma sample with the bil
 ibcChromaPredict's new filter choice). Results (8 streams with such CUs, grn174): every picture identical; Results (27
 streams, grn181 with ECM_GPU_FULL_PIPELINE, M160 to M168 and the block clock): every picture identical. Intra CUs from
 the CPU: DBV with IBC LIC 16 -> 0.
+M161 (2026-10-29): OBMC with an SGPM neighbour above 1024 samples: the table of SGPM's unit parts holds 8 words per
+size and partition (SGPM_UNIT_WORDS: a 64 x 64 CU's 256 units). Results (27 streams, grn181 with
+ECM_GPU_FULL_PIPELINE, M160 to M168 and the block clock): every picture identical. Intra CUs from the CPU: IntraTMP
+OBMC with an SGPM neighbour 2 -> 0.
 Tried after M125 and left out (idle 3070, median of 5 or 7): the CCP merge history's and list's records read ahead in
 parallel with signatures (neutral); IntraTMP's refinement ranks counting only the windows that overlap no other
 (+3 % aiodd: the weaker filter sends more positions to the walk) or comparing only positions of overlapping windows

@@ -1658,9 +1658,10 @@ gpu::Kernel& intraRecKernel( const Shared& sh, gpu::Context& ctx, IntraRecVarian
 // (xSgpmSadTM's g_geoWeightsTpl walk, one sample thick: the above row's width samples, then the left column's height)
 // and the block's (xWeightedSgpm's g_geoWeights walk with the size's blending width, GET_SGPM_BLD_IDX), then the
 // block's without blending (the PPS's sgpmNoBlend: g_geoWeights' first blending width); after those, per CU size and
-// partition the part of each 4 x 4 unit (spanIpmInfoSgpm's tpmMask: bit u of 2 words, u = x + y * W / 4), from
-// sgpmUnitMaskBase
-static int sgpmUnitMaskBase = 0;
+// partition the part of each 4 x 4 unit (spanIpmInfoSgpm's tpmMask: bit u of SGPM_UNIT_WORDS words, u = x + y * W / 4,
+// the 256 units of a 64 x 64 CU), from sgpmUnitMaskBase
+static int           sgpmUnitMaskBase = 0;
+static constexpr int SGPM_UNIT_WORDS  = 8;
 
 // spanIpmInfoSgpm's part (0, 1) of unit (x, y) of a W x H CU of partition s (an index into g_sgpmSplitDir)
 static int sgpmUnitPart( int W, int H, int s, int x, int y )
@@ -1812,13 +1813,15 @@ static std::vector<int32_t> sgpmTables()
       const int W = 1 << ( wIdx + GEO_MIN_CU_LOG2_EX ), H = 1 << ( hIdx + GEO_MIN_CU_LOG2_EX );
       for( int s = 0; s < SGPM_TOTAL_NUM_PARTITIONS; s++ )
       {
-        uint32_t bits[2] = { 0, 0 };
-        for( int u = 0; u < ( W >> 2 ) * ( H >> 2 ) && u < 64; u++ )
+        uint32_t bits[SGPM_UNIT_WORDS] = {};
+        for( int u = 0; u < ( W >> 2 ) * ( H >> 2 ); u++ )
         {
           bits[u >> 5] |= uint32_t( sgpmUnitPart( W, H, s, u % ( W >> 2 ), u / ( W >> 2 ) ) ) << ( u & 31 );
         }
-        v.push_back( (int32_t) bits[0] );
-        v.push_back( (int32_t) bits[1] );
+        for( uint32_t b : bits )
+        {
+          v.push_back( (int32_t) b );
+        }
       }
     }
   }
@@ -5143,14 +5146,15 @@ static const char* bvObmcUnits( GpuIntraRec::Impl& m, const CodingUnit& cu, std:
     else if( n.sgpm )   // (its mode by its part there: its node's partition and modes, sgpmUnitPart's table)
     {
       const int wIdx = floorLog2( n.lwidth() ) - GEO_MIN_CU_LOG2_EX, hIdx = floorLog2( n.lheight() ) - GEO_MIN_CU_LOG2_EX;
-      if( n.lwidth() * n.lheight() > 64 * 16 || m.cus[rec->second].kind != CU_SGPM )
+      if( m.cus[rec->second].kind != CU_SGPM )
       {
         why = tmp ? "IntraTMP OBMC with an SGPM neighbour" : "IBC OBMC with an SGPM neighbour";
       }
       u[OBMC_U_MODE]   = rec->second;
       u[OBMC_U_MV]     = 1;
       u[OBMC_U_MV + 1] = ( ( pos.x - n.lx() ) >> 2 ) + ( ( pos.y - n.ly() ) >> 2 ) * ( n.lwidth() >> 2 );
-      u[OBMC_U_LIC]    = sgpmUnitMaskBase + ( wIdx * GEO_NUM_CU_SIZE_EX + hIdx ) * SGPM_TOTAL_NUM_PARTITIONS * 2;
+      u[OBMC_U_LIC]    = sgpmUnitMaskBase
+                         + ( wIdx * GEO_NUM_CU_SIZE_EX + hIdx ) * SGPM_TOTAL_NUM_PARTITIONS * SGPM_UNIT_WORDS;
     }
     else
     {
