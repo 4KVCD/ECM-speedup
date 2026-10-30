@@ -3460,6 +3460,19 @@ without BDOF the first pass's stripes alone. Mode 2 keeps xSubPuMC's runs and la
 (27 streams, one session each): 43,658 -> 42,850 ms (-1.8 %; the AI streams, untouched, ~0.8 % slower in that
 session); paired (alternating, two rounds): ra720_pj17 3,546 / 3,562 -> 3,477 / 3,446 ms, ai720 1,564 / 1,552 ->
 1,550 / 1,540. Results (grn239, 27 streams): every picture identical.
+M175 (2026-10-29): intra_deps' passes 1 and 2 (the read ranges, availability and dependencies; timed apart with a
+barrier after intra_resi, whose "residuals" timestamp had no barrier and so counted in "deps") took 2-6 ms per picture
+even at 132 blocks: one invocation per block walked the owners along its reference lines (8x its sides), the areas
+(templates, DIMD's regions, CCCM's) and the modes' read ranges one after the other, each new owner looked up in the
+32-entry list in local memory. Now a subgroup per block: its lanes run the block alike (the first lane alone writes),
+split those scans (addLaneDeps adds each step's owners in ascending order; availablePrefix's ballot finds an arm's
+first unit not decoded) and hold the 32-entry list one entry per lane (a lookup is one subgroupAny). Only the
+dependencies' order differs, so the duplicates beyond the list - the host compares them as sets. The list in local
+memory alone kept most of the cost (ai_md5 2.5 -> 1-2 ms per pass); with it spread: 0.36 ms. Pictures of ~11,000
+blocks keep their 5.7-6 ms (fp720_ai) or lose (pj720_ai's deps 110 -> 171 ms): 32 lanes per block cost throughput
+there. Deps over the 27 streams 1,092 -> 557 ms; GPU time (grn239 -> grn244): 42,693 -> 42,017 ms (-1.6 %): ai_md5
+658 -> 541 ms, ai_long 905 -> 795, ld_md5 248 -> 220, ra_ip64_md5 1,083 -> 996. Results (grn244, 27 streams): every
+picture identical, the scheduling data the host's.
 Tried after M125 and left out (idle 3070, median of 5 or 7): IntraTMP's lists in the angular arrays (s_angA, a word
 as two int16; paired: aiodd +19 %, ra720 +41 %, the clustering 6.6 times as long - likely the index division and the
 two loads per word in invocation 0's walks, against the scratch's one load; with the division gone, M169's chunks

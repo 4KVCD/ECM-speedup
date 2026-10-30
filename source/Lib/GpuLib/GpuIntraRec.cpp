@@ -13401,14 +13401,17 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
     Push pass{ m.params.addr, (int32_t) n, 0 };
     s.dispatch( m.sh->kernelDeps, &pass, depGroups );   // the owner maps
     s.barrier();
+    // (passes 1 and 2: a subgroup per block, two per workgroup with NVIDIA's 32 invocations; with other sizes the
+    // workgroups take the rest in turn)
+    const uint32_t depBlockGroups = (uint32_t) std::min<size_t>( ( n + 1 ) / 2, 65535 );
     pass.verify = 1;
-    s.dispatch( m.sh->kernelDeps, &pass, depGroups );   // availability, read ranges, dependency counts
+    s.dispatch( m.sh->kernelDeps, &pass, depBlockGroups );   // availability, read ranges, dependency counts
     s.barrier();
     PushScan scan{ P.depCount, P.depStart, (int32_t) n, 0 };
     s.dispatch( m.sh->kernelScan, &scan, 1 );
     s.barrier();
     pass.verify = 2;
-    s.dispatch( m.sh->kernelDeps, &pass, depGroups );   // the dependencies, the dependents' counts
+    s.dispatch( m.sh->kernelDeps, &pass, depBlockGroups );   // the dependencies, the dependents' counts
     s.barrier();
     scan = PushScan{ P.numDep, P.depOffset, (int32_t) n, 0 };
     s.dispatch( m.sh->kernelScan, &scan, 1 );

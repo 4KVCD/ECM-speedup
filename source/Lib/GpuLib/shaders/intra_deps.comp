@@ -1,7 +1,7 @@
 #version 460
 // the scheduling data of intra_rec, computed on the GPU from the block records: geometry, decoding order and syntax
 // only, with the same rules as GpuIntraRec's host version (which the verification mode compares). One invocation
-// per block; pc.verify selects the pass:
+// per block (passes 1 and 2: a subgroup, below); pc.verify selects the pass:
 //   0  the owner maps (each block writes its index over its units; the maps are -1 before). ISP sub-partitions 1 or
 //      2 wide or high share units: the last one owns them, as on the host (atomicMax)
 //   1  per block the read ranges and the availability (written into the block record) and its number of
@@ -12,6 +12,13 @@
 //      entries) and the queue seeded with the blocks without dependencies
 // Passes 2 and 3 write nothing when the dependencies exceed edgeCap (intra_rec then does nothing either and the
 // host computes the data itself).
+// Passes 1 and 2 take a subgroup per block: its invocations run the block's loop alike (the same state, its first
+// lane alone writes) and split its long scans - the owners along the reference lines and over areas, the modes' read
+// ranges -, adding each scan step's owners in ascending order (addLaneDeps). The dependencies are those of a scan by
+// one invocation; only their order and so the duplicates beyond UNIQ differ, the same in both passes.
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_vote : require
+#extension GL_KHR_shader_subgroup_ballot : require
 #extension GL_GOOGLE_include_directive : require
 #include "common.glsl"
 #include "intra_common.glsl"
@@ -25,13 +32,16 @@ const int UNIQ = 32;   // the dependencies of a block deduplicated exactly (beyo
 Params P;
 int    g_i, g_ch, g_pass;
 int    g_count, g_base;
-// the block's dependencies so far (the first UNIQ). One variable with its count, which main resets: SPIR-V
-// optimizers' private-to-local pass moves a per-invocation global that a single function uses into that function,
-// which without inlining (ECM_SPIRV_INLINE=OFF) makes the list start anew at each addEdge (perf/gpu/private_globals.py)
+// the block's dependencies so far (the first UNIQ), spread over the subgroup's lanes - entry k in lane k modulo the
+// subgroup's size, slot k / size (UNIQ_SLOTS: subgroups of 8 invocations up) -, so that a lookup is one subgroupAny.
+// One variable with its count, which main resets: SPIR-V optimizers' private-to-local pass moves a per-invocation
+// global that a single function uses into that function, which without inlining (ECM_SPIRV_INLINE=OFF) makes the list
+// start anew at each addEdge (perf/gpu/private_globals.py)
+const int UNIQ_SLOTS = UNIQ / 8;
 struct Uniq
 {
   int num;
-  int blocks[UNIQ];
+  int slots[UNIQ_SLOTS];
 };
 Uniq g_uniq;
 
@@ -68,18 +78,25 @@ void addEdge( int o )
   {
     return;
   }
-  for( int k = 0; k < g_uniq.num; k++ )
+  const int size  = int( gl_SubgroupSize ), lane = int( gl_SubgroupInvocationID );
+  bool      known = false;
+  for( int s = 0; s < UNIQ_SLOTS; s++ )
   {
-    if( g_uniq.blocks[k] == o )
-    {
-      return;
-    }
+    known = known || ( s * size + lane < g_uniq.num && g_uniq.slots[s] == o );
+  }
+  if( subgroupAny( known ) )
+  {
+    return;
   }
   if( g_uniq.num < UNIQ )
   {
-    g_uniq.blocks[g_uniq.num++] = o;
+    for( int s = 0; s < UNIQ_SLOTS; s++ )
+    {
+      g_uniq.slots[s] = s * size + lane == g_uniq.num ? o : g_uniq.slots[s];
+    }
+    g_uniq.num++;
   }
-  if( g_pass == 2 )
+  if( g_pass == 2 && subgroupElect() )
   {
     BufI32( P.depTmp ).v[g_base + g_count] = o;
     atomicAdd( BufI32( P.numDep ).v[o], 1 );
@@ -95,6 +112,63 @@ void addDep( int o )
   {
     addEdge( o );
   }
+}
+
+// addDep of each lane's owner o (-1: none), the subgroup's distinct ones in ascending order, so that every lane adds
+// the same
+void addLaneDeps( int o )
+{
+  const int NONE = 0x7fffffff;
+  int       mine = o >= 0 && o < g_i ? o : NONE;
+  for( int next = subgroupMin( mine ); next != NONE; next = subgroupMin( mine ) )
+  {
+    addEdge( next );
+    mine = mine == next ? NONE : mine;
+  }
+}
+
+int lane()
+{
+  return int( gl_SubgroupInvocationID );
+}
+
+int lanes()
+{
+  return int( gl_SubgroupSize );
+}
+
+// the number of units decoded before block g_i from the first of an arm on (lim at most), the units at start, start +
+// step, ...: the subgroup tests a unit per lane, the first one not decoded ends the prefix
+int availablePrefix( OwnerMap m, int lim, ivec2 start, ivec2 step )
+{
+  for( int base = 0; base < lim; base += lanes() )
+  {
+    const ivec2 p   = start + ( base + lane() ) * step;
+    const uvec4 gap = subgroupBallot( base + lane() < lim && !decodedBefore( m, p.x, p.y, g_i ) );
+    if( subgroupBallotBitCount( gap ) > 0 )
+    {
+      return base + int( subgroupBallotFindLSB( gap ) );
+    }
+  }
+  return max( lim, 0 );
+}
+
+// intra_common.glsl's refLineAvailability for block g_i, its arms' scans by the subgroup
+void laneLineAvailability( OwnerMap m, int fx, int fy, int fw, int fh, int tAU, int tLU, int mrl, int uW, int uH,
+                           int unitsTop, int unitsLeft, out int av[7] )
+{
+  const int x0 = fx - 1 - mrl, y0 = fy - 1 - mrl;
+  const int lM = mrl / uH, aM = mrl / uW;
+  const int numAbove = max( fw / uW, 1 ), numLeft = max( fh / uH, 1 );
+  av[0] = decodedBefore( m, x0, y0, g_i ) ? 1 : 0;
+  av[1] = availablePrefix( m, max( 1, min( numAbove, unitsTop ) ), ivec2( fx, y0 ), ivec2( uW, 0 ) );
+  av[2] = availablePrefix( m, max( 1, min( tAU - numAbove, unitsTop - numAbove ) ), ivec2( fx + fw - 1 + uW, y0 ),
+                           ivec2( uW, 0 ) );
+  av[3] = availablePrefix( m, max( 1, min( numLeft, unitsLeft ) ), ivec2( x0, fy ), ivec2( 0, uH ) );
+  av[4] = availablePrefix( m, max( 1, min( tLU - numLeft, unitsLeft - numLeft ) ), ivec2( x0, fy + fh - 1 + uH ),
+                           ivec2( 0, uH ) );
+  av[5] = availablePrefix( m, lM, ivec2( x0, fy - lM * uH ), ivec2( 0, uH ) );
+  av[6] = availablePrefix( m, aM, ivec2( fx - aM * uW, y0 ), ivec2( uW, 0 ) );
 }
 
 // the highest entries of the top and the left arm of line ln (0: multiRefIdx, 1: intra fusion's next one) the
@@ -193,15 +267,13 @@ void addModeDep( int n )
 void addAreaDeps( int comp, int x0, int y0, int x1, int y1 )
 {
   const int ch = comp == 0 ? 0 : 1;
-  for( int uy = y0 >> P.unitLog2Y[ch]; uy <= y1 >> P.unitLog2Y[ch]; uy++ )
+  const int ux0 = x0 >> P.unitLog2X[ch], uy0 = y0 >> P.unitLog2Y[ch];
+  const int nx = ( x1 >> P.unitLog2X[ch] ) - ux0 + 1, ny = ( y1 >> P.unitLog2Y[ch] ) - uy0 + 1;
+  for( int base = 0; nx > 0 && base < nx * ny; base += lanes() )
   {
-    for( int ux = x0 >> P.unitLog2X[ch]; ux <= x1 >> P.unitLog2X[ch]; ux++ )
-    {
-      if( ux >= 0 && uy >= 0 && ux < P.ownerW[ch] && uy < P.ownerH[ch] )
-      {
-        addDep( BufI32( P.owner[comp] ).v[uy * P.ownerW[ch] + ux] );
-      }
-    }
+    const int ux = ux0 + ( base + lane() ) % nx, uy = uy0 + ( base + lane() ) / nx;
+    const bool inside = base + lane() < nx * ny && ux >= 0 && uy >= 0 && ux < P.ownerW[ch] && uy < P.ownerH[ch];
+    addLaneDeps( inside ? BufI32( P.owner[comp] ).v[uy * P.ownerW[ch] + ux] : -1 );
   }
 }
 
@@ -342,9 +414,8 @@ void chromaTmrlDeps( Cu c )
 // t.bfAvail, and a dependency on the owners of a superset of the samples it copies
 void bilateralFilterDeps( inout Tu t, int comp, int availComp, int fx, int fy, int numAbove, int numLeft )
 {
-  int bfA, bfL;
-  for( bfA = 0; bfA < numAbove && availAt( availComp, fx + bfA * t.unitW, fy - 1 ); bfA++ ) {}
-  for( bfL = 0; bfL < numLeft && availAt( availComp, fx - 1, fy + bfL * t.unitH ); bfL++ ) {}
+  const int bfA = availablePrefix( ownerMap( availComp ), numAbove, ivec2( fx, fy - 1 ), ivec2( t.unitW, 0 ) );
+  const int bfL = availablePrefix( ownerMap( availComp ), numLeft, ivec2( fx - 1, fy ), ivec2( 0, t.unitH ) );
   t.bfAvail[0] = availAt( availComp, fx - 1, fy - 1 ) ? 1 : 0;
   t.bfAvail[1] = bfA;
   t.bfAvail[2] = bfL;
@@ -355,15 +426,17 @@ void bilateralFilterDeps( inout Tu t, int comp, int availComp, int fx, int fy, i
     addDep( ownerAt( comp, fx - 2, fy - 1 ) );
     addDep( ownerAt( comp, fx - 1, fy - 1 ) );
   }
-  for( int x = 0; x < bfA * t.unitW; x++ )
+  for( int base = 0; base < bfA * t.unitW; base += lanes() )
   {
-    addDep( ownerAt( comp, fx + x, fy - 2 ) );
-    addDep( ownerAt( comp, fx + x, fy - 1 ) );
+    const bool inside = base + lane() < bfA * t.unitW;
+    addLaneDeps( inside ? ownerAt( comp, fx + base + lane(), fy - 2 ) : -1 );
+    addLaneDeps( inside ? ownerAt( comp, fx + base + lane(), fy - 1 ) : -1 );
   }
-  for( int y = 0; y < bfL * t.unitH; y++ )
+  for( int base = 0; base < bfL * t.unitH; base += lanes() )
   {
-    addDep( ownerAt( comp, fx - 2, fy + y ) );
-    addDep( ownerAt( comp, fx - 1, fy + y ) );
+    const bool inside = base + lane() < bfL * t.unitH;
+    addLaneDeps( inside ? ownerAt( comp, fx - 2, fy + base + lane() ) : -1 );
+    addLaneDeps( inside ? ownerAt( comp, fx - 1, fy + base + lane() ) : -1 );
   }
 }
 
@@ -372,15 +445,17 @@ void signDeps( Tu t, int comp )
 {
   if( t.spCoded >= 0 )
   {
-    for( int k = 0; k < t.h && t.x > 0; k++ )
+    for( int base = 0; base < t.h && t.x > 0; base += lanes() )
     {
-      addDep( ownerAt( comp, t.x - 1, t.y + k ) );
-      addDep( ownerAt( comp, t.x - 2, t.y + k ) );
+      const bool inside = base + lane() < t.h;
+      addLaneDeps( inside ? ownerAt( comp, t.x - 1, t.y + base + lane() ) : -1 );
+      addLaneDeps( inside ? ownerAt( comp, t.x - 2, t.y + base + lane() ) : -1 );
     }
-    for( int k = 0; k < t.w && t.y > 0; k++ )
+    for( int base = 0; base < t.w && t.y > 0; base += lanes() )
     {
-      addDep( ownerAt( comp, t.x + k, t.y - 1 ) );
-      addDep( ownerAt( comp, t.x + k, t.y - 2 ) );
+      const bool inside = base + lane() < t.w;
+      addLaneDeps( inside ? ownerAt( comp, t.x + base + lane(), t.y - 1 ) : -1 );
+      addLaneDeps( inside ? ownerAt( comp, t.x + base + lane(), t.y - 2 ) : -1 );
     }
   }
 }
@@ -390,13 +465,15 @@ void crsDeps( Tu t )
 {
   if( ( t.lmcs & 2 ) != 0 )
   {
-    if( ( t.crsAvail & 1 ) != 0 )
+    for( int base = 0; ( t.crsAvail & 1 ) != 0 && base < t.crsH; base += lanes() )
     {
-      for( int k = 0; k < t.crsH; k++ ) addDep( ownerLumaAt( t.crsX - 1, min( t.crsY + k, P.height[0] - 1 ) ) );
+      const int k = base + lane();
+      addLaneDeps( k < t.crsH ? ownerLumaAt( t.crsX - 1, min( t.crsY + k, P.height[0] - 1 ) ) : -1 );
     }
-    if( ( t.crsAvail & 2 ) != 0 )
+    for( int base = 0; ( t.crsAvail & 2 ) != 0 && base < t.crsW; base += lanes() )
     {
-      for( int k = 0; k < t.crsW; k++ ) addDep( ownerLumaAt( min( t.crsX + k, P.width[0] - 1 ), t.crsY - 1 ) );
+      const int k = base + lane();
+      addLaneDeps( k < t.crsW ? ownerLumaAt( min( t.crsX + k, P.width[0] - 1 ), t.crsY - 1 ) : -1 );
     }
   }
 }
@@ -663,7 +740,7 @@ void dependencies( int comp )
   {
     const int mrl = t.mrl + ln;   // the reference line (multiRefIdx; the fusion line is the next one)
     int topMax = timdBlock ? topLen + mrl : -1, leftMax = timdBlock ? leftLen + mrl : -1;   // -1: the line is not read
-    for( int k = 0; k < numModes; k++ )
+    for( int k = lane(); k < numModes; k += lanes() )   // (each lane its modes, then the subgroup's maxima)
     {
       Tu tm = t;
       if( derived )
@@ -680,6 +757,9 @@ void dependencies( int comp )
       leftMax = max( leftMax, b );
       bfNeeded = bfNeeded || tm.bf != 0;
     }
+    topMax   = subgroupMax( topMax );
+    leftMax  = subgroupMax( leftMax );
+    bfNeeded = subgroupAny( bfNeeded );
     if( topMax < 0 )
     {
       break;
@@ -691,7 +771,8 @@ void dependencies( int comp )
     const int unitsTop  = isp ? tAU : t.readMax[ln][0] >= 1 + mrl ? ( t.readMax[ln][0] - 1 - mrl ) / t.unitW + 1 : 0;
     const int unitsLeft = isp ? tLU : t.readMax[ln][1] >= 1 + mrl ? ( t.readMax[ln][1] - 1 - mrl ) / t.unitH + 1 : 0;
     int av[7];
-    refLineAvailability( ownerMap( availComp ), g_i, fx, fy, fw, fh, tAU, tLU, mrl, t.unitW, t.unitH, unitsTop, unitsLeft, av );
+    laneLineAvailability( ownerMap( availComp ), fx, fy, fw, fh, tAU, tLU, mrl, t.unitW, t.unitH, unitsTop, unitsLeft,
+                          av );
     t.avail[ln] = av;
     // the owners of the samples in range (intra_rec's fill rule); consecutive samples mostly share an owner. A CCLM block
     // with LFNST / NSPT that predicts the other chroma component too (cclmTransformMode) reads that component's line
@@ -699,26 +780,17 @@ void dependencies( int comp )
     const int  otherComp = 3 - comp;
     const bool other     = ln == 0 && ( t.derive & DERIVE_CCLM_DIMD ) != 0
                            && ( t.lm & ( comp == 1 ? LM_HIST_CR : LM_HIST_CB ) ) != 0;
-    int lastOwner = -2, lastOther = -2;
     for( int side = 0; side < 2; side++ )
     {
-      for( int idx = 0; idx <= t.readMax[ln][side]; idx++ )
+      for( int base = 0; base <= t.readMax[ln][side]; base += lanes() )
       {
-        int sx, sy;
-        if( refSource( t, ln, side == 0, idx, sx, sy ) )
+        const int idx = base + lane();
+        int       sx, sy;
+        const bool inside = idx <= t.readMax[ln][side] && refSource( t, ln, side == 0, idx, sx, sy );
+        addLaneDeps( inside ? ownerAt( comp, sx, sy ) : -1 );
+        if( other )
         {
-          const int o = ownerAt( comp, sx, sy );
-          if( o != lastOwner )
-          {
-            addDep( o );
-            lastOwner = o;
-          }
-          const int p = other ? ownerAt( otherComp, sx, sy ) : -2;
-          if( p != lastOther )
-          {
-            addDep( p );
-            lastOther = p;
-          }
+          addLaneDeps( inside ? ownerAt( otherComp, sx, sy ) : -1 );
         }
       }
     }
@@ -774,7 +846,7 @@ void dependencies( int comp )
   // joint CbCr with sign prediction: the residual comes from the decision in the other block of the pair, before or
   // after this one
   addEdge( t.resiFrom );
-  if( g_pass == 1 )
+  if( g_pass == 1 && subgroupElect() )
   {
     BufTu( P.tus ).v[g_i].avail   = t.avail;
     BufTu( P.tus ).v[g_i].readMax = t.readMax;
@@ -786,13 +858,36 @@ void dependencies( int comp )
 
 void main()
 {
-  g_i    = int( gl_GlobalInvocationID.x );
   g_pass = pc.verify;
+  P      = BufParams( pc.params ).p;
+  if( g_pass == 1 || g_pass == 2 )   // (a subgroup per block, the workgroups over the blocks in turn)
+  {
+    const int total = BufI32( P.depStart ).v[pc.numTus];   // (valid in pass 2, after the prefix sum)
+    if( g_pass == 2 && total > P.edgeCap )
+    {
+      return;
+    }
+    const int step = int( gl_NumWorkGroups.x * gl_NumSubgroups );
+    for( g_i = int( gl_WorkGroupID.x * gl_NumSubgroups + gl_SubgroupID ); g_i < pc.numTus; g_i += step )
+    {
+      const int comp = BufTu( P.tus ).v[g_i].comp;
+      g_ch       = comp == 0 ? 0 : 1;
+      g_count    = 0;
+      g_uniq.num = 0;
+      g_base     = g_pass == 2 ? BufI32( P.depStart ).v[g_i] : 0;
+      dependencies( comp );
+      if( g_pass == 1 && subgroupElect() )
+      {
+        BufI32( P.depCount ).v[g_i] = g_count;
+      }
+    }
+    return;
+  }
+  g_i = int( gl_GlobalInvocationID.x );
   if( g_i >= pc.numTus )
   {
     return;
   }
-  P = BufParams( pc.params ).p;
   const int comp = BufTu( P.tus ).v[g_i].comp;
   g_ch = comp == 0 ? 0 : 1;
   const int total = BufI32( P.depStart ).v[pc.numTus];   // valid in passes 2 and 3 (after the prefix sum)
@@ -809,21 +904,6 @@ void main()
       {
         atomicMax( BufI32( P.owner[comp] ).v[uy * P.ownerW[g_ch] + ux], g_i );
       }
-    }
-  }
-  else if( g_pass == 1 || g_pass == 2 )
-  {
-    if( g_pass == 2 && total > P.edgeCap )
-    {
-      return;
-    }
-    g_count   = 0;
-    g_uniq.num = 0;
-    g_base    = g_pass == 2 ? BufI32( P.depStart ).v[g_i] : 0;
-    dependencies( comp );
-    if( g_pass == 1 )
-    {
-      BufI32( P.depCount ).v[g_i] = g_count;
     }
   }
   else
