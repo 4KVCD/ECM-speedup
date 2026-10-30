@@ -216,22 +216,26 @@ constexpr int BVD_SCRATCH_WORDS = 6 * 256 + 4;
 // shift, the bases it ranks (bits); where the GPU builds the list (intra_ibclist.glsl; else 0) the IBC motion table's
 // offset, then the CU's index in the CodingStructure, which neighbours the list takes (bit 0 the non-adjacent ones, 1
 // those of a CU of 4 x 4 samples, 2 the above-left one), the SPS's merge candidates, log2 of the CTU size, the CU's
-// parsed RR-IBC flip, the history table's entries; then per candidate of the list (IBC_MRG_MAX_NUM_CANDS_MEM, the
-// CPU's order before ARMC) its vector (1/16), IBC LIC flag and RR-IBC flip type; then the history table's entries
-// (IMI words each, oldest first); the workgroup scratch it takes, per candidate costed (up to two MBVD bases'
-// offsets) its templates' predictions after the parameters (intra_ibcarmc.glsl's ARMC_S_*)
+// parsed RR-IBC flip, the offset of the picture's list of the CUs that update the IBC history table (their
+// CodingStructure indices in decoding order) and the range of those since the CU's CTU row began, decoded before it;
+// then per candidate of the list (IBC_MRG_MAX_NUM_CANDS_MEM, the CPU's order before ARMC) its vector (1/16), IBC LIC
+// flag and RR-IBC flip type; the workgroup scratch it takes, per candidate costed (up to two MBVD bases' offsets) its
+// templates' predictions after the parameters (intra_ibcarmc.glsl's ARMC_S_*)
 constexpr int ARMC_N = 0, ARMC_VALID = 1, ARMC_IDX = 2, ARMC_IDX1 = 3, ARMC_SIDES = 4, ARMC_LIC = 5, ARMC_MBVD = 6;
 constexpr int ARMC_MBVD_IDX1 = 7, ARMC_MBVD_FLIP = 8, ARMC_MBVD_SHIFT = 9, ARMC_MBVD_MASK = 10, ARMC_LIST = 11;
 constexpr int ARMC_CU = 12, ARMC_BUILD = 13, ARMC_MAXVALID = 14, ARMC_CTU = 15, ARMC_CUFLIP = 16, ARMC_HMVP = 17;
-constexpr int ARMC_CANDS = 18, ARMC_CAND_WORDS = 4, ARMC_REC = ARMC_CANDS + ARMC_CAND_WORDS * IBC_MRG_MAX_NUM_CANDS_MEM;
+constexpr int ARMC_HMVP_FROM = 18, ARMC_HMVP_TO = 19;
+constexpr int ARMC_CANDS = 20, ARMC_CAND_WORDS = 4, ARMC_REC = ARMC_CANDS + ARMC_CAND_WORDS * IBC_MRG_MAX_NUM_CANDS_MEM;
 constexpr int ARMC_SCRATCH_HEAD = 10 * 2 * IBC_MBVD_MAX_REFINE_NUM + 12;
 // a CU's motion as the IBC lists take it (the IBC motion table, per CodingStructure index; intra_ibclist.glsl's
 // IMI_*): whether the lists take it (an IBC, IntraTMP, BVG-DIMD or EIP CU with a vector), then the CPU's MotionInfo at
 // the CU's top-left - isInter, isIBCmot, sliceIdx, interDir, mv (1/16) and refIdx of both lists, useAltHpelIf,
-// useIbcLic, useIbcFilter, rribcFlipType - and its centre; a history table entry alike (its centerPos)
+// useIbcLic, useIbcFilter, rribcFlipType - and its centre; where the GPU has the CU's vectors, which the lists take
+// instead, an IBC CU's luma IBC record (IBC_REC_MV, the GPU's where it derives them) or an IntraTMP / BVG-DIMD / EIP
+// CU's block vector record (Params::bvOut's, its node's), else -1 each; a history table entry alike (its centerPos)
 constexpr int IMI_KIND = 0, IMI_INTER = 1, IMI_IBC = 2, IMI_SLICE = 3, IMI_DIR = 4, IMI_MV0 = 5, IMI_MV1 = 7;
 constexpr int IMI_REF0 = 9, IMI_REF1 = 10, IMI_HPEL = 11, IMI_LIC = 12, IMI_FILTER = 13, IMI_FLIP = 14;
-constexpr int IMI_CENTER = 15, IMI = 17;
+constexpr int IMI_CENTER = 15, IMI_IBC_REC = 17, IMI_BV_REC = 18, IMI = 19;
 // IBC_REC_OWN_MV2 of a CU of one vector (its neighbours of one vector compare), of two with BCW's weights other than
 // the default (no neighbour's motion equals it: a neighbour of two vectors with BCW is the CPU's)
 constexpr int IBC_OWN_MV2_NONE = 0x7FFFFFFF, IBC_OWN_MV2_NEVER = 0x7FFFFFFE;
@@ -7816,7 +7820,7 @@ static void ibcRecord( GpuIntraRec::Impl& m, const CodingUnit& cu, const Compone
   }
 #endif
   t.ibc = (int32_t) m.timdData.size();
-  if( rec[IBC_REC_BVD] >= 0 || rec[IBC_REC_ARMC] >= 0 )
+  if( compID == COMPONENT_Y )   // (the vectors the CU's other blocks and the IBC motion table read)
   {
     m.ibcLumaRec[&cu] = t.ibc;
   }
@@ -11439,11 +11443,12 @@ static std::vector<int32_t> armcRecord( const CodingUnit& cu, const MergeCtx& ct
     r[o + 3]    = ctx.rribcFlipTypes[i];
   }
   // the GPU builds the list (intra_ibclist.glsl) of a merge or MBVD CU of an intra slice that is the picture's only
-  // slice and tile (no temporal vectors, no inter GPM neighbours; getPURestricted's slice and tile alike): its
-  // neighbours' motion from the IBC motion table (ARMC_LIST: its offset, at the picture's end), the history table as
-  // addIBCMergeHMVPCand reads it now
+  // slice and tile (no temporal vectors, no inter GPM neighbours; getPURestricted's slice and tile alike) without GDR
+  // (a single IBC history table): its neighbours' motion from the IBC motion table, the history table replayed from it
+  // (ARMC_LIST, ARMC_HMVP*: at the picture's end)
   const Slice& slice = *cu.slice;
-  if( slice.isIntra() && cs.picture->slices.size() == 1 && cs.pps->getNumTiles() == 1 && pu.mergeFlag )
+  if( slice.isIntra() && cs.picture->slices.size() == 1 && cs.pps->getNumTiles() == 1 && pu.mergeFlag
+      && !cu.cs->isGdrEnabled() )
   {
     const SPS& sps   = *cs.sps;
     const bool aml   = sps.getUseAML() && sps.getTMnoninterToolsEnableFlag();
@@ -11454,20 +11459,6 @@ static std::vector<int32_t> armcRecord( const CodingUnit& cu, const MergeCtx& ct
     r[ARMC_MAXVALID] = (int32_t) sps.getMaxNumIBCMergeCand();
     r[ARMC_CTU]      = floorLog2( sps.getCTUSize() );
     r[ARMC_CUFLIP]   = cu.rribcFlipType;
-#if JVET_Z0118_GDR
-    const bool  clean = cs.isClean( cu.Y().bottomRight(), CHANNEL_TYPE_LUMA );
-    const auto& lut   = clean ? cs.motionLut.lutIbc1 : cs.motionLut.lutIbc0;
-#else
-    const auto& lut = cs.motionLut.lutIbc;
-#endif
-    r[ARMC_HMVP] = (int32_t) lut.size();
-    for( const MotionInfo& mi: lut )
-    {
-      const int32_t e[IMI] = { 0, mi.isInter, mi.isIBCmot, mi.sliceIdx, mi.interDir, mi.mv[0].hor, mi.mv[0].ver,
-                               mi.mv[1].hor, mi.mv[1].ver, mi.refIdx[0], mi.refIdx[1], mi.useAltHpelIf, mi.useIbcLic,
-                               mi.useIbcFilter, mi.rribcFlipType, mi.centerPos.x, mi.centerPos.y };
-      r.insert( r.end(), e, e + IMI );
-    }
   }
   return r;
 }
@@ -13124,19 +13115,53 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
         }
         const PredictionUnit& pu = *cu->firstPU;
         const MotionInfo      mi = pu.getMotionInfo();
-        const bool    kind = CU::isIBC( *cu ) || cu->tmpFlag || PU::hasBvgBv( pu ) || PU::isBvEip( pu );
+        const bool    bvCu = !CU::isIBC( *cu ) && ( cu->tmpFlag || PU::hasBvgBv( pu ) || PU::isBvEip( pu ) );
+        const bool    kind = CU::isIBC( *cu ) || bvCu;
         const int32_t cx = int32_t( pu.lx() + ( pu.lwidth() >> 1 ) ), cy = int32_t( pu.ly() + ( pu.lheight() >> 1 ) );
+        // (an IntraTMP fusion CU's mv is none of its record's vectors: the CPU's)
+        const auto    ibcRec = m.ibcLumaRec.find( cu );
+        const int32_t fromIbc = CU::isIBC( *cu ) && ibcRec != m.ibcLumaRec.end() ? ibcRec->second : -1;
+        const int32_t fromBv  = bvCu && !cu->tmpFusionFlag ? P.bvOut + int32_t( cu->idx ) * BV_OUT : -1;
         const int32_t e[IMI] = { kind, mi.isInter, mi.isIBCmot, mi.sliceIdx, mi.interDir, mi.mv[0].hor, mi.mv[0].ver,
                                  mi.mv[1].hor, mi.mv[1].ver, mi.refIdx[0], mi.refIdx[1], mi.useAltHpelIf,
-                                 mi.useIbcLic, mi.useIbcFilter, mi.rribcFlipType, cx, cy };
+                                 mi.useIbcLic, mi.useIbcFilter, mi.rribcFlipType, cx, cy, fromIbc, fromBv };
         std::copy( e, e + IMI, &m.timdData[table + size_t( cu->idx ) * IMI] );
+      }
+      // the CUs that update the IBC history table in decoding order (CU::saveMotionInHMVP: every IBC CU, a luma
+      // IntraTMP CU), and per list the range of them in its CTU row before it (DecSlice resets the table at each row's
+      // start)
+      const size_t updates = m.timdData.size();
+      const int    log2Ctu = floorLog2( cs.sps->getCTUSize() );
+      std::vector<std::pair<int32_t, int32_t>> rows;   // (per update its CTU row and CodingStructure index)
+      for( const CodingUnit* cu: cs.cus )
+      {
+        if( cu->blocks[COMPONENT_Y].valid() && ( CU::isIBC( *cu ) || cu->tmpFlag ) )
+        {
+          rows.emplace_back( int32_t( cu->ly() >> log2Ctu ), (int32_t) cu->idx );
+          m.timdData.push_back( (int32_t) cu->idx );
+        }
       }
       // (development: ECM_GPU_IBC_LIST_CHECK compares the GPU's lists with these, the CPU's)
       static const bool check = getenv( "ECM_GPU_IBC_LIST_CHECK" ) != nullptr;
       m.ibcListCus += (int) m.armcListRecs.size();
       for( const size_t rec: m.armcListRecs )
       {
-        m.timdData[rec + ARMC_LIST] = (int32_t) table;
+        const int32_t idx  = m.timdData[rec + ARMC_CU];
+        const int32_t row  = int32_t( cs.cus[idx - 1]->ly() >> log2Ctu );
+        int32_t       from = 0;
+        while( from < (int32_t) rows.size() && rows[from].first < row )
+        {
+          from++;
+        }
+        int32_t to = from;
+        while( to < (int32_t) rows.size() && rows[to].second < idx )
+        {
+          to++;
+        }
+        m.timdData[rec + ARMC_HMVP]      = (int32_t) updates;
+        m.timdData[rec + ARMC_HMVP_FROM] = from;
+        m.timdData[rec + ARMC_HMVP_TO]   = to;
+        m.timdData[rec + ARMC_LIST]      = (int32_t) table;
         if( check )
         {
           m.armcListCpu.emplace_back( &m.timdData[rec], &m.timdData[rec] + ARMC_REC );

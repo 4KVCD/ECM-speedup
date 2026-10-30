@@ -10,10 +10,11 @@
 
 // a CU's motion as the IBC lists take it (the IBC motion table's words, GpuIntraRec.cpp's IMI_*: the CPU's MotionInfo
 // at the CU's top-left; kind 1 where the lists take the CU's motion at all - an IBC, IntraTMP, BVG-DIMD or EIP CU with
-// a vector), and per history table entry alike (its kind unused)
+// a vector -; the records of the CU's vectors on the GPU, which the lists take instead: an IBC CU's luma IBC record, an
+// IntraTMP / BVG-DIMD / EIP CU's block vector record, else -1), and per history table entry alike (its kind unused)
 const int IMI_KIND = 0, IMI_INTER = 1, IMI_IBC = 2, IMI_SLICE = 3, IMI_DIR = 4, IMI_MV0 = 5, IMI_MV1 = 7;
 const int IMI_REF0 = 9, IMI_REF1 = 10, IMI_HPEL = 11, IMI_LIC = 12, IMI_FILTER = 13, IMI_FLIP = 14, IMI_CENTER = 15;
-const int IMI = 17;
+const int IMI_IBC_REC = 17, IMI_BV_REC = 18, IMI = 19;
 
 struct IbcMi
 {
@@ -49,6 +50,24 @@ IbcMi ibcMiAt( int o )
   m.filtered = d.v[o + IMI_FILTER] != 0;
   m.flip   = d.v[o + IMI_FLIP];
   m.center = ivec2( d.v[o + IMI_CENTER], d.v[o + IMI_CENTER + 1] );
+  // the vectors on the GPU: an IBC CU's from its luma record (bi-prediction's second one the first where the two
+  // predict as one: xCheckIdenticalMotion), an IntraTMP / BVG-DIMD / EIP CU's mv - the one SGPM's list takes where its
+  // record has it (a sub-sample IntraTMP vector), else its first block vector x 16
+  const int ibc = d.v[o + IMI_IBC_REC], bv = d.v[o + IMI_BV_REC];
+  if( ibc >= 0 )
+  {
+    m.mv0 = ivec2( d.v[ibc + IBC_REC_MV], d.v[ibc + IBC_REC_MV + 1] );
+    if( m.dir == 3 )
+    {
+      const bool two = d.v[ibc + IBC_REC_BI] != 0;
+      m.mv1          = two ? ivec2( d.v[ibc + IBC_REC_MV2], d.v[ibc + IBC_REC_MV2 + 1] ) : m.mv0;
+    }
+  }
+  else if( bv >= 0 )
+  {
+    m.mv0 = d.v[bv + BV_OUT_SGPM] > 0 ? ivec2( d.v[bv + BV_OUT_SGPM + 1], d.v[bv + BV_OUT_SGPM + 2] )
+                                      : bvUnpack( d.v[bv + 1] ) << 4;
+  }
   return m;
 }
 
@@ -166,6 +185,50 @@ ivec2 ibcListCentre( int idx )
   return ivec2( CBufI32( P.timdData ).v[idx + IMI_CENTER], CBufI32( P.timdData ).v[idx + IMI_CENTER + 1] );
 }
 
+// the IBC history table (MAX_NUM_HMVP_IBC_CANDS entries) as the CU's list reads it, oldest first: from the CTU row's
+// start (DecSlice resets it there) addMiToLutIBC of the motion of every IBC and IntraTMP CU decoded before the CU
+// (CU::saveMotionInHMVP; the record's range of the picture's list of those CUs), each from the IBC motion table - the
+// GPU's vectors -: an entry equal to the new one (MotionInfo's comparison) or else, with the table full, the oldest
+// removed, the new one appended; a bi-predicted CU's list 1 vector, then its list 0 vector, each as one of list 0
+const int HMVP_IBC = 25;
+
+int ibcHmvpTable( IbcListCtx x, int r, out IbcMi tab[HMVP_IBC] )
+{
+  CBufI32   d    = CBufI32( P.timdData );
+  const int list = d.v[r + ARMC_HMVP], from = d.v[r + ARMC_HMVP_FROM], to = d.v[r + ARMC_HMVP_TO];
+  int       n    = 0;
+  for( int p = from; p < to; p++ )
+  {
+    const IbcMi mi = ibcMiAt( x.table + d.v[list + p] * IMI );
+    for( int l = mi.dir == 3 ? 1 : 0; l >= 0; l-- )
+    {
+      IbcMi e = mi;
+      if( mi.dir == 3 )
+      {
+        e.mv0  = l == 1 ? mi.mv1 : mi.mv0;
+        e.dir  = 1;
+        e.mv1  = ivec2( 0 );
+        e.ref1 = -1;
+      }
+      int same = -1;
+      for( int k = 0; k < n && same < 0; k++ )
+      {
+        same = ibcMiEqual( tab[k], e ) ? k : -1;
+      }
+      if( same >= 0 || n == HMVP_IBC )
+      {
+        for( int k = max( same, 0 ); k < n - 1; k++ )
+        {
+          tab[k] = tab[k + 1];
+        }
+        n--;
+      }
+      tab[n++] = e;
+    }
+  }
+  return n;
+}
+
 // the list of IBC merge CU c from ARMC record r (invocation 0): written into the record's candidates (vector, IBC LIC
 // flag, RR-IBC flip) and ARMC_VALID; returns the number of entries before the first padding (cnt)
 int ibcBuildList( Cu c, int r )
@@ -252,11 +315,11 @@ int ibcBuildList( Cu c, int r )
   }
   // the history table, newest first (addIBCMergeHMVPCand: an entry's interDir and flip as they are, its LIC and filter
   // only without a flip; compared only with the entries before the table's)
-  const int compareNum = l.cnt, numHmvp = d.v[r + ARMC_HMVP];
+  IbcMi     hmvp[HMVP_IBC];
+  const int compareNum = l.cnt, numHmvp = ibcHmvpTable( x, r, hmvp );
   for( int h = numHmvp - 1; h >= 0 && !l.full; h-- )
   {
-    const int   o = r + ARMC_REC + h * IMI;
-    const IbcMi m = ibcListAdjust( x, ibcMiAt( o ), ibcListCentre( o ) );
+    const IbcMi m = ibcListAdjust( x, hmvp[h], hmvp[h].center );
     if( !ibcListValid( x, m.mv0 ) )
     {
       continue;

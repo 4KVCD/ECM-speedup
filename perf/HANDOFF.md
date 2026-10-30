@@ -3541,8 +3541,19 @@ addIBCMergeHMVPCand reads it (in the ARMC record). Only in intra slices that are
 (no temporal vectors, no inter GPM neighbours) and not with an IBC GPM CU in the picture (per-part motion): those keep
 the host's lists. ECM_GPU_IBC_LIST_CHECK=1 downloads timdData and prints every list whose words (ARMC_N, ARMC_VALID,
 the 28 entries) differ from the CPU's. Counts (lists the GPU builds): fp720_ai 218, pj720_ai 60, ra720 32, ai720 23;
-401 over the 27 streams, none differing. GPU time (27 streams, FULL): 43,464 -> 43,727 ms (+0.6 %: invocation 0 builds
+389 over the 27 streams, none differing. GPU time (27 streams, FULL): 43,464 -> 43,727 ms (+0.6 %: invocation 0 builds
 the list from local memory). Results (grn279, 27 streams): every picture identical.
+M182-M183 (2026-10-30): the IBC lists' inputs from the GPU. The IBC motion table's vectors come from the GPU's records
+(IMI_IBC_REC: an IBC CU's luma IBC record, whose IBC_REC_MV / MV2 the CU's derivation writes - bi-prediction's second
+vector the first where xCheckIdenticalMotion made them one -; IMI_BV_REC: a non-fusion IntraTMP / BVG-DIMD / EIP CU's
+block vector record, its node's - its mv the record's SGPM vector where it has one, a sub-sample IntraTMP vector, else
+its first vector x 16; a fusion CU's stays the CPU's). The history table is no longer the host's: per list the host
+passes the range of the picture's list of the CUs that update it (CU::saveMotionInHMVP: every IBC CU, every luma
+IntraTMP CU, in decoding order) since the CU's CTU row began (DecSlice resets it there), and ibcHmvpTable replays
+addMiToLutIBC over their motion from the table (a bi-predicted CU's list 1 vector, then its list 0 one; a pruned or
+the oldest entry removed). Only without GDR (one table). The other fields of the table (flags, interDir) are still
+the CPU's. GPU time (27 streams, FULL): 43,727 -> 44,171 ms (+1.0 %: the replay, invocation 0). Results (grn282, 27 streams, ECM_GPU_IBC_LIST_CHECK): every
+picture identical, every list equal to the CPU's.
 Tried after M176 and left out (2026-10-29): intra_deps' passes 1 and 2 with a cluster of 8 invocations per block
 (clustered subgroup operations) instead of M175's subgroup: pj720_ai's deps 171 -> 145 ms, but ai_md5 24 -> 62,
 ai_long 28 -> 79, ld_md5 8 -> 17 (the scans 4 times as long per block). To keep intra_rec at 255 registers: a branch

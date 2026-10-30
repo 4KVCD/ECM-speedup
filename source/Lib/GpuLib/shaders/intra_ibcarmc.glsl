@@ -18,14 +18,15 @@
 // bi-prediction), the RR-IBC flip its templates take, the offsets' right shift, the bases it ranks (bits); where the
 // GPU builds the list (intra_ibclist.glsl; else 0) the IBC motion table's offset, then the CU's index in the
 // CodingStructure, which neighbours the list takes (bit 0 the non-adjacent ones, 1 those of a CU of 4 x 4 samples, 2
-// the above-left one), the SPS's merge candidates, log2 of the CTU size, the CU's parsed RR-IBC flip, the history
-// table's entries; then per candidate of the list in the CPU's order its vector (1/16 samples), IBC LIC flag and
-// RR-IBC flip type (those the GPU builds over the host's); after them the history table's entries (IMI words each,
-// oldest first)
+// the above-left one), the SPS's merge candidates, log2 of the CTU size, the CU's parsed RR-IBC flip, the offset of
+// the picture's list of the CUs that update the IBC history table and the range of those since the CU's CTU row
+// began, decoded before it; then per candidate of the list in the CPU's order its vector (1/16 samples), IBC LIC flag
+// and RR-IBC flip type (those the GPU builds over the host's)
 const int ARMC_N = 0, ARMC_VALID = 1, ARMC_IDX = 2, ARMC_IDX1 = 3, ARMC_SIDES = 4, ARMC_LIC = 5, ARMC_MBVD = 6;
 const int ARMC_MBVD_IDX1 = 7, ARMC_MBVD_FLIP = 8, ARMC_MBVD_SHIFT = 9, ARMC_MBVD_MASK = 10, ARMC_LIST = 11;
 const int ARMC_CU = 12, ARMC_BUILD = 13, ARMC_MAXVALID = 14, ARMC_CTU = 15, ARMC_CUFLIP = 16, ARMC_HMVP = 17;
-const int ARMC_CANDS = 18, ARMC_CAND_WORDS = 4, ARMC_MAX_CANDS = 28;   // (IBC_MRG_MAX_NUM_CANDS_MEM)
+const int ARMC_HMVP_FROM = 18, ARMC_HMVP_TO = 19;
+const int ARMC_CANDS = 20, ARMC_CAND_WORDS = 4, ARMC_MAX_CANDS = 28;   // (IBC_MRG_MAX_NUM_CANDS_MEM)
 const int ARMC_REC = ARMC_CANDS + ARMC_CAND_WORDS * ARMC_MAX_CANDS;
 // MBVD (IBC_MBVD_*): bases, offsets per base (20 steps x 4 directions), offsets ranked per base, merge indices below
 // its candidates' (ibcMergeIdx1 of a plain base)
