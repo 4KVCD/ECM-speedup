@@ -32,18 +32,36 @@ void ibcBlock( Tu t, int lid, int NT )
   c.y = py;
   c.w = w;
   c.h = h;
-  // an IBC AMVP CU with BVD prediction (intra_ibcbvd.glsl) or an IBC merge CU (intra_ibcarmc.glsl): its luma block
-  // derives the vectors - the predictor plus bvdDerive's BVD, clipped to the storage's 18 bits
-  // (mvCliptoStorageBitDepth); the merge list's entries ARMC ranks first - and publishes them in its record; the CU's
-  // other blocks read them there (they come after it)
+  // an IBC AMVP CU (intra_ibcarmc.glsl's ibcAmvpPredictor; with BVD prediction intra_ibcbvd.glsl's BVD) or an IBC
+  // merge CU (intra_ibcarmc.glsl): its luma block derives the vectors - the predictor (its list's, or the host's for a
+  // CU with only a BVD record) plus the BVD, clipped to the storage's 18 bits (mvCliptoStorageBitDepth); the merge
+  // list's entries ARMC ranks first - and publishes them in its record; the CU's other blocks read them there (they
+  // come after it)
   const int bvd  = WITH_IBC ? d.v[r + IBC_REC_BVD] : -1, from = WITH_IBC ? d.v[r + IBC_REC_FROM] : -1;
   const int armc = WITH_IBC ? d.v[r + IBC_REC_ARMC] : -1;
   if( bvd >= 0 || armc >= 0 )
   {
-    if( bvd >= 0 )
+    const ivec2 storage = ivec2( ( 1 << 17 ) - 1 );   // (mvCliptoStorageBitDepth: 18 bits)
+    if( armc >= 0 && d.v[armc + ARMC_AMVP] >= 0 )   // (an AMVP CU's predictor from its list, intra_ibcarmc.glsl's)
+    {
+      const ivec2 pred = ibcAmvpPredictor( c, armc, lid );
+      ivec2       mvd  = ivec2( d.v[armc + ARMC_MVD], d.v[armc + ARMC_MVD + 1] );
+      if( bvd >= 0 )   // (the BVD derivation's candidates are relative to it)
+      {
+        if( lid == 0 )
+        {
+          CBufI32( P.timdData ).v[bvd + BVD_PRED]     = pred.x;
+          CBufI32( P.timdData ).v[bvd + BVD_PRED + 1] = pred.y;
+        }
+        cccmSync();
+        mvd = bvdDerive( t, c, bvd, lid, NT );
+      }
+      mv = clamp( pred + mvd, -storage - 1, storage );
+    }
+    else if( bvd >= 0 )
     {
       const ivec2 pred = ivec2( d.v[bvd + BVD_PRED], d.v[bvd + BVD_PRED + 1] );
-      mv = clamp( pred + bvdDerive( t, c, bvd, lid, NT ), ivec2( -( 1 << 17 ) ), ivec2( ( 1 << 17 ) - 1 ) );
+      mv = clamp( pred + bvdDerive( t, c, bvd, lid, NT ), -storage - 1, storage );
     }
     else
     {

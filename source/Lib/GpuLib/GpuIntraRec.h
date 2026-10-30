@@ -132,6 +132,9 @@ public:
   /// (sortIbcMergeMbvdCandidates): the list as getIBCMergeCandidates built it, from which its luma block derives the
   /// vectors on the GPU (recordInterCu's)
   void ibcMbvdList( const CodingUnit& cu, const MergeCtx& ctx );
+  /// IBC AMVP CU cu, after fillIBCMvpCand: the list it took its predictors from (ctx) and the parsed predictor index,
+  /// from which its luma block derives the predictor on the GPU (recordInterCu's)
+  void ibcAmvpList( const CodingUnit& cu, const MergeCtx& ctx, int mvpIdx );
   /// inter CU cu of multi-pass DMVR (bdmvrRefine), which the CPU has predicted: DMVR's refined vectors per 16 x 16
   /// sub-PU (InterPrediction's m_bdmvrSubPuMvBuf, stride DMVR_SUBPU_STRIDE), recordInterCu's
   void dmvrVectors( const CodingUnit& cu, const Mv* list0, const Mv* list1 );

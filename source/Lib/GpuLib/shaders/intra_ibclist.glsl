@@ -95,12 +95,15 @@ struct IbcList
   bool  full;   // (cnt reached the list's size: the CPU returns)
 };
 
-// the list's inputs: the CU, whether it is an MBVD CU (its flips 0, no RR-IBC adjustment), the IBC motion table
+// the list's inputs: the CU, whether it is an MBVD CU (its flips 0, no RR-IBC adjustment), the IBC motion table;
+// whether it is a merge list (else fillIBCMvpCand's AMVP list: built with mergeFlag 0 and, without RR-IBC, IBC TM
+// merge's tmMergeFlag set - no flips, no RR-IBC adjustment), the CU's RR-IBC flip, mvdSimilarityThresh, the count at
+// which the CPU returns (mrgCandIdx: AMVP's maxNumIBCMergeCand, else -1) and an AMVP list's useAltHpelIf
 struct IbcListCtx
 {
   Cu   c;
-  bool mbvd;
-  int  table, cuIndex;
+  bool mbvd, merge, tm, hpel;
+  int  table, cuIndex, cuFlip, thresh, stopAt;
 };
 
 // checkIsIBCCandidateValid: the CU's block at the vector's integer part is valid (checkValidBv ignoring the fraction)
@@ -110,11 +113,14 @@ bool ibcListValid( IbcListCtx x, ivec2 mv )
 }
 
 // rribcAdjustMotion of a neighbour's motion whose CU (or history entry) is centred at cp: an RR-IBC neighbour's vector
-// moved along its flip by twice the centres' distance, where the moved vector is valid (merge lists; none for MBVD)
-IbcMi ibcListAdjust( IbcListCtx x, IbcMi m, ivec2 cp )
+// moved along its flip by twice the centres' distance, where the moved vector is valid (none for MBVD or IBC TM
+// merge; an AMVP list's only of a neighbour of the CU's own flip, and with near - the non-adjacent, history and
+// relocated ones - only where the centres are within 1.5 times the CU's size)
+IbcMi ibcListAdjust( IbcListCtx x, IbcMi m, ivec2 cp, bool near )
 {
   const ivec2 cur = ivec2( x.c.x + ( x.c.w >> 1 ), x.c.y + ( x.c.h >> 1 ) );
-  if( !x.mbvd && m.ibc && m.flip != 0 )
+  const bool  close = abs( cur.x - cp.x ) <= ( x.c.w >> 1 ) * 3 && abs( cur.y - cp.y ) <= ( x.c.h >> 1 ) * 3;
+  if( !x.mbvd && !x.tm && m.ibc && m.flip != 0 && ( x.merge || ( m.flip == x.cuFlip && ( !near || close ) ) ) )
   {
     const int   shift = m.flip == 1 ? ( cp.x - cur.x ) << 1 : ( cp.y - cur.y ) << 1;
     const ivec2 moved = m.mv0 + ( m.flip == 1 ? ivec2( shift << 4, 0 ) : ivec2( 0, shift << 4 ) );
@@ -123,28 +129,31 @@ IbcMi ibcListAdjust( IbcListCtx x, IbcMi m, ivec2 cp )
   return m;
 }
 
-// xCheckSimilarIBCMotion of entry cnt (mvdSimilarityThresh 1: merge lists) against the first compareNum
-bool ibcListSimilar( IbcList l, int compareNum )
+// xCheckSimilarIBCMotion of entry cnt: with mvdSimilarityThresh 1 the same vector among the first compareNum, else
+// one closer than the threshold in both components among all before it
+bool ibcListSimilar( IbcListCtx x, IbcList l, int compareNum )
 {
   bool similar = l.ref[l.cnt] < 0;
-  for( int i = 0; i < compareNum && !similar; i++ )
+  for( int i = 0; i < ( x.thresh > 1 ? l.cnt : compareNum ) && !similar; i++ )
   {
-    similar = l.mv[i] == l.mv[l.cnt];
+    const ivec2 diff = abs( l.mv[i] - l.mv[l.cnt] );
+    similar          = x.thresh > 1 ? diff.x < x.thresh && diff.y < x.thresh : diff == ivec2( 0 );
   }
   return similar;
 }
 
-// entry cnt counted (after the similarity check where the source has one)
-void ibcListCount( inout IbcList l )
+// entry cnt counted (after the similarity check where the source has one); at mrgCandIdx the CPU returns first
+void ibcListCount( IbcListCtx x, inout IbcList l )
 {
-  l.cnt++;
-  l.full = l.cnt == ARMC_MAX_CANDS;
+  l.full = l.cnt == x.stopAt;
+  l.cnt += l.full ? 0 : 1;
+  l.full = l.full || l.cnt == ARMC_MAX_CANDS;
 }
 
 // a spatial neighbour's motion m (adjusted) written to entry cnt as getIBCMergeCandidates' neighbours write it (list
-// 0's vector; with RR-IBC the neighbour's flip, but none for MBVD; its LIC and filter only without a flip), counted
-// where it is valid and (but for the left neighbour) not similar; second: a bi-predicted neighbour's list 1 vector,
-// whose entry keeps the previous alternative filter flag
+// 0's vector; with RR-IBC the neighbour's flip, but none for MBVD or IBC TM merge; its LIC and filter only without a
+// flip; an AMVP list's useAltHpelIf the CU's), counted where it is valid and (but for the left neighbour) not similar;
+// second: a bi-predicted neighbour's list 1 vector, whose entry keeps the previous alternative filter flag
 void ibcListNeighbour( IbcListCtx x, inout IbcList l, IbcMi m, bool check, bool second )
 {
   if( l.full || !ibcListValid( x, m.mv0 ) )
@@ -155,13 +164,13 @@ void ibcListNeighbour( IbcListCtx x, inout IbcList l, IbcMi m, bool check, bool 
   l.dir[k]    = 1;
   l.mv[k]     = m.mv0;
   l.ref[k]    = m.ref0;
-  l.hpel[k]   = second ? l.hpel[k] : m.hpel;
-  l.flip[k]   = m.ibc && !x.mbvd ? m.flip : 0;
+  l.hpel[k]   = second ? l.hpel[k] : x.merge ? m.hpel : x.hpel;
+  l.flip[k]   = m.ibc && !x.mbvd && !x.tm ? m.flip : 0;
   l.lic[k]    = m.ibc && l.flip[k] == 0 && m.lic;
   l.filtered[k] = m.ibc && l.flip[k] == 0 && m.filtered;
-  if( !check || !ibcListSimilar( l, k ) )
+  if( !check || !ibcListSimilar( x, l, k ) )
   {
-    ibcListCount( l );
+    ibcListCount( x, l );
   }
 }
 
@@ -241,6 +250,12 @@ int ibcBuildList( Cu c, int r )
   x.cuIndex = d.v[r + ARMC_CU];
   const int  flags = d.v[r + ARMC_BUILD];
   const bool nonAdj = ( flags & 1 ) != 0, gt4x4 = ( flags & 2 ) != 0;
+  x.merge  = ( flags & 8 ) == 0;
+  x.cuFlip = d.v[r + ARMC_CUFLIP];
+  x.tm     = !x.merge && x.cuFlip == 0;   // (fillIBCMvpCand sets tmMergeFlag for the list)
+  x.thresh = x.tm ? ( c.w * c.h < 64 ? 16 : c.w * c.h < 256 ? 32 : 64 ) : 1;   // (getTMMvdThreshold)
+  x.stopAt = x.merge ? -1 : d.v[r + ARMC_MAXVALID];
+  x.hpel   = d.v[r + ARMC_IMV] == 3;   // (IMV_HPEL)
   IbcList    l;
   for( int i = 0; i < ARMC_MAX_CANDS; i++ )
   {
@@ -262,14 +277,15 @@ int ibcBuildList( Cu c, int r )
   bool        avail[5];
   for( int n = 0; n < 5; n++ )
   {
-    const int o = n < 4 || ( flags & 4 ) != 0 ? ibcListCuAt( x, at[n].x, at[n].y ) : -1;
+    const bool aboveLeft = ( flags & 4 ) != 0 || ( ( flags & 16 ) != 0 && l.cnt < 4 );
+    const int  o = n < 4 || aboveLeft ? ibcListCuAt( x, at[n].x, at[n].y ) : -1;
     avail[n]    = o >= 0;
     mi[n]       = ibcMiDefault();
     if( !gt4x4 || o < 0 )
     {
       continue;
     }
-    mi[n] = ibcListAdjust( x, ibcMiAt( o ), ibcListCentre( o ) );
+    mi[n] = ibcListAdjust( x, ibcMiAt( o ), ibcListCentre( o ), false );
     bool differs = true;
     for( int p = 0; p < n; p++ )
     {
@@ -283,13 +299,14 @@ int ibcBuildList( Cu c, int r )
         IbcMi m1 = mi[n];
         m1.mv0   = m1.mv1;
         m1.ref1  = -1;
-        ibcListNeighbour( x, l, ibcListAdjust( x, m1, ibcListCentre( o ) ), n > 0, true );
+        ibcListNeighbour( x, l, ibcListAdjust( x, m1, ibcListCentre( o ), false ), n > 0, true );
       }
     }
   }
-  // the non-adjacent positions (merge lists): per distance (the CU's size times 1 .. 7) left-below, right-above, above,
-  // left and above-left of it, each where its CU's motion is taken, then its list 1 vector
-  for( int dist = 0; nonAdj && dist < 7 && !l.full; dist++ )
+  // the non-adjacent positions: per distance (the CU's size times 1 .. 7, an AMVP list's 1 .. NADISTANCE_LEVEL)
+  // left-below, right-above, above, left and above-left of it, each where its CU's motion is taken, then its list 1
+  // vector
+  for( int dist = 0; nonAdj && dist < ( x.merge ? 7 : 4 ) && !l.full; dist++ )
   {
     const int hor = c.w * ( dist + 1 ), ver = c.h * ( dist + 1 );
     for( int k = 0; k < 5 && !l.full; k++ )
@@ -302,14 +319,14 @@ int ibcBuildList( Cu c, int r )
       {
         continue;
       }
-      const IbcMi m = ibcListAdjust( x, ibcMiAt( o ), ibcListCentre( o ) );
+      const IbcMi m = ibcListAdjust( x, ibcMiAt( o ), ibcListCentre( o ), true );
       ibcListNeighbour( x, l, m, true, false );
       if( m.ibc && m.dir == 3 )
       {
         IbcMi m1 = m;
         m1.mv0   = m1.mv1;
         m1.ref1  = -1;
-        ibcListNeighbour( x, l, ibcListAdjust( x, m1, ibcListCentre( o ) ), true, true );
+        ibcListNeighbour( x, l, ibcListAdjust( x, m1, ibcListCentre( o ), true ), true, true );
       }
     }
   }
@@ -319,22 +336,22 @@ int ibcBuildList( Cu c, int r )
   const int compareNum = l.cnt, numHmvp = ibcHmvpTable( x, r, hmvp );
   for( int h = numHmvp - 1; h >= 0 && !l.full; h-- )
   {
-    const IbcMi m = ibcListAdjust( x, hmvp[h], hmvp[h].center );
+    const IbcMi m = ibcListAdjust( x, hmvp[h], hmvp[h].center, true );
     if( !ibcListValid( x, m.mv0 ) )
     {
       continue;
     }
     const int k = l.cnt;
     l.dir[k]    = m.dir;
-    l.flip[k]   = m.flip;
-    l.hpel[k]   = m.hpel;
+    l.flip[k]   = x.tm ? 0 : m.flip;
+    l.hpel[k]   = x.merge ? m.hpel : x.hpel;
     l.mv[k]     = m.mv0;
     l.ref[k]    = m.ref0;
     l.lic[k]    = l.flip[k] == 0 && m.lic;
     l.filtered[k] = l.flip[k] == 0 && m.filtered;
-    if( !ibcListSimilar( l, compareNum ) )
+    if( !ibcListSimilar( x, l, compareNum ) )
     {
-      ibcListCount( l );
+      ibcListCount( x, l );
     }
   }
   // the auto-relocated vectors: per entry so far, the CUs at the CU's centre and corners moved by its vector (whole
@@ -353,7 +370,7 @@ int ibcBuildList( Cu c, int r )
       {
         continue;
       }
-      const IbcMi m = ibcListAdjust( x, ibcMiAt( o ), ibcListCentre( o ) );
+      const IbcMi m = ibcListAdjust( x, ibcMiAt( o ), ibcListCentre( o ), true );
       for( int list = 0; list < 2 && !l.full; list++ )
       {
         if( list == 1 && !( m.ibc && m.dir == 3 ) )
@@ -365,7 +382,7 @@ int ibcBuildList( Cu c, int r )
         {
           m1.mv0  = m1.mv1;
           m1.ref1 = -1;
-          m1      = ibcListAdjust( x, m1, ibcListCentre( o ) );
+          m1      = ibcListAdjust( x, m1, ibcListCentre( o ), true );
         }
         const ivec2 mv = m1.mv0 + base;
         if( ( list == 0 && m.ref0 == -1 ) || !ibcListValid( x, mv ) )
@@ -376,13 +393,13 @@ int ibcBuildList( Cu c, int r )
         l.dir[k]    = 1;
         l.mv[k]     = mv;
         l.ref[k]    = m1.ref0;
-        l.hpel[k]   = false;
+        l.hpel[k]   = !x.merge && x.hpel;
         l.flip[k]   = 0;
         l.lic[k]    = ( m.ibc && m.lic ) || eLic;
         l.filtered[k] = ( m.ibc && m.filtered ) || eFilter;
-        if( !ibcListSimilar( l, k ) )
+        if( !ibcListSimilar( x, l, k ) )
         {
-          ibcListCount( l );
+          ibcListCount( x, l );
         }
       }
     }
@@ -406,10 +423,10 @@ int ibcBuildList( Cu c, int r )
       l.ref[k]  = 1;   // (MAX_NUM_REF: any valid index)
       l.dir[k]  = 1;
       l.flip[k] = 0;
-      l.hpel[k] = false;
-      if( !ibcListSimilar( l, k ) )
+      l.hpel[k] = !x.merge && x.hpel;
+      if( !ibcListSimilar( x, l, k ) )
       {
-        ibcListCount( l );
+        ibcListCount( x, l );
       }
     }
   }
@@ -448,13 +465,13 @@ int ibcBuildList( Cu c, int r )
       l.mv[k]     = pad[i] << 4;
       l.ref[k]    = 1;
       l.dir[k]    = 1;
-      l.hpel[k]   = false;
+      l.hpel[k]   = !x.merge && x.hpel;
       l.lic[k]    = false;
       l.filtered[k] = false;
       l.flip[k]   = 0;
-      if( !ibcListSimilar( l, k ) && ibcListValid( x, l.mv[k] ) )
+      if( !ibcListSimilar( x, l, k ) && ibcListValid( x, l.mv[k] ) )
       {
-        ibcListCount( l );
+        ibcListCount( x, l );
       }
     }
   }

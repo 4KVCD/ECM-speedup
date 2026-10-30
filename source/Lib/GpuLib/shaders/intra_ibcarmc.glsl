@@ -20,13 +20,15 @@
 // CodingStructure, which neighbours the list takes (bit 0 the non-adjacent ones, 1 those of a CU of 4 x 4 samples, 2
 // the above-left one), the SPS's merge candidates, log2 of the CTU size, the CU's parsed RR-IBC flip, the offset of
 // the picture's list of the CUs that update the IBC history table and the range of those since the CU's CTU row
-// began, decoded before it; then per candidate of the list in the CPU's order its vector (1/16 samples), IBC LIC flag
-// and RR-IBC flip type (those the GPU builds over the host's)
+// began, decoded before it; an IBC AMVP CU's list (fillIBCMvpCand's, not ranked: bit 3 of the neighbours' word, bit 4
+// its above-left one while it has fewer than 4) its mvpIdx (else -1), imv, its BVD (1/16: the parsed one, which BVD
+// prediction derives further) and the predictor the GPU finds (written by it); then per candidate of the list in the
+// CPU's order its vector (1/16 samples), IBC LIC flag and RR-IBC flip type (those the GPU builds over the host's)
 const int ARMC_N = 0, ARMC_VALID = 1, ARMC_IDX = 2, ARMC_IDX1 = 3, ARMC_SIDES = 4, ARMC_LIC = 5, ARMC_MBVD = 6;
 const int ARMC_MBVD_IDX1 = 7, ARMC_MBVD_FLIP = 8, ARMC_MBVD_SHIFT = 9, ARMC_MBVD_MASK = 10, ARMC_LIST = 11;
 const int ARMC_CU = 12, ARMC_BUILD = 13, ARMC_MAXVALID = 14, ARMC_CTU = 15, ARMC_CUFLIP = 16, ARMC_HMVP = 17;
-const int ARMC_HMVP_FROM = 18, ARMC_HMVP_TO = 19;
-const int ARMC_CANDS = 20, ARMC_CAND_WORDS = 4, ARMC_MAX_CANDS = 28;   // (IBC_MRG_MAX_NUM_CANDS_MEM)
+const int ARMC_HMVP_FROM = 18, ARMC_HMVP_TO = 19, ARMC_AMVP = 20, ARMC_IMV = 21, ARMC_MVD = 22, ARMC_PRED = 24;
+const int ARMC_CANDS = 26, ARMC_CAND_WORDS = 4, ARMC_MAX_CANDS = 28;   // (IBC_MRG_MAX_NUM_CANDS_MEM)
 const int ARMC_REC = ARMC_CANDS + ARMC_CAND_WORDS * ARMC_MAX_CANDS;
 // MBVD (IBC_MBVD_*): bases, offsets per base (20 steps x 4 directions), offsets ranked per base, merge indices below
 // its candidates' (ibcMergeIdx1 of a plain base)
@@ -300,6 +302,42 @@ int mbvdGroupBase( int r, int g )
     n += chosen ? 1 : 0;
   }
   return found;
+}
+
+// the predictor of IBC AMVP CU c from record r (all invocations, ending with a barrier): its list (the GPU's where the
+// record says so), then fillIBCMvpCand's candidates - the list's valid entries at imv's precision
+// (roundIbcPrecInternal2Amvr), each not already among them, at most AMVP_MAX_NUM_CANDS_MEM, then the first
+// AMVP_MAX_NUM_CANDS padded with zero vectors - and mvpIdx's
+ivec2 ibcAmvpPredictor( Cu c, int r, int lid )
+{
+  CBufI32 d = CBufI32( P.timdData );
+  if( lid == 0 )
+  {
+    if( d.v[r + ARMC_LIST] != 0 )
+    {
+      ibcBuildList( c, r );
+    }
+    const int imv = d.v[r + ARMC_IMV], numValid = d.v[r + ARMC_VALID];
+    ivec2     cand[3];
+    int       n = 0;
+    for( int i = 0; i < numValid && n < 3; i++ )
+    {
+      const ivec2 v = armcCandMv( r, i );
+      cand[n]       = ivec2( bvdToInternal( bvdToAmvr( v.x, imv ), imv ), bvdToInternal( bvdToAmvr( v.y, imv ), imv ) );
+      bool known    = false;
+      for( int k = 0; k < n; k++ )
+      {
+        known = known || cand[k] == cand[n];
+      }
+      n += known ? 0 : 1;
+    }
+    const int   idx  = d.v[r + ARMC_AMVP];
+    const ivec2 pred = idx < min( n, 2 ) ? cand[idx] : ivec2( 0 );
+    d.v[r + ARMC_PRED]     = pred.x;
+    d.v[r + ARMC_PRED + 1] = pred.y;
+  }
+  cccmSync();
+  return ivec2( d.v[r + ARMC_PRED], d.v[r + ARMC_PRED + 1] );
 }
 
 // the vectors of IBC merge block t's CU from record r (all invocations, ending with a barrier): list 0's, with

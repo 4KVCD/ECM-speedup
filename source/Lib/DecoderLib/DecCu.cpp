@@ -7351,6 +7351,12 @@ void DecCu::xDeriveCUMV(CodingUnit &cu)
 #if (JVET_Z0084_IBC_TM && IBC_TM_AMVP) || JVET_AC0060_IBC_BVP_CLUSTER_RRIBC_BVD_SIGN_DERIV
 #if JVET_AE0169_BIPREDICTIVE_IBC
           PU::fillIBCMvpCand(pu, amvpInfo, mrgCtx, m_pcInterPred);
+#if ECM_VULKAN
+          if( m_gpuIntraRec )
+          {
+            m_gpuIntraRec->ibcAmvpList( *pu.cu, mrgCtx, pu.mvpIdx[REF_PIC_LIST_0] );
+          }
+#endif
 #else
           PU::fillIBCMvpCand(pu, amvpInfo, m_pcInterPred);
 #endif
