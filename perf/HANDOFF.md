@@ -3560,7 +3560,62 @@ within the budget (M118's 3070 runs skipped those pictures with ECM_GPU_NO_CCP_L
 
 ## 9. Next steps (in the order I would take them)
 
-000. Now (2026-10-26, after M121; RTX 3070 PC): every picture verifies (no ECM_GPU_NO_* switch needed). Open
+0000. Now (2026-10-30, after M177; RTX 3070 PC). Partial verification takes no CU from the CPU on the 27 streams
+   (M172), but ON mode (`--GpuRecon=3`, the GPU reconstructing without the CPU's reconstruction) still gives the
+   CPU nearly every picture of them: only intra pictures without IBC go to the GPU (ai_md5 32 of 33, ai_long 27 of
+   33, ai_parkjoy 1 of 1, the first picture of ld_foreman, ld_md5, ra_foreman, ra_ip64_md5's 4 and ra_long's 6);
+   every intra picture with an IBC CU ("inter / IBC / palette CU": fp720_ai, pj720_ai, ai720, aiodd, ai_foreman, the
+   first pictures of the RA / LD streams), every inter picture ("not an intra slice") and pictures with "IntraTMP OBMC
+   with a neighbour of list 1" fall back. Partial verification gives the GPU what ON mode would have to derive itself
+   from its own reconstruction: the CPU's final block vectors and motion, its LIC models and its reference pictures.
+   a. IBC in intra pictures (the AI streams' IBC CUs, partial verification's counts: fp720_ai 804 - AMVP 586, MBVD
+      merge 180, merge 38; bi-prediction 96, LIC 100 -, ai720 101, pj720_ai 119; AML on in all). Every IBC CU's vector
+      derivation reads samples of the current picture: getIBCMergeCandidates (with IBC_TM_MRG its candidates refined
+      by template matching), adjustIBCMergeCandidates (ARMC's template costs), sortIbcMergeMbvdCandidates,
+      adjustIbcMergeRribcCand, fillIBCMvpCand (each predictor refined by deriveTMMv and sorted by its cost, or with
+      BVP clustering getTMCost's), deriveBvdSignIBC (the BVD's signs by template costs), the IBC LIC models. A CU's
+      candidates come from earlier IBC CUs' final vectors (spatial neighbours, the history table), so the whole
+      derivation has to run on the GPU in decoding order - as nodes like IntraTMP's, a chain through the IBC CUs -
+      not as CPU work between GPU steps (a round trip per CU). The AI streams' SPS (ai720, fp720_ai): BVP clustering
+      0, BVD prediction 1, IBC TM 0, DMVD 1, fractional BVs 1, MBVD's adaptive search 0, 6 merge candidates, the TM
+      tools of non-inter CUs 1, AML 1. So an AMVP CU's predictors come from getIBCMergeCandidates without template
+      matching (its vector field: the earlier IBC and IntraTMP CUs' final vectors; the history table) and its BVD's
+      signs and suffix from deriveBvdSignIBC (mvsdIdx 0-3 used; imv 0 and 1); a merge / MBVD CU's from ARMC and
+      sortIbcMergeMbvdCandidates; bi-prediction's second vector from the merge list after ARMC; LIC's models from
+      templates.
+      First step (planned M178, checked in partial verification against the CPU's vector before ON mode takes it):
+      the BVD derivation of an IBC AMVP CU on the GPU - a node per such CU, its predictor the host's for now. The CPU
+      code: DecCu.cpp's IBC AMVP branch (`pu.isBvdPredApplicable() && mvd.isMvdPredApplicable()`: cMvPred regulated by
+      getBvType, bvdSuffixInfo.initPrefixes, deriveBvdSignIBC, deriveMVDFromMVSDIdxTransIBC, applyOffsets, then
+      mv = predictor + mvd, regulateMv); InterPrediction.cpp's deriveBvdSignIBC (the candidates: per allowed sign and
+      the predicted most significant bins of each suffix), CandCheckEnv (estimate: checkValidBv of the vector with
+      boundary check, then of 1-sample template strips beside the reference block - RR-IBC's sides differ -;
+      checkSubRange: a bisection over each run of candidates where the inner ones of a run whose two ends are valid
+      are costed without the check, top and left assumed available - the costs differ from the checked ones, so the
+      GPU must replay the same recursion), then stableSortSmall by cost and mvsdIdx's entry; TplMatchingCtrl's
+      constructor's isForBmvdFlag branch (the current templates), xGetTempMatchErrorBvd<1> (per side SAD of the
+      1-sample templates, xGetRefTemplate's interpolation of a fractional vector; a side not available adds
+      numeric_limits<Distortion>::max() - unsigned 64-bit, so two such sides wrap: the GPU must keep that arithmetic).
+      On the GPU already: intra_bv.glsl's bvValid, intra_ibc.glsl's checkValidBv reach and fractional interpolation.
+      The templates (InterPrediction.cpp ~29190-30500): the current one per side where xGetCurTemplateAvailable<1>
+      holds (a CU above / left - cs.getCU of the luma position 1 above / left - and PU::searchBv of the 1-sample strip
+      at the vector (0, -1) / (-1, 0)), xGetCurTemplateBvd: the reconstruction copied (filterHor at fraction 0;
+      RR-IBC's flip a reversed copy); the reference one, xGetRefTemplate<1, side, 0> with sr 0: checkValidBv
+      (filterIdx 1) of the strip at the vector plus (0, -1) / (-1, 0) - RR-IBC flip 1's left strip at (W, 0) and flip
+      2's top strip at (0, H) instead - else no template (cost max), then the strip interpolated at the vector
+      (filter 1, no MV clipping for IBC); the cost SAD (useWeight false, subShift 0; FULL_NBIT's shift).
+   b. Inter pictures: the same for all of ECM's decoder-side motion derivation (merge lists and HMVP, TMVP from the
+      GPU's own motion of earlier pictures, TM / BM merge, ARMC of every list, affine and GPM TM, DMVR's search, LIC
+      models, MVD sign and suffix prediction, ...), the decoded pictures kept on the GPU as references (inter_mc reads
+      the CPU's today), and the in-loop filters on the GPU without a CPU round trip (5. below). Weeks of work.
+   c. Speed: where it runs, the GPU path is slower than the CPU decoder - fp720_ai's intra_rec takes 12.3 s of GPU
+      time, the whole CPU decode (`--GpuRecon=3`, every picture on the CPU) 2.7 s. intra_rec follows one chain of
+      dependencies (the blocks' durations sum to ~1.3 times the picture's GPU time on fp720_ai / pj720_ai: about one
+      block in flight on 46 SMs). Pictures that do not depend on each other (all of an AI stream's; in RA / LD those
+      of a temporal layer without references to each other) could run at once: a set of the per-picture buffers per
+      picture in flight, the pictures on separate queues (a barrier in one submission waits for all earlier work of
+      its queue), the verification deferred.
+000. (2026-10-26, after M121; RTX 3070 PC): every picture verifies (no ECM_GPU_NO_* switch needed). Open
    differences, all of them older (pictures the switches skipped before):
    a. Fixed by M148 (a CCP merge candidate's inter CCCM switch left set). It was: decoder-derived CCP fusion in an
       inter picture (ra_ip64_md5 POC 8, chroma 4,32 4x16: CPU type 16, GPU 1; also
