@@ -3514,6 +3514,20 @@ CPU). IBC GPM and IBC TM merge CUs keep the CPU's vectors; MBVD is next (M180). 
 ai_md5 539 -> 537 ms, ai_parkjoy 151 -> 150 (no IBC derivations: the MPM pipeline), ai_long 795 -> 805, ai720 1,563
 -> 1,667, aiodd 229 -> 243, ai_foreman 224 -> 253, fp720_ai 12,302 -> 13,258. Results (grn272 for M178 alone, grn274,
 27 streams): every picture identical.
+M180 (2026-10-30): IBC MBVD on the GPU (intra_ibcarmc.glsl's second stage; DecCu's MBVD branch, GpuIntraRec::
+ibcMbvdList): ARMC ranks the list without the candidates' IBC LIC (ibcMbvdMergeFlag stays set during it:
+getIBCAMLRefTemplate's doIbcLic), the ranked list's first entries are the bases, and per base the MBVD and bi-
+prediction indices name, its 80 offsets (20 steps x 4 directions, quarter samples unless the picture header disables
+fractional MBVD with palette on; none across the base's RR-IBC flip; only those whose integer vector is valid) are
+costed by the same template SATD and the 8 cheapest moved first (sortIbcMergeMbvdCandidates' LUT); the vectors at the
+indices' entries. Its templates take the RR-IBC flip the CU holds after ARMC: setMergeInfo's last call leaves the
+candidate's where updateIBCCandInfo stops (the first whose vector rounds to zero, else the 28th), or the parsed one
+where ARMC returned early. A CU whose indices take a base of no vector (refIdx < 0: getIbcMbvdMergeCandidates leaves
+its slot as it was) keeps the CPU's vectors; none of the 27 streams has one (a first version that required all 5 bases
+skipped 4 of fp720_ai's). The adaptive MBVD search (SPS) keeps the CPU's too. Counts: fp720_ai 180 (with M178 / M179
+798 of its 804 IBC CUs derive their vectors on the GPU), pj720_ai 33, ra720 24, ai720 19. GPU time (27 streams,
+FULL): 44,005 -> 44,008 ms (grn275), 43,464 (grn276, a host-only change: the runs' noise). Results (grn276, 27
+streams): every picture identical.
 Tried after M176 and left out (2026-10-29): intra_deps' passes 1 and 2 with a cluster of 8 invocations per block
 (clustered subgroup operations) instead of M175's subgroup: pj720_ai's deps 171 -> 145 ms, but ai_md5 24 -> 62,
 ai_long 28 -> 79, ld_md5 8 -> 17 (the scans 4 times as long per block). To keep intra_rec at 255 registers: a branch
@@ -3608,12 +3622,14 @@ within the budget (M118's 3070 runs skipped those pictures with ECM_GPU_NO_CCP_L
       signs and suffix from deriveBvdSignIBC (mvsdIdx 0-3 used; imv 0 and 1); a merge / MBVD CU's from ARMC and
       sortIbcMergeMbvdCandidates; bi-prediction's second vector from the merge list after ARMC; LIC's models from
       templates.
-      Done: M178 (the BVD derivation, below) and M179 (ARMC of the merge list; section 7). Next: M180 MBVD's sorting
-      (sortIbcMergeMbvdCandidates: per base of the ranked list 80 offsets, the 8 cheapest by template SATD without
-      LIC; its templates take the RR-IBC flip ARMC's last setMergeInfo left in the CU - the candidate at the first
-      zero vector, or the parsed one where ARMC returned early -, and the MBVD branch ranks without LIC since
-      ibcMbvdMergeFlag stays set), then AMVP-merge bi-prediction, the predictor lists (fillIBCMvpCand), the candidate
-      lists, the vector field and HMVP.
+      Done: M178 (the BVD derivation, below), M179 (ARMC of the merge list) and M180 (MBVD's sorting; section 7):
+      798 of fp720_ai's 804 IBC CUs derive their vectors on the GPU from the host's candidate lists. Next: the
+      candidate lists themselves (getIBCMergeCandidates, UnitTools.cpp ~10888-12860: the spatial neighbours'
+      vectors - IBC CUs', and with JVET_AB0061 / AL0108 / AL0106 IntraTMP's, BVG-DIMD's and EIP's block vectors, which
+      the GPU derives -, JVET-AE0094's non-adjacent ones, the history table (addIBCMergeHMVPCand), pairwise ones),
+      so a vector field and the HMVP table on the GPU in decoding order. With the AI streams' SPS (TM IBC 0, BVP
+      clustering 0) fillIBCMvpCand is that list without sample costs, and AMVP-merge bi-prediction (its list 1 from
+      the ranked merge list) follows from it.
       M178 (done; checked in partial verification against the CPU's vector before ON mode takes it):
       the BVD derivation of an IBC AMVP CU on the GPU - a node per such CU, its predictor the host's for now. The CPU
       code: DecCu.cpp's IBC AMVP branch (`pu.isBvdPredApplicable() && mvd.isMvdPredApplicable()`: cMvPred regulated by

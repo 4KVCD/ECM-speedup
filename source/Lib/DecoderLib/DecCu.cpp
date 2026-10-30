@@ -5780,6 +5780,12 @@ void DecCu::xDeriveCUMV(CodingUnit &cu)
 #endif
 #if JVET_Z0075_IBC_HMVP_ENLARGE
                 PU::getIBCMergeCandidates(pu, mrgCtx);
+#if ECM_VULKAN
+                if( m_gpuIntraRec )
+                {
+                  m_gpuIntraRec->ibcMbvdList( *pu.cu, mrgCtx );
+                }
+#endif
 #if JVET_AC0112_IBC_LIC && !JVET_AA0070_RRIBC
                 pu.ibcMbvdMergeFlag = false;
 #endif

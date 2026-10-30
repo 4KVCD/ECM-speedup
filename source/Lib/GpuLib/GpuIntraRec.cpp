@@ -210,13 +210,16 @@ constexpr int BVD_MSB_BINS = 10, BVD_GROUP = 12, BVD_SIGN_EP = 14, BVD_OFFSET = 
 constexpr int BVD_SCRATCH_WORDS = 6 * 256 + 4;
 // an IBC merge CU's ARMC (intra_ibcarmc.glsl; DecCu's IBC merge branch with AML): how many candidates ARMC ranks
 // (those before the first whose vector rounds to zero samples; 0 where adjustIBCMergeCandidates ranks none), the
-// list's valid candidates, the merge index, ibcMergeIdx1 (-1 without bi-prediction), the current templates' sides (bit
-// 0 above, bit 1 left), then per candidate of the list (IBC_MRG_MAX_NUM_CANDS_MEM, the CPU's order before ARMC) its
-// vector (1/16), IBC LIC flag and RR-IBC flip type; the workgroup scratch it takes, per candidate ranked its
-// templates' predictions after its parameters (intra_ibcarmc.glsl's ARMC_S_*)
-constexpr int ARMC_N = 0, ARMC_VALID = 1, ARMC_IDX = 2, ARMC_IDX1 = 3, ARMC_SIDES = 4, ARMC_CANDS = 5;
+// list's valid candidates, the merge index, ibcMergeIdx1 (-1 without bi-prediction or with MBVD), the current
+// templates' sides (bit 0 above, bit 1 left), whether the ranking applies the candidates' IBC LIC; with MBVD (else -1)
+// its index, its ibcMergeIdx1 (-1 without bi-prediction), the RR-IBC flip its templates take, the offsets' right
+// shift, the bases it ranks (bits); then per candidate of the list (IBC_MRG_MAX_NUM_CANDS_MEM, the CPU's order before
+// ARMC) its vector (1/16), IBC LIC flag and RR-IBC flip type; the workgroup scratch it takes, per candidate costed
+// (up to two MBVD bases' offsets) its templates' predictions after the parameters (intra_ibcarmc.glsl's ARMC_S_*)
+constexpr int ARMC_N = 0, ARMC_VALID = 1, ARMC_IDX = 2, ARMC_IDX1 = 3, ARMC_SIDES = 4, ARMC_LIC = 5, ARMC_MBVD = 6;
+constexpr int ARMC_MBVD_IDX1 = 7, ARMC_MBVD_FLIP = 8, ARMC_MBVD_SHIFT = 9, ARMC_MBVD_MASK = 10, ARMC_CANDS = 11;
 constexpr int ARMC_CAND_WORDS = 4, ARMC_REC = ARMC_CANDS + ARMC_CAND_WORDS * IBC_MRG_MAX_NUM_CANDS_MEM;
-constexpr int ARMC_SCRATCH_HEAD = 8 * IBC_MRG_MAX_NUM_CANDS_MEM + 4;
+constexpr int ARMC_SCRATCH_HEAD = 10 * 2 * IBC_MBVD_MAX_REFINE_NUM + 12;
 // IBC_REC_OWN_MV2 of a CU of one vector (its neighbours of one vector compare), of two with BCW's weights other than
 // the default (no neighbour's motion equals it: a neighbour of two vectors with BCW is the CPU's)
 constexpr int IBC_OWN_MV2_NONE = 0x7FFFFFFF, IBC_OWN_MV2_NEVER = 0x7FFFFFFE;
@@ -2404,6 +2407,7 @@ struct GpuIntraRec::Impl
   int                                                          ibcGpmCus = 0;   // ... of them IBC GPM CUs
   int                                                          ibcBvdCus = 0;   // ... AMVP CUs deriving their BVD
   int                                                          ibcArmcCus = 0;   // ... merge CUs ranking their list
+  int                                                          ibcMbvdCus = 0;   // ... of them MBVD CUs
   std::unordered_map<const CodingUnit*, std::pair<Mv, Mv>>     ibcGpmMvs;   // IBC GPM CUs' parts' vectors (DecCu)
   // IBC AMVP CUs with BVD prediction (ibcBvdInputs): their BVD records' words; IBC merge CUs with ARMC (ibcMergeList):
   // their ARMC records' words; those CUs' luma blocks' IBC records
@@ -2569,8 +2573,8 @@ GpuIntraRec::~GpuIntraRec()
       if( m.ibcCus )
       {
         printf( "[gpu-intra] IBC CUs predicted by the GPU: %d (IBC GPM %d, deriving their BVD %d, ranking their merge "
-                "list %d)\n",
-                m.ibcCus, m.ibcGpmCus, m.ibcBvdCus, m.ibcArmcCus );
+                "list %d - MBVD %d)\n",
+                m.ibcCus, m.ibcGpmCus, m.ibcBvdCus, m.ibcArmcCus, m.ibcMbvdCus );
       }
       if( !m.interKinds.empty() )   // (the inter CUs whose prediction is the CPU's, by its kind)
       {
@@ -7738,9 +7742,10 @@ static void ibcRecord( GpuIntraRec::Impl& m, const CodingUnit& cu, const Compone
   {
     rec[IBC_REC_ARMC] = (int32_t) m.timdData.size();
     m.timdData.insert( m.timdData.end(), armcIn->second.begin(), armcIn->second.end() );
-    const int ranked   = armcIn->second[ARMC_N];
-    m.cccmScratchWords = std::max( m.cccmScratchWords, ARMC_SCRATCH_HEAD + ranked * int( area.width + area.height ) );
+    const int costed   = armcIn->second[ARMC_MBVD] >= 0 ? 2 * IBC_MBVD_MAX_REFINE_NUM : armcIn->second[ARMC_N];
+    m.cccmScratchWords = std::max( m.cccmScratchWords, ARMC_SCRATCH_HEAD + costed * int( area.width + area.height ) );
     m.ibcArmcCus++;
+    m.ibcMbvdCus += armcIn->second[ARMC_MBVD] >= 0 ? 1 : 0;
     m.numIbcDerived++;
   }
   else if( derived )
@@ -11366,14 +11371,11 @@ void GpuIntraRec::ibcBvdInputs( const CodingUnit& cu, const Mv& predictor, const
                           (int32_t) si.verOffsetPrediction };
 }
 
-void GpuIntraRec::ibcMergeList( const CodingUnit& cu, const MergeCtx& ctx, int mergeIdx )
+// the ARMC record (ARMC_*) of IBC merge CU cu's list ctx before adjustIBCMergeCandidates ranks it, without the merge
+// indices and MBVD
+static std::array<int32_t, ARMC_REC> armcRecord( const CodingUnit& cu, const MergeCtx& ctx )
 {
-  // (IBC GPM's parts and IBC TM merge keep the CPU's vectors)
-  const PredictionUnit& pu = *cu.firstPU;
-  if( pu.ibcGpmFlag || pu.tmMergeFlag )
-  {
-    return;
-  }
+  const PredictionUnit&         pu = *cu.firstPU;
   std::array<int32_t, ARMC_REC> r{};
   // adjustIBCMergeCandidates ranks the candidates before the first whose vector rounds to zero samples
   // (setMergeInfo's bv), where the list has more than one valid candidate and the CU a template
@@ -11396,13 +11398,14 @@ void GpuIntraRec::ibcMergeList( const CodingUnit& cu, const MergeCtx& ctx, int m
   }
   r[ARMC_N]     = ctx.numValidMergeCand > 1 && sides != 0 ? ranked : 0;
   r[ARMC_VALID] = ctx.numValidMergeCand;
-  r[ARMC_IDX]   = mergeIdx;
-#if JVET_AE0169_BIPREDICTIVE_IBC
-  r[ARMC_IDX1] = pu.ibcMergeIdx1 != MAX_INT ? pu.ibcMergeIdx1 : -1;
-#else
-  r[ARMC_IDX1] = -1;
-#endif
+  r[ARMC_IDX1]  = -1;
   r[ARMC_SIDES] = sides;
+  r[ARMC_LIC]   = 1;
+  r[ARMC_MBVD]  = -1;
+  // (the RR-IBC flip the last setMergeInfo of a ranking leaves in the CU: the candidate where updateIBCCandInfo stops)
+  r[ARMC_MBVD_FLIP] = ctx.numValidMergeCand > 1 && sides != 0
+                        ? ctx.rribcFlipTypes[std::min( ranked, IBC_MRG_MAX_NUM_CANDS_MEM - 1 )]
+                        : cu.rribcFlipType;
   for( int i = 0; i < IBC_MRG_MAX_NUM_CANDS_MEM; i++ )
   {
     const int o = ARMC_CANDS + ARMC_CAND_WORDS * i;
@@ -11411,6 +11414,63 @@ void GpuIntraRec::ibcMergeList( const CodingUnit& cu, const MergeCtx& ctx, int m
     r[o + 2]    = ctx.ibcLicFlags[i] ? 1 : 0;
     r[o + 3]    = ctx.rribcFlipTypes[i];
   }
+  return r;
+}
+
+void GpuIntraRec::ibcMergeList( const CodingUnit& cu, const MergeCtx& ctx, int mergeIdx )
+{
+  // (IBC GPM's parts and IBC TM merge keep the CPU's vectors)
+  const PredictionUnit& pu = *cu.firstPU;
+  if( pu.ibcGpmFlag || pu.tmMergeFlag )
+  {
+    return;
+  }
+  std::array<int32_t, ARMC_REC> r = armcRecord( cu, ctx );
+  r[ARMC_IDX]                     = mergeIdx;
+#if JVET_AE0169_BIPREDICTIVE_IBC
+  r[ARMC_IDX1] = pu.ibcMergeIdx1 != MAX_INT ? pu.ibcMergeIdx1 : -1;
+#endif
+  m_impl->ibcArmc[&cu] = r;
+}
+
+void GpuIntraRec::ibcMbvdList( const CodingUnit& cu, const MergeCtx& ctx )
+{
+  // (the adaptive MBVD search, an IBC TM merge CU, and a second vector of base 5 - getIbcMbvdMergeCandidates keeps
+  // IBC_MBVD_BASE_NUM bases - keep the CPU's vectors)
+  const PredictionUnit& pu = *cu.firstPU;
+#if JVET_AE0169_BIPREDICTIVE_IBC
+  const int idx1 = pu.interDir == 1 ? -1 : pu.ibcMergeIdx1;   // (DecCu's ibcMbvdIdx1)
+#else
+  const int idx1 = -1;
+#endif
+  const bool secondBeyondBases = idx1 >= IBC_MBVD_BASE_NUM && idx1 < IBC_MRG_MAX_NUM_CANDS;
+  if( cu.cs->sps->getUseIbcMbvdAdSearch() || pu.tmMergeFlag || secondBeyondBases )
+  {
+    return;
+  }
+  std::array<int32_t, ARMC_REC> r = armcRecord( cu, ctx );
+  // the bases are the ranked list's first entries (getIbcMbvdMergeCandidates leaves the slot of a candidate without a
+  // vector - refIdx - as it was: a CU whose indices take such a base keeps the CPU's vectors; the ranked entries are
+  // the candidates before ARMC_N in another order)
+  const int base0    = pu.ibcMbvdMergeIdx / IBC_MBVD_MAX_REFINE_NUM;
+  const int base1    = idx1 < IBC_MRG_MAX_NUM_CANDS ? idx1 : ( idx1 - IBC_MRG_MAX_NUM_CANDS ) / IBC_MBVD_MAX_REFINE_NUM;
+  const int lastBase = std::max( base0, base1 );
+  for( int i = 0; i < std::max( r[ARMC_N], lastBase + 1 ); i++ )
+  {
+    if( ctx.mvFieldNeighbours[i << 1].refIdx < 0 )
+    {
+      return;
+    }
+  }
+  // DecCu's MBVD branch ranks without the candidates' IBC LIC (ibcMbvdMergeFlag stays set: getIBCAMLRefTemplate's
+  // doIbcLic), then sorts the offsets of the bases its indices name (setIbcMbvdMergeCandiInfo: quarter-sample offsets
+  // unless the picture header disables fractional MBVD with palette on)
+  r[ARMC_LIC]       = 0;
+  r[ARMC_MBVD]      = pu.ibcMbvdMergeIdx;
+  r[ARMC_MBVD_IDX1] = idx1;
+  r[ARMC_MBVD_SHIFT] =
+    !cu.slice->getPicHeader()->getDisFracMBVD() || !cu.cs->sps->getPLTMode() ? 2 : 0;
+  r[ARMC_MBVD_MASK] = ( 1 << base0 ) | ( idx1 >= IBC_MRG_MAX_NUM_CANDS ? 1 << base1 : 0 );
   m_impl->ibcArmc[&cu] = r;
 }
 

@@ -3,26 +3,35 @@
 // and left of the CU against those beside the reference block at each candidate's vector (getIBCAMLRefTemplate:
 // RR-IBC's mirrored, with the candidate's IBC LIC a model of the templates a sample further out), then with
 // bi-prediction moves the RR-IBC candidates last (adjustIbcMergeRribcCand), and takes the merge index's entry (and
-// with bi-prediction ibcMergeIdx1's). The CU's luma block derives its vectors so at its start (it waits for every
-// block before it: the templates and the reference area are decoded), into the CU's IBC records. Included by
-// intra_rec.comp before intra_ibccu.glsl.
+// with bi-prediction ibcMergeIdx1's). An MBVD CU takes its bases from the ranked list and ranks each chosen base's
+// offsets alike (sortIbcMergeMbvdCandidates: the 8 cheapest first). The CU's luma block derives its vectors so at its
+// start (it waits for every block before it: the templates and the reference area are decoded), into the CU's IBC
+// records. Included by intra_rec.comp before intra_ibccu.glsl.
 #ifndef INTRA_IBCARMC_GLSL
 #define INTRA_IBCARMC_GLSL
 
 // the record (Params::timdData, GpuIntraRec.cpp's ARMC_*): how many candidates ARMC ranks (those before the first
 // whose vector rounds to zero samples; 0 where it ranks none: a list of one valid candidate, or no template), the
-// list's valid candidates (numValidMergeCand), the merge index, ibcMergeIdx1 (-1 without bi-prediction), the current
-// templates' sides (bit 0 above, bit 1 left: xAMLIsTopTempAvailable / xAMLIsLeftTempAvailable), then per candidate of
-// the list in the CPU's order its vector (1/16 samples), IBC LIC flag and RR-IBC flip type
-const int ARMC_N = 0, ARMC_VALID = 1, ARMC_IDX = 2, ARMC_IDX1 = 3, ARMC_SIDES = 4, ARMC_CANDS = 5;
+// list's valid candidates (numValidMergeCand), the merge index, ibcMergeIdx1 (-1 without bi-prediction or with MBVD),
+// the current templates' sides (bit 0 above, bit 1 left: xAMLIsTopTempAvailable / xAMLIsLeftTempAvailable), whether
+// the ranking applies the candidates' IBC LIC; with MBVD (else -1) its index, its ibcMergeIdx1 (-1 without
+// bi-prediction), the RR-IBC flip its templates take, the offsets' right shift, the bases it ranks (bits); then per
+// candidate of the list in the CPU's order its vector (1/16 samples), IBC LIC flag and RR-IBC flip type
+const int ARMC_N = 0, ARMC_VALID = 1, ARMC_IDX = 2, ARMC_IDX1 = 3, ARMC_SIDES = 4, ARMC_LIC = 5, ARMC_MBVD = 6;
+const int ARMC_MBVD_IDX1 = 7, ARMC_MBVD_FLIP = 8, ARMC_MBVD_SHIFT = 9, ARMC_MBVD_MASK = 10, ARMC_CANDS = 11;
 const int ARMC_CAND_WORDS = 4, ARMC_MAX_CANDS = 28;   // (IBC_MRG_MAX_NUM_CANDS_MEM)
 const int ARMC_REC = ARMC_CANDS + ARMC_CAND_WORDS * ARMC_MAX_CANDS;
+// MBVD (IBC_MBVD_*): bases, offsets per base (20 steps x 4 directions), offsets ranked per base, merge indices below
+// its candidates' (ibcMergeIdx1 of a plain base)
+const int MBVD_BASES = 5, MBVD_REFINE = 80, MBVD_KEEP = 8, MBVD_MERGE = 6;
 
-// the workgroup's scratch (cccmScratchBase's words; free at an IBC block's start): per ranked candidate its templates'
-// vectors (above, left) and LIC model (whether it has one, scale, shift, offset), the vectors derived, then per ranked
-// candidate its templates' predictions (W + H samples: above, then left)
-const int ARMC_S_PARAM = 0, ARMC_S_PARAM_WORDS = 8, ARMC_S_RESULT = ARMC_S_PARAM_WORDS * ARMC_MAX_CANDS;
-const int ARMC_S_PRED = ARMC_S_RESULT + 4;
+// the workgroup's scratch (cccmScratchBase's words; free at an IBC block's start): per candidate costed (a merge
+// candidate, or an MBVD offset of up to two bases) its templates' vectors (above, left), LIC model (whether it has
+// one, scale, shift, offset), RR-IBC flip and whether it is costed; the vectors derived; the ranked list's first
+// entries (MBVD's bases); then per candidate costed its templates' predictions (W + H samples: above, then left)
+const int ARMC_S_SLOTS = 2 * MBVD_REFINE, ARMC_S_PARAM_WORDS = 10, ARMC_S_PARAM = 0;
+const int ARMC_S_RESULT = ARMC_S_PARAM_WORDS * ARMC_S_SLOTS, ARMC_S_BASES = ARMC_S_RESULT + 4;
+const int ARMC_S_PRED = ARMC_S_BASES + 8;
 
 // setMergeInfo's pu.bv == Mv( 0, 0 ): the vector rounded to whole samples (changePrecision) is zero
 bool armcZeroBv( ivec2 mv ) { return abs( mv.x ) <= 8 && abs( mv.y ) <= 8; }
@@ -68,22 +77,17 @@ int armcLicRef( Cu c, bool above, ivec2 tv, int k, int bitDepth )
   return above ? recoAt( 0, c.x + b.x + k, c.y + b.y ) : recoAt( 0, c.x + b.x, c.y + b.y + k );
 }
 
-// candidate cand's templates (invocation per candidate): getIBCAMLRefTemplate's vector of each side's template - the
-// strip beside the reference block (RR-IBC's flip: below it, or right of it), where that strip is not valid
-// (checkIsIBCCandidateValid, its integer part) the reference block's own first row / column - and with IBC LIC its
-// model: of each side whose strip is valid and whose strip a sample further out is valid too, the samples
-// xGetLICParamGeneral steps (numSteps by the smaller side) of that outer strip against the reconstruction two samples
-// beside the CU, fitted as inter LIC's one model (tmpLicModel's single-model fit); into the scratch
-void armcParams( Cu c, int r, int cand, int sides, int base, int bitDepth )
+// the templates of a candidate of vector mv (invocation per candidate; its slot of the scratch): getIBCAMLRefTemplate's
+// vector of each side's template - the strip beside the reference block (RR-IBC's flip: below it, or right of it),
+// where that strip is not valid (checkIsIBCCandidateValid, its integer part) the reference block's own first row /
+// column - and with IBC LIC its model: of each side whose strip is valid and whose strip a sample further out is valid
+// too, the samples xGetLICParamGeneral steps (numSteps by the smaller side) of that outer strip against the
+// reconstruction two samples beside the CU, fitted as inter LIC's one model (tmpLicModel's single-model fit)
+void armcParams( Cu c, int slot, ivec2 mv, bool lic, int flip, int sides, int base, int bitDepth )
 {
-  CBufI32     d    = CBufI32( P.timdData );
-  WBufI32     s    = WBufI32( P.scratch );
-  const int   o    = r + ARMC_CANDS + ARMC_CAND_WORDS * cand;
-  const ivec2 mv   = ivec2( d.v[o], d.v[o + 1] );
-  const bool  lic  = d.v[o + 2] != 0;
-  const int   flip = d.v[o + 3];
-  ivec2       tv[2];
-  bool        licSide[2];
+  WBufI32 s = WBufI32( P.scratch );
+  ivec2   tv[2];
+  bool    licSide[2];
   for( int side = 0; side < 2; side++ )
   {
     const bool  above = side == 0;
@@ -157,7 +161,7 @@ void armcParams( Cu c, int r, int cand, int sides, int base, int bitDepth )
     const int offset = ( sumY - ( ( scale * sumX ) >> shift ) + ( ( 1 << cntShift ) >> 1 ) ) >> cntShift;
     model = int[4]( 1, scale, shift, clamp( offset, -1 - maxOffset, maxOffset ) );
   }
-  const int p = base + ARMC_S_PARAM + ARMC_S_PARAM_WORDS * cand;
+  const int p = base + ARMC_S_PARAM + ARMC_S_PARAM_WORDS * slot;
   s.v[p]     = tv[0].x;
   s.v[p + 1] = tv[0].y;
   s.v[p + 2] = tv[1].x;
@@ -166,6 +170,61 @@ void armcParams( Cu c, int r, int cand, int sides, int base, int bitDepth )
   {
     s.v[p + 4 + k] = model[k];
   }
+  s.v[p + 8] = flip;
+  s.v[p + 9] = 1;
+}
+
+// the costs of the candidates in slots 0 .. count - 1 whose parameters armcParams set (all invocations, after a
+// barrier; ending with one): their templates' predictions through the candidate's LIC model, their SATD against the
+// CU's templates (RdCost's DF_HAD of the width: JVET-AJ0096's kernels along an arm one sample thick, timdHadLine)
+// per kernel's stretch added into s_spCost[slot]
+void armcCosts( Cu c, int count, int sides, int base, int bitDepth, int lid, int NT )
+{
+  WBufI32   s = WBufI32( P.scratch );
+  const int T = c.w + c.h, maxPel = ( 1 << bitDepth ) - 1;
+  for( int m = lid; m < count; m += NT )
+  {
+    s_spCost[m] = 0u;
+  }
+  for( int i = lid; i < count * T; i += NT )
+  {
+    const int  m = i / T, k = i % T, p = base + ARMC_S_PARAM + ARMC_S_PARAM_WORDS * m;
+    const bool above = k < c.w;
+    if( ( sides & ( above ? 1 : 2 ) ) == 0 || s.v[p + 9] == 0 )
+    {
+      continue;
+    }
+    const ivec2 tv = above ? ivec2( s.v[p], s.v[p + 1] ) : ivec2( s.v[p + 2], s.v[p + 3] );
+    int         v  = armcTemplateSample( c, above, tv, s.v[p + 8], above ? k : k - c.w, bitDepth );
+    if( s.v[p + 4] != 0 )
+    {
+      const int model[TMP_LIC] = int[TMP_LIC]( 0, s.v[p + 5], s.v[p + 6], s.v[p + 7], 0, 0, 0, 0 );
+      v = tmpLicSample( v, model, maxPel );
+    }
+    s.v[base + ARMC_S_PRED + i] = v;
+  }
+  cccmSync();
+  const int ka = c.w % 16 == 0 ? 16 : c.w % 8 == 0 ? 8 : c.w, kl = c.h % 16 == 0 ? 16 : c.h % 8 == 0 ? 8 : c.h;
+  const int nbA = ( sides & 1 ) != 0 ? c.w / ka : 0, B = nbA + ( ( sides & 2 ) != 0 ? c.h / kl : 0 );
+  for( int i = lid; i < count * B; i += NT )
+  {
+    const int m = i / B, b = i % B;
+    if( s.v[base + ARMC_S_PARAM + ARMC_S_PARAM_WORDS * m + 9] == 0 )
+    {
+      continue;
+    }
+    const bool above = b < nbA;
+    const int  len = above ? ka : kl, first = above ? b * ka : ( b - nbA ) * kl;
+    int        diff[32];
+    for( int k = 0; k < len; k++ )
+    {
+      const int at  = first + k;
+      const int cur = above ? recoAt( 0, c.x + at, c.y - 1 ) : recoAt( 0, c.x - 1, c.y + at );
+      diff[k]       = cur - s.v[base + ARMC_S_PRED + m * T + ( above ? at : c.w + at )];
+    }
+    atomicAdd( s_spCost[m], uint( timdHadLine( diff, len ) ) );
+  }
+  cccmSync();
 }
 
 // updateCandList: candidate cand of cost into the list of the cheapest (ascending, a later candidate after an earlier
@@ -209,6 +268,31 @@ void armcReorder( int r, inout int list[ARMC_MAX_CANDS], int rd[ARMC_MAX_CANDS] 
   }
 }
 
+// MBVD offset k (0 .. MBVD_REFINE - 1) of a base: setIbcMbvdMergeCandiInfo's step (k / 4: refMvdCands, quarter
+// samples unless the picture header disables fractional MBVD with palette on) along direction k % 4 ((+, 0), (-, 0),
+// (0, +), (0, -))
+ivec2 mbvdOffset( int k, int shift )
+{
+  const int steps[20] = int[20]( 1, 2, 4, 8, 12, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120, 128 );
+  const int offset = ( steps[k / 4] << 4 ) >> shift, dir = k % 4;
+  return dir < 2 ? ivec2( dir == 0 ? offset : -offset, 0 ) : ivec2( 0, dir == 2 ? offset : -offset );
+}
+
+// the base (0 .. MBVD_BASES - 1) of MBVD group g of record r: the g-th set bit of its mask among the valid bases
+int mbvdGroupBase( int r, int g )
+{
+  CBufI32   d = CBufI32( P.timdData );
+  const int mask = d.v[r + ARMC_MBVD_MASK], numBases = min( MBVD_BASES, d.v[r + ARMC_VALID] );
+  int       found = -1;
+  for( int b = 0, n = 0; b < numBases; b++ )
+  {
+    const bool chosen = ( mask & ( 1 << b ) ) != 0;
+    found = chosen && n == g ? b : found;
+    n += chosen ? 1 : 0;
+  }
+  return found;
+}
+
 // the vectors of IBC merge block t's CU from record r (all invocations, ending with a barrier): list 0's, with
 // bi-prediction list 1's (else zero)
 ivec4 armcDerive( Tu t, Cu c, int r, int lid, int NT )
@@ -216,51 +300,15 @@ ivec4 armcDerive( Tu t, Cu c, int r, int lid, int NT )
   CBufI32   d     = CBufI32( P.timdData );
   WBufI32   s     = WBufI32( P.scratch );
   const int base  = cccmScratchBase(), n = d.v[r + ARMC_N], sides = d.v[r + ARMC_SIDES];
-  const int T     = c.w + c.h, maxPel = ( 1 << t.bitDepth ) - 1;
-  for( int m = lid; m < n; m += NT )
+  const int mbvd  = d.v[r + ARMC_MBVD];
+  for( int m = lid; m < n; m += NT )   // ARMC's costs
   {
-    armcParams( c, r, m, sides, base, t.bitDepth );
-    s_spCost[m] = 0u;
+    const int o = r + ARMC_CANDS + ARMC_CAND_WORDS * m;
+    armcParams( c, m, ivec2( d.v[o], d.v[o + 1] ), d.v[r + ARMC_LIC] != 0 && d.v[o + 2] != 0, d.v[o + 3], sides,
+                base, t.bitDepth );
   }
   cccmSync();
-  // the templates' predictions, through the candidate's LIC model
-  for( int i = lid; i < n * T; i += NT )
-  {
-    const int m = i / T, k = i % T, p = base + ARMC_S_PARAM + ARMC_S_PARAM_WORDS * m;
-    const bool above = k < c.w;
-    if( ( sides & ( above ? 1 : 2 ) ) == 0 )
-    {
-      continue;
-    }
-    const ivec2 tv = above ? ivec2( s.v[p], s.v[p + 1] ) : ivec2( s.v[p + 2], s.v[p + 3] );
-    int         v  = armcTemplateSample( c, above, tv, armcCandFlip( r, m ), above ? k : k - c.w, t.bitDepth );
-    if( s.v[p + 4] != 0 )
-    {
-      const int model[TMP_LIC] = int[TMP_LIC]( 0, s.v[p + 5], s.v[p + 6], s.v[p + 7], 0, 0, 0, 0 );
-      v = tmpLicSample( v, model, maxPel );
-    }
-    s.v[base + ARMC_S_PRED + i] = v;
-  }
-  cccmSync();
-  // their SATD against the CU's templates (RdCost's DF_HAD of the width: JVET-AJ0096's kernels along an arm one
-  // sample thick, timdHadLine), per kernel's stretch added to the candidate's cost
-  const int ka = c.w % 16 == 0 ? 16 : c.w % 8 == 0 ? 8 : c.w, kl = c.h % 16 == 0 ? 16 : c.h % 8 == 0 ? 8 : c.h;
-  const int nbA = ( sides & 1 ) != 0 ? c.w / ka : 0, B = nbA + ( ( sides & 2 ) != 0 ? c.h / kl : 0 );
-  for( int i = lid; i < n * B; i += NT )
-  {
-    const int  m = i / B, b = i % B;
-    const bool above = b < nbA;
-    const int  len = above ? ka : kl, first = above ? b * ka : ( b - nbA ) * kl;
-    int        diff[32];
-    for( int k = 0; k < len; k++ )
-    {
-      const int at  = first + k;
-      const int cur = above ? recoAt( 0, c.x + at, c.y - 1 ) : recoAt( 0, c.x - 1, c.y + at );
-      diff[k]       = cur - s.v[base + ARMC_S_PRED + m * T + ( above ? at : c.w + at )];
-    }
-    atomicAdd( s_spCost[m], uint( timdHadLine( diff, len ) ) );
-  }
-  cccmSync();
+  armcCosts( c, n, sides, base, t.bitDepth, lid, NT );
   if( lid == 0 )
   {
     int list[ARMC_MAX_CANDS], rd[ARMC_MAX_CANDS];
@@ -307,8 +355,97 @@ ivec4 armcDerive( Tu t, Cu c, int r, int lid, int NT )
     s.v[base + ARMC_S_RESULT + 1] = mv0.y;
     s.v[base + ARMC_S_RESULT + 2] = mv1.x;
     s.v[base + ARMC_S_RESULT + 3] = mv1.y;
+    for( int b = 0; b < MBVD_BASES; b++ )   // (getIbcMbvdMergeCandidates' bases: the ranked list's first entries)
+    {
+      s.v[base + ARMC_S_BASES + b] = list[b];
+    }
   }
   cccmSync();
+  if( mbvd >= 0 )
+  {
+    // sortIbcMergeMbvdCandidates: per chosen base its offsets but those across the base's RR-IBC flip, at vectors
+    // whose integer part is valid (checkValidBvPU), costed at the RR-IBC flip the CU holds then (the record's) without
+    // LIC; none where the CU has no template
+    const int mask = d.v[r + ARMC_MBVD_MASK], numBases = min( MBVD_BASES, d.v[r + ARMC_VALID] );
+    const int groups = sides == 0 ? 0 : bitCount( uint( mask & ( ( 1 << numBases ) - 1 ) ) );
+    const int shift = d.v[r + ARMC_MBVD_SHIFT], flip = d.v[r + ARMC_MBVD_FLIP];
+    for( int j = lid; j < groups * MBVD_REFINE; j += NT )
+    {
+      const int   cand = s.v[base + ARMC_S_BASES + mbvdGroupBase( r, j / MBVD_REFINE )], k = j % MBVD_REFINE;
+      const int   baseFlip = armcCandFlip( r, cand );
+      const ivec2 offset = mbvdOffset( k, shift ), mv = armcCandMv( r, cand ) + offset;
+      const bool  across = ( baseFlip == 1 && offset.y != 0 ) || ( baseFlip == 2 && offset.x != 0 );
+      s.v[base + ARMC_S_PARAM + ARMC_S_PARAM_WORDS * j + 9] = 0;
+      if( !across && ibcAreaValid( c.x, c.y, c.w, c.h, mv >> 4, 0, 0, g_ti ) )
+      {
+        armcParams( c, j, mv, false, flip, sides, base, t.bitDepth );
+      }
+    }
+    cccmSync();
+    armcCosts( c, groups * MBVD_REFINE, sides, base, t.bitDepth, lid, NT );
+    if( lid == 0 )
+    {
+      // per group the MBVD_KEEP cheapest offsets first (ibcMbvdLUT's first entries of the group; the others in their
+      // order), then the vectors at the MBVD index's entry and, with bi-prediction, ibcMergeIdx1's - a plain base of
+      // the ranked list, or an MBVD entry
+      int  lut[2][MBVD_KEEP];
+      uint costs[2][MBVD_KEEP];
+      for( int g = 0; g < 2; g++ )
+      {
+        for( int i = 0; i < MBVD_KEEP; i++ )
+        {
+          lut[g][i]   = i;
+          costs[g][i] = 0xFFFFFFFFu;
+        }
+      }
+      for( int j = 0; j < groups * MBVD_REFINE; j++ )
+      {
+        const int g = j / MBVD_REFINE, k = j % MBVD_REFINE;
+        if( s.v[base + ARMC_S_PARAM + ARMC_S_PARAM_WORDS * j + 9] == 0 )
+        {
+          continue;
+        }
+        int at = MBVD_KEEP;
+        while( at > 0 && s_spCost[j] < costs[g][at - 1] )
+        {
+          at--;
+        }
+        for( int i = MBVD_KEEP - 1; i > at; i-- )
+        {
+          lut[g][i]   = lut[g][i - 1];
+          costs[g][i] = costs[g][i - 1];
+        }
+        if( at < MBVD_KEEP )
+        {
+          lut[g][at]   = k;
+          costs[g][at] = s_spCost[j];
+        }
+      }
+      ivec2 mvs[2];
+      for( int l = 0; l < 2; l++ )
+      {
+        const int idx = l == 0 ? mbvd : d.v[r + ARMC_MBVD_IDX1];
+        if( l == 1 && idx < MBVD_MERGE )
+        {
+          mvs[1] = idx < 0 ? ivec2( 0 ) : armcCandMv( r, s.v[base + ARMC_S_BASES + idx] );
+          continue;
+        }
+        const int e = l == 0 ? idx : idx - MBVD_MERGE, b = e / MBVD_REFINE;
+        int       g = -1;
+        for( int i = 0; i < 2; i++ )
+        {
+          g = mbvdGroupBase( r, i ) == b ? i : g;
+        }
+        const int k = g >= 0 && e % MBVD_REFINE < MBVD_KEEP ? lut[g][e % MBVD_REFINE] : e % MBVD_REFINE;
+        mvs[l] = armcCandMv( r, s.v[base + ARMC_S_BASES + b] ) + mbvdOffset( k, shift );
+      }
+      s.v[base + ARMC_S_RESULT]     = mvs[0].x;
+      s.v[base + ARMC_S_RESULT + 1] = mvs[0].y;
+      s.v[base + ARMC_S_RESULT + 2] = mvs[1].x;
+      s.v[base + ARMC_S_RESULT + 3] = mvs[1].y;
+    }
+    cccmSync();
+  }
   const ivec4 mvs = ivec4( s.v[base + ARMC_S_RESULT], s.v[base + ARMC_S_RESULT + 1], s.v[base + ARMC_S_RESULT + 2],
                            s.v[base + ARMC_S_RESULT + 3] );
   cccmSync();   // (the scratch's next use)
