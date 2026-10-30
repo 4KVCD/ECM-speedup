@@ -15,11 +15,17 @@
 // list's valid candidates (numValidMergeCand), the merge index, ibcMergeIdx1 (-1 without bi-prediction or with MBVD),
 // the current templates' sides (bit 0 above, bit 1 left: xAMLIsTopTempAvailable / xAMLIsLeftTempAvailable), whether
 // the ranking applies the candidates' IBC LIC; with MBVD (else -1) its index, its ibcMergeIdx1 (-1 without
-// bi-prediction), the RR-IBC flip its templates take, the offsets' right shift, the bases it ranks (bits); then per
-// candidate of the list in the CPU's order its vector (1/16 samples), IBC LIC flag and RR-IBC flip type
+// bi-prediction), the RR-IBC flip its templates take, the offsets' right shift, the bases it ranks (bits); where the
+// GPU builds the list (intra_ibclist.glsl; else 0) the IBC motion table's offset, then the CU's index in the
+// CodingStructure, which neighbours the list takes (bit 0 the non-adjacent ones, 1 those of a CU of 4 x 4 samples, 2
+// the above-left one), the SPS's merge candidates, log2 of the CTU size, the CU's parsed RR-IBC flip, the history
+// table's entries; then per candidate of the list in the CPU's order its vector (1/16 samples), IBC LIC flag and
+// RR-IBC flip type (those the GPU builds over the host's); after them the history table's entries (IMI words each,
+// oldest first)
 const int ARMC_N = 0, ARMC_VALID = 1, ARMC_IDX = 2, ARMC_IDX1 = 3, ARMC_SIDES = 4, ARMC_LIC = 5, ARMC_MBVD = 6;
-const int ARMC_MBVD_IDX1 = 7, ARMC_MBVD_FLIP = 8, ARMC_MBVD_SHIFT = 9, ARMC_MBVD_MASK = 10, ARMC_CANDS = 11;
-const int ARMC_CAND_WORDS = 4, ARMC_MAX_CANDS = 28;   // (IBC_MRG_MAX_NUM_CANDS_MEM)
+const int ARMC_MBVD_IDX1 = 7, ARMC_MBVD_FLIP = 8, ARMC_MBVD_SHIFT = 9, ARMC_MBVD_MASK = 10, ARMC_LIST = 11;
+const int ARMC_CU = 12, ARMC_BUILD = 13, ARMC_MAXVALID = 14, ARMC_CTU = 15, ARMC_CUFLIP = 16, ARMC_HMVP = 17;
+const int ARMC_CANDS = 18, ARMC_CAND_WORDS = 4, ARMC_MAX_CANDS = 28;   // (IBC_MRG_MAX_NUM_CANDS_MEM)
 const int ARMC_REC = ARMC_CANDS + ARMC_CAND_WORDS * ARMC_MAX_CANDS;
 // MBVD (IBC_MBVD_*): bases, offsets per base (20 steps x 4 directions), offsets ranked per base, merge indices below
 // its candidates' (ibcMergeIdx1 of a plain base)
@@ -35,6 +41,8 @@ const int ARMC_S_PRED = ARMC_S_BASES + 8;
 
 // setMergeInfo's pu.bv == Mv( 0, 0 ): the vector rounded to whole samples (changePrecision) is zero
 bool armcZeroBv( ivec2 mv ) { return abs( mv.x ) <= 8 && abs( mv.y ) <= 8; }
+
+#include "intra_ibclist.glsl"
 
 ivec2 armcCandMv( int r, int cand )
 {
@@ -297,10 +305,29 @@ int mbvdGroupBase( int r, int g )
 // bi-prediction list 1's (else zero)
 ivec4 armcDerive( Tu t, Cu c, int r, int lid, int NT )
 {
-  CBufI32   d     = CBufI32( P.timdData );
-  WBufI32   s     = WBufI32( P.scratch );
-  const int base  = cccmScratchBase(), n = d.v[r + ARMC_N], sides = d.v[r + ARMC_SIDES];
-  const int mbvd  = d.v[r + ARMC_MBVD];
+  CBufI32 d = CBufI32( P.timdData );
+  WBufI32 s = WBufI32( P.scratch );
+  if( d.v[r + ARMC_LIST] != 0 )   // the list on the GPU, then what the host derived from its own
+  {
+    if( lid == 0 )
+    {
+      // ARMC ranks the entries before the first whose vector rounds to zero where the list has more than one valid
+      // candidate and the CU a template; with MBVD the RR-IBC flip its offsets' templates take is the one ARMC's last
+      // setMergeInfo leaves (the entry where updateIBCCandInfo stops), else the parsed one
+      ibcBuildList( c, r );
+      const bool ranks = d.v[r + ARMC_VALID] > 1 && d.v[r + ARMC_SIDES] != 0;
+      int        ranked = 0;
+      while( ranked < ARMC_MAX_CANDS && !armcZeroBv( armcCandMv( r, ranked ) ) )
+      {
+        ranked++;
+      }
+      d.v[r + ARMC_N]         = ranks ? ranked : 0;
+      d.v[r + ARMC_MBVD_FLIP] = ranks ? armcCandFlip( r, min( ranked, ARMC_MAX_CANDS - 1 ) ) : d.v[r + ARMC_CUFLIP];
+    }
+    cccmSync();
+  }
+  const int base = cccmScratchBase(), n = d.v[r + ARMC_N], sides = d.v[r + ARMC_SIDES];
+  const int mbvd = d.v[r + ARMC_MBVD];
   for( int m = lid; m < n; m += NT )   // ARMC's costs
   {
     const int o = r + ARMC_CANDS + ARMC_CAND_WORDS * m;
