@@ -3481,6 +3481,14 @@ each a job of its own (the first in the job's record - OBMC's jobs name the CU's
 after the jobs; MC_DST and MC_GPM_SEP's part 1 at the band's rows). Host only. GPU time (27 streams, grn244 ->
 grn246): 42,017 -> 40,587 ms (-3.4 %): ld_md5 220 -> 103 ms (x2.14), ra_long 1,386 -> 834 (x1.66), ra_ip64_md5 996 ->
 650 (x1.53), ld_cif33 495 -> 404 (x1.22). Results (grn246, 27 streams): every picture identical.
+M177 (2026-10-30): inter_dmvr's workgroups of 128 invocations (MC_NT; inter_mc's stay 64, its SPIR-V unchanged).
+After M176, inter_dmvr's segment was most of the motion compensation (timed apart: ra_ip64_md5 268 ms, ra_long 221,
+ra720_pj17 126, the blocks' jobs 14-41). Its stripes' tiles and BDOF blocks (16 clusters instead of 8) go twice as
+wide. Motion compensation over the 27 streams (grn246 -> grn253): 1,194 -> 982 ms (-18 %, every stream with it
+faster: ra_ip64_md5 332 -> 255, ra_long 294 -> 249, ra720_pj17 215 -> 180, ra_cif33 102 -> 82); paired
+(alternating, two rounds) ra_ip64_md5 649 / 654 -> 574 / 573 ms (-12 %). The whole GPU time over the 27 streams in one
+session each: 40,592 -> 40,545 ms (the rest's noise is as large). Results (grn253, 27 streams): every picture
+identical.
 Tried after M176 and left out (2026-10-29): intra_deps' passes 1 and 2 with a cluster of 8 invocations per block
 (clustered subgroup operations) instead of M175's subgroup: pj720_ai's deps 171 -> 145 ms, but ai_md5 24 -> 62,
 ai_long 28 -> 79, ld_md5 8 -> 17 (the scans 4 times as long per block). To keep intra_rec at 255 registers: a branch

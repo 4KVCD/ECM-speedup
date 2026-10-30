@@ -41,7 +41,13 @@
 
 #include "common.glsl"
 
-layout( local_size_x = 64 ) in;
+// the workgroup: 64 invocations; inter_dmvr's 128 (its stripes' tiles and BDOF blocks the more in parallel)
+#ifdef DMVR_PASSES
+const int MC_NT = 128;
+#else
+const int MC_NT = 64;
+#endif
+layout( local_size_x = MC_NT ) in;
 
 layout( push_constant ) uniform PushMc
 {
@@ -360,7 +366,7 @@ void bdofJob( BufI32 jb, int o, int lid )
   // the predictions over the PU grown by 2 (the sharp filter: W + 4 x H + 4 is above 4 x 4), the ring beyond them a
   // replication; with LIC the ring predicted too (xPredInterBlk's LIC branch interpolates the PU grown by 3)
   const int ring = lo >= 0 ? 3 : 2;
-  for( int i = lid; i < bdofTw * ( bh + 6 ); i += 64 )
+  for( int i = lid; i < bdofTw * ( bh + 6 ); i += MC_NT )
   {
     const int cx = clamp( bdofX0 + i % bdofTw, -ring, W + ring - 1 );
     const int cy = clamp( bdofY0 + i / bdofTw, -ring, H + ring - 1 );
@@ -378,7 +384,7 @@ void bdofJob( BufI32 jb, int o, int lid )
   }
   barrier();
   // the sub-block's SAD of dI and its samples out of boundary
-  for( int i = lid; i < bw * bh; i += 64 )
+  for( int i = lid; i < bw * bh; i += MC_NT )
   {
     const int x = sx + i % bw, y = sy + i / bw;
     atomicAdd( sSad, abs( bdofDI( x, y ) ) );
@@ -394,7 +400,7 @@ void bdofJob( BufI32 jb, int o, int lid )
   const bool noMean   = ( flags & MC_NO_MEAN ) != 0;
   const int  headRoom = max( 2, IF_INTERNAL_PREC - bd );
   const int  shiftNum = headRoom + 1, offset = ( 1 << ( shiftNum - 1 ) ) + 2 * IF_INTERNAL_OFFS;
-  for( int i = lid; i < bw * bh; i += 64 )
+  for( int i = lid; i < bw * bh; i += MC_NT )
   {
     const int x = sx + i % bw, y = sy + i / bw;
     const int p0 = bdofP( 0, x, y ), p1 = bdofP( 1, x, y );
@@ -588,7 +594,7 @@ void dmTileList( int l, int slot, ivec2 c, int bx, int by, int bw, int bh, int r
   const int   cyLo = max( ry - 3, by - 2 ), cyHi = min( ry + rh + 2, by + bh + 1 ), hy0 = cyLo - 5;
   if( twoStages )
   {
-    for( int i = lid; i < hw * ( cyHi + 6 - hy0 + 1 ); i += 64 )
+    for( int i = lid; i < hw * ( cyHi + 6 - hy0 + 1 ); i += MC_NT )
     {
       const int x = bx - 2 + i % hw, y = hy0 + i / hw;
       sH[i] = int16_t( ( mcSum( slot, 0, ox + x, oy + y, 1, 0, tapsH ) + offset1 ) >> shift1 );
@@ -596,7 +602,7 @@ void dmTileList( int l, int slot, ivec2 c, int bx, int by, int bw, int bh, int r
     barrier();
   }
   BufI32 f = BufI32( pc.filters );
-  for( int i = lid; i < bdofTw * ( rh + 6 ); i += 64 )
+  for( int i = lid; i < bdofTw * ( rh + 6 ); i += MC_NT )
   {
     const int cx = clamp( bdofX0 + i % bdofTw, bx - 2, bx + bw + 1 );
     const int cy = clamp( bdofY0 + i / bdofTw, by - 2, by + bh + 1 );
@@ -651,7 +657,7 @@ void dmTileRows( int bx, int by, int bw, int bh, int ry, int rh, ivec2 mv0, ivec
   bdofG0     = dmS + 4 * ( dmW >> 2 ) * ( dmH >> 2 );
   bdofG1     = bdofG0 + ( dmW + 6 ) * ( dmH + 6 );
   BufC32 s   = BufC32( pc.scratch );
-  for( int i = lid; i < bdofTw * ( bh + 6 ); i += 64 )
+  for( int i = lid; i < bdofTw * ( bh + 6 ); i += MC_NT )
   {
     const int cx = clamp( bdofX0 + i % bdofTw, bx - 2, bx + bw + 1 ), cy = clamp( bdofY0 + i / bdofTw, by - 2, by + bh + 1 );
     s.v[bdofG0 + i] = mcPredict( dmSlot0, 0, dmX + cx + ( c0.x >> 4 ), dmY + cy + ( c0.y >> 4 ), c0.x & 15, c0.y & 15, dmAlt,
@@ -689,7 +695,7 @@ void dmChroma( int bx, int by, int bw, int bh, ivec2 mv0, ivec2 mv1, bool bio )
   const int   g   = bio ? 4 : 0;
   const ivec2 c0 = dmClip( mv0, dmX + bx - g, dmY + by - g ), c1 = dmClip( mv1, dmX + bx - g, dmY + by - g );
   const int   cw = bw >> 1, ch = bh >> 1;
-  for( int i = lid; i < 2 * cw * ch; i += 64 )
+  for( int i = lid; i < 2 * cw * ch; i += MC_NT )
   {
     const int comp = 1 + i / ( cw * ch ), x = ( bx >> 1 ) + i % cw, y = ( by >> 1 ) + ( i / cw ) % ch;
     const int ax = ( dmX >> 1 ) + x, ay = ( dmY >> 1 ) + y;
@@ -706,7 +712,7 @@ void dmLuma( int bx, int by, int bw, int bh, ivec2 mv0, ivec2 mv1 )
 {
   const int   lid = int( gl_LocalInvocationID.x );
   const ivec2 c0 = dmClip( mv0, dmX + bx, dmY + by ), c1 = dmClip( mv1, dmX + bx, dmY + by );
-  for( int i = lid; i < bw * bh; i += 64 )
+  for( int i = lid; i < bw * bh; i += MC_NT )
   {
     const int x = bx + i % bw, y = by + i / bw;
     const int p0 = mcPredict( dmSlot0, 0, dmX + x + ( c0.x >> 4 ), dmY + y + ( c0.y >> 4 ), c0.x & 15, c0.y & 15, dmAlt, true,
@@ -719,11 +725,11 @@ void dmLuma( int bx, int by, int bw, int bh, ivec2 mv0, ivec2 mv1 )
 
 // The BDOF blocks of a run (dmRefine, dmFinal) are independent once the run's tile is complete: each goes to a
 // cluster of DM_CLUSTER invocations of one subgroup, which sum over it with clustered subgroup additions, so the
-// workgroup handles 64 / DM_CLUSTER blocks at a time without a barrier between them. (Every block's sample and window
-// counts are multiples of DM_CLUSTER: all lanes of a cluster take each loop equally often.)
+// workgroup handles MC_NT / DM_CLUSTER blocks at a time without a barrier between them. (Every block's sample and
+// window counts are multiples of DM_CLUSTER: all lanes of a cluster take each loop equally often.)
 const int DM_CLUSTER = 8;
 
-// this invocation's cluster (0 .. 64 / DM_CLUSTER - 1) and its lane in it
+// this invocation's cluster (0 .. MC_NT / DM_CLUSTER - 1) and its lane in it
 int dmCluster()
 {
   return int( gl_SubgroupID * gl_SubgroupSize + gl_SubgroupInvocationID ) / DM_CLUSTER;
@@ -799,7 +805,7 @@ void dmRefineRows( int bx, int by, int bw, int bh, int ry, int rh, ivec2 mv0, iv
   const int  wOff = MC_FILT_BDOF_W + DM_WEIGHT_OFFSET[( ww == 8 ? 0 : ww == 12 ? 3 : 6 ) + ( wh == 8 ? 0 : wh == 12 ? 1 : 2 )];
   const int  nbx = ( bw + bioDx - 1 ) / bioDx, nb = nbx * ( ( rh + bioDy - 1 ) / bioDy );
   const bool first = dmLane() == 0;
-  for( int b = dmCluster(); b < nb; b += 64 / DM_CLUSTER )
+  for( int b = dmCluster(); b < nb; b += MC_NT / DM_CLUSTER )
   {
     const int   x0 = bx + ( b % nbx ) * bioDx, y0 = ry + ( b / nbx ) * bioDy;
     const ivec2 stats = dmBlockStats( x0, y0, bioDx, bioDy, mv0, mv1, true );
@@ -984,7 +990,7 @@ void dmFinalRow( int y )
       const int  bdx    = min( dx2, 4 * sc ), bdy = min( bioDy, 4 * sc );
       const bool noMean = ( dmFlags & DM_SAME_DIR ) != 0 && !( dx2 * bioDy >= 2048 && dmLdbMode( dx2 * bioDy ) == 2 );
       const int  nbx    = ( dx2 + bdx - 1 ) / bdx, nb = nbx * ( ( bioDy + bdy - 1 ) / bdy );
-      for( int b = dmCluster(); b < nb; b += 64 / DM_CLUSTER )
+      for( int b = dmCluster(); b < nb; b += MC_NT / DM_CLUSTER )
       {
         const int  x0 = x + ( b % nbx ) * bdx, y0 = y + ( b / nbx ) * bdy;
         const bool oobBlock = dmBlockStats( x0, y0, bdx, bdy, mv0, mv1, false ).y != 0;
@@ -1017,14 +1023,14 @@ void sbRun()
     return;
   }
   const ivec2 c = dmClip( mv0, dmX, dmY );
-  for( int i = lid; i < dmW * dmH; i += 64 )
+  for( int i = lid; i < dmW * dmH; i += MC_NT )
   {
     const int x = i % dmW, y = i / dmW;
     dmOut( 0, x, y, mcPredict( dmSlot0, 0, dmX + x + ( c.x >> 4 ), dmY + y + ( c.y >> 4 ), c.x & 15, c.y & 15, dmAlt, false,
                                dmW, dmH, dmBd, dmClipMin, dmClipMax ) );
   }
   const int cw = dmW >> 1, ch = dmH >> 1;
-  for( int i = lid; i < 2 * cw * ch; i += 64 )
+  for( int i = lid; i < 2 * cw * ch; i += MC_NT )
   {
     const int comp = 1 + i / ( cw * ch ), x = i % cw, y = ( i / cw ) % ch;
     dmOut( comp, x, y, mcPredict( dmSlot0, comp, ( dmX >> 1 ) + x + ( c.x >> 5 ), ( dmY >> 1 ) + y + ( c.y >> 5 ), c.x & 31,
@@ -1056,7 +1062,7 @@ void sbGroup()
   if( ( dmFlags & DM_ZERO ) != 0 )   // (bdofCond off: xSubPuMC zeroes the offsets, not the last ones)
   {
     dmSync();
-    for( int i = lid; i < ( dmW >> 2 ) * ( dmH >> 2 ); i += 64 )
+    for( int i = lid; i < ( dmW >> 2 ) * ( dmH >> 2 ); i += MC_NT )
     {
       BufC32( pc.scratch ).v[dmS + 2 * i]     = 0;
       BufC32( pc.scratch ).v[dmS + 2 * i + 1] = 0;
@@ -1109,7 +1115,7 @@ void dmFirstStripe( int a )
   const int  lid  = int( gl_LocalInvocationID.x );
   const bool cols = dmColumns();
   const int  sw = cols ? dmStripe() : dmW, sh = cols ? dmH : dmStripe();
-  for( int i = lid; i < ( sw >> 2 ) * ( sh >> 2 ); i += 64 )
+  for( int i = lid; i < ( sw >> 2 ) * ( sh >> 2 ); i += MC_NT )
   {
     const int x = ( cols ? a : 0 ) + 4 * ( i % ( sw >> 2 ) ), y = ( cols ? 0 : a ) + 4 * ( i / ( sw >> 2 ) );
     dmSetOff( false, x, y, ivec2( 0 ) );
@@ -1162,7 +1168,7 @@ void dmvrJob( int o )
   }
   if( dmSub )
   {
-    for( int i = lid; i < 4 * ( dmW >> 2 ) * ( dmH >> 2 ); i += 64 )   // the offsets 0
+    for( int i = lid; i < 4 * ( dmW >> 2 ) * ( dmH >> 2 ); i += MC_NT )   // the offsets 0
     {
       BufC32( pc.scratch ).v[dmS + i] = 0;
     }
@@ -1200,7 +1206,7 @@ void dmPassJob( int pass, int o, int stripe )
   if( pass == 0 && dmSub )
   {
     const int y = stripe * min( dmH, 4 * dmIterScale( 1 ) ), rh = min( dmH, 4 * dmIterScale( 1 ) );
-    for( int i = int( gl_LocalInvocationID.x ); i < ( dmW >> 2 ) * ( rh >> 2 ); i += 64 )
+    for( int i = int( gl_LocalInvocationID.x ); i < ( dmW >> 2 ) * ( rh >> 2 ); i += MC_NT )
     {
       const int x = 4 * ( i % ( dmW >> 2 ) ), yy = y + 4 * ( i / ( dmW >> 2 ) );
       dmSetOff( false, x, yy, ivec2( 0 ) );
@@ -1224,7 +1230,7 @@ void dmPassJob( int pass, int o, int stripe )
     const int y = stripe * min( dmH, 4 * dmFinalScale() ), rh = min( dmH, 4 * dmFinalScale() );
     if( dmSub && ( dmFlags & DM_ZERO ) != 0 )   // (bdofCond off: xSubPuMC zeroes the offsets, not the last ones)
     {
-      for( int i = int( gl_LocalInvocationID.x ); i < ( dmW >> 2 ) * ( rh >> 2 ); i += 64 )
+      for( int i = int( gl_LocalInvocationID.x ); i < ( dmW >> 2 ) * ( rh >> 2 ); i += MC_NT )
       {
         dmSetOff( false, 4 * ( i % ( dmW >> 2 ) ), y + 4 * ( i / ( dmW >> 2 ) ), ivec2( 0 ) );
       }
@@ -1790,7 +1796,7 @@ void obmcJob( int o, int lid )
       sObmcSkip = 0;
     }
     barrier();
-    for( int i = lid; i < cw * ch; i += 64 )
+    for( int i = lid; i < cw * ch; i += MC_NT )
     {
       const int x = cx + i % cw, y = cy + i / cw;
       mcNoSharp = ( jb.v[o + MC_FLAGS] & MC_NO_SHARP ) != 0;
@@ -1838,7 +1844,7 @@ void obmcJob( int o, int lid )
   if( ( jb.v[o + OBMC_J_FLAGS] & OBMC_TM ) != 0 )   // the templates: a row above the band or a column left of it
   {
     const int tw = dir == 0 ? W : 1, th = dir == 0 ? 1 : H;
-    for( int i = lid; i < 2 * L; i += 64 )
+    for( int i = lid; i < 2 * L; i += MC_NT )
     {
       const int k = i % L, t = o + OBMC_J_TPL + ( i / L ) * OBMC_J_TPL_MOTION;
       const int x = bx + ( dir == 0 ? k : 0 ), y = by + ( dir == 0 ? 0 : k );
@@ -1868,7 +1874,7 @@ void obmcInnerJob( int o, int lid )
   {
     od.v[dst] = int16_t( av );
   }
-  for( int i = lid; i < 4 * 24; i += 64 )
+  for( int i = lid; i < 4 * 24; i += MC_NT )
   {
     const int k = i / 24, s = i % 24;
     if( ( av & ( 1 << k ) ) == 0 )
@@ -1922,7 +1928,7 @@ void main()
     const int dst = jb.v[o + MC_DST], bd = jb.v[o + MC_BD];
     // (GPM's rounded blend, MC_GPM_SEP: part 1's final prediction too, at MC_BDOF_TH; one call site)
     const int parts = ( jb.v[o + MC_FLAGS] & MC_GPM_SEP ) != 0 ? 2 : 1;
-    for( int i = lid; i < W * H; i += 64 )
+    for( int i = lid; i < W * H; i += MC_NT )
     {
       [[dont_unroll]] for( int part = 0; part < parts; part++ )
       {
