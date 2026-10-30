@@ -3473,6 +3473,14 @@ blocks keep their 5.7-6 ms (fp720_ai) or lose (pj720_ai's deps 110 -> 171 ms): 3
 there. Deps over the 27 streams 1,092 -> 557 ms; GPU time (grn239 -> grn244): 42,693 -> 42,017 ms (-1.6 %): ai_md5
 658 -> 541 ms, ai_long 905 -> 795, ld_md5 248 -> 220, ra_ip64_md5 1,083 -> 996. Results (grn244, 27 streams): every
 picture identical, the scheduling data the host's.
+M176 (2026-10-29): the blocks' jobs (inter_mc's mode 0) in bands of rows. Timed apart (barriers between inter_mc's
+segments), mode 0 was most of the motion compensation left (ra_long 590 ms, ra_ip64_md5 405, ld_md5 135, ld_cif33 106)
+with only ~50 jobs per picture: a workgroup filters its block's samples 64 at a time, a 64 x 64 block 64 rounds of the
+12-tap 2D filter. The host now splits a job of more than MC_BAND_SAMPLES (256) samples into bands of whole rows,
+each a job of its own (the first in the job's record - OBMC's jobs name the CU's block jobs by index -, the others
+after the jobs; MC_DST and MC_GPM_SEP's part 1 at the band's rows). Host only. GPU time (27 streams, grn244 ->
+grn246): 42,017 -> 40,587 ms (-3.4 %): ld_md5 220 -> 103 ms (x2.14), ra_long 1,386 -> 834 (x1.66), ra_ip64_md5 996 ->
+650 (x1.53), ld_cif33 495 -> 404 (x1.22). Results (grn246, 27 streams): every picture identical.
 Tried after M125 and left out (idle 3070, median of 5 or 7): IntraTMP's lists in the angular arrays (s_angA, a word
 as two int16; paired: aiodd +19 %, ra720 +41 %, the clustering 6.6 times as long - likely the index division and the
 two loads per word in invocation 0's walks, against the scratch's one load; with the division gone, M169's chunks

@@ -1413,6 +1413,7 @@ constexpr int MC_BDOF_OUT = 30, MC_JOB = 32;
 constexpr int MC_ALT_HPEL = 1, MC_BI = 2, MC_BDOF = 4, MC_NO_MEAN = 8;
 constexpr int MC_BDOF_SUB = 16;   // BDOF's sub-blocks: at most 16 x 16 (JVET-AG0067's scaleBDOF 4), a LIC CU's at
 constexpr int MC_BDOF_SUB_LIC = 8;   // most 8 x 8 (JVET-AG0276: applyBiOptFlow keeps scaleBDOF 2 with LIC)
+constexpr int MC_BAND_SAMPLES = 256;   // a block's job at most (whole rows; more: bands of rows, jobs of their own)
 // a DMVR job (inter_mc's mode 2, DM_*): the PU, its prediction's place in mcBdofBuf, clipMvInl's bounds, the slots,
 // the flags, the bit depth and clipping range, BCW's weights, bioBlockDistTh's QP shift, the picture's size, its
 // scratch, its sub-PU vectors (after the jobs)
@@ -13016,6 +13017,27 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
   for( size_t d = 0; d < m.dmvrJobs.size(); d += MC_JOB )
   {
     m.dmvrJobs[d + DM_MVS] += (int32_t) m.dmvrJobs.size();
+  }
+  // a block's job of more than MC_BAND_SAMPLES samples in bands of rows, each a job of its own: a workgroup filters
+  // its samples 64 at a time, so a 64 x 64 block alone took a workgroup 64 rounds of the 12-tap 2D filter. The first
+  // band stays in the job's record, the others go after the jobs (OBMC's jobs name the CU's block jobs by index); a
+  // band's prediction at its rows' place in the block's (MC_DST, with MC_GPM_SEP part 1's at MC_BDOF_TH)
+  for( size_t k = 0, num = m.mcJobs.size(); k < num; k += MC_JOB )
+  {
+    int32_t job[MC_JOB];
+    std::copy( &m.mcJobs[k], &m.mcJobs[k] + MC_JOB, job );
+    const int32_t w = job[MC_W], h = job[MC_H], rows = std::max( 1, MC_BAND_SAMPLES / w );
+    for( int32_t r = rows; r < h; r += rows )
+    {
+      int32_t band[MC_JOB];
+      std::copy( job, job + MC_JOB, band );
+      band[MC_Y] += r;
+      band[MC_H] = std::min( rows, h - r );
+      band[MC_DST] += r * w;
+      band[MC_BDOF_TH] += ( job[MC_FLAGS] & MC_GPM_SEP ) ? r * w : 0;
+      m.mcJobs.insert( m.mcJobs.end(), band, band + MC_JOB );
+    }
+    m.mcJobs[k + MC_H] = std::min( rows, h );
   }
   // inter_dmvr's jobs: per pass their (job, stripe) pairs after the vectors, where each pass's list starts in the
   // buffer and its count; the stripes as dmPassJob takes them. A DMVR PU's first pass: columns of min(16, W) where
