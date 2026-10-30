@@ -63,6 +63,7 @@
 #include <vector>
 
 class CodingStructure;
+class MergeCtx;
 class QpParam;
 class Reshape;
 class TrQuant;
@@ -119,6 +120,14 @@ public:
   void recordInterCu( const CodingUnit& cu );
   /// IBC GPM CU cu, which the CPU has predicted: its parts' final vectors (recordInterCu's)
   void ibcGpmVectors( const CodingUnit& cu, const Mv& mv0, const Mv& mv1 );
+  /// IBC AMVP CU cu with BVD prediction, before the CPU derives its BVD (deriveBvdSignIBC): its predictor
+  /// (regulated), the parsed BVD (1/16 samples), its suffix information (initPrefixes') and the parsed sign index, from
+  /// which its luma block derives the vector on the GPU (recordInterCu's)
+  void ibcBvdInputs( const CodingUnit& cu, const Mv& predictor, const Mv& mvd, const MvdSuffixInfo& si, int mvsdIdx );
+  /// IBC merge CU cu with ARMC, before the CPU ranks its list (adjustIBCMergeCandidates): the list as
+  /// getIBCMergeCandidates built it and the parsed merge index, from which its luma block derives the vectors on the
+  /// GPU (recordInterCu's; IBC GPM and IBC TM merge CUs keep the CPU's)
+  void ibcMergeList( const CodingUnit& cu, const MergeCtx& ctx, int mergeIdx );
   /// inter CU cu of multi-pass DMVR (bdmvrRefine), which the CPU has predicted: DMVR's refined vectors per 16 x 16
   /// sub-PU (InterPrediction's m_bdmvrSubPuMvBuf, stride DMVR_SUBPU_STRIDE), recordInterCu's
   void dmvrVectors( const CodingUnit& cu, const Mv* list0, const Mv* list1 );

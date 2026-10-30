@@ -5844,6 +5844,12 @@ void DecCu::xDeriveCUMV(CodingUnit &cu)
 #if JVET_Z0075_IBC_HMVP_ENLARGE
                 auto mrgCandIdx = pu.mergeIdx;
                 PU::getIBCMergeCandidates(pu, mrgCtx);
+#if ECM_VULKAN
+                if( m_gpuIntraRec )
+                {
+                  m_gpuIntraRec->ibcMergeList( *pu.cu, mrgCtx, mrgCandIdx );
+                }
+#endif
 
 #if JVET_AK0076_EXTENDED_OBMC_IBC
                 bool tmpGpm = pu.ibcGpmFlag;
@@ -7456,6 +7462,12 @@ void DecCu::xDeriveCUMV(CodingUnit &cu)
             cMvdDerivedVec.resize(0);
 #else
             std::vector<Mv> cMvdDerivedVec;
+#endif
+#if ECM_VULKAN
+            if( m_gpuIntraRec )   // (the GPU derives the vector from the same inputs: intra_ibcbvd.glsl)
+            {
+              m_gpuIntraRec->ibcBvdInputs( *pu.cu, cMvPred, mvd, pu.bvdSuffixInfo, pu.mvsdIdx[REF_PIC_LIST_0] );
+            }
 #endif
             m_pcInterPred->deriveBvdSignIBC(cMvPred, mvd, pu, cMvdDerivedVec, pu.cu->imv);
             CHECK(pu.mvsdIdx[REF_PIC_LIST_0] >= cMvdDerivedVec.size(), "pu.mvsdIdx[REF_PIC_LIST_0] out of range");

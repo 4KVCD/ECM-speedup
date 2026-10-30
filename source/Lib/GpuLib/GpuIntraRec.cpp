@@ -193,10 +193,30 @@ constexpr int DERIVE_IBC          = 1073741824; // with DERIVE_INTER an IBC CU's
 // region, row-major in Params::timdData (else -1); with IBC LIC its ibcLicIdx + 1 (else 0); a luma block's OBMC record
 // (intra_obmc.glsl's OBMC_*, else -1) and the CU's own LIC scale and offset getSameNeigMotion compares (its licScale /
 // licOffset of list 0's luma); with bi-prediction list 0's BCW weight (of 8; the second vector in IBC_REC_MV2; else 0);
-// the second vector getSameNeigMotion compares (IBC_OWN_MV2_*, or a CU of two vectors its list 1 vector)
+// the second vector getSameNeigMotion compares (IBC_OWN_MV2_*, or a CU of two vectors its list 1 vector); a luma
+// block that derives the CU's vector its BVD record (BVD_*, else -1), the CU's other blocks the luma block's record
+// they read the vectors from (else -1), a luma block that derives them from the merge list its ARMC record (ARMC_*,
+// else -1)
 constexpr int IBC_REC_X = 0, IBC_REC_Y = 1, IBC_REC_W = 2, IBC_REC_H = 3, IBC_REC_MV = 4, IBC_REC_FLIP = 6;
 constexpr int IBC_REC_MV2 = 7, IBC_REC_WEIGHTS = 9, IBC_REC_LIC = 10, IBC_REC_OBMC = 11, IBC_REC_OWN_LIC = 12;
-constexpr int IBC_REC_BI = 14, IBC_REC_OWN_MV2 = 15, IBC_REC = 17;
+constexpr int IBC_REC_BI = 14, IBC_REC_OWN_MV2 = 15, IBC_REC_BVD = 17, IBC_REC_FROM = 18, IBC_REC_ARMC = 19;
+constexpr int IBC_REC = 20;
+// an IBC AMVP CU's BVD derivation (intra_ibcbvd.glsl; DecCu's isBvdPredApplicable branch): the predictor (1/16), the
+// parsed BVD (1/16, before the derivation), imv, mvsdIdx, then MvdSuffixInfo's per component (horizontal, vertical):
+// prefix, iBinsIn*Suffix, *OffsetPredictionNumBins, *PrefixGroupStartValue, *EncodeSignInEP, *OffsetPrediction; the
+// workgroup scratch its derivation takes (intra_ibcbvd.glsl's BVD_S_WORDS)
+constexpr int BVD_PRED = 0, BVD_MVD = 2, BVD_IMV = 4, BVD_MVSD = 5, BVD_PREFIX = 6, BVD_SUFFIX_BINS = 8;
+constexpr int BVD_MSB_BINS = 10, BVD_GROUP = 12, BVD_SIGN_EP = 14, BVD_OFFSET = 16, BVD_REC = 18;
+constexpr int BVD_SCRATCH_WORDS = 6 * 256 + 4;
+// an IBC merge CU's ARMC (intra_ibcarmc.glsl; DecCu's IBC merge branch with AML): how many candidates ARMC ranks
+// (those before the first whose vector rounds to zero samples; 0 where adjustIBCMergeCandidates ranks none), the
+// list's valid candidates, the merge index, ibcMergeIdx1 (-1 without bi-prediction), the current templates' sides (bit
+// 0 above, bit 1 left), then per candidate of the list (IBC_MRG_MAX_NUM_CANDS_MEM, the CPU's order before ARMC) its
+// vector (1/16), IBC LIC flag and RR-IBC flip type; the workgroup scratch it takes, per candidate ranked its
+// templates' predictions after its parameters (intra_ibcarmc.glsl's ARMC_S_*)
+constexpr int ARMC_N = 0, ARMC_VALID = 1, ARMC_IDX = 2, ARMC_IDX1 = 3, ARMC_SIDES = 4, ARMC_CANDS = 5;
+constexpr int ARMC_CAND_WORDS = 4, ARMC_REC = ARMC_CANDS + ARMC_CAND_WORDS * IBC_MRG_MAX_NUM_CANDS_MEM;
+constexpr int ARMC_SCRATCH_HEAD = 8 * IBC_MRG_MAX_NUM_CANDS_MEM + 4;
 // IBC_REC_OWN_MV2 of a CU of one vector (its neighbours of one vector compare), of two with BCW's weights other than
 // the default (no neighbour's motion equals it: a neighbour of two vectors with BCW is the CPU's)
 constexpr int IBC_OWN_MV2_NONE = 0x7FFFFFFF, IBC_OWN_MV2_NEVER = 0x7FFFFFFE;
@@ -1481,8 +1501,8 @@ constexpr int FILTER_TAPS[5] = { 6, 8, 10, 12, 16 };
 constexpr int RESI_GROUPS    = 256;   // persistent workgroups of intra_resi
 
 // intra_rec's pipelines (its specialization constants WITH_DIMD, WITH_DERIVED_TRANSFORMS, WITH_MERGE, WITH_TIMD,
-// WITH_TIMD_SAD, WITH_TIMD_MERGE, WITH_TMRL, WITH_MPM): code that never runs still slows every block, so a picture
-// runs the pipeline without the features it does not use. The one with DIMD has the derived transforms too: the
+// WITH_TIMD_SAD, WITH_TIMD_MERGE, WITH_TMRL, WITH_MPM, WITH_IBC): code that never runs still slows every block, so a
+// picture runs the pipeline without the features it does not use. The one with DIMD has the derived transforms too: the
 // compiler made the one with DIMD alone slower in every case measured (16.8 instead of 14.2 ms per picture without
 // either feature, 46.3 instead of 42.4 with DIMD); intra merge's code slowed the pictures with DIMD but without intra
 // merge by ~11 %, TIMD-SAD's the pictures with TIMD but without it by ~5 %
@@ -1497,6 +1517,7 @@ enum IntraRecVariant
   VARIANT_TIMD_MERGE,           // TIMD merge CUs (with TIMD-SAD)
   VARIANT_TMRL,                 // TMRL CUs (with TIMD merge)
   VARIANT_MPM,                  // MPM CUs with MPM sorting, MDIP, PDP's lists, MDIP CUs, EIP CUs, IBC OBMC (with TMRL)
+  VARIANT_IBC,                  // IBC CUs deriving their vectors (BVD prediction; with MPM)
   NUM_VARIANTS
 };
 
@@ -1600,8 +1621,8 @@ gpu::Kernel& intraRecKernel( const Shared& sh, gpu::Context& ctx, IntraRecVarian
 {
   // the names (the kernel keeps the pointer) and the specialization constants (WITH_DIMD, WITH_DERIVED_TRANSFORMS,
   // WITH_MERGE, WITH_TIMD, WITH_TIMD_SAD, WITH_TIMD_MERGE, WITH_TMRL; then WITH_CCLM, WITH_CCCM, WITH_CFLM,
-  // WITH_CCP_MERGE, WITH_CCP_DERIVED; then WITH_MPM) per IntraRecVariant and LmLevel, LEVEL_CCP_LFNST's of the second
-  // module
+  // WITH_CCP_MERGE, WITH_CCP_DERIVED; then WITH_MPM, WITH_IBC) per IntraRecVariant and LmLevel, LEVEL_CCP_LFNST's of
+  // the second module
   static const char* const NAMES[NUM_VARIANTS][NUM_LM_LEVELS] = {
     { "intra_rec", "intra_rec (CCLM)", "intra_rec (CCLM, CCCM)", "intra_rec (CCLM, CCCM, CFLM)",
       "intra_rec (CCLM, CCCM, CFLM, CCP merge)", "intra_rec (CCLM, CCCM, CFLM, CCP merge, derived CCP)",
@@ -1638,11 +1659,15 @@ gpu::Kernel& intraRecKernel( const Shared& sh, gpu::Context& ctx, IntraRecVarian
     { "intra_rec (MPM)", "intra_rec (MPM, CCLM)", "intra_rec (MPM, CCLM, CCCM)",
       "intra_rec (MPM, CCLM, CCCM, CFLM)", "intra_rec (MPM, CCLM, CCCM, CFLM, CCP merge)",
       "intra_rec (MPM, CCLM, CCCM, CFLM, CCP merge, derived CCP)",
-      "intra_rec (MPM, CCLM, CCCM, CFLM, CCP merge, derived CCP, CCP LFNST)" } };
+      "intra_rec (MPM, CCLM, CCCM, CFLM, CCP merge, derived CCP, CCP LFNST)" },
+    { "intra_rec (IBC)", "intra_rec (IBC, CCLM)", "intra_rec (IBC, CCLM, CCCM)",
+      "intra_rec (IBC, CCLM, CCCM, CFLM)", "intra_rec (IBC, CCLM, CCCM, CFLM, CCP merge)",
+      "intra_rec (IBC, CCLM, CCCM, CFLM, CCP merge, derived CCP)",
+      "intra_rec (IBC, CCLM, CCCM, CFLM, CCP merge, derived CCP, CCP LFNST)" } };
   static const uint32_t SPECIALIZATION[NUM_VARIANTS][7] = {
     { 0, 0, 0, 0, 0, 0, 0 }, { 0, 1, 0, 0, 0, 0, 0 }, { 1, 1, 0, 0, 0, 0, 0 }, { 1, 1, 1, 0, 0, 0, 0 },
     { 1, 1, 1, 1, 0, 0, 0 }, { 1, 1, 1, 1, 1, 0, 0 }, { 1, 1, 1, 1, 1, 1, 0 }, { 1, 1, 1, 1, 1, 1, 1 },
-    { 1, 1, 1, 1, 1, 1, 1 } };
+    { 1, 1, 1, 1, 1, 1, 1 }, { 1, 1, 1, 1, 1, 1, 1 } };
   std::call_once( sh.kernelOnce[variant][lm], [&] {
     std::vector<uint32_t> constants( SPECIALIZATION[variant], SPECIALIZATION[variant] + 7 );
     constants.push_back( lm != LEVEL_NO_LM ? 1 : 0 );
@@ -1650,7 +1675,8 @@ gpu::Kernel& intraRecKernel( const Shared& sh, gpu::Context& ctx, IntraRecVarian
     constants.push_back( lm >= LEVEL_CFLM ? 1 : 0 );
     constants.push_back( lm >= LEVEL_CCP_MERGE ? 1 : 0 );
     constants.push_back( lm >= LEVEL_CCP_DERIVED ? 1 : 0 );
-    constants.push_back( variant == VARIANT_MPM ? 1 : 0 );   // WITH_MPM
+    constants.push_back( variant >= VARIANT_MPM ? 1 : 0 );   // WITH_MPM
+    constants.push_back( variant == VARIANT_IBC ? 1 : 0 );   // WITH_IBC
     const bool            lfnst = lm == LEVEL_CCP_LFNST;
     std::vector<uint32_t> replacement;
     const uint32_t*       code = lfnst ? spv_intra_rec_lfnst : spv_intra_rec;
@@ -2299,6 +2325,7 @@ struct GpuIntraRec::Impl
   int                         numEipMm = 0;
   int                         numEipBv = 0;
   int                         numIbcObmc = 0;     // IBC blocks with OBMC (intra_obmc.glsl: the MPM pipelines)
+  int                         numIbcDerived = 0;  // IBC CUs deriving their vectors (BVD, ARMC: the IBC pipelines)
   std::vector<uint8_t>        cuMipDimd;          // per CU: a MIP CU whose block derives mipDimdMode (DERIVE_MIP_DIMD)
   bool                        blendBlocks = false;   // a block of a DIMD / OBIC / merge CU was recorded (the
                                                      // workgroups' blending sums, BLEND_ACC, are needed)
@@ -2375,7 +2402,14 @@ struct GpuIntraRec::Impl
   std::map<std::string, int>                                   interKinds;
   int                                                          ibcCus = 0;   // IBC CUs the GPU predicts
   int                                                          ibcGpmCus = 0;   // ... of them IBC GPM CUs
+  int                                                          ibcBvdCus = 0;   // ... AMVP CUs deriving their BVD
+  int                                                          ibcArmcCus = 0;   // ... merge CUs ranking their list
   std::unordered_map<const CodingUnit*, std::pair<Mv, Mv>>     ibcGpmMvs;   // IBC GPM CUs' parts' vectors (DecCu)
+  // IBC AMVP CUs with BVD prediction (ibcBvdInputs): their BVD records' words; IBC merge CUs with ARMC (ibcMergeList):
+  // their ARMC records' words; those CUs' luma blocks' IBC records
+  std::unordered_map<const CodingUnit*, std::array<int32_t, BVD_REC>>  ibcBvd;
+  std::unordered_map<const CodingUnit*, std::array<int32_t, ARMC_REC>> ibcArmc;
+  std::unordered_map<const CodingUnit*, int32_t>                       ibcLumaRec;
   // inter CCCM / inter CCP merge TUs: their Cb and Cr predictions before the blend (DecCu, interChromaPred)
   std::unordered_map<const TransformUnit*, std::vector<Pel>>   interChromaPreds;
   // inter CCP merge CUs: the CTU row's CCP history (its start, its length) before the CU (interCu: the CPU then adds
@@ -2534,7 +2568,9 @@ GpuIntraRec::~GpuIntraRec()
       }
       if( m.ibcCus )
       {
-        printf( "[gpu-intra] IBC CUs predicted by the GPU: %d (IBC GPM %d)\n", m.ibcCus, m.ibcGpmCus );
+        printf( "[gpu-intra] IBC CUs predicted by the GPU: %d (IBC GPM %d, deriving their BVD %d, ranking their merge "
+                "list %d)\n",
+                m.ibcCus, m.ibcGpmCus, m.ibcBvdCus, m.ibcArmcCus );
       }
       if( !m.interKinds.empty() )   // (the inter CUs whose prediction is the CPU's, by its kind)
       {
@@ -2684,6 +2720,7 @@ void GpuIntraRec::beginPicture( const CodingStructure& cs )
   m.numEipMm    = 0;
   m.numEipBv    = 0;
   m.numIbcObmc  = 0;
+  m.numIbcDerived = 0;
   m.cuMipDimd.clear();
   m.blendBlocks = false;
   m.cccmScratchWords = 0;
@@ -2715,6 +2752,9 @@ void GpuIntraRec::beginPicture( const CodingStructure& cs )
   m.cuTus.clear();
   m.cpuCus.clear();
   m.ibcGpmMvs.clear();
+  m.ibcBvd.clear();
+  m.ibcArmc.clear();
+  m.ibcLumaRec.clear();
   m.interChromaPreds.clear();
   m.interCcpHist.clear();
   m.cpuDummyCu = -1;
@@ -7680,7 +7720,35 @@ static void ibcRecord( GpuIntraRec::Impl& m, const CodingUnit& cu, const Compone
   int32_t rec[IBC_REC] = { area.x, area.y, (int32_t) area.width, (int32_t) area.height, pu.mv[0].hor, pu.mv[0].ver,
                            cu.rribcFlipType, 0, 0, -1, cu.ibcLicFlag ? cu.ibcLicIdx + 1 : 0, -1,
                            cu.licScale[0][COMPONENT_Y], cu.licOffset[0][COMPONENT_Y], 0, IBC_OWN_MV2_NONE,
-                           IBC_OWN_MV2_NONE };
+                           IBC_OWN_MV2_NONE, -1, -1, -1 };
+  // the vectors of an IBC AMVP CU with BVD prediction (the CPU's inputs, ibcBvdInputs) or of an IBC merge CU with ARMC
+  // (its list, ibcMergeList): its luma block derives them, the others read them from that block's record
+  const auto bvdIn  = m.ibcBvd.find( &cu );
+  const auto armcIn = m.ibcArmc.find( &cu );
+  const bool derived = bvdIn != m.ibcBvd.end() || armcIn != m.ibcArmc.end();
+  if( bvdIn != m.ibcBvd.end() && compID == COMPONENT_Y )
+  {
+    rec[IBC_REC_BVD] = (int32_t) m.timdData.size();
+    m.timdData.insert( m.timdData.end(), bvdIn->second.begin(), bvdIn->second.end() );
+    m.cccmScratchWords = std::max( m.cccmScratchWords, BVD_SCRATCH_WORDS );
+    m.ibcBvdCus++;
+    m.numIbcDerived++;
+  }
+  else if( armcIn != m.ibcArmc.end() && compID == COMPONENT_Y )
+  {
+    rec[IBC_REC_ARMC] = (int32_t) m.timdData.size();
+    m.timdData.insert( m.timdData.end(), armcIn->second.begin(), armcIn->second.end() );
+    const int ranked   = armcIn->second[ARMC_N];
+    m.cccmScratchWords = std::max( m.cccmScratchWords, ARMC_SCRATCH_HEAD + ranked * int( area.width + area.height ) );
+    m.ibcArmcCus++;
+    m.numIbcDerived++;
+  }
+  else if( derived )
+  {
+    const auto luma = m.ibcLumaRec.find( &cu );
+    CHECK( luma == m.ibcLumaRec.end(), "an IBC CU's chroma block before its luma block" );
+    rec[IBC_REC_FROM] = luma->second;
+  }
 #if JVET_AE0169_BIPREDICTIVE_IBC
   // the motion OBMC compares a neighbour's with (identicalMvOBMC: the same lists and vectors; then BCW's index)
   if( pu.interDir == 3 && !pu.ibcGpmFlag )
@@ -7719,6 +7787,10 @@ static void ibcRecord( GpuIntraRec::Impl& m, const CodingUnit& cu, const Compone
   }
 #endif
   t.ibc = (int32_t) m.timdData.size();
+  if( rec[IBC_REC_BVD] >= 0 || rec[IBC_REC_ARMC] >= 0 )
+  {
+    m.ibcLumaRec[&cu] = t.ibc;
+  }
 #if JVET_AC0112_IBC_GPM && JVET_AA0058_GPM_ADAPTIVE_BLENDING
   if( pu.ibcGpmFlag )   // the parts' vectors (DecCu's), the first one's weights (xWeightedGeoBlkRounded's walk)
   {
@@ -11279,6 +11351,69 @@ void GpuIntraRec::ibcGpmVectors( const CodingUnit& cu, const Mv& mv0, const Mv& 
   m_impl->ibcGpmMvs[&cu] = std::make_pair( mv0, mv1 );
 }
 
+void GpuIntraRec::ibcBvdInputs( const CodingUnit& cu, const Mv& predictor, const Mv& mvd, const MvdSuffixInfo& si,
+                                int mvsdIdx )
+{
+  // (a 1-D vector - RR-IBC's flip, BVP clustering's zero component: getBvType - keeps the CPU's)
+  if( cu.firstPU->getBvType() != 0 )
+  {
+    return;
+  }
+  m_impl->ibcBvd[&cu] = { predictor.hor, predictor.ver, mvd.hor, mvd.ver, cu.imv, mvsdIdx, si.horPrefix, si.verPrefix,
+                          si.iBinsInHorSuffix, si.iBinsInVerSuffix, si.horOffsetPredictionNumBins,
+                          si.verOffsetPredictionNumBins, si.horPrefixGroupStartValue, si.verPrefixGroupStartValue,
+                          si.horEncodeSignInEP ? 1 : 0, si.verEncodeSignInEP ? 1 : 0, (int32_t) si.horOffsetPrediction,
+                          (int32_t) si.verOffsetPrediction };
+}
+
+void GpuIntraRec::ibcMergeList( const CodingUnit& cu, const MergeCtx& ctx, int mergeIdx )
+{
+  // (IBC GPM's parts and IBC TM merge keep the CPU's vectors)
+  const PredictionUnit& pu = *cu.firstPU;
+  if( pu.ibcGpmFlag || pu.tmMergeFlag )
+  {
+    return;
+  }
+  std::array<int32_t, ARMC_REC> r{};
+  // adjustIBCMergeCandidates ranks the candidates before the first whose vector rounds to zero samples
+  // (setMergeInfo's bv), where the list has more than one valid candidate and the CU a template
+  // (xAMLIsTopTempAvailable / xAMLIsLeftTempAvailable: a PU of another CU above its top-right sample / left of its
+  // bottom-left one)
+  const CodingStructure& cs    = *cu.cs;
+  const PredictionUnit*  above = cs.getPURestricted( pu.Y().topRight().offset( 0, -1 ), pu, pu.chType );
+  const PredictionUnit*  left  = cs.getPURestricted( pu.Y().bottomLeft().offset( -1, 0 ), pu, pu.chType );
+  const int sides = ( above && above->cu != &cu ? 1 : 0 ) | ( left && left->cu != &cu ? 2 : 0 );
+  int       ranked = 0;
+  while( ranked < IBC_MRG_MAX_NUM_CANDS_MEM )
+  {
+    Mv bv = ctx.mvFieldNeighbours[ranked << 1].mv;
+    bv.changePrecision( MV_PRECISION_INTERNAL, MV_PRECISION_INT );
+    if( bv == Mv( 0, 0 ) )
+    {
+      break;
+    }
+    ranked++;
+  }
+  r[ARMC_N]     = ctx.numValidMergeCand > 1 && sides != 0 ? ranked : 0;
+  r[ARMC_VALID] = ctx.numValidMergeCand;
+  r[ARMC_IDX]   = mergeIdx;
+#if JVET_AE0169_BIPREDICTIVE_IBC
+  r[ARMC_IDX1] = pu.ibcMergeIdx1 != MAX_INT ? pu.ibcMergeIdx1 : -1;
+#else
+  r[ARMC_IDX1] = -1;
+#endif
+  r[ARMC_SIDES] = sides;
+  for( int i = 0; i < IBC_MRG_MAX_NUM_CANDS_MEM; i++ )
+  {
+    const int o = ARMC_CANDS + ARMC_CAND_WORDS * i;
+    r[o]        = ctx.mvFieldNeighbours[i << 1].mv.hor;
+    r[o + 1]    = ctx.mvFieldNeighbours[i << 1].mv.ver;
+    r[o + 2]    = ctx.ibcLicFlags[i] ? 1 : 0;
+    r[o + 3]    = ctx.rribcFlipTypes[i];
+  }
+  m_impl->ibcArmc[&cu] = r;
+}
+
 void GpuIntraRec::subPuMotion( const CodingUnit& cu, const std::vector<int32_t>& items )
 {
   Impl& m = *m_impl;
@@ -12939,7 +13074,8 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
   // ones below it), so that a shader change is compiled once for all streams rather than per variant and level they
   // use; verification of a change still runs without it, in the pipelines the pictures pick
   const bool full = getenv( "ECM_GPU_FULL_PIPELINE" ) != nullptr;
-  const IntraRecVariant variant = full || m.numMpm > 0 || eip || m.numIbcObmc > 0 ? VARIANT_MPM
+  const IntraRecVariant variant = full || m.numIbcDerived > 0                      ? VARIANT_IBC
+                                  : m.numMpm > 0 || eip || m.numIbcObmc > 0 ? VARIANT_MPM
                                   : !m.cpuTmrl.empty() ? VARIANT_TMRL
                                   : m.numTimdMerge > 0 ? VARIANT_TIMD_MERGE
                                   : m.numTimdSad > 0 ? VARIANT_TIMD_SAD : m.numTimd > 0 ? VARIANT_TIMD

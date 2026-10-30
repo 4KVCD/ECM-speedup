@@ -22,8 +22,8 @@ void ibcBlock( Tu t, int lid, int NT )
   BufI32      d   = BufI32( P.timdData );
   const int   r   = t.ibc;
   const int   px  = d.v[r + IBC_REC_X], py = d.v[r + IBC_REC_Y], w = d.v[r + IBC_REC_W], h = d.v[r + IBC_REC_H];
-  const ivec2 mv  = ivec2( d.v[r + IBC_REC_MV], d.v[r + IBC_REC_MV + 1] );
-  const ivec2 mv2 = ivec2( d.v[r + IBC_REC_MV2], d.v[r + IBC_REC_MV2 + 1] );
+  ivec2       mv  = ivec2( d.v[r + IBC_REC_MV], d.v[r + IBC_REC_MV + 1] );
+  ivec2       mv2 = ivec2( d.v[r + IBC_REC_MV2], d.v[r + IBC_REC_MV2 + 1] );
   const int   ox = t.x - px, oy = t.y - py, flip = d.v[r + IBC_REC_FLIP], weights = d.v[r + IBC_REC_WEIGHTS];
   const int   lic = d.v[r + IBC_REC_LIC], ob = d.v[r + IBC_REC_OBMC];
   const bool  obmc = WITH_MPM && t.comp == 0 && ob >= 0, bi = d.v[r + IBC_REC_BI] != 0;
@@ -32,6 +32,38 @@ void ibcBlock( Tu t, int lid, int NT )
   c.y = py;
   c.w = w;
   c.h = h;
+  // an IBC AMVP CU with BVD prediction (intra_ibcbvd.glsl) or an IBC merge CU (intra_ibcarmc.glsl): its luma block
+  // derives the vectors - the predictor plus bvdDerive's BVD, clipped to the storage's 18 bits
+  // (mvCliptoStorageBitDepth); the merge list's entries ARMC ranks first - and publishes them in its record; the CU's
+  // other blocks read them there (they come after it)
+  const int bvd  = WITH_IBC ? d.v[r + IBC_REC_BVD] : -1, from = WITH_IBC ? d.v[r + IBC_REC_FROM] : -1;
+  const int armc = WITH_IBC ? d.v[r + IBC_REC_ARMC] : -1;
+  if( bvd >= 0 || armc >= 0 )
+  {
+    if( bvd >= 0 )
+    {
+      const ivec2 pred = ivec2( d.v[bvd + BVD_PRED], d.v[bvd + BVD_PRED + 1] );
+      mv = clamp( pred + bvdDerive( t, c, bvd, lid, NT ), ivec2( -( 1 << 17 ) ), ivec2( ( 1 << 17 ) - 1 ) );
+    }
+    else
+    {
+      const ivec4 mvs = armcDerive( t, c, armc, lid, NT );
+      mv  = mvs.xy;
+      mv2 = bi ? mvs.zw : mv2;
+    }
+    if( lid == 0 )
+    {
+      CBufI32( P.timdData ).v[r + IBC_REC_MV]      = mv.x;
+      CBufI32( P.timdData ).v[r + IBC_REC_MV + 1]  = mv.y;
+      CBufI32( P.timdData ).v[r + IBC_REC_MV2]     = mv2.x;
+      CBufI32( P.timdData ).v[r + IBC_REC_MV2 + 1] = mv2.y;
+    }
+  }
+  else if( from >= 0 )
+  {
+    mv  = ivec2( CBufI32( P.timdData ).v[from + IBC_REC_MV], CBufI32( P.timdData ).v[from + IBC_REC_MV + 1] );
+    mv2 = ivec2( CBufI32( P.timdData ).v[from + IBC_REC_MV2], CBufI32( P.timdData ).v[from + IBC_REC_MV2 + 1] );
+  }
   if( lic > 0 )   // (invocation 0 in the workgroup's scratch, as an IntraTMP node's)
   {
     if( lid == 0 )

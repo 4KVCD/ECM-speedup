@@ -491,8 +491,9 @@ min instead of ~2 h, each covering a whole tool family on real streams. Keep it 
   interpolation).
 - Shader changes cost pipeline compiles: an intra_rec pipeline takes 225-480 s cold. After a shader change run
   `precompile.py <build> -j 7 8:0 8:1 8:2 8:3 8:4 8:5 8:6` (~7 min: the MPM variant, which every regular stream's
-  pictures take since EIP / IntraTMP / SGPM CUs force it), not all 63 (~26 min with 14 at a time; only needed before
-  the 444-stream regression). Pipelines then load from runs/pipecache in 0.0 s. Check a shader edit with glslang
+  pictures take since EIP / IntraTMP / SGPM CUs force it; since M178 also `9:0` .. `9:6`, the IBC variant of the
+  pictures whose IBC CUs derive their vectors, and `9:6` alone is ECM_GPU_FULL_PIPELINE's), not all 70 (~26 min for
+  63 with 14 at a time; only needed before the 444-stream regression; at most ~4 at once fit the memory budget). Pipelines then load from runs/pipecache in 0.0 s. Check a shader edit with glslang
   first (`spirv_ids.py`: compile errors and each module's size in about a minute; since 2026-10-22 the build's
   spirv-opt step removed the SPIR-V ID budget that bound M45-M70). Host-only edits need no compile at all.
 - Never wait idle: builds, precompiles and test runs go to the background while you read the CPU code for the next
@@ -707,7 +708,8 @@ commands that combine `Remove-Item` with `//` text. `perf\gpu\crlf.ps1 <worktree
 | `slangopt.cmd` / `slangopt.py` | spirv-opt's stand-in from Nsight Graphics' SPIRV-Tools (section 4's build without the SDK); `ECM_GPU_INTRA_REC_SPV=<file.spv>` / `ECM_GPU_INTER_MC_SPV=<file.spv>` make a decoder take that module for intra_rec's first module / inter_mc (an experiment on a changed shader, e.g. the driver's compile, without a rebuild) |
 | development switches | `ECM_GPU_NO_CCP_LFNST=1`: partial verification leaves the pictures that need LEVEL_CCP_LFNST's pipeline (intra_rec's second module) unverified - on the 3070 PC its cold compile needs over 35 GB, past the budget, and most intra pictures need it. `ECM_GPU_CPU_KINDS=GPM,affine,...`: those inter CU kinds (interKind's names) keep the CPU's prediction (which kind a difference is in). `ECM_GPU_PIPELINE_TIMES=1` also names a pipeline before it compiles. `ECM_GPU_FAULT=1` enables VK_EXT_device_fault: a lost device prints the faulting addresses, and every buffer prints its address range at its creation. `ECM_GPU_NO_DERIVED_CCP=1`: as ECM_GPU_NO_CCP_LFNST for LEVEL_CCP_DERIVED's pipelines (the MPM one did not compile within the budget on 2026-10-25). `ECM_GPU_DIFFS=1`: a picture's first differing block also lists its samples, CPU / GPU, prediction and residual. `ECM_GPU_MIN_LEVEL=<n>` runs every intra picture in a pipeline of at least that level (a speed comparison of the pipelines on the same pictures; the output is the same). Every pipeline the driver compiles prints its statistics on stdout (VK_KHR_pipeline_executable_properties: `[gpu] pipeline <name> CS: Register Count ...; Local Memory Size ...` - NVIDIA's local memory reads 2^36 + the bytes per invocation -, Shared Memory Size, Binary Size), so a new build's partial.py logs have intra_rec's; one from a cache prints nothing, and `ECM_GPU_PIPELINE_STATS=1` (with `__GL_SHADER_DISK_CACHE=0`) compiles them all anew for it. NVIDIA's driver gives intra_rec either 255 registers (one workgroup per SM) or 128 (two: 2 x 256 x 128 fills the register file), with ~11 KB of local memory per invocation either way (mostly local arrays): M171's shaders 255 / 10,672 bytes, the same with the sub-sample search split (grn215) 128 / 11,408 bytes and 4 % slower. Which one a build gets moves its whole time by several %, so compare builds of the same register count, or a change's phase on the block clock. |
 | `spirv_noinline.py <in.spv> <out.spv> <min> [names]` | marks functions DontInline (the named ones, or those of at least `min` inlined SPIR-V instructions called more than once): an experiment on the driver's compile memory via ECM_GPU_INTRA_REC_SPV. On the 3070 (2026-10-25) it halved intra_rec's but the output was wrong and 20 % slower: not for NVIDIA |
-| `precompile.py <build> [-j N] [variant:level ...]` | compiles intra_rec's pipelines into runs/nvcache and runs/pipecache (see 1a: after a shader change `8:0` .. `8:6`) |
+| `nvvmprobe.py <build> [stream] [seconds]` | whether the NVIDIA driver's compile of a build's intra_rec gets past the ~160 s point where an NVVM failure ends the decoder (a decoder under gpuslot, stopped by its PID once past it) |
+| `precompile.py <build> [-j N] [variant:level ...]` | compiles intra_rec's pipelines into runs/nvcache and runs/pipecache (see 1a: after a shader change `8:0` .. `8:6`, `9:0` .. `9:6`) |
 | `verify_all.py [-j N] <build> [streams]` | the full regression: `--GpuRecon=2` over the 444 GPU test streams (C:\Code\ECM\streams_gpu); M66 baseline 1565 verified, 8 skipped, 0 differences |
 | `cpu_cus.py <build> ...` | sums partial.py's "CUs taken from the CPU" per reason over the logs: what to port next |
 | `long_lines.py <worktree> <files>` | added lines over 120 columns (the style rule) |
@@ -3489,6 +3491,29 @@ faster: ra_ip64_md5 332 -> 255, ra_long 294 -> 249, ra720_pj17 215 -> 180, ra_ci
 (alternating, two rounds) ra_ip64_md5 649 / 654 -> 574 / 573 ms (-12 %). The whole GPU time over the 27 streams in one
 session each: 40,592 -> 40,545 ms (the rest's noise is as large). Results (grn253, 27 streams): every picture
 identical.
+M178 (2026-10-30): the BVD of an IBC AMVP CU with BVD prediction derived on the GPU (intra_ibcbvd.glsl, its luma
+block's start: deriveBvdSignIBC's candidates, CandCheckEnv's bisection replayed with a stack, the one-sample template
+costs as unsigned 64-bit sums, stableSortSmall, deriveMVDFromMVSDIdxTransIBC, applyOffsets; the predictor still the
+host's), the vector published in the luma block's IBC record for the CU's chroma blocks. The NVIDIA compiler failed on
+it ("NVVM compilation failed: 3", VkResult -13; `nvvmprobe.py <build>` tells in ~4 min whether a change gets past
+the point where it fails, ~160 s into the compile): a sign written as nested choices (`v > 0 ? 1 : v < 0 ? -1 : 0`)
+was the cause, found by bisecting the new code with it. The
+new code put intra_rec at 128 registers (fp720_ai 12,302 -> 13,252 ms), so it lives in a pipeline variant of its own,
+VARIANT_IBC (WITH_IBC, `9:x`), which only pictures whose IBC CUs derive their vectors take; the MPM pipeline stays at
+255. Counts: fp720_ai 584 of its 586 AMVP CUs (the 2 others have a 1-D vector: getBvType keeps the CPU's), ai720 78,
+ra720 77, pj720_ai 51.
+M179 (2026-10-30): IBC merge's ARMC on the GPU (intra_ibcarmc.glsl): the host passes getIBCMergeCandidates' list (28
+candidates in the CPU's order: vector, IBC LIC flag, RR-IBC flip), the merge indices and the current templates' sides;
+the luma block ranks the candidates before the first whose vector rounds to zero by the SATD of the one-sample
+templates (getIBCAMLRefTemplate: the strip beside the reference block, mirrored with RR-IBC, else the block's own first
+row / column; with the candidate's IBC LIC a model of the strips a sample further out), adjustIbcMergeRribcCand with
+bi-prediction, updateIBCCandInfo's rewrites ported literally (positions past the ranked ones keep or default as on the
+CPU). IBC GPM and IBC TM merge CUs keep the CPU's vectors; MBVD is next (M180). Counts: fp720_ai 38, pj720_ai 27, ra720
+8, ai720 4. GPU time (27 streams, ECM_GPU_FULL_PIPELINE, which now runs the IBC pipeline everywhere): grn253 -> grn274
+40,525 -> 44,005 ms (+8.6 %: its 128 registers). In the pipelines pictures pick (ECM_GPU_MIN_LEVEL=6, the AI streams):
+ai_md5 539 -> 537 ms, ai_parkjoy 151 -> 150 (no IBC derivations: the MPM pipeline), ai_long 795 -> 805, ai720 1,563
+-> 1,667, aiodd 229 -> 243, ai_foreman 224 -> 253, fp720_ai 12,302 -> 13,258. Results (grn272 for M178 alone, grn274,
+27 streams): every picture identical.
 Tried after M176 and left out (2026-10-29): intra_deps' passes 1 and 2 with a cluster of 8 invocations per block
 (clustered subgroup operations) instead of M175's subgroup: pj720_ai's deps 171 -> 145 ms, but ai_md5 24 -> 62,
 ai_long 28 -> 79, ld_md5 8 -> 17 (the scans 4 times as long per block). To keep intra_rec at 255 registers: a branch
@@ -3583,7 +3608,13 @@ within the budget (M118's 3070 runs skipped those pictures with ECM_GPU_NO_CCP_L
       signs and suffix from deriveBvdSignIBC (mvsdIdx 0-3 used; imv 0 and 1); a merge / MBVD CU's from ARMC and
       sortIbcMergeMbvdCandidates; bi-prediction's second vector from the merge list after ARMC; LIC's models from
       templates.
-      First step (planned M178, checked in partial verification against the CPU's vector before ON mode takes it):
+      Done: M178 (the BVD derivation, below) and M179 (ARMC of the merge list; section 7). Next: M180 MBVD's sorting
+      (sortIbcMergeMbvdCandidates: per base of the ranked list 80 offsets, the 8 cheapest by template SATD without
+      LIC; its templates take the RR-IBC flip ARMC's last setMergeInfo left in the CU - the candidate at the first
+      zero vector, or the parsed one where ARMC returned early -, and the MBVD branch ranks without LIC since
+      ibcMbvdMergeFlag stays set), then AMVP-merge bi-prediction, the predictor lists (fillIBCMvpCand), the candidate
+      lists, the vector field and HMVP.
+      M178 (done; checked in partial verification against the CPU's vector before ON mode takes it):
       the BVD derivation of an IBC AMVP CU on the GPU - a node per such CU, its predictor the host's for now. The CPU
       code: DecCu.cpp's IBC AMVP branch (`pu.isBvdPredApplicable() && mvd.isMvdPredApplicable()`: cMvPred regulated by
       getBvType, bvdSuffixInfo.initPrefixes, deriveBvdSignIBC, deriveMVDFromMVSDIdxTransIBC, applyOffsets, then

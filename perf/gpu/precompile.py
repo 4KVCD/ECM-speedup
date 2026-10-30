@@ -14,7 +14,7 @@ import gpuslot   # (the memory budget: at most ECM_GPU_SLOTS decoders, stopped a
 
 PIPECACHE_GB = 30
 
-NUM_VARIANTS, NUM_LEVELS = 9, 7   # GpuIntraRec.cpp's IntraRecVariant, LmLevel
+NUM_VARIANTS, NUM_LEVELS = 10, 7   # GpuIntraRec.cpp's IntraRecVariant, LmLevel
 
 args = sys.argv[1:]
 build = args.pop(0)
