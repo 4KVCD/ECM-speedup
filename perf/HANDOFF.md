@@ -3567,6 +3567,13 @@ without BVD prediction adds the parsed BVD. Not with a 1-D vector (getBvType), B
 all 804 of its IBC CUs' lists built by the GPU), ai720 78, pj720_ai 59; 868 AMVP lists over the 27 streams, 1,257
 lists in all. GPU time (27 streams, FULL): 44,171 -> 44,764 ms (+1.3 %; fp720_ai +3.8 %: invocation 0 builds each
 list). Results (grn283, 27 streams, ECM_GPU_IBC_LIST_CHECK): every picture identical, every list equal to the CPU's.
+Tried after M184 and left out (2026-10-30): the list builder's state in the record and the workgroup scratch instead
+of invocation 0's local arrays (8 words per entry, the history table in the scratch: coherent global accesses).
+Correct (every list equal), local memory ~22 KB -> ~13.5 KB per invocation, the IBC pipeline's cold compile a little
+shorter, but GPU time worse: ai720 1,767 -> 1,931 ms, fp720_ai 14,046 -> 15,435 (+10 %). Faster lists likely need the
+work spread over the workgroup (candidates' motion and validity read ahead in parallel, as intra_bv.glsl's lists do)
+rather than moved to global memory.
+Stopped here (2026-10-30, at the user's request) after M184; section 9 item 0000 has the next steps.
 Tried after M176 and left out (2026-10-29): intra_deps' passes 1 and 2 with a cluster of 8 invocations per block
 (clustered subgroup operations) instead of M175's subgroup: pj720_ai's deps 171 -> 145 ms, but ai_md5 24 -> 62,
 ai_long 28 -> 79, ld_md5 8 -> 17 (the scans 4 times as long per block). To keep intra_rec at 255 registers: a branch
