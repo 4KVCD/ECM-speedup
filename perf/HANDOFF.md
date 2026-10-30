@@ -3420,6 +3420,21 @@ neighbour: obicNeighbours lists one whose motion field keeps intra modes, but de
 (or palette) CU, so it counts nothing; addObicNeighbours now leaves it out instead of looking for its record. Results
 (27 streams, grn225 with ECM_GPU_FULL_PIPELINE): every picture identical, CUs from the CPU 1 -> 0 (none left on the
 test streams). Host only: the shaders' SPIR-V is unchanged.
+intra_rec's register mode (2026-10-29, after M172; the logs' "[gpu] pipeline intra_rec ... Register Count"): NVIDIA's
+driver compiles it at 255 registers (M171, M172) or at 128 (two workgroups per SM), and nearly every change of some
+size since landed on 128, costing ~4-7 % of the whole kernel (paired, ai720 ~1,550 -> ~1,600-1,670 ms). Not the
+binary size (the sign-prediction merge below cut the inlined size 5.7 % and got 128), not SM packing (46 groups
+instead of 32 change nothing in either mode). Changes measured in 128 mode against each other, so their own effect:
+IntraTMP's sub-sample costs split over 8 invocations per candidate (-45 ms ai720), NN's wide layers two outputs per
+invocation without barriers (-30 ms in 128 mode, neutral in 255), the CCP merge list's and history's comparisons as a
+parallel bit matrix (neutral), signPrediction's three inter call sites merged into one (inlined size -41k
+instructions, neutral), IntraTMP's sparse ranks over the positions below the threshold only (gathered by atomics or
+ballots; +5 % against 255, its own effect not measured). Together the first two in 128 mode: 27 streams 52.22 ->
+54.23 s (+3.9 % against M172's 255). Kept out until a way to keep 255 (or to make 128 as fast) is found.
+Where the time goes before intra_rec (2026-10-29, grn231; each POC line now prints "before intra_rec x ms: motion a,
+residuals b"): over the 27 streams GPU 51.95 s, of it inter_mc's motion compensation 12.1 s (23 %; ~90 % of the RA
+streams' time), and of that BDOF with DMVR / sub-PU (modes 1 and 2, before their one barrier) most: ra_ip64_md5
+4,161 ms against the blocks' 401 ms, ra_long 3,058 / 585, ra720_pj17 874 / 105, ra_cif33 728 / 68.
 Tried after M125 and left out (idle 3070, median of 5 or 7): IntraTMP's lists in the angular arrays (s_angA, a word
 as two int16; paired: aiodd +19 %, ra720 +41 %, the clustering 6.6 times as long - likely the index division and the
 two loads per word in invocation 0's walks, against the scratch's one load; with the division gone, M169's chunks

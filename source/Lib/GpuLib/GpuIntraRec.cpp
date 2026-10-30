@@ -2239,6 +2239,8 @@ struct GpuIntraRec::Impl
   TrQuant*                    trQuant = nullptr;   // the decoder's TrQuant (transform types of the blocks)
   const IntraPrediction*      intraPred = nullptr; // the decoder's intra prediction (its intra merge template costs)
   int                         numGroups = 0;
+  double                      prePassMs = 0;   // the picture's GPU time before intra_rec (its first timestamp to it),
+  double                      mcMs = 0, resiMs = 0;   // of it inter_mc's motion compensation and intra_resi's residuals
   size_t                      edgeCap   = 0;   // dependency edges per picture the scheduling buffer holds
   gpu::Buffer                 upload, download;
 
@@ -13319,9 +13321,11 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
         s.dispatch( m.sh->kernelMc, &inner, (uint32_t) std::min<int32_t>( numInner, 4096 ) );
       }
     }
+    const uint32_t tMc = s.timestamp();   // (the motion compensation's end, for the time printed per picture)
     const uint32_t depGroups = (uint32_t) ( ( n + 63 ) / 64 );
     Push push{ m.params.addr, (int32_t) n, m.on ? 0 : 1 };
     s.dispatch( m.sh->kernelResi, &push, (uint32_t) std::min<size_t>( RESI_GROUPS, n ) );   // the residuals
+    const uint32_t tResi = s.timestamp();
     Push pass{ m.params.addr, (int32_t) n, 0 };
     s.dispatch( m.sh->kernelDeps, &pass, depGroups );   // the owner maps
     s.barrier();
@@ -13376,6 +13380,12 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
       const int32_t done = ( (const int32_t*) m.download.mapped )[1];
       CHECK( done <= finished, "intra_rec: a slice without progress" );
       gpuNs += s.elapsedNs( slice == 0 ? t0 : r0, r1 );
+      if( slice == 0 )   // (the motion compensation, residuals and dependencies before intra_rec)
+      {
+        m.prePassMs = s.elapsedNs( t0, r0 ) * 1e-6;
+        m.mcMs      = s.elapsedNs( t0, tMc ) * 1e-6;
+        m.resiMs    = s.elapsedNs( tMc, tResi ) * 1e-6;
+      }
       const double perBlock = s.elapsedNs( r0, r1 ) / ( done - finished );
       m.sliceBlocks = (int32_t) std::min<double>( std::max<double>( SLICE_NS / std::max( perBlock, 1.0 ), 64 ),
                                                   1 << 30 );
@@ -14265,8 +14275,8 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
       numTimdBlended += m.cpuTimd[size_t( th.index ) * TIMD_OUT + ( th.sad ? TIMD_OUT_SAD : 0 ) + TIMD_OUT_BLENDED] != 0;
     }
   }
-  printf( "\n[gpu-intra] POC %d: %d blocks, chain %d (ref filter %d, PDPC %d, gradient PDPC %d, fusion %d, bilateral filter candidates %d, CU nodes %d, DIMD %d, DIMD CUs %d, OBIC CUs %d, intra merge CUs %d, TIMD CUs %d (blended %d, TIMD-SAD %d, TIMD merge %d, inheriting transforms %d), TMRL CUs %d, chroma TMRL CUs %d, chroma reordering CUs %d (the CPU's modes %d), MPM records %d (sorted %d, MDIP %d), EIP CUs %d (merge %d, two models %d, with a vector %d), IntraTMP CUs %d, BVG-DIMD CUs %d, SGPM CUs %d, their MTS / LFNST / NSPT blocks %d, MTSS %d, MIP LFNST / NSPT %d, LM blocks %d (MMLM %d, MDLM %d, LBCCP %d, LFNST / NSPT %d, GLM %d (with luma %d), CCCM %d: above %d, left %d, GL %d, several filters %d, without subsampling %d), LM chroma fusion %d (CFLM %d), CCP merge %d (fusion with CCCM %d (by a blend model %d), with DIMD chroma %d, adjusted %d, decoder-derived fusion %d, LFNST / NSPT %d (with DIMD chroma %d)), decoder-derived CCP fusion %d), GPU %.2f ms: %s%s%s", m.poc,
-          (int) m.rec.size() - numNodes, maxDepth, numFilter, numPdpc, numGrad, numFusion, numBf, numNodes, numDimd, numDimdCus, numObic, m.numMerge, m.numTimd, numTimdBlended, numTimdSad, m.numTimdMerge, numInherited, numTmrl, numChromaTmrl, numReorder, m.numReorderCpu, m.numMpm, m.numMpmSorted, m.numMdip, numEipGpu, m.numEipMerge, m.numEipMm, m.numEipBv, numTmpGpu, numBvgGpu, numSgpmGpu, numDimdTransforms, numMtss, numMipDimd, numCclm, numMmlm, numMdlm, numLbccp, numCclmDimd, numGlm, numGlmLuma, numCccm, numCccmAbove, numCccmLeft, numGlCccm, numMdfCccm, numNoSubCccm, numLmFusion, numCflm, numCcpMerge, numCcpMergeFusion, m.numFusionBlend, numCcpMergeDimd, m.numCcpAdjust, m.numDdMergeFusion, numCcpMergeLfnst, numCcpMergeDimdLfnst, m.numDerivedCcp, ms, bad ? "MISMATCH, " : "identical",
+  printf( "\n[gpu-intra] POC %d: %d blocks, chain %d (ref filter %d, PDPC %d, gradient PDPC %d, fusion %d, bilateral filter candidates %d, CU nodes %d, DIMD %d, DIMD CUs %d, OBIC CUs %d, intra merge CUs %d, TIMD CUs %d (blended %d, TIMD-SAD %d, TIMD merge %d, inheriting transforms %d), TMRL CUs %d, chroma TMRL CUs %d, chroma reordering CUs %d (the CPU's modes %d), MPM records %d (sorted %d, MDIP %d), EIP CUs %d (merge %d, two models %d, with a vector %d), IntraTMP CUs %d, BVG-DIMD CUs %d, SGPM CUs %d, their MTS / LFNST / NSPT blocks %d, MTSS %d, MIP LFNST / NSPT %d, LM blocks %d (MMLM %d, MDLM %d, LBCCP %d, LFNST / NSPT %d, GLM %d (with luma %d), CCCM %d: above %d, left %d, GL %d, several filters %d, without subsampling %d), LM chroma fusion %d (CFLM %d), CCP merge %d (fusion with CCCM %d (by a blend model %d), with DIMD chroma %d, adjusted %d, decoder-derived fusion %d, LFNST / NSPT %d (with DIMD chroma %d)), decoder-derived CCP fusion %d), GPU %.2f ms (before intra_rec %.2f ms: motion %.2f, residuals %.2f): %s%s%s", m.poc,
+          (int) m.rec.size() - numNodes, maxDepth, numFilter, numPdpc, numGrad, numFusion, numBf, numNodes, numDimd, numDimdCus, numObic, m.numMerge, m.numTimd, numTimdBlended, numTimdSad, m.numTimdMerge, numInherited, numTmrl, numChromaTmrl, numReorder, m.numReorderCpu, m.numMpm, m.numMpmSorted, m.numMdip, numEipGpu, m.numEipMerge, m.numEipMm, m.numEipBv, numTmpGpu, numBvgGpu, numSgpmGpu, numDimdTransforms, numMtss, numMipDimd, numCclm, numMmlm, numMdlm, numLbccp, numCclmDimd, numGlm, numGlmLuma, numCccm, numCccmAbove, numCccmLeft, numGlCccm, numMdfCccm, numNoSubCccm, numLmFusion, numCflm, numCcpMerge, numCcpMergeFusion, m.numFusionBlend, numCcpMergeDimd, m.numCcpAdjust, m.numDdMergeFusion, numCcpMergeLfnst, numCcpMergeDimdLfnst, m.numDerivedCcp, ms, m.prePassMs, m.mcMs, m.resiMs, bad ? "MISMATCH, " : "identical",
           bad ? first.c_str() : "", numBad ? ( ", " + std::to_string( numBad ) + " picture samples differ" ).c_str() : "" );
   if( m.partial )
   {
