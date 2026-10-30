@@ -3451,6 +3451,15 @@ ra_ip64_md5 4,945 -> 1,343 ms (x3.68), ra_long 4,253 -> 1,582 (x2.69), ra_parkjo
 118, ld_md5 385 -> 260, ra_cif33 1,488 -> 1,060, ra720_pj17 4,031 -> 3,541; the AI streams unchanged. Results
 (grn235): every picture identical. Left in mode 2: xSubPuMC's groups with BDOF (up to 128 x 128: one ra720_pj17
 picture's 72 ms) and DMVR PUs without it (inter_dmvr's next step), its runs.
+M174 (2026-10-29): inter_dmvr takes xSubPuMC's groups with BDOF (or m_skipAffineFirstIterBdof's) and the DMVR PUs
+without BDOF, up to 128 x 128. A group by rows of BDOF blocks: the first pass's rows each predict their own rows of the
+group's tile (dmTileRows: the rows they read, 3 around, the group's ring as in the whole tile) and refine their blocks
+(dmRefineRows), the iteration's and the last pass's rows as a PU's (DM_ZERO's offsets 0 by the last pass's rows); a PU
+without BDOF the first pass's stripes alone. Mode 2 keeps xSubPuMC's runs and larger jobs. Motion compensation
+(grn235 -> grn239): ra720_pj17 446 -> 249 ms, ra_cif33 371 -> 140, ra_ip64_md5 977 -> 685, ra_long 984 -> 824. GPU time
+(27 streams, one session each): 43,658 -> 42,850 ms (-1.8 %; the AI streams, untouched, ~0.8 % slower in that
+session); paired (alternating, two rounds): ra720_pj17 3,546 / 3,562 -> 3,477 / 3,446 ms, ai720 1,564 / 1,552 ->
+1,550 / 1,540. Results (grn239, 27 streams): every picture identical.
 Tried after M125 and left out (idle 3070, median of 5 or 7): IntraTMP's lists in the angular arrays (s_angA, a word
 as two int16; paired: aiodd +19 %, ra720 +41 %, the clustering 6.6 times as long - likely the index division and the
 two loads per word in invocation 0's walks, against the scratch's one load; with the division gone, M169's chunks

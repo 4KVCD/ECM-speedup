@@ -24,12 +24,13 @@
 //   +-31), addBIOAvgN's average at the sample moved by one where |v| > 16 - or without the move where the sub-block has
 //   a sample out of boundary in either list (JVET-Z0136: those samples one list alone)
 // - multi-pass DMVR (bdmvrRefine): replays xPredInterBi's DMVR branch from the CPU's sub-PU vectors into pc.bdofOut
-//   (luma and chroma), which all its blocks' jobs copy; a PU with BDOF of at most 128 x 128 in this file's second
-//   module, inter_dmvr (DMVR_PASSES: dmPassJob), in four dispatches of a workgroup per stripe, its tiles in shared
-//   memory; any other one workgroup per PU (mode 2, dmvrJob)
-// - xSubPuMC (sub-block merge, AMVP-SbTMVP, JVET-AF0159's affine sub-PU BDOF): one workgroup (mode 2) per group of one
-//   bi motion (xPredInterBi with m_subPuMC and bdmvrRefine, xPredInterBiSubPuBDOF) and per run of sub-PUs of one
-//   motion (uni- or bi-prediction), each at its place in the PU's prediction in pc.bdofOut, which its blocks copy
+//   (luma and chroma), which all its blocks' jobs copy; a PU of at most 128 x 128 in this file's second module,
+//   inter_dmvr (DMVR_PASSES: dmPassJob), in up to four dispatches of a workgroup per stripe, its tiles in shared
+//   memory; a larger one in one workgroup (mode 2, dmvrJob)
+// - xSubPuMC (sub-block merge, AMVP-SbTMVP, JVET-AF0159's affine sub-PU BDOF): per group of one bi motion (xPredInterBi
+//   with m_subPuMC and bdmvrRefine, xPredInterBiSubPuBDOF; with BDOF up to 128 x 128 inter_dmvr's passes, else one
+//   workgroup in mode 2) and per run of sub-PUs of one motion (uni- or bi-prediction, mode 2), each at its place in
+//   the PU's prediction in pc.bdofOut, which its blocks copy
 // - OBMC (mode 3, after the blocks' jobs): per boundary segment of an OBMC CU what its blending needs that does not
 //   read the current picture (obmcJob), for intra_rec, which chooses and blends in the dependency chain
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
@@ -456,7 +457,7 @@ const int DM_UNI      = 1024;  // ... the run's uni-prediction (or xCheckIdentic
 const int DM_ZERO     = 2048;
 const int DM_NLIC     = 4096;  // ... a group of a non-local LIC CU: no refinement (applyBiOptFlow's altLMFlag)
 const int DM_NOMR     = 8192;  // a GPM part's (M116): the refinement without the mean removal (applyBiOptFlow's noMR)
-const int DM_PASSES   = 16384; // a PU that inter_dmvr's passes predict (dmPassJob), not mode 2
+const int DM_PASSES   = 16384; // a job that inter_dmvr's passes predict (dmPassJob), not mode 2
 
 int  dmO, dmX, dmY, dmW, dmH, dmFlags, dmBd, dmClipMin, dmClipMax, dmSlot0, dmSlot1, dmS, dmNux, dmDst;
 int  dmOX, dmOY, dmOW, dmOH;   // (the block's place in its PU's prediction, the PU's size)
@@ -568,11 +569,12 @@ void dmOut( int comp, int x, int y, int v )
 }
 
 #ifdef DMVR_PASSES
-// inter_dmvr: list l's tile of the run (bx, by, bw, bh) at clipped vector c in shared memory. Where both fractions are
-// non-zero the filter's two stages go apart: the horizontal one once per sample of the run grown by 2 and the 11 rows
-// the vertical taps reach beyond it (sH), then the vertical one from those - the values mcPredict's two stages give
-// each sample, with 24 reads of the reference instead of 144.
-void dmTileList( int l, int slot, ivec2 c, int bx, int by, int bw, int bh )
+// inter_dmvr: list l's tile of the run (bx, by, bw, bh) at clipped vector c in shared memory, its rows ry - 3 ..
+// ry + rh + 2 (the run's ring replicated as in the whole tile). Where both fractions are non-zero the filter's two
+// stages go apart: the horizontal one once per sample of the rows the vertical taps reach (sH: the run's columns grown
+// by 2), then the vertical one from those - the values mcPredict's two stages give each sample, with 24 reads of the
+// reference instead of 144.
+void dmTileList( int l, int slot, ivec2 c, int bx, int by, int bw, int bh, int ry, int rh )
 {
   const int   lid = int( gl_LocalInvocationID.x );
   const int   fx = c.x & 15, fy = c.y & 15, ox = dmX + ( c.x >> 4 ), oy = dmY + ( c.y >> 4 );
@@ -580,25 +582,28 @@ void dmTileList( int l, int slot, ivec2 c, int bx, int by, int bw, int bh )
   const int   shift1 = IF_FILTER_PREC - headRoom, offset1 = -IF_INTERNAL_OFFS << shift1;
   const ivec2 tapsH = mcTaps( true, fx, dmAlt, true ), tapsV = mcTaps( true, fy, dmAlt, true );
   const bool  twoStages = fx != 0 && fy != 0;
-  const int   hw = bw + 4;   // (the horizontal stage's columns: the run grown by 2; its rows start 7 above the run)
+  const int   hw = bw + 4;
+  // (the tile's distinct rows, and sH's: from 5 above the first - the 12 taps' reach, the 8 alternative ones' less -
+  // to 6 below the last)
+  const int   cyLo = max( ry - 3, by - 2 ), cyHi = min( ry + rh + 2, by + bh + 1 ), hy0 = cyLo - 5;
   if( twoStages )
   {
-    for( int i = lid; i < hw * ( bh + 4 + 11 ); i += 64 )
+    for( int i = lid; i < hw * ( cyHi + 6 - hy0 + 1 ); i += 64 )
     {
-      const int x = bx - 2 + i % hw, y = by - 7 + i / hw;
+      const int x = bx - 2 + i % hw, y = hy0 + i / hw;
       sH[i] = int16_t( ( mcSum( slot, 0, ox + x, oy + y, 1, 0, tapsH ) + offset1 ) >> shift1 );
     }
     barrier();
   }
   BufI32 f = BufI32( pc.filters );
-  for( int i = lid; i < bdofTw * ( bh + 6 ); i += 64 )
+  for( int i = lid; i < bdofTw * ( rh + 6 ); i += 64 )
   {
     const int cx = clamp( bdofX0 + i % bdofTw, bx - 2, bx + bw + 1 );
     const int cy = clamp( bdofY0 + i / bdofTw, by - 2, by + bh + 1 );
     int       v;
     if( twoStages )
     {
-      const int first = ( cy - ( by - 7 ) - ( tapsV.y / 2 - 1 ) ) * hw + cx - ( bx - 2 );
+      const int first = ( cy - ( tapsV.y / 2 - 1 ) - hy0 ) * hw + cx - ( bx - 2 );
       int       sum   = 0;
       for( int k = 0; k < tapsV.y; k++ )
       {
@@ -624,18 +629,19 @@ void dmTileList( int l, int slot, ivec2 c, int bx, int by, int bw, int bh )
 #endif
 
 // a block's luma tile (xPredInterBlk with bioApplied: the vectors clipped at the position grown by BIO_EXTEND_SIZE + 1,
-// the sharp filter as the grown block is above 4 x 4)
-void dmTile( int bx, int by, int bw, int bh, ivec2 mv0, ivec2 mv1 )
+// the sharp filter as the grown block is above 4 x 4); inter_dmvr's of the rows ry .. ry + rh - 1 alone (and the 3
+// around them), mode 2's of the whole run
+void dmTileRows( int bx, int by, int bw, int bh, int ry, int rh, ivec2 mv0, ivec2 mv1 )
 {
   const int   lid = int( gl_LocalInvocationID.x );
   const ivec2 c0 = dmClip( mv0, dmX + bx - 4, dmY + by - 4 ), c1 = dmClip( mv1, dmX + bx - 4, dmY + by - 4 );
   dmSync();
 #ifdef DMVR_PASSES
   bdofX0 = bx - 3;
-  bdofY0 = by - 3;
+  bdofY0 = ry - 3;
   bdofTw = bw + 6;
-  dmTileList( 0, dmSlot0, c0, bx, by, bw, bh );
-  dmTileList( 1, dmSlot1, c1, bx, by, bw, bh );
+  dmTileList( 0, dmSlot0, c0, bx, by, bw, bh, ry, rh );
+  dmTileList( 1, dmSlot1, c1, bx, by, bw, bh, ry, rh );
   return;
 #endif
   bdofGlobal = true;
@@ -654,6 +660,11 @@ void dmTile( int bx, int by, int bw, int bh, ivec2 mv0, ivec2 mv1 )
                                  true, bw + 4, bh + 4, dmBd, dmClipMin, dmClipMax );
   }
   dmSync();
+}
+
+void dmTile( int bx, int by, int bw, int bh, ivec2 mv0, ivec2 mv1 )
+{
+  dmTileRows( bx, by, bw, bh, by, bh, mv0, mv1 );
 }
 
 // the average of two lists' intermediate predictions with BCW's weights (addWeightedAvg; a sample out of boundary in
@@ -773,8 +784,9 @@ const int DM_WEIGHT_OFFSET[9] = int[]( 0, 64, 160, 320, 416, 560, 800, 960, 1200
 // applyBiOptFlow with isBdofMvRefine (iteration iter) on the tile's block (bx, by, bw, bh) at vectors mv0 / mv1;
 // m_subPuMC (dmSub): scaleBDOF 1 where a side is 4 modulo 8 (not 4), else 2, the SAD threshold without the QP term,
 // the first pass writes the luma of the blocks it does not move, its offsets halved only from 256 samples, the mean
-// removal of calcBIOParamSumHighPrecision_SSE's isSub
-void dmRefine( int bx, int by, int bw, int bh, ivec2 mv0, ivec2 mv1, int iter )
+// removal of calcBIOParamSumHighPrecision_SSE's isSub. The blocks of rows ry .. ry + rh - 1 alone (whole rows of
+// blocks).
+void dmRefineRows( int bx, int by, int bw, int bh, int ry, int rh, ivec2 mv0, ivec2 mv1, int iter )
 {
   const int  area    = dmW * dmH;
   const int  scale   = dmSub ? ( ( bw % 8 == 4 && bw != 4 ) || ( bh % 8 == 4 && bh != 4 ) ? 1 : 2 )
@@ -785,11 +797,11 @@ void dmRefine( int bx, int by, int bw, int bh, ivec2 mv0, ivec2 mv1, int iter )
   const bool noMean  = sameDir && !( bw * bh >= 2048 && dmLdbMode( bw * bh ) == 2 );
   const int  ww = bioDx + 4, wh = bioDy + 4;
   const int  wOff = MC_FILT_BDOF_W + DM_WEIGHT_OFFSET[( ww == 8 ? 0 : ww == 12 ? 3 : 6 ) + ( wh == 8 ? 0 : wh == 12 ? 1 : 2 )];
-  const int  nbx = ( bw + bioDx - 1 ) / bioDx, nb = nbx * ( ( bh + bioDy - 1 ) / bioDy );
+  const int  nbx = ( bw + bioDx - 1 ) / bioDx, nb = nbx * ( ( rh + bioDy - 1 ) / bioDy );
   const bool first = dmLane() == 0;
   for( int b = dmCluster(); b < nb; b += 64 / DM_CLUSTER )
   {
-    const int   x0 = bx + ( b % nbx ) * bioDx, y0 = by + ( b / nbx ) * bioDy;
+    const int   x0 = bx + ( b % nbx ) * bioDx, y0 = ry + ( b / nbx ) * bioDy;
     const ivec2 stats = dmBlockStats( x0, y0, bioDx, bioDy, mv0, mv1, true );
     if( stats.x < th )
     {
@@ -890,6 +902,11 @@ void dmRefine( int bx, int by, int bw, int bh, ivec2 mv0, ivec2 mv1, int iter )
     }
   }
   dmSync();   // (the offsets and the luma for the next pass, the tile for the next run)
+}
+
+void dmRefine( int bx, int by, int bw, int bh, ivec2 mv0, ivec2 mv1, int iter )
+{
+  dmRefineRows( bx, by, bw, bh, by, bh, mv0, mv1, iter );
 }
 
 // xPredInterBiBDMVR2's iteration iter (1, 2) on the row of blocks at y: the blocks of equal offsets again at their
@@ -1169,14 +1186,32 @@ void dmvrJob( int o )
   bdofGlobal = false;
 }
 
-// inter_dmvr's passes (DMVR_PASSES): a DMVR PU with BDOF of at most 128 x 128 (DM_PASSES) in four dispatches - the
-// first pass, xPredInterBiBDMVR2's two iterations, xPredInterBiSubPuBDOF -, one workgroup per stripe of the pass
-// (the first pass's stripe, the iteration's or the last pass's row of blocks), which depends on the previous passes'
-// offsets of its own blocks alone
+// inter_dmvr's passes (DMVR_PASSES), one workgroup per stripe of a pass, which depends on the previous passes' offsets
+// of its own blocks alone. A job of at most 128 x 128 with DM_PASSES:
+// - a DMVR PU with BDOF: four dispatches - the first pass's stripes, xPredInterBiBDMVR2's two iterations' rows of
+//   blocks, xPredInterBiSubPuBDOF's rows
+// - a DMVR PU without BDOF: the first pass's stripes (their runs' bi-prediction) alone
+// - xSubPuMC's group with BDOF (or m_skipAffineFirstIterBdof's): sbGroup's steps by rows of blocks - the offsets 0 and
+//   the first refinement of the group's tile (each row its rows of it), the iteration (not with
+//   m_skipAffineFirstIterBdof), DM_ZERO's offsets 0 and the last pass
 void dmPassJob( int pass, int o, int stripe )
 {
   dmSetup( o );
-  if( pass == 0 )
+  if( pass == 0 && dmSub )
+  {
+    const int y = stripe * min( dmH, 4 * dmIterScale( 1 ) ), rh = min( dmH, 4 * dmIterScale( 1 ) );
+    for( int i = int( gl_LocalInvocationID.x ); i < ( dmW >> 2 ) * ( rh >> 2 ); i += 64 )
+    {
+      const int x = 4 * ( i % ( dmW >> 2 ) ), yy = y + 4 * ( i / ( dmW >> 2 ) );
+      dmSetOff( false, x, yy, ivec2( 0 ) );
+      dmSetOff( true, x, yy, ivec2( 0 ) );
+    }
+    dmSync();
+    const ivec2 mv0 = dmMv( 0, 0, 0 ), mv1 = dmMv( 1, 0, 0 );
+    dmTileRows( 0, 0, dmW, dmH, y, rh, mv0, mv1 );
+    dmRefineRows( 0, 0, dmW, dmH, y, rh, mv0, mv1, dmW % 8 == 4 || dmH % 8 == 4 ? 1 : 0 );
+  }
+  else if( pass == 0 )
   {
     dmFirstStripe( stripe * dmStripe() );
   }
@@ -1186,7 +1221,16 @@ void dmPassJob( int pass, int o, int stripe )
   }
   else
   {
-    dmFinalRow( stripe * min( dmH, 4 * dmFinalScale() ) );
+    const int y = stripe * min( dmH, 4 * dmFinalScale() ), rh = min( dmH, 4 * dmFinalScale() );
+    if( dmSub && ( dmFlags & DM_ZERO ) != 0 )   // (bdofCond off: xSubPuMC zeroes the offsets, not the last ones)
+    {
+      for( int i = int( gl_LocalInvocationID.x ); i < ( dmW >> 2 ) * ( rh >> 2 ); i += 64 )
+      {
+        dmSetOff( false, 4 * ( i % ( dmW >> 2 ) ), y + 4 * ( i / ( dmW >> 2 ) ), ivec2( 0 ) );
+      }
+      dmSync();
+    }
+    dmFinalRow( y );
   }
 }
 
