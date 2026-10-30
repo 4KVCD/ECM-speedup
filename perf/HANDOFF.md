@@ -3481,6 +3481,25 @@ each a job of its own (the first in the job's record - OBMC's jobs name the CU's
 after the jobs; MC_DST and MC_GPM_SEP's part 1 at the band's rows). Host only. GPU time (27 streams, grn244 ->
 grn246): 42,017 -> 40,587 ms (-3.4 %): ld_md5 220 -> 103 ms (x2.14), ra_long 1,386 -> 834 (x1.66), ra_ip64_md5 996 ->
 650 (x1.53), ld_cif33 495 -> 404 (x1.22). Results (grn246, 27 streams): every picture identical.
+Tried after M176 and left out (2026-10-29): intra_deps' passes 1 and 2 with a cluster of 8 invocations per block
+(clustered subgroup operations) instead of M175's subgroup: pj720_ai's deps 171 -> 145 ms, but ai_md5 24 -> 62,
+ai_long 28 -> 79, ld_md5 8 -> 17 (the scans 4 times as long per block). To keep intra_rec at 255 registers: a branch
+that never runs (a negative block count) holding 224 loaded values live at once, at the start of the block loop, on
+the sign-prediction merge (a 128-register variant): still 128 - the driver spills such a peak rather than raising
+the count. (The build after that experiment, with HEAD's intra_rec, compiled intra_rec again although runs/pipecache
+names its files by the SPIR-V's hash; the cause was not found.) Twice as many workgroups at 128 registers (64,
+ECM_GPU_GROUPS; two fit per SM): ai720 and fp720_ai unchanged - the loss is per block (spills), not parallelism.
+intra_rec at 128 invocations (two workgroups per SM at 255 registers, so that 128 would gain the driver nothing): the
+device was lost - some code takes an invocation per element of up to 256. The drivers' statistics: every 255-register
+build has 10,672 bytes of local memory per invocation, the 128-register ones ~11,400 (the spills). The rest is likely
+local arrays: the SPIR-V's function-scope arrays indexed at run time include glslang's "indexable" copies of constant
+tables (obmcSample 1 KB, ibcChromaTap, ibcTap, coLumaDbvSample, cccmDownsample, glmGradient, eipTap*, mpm*, timd*,
+applyModeParams) and Tu copies of 436 bytes. Within the 128-register mode a change moves the spills too: HEAD + CCP
+merge's linear candidates' costs at once (grn249) ai720 1,651 ms against the sign-prediction merge's 1,670 (both
+128), but with IntraTMP's fractional costs over 8 invocations and NN's wide layers added (grn251) 1,764. (Nsight
+Graphics' GPU Trace with the real-time shader profiler would show where: it needs the driver's GPU performance
+counters allowed, a setting for the user: ngfx.exe --no-timeout --activity "GPU Trace Profiler" --exe <decoder>
+--real-time-shader-profiler --auto-export, launched by gpuslot.run; it compiles the pipelines again.)
 Tried after M125 and left out (idle 3070, median of 5 or 7): IntraTMP's lists in the angular arrays (s_angA, a word
 as two int16; paired: aiodd +19 %, ra720 +41 %, the clustering 6.6 times as long - likely the index division and the
 two loads per word in invocation 0's walks, against the scratch's one load; with the division gone, M169's chunks
