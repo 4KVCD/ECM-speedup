@@ -3435,6 +3435,22 @@ Where the time goes before intra_rec (2026-10-29, grn231; each POC line now prin
 residuals b"): over the 27 streams GPU 51.95 s, of it inter_mc's motion compensation 12.1 s (23 %; ~90 % of the RA
 streams' time), and of that BDOF with DMVR / sub-PU (modes 1 and 2, before their one barrier) most: ra_ip64_md5
 4,161 ms against the blocks' 401 ms, ra_long 3,058 / 585, ra720_pj17 874 / 105, ra_cif33 728 / 68.
+M173 (2026-10-29): DMVR PUs with BDOF in passes across the GPU. Timed apart (a barrier between them), BDOF's
+sub-block jobs were 15 ms of ra_ip64_md5 and DMVR's PU jobs the rest: one 64-invocation workgroup per PU (one SM, two
+warps) ran the first pass, two iterations and the last pass block after block - a 128 x 128 PU 66-103 ms, a 32 x 32
+one 14 ms -, with every tile sample the 144 reads of the 12-tap 2D filter and the tiles in pc.scratch. Now a PU of at
+most 128 x 128 (DM_PASSES, not xSubPuMC's) goes to inter_dmvr, a second module of inter_mc.comp (DMVR_PASSES): four
+dispatches (the first pass's stripes, each iteration's rows, the last pass's rows; a barrier between, BDOF's and mode
+2's jobs beside the last), a workgroup per stripe - the rows of a pass read and write only their own blocks' offsets -,
+each run's tile in shared memory (int16, 20 KB with the horizontal stage; in a module of its own so that inter_mc's
+other modes keep their occupancy), the filter's two stages apart (24 reads per sample), and in every run (both
+modules) each BDOF block by a cluster of 8 invocations with clustered subgroup sums, without the barriers between
+blocks. (The clusters alone, still in pc.scratch, were slower: ra_ip64_md5's motion 4.59 -> 5.88 s, likely the
+uncoalesced reads of four blocks per warp.) GPU time (27 streams, grn231 -> grn235): 51,952 -> 43,658 ms (-16.0 %):
+ra_ip64_md5 4,945 -> 1,343 ms (x3.68), ra_long 4,253 -> 1,582 (x2.69), ra_parkjoy_q32 964 -> 512, ra_foreman 221 ->
+118, ld_md5 385 -> 260, ra_cif33 1,488 -> 1,060, ra720_pj17 4,031 -> 3,541; the AI streams unchanged. Results
+(grn235): every picture identical. Left in mode 2: xSubPuMC's groups with BDOF (up to 128 x 128: one ra720_pj17
+picture's 72 ms) and DMVR PUs without it (inter_dmvr's next step), its runs.
 Tried after M125 and left out (idle 3070, median of 5 or 7): IntraTMP's lists in the angular arrays (s_angA, a word
 as two int16; paired: aiodd +19 %, ra720 +41 %, the clustering 6.6 times as long - likely the index division and the
 two loads per word in invocation 0's walks, against the scratch's one load; with the division gone, M169's chunks

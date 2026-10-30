@@ -79,6 +79,9 @@ endforeach()
 # intra_rec's second module: the pipelines of the pictures with CCP merge or decoder-derived CCP fusion blocks with
 # LFNST / NSPT, whose second merge prediction adds ~1M IDs that the other pipelines' module does without
 spv_header( intra_rec_lfnst "${CMAKE_CURRENT_SOURCE_DIR}/shaders/intra_rec.comp" CCP_LFNST_MODULE ${SHADER_MACROS} )
+# inter_mc's DMVR passes (inter_dmvr): a module of their own, as their tiles in shared memory would cost the other
+# modes' occupancy
+spv_header( inter_dmvr "${CMAKE_CURRENT_SOURCE_DIR}/shaders/inter_mc.comp" DMVR_PASSES ${SHADER_MACROS} )
 
 add_library( ${LIB_NAME} STATIC ${SRC_FILES} ${INC_FILES} ${SPV_HEADERS} ${SHADER_FILES} ${SHADER_INCLUDES} )
 target_include_directories( ${LIB_NAME} PUBLIC . "${ECM_VULKAN_HEADERS}" PRIVATE "${SPV_DIR}" )

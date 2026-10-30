@@ -23,8 +23,10 @@
 //   JVET-AG0067's mean removal unless JVET-AL0081's noMeanRm4Sample), divTable's division into vx / vy (clipped to
 //   +-31), addBIOAvgN's average at the sample moved by one where |v| > 16 - or without the move where the sub-block has
 //   a sample out of boundary in either list (JVET-Z0136: those samples one list alone)
-// - multi-pass DMVR (bdmvrRefine): one workgroup per PU (mode 2, dmvrJob) replays xPredInterBi's DMVR branch from the
-//   CPU's sub-PU vectors into pc.bdofOut (luma and chroma), which all its blocks' jobs copy
+// - multi-pass DMVR (bdmvrRefine): replays xPredInterBi's DMVR branch from the CPU's sub-PU vectors into pc.bdofOut
+//   (luma and chroma), which all its blocks' jobs copy; a PU with BDOF of at most 128 x 128 in this file's second
+//   module, inter_dmvr (DMVR_PASSES: dmPassJob), in four dispatches of a workgroup per stripe, its tiles in shared
+//   memory; any other one workgroup per PU (mode 2, dmvrJob)
 // - xSubPuMC (sub-block merge, AMVP-SbTMVP, JVET-AF0159's affine sub-PU BDOF): one workgroup (mode 2) per group of one
 //   bi motion (xPredInterBi with m_subPuMC and bdmvrRefine, xPredInterBiSubPuBDOF) and per run of sub-PUs of one
 //   motion (uni- or bi-prediction), each at its place in the PU's prediction in pc.bdofOut, which its blocks copy
@@ -32,6 +34,7 @@
 //   read the current picture (obmcJob), for intra_rec, which chooses and blends in the dependency chain
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 #extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_clustered : require
 #extension GL_GOOGLE_include_directive : require
 #extension GL_EXT_control_flow_attributes : require
 
@@ -51,7 +54,8 @@ layout( push_constant ) uniform PushMc
   uint64_t affine;    // affine PUs' records (int32, AF_*), LIC CUs' models (int32, MC_LIC)
   int      numJobs;
   int      mode;      // 0: the blocks' jobs, 1: BDOF's sub-block jobs, 2: DMVR's PUs (1 and 2 before 0), 3: OBMC's
-                      // segments (pc.scratch: the blocks' jobs), 4: OBMC's inner sub-blocks
+                      // segments (pc.scratch: the blocks' jobs), 4: OBMC's inner sub-blocks; inter_dmvr: the pass
+  int      stripes;   // inter_dmvr: where the pass's stripes start in pc.jobs (a DMVR job's offset, the stripe's index)
 } pc;
 
 // McJob (int32): the block (component, position and size in the component's samples), where its prediction goes in
@@ -226,16 +230,24 @@ layout( buffer_reference, std430, buffer_reference_align = 2 ) coherent buffer B
 
 const int BDOF_TILE = 16 + 6;
 shared int sP0[BDOF_TILE * BDOF_TILE], sP1[BDOF_TILE * BDOF_TILE];
-shared int sSad, sOob, sFlag;
-shared int sAcc[9];
+shared int sSad, sOob;
 int        bdofX0, bdofY0, bdofTw;   // the tile's first sample (relative to the PU) and width
 bool       bdofGlobal = false;       // the tile in pc.scratch, list 0's at bdofG0, list 1's at bdofG1
 int        bdofG0, bdofG1;
+#ifdef DMVR_PASSES
+// inter_dmvr's tile of a run (at most 128 x 16 or 16 x 128 luma samples, grown by 3) in shared memory, and the
+// horizontal stage of its luma filter (the run grown by 2, the vertical taps' 7 rows more above and below)
+const int DM_TILE = ( 128 + 6 ) * ( 16 + 6 ), DM_HSTAGE = ( 128 + 4 ) * ( 16 + 4 + 11 );
+shared int16_t sT0[DM_TILE], sT1[DM_TILE], sH[DM_HSTAGE];
+#endif
 
 // list l's prediction at (qx, qy) relative to the PU (in the tile)
 int bdofP( int l, int qx, int qy )
 {
   const int i = ( qy - bdofY0 ) * bdofTw + qx - bdofX0;
+#ifdef DMVR_PASSES
+  return int( l == 0 ? sT0[i] : sT1[i] );
+#endif
   if( bdofGlobal )
   {
     return BufC32( pc.scratch ).v[( l == 0 ? bdofG0 : bdofG1 ) + i];
@@ -444,6 +456,7 @@ const int DM_UNI      = 1024;  // ... the run's uni-prediction (or xCheckIdentic
 const int DM_ZERO     = 2048;
 const int DM_NLIC     = 4096;  // ... a group of a non-local LIC CU: no refinement (applyBiOptFlow's altLMFlag)
 const int DM_NOMR     = 8192;  // a GPM part's (M116): the refinement without the mean removal (applyBiOptFlow's noMR)
+const int DM_PASSES   = 16384; // a PU that inter_dmvr's passes predict (dmPassJob), not mode 2
 
 int  dmO, dmX, dmY, dmW, dmH, dmFlags, dmBd, dmClipMin, dmClipMax, dmSlot0, dmSlot1, dmS, dmNux, dmDst;
 int  dmOX, dmOY, dmOW, dmOH;   // (the block's place in its PU's prediction, the PU's size)
@@ -554,6 +567,62 @@ void dmOut( int comp, int x, int y, int v )
     int16_t( clamp( v, dmClipMin, dmClipMax ) );
 }
 
+#ifdef DMVR_PASSES
+// inter_dmvr: list l's tile of the run (bx, by, bw, bh) at clipped vector c in shared memory. Where both fractions are
+// non-zero the filter's two stages go apart: the horizontal one once per sample of the run grown by 2 and the 11 rows
+// the vertical taps reach beyond it (sH), then the vertical one from those - the values mcPredict's two stages give
+// each sample, with 24 reads of the reference instead of 144.
+void dmTileList( int l, int slot, ivec2 c, int bx, int by, int bw, int bh )
+{
+  const int   lid = int( gl_LocalInvocationID.x );
+  const int   fx = c.x & 15, fy = c.y & 15, ox = dmX + ( c.x >> 4 ), oy = dmY + ( c.y >> 4 );
+  const int   headRoom = max( 2, IF_INTERNAL_PREC - dmBd );
+  const int   shift1 = IF_FILTER_PREC - headRoom, offset1 = -IF_INTERNAL_OFFS << shift1;
+  const ivec2 tapsH = mcTaps( true, fx, dmAlt, true ), tapsV = mcTaps( true, fy, dmAlt, true );
+  const bool  twoStages = fx != 0 && fy != 0;
+  const int   hw = bw + 4;   // (the horizontal stage's columns: the run grown by 2; its rows start 7 above the run)
+  if( twoStages )
+  {
+    for( int i = lid; i < hw * ( bh + 4 + 11 ); i += 64 )
+    {
+      const int x = bx - 2 + i % hw, y = by - 7 + i / hw;
+      sH[i] = int16_t( ( mcSum( slot, 0, ox + x, oy + y, 1, 0, tapsH ) + offset1 ) >> shift1 );
+    }
+    barrier();
+  }
+  BufI32 f = BufI32( pc.filters );
+  for( int i = lid; i < bdofTw * ( bh + 6 ); i += 64 )
+  {
+    const int cx = clamp( bdofX0 + i % bdofTw, bx - 2, bx + bw + 1 );
+    const int cy = clamp( bdofY0 + i / bdofTw, by - 2, by + bh + 1 );
+    int       v;
+    if( twoStages )
+    {
+      const int first = ( cy - ( by - 7 ) - ( tapsV.y / 2 - 1 ) ) * hw + cx - ( bx - 2 );
+      int       sum   = 0;
+      for( int k = 0; k < tapsV.y; k++ )
+      {
+        sum += int( sH[first + k * hw] ) * f.v[tapsV.x + k];
+      }
+      v = int( int16_t( sum >> IF_FILTER_PREC ) );
+    }
+    else
+    {
+      v = mcPredict( slot, 0, ox + cx, oy + cy, fx, fy, dmAlt, true, bw + 4, bh + 4, dmBd, dmClipMin, dmClipMax );
+    }
+    if( l == 0 )
+    {
+      sT0[i] = int16_t( v );
+    }
+    else
+    {
+      sT1[i] = int16_t( v );
+    }
+  }
+  barrier();   // (sH's next list, the tile complete)
+}
+#endif
+
 // a block's luma tile (xPredInterBlk with bioApplied: the vectors clipped at the position grown by BIO_EXTEND_SIZE + 1,
 // the sharp filter as the grown block is above 4 x 4)
 void dmTile( int bx, int by, int bw, int bh, ivec2 mv0, ivec2 mv1 )
@@ -561,6 +630,14 @@ void dmTile( int bx, int by, int bw, int bh, ivec2 mv0, ivec2 mv1 )
   const int   lid = int( gl_LocalInvocationID.x );
   const ivec2 c0 = dmClip( mv0, dmX + bx - 4, dmY + by - 4 ), c1 = dmClip( mv1, dmX + bx - 4, dmY + by - 4 );
   dmSync();
+#ifdef DMVR_PASSES
+  bdofX0 = bx - 3;
+  bdofY0 = by - 3;
+  bdofTw = bw + 6;
+  dmTileList( 0, dmSlot0, c0, bx, by, bw, bh );
+  dmTileList( 1, dmSlot1, c1, bx, by, bw, bh );
+  return;
+#endif
   bdofGlobal = true;
   bdofX0     = bx - 3;
   bdofY0     = by - 3;
@@ -629,35 +706,46 @@ void dmLuma( int bx, int by, int bw, int bh, ivec2 mv0, ivec2 mv1 )
   }
 }
 
-// the out-of-boundary lists of BDOF block (x0, y0, w, h) (bits) and, if sad, its SAD of dI into sSad, sOob
-void dmBlockStats( int x0, int y0, int w, int h, ivec2 mv0, ivec2 mv1, bool sad )
+// The BDOF blocks of a run (dmRefine, dmFinal) are independent once the run's tile is complete: each goes to a
+// cluster of DM_CLUSTER invocations of one subgroup, which sum over it with clustered subgroup additions, so the
+// workgroup handles 64 / DM_CLUSTER blocks at a time without a barrier between them. (Every block's sample and window
+// counts are multiples of DM_CLUSTER: all lanes of a cluster take each loop equally often.)
+const int DM_CLUSTER = 8;
+
+// this invocation's cluster (0 .. 64 / DM_CLUSTER - 1) and its lane in it
+int dmCluster()
 {
-  const int lid = int( gl_LocalInvocationID.x );
-  if( lid == 0 )
-  {
-    sSad = 0;
-    sOob = 0;
-  }
-  dmSync();
-  for( int i = lid; i < w * h; i += 64 )
+  return int( gl_SubgroupID * gl_SubgroupSize + gl_SubgroupInvocationID ) / DM_CLUSTER;
+}
+
+int dmLane()
+{
+  return int( gl_SubgroupInvocationID ) % DM_CLUSTER;
+}
+
+// by a block's cluster: the SAD of dI over BDOF block (x0, y0, w, h) (if sad, else 0) and its lists out of boundary
+// (bits)
+ivec2 dmBlockStats( int x0, int y0, int w, int h, ivec2 mv0, ivec2 mv1, bool sad )
+{
+  int s = 0, oob = 0;
+  for( int i = dmLane(); i < w * h; i += DM_CLUSTER )
   {
     const int x = x0 + i % w, y = y0 + i / w;
     if( sad )
     {
-      atomicAdd( sSad, abs( bdofDI( x, y ) ) );
+      s += abs( bdofDI( x, y ) );
     }
-    atomicOr( sOob, ( dmOob( x, y, mv0 ) ? 1 : 0 ) | ( dmOob( x, y, mv1 ) ? 2 : 0 ) );
+    oob |= ( dmOob( x, y, mv0 ) ? 1 : 0 ) | ( dmOob( x, y, mv1 ) ? 2 : 0 );
   }
-  dmSync();
+  return ivec2( subgroupClusteredAdd( s, DM_CLUSTER ), subgroupClusteredOr( oob, DM_CLUSTER ) );
 }
 
-// the luma of BDOF block (x0, y0, w, h): addAvg (avg) or subBlockBiOptFlow
-void dmBlockOut( int x0, int y0, int w, int h, ivec2 mv0, ivec2 mv1, bool avg, bool noMean )
+// by a block's cluster: the luma of BDOF block (x0, y0, w, h), addAvg (avg) or subBlockBiOptFlow (oobBlock: a sample
+// of the block out of boundary in either list)
+void dmBlockOut( int x0, int y0, int w, int h, ivec2 mv0, ivec2 mv1, bool avg, bool noMean, bool oobBlock )
 {
-  const int  lid      = int( gl_LocalInvocationID.x );
-  const int  shiftNum = max( 2, IF_INTERNAL_PREC - dmBd ) + 1, offset = ( 1 << ( shiftNum - 1 ) ) + 2 * IF_INTERNAL_OFFS;
-  const bool oobBlock = sOob != 0;
-  for( int i = lid; i < w * h; i += 64 )
+  const int shiftNum = max( 2, IF_INTERNAL_PREC - dmBd ) + 1, offset = ( 1 << ( shiftNum - 1 ) ) + 2 * IF_INTERNAL_OFFS;
+  for( int i = dmLane(); i < w * h; i += DM_CLUSTER )
   {
     const int  x = x0 + i % w, y = y0 + i / w;
     const int  p0 = bdofP( 0, x, y ), p1 = bdofP( 1, x, y );
@@ -688,7 +776,6 @@ const int DM_WEIGHT_OFFSET[9] = int[]( 0, 64, 160, 320, 416, 560, 800, 960, 1200
 // removal of calcBIOParamSumHighPrecision_SSE's isSub
 void dmRefine( int bx, int by, int bw, int bh, ivec2 mv0, ivec2 mv1, int iter )
 {
-  const int  lid     = int( gl_LocalInvocationID.x );
   const int  area    = dmW * dmH;
   const int  scale   = dmSub ? ( ( bw % 8 == 4 && bw != 4 ) || ( bh % 8 == 4 && bh != 4 ) ? 1 : 2 )
                              : iter == 0 ? 4 : iter == 1 ? ( area < 256 ? 1 : 2 ) : ( area < 2048 ? 1 : 2 );
@@ -698,191 +785,205 @@ void dmRefine( int bx, int by, int bw, int bh, ivec2 mv0, ivec2 mv1, int iter )
   const bool noMean  = sameDir && !( bw * bh >= 2048 && dmLdbMode( bw * bh ) == 2 );
   const int  ww = bioDx + 4, wh = bioDy + 4;
   const int  wOff = MC_FILT_BDOF_W + DM_WEIGHT_OFFSET[( ww == 8 ? 0 : ww == 12 ? 3 : 6 ) + ( wh == 8 ? 0 : wh == 12 ? 1 : 2 )];
-  for( int yb = 0; yb < bh; yb += bioDy )
+  const int  nbx = ( bw + bioDx - 1 ) / bioDx, nb = nbx * ( ( bh + bioDy - 1 ) / bioDy );
+  const bool first = dmLane() == 0;
+  for( int b = dmCluster(); b < nb; b += 64 / DM_CLUSTER )
   {
-    for( int xb = 0; xb < bw; xb += bioDx )
+    const int   x0 = bx + ( b % nbx ) * bioDx, y0 = by + ( b / nbx ) * bioDy;
+    const ivec2 stats = dmBlockStats( x0, y0, bioDx, bioDy, mv0, mv1, true );
+    if( stats.x < th )
     {
-      const int x0 = bx + xb, y0 = by + yb;
-      dmBlockStats( x0, y0, bioDx, bioDy, mv0, mv1, true );
-      const bool below = sSad < th;
-      if( below )
+      if( iter != 0 && first )
       {
-        if( iter != 0 && lid == 0 )
-        {
-          for( int u = 0; u < max( 1, bioDy >> 2 ) * max( 1, bioDx >> 2 ); u++ )
-          {
-            dmSetOff( true, x0 + 4 * ( u % max( 1, bioDx >> 2 ) ), y0 + 4 * ( u / max( 1, bioDx >> 2 ) ), ivec2( 0 ) );
-          }
-        }
-        if( iter != 0 || dmSub )
-        {
-          dmBlockOut( x0, y0, bioDx, bioDy, mv0, mv1, true, noMean );
-        }
-        dmSync();
-        continue;
-      }
-      // calcBIOParamSum4HighPrecision over the block grown by 2: S1 = gx^2, S2 = gx gy, S3 = gx dI, S5 = gy^2,
-      // S6 = gy dI weighted, the weighted gradients and dI's sums for the mean's removal
-      if( lid < 9 )
-      {
-        sAcc[lid] = 0;
-      }
-      dmSync();
-      for( int i = lid; i < ww * wh; i += 64 )
-      {
-        const int   qx = x0 - 2 + i % ww, qy = y0 - 2 + i / ww;
-        const int   w  = BufI32( pc.filters ).v[wOff + i];
-        const ivec2 g  = bdofGrad( 0, qx, qy ) + bdofGrad( 1, qx, qy );
-        const int   d  = bdofDI( qx, qy );
-        atomicAdd( sAcc[0], w * g.x * g.x );
-        atomicAdd( sAcc[1], w * g.x * g.y );
-        atomicAdd( sAcc[2], w * g.x * d );
-        atomicAdd( sAcc[3], w * g.y * g.y );
-        atomicAdd( sAcc[4], w * g.y * d );
-        atomicAdd( sAcc[5], w * g.x );
-        atomicAdd( sAcc[6], w * g.y );
-        atomicAdd( sAcc[7], d );
-        atomicAdd( sAcc[8], abs( d ) );
-      }
-      dmSync();
-      if( lid == 0 )
-      {
-        int md = 0;   // (noMR: JVET-AL0081's same direction keeps the mean)
-        if( dmSub )   // (isSub: the mean without the test against the mean of the magnitudes)
-        {
-          md = dmGetMean( sAcc[7] + ( ( ww * wh ) >> 1 ), ww * wh );
-        }
-        else if( !sameDir && ( dmFlags & DM_NOMR ) == 0 )
-        {
-          const int mean = sAcc[8] > 2 * abs( sAcc[7] ) ? 0 : sAcc[7];
-          md             = dmGetMean( mean + ww * wh, ( ww * wh ) << 1 );
-        }
-        int reg = 2048;
-        reg >>= bioDx == 4 ? 1 : 0;
-        reg >>= bioDy == 4 ? 1 : 0;
-        reg <<= bioDx == 16 || bioDy == 16 ? 1 : 0;
-        const int s1 = sAcc[0] + reg, s2 = sAcc[1], s3 = sAcc[2] - md * sAcc[5], s5 = sAcc[3] + reg, s6 = sAcc[4] - md * sAcc[6];
-        int64_t       dD = int64_t( s1 ) * int64_t( s5 ) - int64_t( s2 ) * int64_t( s2 );
-        const int64_t xD = ( int64_t( s3 ) * int64_t( s5 ) - int64_t( s6 ) * int64_t( s2 ) ) << 4;
-        const int64_t yD = ( int64_t( s1 ) * int64_t( s6 ) - int64_t( s3 ) * int64_t( s2 ) ) << 4;
-        int           tx = 0, ty = 0;
-        const int64_t signD = dD > int64_t( 0 ) ? int64_t( 1 ) : int64_t( -1 );
-        dD = dD < int64_t( 0 ) ? -dD : dD;
-        if( dD > int64_t( 9 ) )
-        {
-          const int DIV16[16] = int[]( 0, 7, 6, 5, 5, 4, 4, 3, 3, 2, 2, 1, 1, 1, 1, 0 );
-          const int hi = int( dD >> 32 );
-          int log2D = hi != 0 ? 32 + findMSB( hi ) : findMSB( uint( dD ) );
-          const int msbD = int( ( dD << 4 ) >> log2D ) & 15, invD = DIV16[msbD] | 8;
-          log2D += msbD != 0 ? 1 : 0;
-          const int     shiftD  = log2D + 3;
-          const int64_t offsetD = int64_t( int( 1u << uint( ( shiftD - 1 ) & 31 ) ) );   // (a 32-bit shift on x86)
-          tx = int( ( signD * xD * int64_t( invD ) + offsetD ) >> ( shiftD & 63 ) );
-          ty = int( ( signD * yD * int64_t( invD ) + offsetD ) >> ( shiftD & 63 ) );
-        }
-        tx = clamp( tx, -256, 256 );
-        ty = clamp( ty, -256, 256 );
-        ivec2 bioMv = ivec2( tx >= 0 ? ( tx + 2 ) >> 2 : -( ( -tx + 2 ) >> 2 ), ty >= 0 ? ( ty + 2 ) >> 2 : -( ( -ty + 2 ) >> 2 ) );
-        if( ( dmFlags & DM_NLIC ) != 0 )   // (m_subPuMC with non-local LIC: no offset)
-        {
-          bioMv = ivec2( 0 );
-        }
-        if( dmSub ? iter == 0 && area >= 256 : iter == 0 || ( iter == 1 && ( area >= 2048 || area < 256 ) ) )
-        {
-          bioMv = dmHalf( bioMv );
-        }
         for( int u = 0; u < max( 1, bioDy >> 2 ) * max( 1, bioDx >> 2 ); u++ )
         {
-          const int ux = x0 + 4 * ( u % max( 1, bioDx >> 2 ) ), uy = y0 + 4 * ( u / max( 1, bioDx >> 2 ) );
-          dmSetOff( false, ux, uy, ( iter == 0 ? ivec2( 0 ) : dmOff( false, ux, uy ) ) + bioMv );
-          dmSetOff( true, ux, uy, bioMv );
+          dmSetOff( true, x0 + 4 * ( u % max( 1, bioDx >> 2 ) ), y0 + 4 * ( u / max( 1, bioDx >> 2 ) ), ivec2( 0 ) );
         }
-        sFlag = ( iter != 0 || dmSub ) && bioMv == ivec2( 0 ) ? 1 : 0;
       }
-      dmSync();
-      if( sFlag != 0 )
+      if( iter != 0 || dmSub )
       {
-        dmBlockOut( x0, y0, bioDx, bioDy, mv0, mv1, false, noMean );
+        dmBlockOut( x0, y0, bioDx, bioDy, mv0, mv1, true, noMean, stats.y != 0 );
       }
-      dmSync();
+      continue;
     }
+    // calcBIOParamSum4HighPrecision over the block grown by 2: S1 = gx^2, S2 = gx gy, S3 = gx dI, S5 = gy^2,
+    // S6 = gy dI weighted, the weighted gradients and dI's sums for the mean's removal (each lane's part, then the
+    // cluster's sums in every lane, which all solve alike)
+    int acc[9] = int[]( 0, 0, 0, 0, 0, 0, 0, 0, 0 );
+    for( int i = dmLane(); i < ww * wh; i += DM_CLUSTER )
+    {
+      const int   qx = x0 - 2 + i % ww, qy = y0 - 2 + i / ww;
+      const int   w  = BufI32( pc.filters ).v[wOff + i];
+      const ivec2 g  = bdofGrad( 0, qx, qy ) + bdofGrad( 1, qx, qy );
+      const int   d  = bdofDI( qx, qy );
+      acc[0] += w * g.x * g.x;
+      acc[1] += w * g.x * g.y;
+      acc[2] += w * g.x * d;
+      acc[3] += w * g.y * g.y;
+      acc[4] += w * g.y * d;
+      acc[5] += w * g.x;
+      acc[6] += w * g.y;
+      acc[7] += d;
+      acc[8] += abs( d );
+    }
+    [[unroll]] for( int k = 0; k < 9; k++ )
+    {
+      acc[k] = subgroupClusteredAdd( acc[k], DM_CLUSTER );
+    }
+    int md = 0;   // (noMR: JVET-AL0081's same direction keeps the mean)
+    if( dmSub )   // (isSub: the mean without the test against the mean of the magnitudes)
+    {
+      md = dmGetMean( acc[7] + ( ( ww * wh ) >> 1 ), ww * wh );
+    }
+    else if( !sameDir && ( dmFlags & DM_NOMR ) == 0 )
+    {
+      const int mean = acc[8] > 2 * abs( acc[7] ) ? 0 : acc[7];
+      md             = dmGetMean( mean + ww * wh, ( ww * wh ) << 1 );
+    }
+    int reg = 2048;
+    reg >>= bioDx == 4 ? 1 : 0;
+    reg >>= bioDy == 4 ? 1 : 0;
+    reg <<= bioDx == 16 || bioDy == 16 ? 1 : 0;
+    const int s1 = acc[0] + reg, s2 = acc[1], s3 = acc[2] - md * acc[5], s5 = acc[3] + reg, s6 = acc[4] - md * acc[6];
+    int64_t       dD = int64_t( s1 ) * int64_t( s5 ) - int64_t( s2 ) * int64_t( s2 );
+    const int64_t xD = ( int64_t( s3 ) * int64_t( s5 ) - int64_t( s6 ) * int64_t( s2 ) ) << 4;
+    const int64_t yD = ( int64_t( s1 ) * int64_t( s6 ) - int64_t( s3 ) * int64_t( s2 ) ) << 4;
+    int           tx = 0, ty = 0;
+    const int64_t signD = dD > int64_t( 0 ) ? int64_t( 1 ) : int64_t( -1 );
+    dD = dD < int64_t( 0 ) ? -dD : dD;
+    if( dD > int64_t( 9 ) )
+    {
+      const int DIV16[16] = int[]( 0, 7, 6, 5, 5, 4, 4, 3, 3, 2, 2, 1, 1, 1, 1, 0 );
+      const int hi = int( dD >> 32 );
+      int log2D = hi != 0 ? 32 + findMSB( hi ) : findMSB( uint( dD ) );
+      const int msbD = int( ( dD << 4 ) >> log2D ) & 15, invD = DIV16[msbD] | 8;
+      log2D += msbD != 0 ? 1 : 0;
+      const int     shiftD  = log2D + 3;
+      const int64_t offsetD = int64_t( int( 1u << uint( ( shiftD - 1 ) & 31 ) ) );   // (a 32-bit shift on x86)
+      tx = int( ( signD * xD * int64_t( invD ) + offsetD ) >> ( shiftD & 63 ) );
+      ty = int( ( signD * yD * int64_t( invD ) + offsetD ) >> ( shiftD & 63 ) );
+    }
+    tx = clamp( tx, -256, 256 );
+    ty = clamp( ty, -256, 256 );
+    ivec2 bioMv = ivec2( tx >= 0 ? ( tx + 2 ) >> 2 : -( ( -tx + 2 ) >> 2 ),
+                         ty >= 0 ? ( ty + 2 ) >> 2 : -( ( -ty + 2 ) >> 2 ) );
+    if( ( dmFlags & DM_NLIC ) != 0 )   // (m_subPuMC with non-local LIC: no offset)
+    {
+      bioMv = ivec2( 0 );
+    }
+    if( dmSub ? iter == 0 && area >= 256 : iter == 0 || ( iter == 1 && ( area >= 2048 || area < 256 ) ) )
+    {
+      bioMv = dmHalf( bioMv );
+    }
+    if( first )
+    {
+      for( int u = 0; u < max( 1, bioDy >> 2 ) * max( 1, bioDx >> 2 ); u++ )
+      {
+        const int ux = x0 + 4 * ( u % max( 1, bioDx >> 2 ) ), uy = y0 + 4 * ( u / max( 1, bioDx >> 2 ) );
+        dmSetOff( false, ux, uy, ( iter == 0 ? ivec2( 0 ) : dmOff( false, ux, uy ) ) + bioMv );
+        dmSetOff( true, ux, uy, bioMv );
+      }
+    }
+    if( ( iter != 0 || dmSub ) && bioMv == ivec2( 0 ) )
+    {
+      dmBlockOut( x0, y0, bioDx, bioDy, mv0, mv1, false, noMean, stats.y != 0 );
+    }
+  }
+  dmSync();   // (the offsets and the luma for the next pass, the tile for the next run)
+}
+
+// xPredInterBiBDMVR2's iteration iter (1, 2) on the row of blocks at y: the blocks of equal offsets again at their
+// vectors with the offset (m_subPuMC: its one iteration, scaleBDOF 1 where a side is 4 modulo 8 - not 4 -, blocks
+// joined by their offsets alone, those the first pass left in place skipped). The rows are independent: each reads and
+// writes its own blocks' offsets alone.
+int dmIterScale( int iter )
+{
+  return dmSub ? ( ( dmW % 8 == 4 && dmW != 4 ) || ( dmH % 8 == 4 && dmH != 4 ) ? 1 : 2 )
+               : iter == 1 ? 4 : dmW * dmH < 256 ? 1 : 2;
+}
+
+void dmIterRow( int iter, int y )
+{
+  const int dx = min( dmW, 4 * dmIterScale( iter ) ), dy = min( dmH, 4 * dmIterScale( iter ) );
+  int       dx2;
+  for( int x = 0; x < dmW; x += dx2 )
+  {
+    dx2 = dx;
+    while( x + dx2 < dmW && dmOff( false, x, y ) == dmOff( false, x + dx2, y )
+           && ( dmSub || ( dmOff( true, x, y ) == dmOff( true, x + dx2, y )
+                           && ( ( x >> 4 ) == ( ( x + dx2 ) >> 4 ) || dmMvSame( x, y, x + dx2, y ) ) ) ) )
+    {
+      dx2 += dx;
+    }
+    dx2 = dx2 == 4 ? 4 : ( dx2 >> 3 ) << 3;
+    if( ( iter == 2 || dmSub ) && dmOff( true, x, y ) == ivec2( 0 ) )
+    {
+      continue;
+    }
+    const ivec2 bioMv = dmOff( false, x, y );
+    const ivec2 mv0 = dmMv( 0, x, y ) + bioMv, mv1 = dmMv( 1, x, y ) - bioMv;
+    dmTile( x, y, dx2, dy, mv0, mv1 );
+    dmRefine( x, y, dx2, dy, mv0, mv1, iter );
   }
 }
 
-// xPredInterBiBDMVR2's iteration iter (1, 2): the blocks of equal offsets again at their vectors with the offset
-// (m_subPuMC: its one iteration, scaleBDOF 1 where a side is 4 modulo 8 - not 4 -, blocks joined by their offsets alone,
-// those the first pass left in place skipped)
 void dmIter( int iter )
 {
-  const int scale = dmSub ? ( ( dmW % 8 == 4 && dmW != 4 ) || ( dmH % 8 == 4 && dmH != 4 ) ? 1 : 2 )
-                          : iter == 1 ? 4 : dmW * dmH < 256 ? 1 : 2;
-  const int dx = min( dmW, 4 * scale ), dy = min( dmH, 4 * scale );
-  for( int y = 0; y < dmH; y += dy )
+  for( int y = 0; y < dmH; y += min( dmH, 4 * dmIterScale( iter ) ) )
   {
-    int dx2;
-    for( int x = 0; x < dmW; x += dx2 )
-    {
-      dx2 = dx;
-      while( x + dx2 < dmW && dmOff( false, x, y ) == dmOff( false, x + dx2, y )
-             && ( dmSub || ( dmOff( true, x, y ) == dmOff( true, x + dx2, y )
-                             && ( ( x >> 4 ) == ( ( x + dx2 ) >> 4 ) || dmMvSame( x, y, x + dx2, y ) ) ) ) )
-      {
-        dx2 += dx;
-      }
-      dx2 = dx2 == 4 ? 4 : ( dx2 >> 3 ) << 3;
-      if( ( iter == 2 || dmSub ) && dmOff( true, x, y ) == ivec2( 0 ) )
-      {
-        continue;
-      }
-      const ivec2 bioMv = dmOff( false, x, y );
-      const ivec2 mv0 = dmMv( 0, x, y ) + bioMv, mv1 = dmMv( 1, x, y ) - bioMv;
-      dmTile( x, y, dx2, dy, mv0, mv1 );
-      dmRefine( x, y, dx2, dy, mv0, mv1, iter );
-    }
+    dmIterRow( iter, y );
   }
 }
 
-// xPredInterBiSubPuBDOF: per block of equal offsets the luma again where the last iteration moved it
-// (applyBiOptFlow without isBdofMvRefine: subBlockBiOptFlow everywhere), the chroma of all (m_subPuMC: scaleBDOF 1 below
-// 256 samples or where a side is 4 modulo 8, not 4; subBlockBiOptFlow's blocks by both sides)
+// xPredInterBiSubPuBDOF on the row of blocks at y: per block of equal offsets the luma again where the last iteration
+// moved it (applyBiOptFlow without isBdofMvRefine: subBlockBiOptFlow everywhere), the chroma of all (m_subPuMC:
+// scaleBDOF 1 below 256 samples or where a side is 4 modulo 8, not 4; subBlockBiOptFlow's blocks by both sides)
+int dmFinalScale()
+{
+  const int area = dmW * dmH;
+  return dmSub ? ( area < 256 || ( dmW % 8 == 4 && dmW != 4 ) || ( dmH % 8 == 4 && dmH != 4 ) ? 1 : 2 )
+               : area < 2048 ? 1 : 2;
+}
+
+void dmFinalRow( int y )
+{
+  const int bioDx = min( dmW, 4 * dmFinalScale() ), bioDy = min( dmH, 4 * dmFinalScale() );
+  int       dx2;
+  for( int x = 0; x < dmW; x += dx2 )
+  {
+    dx2 = bioDx;
+    while( x + dx2 < dmW && dmOff( true, x, y ) == dmOff( true, x + dx2, y )
+           && dmOff( false, x, y ) == dmOff( false, x + dx2, y )
+           && ( ( x >> 4 ) == ( ( x + dx2 ) >> 4 ) || dmMvSame( x, y, x + dx2, y ) ) )
+    {
+      dx2 += bioDx;
+    }
+    const ivec2 bioMv = dmOff( false, x, y );
+    const ivec2 mv0 = dmMv( 0, x, y ) + bioMv, mv1 = dmMv( 1, x, y ) - bioMv;
+    if( dmOff( true, x, y ) != ivec2( 0 ) )
+    {
+      dmTile( x, y, dx2, bioDy, mv0, mv1 );
+      const int  sc     = ( dx2 % 8 == 4 && dx2 != 4 ) || ( dmSub && bioDy % 8 == 4 && bioDy != 4 ) ? 1 : 2;
+      const int  bdx    = min( dx2, 4 * sc ), bdy = min( bioDy, 4 * sc );
+      const bool noMean = ( dmFlags & DM_SAME_DIR ) != 0 && !( dx2 * bioDy >= 2048 && dmLdbMode( dx2 * bioDy ) == 2 );
+      const int  nbx    = ( dx2 + bdx - 1 ) / bdx, nb = nbx * ( ( bioDy + bdy - 1 ) / bdy );
+      for( int b = dmCluster(); b < nb; b += 64 / DM_CLUSTER )
+      {
+        const int  x0 = x + ( b % nbx ) * bdx, y0 = y + ( b / nbx ) * bdy;
+        const bool oobBlock = dmBlockStats( x0, y0, bdx, bdy, mv0, mv1, false ).y != 0;
+        dmBlockOut( x0, y0, bdx, bdy, mv0, mv1, false, noMean, oobBlock );
+      }
+    }
+    dmChroma( x, y, dx2, bioDy, mv0, mv1, true );
+    dmSync();
+  }
+}
+
 void dmFinal()
 {
-  const int area  = dmW * dmH;
-  const int scale = dmSub ? ( area < 256 || ( dmW % 8 == 4 && dmW != 4 ) || ( dmH % 8 == 4 && dmH != 4 ) ? 1 : 2 )
-                          : area < 2048 ? 1 : 2;
-  const int bioDx = min( dmW, 4 * scale ), bioDy = min( dmH, 4 * scale );
-  for( int y = 0; y < dmH; y += bioDy )
+  for( int y = 0; y < dmH; y += min( dmH, 4 * dmFinalScale() ) )
   {
-    int dx2;
-    for( int x = 0; x < dmW; x += dx2 )
-    {
-      dx2 = bioDx;
-      while( x + dx2 < dmW && dmOff( true, x, y ) == dmOff( true, x + dx2, y ) && dmOff( false, x, y ) == dmOff( false, x + dx2, y )
-             && ( ( x >> 4 ) == ( ( x + dx2 ) >> 4 ) || dmMvSame( x, y, x + dx2, y ) ) )
-      {
-        dx2 += bioDx;
-      }
-      const ivec2 bioMv = dmOff( false, x, y );
-      const ivec2 mv0 = dmMv( 0, x, y ) + bioMv, mv1 = dmMv( 1, x, y ) - bioMv;
-      if( dmOff( true, x, y ) != ivec2( 0 ) )
-      {
-        dmTile( x, y, dx2, bioDy, mv0, mv1 );
-        const int  sc     = ( dx2 % 8 == 4 && dx2 != 4 ) || ( dmSub && bioDy % 8 == 4 && bioDy != 4 ) ? 1 : 2;
-        const int  bdx    = min( dx2, 4 * sc ), bdy = min( bioDy, 4 * sc );
-        const bool noMean = ( dmFlags & DM_SAME_DIR ) != 0 && !( dx2 * bioDy >= 2048 && dmLdbMode( dx2 * bioDy ) == 2 );
-        for( int yb = 0; yb < bioDy; yb += bdy )
-        {
-          for( int xb = 0; xb < dx2; xb += bdx )
-          {
-            dmBlockStats( x + xb, y + yb, bdx, bdy, mv0, mv1, false );
-            dmBlockOut( x + xb, y + yb, bdx, bdy, mv0, mv1, false, noMean );
-            dmSync();
-          }
-        }
-      }
-      dmChroma( x, y, dx2, bioDy, mv0, mv1, true );
-      dmSync();
-    }
+    dmFinalRow( y );
   }
 }
 
@@ -948,9 +1049,9 @@ void sbGroup()
   dmFinal();
 }
 
-void dmvrJob( int o )
+// the job's globals from its record at o
+void dmSetup( int o )
 {
-  const int lid = int( gl_LocalInvocationID.x );
   dmO       = o;
   dmX       = dmJ( DM_X );
   dmY       = dmJ( DM_Y );
@@ -971,56 +1072,94 @@ void dmvrJob( int o )
   dmOY      = dmSub ? dmJ( DM_OY ) : 0;
   dmOW      = dmSub ? dmJ( DM_OW ) : dmW;
   dmOH      = dmSub ? dmJ( DM_OH ) : dmH;
+}
+
+// the first pass's stripes of DMVR's sub-PUs: columns of min(16, W) where H > W, else rows of min(16, H)
+bool dmColumns()
+{
+  return dmH > dmW;
+}
+
+int dmStripe()
+{
+  return dmColumns() ? min( dmW, 16 ) : min( dmH, 16 );
+}
+
+// the stripe at a: its offsets 0, then its runs of sub-PUs of one vector pair - without BDOF their prediction, with
+// it the first pass (none with DM_SKIP_A)
+void dmFirstStripe( int a )
+{
+  const int  lid  = int( gl_LocalInvocationID.x );
+  const bool cols = dmColumns();
+  const int  sw = cols ? dmStripe() : dmW, sh = cols ? dmH : dmStripe();
+  for( int i = lid; i < ( sw >> 2 ) * ( sh >> 2 ); i += 64 )
+  {
+    const int x = ( cols ? a : 0 ) + 4 * ( i % ( sw >> 2 ) ), y = ( cols ? 0 : a ) + 4 * ( i / ( sw >> 2 ) );
+    dmSetOff( false, x, y, ivec2( 0 ) );
+    dmSetOff( true, x, y, ivec2( 0 ) );
+  }
+  dmSync();
+  const bool bio = ( dmFlags & DM_BIO ) != 0;
+  if( bio && ( dmFlags & DM_SKIP_A ) != 0 )
+  {
+    return;
+  }
+  const int dx = min( dmW, 16 ), dy = min( dmH, 16 ), step = cols ? dy : dx, end = cols ? dmH : dmW;
+  int       len;
+  for( int b = 0; b < end; b += len )
+  {
+    const int x = cols ? a : b, y = cols ? b : a;
+    len = step;
+    while( b + len < end && ( cols ? dmMvSame( x, y + len, x, y ) : dmMvSame( x + len, y, x, y ) ) )
+    {
+      len += step;
+    }
+    const int   w = cols ? dx : len, h = cols ? len : dy;
+    const ivec2 mv0 = dmMv( 0, x, y ), mv1 = dmMv( 1, x, y );
+    if( bio )
+    {
+      dmTile( x, y, w, h, mv0, mv1 );
+      dmRefine( x, y, w, h, mv0, mv1, 0 );
+    }
+    else
+    {
+      dmLuma( x, y, w, h, mv0, mv1 );
+      dmChroma( x, y, w, h, mv0, mv1, false );
+      dmSync();
+    }
+  }
+}
+
+void dmvrJob( int o )
+{
+  const int lid = int( gl_LocalInvocationID.x );
+  dmSetup( o );
+  if( ( dmFlags & DM_PASSES ) != 0 )   // (inter_dmvr's)
+  {
+    return;
+  }
   if( dmSub && ( dmFlags & DM_RUN ) != 0 )
   {
     sbRun();
     return;
   }
-  const bool bio = ( dmFlags & DM_BIO ) != 0;
-  for( int i = lid; i < 4 * ( dmW >> 2 ) * ( dmH >> 2 ); i += 64 )   // the offsets 0
-  {
-    BufC32( pc.scratch ).v[dmS + i] = 0;
-  }
-  dmSync();
   if( dmSub )
   {
+    for( int i = lid; i < 4 * ( dmW >> 2 ) * ( dmH >> 2 ); i += 64 )   // the offsets 0
+    {
+      BufC32( pc.scratch ).v[dmS + i] = 0;
+    }
+    dmSync();
     sbGroup();
     dmSync();
     bdofGlobal = false;
     return;
   }
-  // the runs of DMVR's sub-PUs (columns where H > W): without BDOF their prediction, with it the first pass
-  if( !bio || ( dmFlags & DM_SKIP_A ) == 0 )
+  for( int a = 0; a < ( dmColumns() ? dmW : dmH ); a += dmStripe() )
   {
-    const int dx = min( dmW, 16 ), dy = min( dmH, 16 );
-    for( int a = 0; a < ( dmH > dmW ? dmW : dmH ); a += ( dmH > dmW ? dx : dy ) )
-    {
-      int len;
-      for( int b = 0; b < ( dmH > dmW ? dmH : dmW ); b += len )
-      {
-        const int x = dmH > dmW ? a : b, y = dmH > dmW ? b : a;
-        len = dmH > dmW ? dy : dx;
-        while( b + len < ( dmH > dmW ? dmH : dmW ) && ( dmH > dmW ? dmMvSame( x, y + len, x, y ) : dmMvSame( x + len, y, x, y ) ) )
-        {
-          len += dmH > dmW ? dy : dx;
-        }
-        const int   w = dmH > dmW ? dx : len, h = dmH > dmW ? len : dy;
-        const ivec2 mv0 = dmMv( 0, x, y ), mv1 = dmMv( 1, x, y );
-        if( bio )
-        {
-          dmTile( x, y, w, h, mv0, mv1 );
-          dmRefine( x, y, w, h, mv0, mv1, 0 );
-        }
-        else
-        {
-          dmLuma( x, y, w, h, mv0, mv1 );
-          dmChroma( x, y, w, h, mv0, mv1, false );
-          dmSync();
-        }
-      }
-    }
+    dmFirstStripe( a );
   }
-  if( bio )
+  if( ( dmFlags & DM_BIO ) != 0 )
   {
     dmIter( 1 );
     dmIter( 2 );
@@ -1028,6 +1167,27 @@ void dmvrJob( int o )
   }
   dmSync();
   bdofGlobal = false;
+}
+
+// inter_dmvr's passes (DMVR_PASSES): a DMVR PU with BDOF of at most 128 x 128 (DM_PASSES) in four dispatches - the
+// first pass, xPredInterBiBDMVR2's two iterations, xPredInterBiSubPuBDOF -, one workgroup per stripe of the pass
+// (the first pass's stripe, the iteration's or the last pass's row of blocks), which depends on the previous passes'
+// offsets of its own blocks alone
+void dmPassJob( int pass, int o, int stripe )
+{
+  dmSetup( o );
+  if( pass == 0 )
+  {
+    dmFirstStripe( stripe * dmStripe() );
+  }
+  else if( pass < 3 )
+  {
+    dmIterRow( pass, stripe * min( dmH, 4 * dmIterScale( pass ) ) );
+  }
+  else
+  {
+    dmFinalRow( stripe * min( dmH, 4 * dmFinalScale() ) );
+  }
 }
 
 // ----- the blocks' jobs (mode 0)
@@ -1683,6 +1843,13 @@ void obmcInnerJob( int o, int lid )
 void main()
 {
   const int lid = int( gl_LocalInvocationID.x );
+#ifdef DMVR_PASSES
+  for( int j = int( gl_WorkGroupID.x ); j < pc.numJobs; j += int( gl_NumWorkGroups.x ) )
+  {
+    dmPassJob( pc.mode, BufI32( pc.jobs ).v[pc.stripes + 2 * j], BufI32( pc.jobs ).v[pc.stripes + 2 * j + 1] );
+  }
+  return;
+#endif
   for( int j = int( gl_WorkGroupID.x ); j < pc.numJobs; j += int( gl_NumWorkGroups.x ) )
   {
     if( pc.mode == 1 )

@@ -67,6 +67,7 @@
 #include "intra_rec_lfnst.spv.h"
 #include "intra_resi.spv.h"
 #include "inter_mc.spv.h"
+#include "inter_dmvr.spv.h"
 #include "intra_deps.spv.h"
 #include "scan.spv.h"
 
@@ -1402,6 +1403,7 @@ struct PushMc
 {
   uint64_t jobs, refs, planes, filters, out, bdofOut, scratch, affine;
   int32_t  numJobs, mode;
+  int32_t  stripes;   // inter_dmvr: where the pass's (job, stripe) pairs start in jobs
 };
 constexpr int MC_COMP = 0, MC_X = 1, MC_Y = 2, MC_W = 3, MC_H = 4, MC_DST = 5, MC_PU_W = 6, MC_PU_H = 7, MC_MVX = 8;
 constexpr int MC_MVY = 9, MC_REF = 10, MC_FLAGS = 11, MC_BD = 12, MC_CLIP_MIN = 13, MC_CLIP_MAX = 14, MC_BDOF_TH = 15;
@@ -1421,6 +1423,9 @@ constexpr int DM_BIO = 16, DM_SAME_DIR = 32, DM_LDB = 64, DM_SKIP_A = 128;
 // (xSubPuMC's jobs: the block's place in its PU, the PU's size; a group or a run, the run's uni-prediction, bdofCond off)
 constexpr int DM_OX = 21, DM_OY = 22, DM_OW = 23, DM_OH = 24;
 constexpr int DM_SUB = 256, DM_RUN = 512, DM_UNI = 1024, DM_ZERO = 2048, DM_NLIC = 4096, DM_NOMR = 8192;
+// a PU with BDOF of at most DM_PASS_MAX x DM_PASS_MAX luma samples (not xSubPuMC's) goes to inter_dmvr's DM_PASSES
+// passes (the first pass, the two iterations, the last pass), a workgroup per stripe of each (inter_mc's dmPassJob)
+constexpr int DM_PASSES = 16384, DM_NUM_PASSES = 4, DM_PASS_MAX = 128;
 // OBMC: a CU's record in Params::timdData (intra_rec's OBMC_REC_*; per segment OBMC_SEG_*), a segment's job (inter_mc's
 // mode 3: an McJob of the neighbour's motion over the band, then OBMC_J_*; a template motion OBMC_T_*), a segment's
 // data in Params::interPred (OBMC_D_*: the skip flags, the two templates, the band's predictions)
@@ -1518,6 +1523,7 @@ struct Shared
   mutable std::once_flag           kernelOnce[NUM_VARIANTS][NUM_LM_LEVELS];
   gpu::Kernel                      kernelResi, kernelDeps, kernelScan;
   gpu::Kernel                      kernelMc;                      // inter_mc
+  gpu::Kernel                      kernelDmvr;                    // inter_dmvr (inter_mc's DMVR passes)
   gpu::Buffer                      filters, matrices;
   int32_t                          mcFilters = 0;                 // of inter_mc's interpolation filters in matrices
   gpu::Buffer                      secKernels;                    // int8: the CPU's LFNST and NSPT tables, one after the other
@@ -1846,6 +1852,7 @@ Shared* createShared( gpu::Context& ctx )
   size_t                mcSize = sizeof( spv_inter_mc );
   replacedModule( "ECM_GPU_INTER_MC_SPV", mcModule, mcCode, mcSize );
   sh->kernelMc.create( ctx, mcCode, mcSize, sizeof( PushMc ), "inter_mc" );
+  sh->kernelDmvr.create( ctx, spv_inter_dmvr, sizeof( spv_inter_dmvr ), sizeof( PushMc ), "inter_dmvr" );
 
   // tables, from the C++ tables themselves
   sh->bif.reset( new BilateralFilter );   // BilateralFilter::create derives the LUTs
@@ -13009,6 +13016,35 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
   {
     m.dmvrJobs[d + DM_MVS] += (int32_t) m.dmvrJobs.size();
   }
+  // inter_dmvr's PUs: per pass their (job, stripe) pairs after the vectors, where each pass's list starts in the
+  // buffer and its count; the stripes as dmPassJob takes them (the first pass's columns of min(16, W) where H > W, else
+  // rows of min(16, H); the first iteration's rows of min(16, H), the second's of 4 below 256 samples, else 8; the last
+  // pass's of 4 below 2048 samples, else 8)
+  int32_t passAt[DM_NUM_PASSES] = {}, passJobs[DM_NUM_PASSES] = {};
+  for( int p = 0; p < DM_NUM_PASSES; p++ )
+  {
+    passAt[p] = (int32_t) ( m.dmvrJobs.size() + m.dmvrJobMvs.size() );
+    for( size_t d = 0; d < m.dmvrJobs.size(); d += MC_JOB )
+    {
+      int32_t*  j = &m.dmvrJobs[d];
+      const int w = j[DM_W], h = j[DM_H], area = w * h;
+      if( ( j[DM_FLAGS] & ( DM_SUB | DM_BIO ) ) != DM_BIO || w > DM_PASS_MAX || h > DM_PASS_MAX )
+      {
+        continue;
+      }
+      j[DM_FLAGS] |= DM_PASSES;
+      const int stripe = p == 0 ? std::min( h > w ? w : h, 16 )
+                         : p == 1 ? std::min( h, 16 )
+                         : p == 2 ? std::min( h, area < 256 ? 4 : 8 )
+                                  : std::min( h, area < 2048 ? 4 : 8 );
+      const int extent = p == 0 && h > w ? w : h;
+      for( int s = 0; s * stripe < extent; s++ )
+      {
+        m.dmvrJobMvs.insert( m.dmvrJobMvs.end(), { (int32_t) d, s } );
+        passJobs[p]++;
+      }
+    }
+  }
   for( ;; )   // once, again with more room when the dependencies do not fit
   {
     const size_t cap = m.edgeCap;
@@ -13281,7 +13317,16 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
     {
       const int32_t numJobs = (int32_t) ( m.mcJobs.size() / MC_JOB );
       const uint64_t filters = m.sh->matrices.addr + uint64_t( m.sh->mcFilters ) * 4;
-      // BDOF's sub-blocks and DMVR's PUs first: the PUs' predictions the blocks' jobs copy
+      // BDOF's sub-blocks and DMVR's PUs first: the PUs' predictions the blocks' jobs copy. inter_dmvr's passes each
+      // after the previous one's offsets; BDOF's and mode 2's jobs beside the last pass, which leaves the GPU the
+      // most room
+      for( int p = 0; p + 1 < DM_NUM_PASSES && passJobs[0] > 0; p++ )   // (every pass has stripes, or none)
+      {
+        PushMc pass{ m.mcDmvrJobBuf.addr, m.mcRefBuf.addr, m.mcPlaneBuf.addr, filters, m.interPredBuf.addr,
+                     m.mcBdofBuf.addr, m.mcScratchBuf.addr, 0, passJobs[p], p, passAt[p] };
+        s.dispatch( m.sh->kernelDmvr, &pass, (uint32_t) std::min<int32_t>( passJobs[p], 4096 ) );
+        s.barrier();
+      }
       if( bdofJobBytes )
       {
         const int32_t numBdof = (int32_t) ( m.bdofJobs.size() / MC_JOB );
@@ -13295,6 +13340,13 @@ void GpuIntraRec::endPicture( const CodingStructure& cs )
         PushMc        dmvr{ m.mcDmvrJobBuf.addr, m.mcRefBuf.addr, m.mcPlaneBuf.addr, filters, m.interPredBuf.addr,
                             m.mcBdofBuf.addr, m.mcScratchBuf.addr, affineBytes ? m.mcAffineBuf.addr : 0, numDmvr, 2 };
         s.dispatch( m.sh->kernelMc, &dmvr, (uint32_t) std::min<int32_t>( numDmvr, 4096 ) );
+      }
+      if( passJobs[0] > 0 )
+      {
+        const int p = DM_NUM_PASSES - 1;
+        PushMc    pass{ m.mcDmvrJobBuf.addr, m.mcRefBuf.addr, m.mcPlaneBuf.addr, filters, m.interPredBuf.addr,
+                        m.mcBdofBuf.addr, m.mcScratchBuf.addr, 0, passJobs[p], p, passAt[p] };
+        s.dispatch( m.sh->kernelDmvr, &pass, (uint32_t) std::min<int32_t>( passJobs[p], 4096 ) );
       }
       if( bdofJobBytes || dmvrJobBytes )
       {
